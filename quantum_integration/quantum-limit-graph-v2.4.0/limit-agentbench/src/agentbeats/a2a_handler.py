@@ -1,28 +1,25 @@
+# Update src/agentbeats/a2a_handler.py
+
+from constraints.budget_enforcer import BudgetEnforcer, Budget
+
 class A2AHandler:
-    """Handles A2A protocol version 1.1"""
+    def __init__(self, budget: Budget = None):
+        self.budget_enforcer = BudgetEnforcer(budget) if budget else None
     
-    def __init__(self):
-        self.protocol_version = "1.1"  # ✓ REQUIRED
-        self.validator = A2ASchemaValidator()
-    
-    async def send_task(self, agent_url: str, task: dict) -> str:
-        """
-        Sends task to purple agent
-        Returns: task_id
-        """
-        # ✓ REQUIRED: POST to {agent_url}/a2a/task
-        # ✓ REQUIRED: Validate request against A2A schema
-        # ✓ REQUIRED: Handle connection errors gracefully
-    
-    async def get_result(self, agent_url: str, task_id: str) -> dict:
-        """
-        Gets result from purple agent
-        Returns: A2A-compliant result payload
-        """
-        # ✓ REQUIRED: GET from {agent_url}/a2a/task/{task_id}
-        # ✓ REQUIRED: Poll with timeout
-        # ✓ REQUIRED: Handle partial results
-    
-    async def stream_updates(self, agent_url: str, task_id: str):
-        """Optional: Stream real-time updates"""
-        # ⚪ OPTIONAL but recommended
+    async def send_task_with_budget(self, agent_url: str, task: dict):
+        """Send task with budget constraints"""
+        if self.budget_enforcer:
+            estimated_consumption = self._estimate_consumption(task)
+            
+            can_execute, violations = self.budget_enforcer.manager.can_execute(
+                estimated_consumption
+            )
+            
+            if not can_execute:
+                return {
+                    'status': 'budget_exceeded',
+                    'violations': violations
+                }
+        
+        # Proceed with normal execution
+        return await self.send_task(agent_url, task)
