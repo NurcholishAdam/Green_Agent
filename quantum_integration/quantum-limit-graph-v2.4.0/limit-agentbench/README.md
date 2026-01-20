@@ -2,7 +2,7 @@
 
 **Version**: 2.4.2  
 **Status**: Production Ready  
-**License**: Apache-2.0
+**License**: MIT License
 
 ## Overview
 
