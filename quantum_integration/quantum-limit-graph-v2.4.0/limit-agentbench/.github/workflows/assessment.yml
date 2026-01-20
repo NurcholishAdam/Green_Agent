@@ -1,0 +1,28 @@
+name: AgentBeats Assessment
+
+on:
+  workflow_dispatch:
+    inputs:
+      purple_agent_url:
+        description: 'Purple agent URL to evaluate'
+        required: true
+
+jobs:
+  run-assessment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Build Green Agent
+        run: docker build -t green-sustainability:latest .
+      
+      - name: Run Assessment
+        env:
+          PURPLE_AGENT_URL: ${{ github.event.inputs.purple_agent_url }}
+          AGENTBEATS_API_KEY: ${{ secrets.AGENTBEATS_API_KEY }}
+        run: |
+          docker run --rm \
+            -e PURPLE_AGENT_URL \
+            -e AGENTBEATS_API_KEY \
+            -v $(pwd)/results:/app/results \
+            green-sustainability:latest
