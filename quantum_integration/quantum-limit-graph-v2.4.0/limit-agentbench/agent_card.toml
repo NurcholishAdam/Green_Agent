@@ -1,0 +1,28 @@
+[agent]
+name = "Green Sustainability Agent"
+version = "3.0.0"
+description = "Evaluates AI agents on performance and environmental impact"
+agent_type = "green"  # ✓ CRITICAL: Must be "green"
+
+[capabilities]
+protocols = ["A2A", "MCP"]  # ✓ REQUIRED
+evaluation_domains = ["coding", "reasoning", "tool_use"]
+unique_metrics = [
+    "energy_efficiency",
+    "carbon_footprint",
+    "sustainability_index"
+]
+
+[requirements]
+python_version = ">=3.11"
+hardware = ["CPU", "GPU-optional"]
+
+[endpoints]
+a2a = "http://0.0.0.0:8000/a2a/task"  # ✓ REQUIRED
+health = "http://0.0.0.0:8000/health"  # ✓ REQUIRED
+
+[scoring]
+primary_metric = "sustainability_index"
+secondary_metrics = ["accuracy", "energy_efficiency"]
+failure_handling = true  # ✓ REQUIRED
+partial_credit = true    # ✓ REQUIRED
