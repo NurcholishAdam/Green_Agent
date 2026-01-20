@@ -1,0 +1,13 @@
+# Add: docker-compose.yml
+
+version: '3.8'
+services:
+  green-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GRID_REGION=${GRID_REGION:-US-CA}
+      - AGENTBEATS_API_KEY=${AGENTBEATS_API_KEY}
+    volumes:
+      - ./results:/app/results
