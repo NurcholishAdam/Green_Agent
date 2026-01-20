@@ -1,23 +1,28 @@
-# Add: src/agentbeats/green_agent.py
+# Update src/agentbeats/green_agent.py
+
+from analysis.pareto_analyzer import ParetoFrontierAnalyzer, ParetoPoint
 
 class GreenSustainabilityAgent:
-    """Green agent that evaluates purple agents on sustainability"""
+    def __init__(self):
+        self.pareto_analyzer = ParetoFrontierAnalyzer()
     
-    async def handle_assessment_request(self, request: dict):
-        """
-        Receives assessment request from AgentBeats platform
-        {
-            "purple_agents": ["http://agent1:8000", ...],
-            "config": {
-                "task_suite": "coding_tasks",
-                "track_carbon": true,
-                "grid_region": "US-CA"
-            }
+    async def score_with_pareto(self, results: List[Dict]) -> Dict:
+        """Score agents using Pareto optimality"""
+        points = [
+            ParetoPoint(
+                agent_id=r['agent_id'],
+                accuracy=r['accuracy'],
+                energy_kwh=r['energy_kwh'],
+                carbon_co2e_kg=r['carbon_kg'],
+                latency_ms=r['latency_ms']
+            ) for r in results
+        ]
+        
+        frontier = self.pareto_analyzer.compute_frontier(points)
+        ranks = self.pareto_analyzer.rank_by_dominance(points)
+        
+        return {
+            'frontier': frontier,
+            'ranks': ranks,
+            'knee_point': self.pareto_analyzer.get_knee_point(frontier)
         }
-        """
-        
-    async def orchestrate_evaluation(self, purple_agents: list):
-        """Send tasks to purple agents and collect results"""
-        
-    async def score_with_sustainability(self, results: list):
-        """Score both accuracy and environmental impact"""
