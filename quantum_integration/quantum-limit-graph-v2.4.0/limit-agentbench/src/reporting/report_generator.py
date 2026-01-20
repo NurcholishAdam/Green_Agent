@@ -19,3 +19,12 @@ class ReportGenerator:
             })
         
         return reports
+
+# Executive summary (Layer 3 focus)
+executive_summary = report_gen.generate_executive_summary(full_report)
+
+# Technical report (all layers)
+technical_report = report_gen.generate_technical_report(full_report)
+
+# Research report (Layer 1 + Layer 2)
+research_report = report_gen.generate_research_report(full_report)
