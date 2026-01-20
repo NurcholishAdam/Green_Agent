@@ -1,0 +1,23 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Build Docker image
+        run: docker build -t green-sustainability:latest .
+      
+      - name: Test Docker image
+        run: |
+          docker run -d --name test-agent -p 8000:8000 green-sustainability:latest
+          sleep 10
+          curl -f http://localhost:8000/health || exit 1
+          docker stop test-agent
