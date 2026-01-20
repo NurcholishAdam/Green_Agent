@@ -1,13 +1,28 @@
-# Add: src/agentbeats/a2a_handler.py
-
 class A2AHandler:
-    """Handles A2A protocol communication with purple agents"""
+    """Handles A2A protocol version 1.1"""
+    
+    def __init__(self):
+        self.protocol_version = "1.1"  # ✓ REQUIRED
+        self.validator = A2ASchemaValidator()
     
     async def send_task(self, agent_url: str, task: dict) -> str:
-        """Send task to purple agent and get task_id"""
-        
+        """
+        Sends task to purple agent
+        Returns: task_id
+        """
+        # ✓ REQUIRED: POST to {agent_url}/a2a/task
+        # ✓ REQUIRED: Validate request against A2A schema
+        # ✓ REQUIRED: Handle connection errors gracefully
+    
     async def get_result(self, agent_url: str, task_id: str) -> dict:
-        """Retrieve result from purple agent"""
-        
+        """
+        Gets result from purple agent
+        Returns: A2A-compliant result payload
+        """
+        # ✓ REQUIRED: GET from {agent_url}/a2a/task/{task_id}
+        # ✓ REQUIRED: Poll with timeout
+        # ✓ REQUIRED: Handle partial results
+    
     async def stream_updates(self, agent_url: str, task_id: str):
-        """Stream real-time updates from purple agent"""
+        """Optional: Stream real-time updates"""
+        # ⚪ OPTIONAL but recommended
