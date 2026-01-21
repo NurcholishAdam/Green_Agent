@@ -1,0 +1,22 @@
+# Requirements for Analysis Module
+# Install with: pip install -r requirements_analysis.txt
+
+# Core dependencies (already in Green_Agent)
+numpy>=1.24.0
+logging
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Optional: Visualization (for plotting Pareto frontiers)
+matplotlib>=3.7.0
+plotly>=5.14.0
+
+# Optional: Data export
+pandas>=2.0.0
+
+# Development
+black>=23.0.0  # Code formatting
+flake8>=6.0.0  # Linting
+mypy>=1.4.0    # Type checking
