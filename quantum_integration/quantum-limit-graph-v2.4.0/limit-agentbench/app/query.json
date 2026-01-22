@@ -1,0 +1,31 @@
+{
+  "query_id": "green_eval_001",
+  "task": {
+    "type": "inference",
+    "description": "Evaluate agent on limit-agentbench task",
+    "dataset": "agentbench-limit-v2",
+    "input": {
+      "prompt": "Classify this input according to task specification"
+    }
+  },
+  "objectives": {
+    "accuracy": "maximize",
+    "latency": "minimize",
+    "energy": "minimize",
+    "carbon": "minimize",
+    "memory": "minimize"
+  },
+  "constraints": {
+    "max_latency_sec": 2.0,
+    "max_energy_wh": 0.05,
+    "max_memory_mb": 4096
+  },
+  "execution": {
+    "runs": 5,
+    "deterministic": true
+  },
+  "reporting": {
+    "return_metrics": true,
+    "return_raw_outputs": false
+  }
+}
