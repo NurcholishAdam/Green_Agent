@@ -12,6 +12,12 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Allow cgroup access
+VOLUME ["/sys/fs/cgroup"]
+
+CMD ["python", "run_agent.py"]
+
+
 # Copy source code
 COPY quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src ./src
 COPY agent_card.toml .
