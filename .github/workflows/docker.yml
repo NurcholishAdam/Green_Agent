@@ -1,26 +1,30 @@
-name: Build and push Docker image to Docker Hub
+name: Build & Push Green Agent
 
 on:
   push:
-    branches: [ "main" ] # Trigger on pushes to the main branch
+    branches: [ main ]
+    tags: [ "v*" ]
 
 jobs:
-  build:
+  docker:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Check out the repo
-      uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.nurcholishadam04 }}
-        password: ${{ secrets.dckr_pat_AoYZORJXLWP1NDTCXM47VC1sJyI }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ${{ secrets.nurcholishadam04 }}/green_agent:latest # Replace with your Docker Hub repo name
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.benchmark
+          push: true
+          tags: |
+            nurcholishadam04/green_agent:latest
+            nurcholishadam04/green_agent:${{ github.ref_name }}
