@@ -1,30 +1,24 @@
-name: Build & Push Green Agent
-
-on:
-  push:
-    branches: [ main ]
-    tags: [ "v*" ]
+on: [push]
 
 jobs:
-  docker:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          python-version: '3.11'
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.benchmark
-          push: true
-          tags: |
-            nurcholishadam04/green_agent:latest
-            nurcholishadam04/green_agent:${{ github.ref_name }}
+      - name: Debug — show backend files
+        run: ls -la backend
+
+      - name: Install dependencies (backend)
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      # OR
+      # - name: Install dependencies (explicit path)
+      #   run: pip install -r backend/requirements.txt
