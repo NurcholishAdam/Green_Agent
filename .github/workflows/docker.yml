@@ -23,4 +23,4 @@ jobs:
       with:
         context: .
         push: true
-        tags: ${{ secrets.DOCKER_USERNAME }}/your-repository-name:latest # Replace with your Docker Hub repo name
+        tags: ${{ secrets.nurcholishadam04 }}/green_agent:latest # Replace with your Docker Hub repo name
