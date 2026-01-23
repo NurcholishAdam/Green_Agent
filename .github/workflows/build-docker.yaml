@@ -1,0 +1,15 @@
+name: Build and Publish image to Docker Hub
+on: [workflow_dispatch]
+
+jobs:
+  publish_images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+      - name: build image
+        run: docker build .api/ -t nurcholishadam04/green_agent:latest
+      - name: push image to docker hub
+        run: |
+          docker push nurcholishadam04/green_agent:latest
+        
