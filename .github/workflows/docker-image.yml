@@ -1,11 +1,11 @@
-name: Build & Push Green Agent (AgentBeats)
+name: Docker Image CI
 
 on: 
   push:
     branches: [main]
-    tags:
-      - "v*"
-
+  pull_request:
+    branches: ["main"]
+    
 jobs:
   docker:
     runs-on: ubuntu-latest
@@ -15,7 +15,7 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Login to Docker Hub
@@ -25,14 +25,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context:
-          file: Dockerfile.benchmark
-          push: true
-          tags: |
-            nurcholishadam04/green_agent
-            nurcholishadam04/green_agent:${{ github.ref_name}}
+        run: docker build . --file Dockerfile --tag nurcholishadam04/green_agent:latest 
 
-
-      
+      - name: Push to Docker Hub
+        run: docker push nurcholishadam04/green_agent
