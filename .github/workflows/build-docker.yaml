@@ -32,6 +32,6 @@ jobs:
           push: true
           tags: |
             ghcr.io/nurcholishadam/green_agent:latest
-            ghcr.io/nurcholishadam04/green_agent:main
+            ghcr.io/nurcholishadam/green_agent:main
           
     
