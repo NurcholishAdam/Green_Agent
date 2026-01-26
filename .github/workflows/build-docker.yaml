@@ -33,5 +33,6 @@ jobs:
           tags: |
             ghcr.io/nurcholishadam/green_agent:latest
             ghcr.io/nurcholishadam/green_agent:main
+      
           
     
