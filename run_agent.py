@@ -1,67 +1,118 @@
+"""
+run_agent.py
+
+Multi-query, Pareto-aware green benchmarking entrypoint.
+Compatible with AgentBeats leaderboards.
+"""
+
 import json
-import sys
-import traceback
-from typing import Any, Dict
+import os
+import random
+from typing import Dict, List
 
-# ---- Import metrics collector ----
-from docker_metrics_collector import measure_execution
+from docker_metrics_collector import DockerMetricsCollector
+from src.constraints.energy_budget import check_energy_budget
+from src.analysis.green_score import compute_green_score
+from src.analysis.pareto import pareto_front
+from src.feedback.energy_feedback import generate_energy_feedback
 
-# ---- Import agent logic ----
-# Adjust this import if your agent entry differs
-from src.agentbeats.agent import run_agent as agent_run
 
+# -------------------------------------------------
+# Agent inference (replace with real agent)
+# -------------------------------------------------
 
-def load_input() -> Dict[str, Any]:
+def run_agent_inference(mode: str) -> float:
     """
-    Load JSON input from STDIN (AgentBeats contract).
-    """
-    try:
-        return json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid JSON input: {e}")
+    Simulated agent inference.
 
+    mode affects accuracy/energy tradeoff.
+    """
+    base = {
+        "low_energy": 0.65,
+        "balanced": 0.72,
+        "high_accuracy": 0.78,
+    }[mode]
+
+    return base + random.uniform(-0.01, 0.01)
+
+
+# -------------------------------------------------
+# Query definitions (AgentBeats-aligned)
+# -------------------------------------------------
+
+def get_queries() -> List[Dict]:
+    return [
+        {
+            "id": "low-energy",
+            "mode": "low_energy",
+            "max_energy_wh": 0.03,
+        },
+        {
+            "id": "balanced",
+            "mode": "balanced",
+            "max_energy_wh": 0.06,
+        },
+        {
+            "id": "high-accuracy",
+            "mode": "high_accuracy",
+            "max_energy_wh": None,
+        },
+    ]
+
+
+# -------------------------------------------------
+# Main
+# -------------------------------------------------
 
 def main():
-    try:
-        # 1. Read benchmark query
-        query = load_input()
+    carbon_intensity = float(os.getenv("CARBON_INTENSITY", "0.0004"))
+    collector = DockerMetricsCollector(carbon_intensity=carbon_intensity)
 
-        # Expected (flexible) structure
-        task_input = query.get("task", query)
+    all_results: List[Dict] = []
 
-        # 2. Execute agent under measurement
-        result, metrics = measure_execution(
-            agent_run,
-            task_input
+    for query in get_queries():
+        mode = query["mode"]
+
+        metrics = collector.run_and_measure(
+            fn=lambda: run_agent_inference(mode),
+            runs=5,
         )
 
-        # 3. Standardized output schema
-        output = {
-            "status": "ok",
-            "result": result,
-            "metrics": {
-                "latency_ms": metrics.get("latency_ms"),
-                "cpu_time_ms": metrics.get("cpu_time_ms"),
-                "memory_mb": metrics.get("memory_mb"),
-                "energy_joules": metrics.get("energy_joules"),
-                "carbon_g": metrics.get("carbon_g"),
-            }
+        passed, reason = check_energy_budget(
+            metrics,
+            max_energy_wh=query["max_energy_wh"],
+        )
+
+        result = {
+            "query_id": query["id"],
+            "mode": mode,
+            "passed": passed,
+            "reason": reason,
+            **metrics,
+            "green_score": compute_green_score(
+                metrics["accuracy"],
+                metrics["energy"],
+                metrics["latency"],
+            ),
+            "feedback": generate_energy_feedback(metrics),
         }
 
-        # 4. Emit JSON to STDOUT
-        json.dump(output, sys.stdout)
-        sys.stdout.flush()
+        all_results.append(result)
 
-    except Exception as e:
-        # HARD FAIL must still return JSON
-        error_output = {
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-        json.dump(error_output, sys.stdout)
-        sys.stdout.flush()
-        sys.exit(1)
+    # -------------------------------------------------
+    # Pareto aggregation
+    # -------------------------------------------------
+    pareto = pareto_front(
+        all_results,
+        objectives=("accuracy", "energy", "latency"),
+    )
+
+    output = {
+        "results": all_results,
+        "pareto_front": pareto,
+    }
+
+    print(json.dumps(output, indent=2))
 
 
 if __name__ == "__main__":
