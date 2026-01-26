@@ -17,6 +17,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Debug - Check secrets
+        run: |
+          echo "Checking if secrets are available..."
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "✓ DOCKERHUB_USERNAME is set"
+          else 
+            echo "✗ DOCKERHUB_USERNAME is NOT set or empty"
+          fi
+          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}"]; then
+            echo "✓ DOCKERHUB_TOKEN is set"
+          else 
+            echo "✗ DOCKERHUB_TOKEN is NOT set or empty"
+          fi
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }} 
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
