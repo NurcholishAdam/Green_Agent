@@ -231,13 +231,17 @@ This design is suitable for **leaderboards, papers, and long-term green AI resea
 ---
 
 License
+
 This project is licensed under the MIT License - see the LICENSE file for details.
+
 👤 Author
 Nurcholis Adam
+
 - GitHub: @GreenAgent
 - Email: nurcholisadam@gmail.com
 
 🙏 Acknowledgments
+
 - AgentBeats Team - Platform and A2A protocol
 - THUDM - AgentBench framework
 - Qiskit Team - Quantum computing toolkit
