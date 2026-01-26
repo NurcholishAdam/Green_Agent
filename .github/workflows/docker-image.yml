@@ -43,4 +43,4 @@ jobs:
         run: docker build . --file Dockerfile --tag nurcholishadam04/green_agent:latest 
 
       - name: Push to Docker Hub
-        run: docker push nurcholishadam04/green_agent:latest
+        run: docker push nurcholishadam/green_agent:latest
