@@ -31,7 +31,7 @@ jobs:
           file: Dockerfile.benchmark
           push: true
           tags: |
-            ghcr.io/nurcholishadam04/green_agent:lates
-            ghcr.io/nurcholishadam04/green_agent:${{ github.ref_name }}
+            ghcr.io/nurcholishadam/green_agent:latest
+            ghcr.io/nurcholishadam04/green_agent:main
           
     
