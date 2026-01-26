@@ -1,15 +1,37 @@
-name: Build and Publish image to Docker Hub
-on: [workflow_dispatch]
+name: Build & Push Green Agent (AgentBeats)
+
+on: 
+  push:
+    branches: [ main ]
+    tags:
+      - "v*"
 
 jobs:
-  publish_images:
+  docker:
     runs-on: ubuntu-latest
+
+    permissions: 
+      contents: read
+      packages: write
+
     steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-      - name: build image
-        run: docker build .api/ -t nurcholishadam04/green_agent:latest
-      - name: push image to docker hub
-        run: |
-          docker push nurcholishadam04/green_agent:latest
-        
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@v5
+        with:
+          context:
+          file: Dockerfile.benchmark
+          push: true
+          tags: |
+            ghcr.io/nurcholishadam04/green_agent:lates
+            ghcr.io/nurcholishadam04/green_agent:${{ github.ref_name }}
+          
+    
