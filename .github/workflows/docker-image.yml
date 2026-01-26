@@ -1,46 +1,31 @@
-name: Docker Image CI
+name: Build and Push Green Agent
 
-on: 
+on:
   push:
     branches: [main]
-  pull_request:
-    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write
+
 jobs:
-  docker:
+  build:
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      packages: write
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Debug - Check secrets
-        run: |
-          echo "Checking if secrets are available..."
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
-            echo "✓ DOCKERHUB_USERNAME is set"
-          else 
-            echo "✗ DOCKERHUB_USERNAME is NOT set or empty"
-          fi
-          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}"]; then
-            echo "✓ DOCKERHUB_TOKEN is set"
-          else 
-            echo "✗ DOCKERHUB_TOKEN is NOT set or empty"
-          fi
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }} 
-
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: NurcholishAdam
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push Docker image
-        run: docker build . --file Dockerfile --tag nurcholishadam04/green_agent:latest 
-
-      - name: Push to Docker Hub
-        run: docker push nurcholishadam04/green_agent:latest
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.benchmark
+          push: true
+          tags: ghcr.io/nurcholishadam/green-agent:latest
