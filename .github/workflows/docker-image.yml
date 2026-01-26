@@ -28,4 +28,4 @@ jobs:
           context: .
           file: Dockerfile.benchmark
           push: true
-          tags: ghcr.io/nurcholishadam/green-agent:latest
+          tags: ghcr.io/nurcholishadam/green_agent:latest
