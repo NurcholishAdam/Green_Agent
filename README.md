@@ -237,7 +237,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 👤 Author
 Nurcholis Adam
 
-- GitHub: @GreenAgent
+- GitHub: https://github.com/NurcholishAdam/
 - Email: nurcholisadam@gmail.com
 
 🙏 Acknowledgments
