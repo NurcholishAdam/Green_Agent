@@ -1,15 +1,12 @@
 # src/analysis/autogen_runtime.py
 
 from typing import Dict, Any
-
 from .runtime_adapter import AgentRuntime
 
 
 class AutoGenRuntime(AgentRuntime):
     """
-    Adapter for AutoGen conversational agents.
-
-    Measures one conversation turn as a benchmark unit.
+    Adapter for AutoGen with conversation-depth measurement.
     """
 
     def init(self, config: Dict[str, Any]) -> None:
@@ -17,8 +14,8 @@ class AutoGenRuntime(AgentRuntime):
             import autogen
         except ImportError:
             raise RuntimeError(
-                "AutoGen is not installed. "
-                "Install with `pip install pyautogen` to use AutoGenRuntime."
+                "AutoGen not installed. "
+                "pip install pyautogen"
             )
 
         self.agent = config.get("agent")
@@ -26,14 +23,14 @@ class AutoGenRuntime(AgentRuntime):
             raise ValueError("AutoGenRuntime requires `agent` in config")
 
     def run(self, query: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Executes a single AutoGen interaction.
-        """
         prompt = query.get("input")
 
-        reply = self.agent.generate_reply(
-            messages=[{"role": "user", "content": prompt}]
-        )
+        messages = [{"role": "user", "content": prompt}]
+
+        reply = self.agent.generate_reply(messages=messages)
+
+        # Conversation depth = user + agent replies
+        conversation_depth = len(messages) + 1
 
         accuracy = (
             query.get("expected") == reply
@@ -44,6 +41,7 @@ class AutoGenRuntime(AgentRuntime):
         return {
             "output": reply,
             "accuracy": float(accuracy),
+            "conversation_depth": conversation_depth,
         }
 
     def finalize(self) -> None:
