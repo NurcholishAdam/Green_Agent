@@ -6,12 +6,21 @@ from .dominance_checker import dominates
 
 class ParetoAnalyzer:
     """
-    Computes Pareto frontier over multi-objective agent results.
+    Multi-objective Pareto analyzer with framework overhead awareness.
     """
 
     def __init__(
         self,
-        minimize=("energy", "carbon", "latency", "memory"),
+        minimize=(
+            "energy",
+            "carbon",
+            "latency",
+            "memory",
+            "framework_overhead_latency",
+            "framework_overhead_energy",
+            "tool_calls",
+            "conversation_depth",
+        ),
         maximize=("accuracy",),
     ):
         self.minimize = set(minimize)
