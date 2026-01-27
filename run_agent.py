@@ -5,6 +5,8 @@ import sys
 
 from docker_metrics_collector import DockerMetricsCollector
 from src.analysis.runtime_adapter import NativeAgentRuntime
+from src.analysis.langchain_runtime import LangChainRuntime
+from src.analysis.autogen_runtime import AutoGenRuntime
 from src.analysis.pareto_analyzer import ParetoAnalyzer
 from src.constraints.budget_enforcer import BudgetEnforcer, BudgetExceeded
 from src.feedback.metric_sink import StdoutSink
@@ -16,9 +18,17 @@ def main():
     queries = payload.get("queries", [])
     config = payload.get("config", {})
 
-    runtime = NativeAgentRuntime()
+    runtime_type = config.get("runtime", "native")
+    if runtime_type == "langchain":
+        runtime = LangChainRuntime()
+    elif runtime_type == "autogen":
+        runtime = AutoGenRuntime()
+    else:
+        runtime = NativeAgentRuntime()
+    
     runtime.init(config)
 
+    
     metrics_collector = DockerMetricsCollector()
     sink = StdoutSink()
     pareto = ParetoAnalyzer()
