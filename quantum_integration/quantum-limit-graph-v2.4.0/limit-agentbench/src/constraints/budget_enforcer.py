@@ -416,3 +416,31 @@ class BudgetEnforcer:
         """Reset budget tracking"""
         self.manager.reset()
         logger.info("Budget enforcer reset")
+
+
+# src/constraints/budget_enforcer.py
+
+class BudgetExceeded(Exception):
+    pass
+
+
+class BudgetEnforcer:
+    def __init__(
+        self,
+        max_energy: float = None,
+        max_carbon: float = None,
+        max_latency: float = None,
+    ):
+        self.max_energy = max_energy
+        self.max_carbon = max_carbon
+        self.max_latency = max_latency
+
+    def check(self, metrics: dict):
+        if self.max_energy and metrics["energy"] > self.max_energy:
+            raise BudgetExceeded("Energy budget exceeded")
+
+        if self.max_carbon and metrics["carbon"] > self.max_carbon:
+            raise BudgetExceeded("Carbon budget exceeded")
+
+        if self.max_latency and metrics["latency"] > self.max_latency:
+            raise BudgetExceeded("Latency budget exceeded")
