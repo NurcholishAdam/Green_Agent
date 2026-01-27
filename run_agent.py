@@ -1,118 +1,60 @@
-"""
-run_agent.py
-
-Multi-query, Pareto-aware green benchmarking entrypoint.
-Compatible with AgentBeats leaderboards.
-"""
+# run_agent.py
 
 import json
-import os
-import random
-from typing import Dict, List
+import sys
 
 from docker_metrics_collector import DockerMetricsCollector
-from src.constraints.energy_budget import check_energy_budget
-from src.analysis.green_score import compute_green_score
-from src.analysis.pareto import pareto_front
-from src.feedback.energy_feedback import generate_energy_feedback
+from src.analysis.runtime_adapter import NativeAgentRuntime
+from src.analysis.pareto_analyzer import ParetoAnalyzer
+from src.constraints.budget_enforcer import BudgetEnforcer, BudgetExceeded
+from src.feedback.metric_sink import StdoutSink
 
-
-# -------------------------------------------------
-# Agent inference (replace with real agent)
-# -------------------------------------------------
-
-def run_agent_inference(mode: str) -> float:
-    """
-    Simulated agent inference.
-
-    mode affects accuracy/energy tradeoff.
-    """
-    base = {
-        "low_energy": 0.65,
-        "balanced": 0.72,
-        "high_accuracy": 0.78,
-    }[mode]
-
-    return base + random.uniform(-0.01, 0.01)
-
-
-# -------------------------------------------------
-# Query definitions (AgentBeats-aligned)
-# -------------------------------------------------
-
-def get_queries() -> List[Dict]:
-    return [
-        {
-            "id": "low-energy",
-            "mode": "low_energy",
-            "max_energy_wh": 0.03,
-        },
-        {
-            "id": "balanced",
-            "mode": "balanced",
-            "max_energy_wh": 0.06,
-        },
-        {
-            "id": "high-accuracy",
-            "mode": "high_accuracy",
-            "max_energy_wh": None,
-        },
-    ]
-
-
-# -------------------------------------------------
-# Main
-# -------------------------------------------------
 
 def main():
-    carbon_intensity = float(os.getenv("CARBON_INTENSITY", "0.0004"))
-    collector = DockerMetricsCollector(carbon_intensity=carbon_intensity)
+    payload = json.load(sys.stdin)
 
-    all_results: List[Dict] = []
+    queries = payload.get("queries", [])
+    config = payload.get("config", {})
 
-    for query in get_queries():
-        mode = query["mode"]
+    runtime = NativeAgentRuntime()
+    runtime.init(config)
 
-        metrics = collector.run_and_measure(
-            fn=lambda: run_agent_inference(mode),
-            runs=5,
-        )
-
-        passed, reason = check_energy_budget(
-            metrics,
-            max_energy_wh=query["max_energy_wh"],
-        )
-
-        result = {
-            "query_id": query["id"],
-            "mode": mode,
-            "passed": passed,
-            "reason": reason,
-            **metrics,
-            "green_score": compute_green_score(
-                metrics["accuracy"],
-                metrics["energy"],
-                metrics["latency"],
-            ),
-            "feedback": generate_energy_feedback(metrics),
-        }
-
-        all_results.append(result)
-
-    # -------------------------------------------------
-    # Pareto aggregation
-    # -------------------------------------------------
-    pareto = pareto_front(
-        all_results,
-        objectives=("accuracy", "energy", "latency"),
+    metrics_collector = DockerMetricsCollector()
+    sink = StdoutSink()
+    pareto = ParetoAnalyzer()
+    enforcer = BudgetEnforcer(
+        max_energy=config.get("max_energy"),
+        max_carbon=config.get("max_carbon"),
+        max_latency=config.get("max_latency"),
     )
+
+    all_results = []
+
+    for query in queries:
+
+        def run_once():
+            result = runtime.run(query)
+            return result["accuracy"]
+
+        metrics = metrics_collector.run_and_measure(run_once)
+
+        try:
+            enforcer.check(metrics)
+        except BudgetExceeded as e:
+            metrics["budget_exceeded"] = True
+            metrics["error"] = str(e)
+
+        sink.emit(metrics)
+        all_results.append(metrics)
+
+    frontier = pareto.pareto_frontier(all_results)
 
     output = {
         "results": all_results,
-        "pareto_front": pareto,
+        "pareto_frontier": frontier,
     }
 
-    print(json.dumps(output, indent=2))
+    print(json.dumps(output))
 
 
 if __name__ == "__main__":
