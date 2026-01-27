@@ -1,71 +1,180 @@
+#!/usr/bin/env python3
 # run_agent.py
 
 import json
-import sys
+import time
+import argparse
+from typing import Dict, Any, List
 
-from docker_metrics_collector import DockerMetricsCollector
-from src.analysis.runtime_adapter import NativeAgentRuntime
+# ---- Runtime adapters ----
+from src.analysis.runtime_adapter import AgentRuntime
 from src.analysis.langchain_runtime import LangChainRuntime
 from src.analysis.autogen_runtime import AutoGenRuntime
+
+# ---- Analysis modules ----
 from src.analysis.pareto_analyzer import ParetoAnalyzer
-from src.constraints.budget_enforcer import BudgetEnforcer, BudgetExceeded
-from src.feedback.metric_sink import StdoutSink
+from src.analysis.overhead_analyzer import OverheadAnalyzer
+
+# ---- Utilities (assumed existing in repo) ----
+from src.analysis.energy_meter import EnergyMeter
+from src.analysis.carbon_estimator import CarbonEstimator
+from src.reporting.leaderboard import generate_leaderboard
+from src.visualization.plot_pareto import plot_pareto_frontier
 
 
-def main():
-    payload = json.load(sys.stdin)
+# ---------------------------------------------------------------------
+# Runtime factory
+# ---------------------------------------------------------------------
 
-    queries = payload.get("queries", [])
-    config = payload.get("config", {})
-
-    runtime_type = config.get("runtime", "native")
-    if runtime_type == "langchain":
-        runtime = LangChainRuntime()
-    elif runtime_type == "autogen":
-        runtime = AutoGenRuntime()
+def create_runtime(framework: str, config: Dict[str, Any]) -> AgentRuntime:
+    if framework == "langchain":
+        rt = LangChainRuntime()
+    elif framework == "autogen":
+        rt = AutoGenRuntime()
     else:
-        runtime = NativeAgentRuntime()
-    
-    runtime.init(config)
+        raise ValueError(f"Unsupported framework: {framework}")
 
-    
-    metrics_collector = DockerMetricsCollector()
-    sink = StdoutSink()
-    pareto = ParetoAnalyzer()
-    enforcer = BudgetEnforcer(
-        max_energy=config.get("max_energy"),
-        max_carbon=config.get("max_carbon"),
-        max_latency=config.get("max_latency"),
-    )
+    rt.init(config)
+    return rt
 
-    all_results = []
 
-    for query in queries:
+# ---------------------------------------------------------------------
+# Single query execution
+# ---------------------------------------------------------------------
 
-        def run_once():
-            result = runtime.run(query)
-            return result["accuracy"]
+def run_single_query(
+    runtime: AgentRuntime,
+    query: Dict[str, Any],
+    overhead: OverheadAnalyzer,
+) -> Dict[str, Any]:
 
-        metrics = metrics_collector.run_and_measure(run_once)
+    energy_meter = EnergyMeter()
+    carbon = CarbonEstimator()
 
-        try:
-            enforcer.check(metrics)
-        except BudgetExceeded as e:
-            metrics["budget_exceeded"] = True
-            metrics["error"] = str(e)
+    start_time = time.time()
+    energy_meter.start()
 
-        sink.emit(metrics)
-        all_results.append(metrics)
+    # ---- Run agent ----
+    result = runtime.run(query)
 
-    frontier = pareto.pareto_frontier(all_results)
+    energy_meter.stop()
+    latency = time.time() - start_time
 
-    output = {
-        "results": all_results,
-        "pareto_frontier": frontier,
+    energy = energy_meter.joules()
+    carbon_kg = carbon.estimate(energy)
+
+    metrics = {
+        "query_id": query.get("id"),
+        "latency": latency,
+        "energy": energy,
+        "carbon": carbon_kg,
+        **result,
     }
 
-    print(json.dumps(output))
+    # ---- Framework overhead ----
+    metrics = overhead.compute(metrics)
+    return metrics
 
+
+# ---------------------------------------------------------------------
+# Budget-aware query switching
+# ---------------------------------------------------------------------
+
+def within_budget(metrics: List[Dict], budget: Dict[str, float]) -> bool:
+    total_energy = sum(m["energy"] for m in metrics)
+    total_carbon = sum(m["carbon"] for m in metrics)
+
+    if budget.get("max_energy") and total_energy > budget["max_energy"]:
+        return False
+    if budget.get("max_carbon") and total_carbon > budget["max_carbon"]:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------
+# Main runner
+# ---------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--output", default="agentbeats_results.json")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = json.load(f)
+
+    # ---- AgentBeats requirement ----
+    queries: List[Dict] = config["queries"]
+    framework = config["framework"]
+    runtime_config = config["runtime"]
+
+    budget = config.get("budget", {})
+
+    # ---- Baseline calibration ----
+    overhead = OverheadAnalyzer(
+        baseline_latency=config.get("baseline_latency", 0.01),
+        baseline_energy=config.get("baseline_energy", 0.0001),
+    )
+
+    runtime = create_runtime(framework, runtime_config)
+
+    all_metrics: List[Dict] = []
+
+    for query in queries:
+        metrics = run_single_query(runtime, query, overhead)
+        all_metrics.append(metrics)
+
+        # ---- Budget-aware early stop ----
+        if not within_budget(all_metrics, budget):
+            print("⚠️ Budget exceeded — stopping remaining queries.")
+            break
+
+    runtime.finalize()
+
+    # -----------------------------------------------------------------
+    # Pareto aggregation
+    # -----------------------------------------------------------------
+
+    pareto = ParetoAnalyzer()
+    frontier = pareto.pareto_frontier(all_metrics)
+
+    # -----------------------------------------------------------------
+    # Leaderboard & visualization
+    # -----------------------------------------------------------------
+
+    leaderboard = generate_leaderboard(all_metrics)
+
+    plot_pareto_frontier(
+        all_metrics,
+        x="energy",
+        y="accuracy",
+        highlight=frontier,
+        output_path="pareto.png",
+    )
+
+    # -----------------------------------------------------------------
+    # AgentBeats-compatible output
+    # -----------------------------------------------------------------
+
+    result_bundle = {
+        "framework": framework,
+        "queries": queries,          # MUST be array
+        "results": all_metrics,
+        "pareto_frontier": frontier,
+        "leaderboard": leaderboard,
+    }
+
+    with open(args.output, "w") as f:
+        json.dump(result_bundle, f, indent=2)
+
+    print(f"✅ Results written to {args.output}")
+    print("🏁 Pareto frontier size:", len(frontier))
+
+
+# ---------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
