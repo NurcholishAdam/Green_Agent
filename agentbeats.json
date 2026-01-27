@@ -1,7 +1,9 @@
 {
   "name": "GreenAgent",
   "description": "Pareto-optimized green benchmarking agent with multi-objective evaluation",
-  "image": "ghcr.io/nurcholishadam04/green_agent:main",
+  tags: |
+  ghcr.io/nurcholishadam/green_agent:main
+  ghcr.io/nurcholishadam/green_agent:latest,
   "entrypoint": [
     "python",
     "run_agent.py"
