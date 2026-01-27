@@ -1,184 +1,222 @@
 #!/usr/bin/env python3
-# run_agent.py
+"""
+run_agent.py
 
-import json
-import time
+AgentBeats-compatible runner:
+- multi-query execution
+- container-internal energy & carbon estimation
+- framework adapters (LangChain / AutoGen)
+- Pareto aggregation
+- budget-aware early stopping
+"""
+
 import argparse
-from typing import Dict, Any, List
+import json
+from typing import Dict, Any, List, Callable
 
-# ---- Runtime adapters ----
+from docker_metrics_collector import DockerMetricsCollector
+
+# -----------------------------
+# Framework runtimes (pure adapters)
+# -----------------------------
+
 from src.analysis.runtime_adapter import AgentRuntime
 from src.analysis.langchain_runtime import LangChainRuntime
 from src.analysis.autogen_runtime import AutoGenRuntime
 
-# ---- Analysis modules ----
+# -----------------------------
+# Analysis utilities
+# -----------------------------
+
 from src.analysis.pareto_analyzer import ParetoAnalyzer
 from src.analysis.overhead_analyzer import OverheadAnalyzer
-
-# ---- Utilities (assumed existing in repo) ----
-from src.analysis.energy_meter import EnergyMeter
-from src.analysis.carbon_estimator import CarbonEstimator
-from src.reporting.leaderboard import generate_leaderboard
-from src.visualization.plot_pareto import plot_pareto_frontier
-
 from src.analysis.streaming import MetricsStreamer
 
-# ---------------------------------------------------------------------
+
+# =====================================================
 # Runtime factory
-# ---------------------------------------------------------------------
+# =====================================================
 
 def create_runtime(framework: str, config: Dict[str, Any]) -> AgentRuntime:
+    """
+    Instantiate a framework runtime.
+    Must be deterministic and offline.
+    """
     if framework == "langchain":
-        rt = LangChainRuntime()
+        runtime = LangChainRuntime()
     elif framework == "autogen":
-        rt = AutoGenRuntime()
+        runtime = AutoGenRuntime()
     else:
         raise ValueError(f"Unsupported framework: {framework}")
 
-    rt.init(config)
-    return rt
+    runtime.init(config or {})
+    return runtime
 
 
-# ---------------------------------------------------------------------
+# =====================================================
 # Single query execution
-# ---------------------------------------------------------------------
+# =====================================================
 
 def run_single_query(
     runtime: AgentRuntime,
     query: Dict[str, Any],
     overhead: OverheadAnalyzer,
+    collector: DockerMetricsCollector,
 ) -> Dict[str, Any]:
+    """
+    Execute exactly ONE query and measure metrics.
+    """
 
-    energy_meter = EnergyMeter()
-    carbon = CarbonEstimator()
+    def _execute() -> float:
+        """
+        Wrapper required by DockerMetricsCollector.
+        Must return accuracy or score (float).
+        """
+        result = runtime.run(query)
+        return float(result.get("accuracy", 0.0))
 
-    start_time = time.time()
-    energy_meter.start()
+    metrics = collector.run_and_measure(_execute, runs=1)
 
-    # ---- Run agent ----
-    result = runtime.run(query)
-
-    energy_meter.stop()
-    latency = time.time() - start_time
-
-    energy = energy_meter.joules()
-    carbon_kg = carbon.estimate(energy)
-
-    metrics = {
+    # Stable, explicit metric schema
+    record = {
         "query_id": query.get("id"),
-        "latency": latency,
-        "energy": energy,
-        "carbon": carbon_kg,
-        **result,
+        "latency": metrics["latency"],
+        "latency_variance": metrics["latency_variance"],
+        "cpu_time": metrics["cpu_time"],
+        "energy": metrics["energy"],
+        "carbon": metrics["carbon"],
+        "memory": metrics["memory"],
+        "accuracy": metrics["accuracy"],
+        "framework": runtime.name,
+        "tool_calls": runtime.tool_calls,
+        "conversation_depth": runtime.depth,
     }
 
-    # ---- Framework overhead ----
-    metrics = overhead.compute(metrics)
-    return metrics
+    # Framework overhead attribution
+    record = overhead.compute(record)
+
+    return record
 
 
-# ---------------------------------------------------------------------
-# Budget-aware query switching
-# ---------------------------------------------------------------------
+# =====================================================
+# Budget logic
+# =====================================================
 
-def within_budget(metrics: List[Dict], budget: Dict[str, float]) -> bool:
-    total_energy = sum(m["energy"] for m in metrics)
-    total_carbon = sum(m["carbon"] for m in metrics)
+def within_budget(
+    records: List[Dict[str, Any]],
+    budget: Dict[str, float],
+) -> bool:
+    """
+    Check cumulative energy / carbon budgets.
+    """
+    if not budget:
+        return True
 
-    if budget.get("max_energy") and total_energy > budget["max_energy"]:
+    total_energy = sum(r.get("energy", 0.0) for r in records)
+    total_carbon = sum(r.get("carbon", 0.0) for r in records)
+
+    if "max_energy" in budget and total_energy > budget["max_energy"]:
         return False
-    if budget.get("max_carbon") and total_carbon > budget["max_carbon"]:
+    if "max_carbon" in budget and total_carbon > budget["max_carbon"]:
         return False
+
     return True
 
 
-# ---------------------------------------------------------------------
-# Main runner
-# ---------------------------------------------------------------------
+# =====================================================
+# Main entry
+# =====================================================
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", default="agentbeats_results.json")
     args = parser.parse_args()
+
+    # Streaming is side-channel only (safe)
     streamer = MetricsStreamer(enabled=True)
 
-    with open(args.config) as f:
+    # -----------------------------
+    # Load config
+    # -----------------------------
+
+    with open(args.config, "r") as f:
         config = json.load(f)
 
-    # ---- AgentBeats requirement ----
-    queries: List[Dict] = config["queries"]
-    framework = config["framework"]
-    runtime_config = config["runtime"]
+    # AgentBeats REQUIRES queries to be an array
+    queries: List[Dict[str, Any]] = config["queries"]
 
+    framework = config["framework"]
+    runtime_config = config.get("runtime", {})
     budget = config.get("budget", {})
 
-    # ---- Baseline calibration ----
-    overhead = OverheadAnalyzer(
-        baseline_latency=config.get("baseline_latency", 0.01),
-        baseline_energy=config.get("baseline_energy", 0.0001),
-    )
+    # -----------------------------
+    # Initialize components
+    # -----------------------------
 
     runtime = create_runtime(framework, runtime_config)
 
-    all_metrics: List[Dict] = []
-
-    for query in queries:
-        streamer.emit("query_start", {"query_id": query["id"]})
-        metrics = run_single_query(runtime, query, overhead)
-        all_metrics.append(metrics)
-
-        # ---- Budget-aware early stop ----
-        if not within_budget(all_metrics, budget):
-            print("⚠️ Budget exceeded — stopping remaining queries.")
-            break
-    
-    streamer.emit("query_end", metrics)
-    runtime.finalize()
-
-    # -----------------------------------------------------------------
-    # Pareto aggregation
-    # -----------------------------------------------------------------
-
-    pareto = ParetoAnalyzer()
-    frontier = pareto.pareto_frontier(all_metrics)
-
-    # -----------------------------------------------------------------
-    # Leaderboard & visualization
-    # -----------------------------------------------------------------
-
-    leaderboard = generate_leaderboard(all_metrics)
-
-    plot_pareto_frontier(
-        all_metrics,
-        x="energy",
-        y="accuracy",
-        highlight=frontier,
-        output_path="pareto.png",
+    overhead = OverheadAnalyzer(
+        baseline_latency=config.get("baseline_latency", 0.0),
+        baseline_energy=config.get("baseline_energy", 0.0),
     )
 
-    # -----------------------------------------------------------------
-    # AgentBeats-compatible output
-    # -----------------------------------------------------------------
+    collector = DockerMetricsCollector()
 
-    result_bundle = {
+    all_results: List[Dict[str, Any]] = []
+
+    # -----------------------------
+    # Execute queries
+    # -----------------------------
+
+    for query in queries:
+        streamer.emit("query_start", {"query_id": query.get("id")})
+
+        record = run_single_query(
+            runtime=runtime,
+            query=query,
+            overhead=overhead,
+            collector=collector,
+        )
+
+        all_results.append(record)
+
+        streamer.emit("query_end", record)
+
+        if not within_budget(all_results, budget):
+            print("⚠️ Budget exceeded — stopping early.")
+            break
+
+    runtime.finalize()
+
+    # -----------------------------
+    # Pareto aggregation (offline)
+    # -----------------------------
+
+    pareto = ParetoAnalyzer()
+    frontier = pareto.pareto_frontier(all_results)
+
+    # -----------------------------
+    # AgentBeats output bundle
+    # -----------------------------
+
+    output = {
         "framework": framework,
-        "queries": queries,          # MUST be array
-        "results": all_metrics,
+        "queries": queries,            # REQUIRED ARRAY
+        "results": all_results,
         "pareto_frontier": frontier,
-        "leaderboard": leaderboard,
     }
 
     with open(args.output, "w") as f:
-        json.dump(result_bundle, f, indent=2)
+        json.dump(output, f, indent=2)
 
-    print(f"✅ Results written to {args.output}")
-    print("🏁 Pareto frontier size:", len(frontier))
+    print(f"✅ AgentBeats results written to {args.output}")
+    print(f"🏁 Pareto frontier size: {len(frontier)}")
 
 
-# ---------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------
+# =====================================================
+# Entrypoint
+# =====================================================
 
 if __name__ == "__main__":
     main()
