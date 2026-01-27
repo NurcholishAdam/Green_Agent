@@ -1,45 +1,60 @@
 # src/analysis/langchain_runtime.py
 
 from typing import Dict, Any
-
 from .runtime_adapter import AgentRuntime
+
+
+class ToolCallCounter:
+    """
+    LangChain callback handler to count tool calls.
+    """
+
+    def __init__(self):
+        self.count = 0
+
+    def on_tool_start(self, *args, **kwargs):
+        self.count += 1
 
 
 class LangChainRuntime(AgentRuntime):
     """
-    Adapter for LangChain chains / runnables.
-
-    This module is OPTIONAL.
-    LangChain is imported lazily to avoid hard dependency.
+    Adapter for LangChain chains with tool-call counting.
     """
 
     def init(self, config: Dict[str, Any]) -> None:
         try:
-            from langchain_core.runnables import Runnable
+            from langchain_core.callbacks import BaseCallbackManager
         except ImportError:
             raise RuntimeError(
-                "LangChain is not installed. "
-                "Install with `pip install langchain` to use LangChainRuntime."
+                "LangChain not installed. "
+                "pip install langchain"
             )
 
         self.chain = config.get("chain")
         if self.chain is None:
             raise ValueError("LangChainRuntime requires `chain` in config")
 
+        self.counter = ToolCallCounter()
+
+        # Attach callback if supported
+        if hasattr(self.chain, "callbacks"):
+            self.chain.callbacks.append(self.counter)
+
     def run(self, query: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Executes one LangChain invocation.
-        """
         input_data = query.get("input")
 
-        result = self.chain.invoke(input_data)
+        output = self.chain.invoke(input_data)
 
-        # Accuracy must be user-defined or proxy-based
-        accuracy = query.get("expected") == result if "expected" in query else 0.0
+        accuracy = (
+            query.get("expected") == output
+            if "expected" in query
+            else 0.0
+        )
 
         return {
-            "output": result,
+            "output": output,
             "accuracy": float(accuracy),
+            "tool_calls": self.counter.count,
         }
 
     def finalize(self) -> None:
