@@ -48,4 +48,4 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ghcr.io/${{ github.nurcholishadam }}/green_agent:main
+            ghcr.io/${{ github.repository_owner }}/green_agent:main
