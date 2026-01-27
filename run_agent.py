@@ -21,6 +21,7 @@ from src.analysis.carbon_estimator import CarbonEstimator
 from src.reporting.leaderboard import generate_leaderboard
 from src.visualization.plot_pareto import plot_pareto_frontier
 
+from src.analysis.streaming import MetricsStreamer
 
 # ---------------------------------------------------------------------
 # Runtime factory
@@ -100,6 +101,7 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", default="agentbeats_results.json")
     args = parser.parse_args()
+    streamer = MetricsStreamer(enabled=True)
 
     with open(args.config) as f:
         config = json.load(f)
@@ -122,6 +124,7 @@ def main():
     all_metrics: List[Dict] = []
 
     for query in queries:
+        streamer.emit("query_start", {"query_id": query["id"]})
         metrics = run_single_query(runtime, query, overhead)
         all_metrics.append(metrics)
 
@@ -129,7 +132,8 @@ def main():
         if not within_budget(all_metrics, budget):
             print("⚠️ Budget exceeded — stopping remaining queries.")
             break
-
+    
+    streamer.emit("query_end", metrics)
     runtime.finalize()
 
     # -----------------------------------------------------------------
