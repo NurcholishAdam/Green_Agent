@@ -2,28 +2,25 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System dependencies
+# System deps
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Python dependencies
+# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy benchmarking code
+# Source
 COPY quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src ./src
-COPY agent_card.toml .
-COPY docker_metrics_collector.py .
 COPY run_agent.py .
+COPY docker_metrics_collector.py .
+COPY agentbeats.json .
 
-# Environment
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Allow cgroup metrics
 VOLUME ["/sys/fs/cgroup"]
 
-# Single-shot benchmark execution
 CMD ["python", "run_agent.py"]
