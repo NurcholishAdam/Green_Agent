@@ -1,30 +1,39 @@
-agent_name: GreenAgent
-description: >
-  Pareto-optimized green benchmarking agent measuring
-  energy, carbon, latency, memory, and framework overhead.
-
-image: ghcr.io/nurcholishadam/green_agent:latest
-
-queries:
-  - id: low-energy
-    command:
-      - python
-      - run_agent.py
-    environment:
-      QUERY_MODE: low_energy
-      MAX_ENERGY_WH: "0.03"
-
-  - id: balanced
-    command:
-      - python
-      - run_agent.py
-    environment:
-      QUERY_MODE: balanced
-      MAX_ENERGY_WH: "0.06"
-
-  - id: high-accuracy
-    command:
-      - python
-      - run_agent.py
-    environment:
-      QUERY_MODE: high_accuracy
+{
+  "agent_name": "GreenAgent",
+  "description": "Pareto-optimized green benchmarking agent measuring accuracy, energy, carbon, latency, memory, and framework overhead.",
+  "image": "ghcr.io/nurcholishadam/green_agent:latest",
+  "queries": [
+    {
+      "id": "low-energy",
+      "command": [
+        "python",
+        "run_agent.py"
+      ],
+      "environment": {
+        "QUERY_MODE": "low_energy",
+        "MAX_ENERGY_WH": "0.03"
+      }
+    },
+    {
+      "id": "balanced",
+      "command": [
+        "python",
+        "run_agent.py"
+      ],
+      "environment": {
+        "QUERY_MODE": "balanced",
+        "MAX_ENERGY_WH": "0.06"
+      }
+    },
+    {
+      "id": "high-accuracy",
+      "command": [
+        "python",
+        "run_agent.py"
+      ],
+      "environment": {
+        "QUERY_MODE": "high_accuracy"
+      }
+    }
+  ]
+}
