@@ -1,35 +1,30 @@
 {
-  "name": "GreenAgent",
-  "description": "Pareto-optimized green benchmarking agent with multi-objective evaluation",
-  tags: |
-  ghcr.io/nurcholishadam/green_agent:main
-  ghcr.io/nurcholishadam/green_agent:latest,
-  "entrypoint": [
-    "python",
-    "run_agent.py"
-  ],
-  "args": [
-    "--config",
-    "config.json"
-  ],
+  "agent_name": "GreenAgent",
+  "description": "Pareto-optimized green benchmarking agent",
+  "image": "ghcr.io/nurcholishadam/green_agent:main",
   "queries": [
     {
       "id": "low-energy",
-      "prompt": "Summarize green AI techniques with minimal energy usage.",
-      "budget": {
-        "max_energy": 0.03
+      "command": ["python", "run_agent.py"],
+      "environment": {
+        "QUERY_MODE": "low_energy",
+        "MAX_ENERGY_WH": "0.03"
       }
     },
     {
       "id": "balanced",
-      "prompt": "Explain Pareto efficiency in green AI benchmarking.",
-      "budget": {
-        "max_energy": 0.06
+      "command": ["python", "run_agent.py"],
+      "environment": {
+        "QUERY_MODE": "balanced",
+        "MAX_ENERGY_WH": "0.06"
       }
     },
     {
       "id": "high-accuracy",
-      "prompt": "Provide a detailed technical explanation of carbon-aware AI systems."
+      "command": ["python", "run_agent.py"],
+      "environment": {
+        "QUERY_MODE": "high_accuracy"
+      }
     }
   ]
 }
