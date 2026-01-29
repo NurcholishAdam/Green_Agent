@@ -1,7 +1,7 @@
 {
   "agent_name": "GreenAgent",
   "description": "Pareto-optimized green benchmarking agent with chaos testing",
-  "image": "ghcr.io/nurcholishadam/green_agent:main",
+  "image": "ghcr.io/nurcholishadam/green-agent:main",
   "queries": [
     {
       "id": "low-energy",
