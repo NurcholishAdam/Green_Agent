@@ -16,3 +16,6 @@
       echo "❌ No agentbeats.json or agentbeats.yml found at repo root"
       exit 1
     fi
+
+- run: python scripts/validate_agentbeats.py
+
