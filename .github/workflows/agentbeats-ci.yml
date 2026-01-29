@@ -69,12 +69,12 @@ jobs:
           push: true
           no-cache: true
           tags: |
-            ghcr.io/nurcholishadam/green_agent:main
-            ghcr.io/nurcholishadam/green_agent:latest
+            ghcr.io/nurcholishadam/green-agent:main
+            ghcr.io/nurcholishadam/green-agent:latest
 
       # -------------------------------
       # Verify manifest (CRITICAL)
       # -------------------------------
       - name: Verify image manifest
         run: |
-          docker manifest inspect ghcr.io/nurcholishadam/green_agent:main
+          docker manifest inspect ghcr.io/nurcholishadam/green-agent:main
