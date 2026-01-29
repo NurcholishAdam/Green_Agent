@@ -1,0 +1,102 @@
+name: Build & Publish GreenAgent (AgentBeats-safe)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/nurcholishadam/green_agent
+  IMAGE_TAG: main
+
+jobs:
+  build-guard-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------
+      # 1. Checkout repository
+      # -------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------
+      # 2. Validate agentbeats.json schema (basic)
+      # -------------------------------------------------
+      - name: Validate agentbeats.json syntax
+        run: |
+          jq . agentbeats.json > /dev/null
+
+      # -------------------------------------------------
+      # 3. Guard: image name + tag mismatch prevention
+      # -------------------------------------------------
+      - name: Guard AgentBeats image reference
+        run: |
+          IMAGE_IN_JSON=$(jq -r '.image' agentbeats.json)
+          EXPECTED_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "AgentBeats image: $IMAGE_IN_JSON"
+          echo "Expected image:   $EXPECTED_IMAGE"
+
+          if [ "$IMAGE_IN_JSON" != "$EXPECTED_IMAGE" ]; then
+            echo "❌ Image mismatch detected"
+            exit 1
+          fi
+
+      # -------------------------------------------------
+      # 4. Lowercase enforcement (GHCR hard rule)
+      # -------------------------------------------------
+      - name: Enforce lowercase image name
+        run: |
+          if echo "${IMAGE_NAME}" | grep -q '[A-Z]'; then
+            echo "❌ Image name must be lowercase"
+            exit 1
+          fi
+
+      # -------------------------------------------------
+      # 5. Log in to GitHub Container Registry
+      # -------------------------------------------------
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -------------------------------------------------
+      # 6. Build & push Docker image
+      # -------------------------------------------------
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.benchmark
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      # -------------------------------------------------
+      # 7. Verify image manifest exists (pull simulation)
+      # -------------------------------------------------
+      - name: Verify image manifest
+        run: |
+          docker manifest inspect ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      # -------------------------------------------------
+      # 8. One-line AgentBeats simulation (smoke test)
+      # -------------------------------------------------
+      - name: AgentBeats local simulation
+        run: |
+          docker run --rm \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            python run_agent.py --help
+
+      # -------------------------------------------------
+      # 9. Final success marker
+      # -------------------------------------------------
+      - name: CI completed successfully
+        run: echo "✅ AgentBeats-ready image published"
