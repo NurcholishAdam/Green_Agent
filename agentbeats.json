@@ -3,7 +3,10 @@
   "queries": [
     {
       "id": "low-energy",
-      "command": ["python", "run_agent.py"],
+      "command": [
+        "python",
+        "run_agent.py"
+      ],
       "environment": {
         "QUERY_MODE": "low_energy",
         "MAX_ENERGY_WH": "0.03"
@@ -11,7 +14,10 @@
     },
     {
       "id": "balanced",
-      "command": ["python", "run_agent.py"],
+      "command": [
+        "python",
+        "run_agent.py"
+      ],
       "environment": {
         "QUERY_MODE": "balanced",
         "MAX_ENERGY_WH": "0.06"
@@ -19,7 +25,10 @@
     },
     {
       "id": "high-accuracy",
-      "command": ["python", "run_agent.py"],
+      "command": [
+        "python",
+        "run_agent.py"
+      ],
       "environment": {
         "QUERY_MODE": "high_accuracy"
       }
