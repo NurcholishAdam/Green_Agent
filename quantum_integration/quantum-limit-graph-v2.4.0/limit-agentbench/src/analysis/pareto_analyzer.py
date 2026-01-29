@@ -1,43 +1,28 @@
-"""
-pareto_analyzer.py
-
-Multi-objective Pareto frontier computation for green benchmarking
-and framework overhead comparison.
-
-AgentBeats-safe:
-- Deterministic
-- No I/O
-- No external dependencies
-"""
+# src/analysis/pareto_analyzer.py
 
 from dataclasses import dataclass
-from typing import Dict, List, Iterable
+from typing import Dict, List, Any
 
 
 # ---------------------------------------------------------------------
-# Data model
+# Pareto point representation
 # ---------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ParetoPoint:
     """
-    Represents a single evaluation result in multi-objective space.
-
-    Conventions:
-    - Lower is better (minimize):
-        energy
-        carbon
-        latency
-        memory
-        framework_overhead_latency
-        framework_overhead_energy
-        tool_calls
-        conversation_depth
-
-    - Higher is better (maximize):
-        accuracy
+    A single evaluation point used for Pareto comparison.
+    Lower is better for all metrics.
     """
-    metrics: Dict[str, float]
+    energy: float
+    carbon: float
+    latency: float
+    memory: float
+    framework_overhead_latency: float
+    framework_overhead_energy: float
+    tool_calls: int
+    conversation_depth: int
+    raw: Dict[str, Any]
 
 
 # ---------------------------------------------------------------------
@@ -46,108 +31,96 @@ class ParetoPoint:
 
 class ParetoFrontierAnalyzer:
     """
-    Computes Pareto-optimal results across multiple objectives.
+    Computes a Pareto frontier where ALL metrics are minimized.
     """
 
-    def __init__(
-        self,
-        minimize: Iterable[str] = None,
-        maximize: Iterable[str] = None,
-    ):
-        # Default minimization objectives
-        self.minimize = list(minimize) if minimize is not None else [
-            "energy",
-            "carbon",
-            "latency",
-            "memory",
-            "framework_overhead_latency",
-            "framework_overhead_energy",
-            "tool_calls",
-            "conversation_depth",
-        ]
+    METRICS = [
+        "energy",
+        "carbon",
+        "latency",
+        "memory",
+        "framework_overhead_latency",
+        "framework_overhead_energy",
+        "tool_calls",
+        "conversation_depth",
+    ]
 
-        # Default maximization objectives
-        self.maximize = list(maximize) if maximize is not None else [
-            "accuracy",
-        ]
+    def _to_point(self, metrics: Dict[str, Any]) -> ParetoPoint:
+        """
+        Convert a raw metrics dict into a ParetoPoint.
+        Missing metrics default to 0 (AgentBeats-safe).
+        """
+        return ParetoPoint(
+            energy=float(metrics.get("energy", 0.0)),
+            carbon=float(metrics.get("carbon", 0.0)),
+            latency=float(metrics.get("latency", 0.0)),
+            memory=float(metrics.get("memory", 0.0)),
+            framework_overhead_latency=float(
+                metrics.get("framework_overhead_latency", 0.0)
+            ),
+            framework_overhead_energy=float(
+                metrics.get("framework_overhead_energy", 0.0)
+            ),
+            tool_calls=int(metrics.get("tool_calls", 0)),
+            conversation_depth=int(metrics.get("conversation_depth", 0)),
+            raw=metrics,
+        )
 
-    # -----------------------------------------------------------------
-    # Dominance logic
-    # -----------------------------------------------------------------
-
-    def dominates(self, a: ParetoPoint, b: ParetoPoint) -> bool:
+    def _dominates(self, a: ParetoPoint, b: ParetoPoint) -> bool:
         """
         Returns True if point `a` Pareto-dominates point `b`.
-
-        Dominance definition:
-        - a is no worse than b in all objectives
-        - a is strictly better in at least one objective
         """
+        better_or_equal = True
         strictly_better = False
 
-        # ---- Minimize objectives ----
-        for key in self.minimize:
-            if key not in a.metrics or key not in b.metrics:
-                continue
+        for field in self.METRICS:
+            av = getattr(a, field)
+            bv = getattr(b, field)
 
-            if a.metrics[key] > b.metrics[key]:
-                return False
-            if a.metrics[key] < b.metrics[key]:
+            if av > bv:
+                better_or_equal = False
+                break
+            if av < bv:
                 strictly_better = True
 
-        # ---- Maximize objectives ----
-        for key in self.maximize:
-            if key not in a.metrics or key not in b.metrics:
-                continue
+        return better_or_equal and strictly_better
 
-            if a.metrics[key] < b.metrics[key]:
-                return False
-            if a.metrics[key] > b.metrics[key]:
-                strictly_better = True
-
-        return strictly_better
-
-    # -----------------------------------------------------------------
-    # Frontier computation
-    # -----------------------------------------------------------------
-
-    def compute(self, results: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    def pareto_frontier(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Computes the Pareto frontier from raw result dictionaries.
-
-        Parameters
-        ----------
-        results : List[Dict[str, float]]
-            List of agent evaluation result dictionaries.
-
-        Returns
-        -------
-        List[Dict[str, float]]
-            Pareto-optimal subset of results.
+        Compute Pareto frontier from raw metrics dicts.
+        Returns the ORIGINAL dicts (AgentBeats-compatible).
         """
-        points = [ParetoPoint(r) for r in results]
+        points = [self._to_point(r) for r in results]
         frontier: List[ParetoPoint] = []
 
         for candidate in points:
             dominated = False
-            for other in points:
-                if other is candidate:
-                    continue
-                if self.dominates(other, candidate):
+            to_remove: List[ParetoPoint] = []
+
+            for existing in frontier:
+                if self._dominates(existing, candidate):
                     dominated = True
                     break
+                if self._dominates(candidate, existing):
+                    to_remove.append(existing)
 
             if not dominated:
+                for r in to_remove:
+                    frontier.remove(r)
                 frontier.append(candidate)
 
-        return [p.metrics for p in frontier]
+        return [p.raw for p in frontier]
 
-    # -----------------------------------------------------------------
-    # Backward compatibility alias
-    # -----------------------------------------------------------------
 
-    def pareto_frontier(self, results: List[Dict[str, float]]) -> List[Dict[str, float]]:
-        """
-        Alias for compute(), kept for compatibility with earlier code.
-        """
-        return self.compute(results)
+# ---------------------------------------------------------------------
+# Backward-compatible public API (CRITICAL)
+# ---------------------------------------------------------------------
+
+class ParetoAnalyzer(ParetoFrontierAnalyzer):
+    """
+    Compatibility alias.
+
+    run_agent.py and AgentBeats reviewers expect `ParetoAnalyzer`.
+    This class intentionally adds no behavior.
+    """
+    pass
