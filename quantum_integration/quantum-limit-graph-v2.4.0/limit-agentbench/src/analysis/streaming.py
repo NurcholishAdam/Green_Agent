@@ -14,8 +14,10 @@ class MetricsStreamer:
             return
 
         msg = {
+            "type": "heartbeat",
             "event": event,
             "timestamp": time.time(),
-            "payload": payload
+            "payload": payload,
+
         }
         print(json.dumps(msg), file=sys.stdout, flush=True)
