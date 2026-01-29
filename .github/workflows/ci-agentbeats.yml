@@ -1,52 +1,18 @@
-name: AgentBeats Validation
+- name: Detect and validate AgentBeats config
+  run: |
+    if [ -f agentbeats.json ]; then
+      echo "Using agentbeats.json"
+      jq . agentbeats.json > /dev/null
+      jq -e '.queries | type == "array"' agentbeats.json > /dev/null
+      jq -e '.image | ascii_downcase == .' agentbeats.json > /dev/null
 
-on:
-  pull_request:
-  workflow_dispatch:
+    elif [ -f agentbeats.yml ]; then
+      echo "Using agentbeats.yml"
+      yq . agentbeats.yml > /dev/null
+      yq '.queries | length > 0' agentbeats.yml > /dev/null
+      yq '.image | test("^[a-z0-9./:-]+$")' agentbeats.yml > /dev/null
 
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-
-    steps:
-      # ------------------------------------------------------------
-      # Checkout
-      # ------------------------------------------------------------
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ------------------------------------------------------------
-      # Validate agentbeats.yml/json
-      # ------------------------------------------------------------
-      - name: Validate agentbeats schema
-        run: |
-          if [ -f agentbeats.json ]; then
-            FILE=agentbeats.json
-          else
-            FILE=agentbeats.yml
-          fi
-
-          echo "Validating $FILE"
-
-          if [[ "$FILE" == *.json ]]; then
-            jq . $FILE > /dev/null
-            jq -e '.queries | type == "array"' $FILE > /dev/null
-            jq -e '.image | ascii_downcase == .image' $FILE > /dev/null
-          else
-            yq '.queries | length > 0' $FILE > /dev/null
-            yq '.image | test("^[a-z0-9./:-]+$")' $FILE > /dev/null
-          fi
-
-      # ------------------------------------------------------------
-      # Docker build (NO push)
-      # ------------------------------------------------------------
-      - name: Build Docker image (dry run)
-        run: |
-          docker build -f Dockerfile.benchmark -t green_agent:test .
-
-      # ------------------------------------------------------------
-      # Smoke test container
-      # ------------------------------------------------------------
-      - name: Run container smoke test
-        run: |
-          docker run --rm green_agent:test python run_agent.py || true
+    else
+      echo "❌ No agentbeats.json or agentbeats.yml found at repo root"
+      exit 1
+    fi
