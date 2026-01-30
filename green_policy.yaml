@@ -3,7 +3,7 @@ version: "1.0"
 agent_identity:
   name: "Green-Auditor-Alpha"
   role: "ESG_Compliance_Monitor"
-  mode: "active_enforcement"   # passive_log | active_enforcement
+  mode: "active_enforcement"
 
 constraints:
   max_energy_per_task_wh: 5.0
@@ -15,7 +15,7 @@ carbon_context:
   region: "US-West-2"
   grid_intensity_g_kwh: 385.0
   pue_factor: 1.2
-  use_offset_logic: true
+  use_offset_logic: false
 
 optimization:
   priority_weight:
@@ -27,5 +27,3 @@ optimization:
 reporting:
   alert_threshold_energy_pct: 80
   output_format: "json_detailed"
-  export_to_cloud: false
-  webhook_url: ""
