@@ -1,40 +1,30 @@
-from typing import Dict, List
-
+# src/analysis/pareto_analyzer.py
+from typing import List, Dict
 
 class ParetoAnalyzer:
-    COSTS = [
-        "energy",
-        "carbon",
-        "latency",
-        "memory",
-        "framework_overhead_latency",
-        "framework_overhead_energy",
-        "tool_calls",
-        "conversation_depth",
-    ]
+    def pareto_frontier(self, points: List[Dict]) -> List[Dict]:
+        frontier = []
 
-    BENEFITS = ["accuracy"]
+        for p in points:
+            dominated = False
+            for q in points:
+                if self._dominates(q, p):
+                    dominated = True
+                    break
+            if not dominated:
+                frontier.append(p)
 
-    def dominates(self, a: Dict, b: Dict) -> bool:
-        no_worse = True
-        better = False
+        return frontier
 
-        for k in self.COSTS:
-            if a[k] > b[k]:
-                no_worse = False
-            elif a[k] < b[k]:
-                better = True
-
-        for k in self.BENEFITS:
-            if a[k] < b[k]:
-                no_worse = False
-            elif a[k] > b[k]:
-                better = True
-
-        return no_worse and better
-
-    def pareto_frontier(self, data: List[Dict]) -> List[Dict]:
-        return [
-            p for p in data
-            if not any(self.dominates(q, p) for q in data if q is not p)
-        ]
+    def _dominates(self, a: Dict, b: Dict) -> bool:
+        return (
+            a["accuracy"] >= b["accuracy"]
+            and a["energy"] + a.get("framework_overhead_energy", 0)
+               <= b["energy"] + b.get("framework_overhead_energy", 0)
+            and a["latency"] + a.get("framework_overhead_latency", 0)
+               <= b["latency"] + b.get("framework_overhead_latency", 0)
+            and (
+                a["accuracy"] > b["accuracy"]
+                or a["energy"] < b["energy"]
+            )
+        )
