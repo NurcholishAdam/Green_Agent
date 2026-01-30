@@ -1,7 +1,7 @@
 {
   "agent_name": "GreenAgent",
-  "description": "Pareto-optimized green benchmarking agent with chaos testing",
-  "image": "ghcr.io/nurcholishadam/green-agent:main",
+  "description": "Minimal green benchmarking agent",
+  "image": "ghcr.io/nurcholishadam/green-agent:latest",
   "queries": [
     {
       "id": "low-energy",
@@ -16,14 +16,15 @@
       "command": ["python", "run_agent.py"],
       "environment": {
         "QUERY_MODE": "balanced",
-        "MAX_ENERGY_WH": "0.06"
+        "MAX_ENERGY_WH": "0.05"
       }
     },
     {
       "id": "high-accuracy",
       "command": ["python", "run_agent.py"],
       "environment": {
-        "QUERY_MODE": "high_accuracy"
+        "QUERY_MODE": "high_accuracy",
+        "MAX_ENERGY_WH": "0.08"
       }
     }
   ]
