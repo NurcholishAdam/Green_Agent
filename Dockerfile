@@ -1,37 +1,11 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# --------------------------------------------------
-# System dependencies
-# --------------------------------------------------
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
-# --------------------------------------------------
-# Working directory
-# --------------------------------------------------
 WORKDIR /app
 
-# --------------------------------------------------
-# Python dependencies
-# --------------------------------------------------
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --------------------------------------------------
-# Copy full repo (IMPORTANT)
-# --------------------------------------------------
-COPY . .
+COPY run_agent.py .
+COPY agentbeats.json .
 
-# --------------------------------------------------
-# Runtime environment
-# --------------------------------------------------
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
-
-# --------------------------------------------------
-# Default execution
-# --------------------------------------------------
-CMD ["python", "run_agent.py", "--config", "config.json"]
+ENTRYPOINT ["python", "run_agent.py"]
