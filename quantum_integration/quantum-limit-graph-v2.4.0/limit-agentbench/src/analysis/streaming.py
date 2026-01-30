@@ -1,23 +1,14 @@
-# src/analysis/streaming.py
-
-import json
-import sys
 import time
-from typing import Dict
+import json
+
 
 class MetricsStreamer:
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
+    def __init__(self, interval=5):
+        self.interval = interval
+        self.last = time.time()
 
-    def emit(self, event: str, payload: Dict):
-        if not self.enabled:
-            return
-
-        msg = {
-            "type": "heartbeat",
-            "event": event,
-            "timestamp": time.time(),
-            "payload": payload,
-
-        }
-        print(json.dumps(msg), file=sys.stdout, flush=True)
+    def heartbeat(self, payload):
+        now = time.time()
+        if now - self.last >= self.interval:
+            print("[HEARTBEAT]", json.dumps(payload))
+            self.last = now
