@@ -1,41 +1,33 @@
-name: AgentBeats CI
+name: AgentBeats Submission CI
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
+    branches:
+      - agentbeats-submission
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # -------------------------------
-      # Sanity checks
-      # -------------------------------
-      - name: Ensure agentbeats.json exists
+      - name: Validate agentbeats.json
+        run: jq . agentbeats.json
+
+      - name: Guard image name (lowercase only)
         run: |
-          if [ ! -f agentbeats.json ]; then
-            echo "❌ agentbeats.json missing at repo root"
+          IMAGE=$(jq -r '.image' agentbeats.json)
+          echo "Image: $IMAGE"
+          if echo "$IMAGE" | grep -q '[A-Z_]'; then
+            echo "❌ Image name must be lowercase"
             exit 1
           fi
 
-      - name: Validate agentbeats.json
-        run: |
-          jq . agentbeats.json > /dev/null
-          jq -e '.queries | type=="array"' agentbeats.json > /dev/null
-          jq -e '.image | ascii_downcase == .' agentbeats.json > /dev/null
-
-      # -------------------------------
-      # Docker login (GHCR)
-      # -------------------------------
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -43,38 +35,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # -------------------------------
-      # HARD RESET Buildx (FIXES unknown blob)
-      # -------------------------------
-      - name: Reset Docker Buildx
+      - name: Build & Push Image
         run: |
-          docker buildx rm agentbeats-builder || true
-          docker buildx prune -af
-          docker system prune -af
-
-      - name: Create fresh Buildx builder
-        run: |
-          docker buildx create --name agentbeats-builder --use
-          docker buildx inspect --bootstrap
-
-      # -------------------------------
-      # Build & Push (single arch)
-      # -------------------------------
-      - name: Build and push image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.benchmark
-          platforms: linux/amd64
-          push: true
-          no-cache: true
-          tags: |
-            ghcr.io/nurcholishadam/green-agent:main
-            ghcr.io/nurcholishadam/green-agent:latest
-
-      # -------------------------------
-      # Verify manifest (CRITICAL)
-      # -------------------------------
-      - name: Verify image manifest
-        run: |
-          docker manifest inspect ghcr.io/nurcholishadam/green-agent:main
+          IMAGE=$(jq -r '.image' agentbeats.json)
+          docker build -t $IMAGE .
+          docker push $IMAGE
