@@ -371,7 +371,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## 👤 Author
 
 **Nurcholish Adam**
+
 **nurcholishadam@gmail.com**
+
 **github.com/nurcholishadam**
 
 ---
