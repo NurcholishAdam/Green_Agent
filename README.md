@@ -1,147 +1,200 @@
-# Green Agent — Pareto-Optimized Green Benchmarking
+---
 
-This repository implements **Green Agent**, a research-grade, green-first agent benchmarking system designed for **AgentBeats**. The architecture emphasizes **multi-objective evaluation** (accuracy, energy, carbon, latency, memory) using **Pareto optimization**, **budget-aware execution**, and **container-native measurement**.
+# 🌱 Green_Agent
 
-> **Core idea**: *Do not collapse green metrics too early.* We preserve full multi-dimensional measurements and only aggregate via Pareto frontiers or optional scalar scores.
+Green_Agent is a **resource-aware evaluation agent** for assessing autonomous agents under performance, efficiency, and sustainability constraints.
+It observes agent execution, collects multi-dimensional metrics, and evaluates outcomes using **Pareto-based analysis** rather than single-score aggregation.
 
 ---
 
-## 🧭 High-Level Architecture
+## 🧠 System Architecture
+
+### High-Level Architecture (ASCII)
 
 ```
-Docker Container (single-shot)
-│
-├── run_agent.py               # Entry point (AgentBeats-compatible)
-├── docker_metrics_collector.py
-│
-└── src/
-    ├── analysis/              # Pareto + scoring logic
-    ├── constraints/           # Energy / carbon budgets
-    ├── feedback/              # Human-readable green feedback
-    ├── reporting/             # AgentBeats artifacts (offline)
-    ├── visualization/         # Leaderboard & Pareto plots (offline)
-    └── rlhf/                   # Optional green-aware reward shaping
+┌──────────────────────────────────────────────┐
+│              Container Runtime               │
+│                                              │
+│  ┌─────────────┐        ┌─────────────────┐ │
+│  │ Purple Agent│──────▶ │  Execution Loop │ │
+│  │ (Assessee)  │        │  (run_agent.py) │ │
+│  └─────────────┘        └────────┬────────┘ │
+│                                   │          │
+│                                   ▼          │
+│        ┌──────────── Metrics Collection ────────────┐
+│        │ latency | energy | carbon | memory | tools │
+│        └───────────────┬────────────────────────────┘
+│                        ▼
+│               ┌─────────────────┐
+│               │ Budget / Chaos  │
+│               │ Enforcement     │
+│               └────────┬────────┘
+│                        ▼
+│               ┌─────────────────┐
+│               │ Pareto Analyzer │
+│               └────────┬────────┘
+│                        ▼
+│        ┌──────────────────────────────────┐
+│        │ Reports / Leaderboards / Feedback│
+│        └──────────────────────────────────┘
+└──────────────────────────────────────────────┘
 ```
 
-**Design principles**:
+---
 
-* Single container run = single benchmark datapoint
-* All metrics measured *inside Docker*
-* Pareto-first, scalar scores optional
-* AgentBeats orchestrates queries, not the agent
+### Logical Data Flow (Mermaid)
+
+```mermaid
+flowchart TD
+    A[Purple Agent] --> B[run_agent.py]
+    B --> C[Metrics Collector]
+    C --> D[Budget + Chaos Checks]
+    D --> E[Pareto Analyzer]
+    E --> F[Policy Reporter]
+    E --> G[Policy Feedback]
+```
 
 ---
 
-## ⚙️ Runtime Flow (Single Query)
+## 🔁 Execution Lifecycle
 
-1. **AgentBeats launches container** with environment variables
-2. `run_agent.py` executes exactly once
-3. Agent inference runs under measurement
-4. Metrics collected:
-
-   * Accuracy
-   * Latency + variance
-   * CPU-based energy (Wh)
-   * Carbon (kg CO₂)
-   * Peak memory (MB)
-5. Energy / carbon constraints applied
-6. JSON emitted to STDOUT
+1. Runtime initializes execution context
+2. Purple agent begins execution
+3. Metrics are streamed continuously
+4. Budgets are checked on every step
+5. Chaos module may inject failures
+6. Execution terminates (success or enforced)
+7. Metrics are normalized and evaluated
+8. Pareto frontier and reports are generated
 
 ---
 
-## 📦 Key Modules (What Was Added / Extended)
+## 🗂 Core Modules (with Docstrings)
 
-### 1️⃣ `docker_metrics_collector.py`
-
-Collects green metrics from inside Docker:
-
-* cgroup v1/v2 memory
-* process CPU time
-* energy estimation via CPU TDP
-* carbon via configurable intensity
-
-This ensures **reproducible, container-native measurements**.
+Below are **module-level docstrings** you can paste directly into each file.
 
 ---
 
-### 2️⃣ Constraints (`src/constraints/energy_budget.py`)
+### `run_agent.py`
 
-Applies **hard budgets**:
+```python
+"""
+run_agent.py
 
-* `MAX_ENERGY_WH`
-* `MAX_CARBON_KG`
+Main execution entrypoint for Green_Agent.
 
-If violated, the run is marked as rejected — no silent failures.
+Responsibilities:
+- Load execution policies and budgets
+- Initialize metric collectors
+- Execute purple (assessee) agents
+- Enforce resource constraints and termination rules
+- Emit structured evaluation results
 
----
-
-### 3️⃣ Analysis Layer
-
-#### • Pareto Optimization (`src/analysis/pareto.py`)
-
-* Multi-objective dominance checking
-* Supports accuracy ↑, energy ↓, latency ↓, carbon ↓
-* Used **offline** across AgentBeats outputs
-
-#### • Optional Scalar Score (`src/analysis/green_score.py`)
-
-* Weighted combination for convenience
-* Never replaces Pareto frontiers
-
----
-
-### 4️⃣ Feedback (`src/feedback/energy_feedback.py`)
-
-Generates **human-readable explanations**:
-
-* High energy usage
-* Latency risks
-* Memory pressure
-
-Useful for audits, papers, and debugging.
+Design principles:
+- Deterministic execution
+- Never crash (fail-safe guards)
+- Framework-agnostic
+- JSON-only outputs
+"""
+```
 
 ---
 
-### 5️⃣ RLHF Extension (`src/rlhf/green_reward.py`)
+### `pareto_analyzer.py`
 
-Optional module for **green-aware reward shaping**:
+```python
+"""
+pareto_analyzer.py
 
-* Penalizes energy & carbon during training
-* Not used during benchmarking
+Implements multi-objective evaluation using Pareto dominance.
+
+Responsibilities:
+- Define dominance across heterogeneous metrics
+- Compute Pareto frontiers
+- Compare agents without collapsing metrics into a single score
+
+Metrics supported:
+- Accuracy / task proxy
+- Latency
+- Energy
+- Carbon
+- Memory
+- Tool calls
+- Conversation depth
+- Framework overhead
+"""
+```
 
 ---
 
-### 6️⃣ Visualization (`src/visualization/`)
+### `chaos.py`
 
-Offline scripts for:
+```python
+"""
+chaos.py
 
-* Accuracy vs Energy (Pareto plot)
-* Latency vs Energy
-* Carbon vs Energy (pure green plot)
+Provides deterministic chaos and failure injection.
 
-These are **not executed in CI** and are reviewer-friendly.
+Responsibilities:
+- Simulate budget exhaustion
+- Force early termination
+- Validate evaluator behavior under stress
+- Test robustness against runaway agents
+
+Chaos scenarios are controlled and reproducible.
+"""
+```
 
 ---
 
-## 🚀 `run_agent.py` (Upgraded Entry Point)
+### `policy_reporter.py`
 
-The upgraded `run_agent.py`:
+```python
+"""
+policy_reporter.py
 
-* Is **single-shot** (AgentBeats-safe)
-* Reads configuration from environment variables
-* Executes exactly one operating mode per container
-* Emits schema-stable JSON
+Aggregates raw execution metrics into structured artifacts.
 
-### Supported modes
+Responsibilities:
+- Normalize metrics
+- Generate leaderboard-compatible outputs
+- Persist Pareto frontier results
+- Maintain schema stability for downstream consumers
+"""
+```
 
-* `low_energy`
-* `balanced`
-* `high_accuracy`
+---
 
-Selected via:
+### `policy_feedback.py`
 
-```bash
-QUERY_MODE=balanced
+```python
+"""
+policy_feedback.py
+
+Provides interpretability and diagnostics for evaluations.
+
+Responsibilities:
+- Explain why an agent passed or failed
+- Highlight budget violations
+- Summarize trade-offs between metrics
+- Generate human-readable feedback from raw scores
+"""
+```
+
+---
+
+### `green_policy.yml`
+
+```yaml
+# green_policy.yml
+# Declarative execution policy for Green_Agent
+#
+# Defines:
+# - Resource budgets (energy, latency, carbon)
+# - Execution profiles
+# - Termination conditions
+#
+# Policies are runtime-agnostic and framework-independent.
 ```
 
 ---
@@ -196,58 +249,139 @@ Docker image is published to **GHCR** and referenced by AgentBeats.
 
 ---
 
-## 🧪 Offline Analysis Workflow
 
-After AgentBeats runs:
+## 📊 Metrics Model
 
-1. Collect JSON outputs
-2. Aggregate with `pareto_front()`
-3. Rank with `leaderboard.py`
-4. Visualize using `visualization/leaderboard_plots.py`
+Metrics are intentionally **not collapsed**.
 
-This separation keeps benchmarking **clean and auditable**.
+### Categories
 
----
+* **Task Outcome**
 
-## 🟢 Why This Architecture Is Correct
+  * Accuracy or success proxy
+* **Efficiency**
 
-* ✅ Pareto-first (no metric hiding)
-* ✅ Budget-aware
-* ✅ Container-native metrics
-* ✅ AgentBeats-compliant
-* ✅ Extensible to quantum / RLHF settings
+  * Latency
+  * Energy
+  * Carbon
+  * Memory
+* **Behavior**
 
-This design is suitable for **leaderboards, papers, and long-term green AI research**.
+  * Tool calls
+  * Conversation depth
+* **Overhead**
 
----
+  * Framework-induced latency/energy
 
-## 📌 Next Possible Extensions
-
-* Cross-agent Pareto comparison
-* Region-aware carbon intensity
-* Memory-constrained queries
-* CSV / Parquet leaderboard export
+Pareto dominance is computed across these dimensions.
 
 ---
 
-License
+## ⚖️ Evaluation Philosophy
 
+* No single “winner”
+* Multiple agents may be optimal
+* Trade-offs are explicit and inspectable
+* Budget violations are first-class outcomes
+
+This prevents metric gaming and preserves interpretability.
+
+---
+
+## 🧱 Repository Layout
+
+```text
+.
+├── run_agent.py
+├── pareto_analyzer.py
+├── chaos.py
+├── policy_reporter.py
+├── policy_feedback.py
+├── green_policy.yml
+├── requirements.txt
+├── Dockerfile
+└── README.md
+```
+
+---
+
+## 🧑‍💻 Developer Onboarding Guide
+
+### 1️⃣ Understand the Core Loop
+
+Start with:
+
+* `run_agent.py` → execution + metrics
+* `pareto_analyzer.py` → evaluation logic
+
+Do **not** modify purple agent logic unless adding adapters.
+
+---
+
+### 2️⃣ Adding a New Metric
+
+1. Collect metric in `run_agent.py`
+2. Normalize it in `policy_reporter.py`
+3. Add it to dominance logic in `pareto_analyzer.py`
+4. Document it in `policy_feedback.py`
+
+---
+
+### 3️⃣ Adding a New Execution Policy
+
+1. Add profile to `green_policy.yml`
+2. Ensure budgets are enforced in `run_agent.py`
+3. Validate via chaos tests
+
+---
+
+### 4️⃣ Adding Framework Support
+
+* Wrap framework execution in `run_agent.py`
+* Measure overhead explicitly
+* Never hide framework costs
+
+---
+
+### 5️⃣ Testing Changes
+
+* Use deterministic purple agents
+* Validate monotonic metrics
+* Verify Pareto ordering manually
+
+---
+
+## 🧩 Extensibility Notes
+
+This architecture intentionally supports:
+
+* New metrics without refactoring
+* New dominance rules
+* Real hardware counters
+* Live dashboards
+* Enterprise policy enforcement
+
+All without breaking compatibility.
+
+---
+
+## License
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-👤 Author
-Nurcholis Adam
+## 👤 Author
 
-- GitHub: https://github.com/NurcholishAdam/
-- Email: nurcholisadam@gmail.com
+**Nurcholish Adam**
+**nurcholishadam@gmail.com**
+**github.com/nurcholishadam**
+
+---
 
 🙏 Acknowledgments
 
-- AgentBeats Team - Platform and A2A protocol
-- THUDM - AgentBench framework
-- Qiskit Team - Quantum computing toolkit
-- RDI Foundation - Green agent template
-- Quantum ML Community - QGNN research and implementations
+AgentBeats Team - Platform and A2A protocol
+THUDM - AgentBench framework
+Qiskit Team - Quantum computing toolkit
+RDI Foundation - Green agent template
+Quantum ML Community - QGNN research and implementations
 
-**Green Agent** is not just a benchmark runner — it is a **green evaluation framework**.
-
-🌱
+---
