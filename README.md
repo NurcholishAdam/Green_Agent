@@ -380,10 +380,15 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 🙏 Acknowledgments
 
-AgentBeats Team - Platform and A2A protocol
-THUDM - AgentBench framework
-Qiskit Team - Quantum computing toolkit
-RDI Foundation - Green agent template
-Quantum ML Community - QGNN research and implementations
-
+- AgentBeats Team 
+- Platform and A2A protocol
+- THUDM
+- AgentBench framework
+- Qiskit Team
+- Quantum computing toolkit
+- RDI Foundation
+- Green agent template
+- Quantum ML Community
+- QGNN research and implementations
+- AI Research Agent Team
 ---
