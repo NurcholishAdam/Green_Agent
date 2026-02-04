@@ -1,19 +1,21 @@
 """
-Reporting layer for policy and benchmark results.
+Policy reporting and alerting.
 """
 
-import json
-from typing import List, Dict
+from typing import Dict
 
 
 class PolicyReporter:
-    def write_json(self, path: str, data: List[Dict]) -> None:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+    def __init__(self, policy: Dict):
+        self.threshold = policy.get("reporting", {}).get(
+            "alert_threshold_energy_pct", 80
+        )
 
-    def emit_summary(self, results: List[Dict]) -> Dict:
-        return {
-            "total_runs": len(results),
-            "policy_pass_rate": sum(1 for r in results if r.get("policy_pass")) / max(len(results), 1),
-            "avg_energy_wh": sum(r.get("energy_wh", 0) for r in results) / max(len(results), 1),
-        }
+    def report(self, metrics: Dict) -> Dict:
+        alerts = []
+
+        if metrics.get("energy_pct", 0) >= self.threshold:
+            alerts.append("Energy budget nearing limit")
+
+        metrics["policy_alerts"] = alerts
+        return metrics
