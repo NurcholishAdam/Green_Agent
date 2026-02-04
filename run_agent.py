@@ -1,79 +1,38 @@
-"""
-Main AgentBeats-compatible entrypoint.
+from src.analysis.metric_provenance import MetricProvenance
+from src.policy.policy_engine import PolicyEngine
+from src.policy.policy_reporter import PolicyReporter
+from src.analysis.pareto_analyzer import ParetoAnalyzer
 
-This file is intentionally defensive:
-- Never raises uncaught exceptions
-- Always emits metrics
-"""
+# Load policy
+policy = config.get("green_policy", {})
+policy_engine = PolicyEngine(policy)
+policy_reporter = PolicyReporter(policy)
 
-import json
-import os
-import time
-import traceback
+provenance = MetricProvenance()
 
-from analysis.pareto_analyzer import ParetoAnalyzer
-from policy.policy_engine import PolicyEngine
-from policy.policy_reporter import PolicyReporter
-from chaos import inject_chaos
+# During metric collection
+latency = time.time() - start
+provenance.measured("latency")
 
+energy = energy_meter.joules()
+provenance.measured("energy")
 
-def safe_float(v, default=0.0):
-    try:
-        return float(v)
-    except Exception:
-        return default
+carbon = carbon_estimator.estimate(energy)
+provenance.estimated("carbon")
 
+metrics = provenance.attach(metrics)
+metrics = policy_reporter.report(metrics)
 
-def run_single_query(query_mode: str) -> dict:
-    start = time.time()
-
-    # --- Simulated metrics (replace with real hooks if needed)
-    metrics = {
-        "energy_wh": 0.04 if query_mode == "low_energy" else 0.07,
-        "carbon_kg": 0.0008,
-        "latency_s": time.time() - start,
-        "memory_mb": 120.0,
-        "framework_overhead_latency": 0.01,
-        "framework_overhead_energy": 0.005,
-        "tool_calls": 4,
-        "conversation_depth": 2,
-        "accuracy": 0.82 if query_mode != "low_energy" else 0.75,
-    }
-
-    return metrics
-
-
-def main():
-    results = []
-    policy = PolicyEngine("config/green_policy.yml")
-    reporter = PolicyReporter()
-    analyzer = ParetoAnalyzer()
-
-    query_mode = os.getenv("QUERY_MODE", "balanced")
-
-    try:
-        metrics = run_single_query(query_mode)
-        metrics = inject_chaos(metrics, enabled=True)
-        metrics = policy.enforce(metrics)
-        results.append(metrics)
-
-    except Exception:
-        results.append({
-            "error": "runtime_failure",
-            "trace": traceback.format_exc(),
-        })
-
-    pareto = analyzer.frontier(results)
-
-    reporter.write_json("results.json", results)
-    reporter.write_json("pareto.json", pareto)
-
-    print(json.dumps({
-        "status": "ok",
-        "runs": len(results),
-        "pareto_points": len(pareto)
-    }, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+# Pareto
+pareto = ParetoAnalyzer(
+    metrics=[
+        "energy",
+        "carbon",
+        "latency",
+        "framework_overhead_energy",
+        "tool_calls",
+        "conversation_depth",
+    ],
+    policy_engine=policy_engine,
+)
+frontier = pareto.pareto_frontier(all_metrics)
