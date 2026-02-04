@@ -1,12 +1,22 @@
+"""
+Chaos testing module.
+
+Used ONLY in evaluation mode, never production.
+"""
+
 import random
 
 
-class BudgetChaos:
-    def __init__(self, probability=0.15):
-        self.probability = probability
-
-    def inject(self, metrics):
-        if random.random() < self.probability:
-            metrics["energy"] *= 2.5
-            metrics["latency"] *= 2.0
+def inject_chaos(metrics: dict, enabled: bool = True) -> dict:
+    if not enabled:
         return metrics
+
+    if random.random() < 0.2:
+        metrics["energy_wh"] *= 1.3
+        metrics.setdefault("chaos_events", []).append("energy_spike")
+
+    if random.random() < 0.1:
+        metrics["latency_s"] *= 1.5
+        metrics.setdefault("chaos_events", []).append("latency_spike")
+
+    return metrics
