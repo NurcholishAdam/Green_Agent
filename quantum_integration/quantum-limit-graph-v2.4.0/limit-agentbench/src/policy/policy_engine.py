@@ -1,35 +1,42 @@
 """
-Green policy enforcement engine.
+Enterprise Green Policy Engine.
 
-Hard constraints = circuit breakers.
-Soft constraints = warnings.
+Applies hard constraints and weighted priorities.
 """
 
-import yaml
 from typing import Dict
 
 
 class PolicyEngine:
-    def __init__(self, policy_path: str):
-        with open(policy_path, "r") as f:
-            self.policy = yaml.safe_load(f)
+    def __init__(self, policy: Dict):
+        self.policy = policy
+        self.weights = policy.get("optimization", {}).get(
+            "priority_weight",
+            {"accuracy": 0.5, "sustainability": 0.5},
+        )
+        self.constraints = policy.get("constraints", {})
 
-    def enforce(self, metrics: Dict) -> Dict:
-        constraints = self.policy.get("constraints", {})
-        violations = []
+    def check_constraints(self, metrics: Dict) -> bool:
+        if metrics.get("energy", 0) > self.constraints.get("max_energy_per_task_wh", float("inf")):
+            return False
+        if metrics.get("carbon", 0) > self.constraints.get("max_carbon_per_task_kg", float("inf")):
+            return False
+        if metrics.get("latency", 0) > self.constraints.get("max_latency_seconds", float("inf")):
+            return False
+        return True
 
-        if metrics.get("energy_wh", 0) > constraints.get("max_energy_per_task_wh", float("inf")):
-            violations.append("energy_budget_exceeded")
+    def weighted_score(self, metrics: Dict) -> float:
+        """
+        Lower score is better.
+        """
+        acc = 1.0 - metrics.get("accuracy", 0)
+        sustain = (
+            metrics.get("energy", 0)
+            + metrics.get("carbon", 0)
+            + metrics.get("framework_overhead_energy", 0)
+        )
 
-        if metrics.get("carbon_kg", 0) > constraints.get("max_carbon_per_task_kg", float("inf")):
-            violations.append("carbon_budget_exceeded")
-
-        if metrics.get("latency_s", 0) > constraints.get("max_latency_seconds", float("inf")):
-            violations.append("latency_budget_exceeded")
-
-        if metrics.get("memory_mb", 0) / 1024 > constraints.get("memory_limit_gb", float("inf")):
-            violations.append("memory_budget_exceeded")
-
-        metrics["policy_violations"] = violations
-        metrics["policy_pass"] = len(violations) == 0
-        return metrics
+        return (
+            self.weights["accuracy"] * acc
+            + self.weights["sustainability"] * sustain
+        )
