@@ -1,29 +1,16 @@
-# src/analysis/langchain_runtime.py
-from typing import Dict, Any
-from langchain.callbacks import get_openai_callback
-from .runtime_adapter import AgentRuntime
+from src.analysis.langchain_callbacks import GreenLangChainCallback
 
 class LangChainRuntime(AgentRuntime):
-    def init(self, config: Dict[str, Any]):
-        self.agent = config["agent"]  # already constructed upstream
+    def init(self, config):
+        self.callback = GreenLangChainCallback()
+        self.llm = config["llm"](
+            callbacks=[self.callback]
+        )
 
-    def run(self, query: Dict[str, Any]) -> Dict[str, Any]:
-        with get_openai_callback() as cb:
-            response = self.agent.run(query["input"])
-
-        # LangChain exposes this natively
-        tool_calls = cb.tool_calls
-        tokens = cb.total_tokens
-
-        # Conversation depth = reasoning turns
-        conversation_depth = max(1, cb.successful_requests)
-
+    def run(self, query):
+        output = self.llm.invoke(query["input"])
+        metrics = self.callback.snapshot()
         return {
-            "accuracy": self._score(response),
-            "tool_calls": tool_calls,
-            "conversation_depth": conversation_depth,
-            "tokens": tokens,
+            "output": output,
+            **metrics
         }
-
-    def _score(self, response) -> float:
-        return 1.0 if response else 0.0
