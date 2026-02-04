@@ -1,52 +1,36 @@
 """
-Pareto analysis utilities for Green Agent.
-
-This module computes Pareto-optimal runs across
-environmental, performance, and framework-overhead metrics.
+Policy-aware Pareto analyzer with metric provenance support.
 """
 
-from typing import Dict, List
-
-
-DEFAULT_METRICS = [
-    "energy",
-    "carbon",
-    "latency",
-    "memory",
-    "framework_overhead_energy",
-    "framework_overhead_latency",
-    "tool_calls",
-    "conversation_depth",
-]
+from typing import Dict, List, Optional
+from src.policy.policy_engine import PolicyEngine
 
 
 class ParetoAnalyzer:
-    """
-    Computes Pareto frontier for multi-objective optimization.
-
-    All metrics are minimized.
-    """
-
-    def __init__(self, metrics: List[str] = None):
-        self.metrics = metrics or DEFAULT_METRICS
-
-    def _value(self, record: Dict, key: str) -> float:
-        """
-        Safe metric extraction with defaults.
-        Missing metrics are penalized.
-        """
-        return float(record.get(key, float("inf")))
+    def __init__(
+        self,
+        metrics: List[str],
+        policy_engine: Optional[PolicyEngine] = None,
+    ):
+        self.metrics = metrics
+        self.policy_engine = policy_engine
 
     def dominates(self, a: Dict, b: Dict) -> bool:
         """
-        Returns True if a Pareto-dominates b.
+        Policy-aware domination check.
         """
+        if self.policy_engine:
+            if not self.policy_engine.check_constraints(a):
+                return False
+            if not self.policy_engine.check_constraints(b):
+                return True
+
         better_or_equal = True
         strictly_better = False
 
         for m in self.metrics:
-            va = self._value(a, m)
-            vb = self._value(b, m)
+            va = a.get(m, float("inf"))
+            vb = b.get(m, float("inf"))
 
             if va > vb:
                 better_or_equal = False
@@ -57,21 +41,21 @@ class ParetoAnalyzer:
         return better_or_equal and strictly_better
 
     def pareto_frontier(self, records: List[Dict]) -> List[Dict]:
-        """
-        Compute Pareto-optimal subset.
-        """
         frontier = []
 
-        for candidate in records:
+        for cand in records:
             dominated = False
             for other in records:
-                if other is candidate:
+                if other is cand:
                     continue
-                if self.dominates(other, candidate):
+                if self.dominates(other, cand):
                     dominated = True
                     break
-
             if not dominated:
-                frontier.append(candidate)
+                frontier.append(cand)
+
+        # Policy-aware sorting
+        if self.policy_engine:
+            frontier.sort(key=self.policy_engine.weighted_score)
 
         return frontier
