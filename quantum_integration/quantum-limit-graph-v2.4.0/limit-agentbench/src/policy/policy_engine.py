@@ -1,42 +1,32 @@
 """
-Enterprise Green Policy Engine.
+Policy Engine
 
-Applies hard constraints and weighted priorities.
+Hard + soft constraints, including meta-cognitive reflection rules.
 """
 
-from typing import Dict
-
-
 class PolicyEngine:
-    def __init__(self, policy: Dict):
-        self.policy = policy
-        self.weights = policy.get("optimization", {}).get(
-            "priority_weight",
-            {"accuracy": 0.5, "sustainability": 0.5},
-        )
-        self.constraints = policy.get("constraints", {})
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.constraints = cfg.get("constraints", {})
+        self.meta = cfg.get("meta_policy", {})
 
-    def check_constraints(self, metrics: Dict) -> bool:
+        self.reflection_interval = self.meta.get("reflection_interval", 3)
+
+    # -------------------------
+    # Hard enforcement
+    # -------------------------
+    def enforce(self, metrics: dict):
         if metrics.get("energy", 0) > self.constraints.get("max_energy_per_task_wh", float("inf")):
-            return False
+            raise RuntimeError("Policy violation: energy budget exceeded")
+
         if metrics.get("carbon", 0) > self.constraints.get("max_carbon_per_task_kg", float("inf")):
-            return False
+            raise RuntimeError("Policy violation: carbon budget exceeded")
+
         if metrics.get("latency", 0) > self.constraints.get("max_latency_seconds", float("inf")):
-            return False
-        return True
+            raise RuntimeError("Policy violation: latency exceeded")
 
-    def weighted_score(self, metrics: Dict) -> float:
-        """
-        Lower score is better.
-        """
-        acc = 1.0 - metrics.get("accuracy", 0)
-        sustain = (
-            metrics.get("energy", 0)
-            + metrics.get("carbon", 0)
-            + metrics.get("framework_overhead_energy", 0)
-        )
-
-        return (
-            self.weights["accuracy"] * acc
-            + self.weights["sustainability"] * sustain
-        )
+    # -------------------------
+    # Meta-cognitive rules
+    # -------------------------
+    def should_reflect(self, step: int) -> bool:
+        return step % self.reflection_interval == 0
