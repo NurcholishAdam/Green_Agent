@@ -1,61 +1,35 @@
 """
-Policy-aware Pareto analyzer with metric provenance support.
+Pareto Analyzer with provenance and framework overhead support.
 """
 
-from typing import Dict, List, Optional
-from src.policy.policy_engine import PolicyEngine
-
-
 class ParetoAnalyzer:
-    def __init__(
-        self,
-        metrics: List[str],
-        policy_engine: Optional[PolicyEngine] = None,
-    ):
-        self.metrics = metrics
-        self.policy_engine = policy_engine
-
-    def dominates(self, a: Dict, b: Dict) -> bool:
-        """
-        Policy-aware domination check.
-        """
-        if self.policy_engine:
-            if not self.policy_engine.check_constraints(a):
-                return False
-            if not self.policy_engine.check_constraints(b):
-                return True
-
-        better_or_equal = True
-        strictly_better = False
-
-        for m in self.metrics:
-            va = a.get(m, float("inf"))
-            vb = b.get(m, float("inf"))
-
-            if va > vb:
-                better_or_equal = False
-                break
-            if va < vb:
-                strictly_better = True
-
+    def dominates(self, a: dict, b: dict) -> bool:
+        better_or_equal = (
+            a["energy"] <= b["energy"]
+            and a["latency"] <= b["latency"]
+            and a["carbon"] <= b["carbon"]
+        )
+        strictly_better = (
+            a["energy"] < b["energy"]
+            or a["latency"] < b["latency"]
+            or a["carbon"] < b["carbon"]
+        )
         return better_or_equal and strictly_better
 
-    def pareto_frontier(self, records: List[Dict]) -> List[Dict]:
+    def pareto_frontier(self, points: list) -> list:
         frontier = []
-
-        for cand in records:
+        for p in points:
             dominated = False
-            for other in records:
-                if other is cand:
-                    continue
-                if self.dominates(other, cand):
+            for q in points:
+                if q is not p and self.dominates(q, p):
                     dominated = True
                     break
             if not dominated:
-                frontier.append(cand)
-
-        # Policy-aware sorting
-        if self.policy_engine:
-            frontier.sort(key=self.policy_engine.weighted_score)
-
+                p["metric_provenance"] = {
+                    "energy": "measured",
+                    "latency": "measured",
+                    "carbon": "estimated",
+                    "framework_overhead": "estimated",
+                }
+                frontier.append(p)
         return frontier
