@@ -1,9 +1,9 @@
-version: "1.0"
+version: "2.0"
 
 agent_identity:
-  name: "Green-Auditor-Alpha"
-  role: "ESG_Compliance_Monitor"
-  mode: "active_enforcement"
+  name: "Green-Auditor-Meta-Cognitive"
+  role: "ESG_Compliance_Monitor_With_Reflection"
+  mode: "active_enforcement_with_self_awareness"
 
 constraints:
   max_energy_per_task_wh: 5.0
@@ -24,6 +24,53 @@ optimization:
   preferred_model_tier: "SLM"
   fallback_to_expensive: false
 
+# Meta-Cognitive Configuration
+meta_cognitive:
+  # Reflection frequency: agent pauses every N steps to self-reflect
+  reflection_frequency: 5
+  
+  # Self-adjustment thresholds: trigger adaptive policy changes
+  self_adjustment_thresholds:
+    energy_threshold_pct: 80      # Adjust if energy > 80% of budget
+    carbon_threshold_pct: 80      # Adjust if carbon > 80% of budget
+    latency_threshold_pct: 80     # Adjust if latency > 80% of budget
+    memory_threshold_pct: 80      # Adjust if memory > 80% of budget
+  
+  # Enable dynamic policy adjustments based on reflection outcomes
+  adaptive_policy_enabled: true
+  
+  # Long-context reasoning configuration
+  long_context:
+    enabled: true
+    history_window: 10            # Consider last 10 runs for pattern analysis
+    min_confidence_threshold: 0.7 # Minimum confidence for applying insights
+  
+  # Sustained reflection across runs
+  sustained_reflection:
+    enabled: true
+    memory_persistence: true
+    meta_policy_generation: true
+    pattern_tracking: true
+
+# Interpretability Configuration
+interpretability:
+  # Generate self-explanations at reflection checkpoints
+  self_explanation_enabled: true
+  
+  # Store structured reflection logs
+  reflection_logging: true
+  reflection_log_path: "reflections.json"
+  
+  # Dashboard and visualization
+  dashboard_enabled: true
+  dashboard_output: "dashboard.html"
+  
+  # Dual-layer feedback (objective + subjective)
+  dual_layer_feedback: true
+
 reporting:
   alert_threshold_energy_pct: 80
   output_format: "json_detailed"
+  include_reflections: true
+  include_patterns: true
+  include_meta_policy: true

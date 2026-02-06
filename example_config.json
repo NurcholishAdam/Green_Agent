@@ -1,0 +1,27 @@
+{
+  "framework": "langchain",
+  "runtime": {
+    "model": "gpt-3.5-turbo",
+    "temperature": 0.7
+  },
+  "grid_intensity": 385.0,
+  "pue_factor": 1.2,
+  "chaos_enabled": false,
+  "queries": [
+    {
+      "id": "low-energy",
+      "task": "Summarize a document",
+      "max_tokens": 500
+    },
+    {
+      "id": "balanced",
+      "task": "Answer complex question",
+      "max_tokens": 1000
+    },
+    {
+      "id": "high-accuracy",
+      "task": "Detailed analysis",
+      "max_tokens": 2000
+    }
+  ]
+}
