@@ -23,6 +23,8 @@ from src.reflection.reflection_engine import ReflectionEngine
 from src.reflection.long_context_reasoner import LongContextReasoner
 from src.memory.run_memory import RunMemory
 from src.dashboard.green_dashboard import GreenDashboard
+from src.dashboard.symbolic_visualizer import SymbolicVisualizer
+from src.symbolic.symbolic_reasoning_engine import SymbolicReasoningEngine
 from src.chaos import inject_energy_spike
 
 # -------------------------
@@ -80,6 +82,11 @@ def main():
     feedback_system = PolicyFeedback()
     pareto_analyzer = ParetoAnalyzer()
     dashboard = GreenDashboard()
+    
+    # Initialize symbolic reasoning engine
+    symbolic_engine = SymbolicReasoningEngine(policy_file="symbolic_policy.yaml")
+    symbolic_visualizer = SymbolicVisualizer()
+    print(f"🔍 Symbolic reasoning engine loaded with {len(symbolic_engine.get_active_rules())} rules")
 
     # Load historical context
     historical_runs = run_memory.get_recent_runs(5)
@@ -130,6 +137,21 @@ def main():
             # Get cumulative metrics for reflection
             cumulative_metrics = metrics_collector.get_cumulative_metrics()
             metrics["cumulative"] = cumulative_metrics
+            
+            # Evaluate symbolic rules at each step
+            symbolic_violations = symbolic_engine.evaluate_rules(
+                metrics=metrics,
+                step=step,
+                domain=query.get("domain", None)
+            )
+            
+            if symbolic_violations:
+                print(f"  ⚠️  {len(symbolic_violations)} symbolic rule violation(s) detected")
+                for violation in symbolic_violations:
+                    print(f"     - {violation.rule_name} [{violation.severity}]")
+                
+                metrics["symbolic_violations"] = [v.to_dict() for v in symbolic_violations]
+                symbolic_visualizer.add_violations([v.to_dict() for v in symbolic_violations])
 
             # Reflection checkpoint
             if reflection_engine.should_reflect(step):
@@ -202,11 +224,13 @@ def main():
         if "error" not in metrics:
             pareto_position = pareto_analyzer.analyze_agent_position(metrics, all_metrics)
             agent_reflections = [r for r in all_reflections if r.get("step", 0) <= metrics.get("step", 0)]
+            symbolic_violations = metrics.get("symbolic_violations", [])
             
             dual_feedback = feedback_system.generate_dual_layer_feedback(
                 pareto_analysis=pareto_position,
                 reflections=agent_reflections,
-                metrics=metrics
+                metrics=metrics,
+                symbolic_violations=symbolic_violations
             )
             metrics["dual_layer_feedback"] = dual_feedback
             
@@ -242,6 +266,14 @@ def main():
         "results": all_metrics,
         "pareto_frontier": frontier,
         "reflections": all_reflections,
+        "symbolic_oversight": {
+            "total_violations": len(symbolic_engine.violation_history),
+            "summary": symbolic_engine.get_violation_summary(),
+            "violations_by_category": {
+                cat: len(symbolic_engine.get_violations_by_category(cat))
+                for cat in ['sustainability', 'resource', 'fairness', 'safety', 'compliance']
+            }
+        },
         "meta_cognitive_summary": {
             "total_reflections": len(all_reflections),
             "patterns_identified": reflection_engine.pattern_memory,
@@ -266,20 +298,36 @@ def main():
     reflection_engine.export_reflections("reflections.json")
     long_context_reasoner.export_reasoning_history("reasoning_insights.json")
     pareto_analyzer.export_analysis(all_metrics, "pareto_analysis.json")
+    symbolic_engine.export_violations("symbolic_violations.json")
+    symbolic_visualizer.export_violation_report("symbolic_violation_report.json")
     
-    # Generate dashboard
+    # Generate dashboard with symbolic violations
     dashboard.export_dashboard("dashboard_data.json")
     dashboard.generate_html_report(args.dashboard)
+    
+    # Add symbolic violations section to dashboard
+    symbolic_html = symbolic_visualizer.generate_dashboard_section()
+    with open(args.dashboard, 'a') as f:
+        f.write(symbolic_html)
+    
     print(f"✓ Dashboard generated: {args.dashboard}")
 
     # Cleanup
     runtime.finalize()
     
     print("\n" + "=" * 60)
-    print("✅ Green_Agent execution complete with meta-cognitive analysis")
+    print("✅ Green_Agent execution complete with neuro-symbolic oversight")
     print(f"📈 Total reflections: {len(all_reflections)}")
     print(f"🎯 Pareto frontier size: {len(frontier)}")
     print(f"🧠 Historical runs: {run_memory.get_historical_summary()['total_runs']}")
+    print(f"🔍 Symbolic violations: {len(symbolic_engine.violation_history)}")
+    
+    # Print critical violations summary
+    critical_violations = [v for v in symbolic_engine.violation_history if v.severity == 'critical']
+    if critical_violations:
+        print(f"⚠️  CRITICAL: {len(critical_violations)} critical rule violation(s) detected!")
+        for v in critical_violations[:3]:  # Show first 3
+            print(f"   - {v.rule_name} at step {v.step}")
 
 if __name__ == "__main__":
     main()
