@@ -1,0 +1,171 @@
+# Symbolic Policy Rules for Green Agent
+# Extends green_policy.yaml with explicit symbolic constraints
+
+version: "1.0"
+
+# Symbolic Rules - Explicit logical constraints
+symbolic_rules:
+  # Sustainability Rules
+  - id: "SUST-001"
+    name: "Carbon Threshold Violation"
+    category: "sustainability"
+    priority: "high"
+    condition: "carbon > 60 AND latency > 2000"
+    action: "flag_inefficiency"
+    explanation: "High carbon footprint combined with high latency indicates inefficient execution"
+    
+  - id: "SUST-002"
+    name: "Energy Budget Exceeded"
+    category: "sustainability"
+    priority: "critical"
+    condition: "energy > 5.0"
+    action: "halt_execution"
+    explanation: "Energy consumption exceeds maximum allowed budget"
+    
+  - id: "SUST-003"
+    name: "Carbon Efficiency Warning"
+    category: "sustainability"
+    priority: "medium"
+    condition: "carbon > 0.002"
+    action: "trigger_optimization"
+    explanation: "Carbon emissions approaching policy limit"
+  
+  # Resource Management Rules
+  - id: "RES-001"
+    name: "Memory Overflow Risk"
+    category: "resource"
+    priority: "critical"
+    condition: "memory > 500"
+    action: "trigger_resource_alert"
+    explanation: "Memory usage exceeds safe threshold"
+    
+  - id: "RES-002"
+    name: "Latency Degradation"
+    category: "resource"
+    priority: "high"
+    condition: "latency > 120000"
+    action: "optimize_execution"
+    explanation: "Execution latency exceeds acceptable limits"
+    
+  - id: "RES-003"
+    name: "Tool Call Explosion"
+    category: "resource"
+    priority: "medium"
+    condition: "tool_calls > 50"
+    action: "reduce_tool_usage"
+    explanation: "Excessive tool calls may indicate inefficient planning"
+  
+  # Fairness Rules
+  - id: "FAIR-001"
+    name: "Resource Distribution Imbalance"
+    category: "fairness"
+    priority: "medium"
+    condition: "energy_variance > 2.0"
+    action: "balance_resources"
+    explanation: "Uneven resource distribution across queries detected"
+    
+  - id: "FAIR-002"
+    name: "Query Latency Disparity"
+    category: "fairness"
+    priority: "low"
+    condition: "latency_std_dev > 30000"
+    action: "normalize_latency"
+    explanation: "Significant latency variation between queries"
+  
+  # Safety Rules
+  - id: "SAFE-001"
+    name: "Cascading Failure Risk"
+    category: "safety"
+    priority: "critical"
+    condition: "error_rate > 0.3"
+    action: "emergency_stop"
+    explanation: "High error rate indicates system instability"
+    
+  - id: "SAFE-002"
+    name: "Resource Leak Detection"
+    category: "safety"
+    priority: "high"
+    condition: "memory_growth_rate > 50"
+    action: "investigate_leak"
+    explanation: "Rapid memory growth suggests potential resource leak"
+  
+  # Compliance Rules
+  - id: "COMP-001"
+    name: "ESG Compliance Violation"
+    category: "compliance"
+    priority: "critical"
+    condition: "carbon > 0.002 AND energy > 5.0"
+    action: "compliance_alert"
+    explanation: "Multiple ESG thresholds exceeded simultaneously"
+    
+  - id: "COMP-002"
+    name: "Audit Trail Requirement"
+    category: "compliance"
+    priority: "medium"
+    condition: "policy_violation_count > 0"
+    action: "generate_audit_trace"
+    explanation: "Policy violations require formal audit documentation"
+
+# Composite Rules - Complex logical combinations
+composite_rules:
+  - id: "COMP-SUST-001"
+    name: "Inefficient High-Impact Execution"
+    category: "composite"
+    priority: "critical"
+    condition: "(carbon > 0.0015 OR energy > 4.0) AND latency > 100000 AND tool_calls > 30"
+    action: "comprehensive_optimization"
+    explanation: "Multiple inefficiency indicators detected simultaneously"
+    
+  - id: "COMP-RES-001"
+    name: "Resource Exhaustion Pattern"
+    category: "composite"
+    priority: "high"
+    condition: "memory > 400 AND cpu_percent > 80 AND latency > 90000"
+    action: "resource_throttling"
+    explanation: "System approaching resource exhaustion"
+
+# Domain-Specific Extensions
+domain_extensions:
+  # Research domain
+  research:
+    - id: "RES-DOMAIN-001"
+      condition: "query_type == 'research' AND tool_calls > 100"
+      action: "optimize_research_strategy"
+      explanation: "Research queries should use efficient search strategies"
+  
+  # Production domain
+  production:
+    - id: "PROD-DOMAIN-001"
+      condition: "environment == 'production' AND carbon > 0.001"
+      action: "strict_carbon_enforcement"
+      explanation: "Production environments require stricter carbon limits"
+
+# Rule Evaluation Configuration
+evaluation_config:
+  # When to evaluate rules
+  evaluation_triggers:
+    - "step_completion"
+    - "reflection_checkpoint"
+    - "policy_violation"
+    - "manual_trigger"
+  
+  # Rule evaluation order
+  priority_order:
+    - "critical"
+    - "high"
+    - "medium"
+    - "low"
+  
+  # Violation handling
+  violation_handling:
+    log_all_violations: true
+    generate_traces: true
+    store_with_pareto: true
+    dashboard_alerts: true
+    
+  # Trace generation
+  trace_config:
+    include_rule_details: true
+    include_metric_snapshot: true
+    include_historical_context: true
+    format: "structured_json"
