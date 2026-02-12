@@ -27,24 +27,28 @@ class PolicyFeedback:
         self,
         pareto_analysis: Dict[str, Any],
         reflections: List[Dict[str, Any]],
-        metrics: Dict[str, Any]
+        metrics: Dict[str, Any],
+        symbolic_violations: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         Generate dual-layer feedback combining external and internal perspectives.
+        Enhanced with symbolic violation traces.
         
         Args:
             pareto_analysis: External Pareto frontier analysis
             reflections: Internal agent reflections
             metrics: Execution metrics
+            symbolic_violations: Optional list of symbolic rule violations
             
         Returns:
-            Comprehensive dual-layer feedback
+            Comprehensive dual-layer feedback with symbolic reasoning
         """
         feedback = {
             "timestamp": metrics.get("timestamp", 0),
             "objective_layer": self._generate_objective_feedback(pareto_analysis, metrics),
             "subjective_layer": self._generate_subjective_feedback(reflections),
-            "synthesis": self._synthesize_feedback(pareto_analysis, reflections, metrics)
+            "symbolic_layer": self._generate_symbolic_feedback(symbolic_violations) if symbolic_violations else None,
+            "synthesis": self._synthesize_feedback(pareto_analysis, reflections, metrics, symbolic_violations)
         }
         
         self.feedback_history.append(feedback)
@@ -154,13 +158,50 @@ class PolicyFeedback:
         
         return "stable"
     
+    def _generate_symbolic_feedback(
+        self,
+        symbolic_violations: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Generate feedback from symbolic rule violations."""
+        if not symbolic_violations:
+            return {
+                "violation_count": 0,
+                "status": "compliant",
+                "message": "No symbolic rule violations detected"
+            }
+        
+        # Categorize violations
+        by_category = {}
+        by_severity = {}
+        critical_violations = []
+        
+        for violation in symbolic_violations:
+            category = violation.get("rule_id", "").split("-")[0]
+            severity = violation.get("severity", "unknown")
+            
+            by_category[category] = by_category.get(category, 0) + 1
+            by_severity[severity] = by_severity.get(severity, 0) + 1
+            
+            if severity == "critical":
+                critical_violations.append(violation)
+        
+        return {
+            "violation_count": len(symbolic_violations),
+            "status": "critical" if critical_violations else "warning",
+            "by_category": by_category,
+            "by_severity": by_severity,
+            "critical_violations": critical_violations,
+            "message": f"Detected {len(symbolic_violations)} symbolic rule violation(s)"
+        }
+    
     def _synthesize_feedback(
         self,
         pareto_analysis: Dict[str, Any],
         reflections: List[Dict[str, Any]],
-        metrics: Dict[str, Any]
+        metrics: Dict[str, Any],
+        symbolic_violations: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
-        """Synthesize objective and subjective feedback."""
+        """Synthesize objective, subjective, and symbolic feedback."""
         pareto_position = pareto_analysis.get("position", "unknown")
         avg_confidence = sum(r.get("confidence", 0) for r in reflections) / len(reflections) if reflections else 0
         
@@ -181,29 +222,59 @@ class PolicyFeedback:
         else:
             synthesis_text = "Mixed signals between objective performance and subjective assessment"
         
+        # Incorporate symbolic violations
+        if symbolic_violations:
+            violation_count = len(symbolic_violations)
+            critical_count = sum(1 for v in symbolic_violations if v.get("severity") == "critical")
+            
+            if critical_count > 0:
+                synthesis_text += f" | CRITICAL: {critical_count} symbolic rule violation(s) detected"
+                alignment = "symbolic_violation"
+            elif violation_count > 0:
+                synthesis_text += f" | WARNING: {violation_count} symbolic rule violation(s) detected"
+        
         return {
             "alignment": alignment,
             "synthesis_text": synthesis_text,
-            "recommendations": self._generate_recommendations(pareto_position, avg_confidence, reflections)
+            "recommendations": self._generate_recommendations(
+                pareto_position, avg_confidence, reflections, symbolic_violations
+            )
         }
     
     def _generate_recommendations(
         self,
         pareto_position: str,
         avg_confidence: float,
-        reflections: List[Dict[str, Any]]
+        reflections: List[Dict[str, Any]],
+        symbolic_violations: Optional[List[Dict[str, Any]]] = None
     ) -> List[str]:
-        """Generate actionable recommendations."""
+        """Generate actionable recommendations including symbolic violations."""
         recommendations = []
         
+        # Symbolic violation recommendations (highest priority)
+        if symbolic_violations:
+            critical = [v for v in symbolic_violations if v.get("severity") == "critical"]
+            if critical:
+                for v in critical:
+                    recommendations.append(f"🚨 CRITICAL: {v.get('rule_name')} - {v.get('action_triggered')}")
+            
+            # Group by category
+            categories = set(v.get("rule_id", "").split("-")[0] for v in symbolic_violations)
+            for cat in categories:
+                cat_violations = [v for v in symbolic_violations if v.get("rule_id", "").startswith(cat)]
+                recommendations.append(f"Address {len(cat_violations)} {cat} violation(s)")
+        
+        # Pareto-based recommendations
         if pareto_position == "dominated":
             recommendations.append("Investigate dominated metrics and adjust strategy")
             recommendations.append("Consider trade-off adjustments to reach Pareto frontier")
         
+        # Confidence-based recommendations
         if avg_confidence < 0.5:
             recommendations.append("Low confidence detected - increase reflection frequency")
             recommendations.append("Review decision patterns for consistency")
         
+        # Reflection-based recommendations
         if reflections:
             recent_decisions = [r.get("decision", "") for r in reflections[-3:]]
             if "reduce_energy_usage" in recent_decisions:
