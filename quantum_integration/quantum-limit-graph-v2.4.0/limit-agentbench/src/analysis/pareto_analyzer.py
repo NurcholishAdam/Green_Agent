@@ -1,9 +1,11 @@
-"""
-Pareto Analyzer with provenance and framework overhead support.
-"""
+from .metric_provenance import attach_provenance
 
 class ParetoAnalyzer:
-    def dominates(self, a: dict, b: dict) -> bool:
+    """
+    Multi-objective Pareto frontier with provenance tagging.
+    """
+
+    def dominates(self, a, b):
         better_or_equal = (
             a["energy"] <= b["energy"]
             and a["latency"] <= b["latency"]
@@ -16,7 +18,7 @@ class ParetoAnalyzer:
         )
         return better_or_equal and strictly_better
 
-    def pareto_frontier(self, points: list) -> list:
+    def compute_frontier(self, points):
         frontier = []
         for p in points:
             dominated = False
@@ -25,11 +27,5 @@ class ParetoAnalyzer:
                     dominated = True
                     break
             if not dominated:
-                p["metric_provenance"] = {
-                    "energy": "measured",
-                    "latency": "measured",
-                    "carbon": "estimated",
-                    "framework_overhead": "estimated",
-                }
-                frontier.append(p)
+                frontier.append(attach_provenance(p))
         return frontier
