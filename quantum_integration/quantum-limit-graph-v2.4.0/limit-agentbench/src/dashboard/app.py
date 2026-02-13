@@ -1,13 +1,27 @@
-class AutoGenTracer:
-    """
-    Extracts message graph from AutoGen conversation.
-    """
+"""
+Streamlit Dashboard for Green Agent.
+Run with: streamlit run dashboard/app.py
+"""
 
-    def __init__(self):
-        self.edges = []
+import streamlit as st
+from telemetry_loader import TelemetryLoader
+from pareto_visualizer import ParetoVisualizer
 
-    def record(self, sender, receiver, message):
-        self.edges.append((sender, receiver, len(message)))
+st.set_page_config(layout="wide")
+st.title("🌱 Green Agent Dashboard")
 
-    def get_graph(self):
-        return self.edges
+uploaded = st.file_uploader("Upload green_agent_report.json")
+
+if uploaded:
+    report = TelemetryLoader.load(uploaded)
+    df = TelemetryLoader.to_dataframe(report)
+
+    st.subheader("📊 Metrics Overview")
+    st.dataframe(df)
+
+    st.subheader("📈 Pareto Visualization")
+    fig = ParetoVisualizer.plot(df)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("🧠 Reflection Summary")
+    st.write(report.get("reflection"))
