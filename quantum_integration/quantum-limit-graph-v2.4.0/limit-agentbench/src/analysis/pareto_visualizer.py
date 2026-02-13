@@ -1,16 +1,30 @@
-import matplotlib.pyplot as plt
+"""
+Interactive Pareto visualization using Plotly.
+"""
+
+import plotly.express as px
+import pandas as pd
+
 
 class ParetoVisualizer:
     """
-    Visualizes Pareto frontier.
+    Creates interactive Pareto frontier plots.
     """
 
-    def plot(self, data):
-        energy = [d["energy"] for d in data]
-        latency = [d["latency"] for d in data]
+    @staticmethod
+    def plot(df: pd.DataFrame):
+        fig = px.scatter(
+            df,
+            x="latency",
+            y="energy_kwh",
+            size="carbon_kg",
+            hover_data=df.columns
+        )
 
-        plt.scatter(energy, latency)
-        plt.xlabel("Energy")
-        plt.ylabel("Latency")
-        plt.title("Pareto Frontier")
-        plt.show()
+        fig.update_layout(
+            title="Green Agent Pareto Frontier",
+            xaxis_title="Latency (seconds)",
+            yaxis_title="Energy (kWh)"
+        )
+
+        return fig
