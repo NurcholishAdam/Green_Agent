@@ -1,19 +1,18 @@
-# src/policy/adaptive_controller.py
-
 class AdaptiveController:
     """
-    Adjusts agent behavior based on self-monitor signals.
+    Adjust runtime strategy dynamically.
     """
 
-    def __init__(self, policy):
-        self.policy = policy
+    def __init__(self):
         self.mode = "normal"
 
-    def evaluate(self, monitor_trend):
-        if monitor_trend.get("mem_delta", 0) > self.policy.memory_soft_limit_mb:
+    def evaluate(self, trend):
+        if trend.get("memory_delta", 0) > 25:
             self.mode = "low_memory"
-        if monitor_trend.get("cpu_delta", 0) > self.policy.cpu_soft_limit:
+        elif trend.get("cpu_delta", 0) > 15:
             self.mode = "low_energy"
+        else:
+            self.mode = "normal"
         return self.mode
 
     def apply(self, runtime):
