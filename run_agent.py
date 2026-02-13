@@ -1,294 +1,230 @@
 """
 run_agent.py
 
-Green Agent – Full Meta-Cognitive Execution Orchestrator
+Green Agent Main Execution Entry Point
 
-Features:
-- Meta-cognitive lifecycle phases
-- Real-time resource monitoring
-- Policy enforcement + meta-rules
-- RL-based adaptive strategy switching
-- LangChain / AutoGen runtime execution
-- Pareto analysis with provenance tracking
-- Reflective reporting
-- Chaos injection testing
+Implements:
+- Meta-cognitive lifecycle
+- Real-time monitoring
+- RL-based adaptive policy selection
+- Policy enforcement (budgets + meta rules)
+- LangChain / AutoGen runtime abstraction
+- Pareto analysis with provenance
+- Reflective feedback
+- Chaos injection
+- Episodic memory persistence
 - Telemetry export for dashboard
+- Optional multi-agent coordination
 """
 
 import time
-import uuid
 import json
-import random
-from typing import Dict, Any
+import argparse
+from typing import Dict
 
-from policy.policy_engine import PolicyEngine
-from analysis.pareto_analyzer import ParetoAnalyzer
-from policy.policy_feedback import PolicyFeedback
+# Monitoring
 from telemetry.energy_monitor import EnergyMonitor
-from telemetry.carbon_monitor import CarbonMonitor
 from telemetry.latency_monitor import LatencyMonitor
+from telemetry.carbon_monitor import CarbonMonitor
+
+# Carbon grid awareness
+from carbon.grid_intensity import GridCarbonIntensity
+
+# Policy + analysis
+from policy.policy_engine import PolicyEngine
+from policy.policy_feedback import PolicyFeedback
+from analysis.pareto_analyzer import ParetoAnalyzer
+
+# RL
+from rl.q_learning import QLearningAgent
+
+# Memory
+from memory.episodic_memory import EpisodicMemory
+
+# Runtime
+from runtime.langchain_runtime import LangChainRuntime
+from runtime.autogen_runtime import AutoGenRuntime
+
+# Chaos
+from chaos import ChaosInjector
+
+# Multi-agent
+from multi_agent.coordinator import MultiAgentCoordinator
+from multi_agent.agent_node import AgentNode
 
 
-# ============================================================
-# GreenAgentRunner
-# ============================================================
+TELEMETRY_STREAM_FILE = "telemetry_stream.json"
+
 
 class GreenAgentRunner:
-    """
-    Research-grade orchestration engine for sustainable AI execution.
-    """
 
-    def __init__(
-        self,
-        runtime,
-        policy_config: Dict,
-        chaos_probability: float = 0.0,
-        enable_meta_rules: bool = True,
-    ):
-        self.runtime = runtime
-        self.policy_engine = PolicyEngine(policy_config)
-        self.pareto = ParetoAnalyzer()
-        self.feedback = PolicyFeedback()
+    def __init__(self, runtime_type="langchain", multi_agent=False):
 
+        # Runtime selection
+        if runtime_type == "langchain":
+            self.runtime = LangChainRuntime()
+        elif runtime_type == "autogen":
+            self.runtime = AutoGenRuntime()
+        else:
+            raise ValueError("Unsupported runtime")
+
+        # Monitoring
         self.energy_monitor = EnergyMonitor()
-        self.carbon_monitor = CarbonMonitor()
         self.latency_monitor = LatencyMonitor()
+        self.carbon_monitor = CarbonMonitor()
+        self.grid = GridCarbonIntensity()
 
-        self.chaos_probability = chaos_probability
-        self.enable_meta_rules = enable_meta_rules
+        # Policy
+        self.policy_engine = PolicyEngine("green_policy.yml")
+        self.policy_feedback = PolicyFeedback()
+        self.pareto = ParetoAnalyzer()
 
-        self.execution_id = str(uuid.uuid4())
+        # RL
+        self.rl_agent = QLearningAgent()
 
-    # ============================================================
-    # Public API
-    # ============================================================
+        # Memory
+        self.memory = EpisodicMemory()
 
-    def run(self, task_input: str) -> Dict[str, Any]:
+        # Chaos
+        self.chaos = ChaosInjector()
 
-        lifecycle_trace = []
+        # Multi-agent
+        self.multi_agent = multi_agent
 
-        # ========================================================
-        # Phase 1: Intent Analysis (Meta-Cognition)
-        # ========================================================
-        phase = "intent_analysis"
-        lifecycle_trace.append(phase)
+    # ==========================================================
+    # META-COGNITIVE EXECUTION LIFECYCLE
+    # ==========================================================
 
-        strategy = self._select_initial_strategy(task_input)
+    def run(self, task: str) -> Dict:
 
-        # ========================================================
-        # Phase 2: Pre-Execution Resource Baseline
-        # ========================================================
-        phase = "resource_baseline"
-        lifecycle_trace.append(phase)
+        print("\n--- GREEN AGENT EXECUTION START ---")
 
-        baseline_metrics = self._capture_metrics()
+        # -------------------------------
+        # 1️⃣ SELF-MONITORING START
+        # -------------------------------
+        self.energy_monitor.start()
+        self.latency_monitor.start()
 
-        # ========================================================
-        # Phase 3: Chaos Injection (Optional)
-        # ========================================================
-        phase = "chaos_injection"
-        lifecycle_trace.append(phase)
+        # -------------------------------
+        # 2️⃣ RL STRATEGY SELECTION
+        # -------------------------------
+        state = "normal"
 
-        if self._should_inject_chaos():
-            self._inject_chaos()
+        strategy = self.rl_agent.choose_action(state)
+        print(f"[RL] Selected Strategy: {strategy}")
 
-        # ========================================================
-        # Phase 4: Runtime Execution
-        # ========================================================
-        phase = "runtime_execution"
-        lifecycle_trace.append(phase)
+        # -------------------------------
+        # 3️⃣ CHAOS INJECTION (optional)
+        # -------------------------------
+        self.chaos.inject()
 
-        start_time = time.time()
-        result = self._execute_runtime(task_input, strategy)
-        end_time = time.time()
+        # -------------------------------
+        # 4️⃣ EXECUTION (single or multi-agent)
+        # -------------------------------
+        if self.multi_agent:
 
-        # ========================================================
-        # Phase 5: Post-Execution Monitoring
-        # ========================================================
-        phase = "post_execution_monitoring"
-        lifecycle_trace.append(phase)
+            agent_node = AgentNode("agent-1", self.runtime)
+            coordinator = MultiAgentCoordinator([agent_node])
+            results = coordinator.distribute(task)
+            result = results[0]
 
-        metrics = self._collect_runtime_metrics(start_time, end_time)
+        else:
+            result = self.runtime.run(task, strategy=strategy)
 
-        # Add provenance tags
-        metrics["execution_id"] = self.execution_id
-        metrics["strategy"] = strategy
-        metrics["timestamp"] = time.time()
+        # -------------------------------
+        # 5️⃣ STOP MONITORING
+        # -------------------------------
+        energy_kwh = self.energy_monitor.stop()
+        latency = self.latency_monitor.stop()
 
-        # ========================================================
-        # Phase 6: Policy Enforcement
-        # ========================================================
-        phase = "policy_enforcement"
-        lifecycle_trace.append(phase)
+        grid_intensity = self.grid.get_current_intensity()
+        carbon_kg = energy_kwh * grid_intensity
 
-        budget_ok = self.policy_engine.enforce_budgets(metrics)
-
-        if self.enable_meta_rules:
-            budget_ok = budget_ok and self._meta_rules(metrics)
-
-        # ========================================================
-        # Phase 7: Adaptive RL Tuning
-        # ========================================================
-        phase = "adaptive_policy_update"
-        lifecycle_trace.append(phase)
-
-        self.policy_engine.adapt(metrics)
-
-        # ========================================================
-        # Phase 8: Adaptive Strategy Switching
-        # ========================================================
-        phase = "strategy_switching"
-        lifecycle_trace.append(phase)
-
-        new_strategy = self._adaptive_strategy_switch(metrics)
-
-        # ========================================================
-        # Phase 9: Pareto Analysis
-        # ========================================================
-        phase = "pareto_analysis"
-        lifecycle_trace.append(phase)
-
-        pareto_score = self.pareto.compute(metrics)
-
-        # ========================================================
-        # Phase 10: Reflective Feedback
-        # ========================================================
-        phase = "reflection"
-        lifecycle_trace.append(phase)
-
-        reflection = self.feedback.generate(metrics, pareto_score)
-
-        # ========================================================
-        # Phase 11: Telemetry Export
-        # ========================================================
-        phase = "telemetry_export"
-        lifecycle_trace.append(phase)
-
-        telemetry_bundle = self._export_telemetry(metrics)
-
-        # ========================================================
-        # Final Report
-        # ========================================================
-
-        report = {
-            "execution_id": self.execution_id,
-            "result": result,
-            "metrics": metrics,
-            "pareto_score": pareto_score,
-            "policy_weights": self.policy_engine.weights,
-            "budget_compliant": budget_ok,
-            "lifecycle_trace": lifecycle_trace,
-            "reflection": reflection,
-            "next_recommended_strategy": new_strategy,
-            "telemetry_bundle": telemetry_bundle,
+        metrics = {
+            "energy_kwh": energy_kwh,
+            "latency": latency,
+            "carbon_kg": carbon_kg,
+            "grid_intensity": grid_intensity
         }
 
-        self._persist_report(report)
+        print(f"[Metrics] {metrics}")
+
+        # -------------------------------
+        # 6️⃣ POLICY ENFORCEMENT
+        # -------------------------------
+        violations = self.policy_engine.evaluate(metrics)
+
+        # -------------------------------
+        # 7️⃣ PARETO ANALYSIS (with provenance)
+        # -------------------------------
+        pareto_result = self.pareto.analyze(metrics)
+
+        # -------------------------------
+        # 8️⃣ REFLECTIVE FEEDBACK
+        # -------------------------------
+        reflection = self.policy_feedback.generate(
+            metrics=metrics,
+            strategy=strategy,
+            violations=violations
+        )
+
+        # -------------------------------
+        # 9️⃣ RL UPDATE
+        # -------------------------------
+        reward = -metrics["energy_kwh"] - metrics["latency"]
+
+        next_state = "normal"
+        self.rl_agent.update(state, strategy, reward, next_state)
+
+        # -------------------------------
+        # 🔟 EPISODIC MEMORY STORE
+        # -------------------------------
+        report = {
+            "task": task,
+            "strategy": strategy,
+            "metrics": metrics,
+            "violations": violations,
+            "pareto": pareto_result,
+            "reflection": reflection,
+            "result": result
+        }
+
+        self.memory.store(report)
+
+        # -------------------------------
+        # 1️⃣1️⃣ TELEMETRY EXPORT
+        # -------------------------------
+        with open(TELEMETRY_STREAM_FILE, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+
+        print("\n--- GREEN AGENT EXECUTION END ---")
 
         return report
 
-    # ============================================================
-    # Strategy Selection
-    # ============================================================
 
-    def _select_initial_strategy(self, task_input: str) -> str:
-        if len(task_input) > 200:
-            return "energy_saver"
-        return "balanced"
+# ==========================================================
+# CLI ENTRY POINT
+# ==========================================================
 
-    def _adaptive_strategy_switch(self, metrics: Dict) -> str:
-        if metrics["energy_kwh"] > 0.5:
-            return "energy_saver"
-        if metrics["latency"] > 5.0:
-            return "latency_optimized"
-        return "balanced"
+def main():
 
-    # ============================================================
-    # Runtime Execution (LangChain / AutoGen)
-    # ============================================================
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", type=str, required=True)
+    parser.add_argument("--runtime", type=str, default="langchain")
+    parser.add_argument("--multi_agent", action="store_true")
 
-    def _execute_runtime(self, task_input: str, strategy: str):
+    args = parser.parse_args()
 
-        # Strategy injection
-        runtime_config = {"mode": strategy}
+    runner = GreenAgentRunner(
+        runtime_type=args.runtime,
+        multi_agent=args.multi_agent
+    )
 
-        if hasattr(self.runtime, "run"):
-            return self.runtime.run(task_input, runtime_config)
+    report = runner.run(args.task)
 
-        raise RuntimeError("Runtime does not implement run()")
+    print("\nFinal Report:")
+    print(json.dumps(report, indent=4))
 
-    # ============================================================
-    # Monitoring
-    # ============================================================
 
-    def _capture_metrics(self) -> Dict:
-        return {
-            "energy_kwh": self.energy_monitor.read(),
-            "carbon_kg": self.carbon_monitor.read(),
-            "latency": self.latency_monitor.read(),
-        }
-
-    def _collect_runtime_metrics(self, start: float, end: float) -> Dict:
-        return {
-            "energy_kwh": self.energy_monitor.read(),
-            "carbon_kg": self.carbon_monitor.read(),
-            "latency": end - start,
-        }
-
-    # ============================================================
-    # Policy Meta-Rules
-    # ============================================================
-
-    def _meta_rules(self, metrics: Dict) -> bool:
-        """
-        Meta-rules for system safety:
-        - Avoid runaway carbon spikes
-        - Prevent extreme latency loops
-        """
-
-        if metrics["carbon_kg"] > 1.0:
-            return False
-
-        if metrics["latency"] > 30:
-            return False
-
-        return True
-
-    # ============================================================
-    # Chaos Engineering
-    # ============================================================
-
-    def _should_inject_chaos(self) -> bool:
-        return random.random() < self.chaos_probability
-
-    def _inject_chaos(self):
-        print("[Chaos] Injecting synthetic latency spike...")
-        time.sleep(random.uniform(0.5, 1.5))
-
-    # ============================================================
-    # Telemetry Export
-    # ============================================================
-
-    def _export_telemetry(self, metrics: Dict) -> Dict:
-
-        telemetry = {
-            "execution_id": self.execution_id,
-            "energy_kwh": metrics["energy_kwh"],
-            "carbon_kg": metrics["carbon_kg"],
-            "latency": metrics["latency"],
-            "policy_weights": self.policy_engine.weights,
-            "timestamp": metrics["timestamp"],
-        }
-
-        with open("telemetry_stream.json", "a") as f:
-            f.write(json.dumps(telemetry) + "\n")
-
-        return telemetry
-
-    # ============================================================
-    # Persistence
-    # ============================================================
-
-    def _persist_report(self, report: Dict):
-        with open(f"execution_report_{self.execution_id}.json", "w") as f:
-            json.dump(report, f, indent=4)
+if __name__ == "__main__":
+    main()
