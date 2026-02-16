@@ -1,31 +1,37 @@
-from .metric_provenance import attach_provenance
+from typing import List, Dict
+
 
 class ParetoAnalyzer:
     """
-    Multi-objective Pareto frontier with provenance tagging.
+    Computes Pareto frontier with metric provenance tags.
     """
 
-    def dominates(self, a, b):
-        better_or_equal = (
-            a["energy"] <= b["energy"]
-            and a["latency"] <= b["latency"]
-            and a["carbon"] <= b["carbon"]
-        )
-        strictly_better = (
-            a["energy"] < b["energy"]
-            or a["latency"] < b["latency"]
-            or a["carbon"] < b["carbon"]
-        )
-        return better_or_equal and strictly_better
-
-    def compute_frontier(self, points):
+    def compute_frontier(self, results: List[Dict]) -> List[Dict]:
         frontier = []
-        for p in points:
+
+        for candidate in results:
             dominated = False
-            for q in points:
-                if q is not p and self.dominates(q, p):
+            for other in results:
+                if (
+                    other["energy"] <= candidate["energy"]
+                    and other["accuracy"] >= candidate["accuracy"]
+                    and other != candidate
+                ):
                     dominated = True
                     break
+
             if not dominated:
-                frontier.append(attach_provenance(p))
+                frontier.append(candidate)
+
         return frontier
+
+{
+    "accuracy": 0.9,
+    "energy": 120,
+    "latency": 1.2,
+    "provenance": {
+        "energy": "measured",
+        "latency": "measured",
+        "accuracy": "evaluated"
+    }
+}
