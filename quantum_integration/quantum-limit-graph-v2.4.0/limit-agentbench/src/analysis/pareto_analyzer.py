@@ -1,37 +1,64 @@
-from typing import List, Dict
+# analytics/pareto_frontier.py
+
+from dataclasses import dataclass
+from typing import List, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-class ParetoAnalyzer:
+@dataclass
+class AgentPerformancePoint:
+    energy_joules: float
+    accuracy_percent: float
+    label: str
+
+
+class SustainabilityPareto:
     """
-    Computes Pareto frontier with metric provenance tags.
+    Computes and manages the Sustainability Pareto Frontier
+    (Energy vs Accuracy).
+    Lower energy and higher accuracy are preferred.
     """
 
-    def compute_frontier(self, results: List[Dict]) -> List[Dict]:
+    def __init__(self):
+        self.points: List[AgentPerformancePoint] = []
+
+    def add_point(self, energy_joules: float, accuracy_percent: float, label: str):
+        if energy_joules < 0 or accuracy_percent < 0:
+            raise ValueError("Energy and accuracy must be non-negative.")
+
+        point = AgentPerformancePoint(
+            energy_joules=energy_joules,
+            accuracy_percent=accuracy_percent,
+            label=label
+        )
+
+        self.points.append(point)
+        logger.info(f"Added performance point: {point}")
+
+    def compute_frontier(self) -> List[AgentPerformancePoint]:
+        """
+        Returns the Pareto-optimal subset.
+        """
+        sorted_points = sorted(
+            self.points,
+            key=lambda p: (p.energy_joules, -p.accuracy_percent)
+        )
+
         frontier = []
+        best_accuracy = -1
 
-        for candidate in results:
-            dominated = False
-            for other in results:
-                if (
-                    other["energy"] <= candidate["energy"]
-                    and other["accuracy"] >= candidate["accuracy"]
-                    and other != candidate
-                ):
-                    dominated = True
-                    break
+        for point in sorted_points:
+            if point.accuracy_percent > best_accuracy:
+                frontier.append(point)
+                best_accuracy = point.accuracy_percent
 
-            if not dominated:
-                frontier.append(candidate)
-
+        logger.info(f"Computed Pareto frontier with {len(frontier)} points.")
         return frontier
 
-{
-    "accuracy": 0.9,
-    "energy": 120,
-    "latency": 1.2,
-    "provenance": {
-        "energy": "measured",
-        "latency": "measured",
-        "accuracy": "evaluated"
-    }
-}
+    def as_tuples(self) -> List[Tuple[float, float, str]]:
+        return [
+            (p.energy_joules, p.accuracy_percent, p.label)
+            for p in self.points
+        ]
