@@ -1,64 +1,81 @@
-# analytics/pareto_frontier.py
+# analytics/pareto_analyzer.py
 
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, asdict
+from typing import List, Dict
+import json
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class AgentPerformancePoint:
+class ParetoPoint:
     energy_joules: float
-    accuracy_percent: float
+    accuracy: float
+    carbon_grams: float
     label: str
+    metadata: Dict
 
 
-class SustainabilityPareto:
+class ParetoAnalyzer:
     """
-    Computes and manages the Sustainability Pareto Frontier
-    (Energy vs Accuracy).
-    Lower energy and higher accuracy are preferred.
+    Sustainability Pareto Analyzer:
+    - X axis: Energy (Joules)
+    - Y axis: Accuracy (%)
+    - Stores provenance metadata
+    - Computes Pareto frontier
     """
 
     def __init__(self):
-        self.points: List[AgentPerformancePoint] = []
+        self.points: List[ParetoPoint] = []
 
-    def add_point(self, energy_joules: float, accuracy_percent: float, label: str):
-        if energy_joules < 0 or accuracy_percent < 0:
-            raise ValueError("Energy and accuracy must be non-negative.")
+    def add_record(
+        self,
+        energy_joules: float,
+        accuracy: float,
+        carbon_grams: float,
+        label: str,
+        metadata: Dict = None
+    ):
+        if metadata is None:
+            metadata = {}
 
-        point = AgentPerformancePoint(
+        point = ParetoPoint(
             energy_joules=energy_joules,
-            accuracy_percent=accuracy_percent,
-            label=label
+            accuracy=accuracy,
+            carbon_grams=carbon_grams,
+            label=label,
+            metadata=metadata
         )
 
         self.points.append(point)
-        logger.info(f"Added performance point: {point}")
+        logger.info(f"Added Pareto record: {label}")
 
-    def compute_frontier(self) -> List[AgentPerformancePoint]:
+    def compute_frontier(self) -> List[ParetoPoint]:
         """
-        Returns the Pareto-optimal subset.
+        Pareto-optimal points:
+        Lower energy + Higher accuracy
         """
-        sorted_points = sorted(
+
+        sorted_pts = sorted(
             self.points,
-            key=lambda p: (p.energy_joules, -p.accuracy_percent)
+            key=lambda p: (p.energy_joules, -p.accuracy)
         )
 
         frontier = []
         best_accuracy = -1
 
-        for point in sorted_points:
-            if point.accuracy_percent > best_accuracy:
-                frontier.append(point)
-                best_accuracy = point.accuracy_percent
+        for p in sorted_pts:
+            if p.accuracy > best_accuracy:
+                frontier.append(p)
+                best_accuracy = p.accuracy
 
-        logger.info(f"Computed Pareto frontier with {len(frontier)} points.")
+        logger.info(f"Computed Pareto frontier ({len(frontier)} points)")
         return frontier
 
-    def as_tuples(self) -> List[Tuple[float, float, str]]:
-        return [
-            (p.energy_joules, p.accuracy_percent, p.label)
-            for p in self.points
-        ]
+    def export_json(self, path="pareto_results.json"):
+        with open(path, "w") as f:
+            json.dump([asdict(p) for p in self.points], f, indent=4)
+
+        logger.info(f"Pareto data exported to {path}")
