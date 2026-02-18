@@ -1,394 +1,302 @@
----
-
-# 🌱 Green_Agent
-
-Green_Agent is a **resource-aware evaluation agent** for assessing autonomous agents under performance, efficiency, and sustainability constraints.
-It observes agent execution, collects multi-dimensional metrics, and evaluates outcomes using **Pareto-based analysis** rather than single-score aggregation.
-
----
-
-## 🧠 System Architecture
-
-### High-Level Architecture (ASCII)
-
-```
-┌──────────────────────────────────────────────┐
-│              Container Runtime               │
-│                                              │
-│  ┌─────────────┐        ┌─────────────────┐ │
-│  │ Purple Agent│──────▶ │  Execution Loop │ │
-│  │ (Assessee)  │        │  (run_agent.py) │ │
-│  └─────────────┘        └────────┬────────┘ │
-│                                   │          │
-│                                   ▼          │
-│        ┌──────────── Metrics Collection ────────────┐
-│        │ latency | energy | carbon | memory | tools │
-│        └───────────────┬────────────────────────────┘
-│                        ▼
-│               ┌─────────────────┐
-│               │ Budget / Chaos  │
-│               │ Enforcement     │
-│               └────────┬────────┘
-│                        ▼
-│               ┌─────────────────┐
-│               │ Pareto Analyzer │
-│               └────────┬────────┘
-│                        ▼
-│        ┌──────────────────────────────────┐
-│        │ Reports / Leaderboards / Feedback│
-│        └──────────────────────────────────┘
-└──────────────────────────────────────────────┘
-```
-
----
-
-### Logical Data Flow (Mermaid)
-
-```mermaid
-flowchart TD
-    A[Purple Agent] --> B[run_agent.py]
-    B --> C[Metrics Collector]
-    C --> D[Budget + Chaos Checks]
-    D --> E[Pareto Analyzer]
-    E --> F[Policy Reporter]
-    E --> G[Policy Feedback]
-```
-
----
-
-## 🔁 Execution Lifecycle
-
-1. Runtime initializes execution context
-2. Purple agent begins execution
-3. Metrics are streamed continuously
-4. Budgets are checked on every step
-5. Chaos module may inject failures
-6. Execution terminates (success or enforced)
-7. Metrics are normalized and evaluated
-8. Pareto frontier and reports are generated
-
----
-
-## 🗂 Core Modules (with Docstrings)
-
-Below are **module-level docstrings** you can paste directly into each file.
-
----
-
-### `run_agent.py`
-
-```python
-"""
-run_agent.py
-
-Main execution entrypoint for Green_Agent.
-
-Responsibilities:
-- Load execution policies and budgets
-- Initialize metric collectors
-- Execute purple (assessee) agents
-- Enforce resource constraints and termination rules
-- Emit structured evaluation results
-
-Design principles:
-- Deterministic execution
-- Never crash (fail-safe guards)
-- Framework-agnostic
-- JSON-only outputs
-"""
-```
-
----
+🌱 Green Agent
+A Green Distributed AI Runtime
+Energy-Aware • Carbon-Adaptive • Multi-Agent • Reinforcement-Learned
 
-### `pareto_analyzer.py`
+A fully distributed, sustainability-first AI agent runtime that integrates:
 
-```python
-"""
-pareto_analyzer.py
+⚡ Energy-aware policy enforcement
 
-Implements multi-objective evaluation using Pareto dominance.
+🧠 PPO + Q-table hybrid reinforcement learning
 
-Responsibilities:
-- Define dominance across heterogeneous metrics
-- Compute Pareto frontiers
-- Compare agents without collapsing metrics into a single score
-
-Metrics supported:
-- Accuracy / task proxy
-- Latency
-- Energy
-- Carbon
-- Memory
-- Tool calls
-- Conversation depth
-- Framework overhead
-"""
-```
-
----
-
-### `chaos.py`
-
-```python
-"""
-chaos.py
-
-Provides deterministic chaos and failure injection.
-
-Responsibilities:
-- Simulate budget exhaustion
-- Force early termination
-- Validate evaluator behavior under stress
-- Test robustness against runaway agents
-
-Chaos scenarios are controlled and reproducible.
-"""
-```
-
----
-
-### `policy_reporter.py`
-
-```python
-"""
-policy_reporter.py
-
-Aggregates raw execution metrics into structured artifacts.
-
-Responsibilities:
-- Normalize metrics
-- Generate leaderboard-compatible outputs
-- Persist Pareto frontier results
-- Maintain schema stability for downstream consumers
-"""
-```
+🧩 Distributed multi-agent coordination (Ray cluster)
 
----
-
-### `policy_feedback.py`
-
-```python
-"""
-policy_feedback.py
-
-Provides interpretability and diagnostics for evaluations.
-
-Responsibilities:
-- Explain why an agent passed or failed
-- Highlight budget violations
-- Summarize trade-offs between metrics
-- Generate human-readable feedback from raw scores
-"""
-```
+📊 Real-time Pareto Frontier visualization
 
----
+🌍 Carbon-grid adaptive throttling
 
-### `green_policy.yml`
-
-```yaml
-# green_policy.yml
-# Declarative execution policy for Green_Agent
-#
-# Defines:
-# - Resource budgets (energy, latency, carbon)
-# - Execution profiles
-# - Termination conditions
-#
-# Policies are runtime-agnostic and framework-independent.
-```
-
----
-
-## 📊 Multi-Query AgentBeats Submission
-
-AgentBeats requires **queries to be an array**. Each query launches the same image with different budgets.
-
-```json
-{
-  "image": "ghcr.io/nurcholishadam/green-agent:latest",
-  "queries": [
-    {
-      "id": "low-energy",
-      "command": ["python", "run_agent.py"],
-      "environment": {
-        "QUERY_MODE": "low_energy",
-        "MAX_ENERGY_WH": "0.03"
-      }
-    },
-    {
-      "id": "balanced",
-      "command": ["python", "run_agent.py"],
-      "environment": {
-        "QUERY_MODE": "balanced",
-        "MAX_ENERGY_WH": "0.06"
-      }
-    },
-    {
-      "id": "high-accuracy",
-      "command": ["python", "run_agent.py"],
-      "environment": {
-        "QUERY_MODE": "high_accuracy"
-      }
-    }
-  ]
-}
-```
-
-Each query → one datapoint → Pareto aggregation offline.
-
----
-
-## 🐳 Docker Integration
-
-* Python 3.11 slim base
-* cgroup access enabled for metrics
-* No background servers
-* Deterministic, CI-safe execution
-
-Docker image is published to **GHCR** and referenced by AgentBeats.
-
----
-
-
-## 📊 Metrics Model
-
-Metrics are intentionally **not collapsed**.
-
-### Categories
-
-* **Task Outcome**
-
-  * Accuracy or success proxy
-* **Efficiency**
-
-  * Latency
-  * Energy
-  * Carbon
-  * Memory
-* **Behavior**
-
-  * Tool calls
-  * Conversation depth
-* **Overhead**
-
-  * Framework-induced latency/energy
-
-Pareto dominance is computed across these dimensions.
-
----
-
-## ⚖️ Evaluation Philosophy
-
-* No single “winner”
-* Multiple agents may be optimal
-* Trade-offs are explicit and inspectable
-* Budget violations are first-class outcomes
-
-This prevents metric gaming and preserves interpretability.
-
----
-
-## 🧱 Repository Layout
-
-```text
-.
-├── run_agent.py
-├── pareto_analyzer.py
-├── chaos.py
-├── policy_reporter.py
-├── policy_feedback.py
-├── green_policy.yml
-├── requirements.txt
-├── Dockerfile
+💳 Carbon-credit market simulation
+
+🏆 Negawatt-based sustainability ranking
+
+☁ Kubernetes autoscaling
+
+🚀 Why This Project Exists
+
+Most AI agent frameworks optimize for:
+
+Accuracy
+
+Latency
+
+Throughput
+
+This architecture optimizes for:
+
+Accuracy per Watt per Carbon Unit
+
+We treat energy as a first-class optimization objective.
+
+🧠 Core Philosophy
+
+We extend classical AI benchmarking into:
+
+1️⃣ Sustainability Pareto Frontier
+
+Energy (Joules) vs Accuracy (%)
+
+2️⃣ Negawatt Reward System
+
+Agents are rewarded for energy saved, not just accuracy achieved.
+
+3️⃣ Carbon-Adaptive Intelligence
+
+Agents throttle themselves when the power grid is “dirty”.
+
+4️⃣ Quantum-Inspired Energy Efficiency Metric
+𝐸
+𝑒
+𝑓
+𝑓
+=
+Task Completion Ratio
+∑
+Quantum-Inspired Energy Loops
+E
+eff
+	​
+
+=
+∑Quantum-Inspired Energy Loops
+Task Completion Ratio
+	​
+
+🏗 System Architecture
+User
+  │
+  ▼
+FastAPI (Dashboard API)
+  │
+  ▼
+Ray Distributed Cluster (Kubernetes Autoscaled)
+  │
+  ├── Multi-Agent Workers
+  ├── PPO Trainer
+  ├── Q-table Store (Persistent)
+  ├── Carbon Grid Forecaster
+  ├── Pareto Analyzer
+  └── Carbon Market Simulator
+
+📂 Repository Structure
+green_ai_cluster/
+│
+├── runtime/
+│   ├── run_agent.py
+│   ├── distributed_runtime.py
+│   └── stress_test_harness.py
+│
+├── policy/
+│   ├── policy_engine.py
+│   ├── ppo_policy.py
+│   └── q_table_store.py
+│
+├── rewards/
+│   └── negawatt_reward.py
+│
+├── carbon/
+│   ├── carbon_forecast.py
+│   ├── carbon_throttler.py
+│   └── carbon_credit_simulator.py
+│
+├── distillation/
+│   └── knowledge_distiller.py
+│
+├── analytics/
+│   └── pareto_analyzer.py
+│
+├── dashboard/
+│   ├── api_server.py
+│   └── plotly_dashboard.py
+│
+├── k8s/
+│   └── ray-cluster.yaml
+│
 └── README.md
-```
 
----
+🔥 Features Breakdown
+1️⃣ Ray-Based Distributed Multi-Agent Runtime
 
-## 🧑‍💻 Developer Onboarding Guide
+Powered by Ray
 
-### 1️⃣ Understand the Core Loop
+Actor-based multi-agent execution
 
-Start with:
+Autoscaling via Kubernetes
 
-* `run_agent.py` → execution + metrics
-* `pareto_analyzer.py` → evaluation logic
+Fault-tolerant distributed state
 
-Do **not** modify purple agent logic unless adding adapters.
+Async task execution
 
----
+2️⃣ PPO + Persistent Q-Table Hybrid Learning
 
-### 2️⃣ Adding a New Metric
+On-policy PPO fine-tuning
 
-1. Collect metric in `run_agent.py`
-2. Normalize it in `policy_reporter.py`
-3. Add it to dominance logic in `pareto_analyzer.py`
-4. Document it in `policy_feedback.py`
+Persistent Q-table for fast bootstrapping
 
----
+Episodic memory across executions
 
-### 3️⃣ Adding a New Execution Policy
+Policy adaptation based on:
 
-1. Add profile to `green_policy.yml`
-2. Ensure budgets are enforced in `run_agent.py`
-3. Validate via chaos tests
+Energy usage
 
----
+Accuracy
 
-### 4️⃣ Adding Framework Support
+Carbon intensity
 
-* Wrap framework execution in `run_agent.py`
-* Measure overhead explicitly
-* Never hide framework costs
+3️⃣ Negawatt Reward Module
 
----
+Instead of:
 
-### 5️⃣ Testing Changes
+Reward = Accuracy
 
-* Use deterministic purple agents
-* Validate monotonic metrics
-* Verify Pareto ordering manually
 
----
+We use:
 
-## 🧩 Extensibility Notes
+Reward = Accuracy + Energy_Saved_Bonus
 
-This architecture intentionally supports:
 
-* New metrics without refactoring
-* New dominance rules
-* Real hardware counters
-* Live dashboards
-* Enterprise policy enforcement
+Agents solving the same task with lower energy get ranked higher on the Green Leaderboard.
 
-All without breaking compatibility.
+4️⃣ Sustainability Pareto Visualization
 
----
+Dashboard shows:
 
-## License
-This project is licensed under the MIT License - see the LICENSE file for details.
+X-axis: Energy (Joules)
 
-## 👤 Author
+Y-axis: Accuracy (%)
 
-**Nurcholish Adam**
+Pareto frontier
 
-**nurcholishadam@gmail.com**
+Dominated vs non-dominated agents
 
-**[nurcholishadam Github Repository](https://github.com/NurcholishAdam/Green_Agent/)**
+Built using:
 
----
+FastAPI
 
-🙏 Acknowledgments
+Plotly
 
-- AgentBeats Team 
-- Platform and A2A protocol
-- THUDM
-- AgentBench framework
-- Qiskit Team
-- Quantum computing toolkit
-- RDI Foundation
-- Green agent template
-- Quantum ML Community
-- QGNN research and implementations
-- AI Research Agent Team
----
+5️⃣ Carbon-Grid Adaptive Throttling
+
+The system queries regional carbon intensity:
+
+If grid is “dirty” → activate Eco Mode
+
+Reduce token output
+
+Increase pruning
+
+Switch to lightweight policies
+
+6️⃣ Temporal Carbon Shifting
+
+For non-urgent tasks:
+
+Suggest delay window
+
+Show estimated CO₂ savings
+
+“Delay for Green” option in dashboard
+
+7️⃣ Carbon Credit Simulation
+
+Each agent execution:
+
+Calculates carbon footprint
+
+Converts CO₂ to simulated carbon credits
+
+Tracks ESG-style sustainability index
+
+8️⃣ Cross-Agent Knowledge Distillation
+
+Agents periodically:
+
+Share compressed policy representations
+
+Align value functions
+
+Improve cluster-wide efficiency
+
+This reduces:
+
+Redundant exploration
+
+Energy waste
+
+Training instability
+
+9️⃣ Kubernetes Autoscaling
+
+Ray cluster deployed with:
+
+Horizontal autoscaler
+
+Dynamic worker scaling
+
+Load-aware resource provisioning
+
+📊 Metrics
+Metric	Description
+Accuracy	Task success ratio
+Energy (J)	Total Joules consumed
+gCO₂	Carbon footprint
+Accuracy-per-Watt	Sustainability efficiency
+E_eff	Quantum-inspired efficiency
+Sustainability Rank	Composite score
+🧪 Stress Testing
+
+The stress_test_harness.py simulates:
+
+Node crashes
+
+Energy spikes
+
+Carbon intensity shifts
+
+PPO instability
+
+Network delays
+
+Automatic recovery includes:
+
+Actor restart
+
+State rehydration
+
+Q-table reload
+
+Policy fallback
+
+▶ Installation
+pip install -r requirements.txt
+
+▶ Start Ray Cluster (Kubernetes)
+kubectl apply -f k8s/ray-cluster.yaml
+
+▶ Run Distributed Runtime
+python runtime/run_agent.py
+
+▶ Launch Dashboard
+uvicorn dashboard.api_server:app --reload
+
+🏆 Research Contributions
+
+This framework contributes:
+
+Sustainability-first agent benchmarking
+
+Accuracy-per-Watt optimization
+
+Carbon-reactive policy switching
+
+Distributed green multi-agent RL
+
+Quantum-inspired efficiency metrics
