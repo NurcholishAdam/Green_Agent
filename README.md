@@ -263,7 +263,7 @@ By prioritizing energy efficiency and carbon awareness, Green Agent demonstrates
 
 ## 📄 License
 
-[MIT License]
+See [LICENSE](../../LICENSE) for details.
 
 ---
 
@@ -280,3 +280,4 @@ For questions or collaboration opportunities, please reach out via [your contact
 ---
 
 **Built with 💚 for a sustainable AI future**
+
