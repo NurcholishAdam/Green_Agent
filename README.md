@@ -1,76 +1,49 @@
-🌱 Green Agent
-A Green Distributed AI Runtime
-Energy-Aware • Carbon-Adaptive • Multi-Agent • Reinforcement-Learned
+# 🌱 Green Agent: A Green Distributed AI Runtime
 
-A fully distributed, sustainability-first AI agent runtime that integrates:
+**Energy-Aware • Carbon-Adaptive • Multi-Agent • Reinforcement-Learned**
 
-⚡ Energy-aware policy enforcement
+A fully distributed, sustainability-first AI agent runtime that integrates energy-aware policy enforcement, hybrid reinforcement learning, distributed multi-agent coordination, real-time Pareto Frontier visualization, carbon-grid adaptive throttling, carbon-credit market simulation, negawatt-based sustainability ranking, and Kubernetes autoscaling.
 
-🧠 PPO + Q-table hybrid reinforcement learning
+---
 
-🧩 Distributed multi-agent coordination (Ray cluster)
-
-📊 Real-time Pareto Frontier visualization
-
-🌍 Carbon-grid adaptive throttling
-
-💳 Carbon-credit market simulation
-
-🏆 Negawatt-based sustainability ranking
-
-☁ Kubernetes autoscaling
-
-🚀 Why This Project Exists
+## 🚀 Why This Project Exists
 
 Most AI agent frameworks optimize for:
+- **Accuracy**
+- **Latency**
+- **Throughput**
 
-Accuracy
+**This architecture optimizes for:**
+- **Accuracy per Watt per Carbon Unit**
 
-Latency
+We treat energy as a first-class optimization objective, redefining what it means to build intelligent systems in the age of climate awareness.
 
-Throughput
+---
 
-This architecture optimizes for:
+## 🧠 Core Philosophy
 
-Accuracy per Watt per Carbon Unit
+We extend classical AI benchmarking into four key dimensions:
 
-We treat energy as a first-class optimization objective.
+### 1️⃣ Sustainability Pareto Frontier
+Visualizing the trade-off between **Energy (Joules)** and **Accuracy (%)** to identify optimal efficiency points.
 
-🧠 Core Philosophy
+### 2️⃣ Negawatt Reward System
+Agents are rewarded for **energy saved**, not just accuracy achieved. This inverts traditional optimization objectives.
 
-We extend classical AI benchmarking into:
+### 3️⃣ Carbon-Adaptive Intelligence
+Agents throttle themselves when the power grid is "dirty," automatically reducing computational intensity during high-carbon periods.
 
-1️⃣ Sustainability Pareto Frontier
+### 4️⃣ Quantum-Inspired Energy Efficiency Metric
+```
+E_eff = Task Completion Ratio / Σ(Quantum-Inspired Energy Loops)
+```
+A novel metric that captures energy efficiency across complex, multi-stage agent tasks.
 
-Energy (Joules) vs Accuracy (%)
+---
 
-2️⃣ Negawatt Reward System
+## 🏗 System Architecture
 
-Agents are rewarded for energy saved, not just accuracy achieved.
-
-3️⃣ Carbon-Adaptive Intelligence
-
-Agents throttle themselves when the power grid is “dirty”.
-
-4️⃣ Quantum-Inspired Energy Efficiency Metric
-𝐸
-𝑒
-𝑓
-𝑓
-=
-Task Completion Ratio
-∑
-Quantum-Inspired Energy Loops
-E
-eff
-	​
-
-=
-∑Quantum-Inspired Energy Loops
-Task Completion Ratio
-	​
-
-🏗 System Architecture
+```
 User
   │
   ▼
@@ -85,8 +58,13 @@ Ray Distributed Cluster (Kubernetes Autoscaled)
   ├── Carbon Grid Forecaster
   ├── Pareto Analyzer
   └── Carbon Market Simulator
+```
 
-📂 Repository Structure
+---
+
+## 📂 Repository Structure
+
+```
 green_ai_cluster/
 │
 ├── runtime/
@@ -121,182 +99,184 @@ green_ai_cluster/
 │   └── ray-cluster.yaml
 │
 └── README.md
+```
 
-🔥 Features Breakdown
-1️⃣ Ray-Based Distributed Multi-Agent Runtime
+---
 
-Powered by Ray
+## 🔥 Features Breakdown
 
-Actor-based multi-agent execution
+### 1️⃣ Ray-Based Distributed Multi-Agent Runtime
+- Powered by **Ray**
+- Actor-based multi-agent execution
+- Autoscaling via Kubernetes
+- Fault-tolerant distributed state
+- Async task execution
 
-Autoscaling via Kubernetes
+### 2️⃣ PPO + Persistent Q-Table Hybrid Learning
+- On-policy PPO fine-tuning
+- Persistent Q-table for fast bootstrapping
+- Episodic memory across executions
+- Policy adaptation based on:
+  - Energy usage
+  - Accuracy
+  - Carbon intensity
 
-Fault-tolerant distributed state
-
-Async task execution
-
-2️⃣ PPO + Persistent Q-Table Hybrid Learning
-
-On-policy PPO fine-tuning
-
-Persistent Q-table for fast bootstrapping
-
-Episodic memory across executions
-
-Policy adaptation based on:
-
-Energy usage
-
-Accuracy
-
-Carbon intensity
-
-3️⃣ Negawatt Reward Module
-
-Instead of:
-
+### 3️⃣ Negawatt Reward Module
+Instead of traditional reward functions:
+```
 Reward = Accuracy
-
+```
 
 We use:
-
+```
 Reward = Accuracy + Energy_Saved_Bonus
+```
 
+Agents solving the same task with lower energy consumption get ranked higher on the **Green Leaderboard**.
 
-Agents solving the same task with lower energy get ranked higher on the Green Leaderboard.
-
-4️⃣ Sustainability Pareto Visualization
-
-Dashboard shows:
-
-X-axis: Energy (Joules)
-
-Y-axis: Accuracy (%)
-
-Pareto frontier
-
-Dominated vs non-dominated agents
+### 4️⃣ Sustainability Pareto Visualization
+Dashboard displays:
+- **X-axis:** Energy (Joules)
+- **Y-axis:** Accuracy (%)
+- Pareto frontier analysis
+- Dominated vs non-dominated agents
 
 Built using:
+- FastAPI
+- Plotly
 
-FastAPI
-
-Plotly
-
-5️⃣ Carbon-Grid Adaptive Throttling
-
+### 5️⃣ Carbon-Grid Adaptive Throttling
 The system queries regional carbon intensity:
+- If grid is "dirty" → activate **Eco Mode**
+  - Reduce token output
+  - Increase pruning
+  - Switch to lightweight policies
 
-If grid is “dirty” → activate Eco Mode
-
-Reduce token output
-
-Increase pruning
-
-Switch to lightweight policies
-
-6️⃣ Temporal Carbon Shifting
-
+### 6️⃣ Temporal Carbon Shifting
 For non-urgent tasks:
+- Suggest delay window
+- Show estimated CO₂ savings
+- "Delay for Green" option in dashboard
 
-Suggest delay window
-
-Show estimated CO₂ savings
-
-“Delay for Green” option in dashboard
-
-7️⃣ Carbon Credit Simulation
-
+### 7️⃣ Carbon Credit Simulation
 Each agent execution:
+- Calculates carbon footprint
+- Converts CO₂ to simulated carbon credits
+- Tracks ESG-style sustainability index
 
-Calculates carbon footprint
-
-Converts CO₂ to simulated carbon credits
-
-Tracks ESG-style sustainability index
-
-8️⃣ Cross-Agent Knowledge Distillation
-
+### 8️⃣ Cross-Agent Knowledge Distillation
 Agents periodically:
-
-Share compressed policy representations
-
-Align value functions
-
-Improve cluster-wide efficiency
+- Share compressed policy representations
+- Align value functions
+- Improve cluster-wide efficiency
 
 This reduces:
+- Redundant exploration
+- Energy waste
+- Training instability
 
-Redundant exploration
-
-Energy waste
-
-Training instability
-
-9️⃣ Kubernetes Autoscaling
-
+### 9️⃣ Kubernetes Autoscaling
 Ray cluster deployed with:
+- Horizontal autoscaler
+- Dynamic worker scaling
+- Load-aware resource provisioning
 
-Horizontal autoscaler
+---
 
-Dynamic worker scaling
+## 📊 Metrics
 
-Load-aware resource provisioning
+| Metric | Description |
+|--------|-------------|
+| **Accuracy** | Task success ratio |
+| **Energy (J)** | Total Joules consumed |
+| **gCO₂** | Carbon footprint |
+| **Accuracy-per-Watt** | Sustainability efficiency |
+| **E_eff** | Quantum-inspired efficiency |
+| **Sustainability Rank** | Composite score |
 
-📊 Metrics
-Metric	Description
-Accuracy	Task success ratio
-Energy (J)	Total Joules consumed
-gCO₂	Carbon footprint
-Accuracy-per-Watt	Sustainability efficiency
-E_eff	Quantum-inspired efficiency
-Sustainability Rank	Composite score
-🧪 Stress Testing
+---
 
-The stress_test_harness.py simulates:
+## 🧪 Stress Testing
 
-Node crashes
-
-Energy spikes
-
-Carbon intensity shifts
-
-PPO instability
-
-Network delays
+The `stress_test_harness.py` simulates:
+- Node crashes
+- Energy spikes
+- Carbon intensity shifts
+- PPO instability
+- Network delays
 
 Automatic recovery includes:
+- Actor restart
+- State rehydration
+- Q-table reload
+- Policy fallback
 
-Actor restart
+---
 
-State rehydration
+## ⚙️ Installation & Quick Start
 
-Q-table reload
+### Prerequisites
+- Python 3.8+
+- Kubernetes cluster
+- Ray 2.0+
 
-Policy fallback
-
-▶ Installation
+### Installation
+```bash
 pip install -r requirements.txt
+```
 
-▶ Start Ray Cluster (Kubernetes)
+### Start Ray Cluster (Kubernetes)
+```bash
 kubectl apply -f k8s/ray-cluster.yaml
+```
 
-▶ Run Distributed Runtime
+### Run Distributed Runtime
+```bash
 python runtime/run_agent.py
+```
 
-▶ Launch Dashboard
+### Launch Dashboard
+```bash
 uvicorn dashboard.api_server:app --reload
+```
 
-🏆 Research Contributions
+Access the dashboard at `http://localhost:8000`
+
+---
+
+## 🏆 Research Contributions
 
 This framework contributes:
+- **Sustainability-first agent benchmarking**
+- **Accuracy-per-Watt optimization**
+- **Carbon-reactive policy switching**
+- **Distributed green multi-agent RL**
+- **Quantum-inspired efficiency metrics**
 
-Sustainability-first agent benchmarking
+---
 
-Accuracy-per-Watt optimization
+## 🌍 Environmental Impact
 
-Carbon-reactive policy switching
+By prioritizing energy efficiency and carbon awareness, Green Agent demonstrates that high-performance AI systems can be built with environmental responsibility at their core. Every joule saved is a step toward sustainable artificial intelligence.
 
-Distributed green multi-agent RL
+---
 
-Quantum-inspired efficiency metrics
+## 📄 License
+
+[MIT License]
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+## 📧 Contact
+
+For questions or collaboration opportunities, please reach out via [your contact information].
+
+---
+
+**Built with 💚 for a sustainable AI future**
