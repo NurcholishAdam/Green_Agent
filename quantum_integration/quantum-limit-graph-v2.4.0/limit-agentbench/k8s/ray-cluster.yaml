@@ -1,0 +1,34 @@
+apiVersion: ray.io/v1alpha1
+kind: RayCluster
+metadata:
+  name: green-ai-ray-cluster
+spec:
+  rayVersion: "2.9.0"
+
+  headGroupSpec:
+    serviceType: ClusterIP
+    replicas: 1
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: rayproject/ray:latest
+          resources:
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+  workerGroupSpecs:
+  - replicas: 2
+    minReplicas: 2
+    maxReplicas: 10
+    groupName: green-workers
+    template:
+      spec:
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:latest
+          resources:
+            limits:
+              cpu: "2"
+              memory: "4Gi"
