@@ -1,139 +1,249 @@
+# runtime/run_agent.py
+
 import os
 import time
+import json
+import logging
 import traceback
+import random
+from typing import Dict
 
-import torch
-
-from core.config import PPOConfig, SystemConfig
-from rl.ppo_agent import PPOAgent
-from rl.q_memory import QMemory
-from rl.reward_normalizer import RewardNormalizer
+from analytics.pareto_analyzer import ParetoAnalyzer
+from sustainability.carbon_intensity_provider import CarbonIntensityProvider
+from sustainability.eco_mode_controller import EcoModeController
+from metrics.quantum_efficiency import QuantumEfficiencyMetric
+from rewards.negawatt_reward import NegawattReward
+from rl.q_learning import QLearningAgent
+from rl.ppo_trainer import PPOTrainer
+from coordination.distributed_manager import DistributedCoordinator
+from telemetry.telemetry_exporter import TelemetryExporter
 from policy.policy_engine import PolicyEngine
-from distributed.agent_registry import AgentRegistry
-from metrics.schema import create_episode_record
-from system.persistence_manager import PersistenceManager
-from system.health_monitor import HealthMonitor
 
 
-CHECKPOINT_DIR = "checkpoints"
-MODEL_PATH = os.path.join(CHECKPOINT_DIR, "ppo_model.pt")
-QTABLE_PATH = os.path.join(CHECKPOINT_DIR, "q_table.json")
-STATE_PATH = os.path.join(CHECKPOINT_DIR, "runtime_state.json")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def ensure_dirs():
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+class RobustGreenAgentRuntime:
+
+    def __init__(self, config: Dict):
+
+        self.config = config
+        self.checkpoint_path = "runtime_checkpoint.json"
+
+        # Core Engines
+        self.policy_engine = PolicyEngine(
+            energy_budget=config["energy_budget"],
+            baseline_energy=config.get("baseline_energy")
+        )
+
+        self.negawatt = NegawattReward(config.get("baseline_energy", 1000))
+
+        self.q_agent = QLearningAgent(
+            state_space=10,
+            action_space=5,
+            persistence_path="q_table.pkl"
+        )
+
+        self.ppo = PPOTrainer(
+            state_dim=10,
+            action_dim=5
+        )
+
+        self.distributed = DistributedCoordinator()
+
+        self.carbon_provider = CarbonIntensityProvider(
+            region=config.get("region")
+        )
+
+        self.eco_controller = EcoModeController(self.policy_engine)
+
+        self.quantum_metric = QuantumEfficiencyMetric()
+        self.pareto = ParetoAnalyzer()
+
+        self.telemetry = TelemetryExporter()
+
+        self.total_energy = 0.0
+        self.total_accuracy = 0.0
+        self.total_carbon = 0.0
+
+        self.episode = 0
+
+    # ------------------------------------------------
+    # Meta-Cognitive Lifecycle
+    # ------------------------------------------------
+
+    def plan(self):
+        logger.info("Planning phase...")
+        return {"strategy": "adaptive"}
+
+    def execute(self, task):
+        logger.info("Execution phase...")
+
+        energy_used = random.uniform(20, 100)
+        accuracy = random.uniform(0.7, 1.0)
+
+        quantum_energy = energy_used * 0.2
+
+        return {
+            "energy": energy_used,
+            "accuracy": accuracy,
+            "quantum_energy": quantum_energy
+        }
+
+    def reflect(self, result):
+        logger.info("Reflection phase...")
+
+        reward = self.negawatt.combined_reward(
+            accuracy=result["accuracy"],
+            energy=result["energy"]
+        )
+
+        state = random.randint(0, 9)
+        action = random.randint(0, 4)
+
+        self.q_agent.update(state, action, reward)
+
+        self.ppo.store_transition(state, action, reward)
+
+        return reward
+
+    # ------------------------------------------------
+    # Carbon-aware Adaptation
+    # ------------------------------------------------
+
+    def carbon_adapt(self):
+        intensity = self.carbon_provider.get_current_intensity()
+        self.eco_controller.update(intensity)
+
+    # ------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------
+
+    def save_checkpoint(self):
+        data = {
+            "episode": self.episode,
+            "total_energy": self.total_energy,
+            "total_accuracy": self.total_accuracy,
+            "total_carbon": self.total_carbon
+        }
+        with open(self.checkpoint_path, "w") as f:
+            json.dump(data, f)
+
+        logger.info("Checkpoint saved.")
+
+    def load_checkpoint(self):
+        if os.path.exists(self.checkpoint_path):
+            with open(self.checkpoint_path) as f:
+                data = json.load(f)
+
+            self.episode = data["episode"]
+            self.total_energy = data["total_energy"]
+            self.total_accuracy = data["total_accuracy"]
+            self.total_carbon = data["total_carbon"]
+
+            logger.info("Checkpoint restored.")
+
+    # ------------------------------------------------
+    # Stress Testing
+    # ------------------------------------------------
+
+    def chaos_injection(self):
+        if random.random() < 0.05:
+            raise RuntimeError("Injected failure for robustness testing.")
+
+    # ------------------------------------------------
+    # Main Loop
+    # ------------------------------------------------
+
+    def run(self, num_episodes=10):
+
+        self.load_checkpoint()
+
+        for _ in range(num_episodes):
+
+            try:
+                self.episode += 1
+
+                self.chaos_injection()
+
+                self.carbon_adapt()
+
+                task = self.plan()
+
+                result = self.execute(task)
+
+                reward = self.reflect(result)
+
+                self.total_energy += result["energy"]
+                self.total_accuracy += result["accuracy"]
+                self.total_carbon += (
+                    result["energy"] *
+                    self.carbon_provider.get_current_intensity() / 1000
+                )
+
+                # Quantum efficiency update
+                self.quantum_metric.add_quantum_energy(
+                    result["quantum_energy"]
+                )
+                self.quantum_metric.set_task_completion_ratio(
+                    result["accuracy"]
+                )
+
+                # Pareto tracking
+                self.pareto.add_record(
+                    energy_joules=result["energy"],
+                    accuracy=result["accuracy"] * 100,
+                    carbon_grams=result["energy"] *
+                    self.carbon_provider.get_current_intensity() / 1000,
+                    label=f"Episode_{self.episode}",
+                    metadata={"reward": reward}
+                )
+
+                # Distributed coordination sync
+                self.distributed.sync_state(self.episode)
+
+                # Telemetry
+                self.telemetry.export(
+                    episode=self.episode,
+                    energy=result["energy"],
+                    accuracy=result["accuracy"],
+                    reward=reward
+                )
+
+                # PPO training periodically
+                if self.episode % 5 == 0:
+                    self.ppo.train()
+
+                self.save_checkpoint()
+
+            except Exception as e:
+                logger.error("Crash detected. Recovering...")
+                logger.error(traceback.format_exc())
+                self.load_checkpoint()
+
+        # Final exports
+        frontier = self.pareto.compute_frontier()
+        self.pareto.export_json()
+
+        quantum_eff = self.quantum_metric.compute()
+
+        logger.info("Run completed.")
+        logger.info(f"Quantum Efficiency: {quantum_eff}")
+        logger.info(f"Pareto frontier size: {len(frontier)}")
 
 
-def save_runtime_state(state):
-    PersistenceManager.atomic_json_save(state, STATE_PATH)
+# ------------------------------------------------
+# Entry
+# ------------------------------------------------
 
+if __name__ == "__main__":
 
-def load_runtime_state():
-    if os.path.exists(STATE_PATH):
-        import json
-        with open(STATE_PATH) as f:
-            return json.load(f)
-    return {"episode": 0}
+    config = {
+        "energy_budget": 10000,
+        "baseline_energy": 120,
+        "region": "ID"
+    }
 
-
-def run():
-
-    ensure_dirs()
-
-    # ---- CONFIG ----
-    ppo_config = PPOConfig()
-    system_config = SystemConfig()
-
-    # ---- COMPONENTS ----
-    agent = PPOAgent(ppo_config)
-    q_memory = QMemory(QTABLE_PATH)
-    reward_normalizer = RewardNormalizer()
-    policy_engine = PolicyEngine(
-        energy_budget=system_config.energy_budget,
-        baseline_energy=50.0
-    )
-    registry = AgentRegistry()
-    monitor = HealthMonitor()
-
-    # ---- RECOVERY ----
-    PersistenceManager.load_model(agent.model, MODEL_PATH)
-    q_memory.load()
-
-    runtime_state = load_runtime_state()
-    start_episode = runtime_state["episode"]
-
-    print(f"[INFO] Resuming from episode {start_episode}")
-
-    episode = start_episode
-
-    while True:
-
-        try:
-            # 1️⃣ Simulate environment interaction
-            state = agent.get_state()
-            action = agent.select_action(state)
-
-            accuracy, energy, carbon = agent.execute(action)
-
-            # 2️⃣ Sustainability reward
-            sustain_reward = policy_engine.compute_sustainability_reward(
-                accuracy,
-                energy
-            )
-
-            total_reward = accuracy + sustain_reward
-
-            # 3️⃣ Normalize reward
-            reward_normalizer.update(total_reward)
-            total_reward = reward_normalizer.normalize(total_reward)
-
-            # 4️⃣ PPO update
-            loss = agent.update(state, action, total_reward)
-
-            # 5️⃣ Health checks
-            monitor.check_loss(loss)
-            monitor.check_energy(energy, system_config.energy_budget)
-            monitor.check_reward(total_reward)
-
-            # 6️⃣ QMemory update
-            q_memory.update(state, action, total_reward)
-
-            # 7️⃣ Telemetry record
-            record = create_episode_record(
-                episode,
-                accuracy,
-                energy,
-                carbon,
-                total_reward,
-                provenance_energy="measured",
-                provenance_carbon="forecast"
-            )
-
-            # 8️⃣ Distributed registry update
-            registry.register(agent.agent_id, record)
-
-            # 9️⃣ Periodic save
-            if episode % system_config.save_interval == 0:
-                PersistenceManager.atomic_model_save(agent.model, MODEL_PATH)
-                q_memory.save()
-                save_runtime_state({"episode": episode})
-
-            # 🔟 Periodic coordination
-            if episode % system_config.coordinator_sync_interval == 0:
-                global_metrics = registry.aggregate()
-                print(f"[INFO] Coordinator sees {len(global_metrics)} agents")
-
-            episode += 1
-
-        except Exception as e:
-            print("[CRASH DETECTED]")
-            traceback.print_exc()
-
-            # Save crash snapshot
-            PersistenceManager.atomic_model_save(agent.model, MODEL_PATH)
-            q_memory.save()
-            save_runtime_state({"episode": episode})
-
-            print("[INFO] Recovery checkpoint saved. Restarting in 3 seconds...")
-            time.sleep(3)
+    runtime = RobustGreenAgentRuntime(config)
+    runtime.run(num_episodes=20)
