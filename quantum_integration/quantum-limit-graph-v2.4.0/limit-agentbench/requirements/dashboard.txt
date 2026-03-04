@@ -1,0 +1,19 @@
+# Green Agent - Dashboard Requirements
+# Location: requirements/dashboard.txt
+
+-r base.txt
+
+# FastAPI backend
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+websockets>=12.0
+
+# Plotly Dash frontend
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+plotly>=5.18.0
+
+# Data processing for visualization
+pandas>=2.0.0
+numpy>=1.24.0
