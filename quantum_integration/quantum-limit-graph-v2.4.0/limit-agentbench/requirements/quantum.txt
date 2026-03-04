@@ -1,0 +1,15 @@
+# Green Agent - Quantum Efficiency Requirements
+# Location: requirements/quantum.txt
+
+-r base.txt
+
+# Quantum simulation
+qiskit>=0.45.0
+qiskit-aer>=0.13.0
+
+# Linear algebra
+scipy>=1.10.0
+numpy>=1.24.0
+
+# Network analysis (for quantum walks on graphs)
+networkx>=3.1
