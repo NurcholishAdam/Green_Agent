@@ -1,0 +1,13 @@
+# Green Agent - Distributed Runtime Requirements
+# Location: requirements/distributed.txt
+
+-r base.txt
+
+# Ray for distributed execution
+ray[default]>=2.9.0
+ray[serve]>=2.9.0
+
+# Resource management
+psutil>=5.9.0
+gputil>=1.4.0
+py-cpuinfo>=9.0.0
