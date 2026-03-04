@@ -1,0 +1,26 @@
+# Green Agent Advanced Modules - Base Requirements
+# Location: requirements/base.txt
+
+# Core dependencies
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# Async and concurrency
+asyncio>=3.4.3
+aiohttp>=3.8.0
+
+# Logging and monitoring
+python-json-logger>=2.0.7
+colorlog>=6.7.0
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Data structures
+dataclasses-json>=0.6.0
+
+# Utilities
+tqdm>=4.65.0
+click>=8.1.0
