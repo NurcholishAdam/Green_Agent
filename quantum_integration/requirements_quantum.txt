@@ -1,0 +1,30 @@
+# File: quantum_integration/requirements_quantum.txt
+
+# Core dependencies
+pennylane>=0.32.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Quantum computing
+qiskit>=0.44.0
+qiskit-aer>=0.12.0
+
+# Machine learning
+torch>=2.0.0
+tensorflow>=2.13.0
+
+# Async support
+asyncio>=3.4.3
+aiohttp>=3.8.0
+
+# Visualization
+matplotlib>=3.7.0
+plotly>=5.15.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
