@@ -1,34 +1,369 @@
-apiVersion: ray.io/v1alpha1
+# File: k8s/ray-cluster.yaml
+
+apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
-  name: green-ai-ray-cluster
+  name: green-agent-cluster
+  namespace: green-agent
+  labels:
+    app: green-agent
+    version: "5.0.0"
 spec:
-  rayVersion: "2.9.0"
-
+  # Ray head node configuration
   headGroupSpec:
-    serviceType: ClusterIP
-    replicas: 1
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+      dashboard-port: '8265'
+      metrics-export-port: '8080'
+      num-cpus: '4'
+      num-gpus: '0'
+      object-store-memory: '1073741824'
     template:
+      metadata:
+        labels:
+          app: green-agent
+          component: head
       spec:
         containers:
         - name: ray-head
-          image: rayproject/ray:latest
+          image: nurcholish/green-agent:latest
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 6379
+            name: gcs
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 8000
+            name: api
+          - containerPort: 8080
+            name: metrics
+          - containerPort: 10001
+            name: client
+          env:
+          - name: RAY_DISABLE_DOCKER_CPU_WARNING
+            value: "1"
+          - name: CARBON_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: carbon-api-key
+          - name: QUANTUM_ENABLED
+            value: "true"
+          - name: MODE
+            value: "unified"
           resources:
-            limits:
+            requests:
               cpu: "2"
               memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+          - name: data-volume
+            mountPath: /app/data
+          - name: logs-volume
+            mountPath: /app/logs
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: green-agent-data-pvc
+        - name: logs-volume
+          emptyDir: {}
 
+  # Worker node groups
   workerGroupSpecs:
-  - replicas: 2
+  # Standard workers
+  - replicas: 4
     minReplicas: 2
-    maxReplicas: 10
-    groupName: green-workers
+    maxReplicas: 20
+    groupName: standard-workers
+    rayStartParams:
+      num-cpus: '4'
+      num-gpus: '0'
+      memory: '8589934592'  # 8GB
     template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+          worker-type: standard
       spec:
         containers:
         - name: ray-worker
-          image: rayproject/ray:latest
+          image: nurcholish/green-agent:latest
+          imagePullPolicy: Always
+          env:
+          - name: RAY_HEAD_IP
+            value: "green-agent-cluster-head-svc"
+          - name: CARBON_AWARE_WORKER
+            value: "true"
           resources:
-            limits:
+            requests:
               cpu: "2"
               memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+
+  # GPU workers (for ML training)
+  - replicas: 0  # Scaled to 0 by default, scale up when needed
+    minReplicas: 0
+    maxReplicas: 8
+    groupName: gpu-workers
+    rayStartParams:
+      num-cpus: '8'
+      num-gpus: '1'
+      memory: '17179869184'  # 16GB
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+          worker-type: gpu
+      spec:
+        containers:
+        - name: ray-worker-gpu
+          image: nurcholish/green-agent:gpu-latest
+          imagePullPolicy: Always
+          env:
+          - name: RAY_HEAD_IP
+            value: "green-agent-cluster-head-svc"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+        nodeSelector:
+          nvidia.com/gpu: "true"
+        tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+  # Quantum workers (for quantum simulation)
+  - replicas: 2
+    minReplicas: 1
+    maxReplicas: 10
+    groupName: quantum-workers
+    rayStartParams:
+      num-cpus: '8'
+      num-gpus: '0'
+      memory: '34359738368'  # 32GB
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+          worker-type: quantum
+      spec:
+        containers:
+        - name: ray-worker-quantum
+          image: nurcholish/green-agent:quantum-latest
+          imagePullPolicy: Always
+          env:
+          - name: RAY_HEAD_IP
+            value: "green-agent-cluster-head-svc"
+          - name: QUANTUM_WORKER
+            value: "true"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+
+  # Carbon-aware autoscaling
+  autoscalerOptions:
+    upscalingMode: Conservative
+    idleTimeoutSeconds: 300
+    securityContext:
+      runAsUser: 1000
+    env:
+    - name: CARBON_AWARE_AUTOSCALING
+      value: "true"
+    - name: CARBON_INTENSITY_THRESHOLD
+      value: "200"  # gCO2/kWh
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    
+    # Custom metrics for carbon-aware scaling
+    metrics:
+    - type: External
+      external:
+        metric:
+          name: carbon_intensity
+          selector:
+            matchLabels:
+              app: green-agent
+        target:
+          type: AverageValue
+          averageValue: "150"  # gCO2/kWh target
+    
+    # Scaling policies
+    upscalingPolicy:
+      - metricType: CarbonIntensity
+        threshold: 100  # Scale up when carbon is low
+        value: 2        # Add 2 workers
+    downscalingPolicy:
+      - metricType: CarbonIntensity
+        threshold: 300  # Scale down when carbon is high
+        value: 1        # Remove 1 worker
+
+---
+# Service for Ray Dashboard
+apiVersion: v1
+kind: Service
+metadata:
+  name: green-agent-dashboard
+  namespace: green-agent
+  labels:
+    app: green-agent
+spec:
+  type: LoadBalancer
+  ports:
+  - name: dashboard
+    port: 8265
+    targetPort: 8265
+    protocol: TCP
+  - name: api
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  selector:
+    app: green-agent
+    component: head
+
+---
+# ConfigMap for configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: green-agent-config
+  namespace: green-agent
+data:
+  green_agent_config.yaml: |
+    system:
+      mode: "unified"
+      enable_telemetry: true
+    
+    ray:
+      enabled: true
+      carbon_aware_scaling: true
+    
+    quantum:
+      enabled: true
+      backend: "simulator"
+    
+    dashboard:
+      enabled: true
+      port: 8000
+
+---
+# Persistent Volume Claim for data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: green-agent-data-pvc
+  namespace: green-agent
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: standard
+
+---
+# Horizontal Pod Autoscaler (Carbon-Aware)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: green-agent-hpa
+  namespace: green-agent
+spec:
+  scaleTargetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: green-agent-cluster
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: External
+    external:
+      metric:
+        name: carbon_intensity
+        selector:
+          matchLabels:
+            app: green-agent
+      target:
+        type: AverageValue
+        averageValue: "150"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+
+---
+# Prometheus monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: green-agent-monitor
+  namespace: green-agent
+  labels:
+    app: green-agent
+spec:
+  selector:
+    matchLabels:
+      app: green-agent
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
