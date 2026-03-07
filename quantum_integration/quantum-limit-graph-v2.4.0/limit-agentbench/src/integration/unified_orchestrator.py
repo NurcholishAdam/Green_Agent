@@ -1,16 +1,21 @@
-# File: src/integration/unified_orchestrator.py
+"""
+Unified Green Agent Orchestrator v5.0.0
+
+NEW: Central coordination layer managing all 12 layers of execution
+"""
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
+import asyncio
 
 @dataclass
 class UnifiedResult:
     """
     Unified result object for Green Agent execution
     
-    FIXED: Added proper metrics attribute and all required fields
+    NEW: Comprehensive result tracking with metrics
     """
     # Core execution results
     success: bool = True
@@ -29,7 +34,7 @@ class UnifiedResult:
     carbon_saved: float = 0.0     # kg CO₂ saved vs baseline
     efficiency_score: float = 0.0
     
-    # ⚠️ FIXED: Proper metrics dictionary
+    # Metrics dictionary
     metrics: Dict[str, Any] = field(default_factory=dict)
     
     # Additional metadata
@@ -38,7 +43,7 @@ class UnifiedResult:
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     
-    # Quantum-specific (if enabled)
+    # Quantum-specific
     quantum_advantage: float = 0.0
     circuit_depth: int = 0
     error_mitigation_applied: bool = False
@@ -69,11 +74,6 @@ class UnifiedResult:
         """Convert to JSON string"""
         return json.dumps(self.to_dict(), indent=indent)
     
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'UnifiedResult':
-        """Create UnifiedResult from dictionary"""
-        return cls(**data)
-    
     def add_metric(self, key: str, value: Any):
         """Add a metric to the metrics dictionary"""
         self.metrics[key] = value
@@ -87,21 +87,26 @@ class UnifiedResult:
         self.errors.append(error)
         self.success = False
 
-# File: src/integration/unified_orchestrator.py
 
 class UnifiedGreenAgent:
     """
     Unified Green Agent Orchestrator
-    Coordinates all 12 layers of sustainable AI execution
+    
+    NEW FEATURES:
+    - 12-layer coordination
+    - Carbon-aware decision making
+    - Distributed execution via Ray
+    - Quantum integration support
+    - Comprehensive error handling
+    - Real-time metrics collection
     """
     
     def __init__(self, config: Dict):
         self.config = config
         self.initialized = False
         
-        # Initialize components (will be set in initialize())
+        # Components (initialized in initialize())
         self.interpreter = None
-        self.meta_cognition = None
         self.decision_core = None
         self.data_optimizer = None
         self.ray_executor = None
@@ -114,7 +119,7 @@ class UnifiedGreenAgent:
         print("🔧 Initializing Unified Green Agent components...")
         
         try:
-            # Import and initialize components
+            # Import components
             from src.interpretation.workload_interpreter import WorkloadInterpreter
             from src.decision.carbon_aware_decision_core import CarbonAwareDecisionCore
             from src.optimization.synthetic_data_optimizer import DataOptimizer
@@ -123,6 +128,7 @@ class UnifiedGreenAgent:
             from src.benchmarking.benchmark_intelligence import BenchmarkEngine
             from src.carbon.forecasting_engine import CarbonForecaster
             
+            # Instantiate components
             self.interpreter = WorkloadInterpreter(self.config)
             self.decision_core = CarbonAwareDecisionCore(self.config)
             self.data_optimizer = DataOptimizer(self.config)
@@ -145,13 +151,27 @@ class UnifiedGreenAgent:
             
         except Exception as e:
             print(f"❌ Initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
             raise
     
     async def execute(self, task: Dict) -> UnifiedResult:
         """
         Execute task through unified orchestrator
         
-        FIXED: Properly returns UnifiedResult with metrics attribute
+        Coordinates all 12 layers:
+        0. Workload Interpretation
+        1. Meta-Cognition
+        2. Neuro-Symbolic Integration
+        3. Carbon-Aware Decision Core
+        4. ML Optimization
+        5. Data Optimization
+        6. Distributed Execution
+        7. Carbon Monitoring
+        8. Carbon Accounting
+        9. Benchmarking
+        10. Quantum Metrics
+        11. Dashboard Visualization
         """
         start_time = datetime.now()
         
@@ -169,7 +189,11 @@ class UnifiedGreenAgent:
             # Layer 0: Interpret workload
             print("📋 Layer 0: Interpreting workload...")
             profile = await self.interpreter.analyze(task)
-            result.add_metric('workload_profile', profile)
+            result.add_metric('workload_profile', {
+                'task_type': profile.task_type,
+                'complexity': profile.complexity,
+                'energy_estimate': profile.energy_estimate
+            })
             
             # Layer 3: Carbon-aware decision
             print("🌱 Layer 3: Making carbon-aware decision...")
@@ -229,7 +253,6 @@ class UnifiedGreenAgent:
             result.execution_time = (datetime.now() - start_time).total_seconds()
             print(f"❌ Task {result.task_id} failed: {e}")
             
-            # Still return result with error information
             import traceback
             result.add_error(traceback.format_exc())
         
