@@ -1,11 +1,9 @@
-# File: config/green_agent_config.yaml
-
 # Green Agent Configuration v5.0.0
-# Supports: Legacy, Unified, and Quantum-Enhanced modes
+# Complete configuration for unified system
 
 system:
   version: "5.0.0"
-  mode: "compare"  # Options: legacy | unified | compare
+  mode: "unified"  # legacy | unified | compare
   debug: false
   log_level: "INFO"
   enable_telemetry: true
@@ -17,22 +15,16 @@ dashboard:
   port: 8000
   update_interval_seconds: 5
   enable_real_time: true
-  metrics_retention_hours: 168  # 7 days
+  metrics_retention_hours: 168
 
 # Ray Distributed Runtime
 ray:
-  enabled: true
-  num_workers: 8
+  enabled: false  # Set to true for distributed execution
+  num_workers: 4
   min_workers: 2
   max_workers: 20
   dashboard_port: 8265
-  object_store_memory: 1073741824  # 1GB
   carbon_aware_scaling: true
-  autoscaling:
-    upscaling_mode: "conservative"  # aggressive | conservative
-    idle_timeout_seconds: 300
-    scale_up_cooldown_seconds: 60
-    scale_down_cooldown_seconds: 300
 
 # Carbon Management
 carbon:
@@ -41,20 +33,17 @@ carbon:
   api_key_env: "CARBON_API_KEY"
   forecast_days: 30
   update_interval_hours: 1
-  cache_enabled: true
   
   # Thresholds
-  eco_mode_threshold: 200  # gCO2/kWh - enable eco mode above this
-  defer_threshold: 400     # gCO2/kWh - defer non-urgent tasks above this
-  emergency_threshold: 600 # gCO2/kWh - only critical tasks above this
+  eco_mode_threshold: 200
+  defer_threshold: 400
+  emergency_threshold: 600
   
   # Budget tracking
   budget:
     enabled: true
     daily_limit_kg: 100.0
     weekly_limit_kg: 500.0
-    monthly_limit_kg: 2000.0
-    alert_on_80_percent: true
 
 # Policy Engine
 policy:
@@ -62,176 +51,37 @@ policy:
   enforce_lora_above_1b_params: true
   block_if_budget_exceeded: true
   
-  # Carbon-aware decision weights
   weights:
     carbon_importance: 0.4
     performance_importance: 0.3
     cost_importance: 0.2
     deadline_importance: 0.1
 
-# Machine Learning Optimization
-ml_optimization:
-  enable_quantization: true
-  quantization_bits: 8  # 8 | 4 | 2
-  enable_pruning: true
-  pruning_ratio: 0.3
-  enable_knowledge_distillation: true
-  distillation_temperature: 2.0
-
-# Quantum Integration (EXPERIMENTAL)
+# Quantum Integration
 quantum:
-  enabled: true  # 🚀 SET TO TRUE FOR QUANTUM FEATURES
+  enabled: false  # Set to true for quantum features
+  backend: "simulator"
   
-  # Quantum Hardware/Simulator
-  backend: "simulator"  # simulator | ibm_q | rigetti | ionq
-  
-  # Error Mitigation
   error_mitigation:
     enabled: true
     techniques:
       - "zero_noise_extrapolation"
       - "symmetry_verification"
-      - "probabilistic_error_cancellation"
-    extrapolation_order: 2
-    n_shots: 1000
   
-  # Variational Quantum Circuits
   vqc:
     n_qubits: 4
     n_layers: 3
-    encoding_type: "angle"  # angle | amplitude | qaoa
-    ansatz_type: "strongly_entangling"  # strongly_entangling | real_amplitudes
-    measurement_type: "expectation"
-  
-  # Multi-Agent Quantum RL
-  multi_agent:
-    enabled: true
-    n_agents: 4
-    entanglement_strategy: "full"  # full | ring | star
-    communication_rounds: 3
-    quantum_advantage_threshold: 0.7
-  
-  # Quantum-Classical Hybrid
-  hybrid:
-    use_quantum_for_policy: true
-    use_quantum_for_value: false
-    fallback_to_classical_on_error: true
-  
-  # Performance Tracking
-  metrics:
-    track_quantum_advantage: true
-    calculate_e_eff: true
-    log_circuit_depth: true
+    encoding_type: "angle"
+    ansatz_type: "strongly_entangling"
 
-# Distributed Orchestration
-orchestration:
-  scheduler: "carbon_aware"  # round_robin | carbon_aware | priority
-  
-  # Task scheduling
-  scheduling:
-    enable_deferral: true
-    max_deferral_hours: 24
-    enable_batching: true
-    batch_timeout_ms: 100
-    max_batch_size: 32
-  
-  # Resource allocation
-  resources:
-    default_cpu_limit: 2.0
-    default_memory_limit: "4Gi"
-    default_gpu_limit: 0
-    enable_gpu_sharing: true
-
-# Monitoring & Observability
+# Monitoring
 monitoring:
   prometheus:
     enabled: true
     port: 9090
-    metrics_path: "/metrics"
-  
-  grafana:
-    enabled: true
-    port: 3000
   
   logging:
     level: "INFO"
     format: "json"
     output: ["stdout", "file"]
     file_path: "logs/green_agent.log"
-    rotation: "1 day"
-  
-  alerts:
-    enabled: true
-    channels:
-      - type: "email"
-        recipients: ["admin@example.com"]
-      - type: "slack"
-        webhook_env: "SLACK_WEBHOOK"
-    
-    rules:
-      - name: "high_carbon_intensity"
-        condition: "carbon_intensity > 400"
-        severity: "warning"
-      - name: "budget_exceeded"
-        condition: "daily_carbon > daily_limit * 0.8"
-        severity: "critical"
-
-# Benchmarking
-benchmarking:
-  enabled: true
-  track_pareto_frontier: true
-  save_benchmarks: true
-  benchmark_dir: "benchmarks"
-  
-  # Metrics to track
-  metrics:
-    - "accuracy"
-    - "energy_consumption"
-    - "carbon_footprint"
-    - "latency"
-    - "throughput"
-    - "negawatt_reward"
-
-# Storage
-storage:
-  q_table:
-    backend: "persistent"  # memory | persistent | redis
-    path: "data/q_table.pkl"
-    sync_interval_seconds: 60
-  
-  results:
-    backend: "filesystem"  # filesystem | s3 | gcs
-    path: "results"
-    compression: true
-  
-  cache:
-    enabled: true
-    backend: "redis"  # memory | redis
-    ttl_seconds: 3600
-
-# Security
-security:
-  enable_auth: false
-  api_keys:
-    enabled: false
-    keys_env: "API_KEYS"
-  
-  tls:
-    enabled: false
-    cert_path: "certs/cert.pem"
-    key_path: "certs/key.pem"
-
-# Development & Testing
-development:
-  enable_profiling: false
-  enable_debug_endpoints: true
-  mock_carbon_api: false
-  simulate_quantum: true
-
-# Version-specific features
-features:
-  v5:
-    enable_unified_orchestrator: true
-    enable_quantum_integration: true
-    enable_knowledge_distillation: true
-    enable_multi_objective_optimization: true
