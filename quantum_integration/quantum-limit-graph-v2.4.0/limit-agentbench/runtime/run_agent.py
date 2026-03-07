@@ -1,249 +1,402 @@
-# runtime/run_agent.py
+#!/usr/bin/env python3
+"""
+Green Agent v5.0.0 - Unified Version (After Upgrade)
+Production-ready with full orchestration
+"""
 
-import os
-import time
+import asyncio
+import argparse
 import json
-import logging
-import traceback
-import random
-from typing import Dict
+import time
+from typing import Dict, Optional
+from dataclasses import dataclass
+from pathlib import Path
+import yaml
 
-from analytics.pareto_analyzer import ParetoAnalyzer
-from sustainability.carbon_intensity_provider import CarbonIntensityProvider
-from sustainability.eco_mode_controller import EcoModeController
-from metrics.quantum_efficiency import QuantumEfficiencyMetric
-from rewards.negawatt_reward import NegawattReward
-from rl.q_learning import QLearningAgent
-from rl.ppo_trainer import PPOTrainer
-from coordination.distributed_manager import DistributedCoordinator
-from telemetry.telemetry_exporter import TelemetryExporter
-from policy.policy_engine import PolicyEngine
+# Import unified orchestrator
+from src.integration.unified_orchestrator import UnifiedGreenAgent, UnifiedResult
+from src.interpretation.workload_interpreter import WorkloadInterpreter
+from src.carbon.task_carbon_profiler import CarbonProfiler
+from dashboard.api_server import DashboardAPI
 
+@dataclass
+class ExecutionResult:
+    """Result from agent execution"""
+    mode: str
+    execution_time: float
+    energy_consumed: float
+    carbon_emitted: float
+    accuracy: float
+    negawatt_reward: float
+    metrics: Dict
+    success: bool = True
+    errors: list = None
+    
+    def __post_init__(self):
+        if self.errors is None:
+            self.errors = []
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-class RobustGreenAgentRuntime:
-
-    def __init__(self, config: Dict):
-
-        self.config = config
-        self.checkpoint_path = "runtime_checkpoint.json"
-
-        # Core Engines
-        self.policy_engine = PolicyEngine(
-            energy_budget=config["energy_budget"],
-            baseline_energy=config.get("baseline_energy")
-        )
-
-        self.negawatt = NegawattReward(config.get("baseline_energy", 1000))
-
-        self.q_agent = QLearningAgent(
-            state_space=10,
-            action_space=5,
-            persistence_path="q_table.pkl"
-        )
-
-        self.ppo = PPOTrainer(
-            state_dim=10,
-            action_dim=5
-        )
-
-        self.distributed = DistributedCoordinator()
-
-        self.carbon_provider = CarbonIntensityProvider(
-            region=config.get("region")
-        )
-
-        self.eco_controller = EcoModeController(self.policy_engine)
-
-        self.quantum_metric = QuantumEfficiencyMetric()
-        self.pareto = ParetoAnalyzer()
-
-        self.telemetry = TelemetryExporter()
-
-        self.total_energy = 0.0
-        self.total_accuracy = 0.0
-        self.total_carbon = 0.0
-
-        self.episode = 0
-
-    # ------------------------------------------------
-    # Meta-Cognitive Lifecycle
-    # ------------------------------------------------
-
-    def plan(self):
-        logger.info("Planning phase...")
-        return {"strategy": "adaptive"}
-
-    def execute(self, task):
-        logger.info("Execution phase...")
-
-        energy_used = random.uniform(20, 100)
-        accuracy = random.uniform(0.7, 1.0)
-
-        quantum_energy = energy_used * 0.2
-
+class GreenAgentRunner:
+    """
+    Main agent runner with multi-mode support
+    
+    NEW FEATURES:
+    - Three execution modes (legacy/unified/compare)
+    - Dashboard integration
+    - Comprehensive error handling
+    - Metrics collection
+    """
+    
+    def __init__(self, config_path: str = "config/green_agent_config.yaml"):
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+        
+        self.mode = self.config['system']['mode']
+        self.unified_agent = None
+        self.legacy_components = {}
+        self.dashboard = None
+        self.start_time = None
+        
+    async def initialize(self):
+        """Initialize components based on mode"""
+        self.start_time = time.time()
+        print(f"🚀 Initializing Green Agent v5.0.0 in '{self.mode}' mode...\n")
+        
+        if self.mode in ['unified', 'compare']:
+            print("🔧 Initializing unified components...")
+            self.unified_agent = UnifiedGreenAgent(self.config)
+            await self.unified_agent.initialize()
+            print("✅ Unified agent initialized\n")
+        
+        if self.mode in ['legacy', 'compare']:
+            print("🔧 Initializing legacy components...")
+            await self._initialize_legacy_components()
+            print("✅ Legacy components initialized\n")
+        
+        # Initialize dashboard
+        if self.config.get('dashboard', {}).get('enabled', True):
+            print("📊 Starting dashboard...")
+            self.dashboard = DashboardAPI(self.config)
+            await self.dashboard.start()
+            print(f"✅ Dashboard available at: http://localhost:8000\n")
+    
+    async def _initialize_legacy_components(self):
+        """Initialize legacy components for backward compatibility"""
+        from policy.policy_engine import PolicyEngine
+        from rewards.negawatt_reward import NegawattRewardCalculator
+        from carbon.carbon_forecast import CarbonForecaster
+        
+        self.legacy_components = {
+            'policy_engine': PolicyEngine(self.config),
+            'negawatt_calculator': NegawattRewardCalculator(self.config),
+            'carbon_forecaster': CarbonForecaster(self.config)
+        }
+        
+        # Initialize each
+        for name, component in self.legacy_components.items():
+            if hasattr(component, 'initialize'):
+                await component.initialize()
+    
+    async def execute_task(self, task: Dict) -> ExecutionResult:
+        """Execute task based on current mode"""
+        start_time = time.time()
+        
+        try:
+            if self.mode == 'unified':
+                result = await self._execute_unified(task)
+            elif self.mode == 'legacy':
+                result = await self._execute_legacy(task)
+            elif self.mode == 'compare':
+                result = await self._execute_comparison(task)
+            else:
+                raise ValueError(f"Unknown mode: {self.mode}")
+            
+            execution_time = time.time() - start_time
+            
+            return ExecutionResult(
+                mode=self.mode,
+                execution_time=execution_time,
+                **result
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return ExecutionResult(
+                mode=self.mode,
+                execution_time=execution_time,
+                energy_consumed=0,
+                carbon_emitted=0,
+                accuracy=0,
+                negawatt_reward=0,
+                metrics={'error': str(e)},
+                success=False,
+                errors=[str(e)]
+            )
+    
+    async def _execute_unified(self, task: Dict) -> Dict:
+        """Execute using unified orchestrator"""
+        print("🔄 Executing with Unified Green Agent...")
+        
+        result = await self.unified_agent.execute(task)
+        
+        # Log to dashboard
+        if self.dashboard:
+            await self.dashboard.log_execution({
+                'mode': 'unified',
+                'task_id': result.task_id,
+                'energy': result.energy_consumed,
+                'carbon': result.carbon_emitted,
+                'accuracy': result.accuracy,
+                'negawatt_reward': result.negawatt_reward,
+                'timestamp': time.time()
+            })
+        
         return {
-            "energy": energy_used,
-            "accuracy": accuracy,
-            "quantum_energy": quantum_energy
+            'energy_consumed': result.energy_consumed,
+            'carbon_emitted': result.carbon_emitted,
+            'accuracy': result.accuracy,
+            'negawatt_reward': result.negawatt_reward,
+            'metrics': result.metrics,
+            'success': result.success
         }
-
-    def reflect(self, result):
-        logger.info("Reflection phase...")
-
-        reward = self.negawatt.combined_reward(
-            accuracy=result["accuracy"],
-            energy=result["energy"]
+    
+    async def _execute_legacy(self, task: Dict) -> Dict:
+        """Execute using legacy components"""
+        print("🔄 Executing with Legacy Components...")
+        
+        # Legacy execution flow
+        policy_engine = self.legacy_components['policy_engine']
+        negawatt_calc = self.legacy_components['negawatt_calculator']
+        forecaster = self.legacy_components['carbon_forecaster']
+        
+        # Get carbon forecast
+        carbon_intensity = await forecaster.get_current_intensity()
+        
+        # Apply policy
+        policy_decision = await policy_engine.evaluate(task, carbon_intensity)
+        
+        # Execute task (simplified simulation)
+        accuracy = 0.85
+        energy = 1.5  # kWh
+        
+        # Calculate negawatt reward
+        negawatt_reward = await negawatt_calc.calculate(
+            energy_used=energy,
+            baseline_energy=2.0,
+            task_difficulty=0.7
         )
-
-        state = random.randint(0, 9)
-        action = random.randint(0, 4)
-
-        self.q_agent.update(state, action, reward)
-
-        self.ppo.store_transition(state, action, reward)
-
-        return reward
-
-    # ------------------------------------------------
-    # Carbon-aware Adaptation
-    # ------------------------------------------------
-
-    def carbon_adapt(self):
-        intensity = self.carbon_provider.get_current_intensity()
-        self.eco_controller.update(intensity)
-
-    # ------------------------------------------------
-    # Checkpointing
-    # ------------------------------------------------
-
-    def save_checkpoint(self):
-        data = {
-            "episode": self.episode,
-            "total_energy": self.total_energy,
-            "total_accuracy": self.total_accuracy,
-            "total_carbon": self.total_carbon
+        
+        carbon_emitted = energy * carbon_intensity / 1000
+        
+        return {
+            'energy_consumed': energy,
+            'carbon_emitted': carbon_emitted,
+            'accuracy': accuracy,
+            'negawatt_reward': negawatt_reward,
+            'metrics': {
+                'policy_decision': policy_decision,
+                'carbon_intensity': carbon_intensity
+            },
+            'success': True
         }
-        with open(self.checkpoint_path, "w") as f:
-            json.dump(data, f)
+    
+    async def _execute_comparison(self, task: Dict) -> Dict:
+        """Execute both modes and compare results"""
+        print("=" * 70)
+        print("📊 RUNNING COMPARISON MODE: Unified vs Legacy")
+        print("=" * 70 + "\n")
+        
+        # Execute unified
+        print("1️⃣ Running Unified Agent...")
+        unified_start = time.time()
+        unified_result = await self._execute_unified(task)
+        unified_time = time.time() - unified_start
+        
+        # Execute legacy
+        print("\n2️⃣ Running Legacy Components...")
+        legacy_start = time.time()
+        legacy_result = await self._execute_legacy(task)
+        legacy_time = time.time() - legacy_start
+        
+        # Compare results
+        print("\n" + "=" * 70)
+        print("📈 COMPARISON RESULTS")
+        print("=" * 70)
+        
+        comparison = self._generate_comparison(
+            unified_result, legacy_result,
+            unified_time, legacy_time
+        )
+        
+        self._print_comparison(comparison)
+        
+        # Save comparison to file
+        comparison_file = Path("results/comparison_results.json")
+        comparison_file.parent.mkdir(exist_ok=True)
+        with open(comparison_file, 'w') as f:
+            json.dump(comparison, f, indent=2)
+        
+        print(f"\n💾 Comparison saved to: {comparison_file}")
+        print("=" * 70 + "\n")
+        
+        return unified_result  # Return unified as primary result
+    
+    def _generate_comparison(self, unified: Dict, legacy: Dict, 
+                            unified_time: float, legacy_time: float) -> Dict:
+        """Generate comparison metrics"""
+        
+        energy_improvement = (
+            (legacy['energy_consumed'] - unified['energy_consumed']) / 
+            legacy['energy_consumed'] * 100
+        ) if legacy['energy_consumed'] > 0 else 0
+        
+        carbon_improvement = (
+            (legacy['carbon_emitted'] - unified['carbon_emitted']) / 
+            legacy['carbon_emitted'] * 100
+        ) if legacy['carbon_emitted'] > 0 else 0
+        
+        speed_improvement = (
+            (legacy_time - unified_time) / legacy_time * 100
+        ) if legacy_time > 0 else 0
+        
+        return {
+            'timestamp': time.time(),
+            'task_id': 'comparison_run',
+            'unified': {
+                'execution_time': unified_time,
+                'energy_kwh': unified['energy_consumed'],
+                'carbon_kg': unified['carbon_emitted'],
+                'accuracy': unified['accuracy'],
+                'negawatt_reward': unified['negawatt_reward']
+            },
+            'legacy': {
+                'execution_time': legacy_time,
+                'energy_kwh': legacy['energy_consumed'],
+                'carbon_kg': legacy['carbon_emitted'],
+                'accuracy': legacy['accuracy'],
+                'negawatt_reward': legacy['negawatt_reward']
+            },
+            'improvements': {
+                'energy_reduction_percent': energy_improvement,
+                'carbon_reduction_percent': carbon_improvement,
+                'speed_improvement_percent': speed_improvement,
+                'energy_saved_kwh': legacy['energy_consumed'] - unified['energy_consumed'],
+                'carbon_saved_kg': legacy['carbon_emitted'] - unified['carbon_emitted']
+            },
+            'verdict': self._generate_verdict(energy_improvement, carbon_improvement)
+        }
+    
+    def _generate_verdict(self, energy_imp: float, carbon_imp: float) -> str:
+        """Generate verdict based on improvements"""
+        if energy_imp > 50 and carbon_imp > 50:
+            return "✅ UNIFIED MODE SIGNIFICANTLY OUTPERFORMS LEGACY"
+        elif energy_imp > 20 and carbon_imp > 20:
+            return "✅ UNIFIED MODE SHOWS MODERATE IMPROVEMENT"
+        elif energy_imp > 0 or carbon_imp > 0:
+            return "⚠️  UNIFIED MODE SHOWS SLIGHT IMPROVEMENT"
+        else:
+            return "❌ LEGACY MODE PERFORMS BETTER (investigation needed)"
+    
+    def _print_comparison(self, comparison: Dict):
+        """Print comparison results in formatted way"""
+        imp = comparison['improvements']
+        
+        print(f"\n{'Metric':<30} {'Unified':<15} {'Legacy':<15} {'Improvement':<15}")
+        print("-" * 75)
+        print(f"{'Execution Time (s)':<30} {comparison['unified']['execution_time']:<15.4f} "
+              f"{comparison['legacy']['execution_time']:<15.4f} "
+              f"{imp['speed_improvement_percent']:+.1f}%")
+        print(f"{'Energy (kWh)':<30} {comparison['unified']['energy_kwh']:<15.4f} "
+              f"{comparison['legacy']['energy_kwh']:<15.4f} "
+              f"{imp['energy_reduction_percent']:+.1f}%")
+        print(f"{'Carbon (kg CO₂)':<30} {comparison['unified']['carbon_kg']:<15.4f} "
+              f"{comparison['legacy']['carbon_kg']:<15.4f} "
+              f"{imp['carbon_reduction_percent']:+.1f}%")
+        print(f"{'Accuracy':<30} {comparison['unified']['accuracy']:<15.4f} "
+              f"{comparison['legacy']['accuracy']:<15.4f} "
+              f"{'-':<15}")
+        print(f"{'Negawatt Reward':<30} {comparison['unified']['negawatt_reward']:<15.4f} "
+              f"{comparison['legacy']['negawatt_reward']:<15.4f} "
+              f"{'-':<15}")
+        
+        print(f"\n🎯 VERDICT: {comparison['verdict']}")
+        print(f"💾 Energy Saved: {imp['energy_saved_kwh']:.4f} kWh")
+        print(f"🌱 Carbon Saved: {imp['carbon_saved_kg']:.4f} kg CO₂")
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        print("\n🛑 Shutting down Green Agent...")
+        
+        if self.dashboard:
+            await self.dashboard.stop()
+        
+        if self.unified_agent:
+            await self.unified_agent.shutdown()
+        
+        print("✅ Shutdown complete")
 
-        logger.info("Checkpoint saved.")
 
-    def load_checkpoint(self):
-        if os.path.exists(self.checkpoint_path):
-            with open(self.checkpoint_path) as f:
-                data = json.load(f)
+async def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='Green Agent Runner v5.0.0')
+    parser.add_argument('--mode', choices=['legacy', 'unified', 'compare'],
+                       default='unified', help='Execution mode')
+    parser.add_argument('--config', default='config/green_agent_config.yaml',
+                       help='Path to config file')
+    parser.add_argument('--task', type=str, help='Task JSON file')
+    
+    args = parser.parse_args()
+    
+    # Create runner
+    runner = GreenAgentRunner(config_path=args.config)
+    
+    try:
+        # Initialize
+        await runner.initialize()
+        
+        # Load or create task
+        if args.task:
+            with open(args.task, 'r') as f:
+                task = json.load(f)
+        else:
+            # Default test task
+            task = {
+                'id': 'test_task_001',
+                'type': 'ml_inference',
+                'model_size': '1B',
+                'input_size': '1MB',
+                'deadline': time.time() + 3600,
+                'priority': 5
+            }
+        
+        # Execute
+        result = await runner.execute_task(task)
+        
+        # Print results
+        print("\n" + "=" * 70)
+        print("✅ EXECUTION COMPLETE")
+        print("=" * 70)
+        print(f"Mode: {result.mode}")
+        print(f"Success: {result.success}")
+        print(f"Execution Time: {result.execution_time:.4f}s")
+        print(f"Energy Consumed: {result.energy_consumed:.4f} kWh")
+        print(f"Carbon Emitted: {result.carbon_emitted:.4f} kg CO₂")
+        print(f"Accuracy: {result.accuracy:.4f}")
+        print(f"Negawatt Reward: {result.negawatt_reward:.4f}")
+        
+        if result.errors:
+            print(f"Errors: {result.errors}")
+        
+        print("=" * 70 + "\n")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        await runner.shutdown()
 
-            self.episode = data["episode"]
-            self.total_energy = data["total_energy"]
-            self.total_accuracy = data["total_accuracy"]
-            self.total_carbon = data["total_carbon"]
-
-            logger.info("Checkpoint restored.")
-
-    # ------------------------------------------------
-    # Stress Testing
-    # ------------------------------------------------
-
-    def chaos_injection(self):
-        if random.random() < 0.05:
-            raise RuntimeError("Injected failure for robustness testing.")
-
-    # ------------------------------------------------
-    # Main Loop
-    # ------------------------------------------------
-
-    def run(self, num_episodes=10):
-
-        self.load_checkpoint()
-
-        for _ in range(num_episodes):
-
-            try:
-                self.episode += 1
-
-                self.chaos_injection()
-
-                self.carbon_adapt()
-
-                task = self.plan()
-
-                result = self.execute(task)
-
-                reward = self.reflect(result)
-
-                self.total_energy += result["energy"]
-                self.total_accuracy += result["accuracy"]
-                self.total_carbon += (
-                    result["energy"] *
-                    self.carbon_provider.get_current_intensity() / 1000
-                )
-
-                # Quantum efficiency update
-                self.quantum_metric.add_quantum_energy(
-                    result["quantum_energy"]
-                )
-                self.quantum_metric.set_task_completion_ratio(
-                    result["accuracy"]
-                )
-
-                # Pareto tracking
-                self.pareto.add_record(
-                    energy_joules=result["energy"],
-                    accuracy=result["accuracy"] * 100,
-                    carbon_grams=result["energy"] *
-                    self.carbon_provider.get_current_intensity() / 1000,
-                    label=f"Episode_{self.episode}",
-                    metadata={"reward": reward}
-                )
-
-                # Distributed coordination sync
-                self.distributed.sync_state(self.episode)
-
-                # Telemetry
-                self.telemetry.export(
-                    episode=self.episode,
-                    energy=result["energy"],
-                    accuracy=result["accuracy"],
-                    reward=reward
-                )
-
-                # PPO training periodically
-                if self.episode % 5 == 0:
-                    self.ppo.train()
-
-                self.save_checkpoint()
-
-            except Exception as e:
-                logger.error("Crash detected. Recovering...")
-                logger.error(traceback.format_exc())
-                self.load_checkpoint()
-
-        # Final exports
-        frontier = self.pareto.compute_frontier()
-        self.pareto.export_json()
-
-        quantum_eff = self.quantum_metric.compute()
-
-        logger.info("Run completed.")
-        logger.info(f"Quantum Efficiency: {quantum_eff}")
-        logger.info(f"Pareto frontier size: {len(frontier)}")
-
-
-# ------------------------------------------------
-# Entry
-# ------------------------------------------------
 
 if __name__ == "__main__":
-
-    config = {
-        "energy_budget": 10000,
-        "baseline_energy": 120,
-        "region": "ID"
-    }
-
-    runtime = RobustGreenAgentRuntime(config)
-    runtime.run(num_episodes=20)
+    asyncio.run(main())
