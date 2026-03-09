@@ -274,20 +274,20 @@ asyncio.run(main())
 
 ```bash
 # Build image
-docker build -t green-agent:latest .
+docker build -t green_agent:latest .
 
 # Run container
 docker run -d \
-  --name green-agent \
+  --name green_agent \
   -p 8000:8000 \
   -p 8265:8265 \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/data:/app/data \
   -e MODE=unified \
-  green-agent:latest
+  green_agent:latest
 
 # View logs
-docker logs -f green-agent
+docker logs -f green_agent
 ```
 
 ### Kubernetes Deployment
@@ -642,5 +642,6 @@ SOFTWARE.
 🌱 **Green Agent v5.0.0** | [Report Bug](https://github.com/NurcholishAdam/Green_Agent/issues) • [Request Feature](https://github.com/NurcholishAdam/Green_Agent/issues) • [Discussions](https://github.com/NurcholishAdam/Green_Agent/discussions)
 
 </div>
+
 
 
