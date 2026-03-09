@@ -7,9 +7,11 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Version](https://img.shields.io/badge/version-5.0.0-green.svg)](https://github.com/NurcholishAdam/Green_Agent/releases)
-[![Carbon Neutral](https://img.shields.io/badge/carbon-neutral-brightgreen.svg)](https://carbonneutral.com)
+[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
+[![CI/CD](https://github.com/NurcholishAdam/Green_Agent/actions/workflows/build.yml/badge.svg)](https://github.com/NurcholishAdam/Green_Agent/actions)
+[![Security](https://img.shields.io/badge/security-scanned-brightgreen.svg)](https://trivy.dev/)
 
-[Features](#-features) • [Architecture](#-architecture) • [Installation](#-installation) • [Usage](#-usage) • [Documentation](#-documentation)
+[Features](#-features) • [Architecture](#-architecture) • [Installation](#-installation) • [Docker](#-docker-deployment) • [Usage](#-usage) • [Documentation](#-documentation)
 
 </div>
 
@@ -64,6 +66,12 @@ Built with sustainability at its core, Green Agent intelligently schedules AI wo
 - **Prometheus + Grafana** integration
 - **Comprehensive logging** with JSON output
 
+### 🔒 Security & Compliance
+- **Trivy vulnerability scanning** on every build
+- **SARIF report integration** with GitHub Security
+- **Multi-stage Docker builds** for minimal attack surface
+- **Secrets management** via GitHub Actions
+
 ---
 
 ## 🏗️ Architecture
@@ -74,7 +82,6 @@ Built with sustainability at its core, Green Agent intelligently schedules AI wo
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         GREEN AGENT ARCHITECTURE                        │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │                    USER INTERFACE LAYER                         │   │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │   │
@@ -125,7 +132,6 @@ Built with sustainability at its core, Green Agent intelligently schedules AI wo
 │  │  │   Cluster    │  │   Autoscaler │  │  + Grafana   │          │   │
 │  │  └──────────────┘  └──────────────┘  └──────────────┘          │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -174,37 +180,313 @@ mkdir -p config data logs results
 - **RAM**: 4GB minimum, 8GB recommended
 - **Storage**: 10GB free space
 - **Network**: Internet access for carbon APIs
+- **Docker** (optional): 20.10+ for containerized deployment
 
-### Dependencies
+---
 
-```txt
-# Core
-pennylane>=0.32.0
-numpy>=1.24.0
-scipy>=1.10.0
+## 🐳 Docker Deployment
 
-# Distributed
-ray[default]>=2.7.0
-kubernetes>=28.0.0
+### 🚀 Quick Start with Docker
 
-# Web
-fastapi>=0.104.0
-uvicorn>=0.24.0
-aiohttp>=3.9.0
+```bash
+# Pull pre-built image (when available)
+docker pull ghcr.io/nurcholishadam/green_agent:latest
 
-# Data & Viz
-pandas>=2.0.0
-plotly>=5.18.0
-matplotlib>=3.8.0
+# Run container
+docker run -d \
+  --name green-agent \
+  -p 8000:8000 \
+  -p 8265:8265 \
+  -v $(pwd)/config:/app/config \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/results:/app/results \
+  -e MODE=unified \
+  -e LOG_LEVEL=INFO \
+  ghcr.io/nurcholishadam/green_agent:latest
 
-# ML
-torch>=2.0.0
-tensorflow>=2.13.0
+# View logs
+docker logs -f green-agent
 
-# Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
+# Access dashboard
+open http://localhost:8000
 ```
+
+### 🔧 Build Image Locally
+
+If the pre-built image is not available, build it yourself:
+
+```bash
+# Clone and navigate to repository
+git clone https://github.com/NurcholishAdam/Green_Agent.git
+cd Green_Agent
+
+# Build Docker image
+docker build -t green-agent:latest .
+
+# Run the container
+docker run -d \
+  --name green-agent \
+  -p 8000:8000 \
+  -p 8265:8265 \
+  -v $(pwd)/config:/app/config \
+  -v $(pwd)/data:/app/data \
+  green-agent:latest
+```
+
+### 📋 Dockerfile
+
+```dockerfile
+# Dockerfile for Green Agent v5.0.0
+FROM python:3.10-slim
+
+# Build arguments for metadata
+ARG BUILD_DATE
+ARG VERSION
+ARG COMMIT_SHA
+
+# OCI labels for container metadata
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.revision="${COMMIT_SHA}"
+LABEL org.opencontainers.image.source="https://github.com/NurcholishAdam/Green_Agent"
+LABEL org.opencontainers.image.title="Green Agent"
+LABEL org.opencontainers.image.description="Sustainable AI Orchestration Platform"
+LABEL org.opencontainers.image.vendor="Nurcholish Adam"
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy requirements first for better layer caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p config data logs results
+
+# Set proper permissions
+RUN chmod -R 755 /app
+
+# Expose ports
+EXPOSE 8000 8265 9090
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    MODE=unified \
+    LOG_LEVEL=INFO \
+    CARBON_API_PROVIDER=simulation
+
+# Health check endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+# Default command
+CMD ["python", "runtime/run_agent.py", "--mode", "unified", "--config", "config/green_agent_config.yaml"]
+```
+
+### 🔄 Docker Compose (Optional)
+
+Create `docker-compose.yml` for easier multi-container management:
+
+```yaml
+version: '3.8'
+
+services:
+  green-agent:
+    build: .
+    image: green-agent:latest
+    container_name: green-agent
+    ports:
+      - "8000:8000"   # Dashboard
+      - "8265:8265"   # Ray Dashboard
+      - "9090:9090"   # Prometheus
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./results:/app/results
+    environment:
+      - MODE=unified
+      - LOG_LEVEL=INFO
+      - CARBON_API_PROVIDER=simulation
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # Optional: Add Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: green-agent-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - green-agent
+    restart: unless-stopped
+```
+
+Run with:
+
+```bash
+docker-compose up -d
+docker-compose logs -f green-agent
+```
+
+### 🔐 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODE` | `unified` | Execution mode: `legacy`, `unified`, or `compare` |
+| `LOG_LEVEL` | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `CARBON_API_PROVIDER` | `simulation` | Carbon data source: `electricitymap`, `carbonintensity`, `simulation` |
+| `CARBON_API_KEY` | - | API key for carbon data provider |
+| `QUANTUM_ENABLED` | `false` | Enable quantum integration features |
+| `RAY_ENABLED` | `false` | Enable distributed Ray execution |
+
+Create a `.env` file:
+
+```bash
+# .env
+MODE=unified
+LOG_LEVEL=INFO
+CARBON_API_PROVIDER=simulation
+QUANTUM_ENABLED=false
+RAY_ENABLED=false
+```
+
+---
+
+## 🔄 CI/CD with GitHub Actions
+
+Green Agent includes automated build, test, and security scanning via GitHub Actions.
+
+### Workflow: `.github/workflows/build.yml`
+
+```yaml
+name: Build and Push Green Agent
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build locally for scanning
+      - name: Build image (local)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: local-scan:${{ github.sha }}
+          cache-from: type=gha
+
+      # Security scan with Trivy
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'local-scan:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          ignore-unfixed: true
+
+      # Upload results to GitHub Security
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        if: always()
+
+      # Push image after successful scan
+      - name: Push to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+      - name: Summary
+        run: |
+          echo "✅ Build complete: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+```
+
+### 🔒 Security Scanning
+
+Every build is automatically scanned with **Trivy** for:
+
+- 🐛 OS and library vulnerabilities
+- 🔑 Exposed secrets and credentials
+- 📦 Misconfigurations and best practices
+- ♻️ License compliance
+
+Results appear in the **Security** tab of your GitHub repository.
 
 ---
 
@@ -221,18 +503,6 @@ python runtime/run_agent.py --mode legacy
 
 # Run comparison mode (side-by-side analysis)
 python runtime/run_agent.py --mode compare
-```
-
-### Configuration
-
-```bash
-# Edit configuration
-nano config/green_agent_config.yaml
-
-# Set environment variables
-export CARBON_API_KEY="your_api_key"
-export MODE="unified"
-export QUANTUM_ENABLED="false"
 ```
 
 ### Example: Run a Task
@@ -270,41 +540,6 @@ async def main():
 asyncio.run(main())
 ```
 
-### Docker Deployment
-
-```bash
-# Build image
-docker build -t green_agent:latest .
-
-# Run container
-docker run -d \
-  --name green_agent \
-  -p 8000:8000 \
-  -p 8265:8265 \
-  -v $(pwd)/config:/app/config \
-  -v $(pwd)/data:/app/data \
-  -e MODE=unified \
-  green_agent:latest
-
-# View logs
-docker logs -f green_agent
-```
-
-### Kubernetes Deployment
-
-```bash
-# Apply manifests
-kubectl apply -f k8s/ray-cluster.yaml
-kubectl apply -f k8s/service.yaml
-
-# Check status
-kubectl get pods -l app=green-agent
-kubectl get svc green-agent-dashboard
-
-# Port forward
-kubectl port-forward svc/green-agent-dashboard 8000:8000
-```
-
 ---
 
 ## 📊 Dashboard
@@ -316,10 +551,10 @@ Access the real-time dashboard at **http://localhost:8000**
 | Endpoint | Description |
 |----------|-------------|
 | `/` | Dashboard home |
-| `/health` | Health check |
-| `/metrics/realtime` | Real-time metrics |
+| `/health` | Health check (`{"status": "healthy"}`) |
+| `/metrics/realtime` | Real-time metrics (JSON) |
 | `/executions` | Execution history |
-| `/analytics/pareto` | Pareto frontier |
+| `/analytics/pareto` | Pareto frontier analysis |
 | `/carbon/forecast` | Carbon intensity forecast |
 | `/ws/metrics` | WebSocket for live updates |
 
@@ -333,23 +568,55 @@ Access the real-time dashboard at **http://localhost:8000**
 
 ---
 
+## ☸️ Kubernetes Deployment
+
+```bash
+# Apply Kubernetes manifests
+kubectl apply -f k8s/ray-cluster.yaml
+kubectl apply -f k8s/service.yaml
+
+# Check deployment status
+kubectl get pods -l app=green-agent
+kubectl get svc green-agent-dashboard
+
+# Port forward for local access
+kubectl port-forward svc/green-agent-dashboard 8000:8000
+
+# View logs
+kubectl logs -f deployment/green-agent
+
+# Scale workers based on demand
+kubectl scale raycluster green-agent-cluster --replicas=10
+```
+
+### Helm Chart (Coming Soon)
+
+```bash
+# Install via Helm (future release)
+helm repo add green-agent https://nurcholishadam.github.io/helm-charts
+helm install green-agent green-agent/green-agent --values values.yaml
+```
+
+---
+
 ## 🧪 Testing
 
 ```bash
+# Install test dependencies
+pip install pytest pytest-asyncio pytest-cov
+
 # Run all tests
 pytest tests/ -v --asyncio-mode=auto
 
-# Run unit tests
-pytest tests/unit/ -v
+# Run with coverage report
+pytest tests/ --cov=src --cov-report=html --cov-report=term
 
-# Run integration tests
-pytest tests/integration/ -v
-
-# Run with coverage
-pytest tests/ --cov=src --cov-report=html
-
-# View coverage report
+# View coverage in browser
 open htmlcov/index.html
+
+# Run specific test category
+pytest tests/integration/ -v
+pytest tests/unit/ -v
 ```
 
 ---
@@ -358,83 +625,43 @@ open htmlcov/index.html
 
 ```
 Green_Agent/
-│
 ├── runtime/                    # Execution runtime
 │   ├── run_agent.py           # Main entry point
-│   ├── distributed_runtime.py # Ray-based execution
-│   └── stress_test_harness.py # Load testing
-│
+│   └── distributed_runtime.py # Ray-based execution
 ├── src/                        # Source modules
 │   ├── integration/
 │   │   └── unified_orchestrator.py  # 12-layer coordinator
 │   ├── interpretation/
-│   │   └── workload_interpreter.py  # Task analysis
 │   ├── decision/
-│   │   └── carbon_aware_decision_core.py  # Decision engine
 │   ├── optimization/
-│   │   └── synthetic_data_optimizer.py  # Data compression
 │   ├── carbon/
-│   │   ├── forecasting_engine.py  # Carbon prediction
-│   │   ├── task_carbon_profiler.py  # Real-time tracking
-│   │   └── eco_mode_controller.py  # Adaptive throttling
 │   ├── distributed/
-│   │   ├── ray_cluster_manager.py  # Ray orchestration
-│   │   └── carbon_aware_scheduler.py  # Task routing
 │   ├── benchmarking/
-│   │   └── benchmark_intelligence.py  # Performance tracking
 │   └── governance/
-│       └── carbon_ledger.py  # Carbon accounting
-│
 ├── quantum_integration/        # Quantum modules
 │   ├── error_mitigation/
-│   │   └── quantum_error_mitigator.py
 │   ├── vqc/
-│   │   └── variational_quantum_circuit.py
-│   ├── multi_agent/
-│   │   └── quantum_multi_agent_rl.py
-│   └── test_unified_system.py
-│
+│   └── multi_agent/
 ├── dashboard/                  # Visualization
-│   ├── api_server.py          # FastAPI backend
-│   └── plotly_dashboard.py    # Interactive charts
-│
+│   └── api_server.py          # FastAPI backend
 ├── policy/                     # Policy engine
-│   ├── policy_engine.py
-│   ├── ppo_policy.py
-│   └── q_table_store.py
-│
 ├── rewards/                    # Reward calculation
-│   └── negawatt_reward.py
-│
 ├── analytics/                  # Analytics
-│   └── pareto_analyzer.py
-│
 ├── k8s/                        # Kubernetes manifests
-│   ├── ray-cluster.yaml
-│   ├── service.yaml
-│   └── configmap.yaml
-│
+├── .github/workflows/          # CI/CD pipelines
+│   └── build.yml              # Docker build + Trivy scan
 ├── config/                     # Configuration
 │   └── green_agent_config.yaml
-│
 ├── tests/                      # Test suite
-│   ├── unit/
-│   └── integration/
-│
 ├── docs/                       # Documentation
-│   ├── ARCHITECTURE.md
-│   ├── API_REFERENCE.md
-│   └── INTEGRATION_GUIDE.md
-│
 ├── examples/                   # Usage examples
-│   ├── basic_usage.py
-│   ├── advanced_usage.py
-│   └── complete_workflow_demo.py
-│
-├── requirements.txt            # Dependencies
-├── Dockerfile                  # Container config
-├── README.md                   # This file
-└── LICENSE                     # MIT License
+├── Dockerfile                  # Container definition
+├── docker-compose.yml          # Multi-container setup
+├── requirements.txt            # Python dependencies
+├── .env.example                # Environment template
+├── .dockerignore               # Docker build exclusions
+├── .gitignore                  # Git exclusions
+└── README.md                   # This file
 ```
 
 ---
@@ -443,38 +670,27 @@ Green_Agent/
 
 ### Energy Efficiency
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  Component              │  Before  │  After   │  Savings  │
-├────────────────────────────────────────────────────────────┤
-│  ML Inference           │  2.0 kWh │  0.3 kWh │  85%      │
-│  ML Training            │ 15.0 kWh │  2.5 kWh │  83%      │
-│  Data Processing        │  5.0 kWh │  0.8 kWh │  84%      │
-│  Distributed Execution  │ 10.0 kWh │  1.5 kWh │  85%      │
-├────────────────────────────────────────────────────────────┤
-│  AVERAGE                │          │          │  85-88%   │
-└────────────────────────────────────────────────────────────┘
-```
+| Component | Before | After | Savings |
+|-----------|--------|-------|---------|
+| ML Inference | 2.0 kWh | 0.3 kWh | **85%** |
+| ML Training | 15.0 kWh | 2.5 kWh | **83%** |
+| Data Processing | 5.0 kWh | 0.8 kWh | **84%** |
+| **Average** | | | **85-88%** |
 
 ### Carbon Reduction
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  Region                 │  Baseline │  Green    │  Reduction│
-├────────────────────────────────────────────────────────────┤
-│  Nordic (Green)         │  400 gCO₂ │   30 gCO₂ │  92%      │
-│  Central (Yellow)       │  400 gCO₂ │  150 gCO₂ │  62%      │
-│  Industrial (Red)       │  400 gCO₂ │  300 gCO₂ │  25%      │
-├────────────────────────────────────────────────────────────┤
-│  WEIGHTED AVERAGE       │           │           │  90-98%   │
-└────────────────────────────────────────────────────────────┘
-```
+| Region | Baseline | Green Agent | Reduction |
+|--------|----------|-------------|-----------|
+| Nordic (Green) | 400 gCO₂ | 30 gCO₂ | **92%** |
+| Central (Yellow) | 400 gCO₂ | 150 gCO₂ | **62%** |
+| Industrial (Red) | 400 gCO₂ | 300 gCO₂ | **25%** |
+| **Weighted Avg** | | | **90-98%** |
 
 ---
 
 ## 🔧 Configuration
 
-### config/green_agent_config.yaml
+Edit `config/green_agent_config.yaml`:
 
 ```yaml
 system:
@@ -494,12 +710,9 @@ ray:
 
 carbon:
   default_region: "US-CA"
-  api_provider: "electricitymap"
+  api_provider: "electricitymap"  # electricitymap | carbonintensity | simulation
   eco_mode_threshold: 200
   defer_threshold: 400
-
-policy:
-  mode: "moderate"  # soft | moderate | strict
 
 quantum:
   enabled: false
@@ -515,11 +728,11 @@ quantum:
 
 ## 🤝 Contributing
 
-We welcome contributions! Please follow these steps:
+We welcome contributions!
 
 1. **Fork** the repository
 2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
-3. **Commit** your changes (`git commit -m 'Add amazing feature'`)
+3. **Commit** your changes (`git commit -m 'feat: add amazing feature'`)
 4. **Push** to the branch (`git push origin feature/amazing-feature`)
 5. **Open** a Pull Request
 
@@ -540,6 +753,7 @@ pip install -r requirements-dev.txt
 
 # Run tests before committing
 pytest tests/ -v
+pre-commit run --all-files  # If pre-commit hooks enabled
 ```
 
 ### Code Style
@@ -548,50 +762,59 @@ pytest tests/ -v
 - Use **type hints** for all functions
 - Write **docstrings** for all classes and methods
 - Maintain **test coverage** > 80%
+- Run `black .` and `isort .` before committing
 
 ---
 
 ## 📚 Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/ARCHITECTURE.md) | Detailed system architecture |
-| [API Reference](docs/API_REFERENCE.md) | Complete API documentation |
-| [Integration Guide](docs/INTEGRATION_GUIDE.md) | How to integrate with existing systems |
-| [Quantum Integration](quantum_integration/README.md) | Quantum module documentation |
-| [Deployment](docs/DEPLOYMENT.md) | Production deployment guide |
+- [Architecture](docs/ARCHITECTURE.md) - Detailed system architecture
+- [API Reference](docs/API_REFERENCE.md) - Complete API documentation
+- [Integration Guide](docs/INTEGRATION_GUIDE.md) - Integration instructions
+- [Quantum Integration](quantum_integration/README.md) - Quantum module docs
+- [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment instructions
+- [Security](docs/SECURITY.md) - Security practices and scanning
 
 ---
 
 ## 🆘 Troubleshooting
 
-### Common Issues
+### Docker Issues
+
+| Issue | Solution |
+|-------|----------|
+| `could not parse reference` | Remove trailing spaces in YAML; use `load: true` for local scan |
+| `image not found` | Build locally first: `docker build -t green-agent:latest .` |
+| `authentication failed` | Ensure `GITHUB_TOKEN` has `packages: write` permission |
+| `scan too slow` | Add `ignore-unfixed: true` and limit `severity: 'CRITICAL,HIGH'` |
+| `port already in use` | Run `lsof -i :8000` then `kill -9 <PID>` |
+
+### Runtime Issues
 
 | Issue | Solution |
 |-------|----------|
 | `ModuleNotFoundError` | Run `pip install -r requirements.txt` |
-| `Port 8000 in use` | Run `lsof -i :8000` then `kill -9 <PID>` |
 | `Carbon API failed` | Set `api_provider: simulation` in config |
 | `Ray connection failed` | Set `ray.enabled: false` for local testing |
-| `UnifiedResult metrics error` | Run `python fix_unified_result.py` |
+| `UnifiedResult metrics error` | Ensure you're on latest code; run `git pull` |
 
 ### Get Help
 
 - 📖 Read the [documentation](docs/)
 - 🐛 Open an [issue](https://github.com/NurcholishAdam/Green_Agent/issues)
-- 💬 Join our [Discord](https://discord.gg/green-agent)
+- 💬 Join our [Discussions](https://github.com/NurcholishAdam/Green_Agent/discussions)
 - 📧 Email: support@green-agent.io
 
 ---
 
 ## 📄 License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+MIT License - see [LICENSE](LICENSE) file for details.
 
 ```
 MIT License
 
-Copyright (c) 2024 Nurcholish Adam
+Copyright (c) 2026 Nurcholish Adam
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -621,6 +844,7 @@ SOFTWARE.
 - **Ray** for distributed computing
 - **FastAPI** for API framework
 - **Plotly** for visualization
+- **Trivy** for security scanning
 - All contributors and supporters
 
 ---
@@ -641,8 +865,8 @@ SOFTWARE.
 
 🌱 **Green Agent v5.0.0** | [Report Bug](https://github.com/NurcholishAdam/Green_Agent/issues) • [Request Feature](https://github.com/NurcholishAdam/Green_Agent/issues) • [Discussions](https://github.com/NurcholishAdam/Green_Agent/discussions)
 
+[![Built with Docker](https://img.shields.io/badge/built_with-Docker-2496ED?logo=docker)](https://www.docker.com/)
+[![Scanned with Trivy](https://img.shields.io/badge/scanned_with-Trivy-00979D?logo=trivy)](https://trivy.dev/)
+[![Deployed on GitHub Actions](https://img.shields.io/badge/deployed_on-GitHub_Actions-2088FF?logo=githubactions)](https://github.com/features/actions)
+
 </div>
-
-
-
-
