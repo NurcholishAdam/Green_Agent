@@ -630,7 +630,7 @@ SOFTWARE.
 - **Author**: Nurcholish Adam
 - **Email**: nurcholisadam@gmail.com
 - **GitHub**: [@NurcholishAdam](https://github.com/NurcholishAdam)
-- **LinkedIn**: [Nurcholish Adam](www.linkedin.com/in/nurcholish-adam-64a86912a)
+- **LinkedIn**: [Nurcholish Adam](https://www.linkedin.com/in/nurcholish-adam-64a86912a/)
 - **Website**: [green-agent.io](https://green-agent.io)
 
 ---
@@ -642,4 +642,5 @@ SOFTWARE.
 🌱 **Green Agent v5.0.0** | [Report Bug](https://github.com/NurcholishAdam/Green_Agent/issues) • [Request Feature](https://github.com/NurcholishAdam/Green_Agent/issues) • [Discussions](https://github.com/NurcholishAdam/Green_Agent/discussions)
 
 </div>
+
 
