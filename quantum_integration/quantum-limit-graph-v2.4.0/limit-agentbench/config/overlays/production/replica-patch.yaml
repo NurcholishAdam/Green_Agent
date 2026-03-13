@@ -1,0 +1,36 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: green-agent-cluster
+spec:
+  headGroupSpec:
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+  workerGroupSpecs:
+  - replicas: 8
+    minReplicas: 4
+    maxReplicas: 20
+    groupName: standard-workers
+    rayStartParams:
+      num-cpus: '4'
+      memory: '8589934592'
+    template:
+      spec:
+        containers:
+        - name: ray-worker
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
