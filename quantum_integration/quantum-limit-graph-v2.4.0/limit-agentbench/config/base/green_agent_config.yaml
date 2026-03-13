@@ -1,0 +1,193 @@
+# Green Agent Base Configuration
+# This is the base config that all environments inherit from
+
+system:
+  version: "5.0.0"
+  mode: "unified"
+  debug: false
+  log_level: "INFO"
+  enable_telemetry: true
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  update_interval_seconds: 5
+  enable_real_time: true
+  metrics_retention_hours: 168
+
+ray:
+  enabled: true
+  num_workers: 4
+  min_workers: 2
+  max_workers: 20
+  dashboard_port: 8265
+  object_store_memory: 1073741824
+  carbon_aware_scaling: true
+  autoscaling:
+    upscaling_mode: "conservative"
+    idle_timeout_seconds: 300
+    scale_up_cooldown_seconds: 60
+    scale_down_cooldown_seconds: 300
+
+carbon:
+  default_region: "US-CA"
+  api_provider: "electricitymap"
+  api_key_env: "CARBON_API_KEY"
+  forecast_days: 30
+  update_interval_hours: 1
+  cache_enabled: true
+  
+  # Thresholds
+  eco_mode_threshold: 200
+  defer_threshold: 400
+  emergency_threshold: 600
+  
+  # Budget tracking
+  budget:
+    enabled: true
+    daily_limit_kg: 100.0
+    weekly_limit_kg: 500.0
+    monthly_limit_kg: 2000.0
+    alert_on_80_percent: true
+
+policy:
+  mode: "moderate"
+  enforce_lora_above_1b_params: true
+  block_if_budget_exceeded: true
+  
+  weights:
+    carbon_importance: 0.4
+    performance_importance: 0.3
+    cost_importance: 0.2
+    deadline_importance: 0.1
+
+ml_optimization:
+  enable_quantization: true
+  quantization_bits: 8
+  enable_pruning: true
+  pruning_ratio: 0.3
+  enable_knowledge_distillation: true
+  distillation_temperature: 2.0
+
+quantum:
+  enabled: false
+  backend: "simulator"
+  
+  error_mitigation:
+    enabled: true
+    techniques:
+      - "zero_noise_extrapolation"
+      - "symmetry_verification"
+    extrapolation_order: 2
+    n_shots: 1000
+  
+  vqc:
+    n_qubits: 4
+    n_layers: 3
+    encoding_type: "angle"
+    ansatz_type: "strongly_entangling"
+    measurement_type: "expectation"
+  
+  multi_agent:
+    enabled: true
+    n_agents: 4
+    entanglement_strategy: "full"
+    communication_rounds: 3
+    quantum_advantage_threshold: 0.7
+
+orchestration:
+  scheduler: "carbon_aware"
+  
+  scheduling:
+    enable_deferral: true
+    max_deferral_hours: 24
+    enable_batching: true
+    batch_timeout_ms: 100
+    max_batch_size: 32
+  
+  resources:
+    default_cpu_limit: 2.0
+    default_memory_limit: "4Gi"
+    default_gpu_limit: 0
+    enable_gpu_sharing: true
+
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+    metrics_path: "/metrics"
+  
+  grafana:
+    enabled: true
+    port: 3000
+  
+  logging:
+    level: "INFO"
+    format: "json"
+    output: ["stdout", "file"]
+    file_path: "logs/green_agent.log"
+    rotation: "1 day"
+  
+  alerts:
+    enabled: true
+    channels:
+      - type: "email"
+        recipients: ["admin@example.com"]
+      - type: "slack"
+        webhook_env: "SLACK_WEBHOOK"
+    
+    rules:
+      - name: "high_carbon_intensity"
+        condition: "carbon_intensity > 400"
+        severity: "warning"
+      - name: "budget_exceeded"
+        condition: "daily_carbon > daily_limit * 0.8"
+        severity: "critical"
+
+benchmarking:
+  enabled: true
+  track_pareto_frontier: true
+  save_benchmarks: true
+  benchmark_dir: "benchmarks"
+  
+  metrics:
+    - "accuracy"
+    - "energy_consumption"
+    - "carbon_footprint"
+    - "latency"
+    - "throughput"
+    - "negawatt_reward"
+
+storage:
+  q_table:
+    backend: "persistent"
+    path: "data/q_table.pkl"
+    sync_interval_seconds: 60
+  
+  results:
+    backend: "filesystem"
+    path: "results"
+    compression: true
+  
+  cache:
+    enabled: true
+    backend: "redis"
+    ttl_seconds: 3600
+
+security:
+  enable_auth: false
+  api_keys:
+    enabled: false
+    keys_env: "API_KEYS"
+  
+  tls:
+    enabled: false
+    cert_path: "certs/cert.pem"
+    key_path: "certs/key.pem"
+
+development:
+  enable_profiling: false
+  enable_debug_endpoints: true
+  mock_carbon_api: false
+  simulate_quantum: true
