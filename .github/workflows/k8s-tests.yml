@@ -14,194 +14,136 @@ env:
 
 jobs:
   k8s-tests:
-    runs-on: ubuntu-latest  # ✅ Works with Ubuntu 24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     
     steps:
-    # ✅ Step 1: Checkout
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
     
-    # ✅ Step 2: Set up kubectl (using official action)
     - name: Set up kubectl
       uses: azure/setup-kubectl@v4
       with:
         version: ${{ env.KUBECTL_VERSION }}
     
-    # ✅ Step 3: Install kind (Kubernetes IN Docker) - NO OS RESTRICTIONS
     - name: Set up Kind cluster
       run: |
         echo "🚀 Installing Kind ${{ env.KIND_VERSION }}..."
-        
-        # Download and install kind
         curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
         chmod +x ./kind
         sudo mv ./kind /usr/local/bin/kind
         
-        # Verify installation
-        kind version
-        
-        # Create cluster with config for better resource allocation
         cat <<EOF | kind create cluster --config=-
         kind: Cluster
         apiVersion: kind.x-k8s.io/v1alpha4
         name: green-agent-test
         nodes:
         - role: control-plane
-          kubeadmConfigPatches:
-          - |
-            kind: InitConfiguration
-            nodeRegistration:
-              kubeletExtraArgs:
-                node-labels: "ingress-ready=true"
           extraPortMappings:
-          - containerPort: 80
-            hostPort: 80
-            protocol: TCP
-          - containerPort: 443
-            hostPort: 443
-            protocol: TCP
           - containerPort: 8265
             hostPort: 8265
-            protocol: TCP  # Ray dashboard
+            protocol: TCP
         EOF
         
-        # Wait for cluster to be ready
-        echo "⏳ Waiting for cluster to be ready..."
         kubectl wait --for=condition=ready node --all --timeout=60s
         
-        # Install metrics-server for HPA support
-        echo "📊 Installing metrics-server for HPA..."
         kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
         kubectl patch deployment metrics-server -n kube-system \
           --type='json' -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
         
-        echo "✅ Kind cluster ready!"
+        echo "✅ Kind cluster ready"
         kubectl cluster-info
-        kubectl get nodes
       shell: bash
     
-    # ✅ Step 4: Install Helm
     - name: Install Helm
       run: |
-        echo "📦 Installing Helm ${{ env.HELM_VERSION }}..."
         curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
         chmod 700 get_helm.sh
         ./get_helm.sh --version ${{ env.HELM_VERSION }}
-        helm version
       shell: bash
     
-    # ✅ Step 5: Deploy Prometheus Stack (for monitoring tests)
     - name: Deploy Prometheus Stack
       run: |
-        echo "📈 Deploying Prometheus Stack..."
-        
-        # Add repo
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
         
-        # Install with minimal config for testing
         helm install prometheus prometheus-community/kube-prometheus-stack \
           --namespace monitoring \
           --create-namespace \
           --set prometheus.prometheusSpec.resources.requests.cpu=100m \
-          --set prometheus.prometheusSpec.resources.requests.memory=256Mi \
           --set grafana.resources.requests.cpu=50m \
-          --set grafana.resources.requests.memory=128Mi \
-          --set alertmanager.resources.requests.cpu=50m \
-          --set alertmanager.resources.requests.memory=128Mi \
-          --set kube-state-metrics.resources.requests.cpu=50m \
-          --set kube-state-metrics.resources.requests.memory=128Mi \
-          --set node-exporter.resources.requests.cpu=50m \
-          --set node-exporter.resources.requests.memory=128Mi \
-          --wait \
-          --timeout 5m
+          --wait --timeout 5m
         
-        echo "✅ Prometheus Stack deployed"
         kubectl get pods -n monitoring
       shell: bash
     
-    # ✅ Step 6: Deploy Green Agent for testing
+    - name: Verify config files exist
+      run: |
+        echo "🔍 Verifying config structure..."
+        REQUIRED_FILES=(
+          "config/base/kustomization.yaml"
+          "config/base/ray-cluster.yaml"
+          "config/overlays/development/kustomization.yaml"
+        )
+        MISSING=0
+        for file in "${REQUIRED_FILES[@]}"; do
+          if [ -f "$file" ]; then
+            echo "  ✅ $file"
+          else
+            echo "  ❌ MISSING: $file"
+            MISSING=$((MISSING + 1))
+          fi
+        done
+        if [ $MISSING -gt 0 ]; then
+          echo "❌ $MISSING config files missing!"
+          exit 1
+        fi
+        echo "✅ All config files present"
+      shell: bash
+    
     - name: Deploy Green Agent
       run: |
-        echo "🚀 Deploying Green Agent for testing..."
-        
-        # Create test namespace
         kubectl create namespace ${{ env.TEST_NAMESPACE }}
-        
-        # Deploy using development overlay (lightweight for CI)
         kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
-        
-        echo "✅ Green Agent deployed"
         kubectl get pods -n ${{ env.TEST_NAMESPACE }}
       shell: bash
     
-    # ✅ Step 7: Wait for deployment
     - name: Wait for Deployment
       run: |
-        echo "⏳ Waiting for Green Agent to be ready..."
-        
-        # Wait for head pod
         kubectl wait --for=condition=ready pod \
           -l app=green-agent,component=head \
           -n ${{ env.TEST_NAMESPACE }} \
-          --timeout=300s || {
-            echo "⚠ Head pod not ready, showing status:"
-            kubectl get pods -n ${{ env.TEST_NAMESPACE }} -l component=head
-            kubectl describe pod -n ${{ env.TEST_NAMESPACE }} -l component=head | tail -20
-          }
+          --timeout=300s || true
         
-        # Wait for at least one worker
         kubectl wait --for=condition=ready pod \
           -l app=green-agent,component=worker \
           -n ${{ env.TEST_NAMESPACE }} \
-          --timeout=300s || {
-            echo "⚠ Worker pods not ready, showing status:"
-            kubectl get pods -n ${{ env.TEST_NAMESPACE }} -l component=worker
-          }
-        
-        echo "✅ Deployment verification complete"
+          --timeout=300s || true
       shell: bash
     
-    # ✅ Step 8: Install test dependencies
     - name: Install Test Dependencies
       run: |
-        echo "📦 Installing test dependencies..."
         python -m pip install --upgrade pip
         pip install -r tests/requirements-tests.txt
-        pip install pytest-kubernetes
       shell: bash
     
-    # ✅ Step 9: Run K8s Integration Tests
     - name: Run K8s Integration Tests
       run: |
-        echo "🧪 Running Kubernetes integration tests..."
-        
         pytest tests/k8s/ -v \
           --asyncio-mode=auto \
           --junitxml=k8s-test-results.xml \
           --cov=tests/k8s \
-          --cov-report=xml \
-          --cov-report=html \
-          --tb=short
+          --cov-report=xml
       shell: bash
     
-    # ✅ Step 10: Run E2E Tests
     - name: Run E2E Tests
       run: |
-        echo "🧪 Running end-to-end tests..."
-        
-        pytest tests/e2e/ -v \
-          -m e2e \
-          --junitxml=e2e-test-results.xml \
-          --cov=tests/e2e \
-          --cov-report=xml \
-          --tb=short
+        pytest tests/e2e/ -v -m e2e \
+          --junitxml=e2e-test-results.xml
       shell: bash
     
-    # ✅ Step 11: Upload Test Results (v4)
     - name: Upload Test Results
       uses: actions/upload-artifact@v4
       if: always()
@@ -211,12 +153,9 @@ jobs:
           k8s-test-results.xml
           e2e-test-results.xml
           htmlcov/
-          coverage.xml
         retention-days: 7
-        compression-level: 6
         if-no-files-found: warn
     
-    # ✅ Step 12: Upload Coverage to Codecov (v4)
     - name: Upload Coverage to Codecov
       uses: codecov/codecov-action@v4
       with:
@@ -225,21 +164,10 @@ jobs:
         token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: false
     
-    # ✅ Step 13: Cleanup (always run)
     - name: Cleanup
       if: always()
       run: |
-        echo "🧹 Cleaning up test resources..."
-        
-        # Delete test namespace
         kubectl delete namespace ${{ env.TEST_NAMESPACE }} --ignore-not-found || true
-        
-        # Delete Prometheus
         helm uninstall prometheus -n monitoring --ignore-not-found || true
-        kubectl delete namespace monitoring --ignore-not-found || true
-        
-        # Delete Kind cluster
         kind delete cluster --name green-agent-test || true
-        
-        echo "✅ Cleanup complete"
       shell: bash
