@@ -1,0 +1,15 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: green-agent-cluster
+spec:
+  headGroupSpec:
+    template:
+      spec:
+        securityContext:
+          runAsNonRoot: false
+        containers:
+        - name: ray-head
+          securityContext:
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
