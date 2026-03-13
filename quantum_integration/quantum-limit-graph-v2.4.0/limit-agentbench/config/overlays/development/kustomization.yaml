@@ -1,27 +1,21 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-dev
-
-# Base configuration
-bases:
+resources:
 - ../../base
 
-# Name prefix for development
+namespace: green-agent-dev
 namePrefix: dev-
 
-# Common labels
 commonLabels:
   environment: development
   team: platform
 
-# Patches for development
 patches:
 - path: config-patch.yaml
 - path: replica-patch.yaml
 - path: resource-patch.yaml
 
-# ConfigMap overrides
 configMapGenerator:
 - name: green-agent-config
   behavior: merge
@@ -36,23 +30,18 @@ configMapGenerator:
   - ENABLE_DEBUG_ENDPOINTS=true
   - MOCK_CARBON_API=true
 
-# Secret overrides
 secretGenerator:
 - name: green-agent-secrets
   behavior: merge
   literals:
   - CARBON_API_KEY=dev-simulation-key
   - SLACK_WEBHOOK=
-  - API_KEYS=dev-api-key
-  - DATABASE_PASSWORD=dev-password
-  - REDIS_PASSWORD=dev-redis-password
+  - API_KEYS=dev-key
 
-# Image overrides
 images:
 - name: ghcr.io/nurcholishadam/green_agent
   newTag: v5.0.0-dev
 
-# Replicas for development
 replicas:
 - name: green-agent-cluster
   count: 2
