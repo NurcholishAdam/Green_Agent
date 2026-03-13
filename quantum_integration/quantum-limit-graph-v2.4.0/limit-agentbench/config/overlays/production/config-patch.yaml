@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: green-agent-config
+data:
+  green_agent_config.yaml: |
+    system:
+      version: "5.0.0"
+      mode: "unified"
+      debug: false
+      log_level: "WARNING"
+    
+    ray:
+      enabled: true
+      num_workers: 8
+      min_workers: 4
+      max_workers: 20
+      carbon_aware_scaling: true
+    
+    carbon:
+      api_provider: "electricitymap"
+      eco_mode_threshold: 200
+      defer_threshold: 400
+      emergency_threshold: 600
+      budget:
+        enabled: true
+        daily_limit_kg: 100.0
+        weekly_limit_kg: 500.0
+    
+    quantum:
+      enabled: true
+      backend: "simulator"
+      error_mitigation:
+        enabled: true
+        techniques:
+          - "zero_noise_extrapolation"
+          - "symmetry_verification"
+    
+    monitoring:
+      prometheus:
+        enabled: true
+        port: 9090
+      grafana:
+        enabled: true
+        port: 3000
+      logging:
+        level: "WARNING"
+        format: "json"
+        output: ["stdout", "file"]
+    
+    security:
+      enable_auth: true
+      api_keys:
+        enabled: true
+      tls:
+        enabled: true
+        cert_path: "certs/cert.pem"
+        key_path: "certs/key.pem"
+    
+    development:
+      enable_profiling: false
+      enable_debug_endpoints: false
+      mock_carbon_api: false
