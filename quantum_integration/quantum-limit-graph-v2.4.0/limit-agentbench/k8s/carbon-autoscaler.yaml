@@ -1,0 +1,174 @@
+---
+# Horizontal Pod Autoscaler with Carbon-Aware Scaling
+# Enhanced with custom metrics for carbon intensity
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: green-agent-hpa
+  namespace: green-agent
+  labels:
+    app: green-agent
+    autoscaling: carbon-aware
+spec:
+  # Target RayCluster for scaling
+  scaleTargetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: green-agent-cluster
+  
+  # Scaling bounds
+  minReplicas: 2
+  maxReplicas: 20
+  
+  # Scaling metrics (multiple metrics for intelligent scaling)
+  metrics:
+  # 1. CPU-based scaling (fallback)
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  
+  # 2. Memory-based scaling (fallback)
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  
+  # 3. Carbon-based scaling (PRIMARY - Green Agent differentiator)
+  - type: External
+    external:
+      metric:
+        name: carbon_intensity
+        selector:
+          matchLabels:
+            app: green-agent
+      target:
+        type: AverageValue
+        averageValue: "150"  # Scale up when carbon < 150 gCO2/kWh
+  
+  # 4. Queue depth-based scaling
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_queue_depth
+      target:
+        type: AverageValue
+        averageValue: "10"  # Scale up when queue > 10 tasks
+  
+  # Scaling behavior configuration
+  behavior:
+    # Scale down slowly (avoid thrashing)
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 minutes before scaling down
+      policies:
+      - type: Percent
+        value: 50  # Remove max 50% of pods at once
+        periodSeconds: 60
+      - type: Pods
+        value: 2  # Or max 2 pods at once
+        periodSeconds: 60
+      selectPolicy: Min  # Use the policy that removes fewer pods
+    
+    # Scale up quickly (respond to demand)
+    scaleUp:
+      stabilizationWindowSeconds: 60  # Wait 1 minute before scaling up
+      policies:
+      - type: Percent
+        value: 100  # Add up to 100% more pods
+        periodSeconds: 60
+      - type: Pods
+        value: 4  # Or max 4 pods at once
+        periodSeconds: 60
+      selectPolicy: Max  # Use the policy that adds more pods
+
+---
+# Custom Metrics API Configuration
+# Required for carbon_intensity metric
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: carbon-metrics-adapter-config
+  namespace: monitoring
+  labels:
+    app: prometheus-adapter
+data:
+  config.yaml: |
+    rules:
+    # Carbon intensity metric
+    - seriesQuery: 'green_agent_carbon_intensity{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: "namespace"}
+          pod: {resource: "pod"}
+      name:
+        matches: "green_agent_carbon_intensity"
+        as: "carbon_intensity"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+    
+    # Queue depth metric
+    - seriesQuery: 'green_agent_queue_depth{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: "namespace"}
+          pod: {resource: "pod"}
+      name:
+        matches: "green_agent_queue_depth"
+        as: "green_agent_queue_depth"
+      metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+    
+    # Energy consumption metric
+    - seriesQuery: 'green_agent_energy_consumed_kwh_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: "namespace"}
+          pod: {resource: "pod"}
+      name:
+        matches: "green_agent_energy_consumed_kwh_total"
+        as: "energy_consumption"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>)'
+
+---
+# Vertical Pod Autoscaler (optional, for resource optimization)
+
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: green-agent-vpa
+  namespace: green-agent
+  labels:
+    app: green-agent
+spec:
+  targetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: green-agent-cluster
+  
+  # Update mode: Auto, Recreate, Initial, Off
+  updatePolicy:
+    updateMode: "Auto"
+  
+  # Resource recommendations
+  resourcePolicy:
+    containerPolicies:
+    - containerName: ray-head
+      minAllowed:
+        cpu: "1"
+        memory: "2Gi"
+      maxAllowed:
+        cpu: "4"
+        memory: "8Gi"
+      controlledResources: ["cpu", "memory"]
+    - containerName: ray-worker
+      minAllowed:
+        cpu: "2"
+        memory: "4Gi"
+      maxAllowed:
+        cpu: "8"
+        memory: "16Gi"
+      controlledResources: ["cpu", "memory"]
