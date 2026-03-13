@@ -1,0 +1,126 @@
+# Prometheus Adapter Helm Values for Green Agent
+# Enables custom metrics for carbon-aware autoscaling
+
+prometheus:
+  url: http://prometheus-server.monitoring.svc.cluster.local
+  port: 80
+  path: ""
+
+rules:
+  default: false
+  
+  custom:
+  # Carbon Intensity Metric
+  - seriesQuery: 'green_agent_carbon_intensity{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_carbon_intensity"
+      as: "carbon_intensity"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+  
+  # Queue Depth Metric
+  - seriesQuery: 'green_agent_queue_depth{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_queue_depth"
+      as: "queue_depth"
+    metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+  
+  # Energy Consumption Rate Metric
+  - seriesQuery: 'green_agent_energy_consumed_kwh_total{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_energy_consumed_kwh_total"
+      as: "energy_consumption_rate"
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>)'
+  
+  # Accuracy Score Metric
+  - seriesQuery: 'green_agent_accuracy_score{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_accuracy_score"
+      as: "accuracy_score"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+  
+  # Tasks Completed Metric
+  - seriesQuery: 'green_agent_tasks_completed{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_tasks_completed"
+      as: "tasks_completed_rate"
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>)'
+
+  external:
+  # External Carbon Intensity for HPA
+  - seriesQuery: 'green_agent_carbon_intensity{namespace!=""}'
+    resources:
+      template: "green_agent_carbon_intensity"
+    name:
+      matches: "green_agent_carbon_intensity"
+      as: "carbon_intensity_external"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+  
+  # External Queue Depth for HPA
+  - seriesQuery: 'green_agent_queue_depth{namespace!=""}'
+    resources:
+      template: "green_agent_queue_depth"
+    name:
+      matches: "green_agent_queue_depth"
+      as: "queue_depth_external"
+    metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+# Resource limits for adapter
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Affinity to co-locate with Prometheus
+affinity:
+  podAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+      topologyKey: kubernetes.io/hostname
+
+# Replica count
+replicas: 2
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 443
+  annotations: {}
+
+# TLS configuration
+tls:
+  enable: true
+  ca: ""
+  cert: ""
+  key: ""
+
+# Logging
+logLevel: 4
+
+# Metrics for adapter itself
+metrics:
+  enabled: true
