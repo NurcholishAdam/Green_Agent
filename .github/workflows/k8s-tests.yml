@@ -23,7 +23,7 @@ jobs:
         fetch-depth: 0
     
     - name: Set up Kubernetes
-      uses: Azure/setup-kubectl@v3
+      uses: Azure/setup-kubectl@v4
       with:
         version: ${{ env.KUBERNETES_VERSION }}
     
@@ -36,7 +36,7 @@ jobs:
         start args: '--memory=4096 --cpus=2'
     
     - name: Install Helm
-      uses: Azure/setup-helm@v3
+      uses: Azure/setup-helm@v4
       with:
         version: 'v3.13.0'
     
@@ -83,8 +83,9 @@ jobs:
           --cov=tests/e2e \
           --cov-report=xml
     
+    # ✅ FIXED: Updated to v4
     - name: Upload Test Results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: k8s-test-results
@@ -92,12 +93,15 @@ jobs:
           k8s-test-results.xml
           e2e-test-results.xml
           htmlcov/
+        retention-days: 7
+        compression-level: 6
     
     - name: Upload Coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v4
       with:
         files: ./coverage.xml
         flags: k8s-tests
+        token: ${{ secrets.CODECOV_TOKEN }}
     
     - name: Cleanup
       if: always()
