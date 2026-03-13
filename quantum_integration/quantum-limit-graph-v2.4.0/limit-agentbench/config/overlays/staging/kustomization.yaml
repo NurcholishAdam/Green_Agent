@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: green-agent-staging
+
+bases:
+- ../../base
+
+namePrefix: staging-
+
+commonLabels:
+  environment: staging
+  team: platform
+
+patches:
+- path: config-patch.yaml
+- path: replica-patch.yaml
+- path: resource-patch.yaml
+
+configMapGenerator:
+- name: green-agent-config
+  behavior: merge
+  literals:
+  - SYSTEM_MODE=unified
+  - LOG_LEVEL=INFO
+  - RAY_ENABLED=true
+  - QUANTUM_ENABLED=false
+  - DASHBOARD_ENABLED=true
+  - CARBON_API_PROVIDER=electricitymap
+
+secretGenerator:
+- name: green-agent-secrets
+  behavior: merge
+  literals:
+  - CARBON_API_KEY=staging-carbon-api-key
+  - SLACK_WEBHOOK=staging-slack-webhook
+  - API_KEYS=staging-api-keys
+  - DATABASE_PASSWORD=staging-db-password
+  - REDIS_PASSWORD=staging-redis-password
+
+images:
+- name: ghcr.io/nurcholishadam/green_agent
+  newTag: v5.0.0-rc1
+
+replicas:
+- name: green-agent-cluster
+  count: 4
