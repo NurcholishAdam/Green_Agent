@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: green-agent-config
+data:
+  green_agent_config.yaml: |
+    system:
+      version: "5.0.0-rc1"
+      mode: "unified"
+      debug: false
+      log_level: "INFO"
+    
+    ray:
+      enabled: true
+      num_workers: 4
+      min_workers: 2
+      max_workers: 10
+    
+    carbon:
+      api_provider: "electricitymap"
+      eco_mode_threshold: 200
+    
+    quantum:
+      enabled: false
+    
+    monitoring:
+      prometheus:
+        enabled: true
+      grafana:
+        enabled: true
+    
+    development:
+      enable_profiling: false
+      enable_debug_endpoints: false
+      mock_carbon_api: false
+    
+    security:
+      enable_auth: true
+      tls:
+        enabled: false
