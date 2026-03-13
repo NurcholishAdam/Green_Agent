@@ -1,0 +1,240 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: green-agent-cluster
+  labels:
+    app: green-agent
+    version: "5.0.0"
+spec:
+  # Ray head node configuration
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+      dashboard-port: '8265'
+      metrics-export-port: '8080'
+      num-cpus: '4'
+      num-gpus: '0'
+      object-store-memory: '1073741824'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: head
+      spec:
+        containers:
+        - name: ray-head
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 6379
+            name: gcs
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 8000
+            name: api
+          - containerPort: 8080
+            name: metrics
+          - containerPort: 10001
+            name: client
+          - containerPort: 9090
+            name: prometheus
+          
+          # Health probes
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          
+          env:
+          - name: RAY_DISABLE_DOCKER_CPU_WARNING
+            value: "1"
+          - name: CARBON_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: carbon-api-key
+          - name: QUANTUM_ENABLED
+            value: "false"
+          - name: MODE
+            value: "unified"
+          
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+          - name: data-volume
+            mountPath: /app/data
+          - name: logs-volume
+            mountPath: /app/logs
+        
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: green-agent-data-pvc
+        - name: logs-volume
+          emptyDir: {}
+
+  # Worker node groups
+  workerGroupSpecs:
+  # Standard workers
+  - replicas: 4
+    minReplicas: 2
+    maxReplicas: 20
+    groupName: standard-workers
+    rayStartParams:
+      num-cpus: '4'
+      num-gpus: '0'
+      memory: '8589934592'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+          worker-type: standard
+      spec:
+        containers:
+        - name: ray-worker
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+          imagePullPolicy: Always
+          env:
+          - name: RAY_HEAD_IP
+            value: "green-agent-cluster-head-svc"
+          - name: CARBON_AWARE_WORKER
+            value: "true"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+
+  # GPU workers (for ML training)
+  - replicas: 0
+    minReplicas: 0
+    maxReplicas: 8
+    groupName: gpu-workers
+    rayStartParams:
+      num-cpus: '8'
+      num-gpus: '1'
+      memory: '17179869184'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+          worker-type: gpu
+      spec:
+        containers:
+        - name: ray-worker-gpu
+          image: ghcr.io/nurcholishadam/green_agent:gpu-v5.0.0
+          imagePullPolicy: Always
+          env:
+          - name: RAY_HEAD_IP
+            value: "green-agent-cluster-head-svc"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+        nodeSelector:
+          nvidia.com/gpu: "true"
+        tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+  # Quantum workers (for quantum simulation)
+  - replicas: 2
+    minReplicas: 1
+    maxReplicas: 10
+    groupName: quantum-workers
+    rayStartParams:
+      num-cpus: '8'
+      num-gpus: '0'
+      memory: '34359738368'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+          worker-type: quantum
+      spec:
+        containers:
+        - name: ray-worker-quantum
+          image: ghcr.io/nurcholishadam/green_agent:quantum-v5.0.0
+          imagePullPolicy: Always
+          env:
+          - name: RAY_HEAD_IP
+            value: "green-agent-cluster-head-svc"
+          - name: QUANTUM_WORKER
+            value: "true"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+
+  # Autoscaler configuration
+  autoscalerOptions:
+    upscalingMode: Conservative
+    idleTimeoutSeconds: 300
+    securityContext:
+      runAsUser: 1000
+    env:
+    - name: CARBON_AWARE_AUTOSCALING
+      value: "true"
+    - name: CARBON_INTENSITY_THRESHOLD
+      value: "200"
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
