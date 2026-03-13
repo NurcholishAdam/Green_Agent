@@ -1,0 +1,50 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: green-agent-production
+
+bases:
+- ../../base
+
+namePrefix: prod-
+
+commonLabels:
+  environment: production
+  team: platform
+  criticality: high
+
+patches:
+- path: config-patch.yaml
+- path: replica-patch.yaml
+- path: resource-patch.yaml
+- path: hpa-patch.yaml
+- path: security-patch.yaml
+
+configMapGenerator:
+- name: green-agent-config
+  behavior: merge
+  literals:
+  - SYSTEM_MODE=unified
+  - LOG_LEVEL=WARNING
+  - RAY_ENABLED=true
+  - QUANTUM_ENABLED=true
+  - DASHBOARD_ENABLED=true
+  - CARBON_API_PROVIDER=electricitymap
+
+secretGenerator:
+- name: green-agent-secrets
+  behavior: merge
+  literals:
+  - CARBON_API_KEY=production-carbon-api-key
+  - SLACK_WEBHOOK=production-slack-webhook
+  - API_KEYS=production-api-keys
+  - DATABASE_PASSWORD=production-db-password
+  - REDIS_PASSWORD=production-redis-password
+
+images:
+- name: ghcr.io/nurcholishadam/green_agent
+  newTag: v5.0.0
+
+replicas:
+- name: green-agent-cluster
+  count: 8
