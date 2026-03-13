@@ -1,0 +1,91 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: green-agent-monitor
+  labels:
+    release: prometheus
+    app: green-agent
+spec:
+  selector:
+    matchLabels:
+      app: green-agent
+  namespaceSelector:
+    matchNames:
+    - green-agent
+  endpoints:
+  - port: metrics
+    interval: 15s
+    scrapeTimeout: 10s
+    path: /metrics
+    scheme: http
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: service
+    metricRelabelings:
+    - sourceLabels: [__name__]
+      regex: 'go_.*'
+      action: drop
+    - sourceLabels: [__name__]
+      regex: 'python_.*'
+      action: drop
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: green-agent-alerts
+  labels:
+    release: prometheus
+    app: green-agent
+spec:
+  groups:
+  - name: green-agent.rules
+    interval: 30s
+    rules:
+    - alert: GreenAgentHighCarbonIntensity
+      expr: green_agent_carbon_intensity > 400
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High carbon intensity detected"
+        description: "Carbon intensity is {{ $value }} gCO2/kWh"
+    
+    - alert: GreenAgentHighEnergyConsumption
+      expr: rate(green_agent_energy_consumed_kwh_total[5m]) > 10
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High energy consumption detected"
+        description: "Energy consumption rate is {{ $value }} kWh/min"
+    
+    - alert: GreenAgentTaskFailures
+      expr: rate(green_agent_tasks_completed{status="failed"}[5m]) > 0.1
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "High task failure rate"
+        description: "Task failure rate is {{ $value }} failures/min"
+    
+    - alert: GreenAgentLowWorkerCount
+      expr: green_agent_active_workers < 2
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Low worker count"
+        description: "Only {{ $value }} workers active"
+    
+    - alert: GreenAgentServiceDown
+      expr: up{job="green-agent"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Green Agent service is down"
+        description: "Service has been down for more than 1 minute"
