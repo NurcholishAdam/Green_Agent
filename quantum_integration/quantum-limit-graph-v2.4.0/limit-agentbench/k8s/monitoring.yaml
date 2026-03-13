@@ -1,0 +1,175 @@
+---
+# ServiceMonitor for Prometheus
+# Scrapes Green Agent metrics
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: green-agent-monitor
+  namespace: green-agent
+  labels:
+    release: prometheus
+    app: green-agent
+spec:
+  # Select Green Agent services
+  selector:
+    matchLabels:
+      app: green-agent
+  
+  # Monitor in green-agent namespace
+  namespaceSelector:
+    matchNames:
+    - green-agent
+  
+  # Scrape configuration
+  endpoints:
+  - port: metrics
+    interval: 15s
+    scrapeTimeout: 10s
+    path: /metrics
+    scheme: http
+    
+    # Relabel configurations
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: service
+    
+    # Metric relabel configurations
+    metricRelabelings:
+    - sourceLabels: [__name__]
+      regex: 'go_.*'
+      action: drop
+    - sourceLabels: [__name__]
+      regex: 'python_.*'
+      action: drop
+
+---
+# Service for metrics exposure
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: green-agent-metrics
+  namespace: green-agent
+  labels:
+    app: green-agent
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  selector:
+    app: green-agent
+    component: head
+
+---
+# PrometheusRule for alerting
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: green-agent-alerts
+  namespace: green-agent
+  labels:
+    release: prometheus
+    app: green-agent
+spec:
+  groups:
+  - name: green-agent.rules
+    interval: 30s
+    rules:
+    # High carbon intensity alert
+    - alert: GreenAgentHighCarbonIntensity
+      expr: green_agent_carbon_intensity > 400
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High carbon intensity detected"
+        description: "Carbon intensity is {{ $value }} gCO2/kWh for more than 5 minutes"
+    
+    # High energy consumption alert
+    - alert: GreenAgentHighEnergyConsumption
+      expr: rate(green_agent_energy_consumed_kwh_total[5m]) > 10
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High energy consumption detected"
+        description: "Energy consumption rate is {{ $value }} kWh/min"
+    
+    # Task failure alert
+    - alert: GreenAgentTaskFailures
+      expr: rate(green_agent_tasks_completed{status="failed"}[5m]) > 0.1
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "High task failure rate"
+        description: "Task failure rate is {{ $value }} failures/min"
+    
+    # Low worker count alert
+    - alert: GreenAgentLowWorkerCount
+      expr: green_agent_active_workers < 2
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Low worker count"
+        description: "Only {{ $value }} workers active"
+    
+    # High queue depth alert
+    - alert: GreenAgentHighQueueDepth
+      expr: green_agent_queue_depth > 100
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High task queue depth"
+        description: "Queue depth is {{ $value }} tasks"
+    
+    # Service down alert
+    - alert: GreenAgentServiceDown
+      expr: up{job="green-agent"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Green Agent service is down"
+        description: "Green Agent service has been down for more than 1 minute"
+
+---
+# ConfigMap for Prometheus scrape config (if using custom Prometheus)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-green-agent-config
+  namespace: monitoring
+  labels:
+    app: prometheus
+data:
+  green-agent-scrape.yml: |
+    - job_name: 'green-agent'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - green-agent
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_label_app]
+        action: keep
+        regex: green-agent
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: metrics
+      scrape_interval: 15s
+      scrape_timeout: 10s
+      metrics_path: /metrics
+      scheme: http
