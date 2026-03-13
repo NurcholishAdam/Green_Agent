@@ -1,265 +1,47 @@
-name: Deploy Green Agent
-
-on:
-  push:
-    branches: [main]
-    tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Deployment environment'
-        required: true
-        default: 'staging'
-        type: choice
-        options:
-        - development
-        - staging
-        - production
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  # ✅ Use $HOME instead of ~ for reliability
-  KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig
-
-permissions:
-  contents: read
-  packages: write
-  id-token: write
-
-jobs:
-  deploy:
+# Add this job BEFORE the main deploy job
+  test-kind:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'staging' }}
-    timeout-minutes: 30
+    if: github.event_name == 'pull_request'  # Only run on PRs
     
     steps:
-    # ✅ Step 1: Checkout
-    - name: Checkout repository
+    - name: Checkout
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
     
-    # ✅ Step 2: Set up kubectl
-    - name: Set up kubectl
-      uses: azure/setup-kubectl@v4
-      with:
-        version: 'v1.28.0'
-    
-    # ✅ Step 3: CRITICAL - Write kubeconfig with explicit path and validation
-    - name: Configure Kubernetes credentials
+    - name: Set up Kind
       run: |
-        echo "🔐 Setting up Kubernetes credentials..."
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+        kind create cluster --name green-agent-test
         
-        # Use explicit path (no ~)
-        KUBECONFIG_FILE="${{ env.KUBECONFIG_PATH }}"
-        
-        # Decode kubeconfig secret
-        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$KUBECONFIG_FILE"
-        
-        # Set restrictive permissions
-        chmod 600 "$KUBECONFIG_FILE"
-        
-        # Export for this step AND write to GITHUB_ENV for future steps
-        echo "KUBECONFIG=${KUBECONFIG_FILE}" >> $GITHUB_ENV
-        export KUBECONFIG="${KUBECONFIG_FILE}"
-        
-        # ✅ CRITICAL: Verify kubeconfig is valid BEFORE proceeding
-        echo "🔍 Validating kubeconfig..."
-        
-        # Check file exists and has content
-        if [ ! -s "$KUBECONFIG_FILE" ]; then
-          echo "❌ Kubeconfig file is empty or missing"
-          echo "File size: $(stat -c%s "$KUBECONFIG_FILE" 2>/dev/null || echo 'unknown')"
-          exit 1
-        fi
-        
-        # Check it's valid YAML with required fields
-        if ! grep -q "clusters:" "$KUBECONFIG_FILE" || ! grep -q "users:" "$KUBECONFIG_FILE"; then
-          echo "❌ Kubeconfig missing required fields"
-          echo "First 10 lines:"
-          head -10 "$KUBECONFIG_FILE"
-          exit 1
-        fi
-        
-        # Extract server URL for verification
-        SERVER_URL=$(grep -A1 "server:" "$KUBECONFIG_FILE" | tail -1 | tr -d ' ')
-        echo "📋 Cluster server: $SERVER_URL"
-        
-        # Test connection with explicit --kubeconfig flag (most reliable)
-        echo "🔍 Testing cluster connection with explicit kubeconfig..."
-        if kubectl --kubeconfig="${KUBECONFIG_FILE}" cluster-info --request-timeout=30s; then
-          echo "✅ Successfully connected to cluster!"
-          kubectl --kubeconfig="${KUBECONFIG_FILE}" get nodes --request-timeout=30s || true
-        else
-          echo "❌ Failed to connect to cluster"
-          echo ""
-          echo "🔍 Debug info:"
-          echo "KUBECONFIG file: ${KUBECONFIG_FILE}"
-          echo "File permissions: $(ls -la "${KUBECONFIG_FILE}")"
-          echo "File content preview (sanitized):"
-          grep -v "token:\|password:\|client-key-\|certificate-authority-" "${KUBECONFIG_FILE}" | head -20 || true
-          echo ""
-          echo "🔍 kubectl version:"
-          kubectl version --client || true
-          exit 1
-        fi
-      shell: bash
+        # Install metrics-server for HPA
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        kubectl patch deployment metrics-server -n kube-system \
+          --type='json' -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
     
-    # ✅ Step 4: Prepare environment (with explicit kubeconfig)
-    - name: Prepare deployment
+    - name: Test kustomize builds
       run: |
-        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
-        NAMESPACE="green-agent-${ENVIRONMENT}"
-        CONFIG_DIR="config/overlays/${ENVIRONMENT}"
-        KUBECONFIG_FILE="${{ env.KUBECONFIG_PATH }}"
-        
-        echo "📋 Environment: $ENVIRONMENT"
-        echo "📋 Namespace: $NAMESPACE"
-        echo "📋 Config: $CONFIG_DIR"
-        echo "📋 Kubeconfig: $KUBECONFIG_FILE"
-        
-        # Verify kustomization file exists
-        if [ ! -f "${CONFIG_DIR}/kustomization.yaml" ]; then
-          echo "❌ Missing: ${CONFIG_DIR}/kustomization.yaml"
-          echo "📋 Available:"
-          ls -la "${CONFIG_DIR}/" 2>&1 || true
-          exit 1
-        fi
-        
-        # Export secrets for kustomize (using envsubst-compatible format)
-        echo "CARBON_API_KEY=${{ secrets.CARBON_API_KEY }}" >> $GITHUB_ENV
-        echo "SLACK_WEBHOOK=${{ secrets.SLACK_WEBHOOK }}" >> $GITHUB_ENV
-        echo "API_KEYS=${{ secrets.API_KEYS }}" >> $GITHUB_ENV
-        
-        echo "✅ Preparation complete"
-      shell: bash
-      env:
-        KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        for env in development staging production; do
+          echo "▶ Testing $env kustomize build..."
+          kubectl kustomize "config/overlays/$env" --enable-helm > /dev/null
+          echo "✅ $env builds successfully"
+        done
     
-    # ✅ Step 5: Deploy with EXPLICIT --kubeconfig flag on EVERY kubectl command
-    - name: Deploy to Kubernetes
+    - name: Deploy to Kind (development overlay)
       run: |
-        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
-        NAMESPACE="green-agent-${ENVIRONMENT}"
-        CONFIG_DIR="config/overlays/${ENVIRONMENT}"
-        PREFIX="${ENVIRONMENT:0:4}"
-        KUBECONFIG_FILE="${{ env.KUBECONFIG_PATH }}"
+        kubectl create namespace green-agent-test
+        kubectl apply -k config/overlays/development -n green-agent-test
         
-        echo "🚀 Deploying Green Agent to $ENVIRONMENT..."
-        echo "================================================"
-        
-        # Helper function for kubectl with explicit kubeconfig
-        kubectl_safe() {
-          kubectl --kubeconfig="${KUBECONFIG_FILE}" "$@"
-        }
-        
-        # Create namespace
-        echo "▶ Creating namespace..."
-        if ! kubectl_safe create namespace "$NAMESPACE" --dry-run=client -o yaml 2>/dev/null | kubectl_safe apply -f - 2>&1; then
-          echo "⚠ Namespace warning (may already exist)"
-        fi
-        
-        # Apply kustomize
-        echo "▶ Applying kustomize configuration..."
-        if ! kubectl_safe apply -k "$CONFIG_DIR" -n "$NAMESPACE" --server-side --force-conflicts 2>&1 | tee /tmp/kubectl-apply.log; then
-          echo "❌ Apply failed"
-          cat /tmp/kubectl-apply.log
-          exit 1
-        fi
-        
-        # Wait for deployment
-        echo "▶ Waiting for resources..."
-        
-        # Wait for head (with timeout and status check)
-        if kubectl_safe wait --for=condition=available \
-            deployment/"${PREFIX}green-agent-cluster-head" \
-            -n "$NAMESPACE" \
-            --timeout=300s 2>&1; then
-          echo "✅ Head ready"
-        else
-          echo "⚠ Head timeout - checking status..."
-          kubectl_safe get pods -n "$NAMESPACE" -l component=head -o wide || true
-          kubectl_safe describe deployment -n "$NAMESPACE" "${PREFIX}green-agent-cluster-head" || true
-        fi
-        
-        # Wait for workers
-        if kubectl_safe wait --for=condition=ready pod \
-            -l "app=green-agent,component=worker" \
-            -n "$NAMESPACE" \
-            --timeout=300s 2>&1; then
-          echo "✅ Workers ready"
-        else
-          echo "⚠ Workers timeout - checking status..."
-          kubectl_safe get pods -n "$NAMESPACE" -l component=worker -o wide || true
-        fi
+        # Wait for pods
+        kubectl wait --for=condition=ready pod \
+          -l app=green-agent \
+          -n green-agent-test \
+          --timeout=300s || true
         
         # Verify
-        echo ""
-        echo "📊 Final Status:"
-        kubectl_safe get all -n "$NAMESPACE" -o wide || true
-        echo ""
-        kubectl_safe get hpa -n "$NAMESPACE" || true
-        echo ""
-        
-        # Save for artifacts
-        kubectl_safe get all -n "$NAMESPACE" -o yaml > /tmp/deployment-status.yaml 2>&1 || true
-        
-        echo "✅ Deployment complete!"
-      shell: bash
-      env:
-        KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        kubectl get all -n green-agent-test
     
-    # ✅ Step 6: Upload artifacts
-    - name: Upload Logs
-      uses: actions/upload-artifact@v4
+    - name: Cleanup
       if: always()
-      with:
-        name: deploy-logs-${{ github.event.inputs.environment || 'staging' }}
-        path: |
-          /tmp/kubectl-apply.log
-          /tmp/deployment-status.yaml
-          ${{ env.KUBECONFIG_PATH }}
-        retention-days: 7
-        if-no-files-found: warn
-    
-    # ✅ Step 7: Notifications
-    - name: Success
-      if: success()
       run: |
-        echo "✅ Deployment successful!"
-        echo "📊 Dashboard: kubectl port-forward svc/staging-green-agent-dashboard 8000:8000"
-    
-    - name: Failure Debug
-      if: failure()
-      run: |
-        echo "❌ Deployment failed!"
-        echo ""
-        echo "🔍 Critical debug info:"
-        echo "Working dir: $(pwd)"
-        echo "KUBECONFIG env: ${KUBECONFIG:-NOT SET}"
-        echo "KUBECONFIG_PATH: ${{ env.KUBECONFIG_PATH }}"
-        echo ""
-        
-        # Try to connect with explicit kubeconfig one more time
-        KUBECONFIG_FILE="${{ env.KUBECONFIG_PATH }}"
-        if [ -f "$KUBECONFIG_FILE" ]; then
-          echo "📋 Kubeconfig exists, testing connection..."
-          if kubectl --kubeconfig="${KUBECONFIG_FILE}" cluster-info --request-timeout=10s 2>&1; then
-            echo "✅ Connection works with explicit flag!"
-          else
-            echo "❌ Connection failed even with explicit flag"
-          fi
-        else
-          echo "❌ Kubeconfig file missing: $KUBECONFIG_FILE"
-        fi
-        
-        echo ""
-        echo "📋 Last 20 lines of kubeconfig (sanitized):"
-        if [ -f "$KUBECONFIG_FILE" ]; then
-          grep -v "token:\|password:\|client-key-\|certificate-authority-" "$KUBECONFIG_FILE" | tail -20 || true
-        fi
-      shell: bash
-      env:
-        KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        kind delete cluster --name green-agent-test || true
