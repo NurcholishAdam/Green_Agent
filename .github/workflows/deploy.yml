@@ -17,178 +17,43 @@ on:
         - staging
         - production
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 permissions:
   contents: read
   packages: write
-  id-token: write
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'staging' }}
-    timeout-minutes: 30
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+    
+    # ✅ Use official Kubernetes action with direct credentials
+    - name: Deploy to Kubernetes
+      uses: azure/k8s-deploy@v5
       with:
-        fetch-depth: 0
+        # ✅ FIX: Use cluster context directly instead of kubeconfig secret
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        namespace: green-agent-${{ github.event.inputs.environment || 'staging' }}
+        # Deploy using kustomize
+        manifests: |
+          config/overlays/${{ github.event.inputs.environment || 'staging' }}/kustomization.yaml
+        images: |
+          ghcr.io/nurcholishadam/green_agent:${{ github.sha }}
+        strategy: rolling
+        force: false
     
-    # ✅ FIX: Set up kubectl with proper version
-    - name: Set up kubectl
-      uses: azure/setup-kubectl@v4
-      with:
-        version: 'v1.28.0'
-      id: install
-    
-    # ✅ FIX: Properly configure kubeconfig
-    - name: Configure Kubernetes credentials
+    - name: Verify deployment
       run: |
-        echo "🔐 Setting up Kubernetes credentials..."
+        NAMESPACE="green-agent-${{ github.event.inputs.environment || 'staging' }}"
         
-        # Create .kube directory
-        mkdir -p ~/.kube
+        # Wait for pods
+        kubectl wait --for=condition=ready pod \
+          -l app=green-agent \
+          -n $NAMESPACE \
+          --timeout=300s || true
         
-        # Decode and write kubeconfig
-        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
-        
-        # Set proper permissions
-        chmod 600 ~/.kube/config
-        
-        # Set KUBECONFIG environment variable
-        echo "KUBECONFIG=~/.kube/config" >> $GITHUB_ENV
-        
-        # Verify connection
-        echo "🔍 Testing cluster connection..."
-        if kubectl cluster-info --request-timeout=30s; then
-          echo "✅ Connected to cluster!"
-          kubectl get nodes --request-timeout=30s || true
-        else
-          echo "❌ Failed to connect to cluster"
-          echo "KUBECONFIG: $KUBECONFIG"
-          echo "Config file contents (sanitized):"
-          grep -v "token:\|password:\|client-key-data:\|certificate-authority-data:" ~/.kube/config || true
-          exit 1
-        fi
-      env:
-        KUBECONFIG: ~/.kube/config
-    
-    # ✅ FIX: Inline deployment with proper error handling
-    - name: Deploy to environment
-      run: |
-        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
-        NAMESPACE="green-agent-${ENVIRONMENT}"
-        CONFIG_DIR="config/overlays/${ENVIRONMENT}"
-        PREFIX="${ENVIRONMENT:0:4}"
-        
-        echo "🚀 Deploying Green Agent to $ENVIRONMENT environment..."
-        echo "========================================================"
-        echo "Environment: $ENVIRONMENT"
-        echo "Namespace: $NAMESPACE"
-        echo "Config: $CONFIG_DIR"
-        echo "========================================================"
-        
-        # Create namespace with error handling
-        echo "▶ Creating namespace: $NAMESPACE..."
-        if ! kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml 2>/dev/null | kubectl apply -f - 2>&1; then
-          echo "⚠ Namespace creation warning (may already exist)"
-        fi
-        
-        # Apply configuration with detailed error output
-        echo "▶ Applying Kustomize configuration..."
-        if ! kubectl apply -k "$CONFIG_DIR" -n "$NAMESPACE" 2>&1 | tee /tmp/kubectl-apply.log; then
-          echo "❌ Failed to apply configuration"
-          echo "📋 Apply log:"
-          cat /tmp/kubectl-apply.log
-          exit 1
-        fi
-        
-        # Wait for deployment with timeout and fallback
-        echo "▶ Waiting for deployment..."
-        
-        # Wait for head pod
-        if ! kubectl wait --for=condition=available \
-            deployment/"${PREFIX}green-agent-cluster-head" \
-            -n "$NAMESPACE" \
-            --timeout=300s 2>&1; then
-          echo "⚠ Head deployment not ready within timeout"
-          echo "📋 Pod status:"
-          kubectl get pods -n "$NAMESPACE" -l component=head || true
-        fi
-        
-        # Wait for worker pods
-        if ! kubectl wait --for=condition=ready pod \
-            -l "app=green-agent,component=worker" \
-            -n "$NAMESPACE" \
-            --timeout=300s 2>&1; then
-          echo "⚠ Worker pods not ready within timeout"
-          echo "📋 Worker pod status:"
-          kubectl get pods -n "$NAMESPACE" -l component=worker || true
-        fi
-        
-        # Verify deployment
-        echo ""
-        echo "📊 Deployment Status:"
-        echo ""
-        
-        echo "Pods:"
-        kubectl get pods -n "$NAMESPACE" -o wide 2>&1 || echo "⚠ Could not get pods"
-        echo ""
-        
-        echo "Services:"
-        kubectl get svc -n "$NAMESPACE" 2>&1 || echo "⚠ Could not get services"
-        echo ""
-        
-        echo "HPA:"
-        kubectl get hpa -n "$NAMESPACE" 2>&1 || echo "⚠ Could not get HPA"
-        echo ""
-        
-        echo "Events (last 10):"
-        kubectl get events -n "$NAMESPACE" --sort-by='.lastTimestamp' 2>&1 | tail -10 || true
-        echo ""
-        
-        echo "✅ Deployment verification complete"
-        
-        # Save logs for artifact upload
-        kubectl get all -n "$NAMESPACE" -o yaml > /tmp/deployment-status.yaml 2>&1 || true
-        kubectl describe deployment -n "$NAMESPACE" > /tmp/deployment-describe.txt 2>&1 || true
-        
-      env:
-        KUBECONFIG: ~/.kube/config
-    
-    # ✅ FIX: Upload artifacts with proper paths
-    - name: Upload Deployment Logs
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: deployment-logs-${{ github.event.inputs.environment || 'staging' }}
-        path: |
-          /tmp/kubectl-apply.log
-          /tmp/deployment-status.yaml
-          /tmp/deployment-describe.txt
-        retention-days: 7
-        if-no-files-found: warn
-    
-    - name: Notify Success
-      if: success()
-      run: |
-        echo "✅ Deployment to ${{ github.event.inputs.environment || 'staging' }} successful!"
-        echo "📊 Dashboard: kubectl port-forward svc/${{ github.event.inputs.environment || 'staging' }}-green-agent-dashboard 8000:8000"
-    
-    - name: Notify Failure
-      if: failure()
-      run: |
-        echo "❌ Deployment to ${{ github.event.inputs.environment || 'staging' }} failed!"
-        echo ""
-        echo "🔍 Debug information:"
-        echo "KUBECONFIG: $KUBECONFIG"
-        echo "Cluster info:"
-        kubectl cluster-info 2>&1 || echo "⚠ Cannot get cluster info"
-        echo ""
-        echo "Namespace status:"
-        kubectl get namespace "green-agent-${{ github.event.inputs.environment || 'staging' }}" 2>&1 || echo "⚠ Namespace not found"
-        exit 1
+        # Show status
+        kubectl get all -n $NAMESPACE
