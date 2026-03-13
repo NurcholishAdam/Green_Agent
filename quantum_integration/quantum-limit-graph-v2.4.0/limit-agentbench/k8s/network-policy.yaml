@@ -1,0 +1,155 @@
+---
+# Network Policy for Green Agent
+# Provides security isolation and access control
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: green-agent-network-policy
+  namespace: green-agent
+  labels:
+    app: green-agent
+    security: enhanced
+spec:
+  # Apply to all Green Agent pods
+  podSelector:
+    matchLabels:
+      app: green-agent
+  
+  # Apply to both ingress and egress traffic
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  # Ingress rules (incoming traffic)
+  ingress:
+  # Allow dashboard access from anywhere (for external users)
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8000
+      name: dashboard
+    - protocol: TCP
+      port: 8265
+      name: ray-dashboard
+  
+  # Allow internal cluster communication between Green Agent pods
+  - from:
+    - podSelector:
+        matchLabels:
+          app: green-agent
+    ports:
+    - protocol: TCP
+      port: 6379
+      name: ray-gcs
+    - protocol: TCP
+      port: 10001
+      name: ray-client
+    - protocol: TCP
+      port: 8000
+      name: dashboard
+    - protocol: TCP
+      port: 9090
+      name: metrics
+  
+  # Allow monitoring from Prometheus namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 9090
+      name: metrics
+  
+  # Allow health checks from Kubernetes API server
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
+      name: health
+  
+  # Egress rules (outgoing traffic)
+  egress:
+  # Allow DNS resolution
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  
+  # Allow HTTPS for external APIs (carbon APIs, etc.)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        # Exclude private networks (optional, remove if internal APIs needed)
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443
+      name: https
+  
+  # Allow HTTP for external APIs (if needed)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 80
+      name: http
+  
+  # Allow internal cluster communication
+  - to:
+    - podSelector:
+        matchLabels:
+          app: green-agent
+    ports:
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 10001
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 9090
+  
+  # Allow communication with Kubernetes API server
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 443
+      name: kubernetes-api
+
+---
+# Default deny policy for additional security
+# Apply this if you want to deny all traffic by default
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: green-agent-default-deny
+  namespace: green-agent
+  labels:
+    app: green-agent
+    security: strict
+spec:
+  podSelector:
+    matchLabels:
+      app: green-agent
+  policyTypes:
+  - Ingress
+  - Egress
+  # No ingress/egress rules = deny all
+  # Apply this policy only if you want strict security
+  # Then add specific allow policies above
