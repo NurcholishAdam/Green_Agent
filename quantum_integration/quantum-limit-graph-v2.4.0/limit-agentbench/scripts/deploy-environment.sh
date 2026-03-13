@@ -1,62 +1,118 @@
-#!/bin/bash
+name: Deploy Green Agent
 
-# Green Agent - Environment Deployment Script
-# Deploys to development, staging, or production
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - development
+        - staging
+        - production
 
-set -e
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # ✅ FIX: Set working directory explicitly
+  WORKING_DIRECTORY: ${{ github.workspace }}
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+permissions:
+  contents: read
+  packages: write
+  id-token: write
 
-# Configuration
-ENVIRONMENT=${1:-development}
-CONFIG_DIR="config/overlays/$ENVIRONMENT"
-
-print_status() { echo -e "${BLUE}▶${NC} $1"; }
-print_success() { echo -e "${GREEN}✓${NC} $1"; }
-print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
-print_error() { echo -e "${RED}✗${NC} $1"; }
-
-# Validate environment
-if [ ! -d "$CONFIG_DIR" ]; then
-    print_error "Environment '$ENVIRONMENT' not found!"
-    echo "Available environments: development, staging, production"
-    exit 1
-fi
-
-print_status "Deploying Green Agent to $ENVIRONMENT environment..."
-echo "========================================================"
-
-# Create namespace
-NAMESPACE="green-agent-$ENVIRONMENT"
-print_status "Creating namespace: $NAMESPACE..."
-kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
-
-# Apply configuration
-print_status "Applying Kustomize configuration..."
-kubectl apply -k $CONFIG_DIR -n $NAMESPACE
-
-# Wait for deployment
-print_status "Waiting for deployment to complete..."
-kubectl wait --for=condition=available \
-  deployment/${ENVIRONMENT:0:4}-green-agent-cluster-head \
-  -n $NAMESPACE \
-  --timeout=300s || true
-
-# Verify
-print_status "Verifying deployment..."
-kubectl get pods -n $NAMESPACE
-kubectl get hpa -n $NAMESPACE
-kubectl get networkpolicy -n $NAMESPACE
-
-echo ""
-print_success "Deployment to $ENVIRONMENT complete!"
-echo ""
-echo "📊 Access Dashboard:"
-echo "   kubectl port-forward svc/${ENVIRONMENT:0:4}-green-agent-dashboard 8000:8000 -n $NAMESPACE"
-echo "   open http://localhost:8000"
-echo ""
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        # ✅ FIX: Ensure we're in the repo root
+        path: .
+    
+    - name: Set up kubectl
+      uses: Azure/setup-kubectl@v4
+      with:
+        version: 'v1.28.0'
+    
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+        chmod 600 ~/.kube/config
+    
+    # ✅ FIX: Make scripts executable BEFORE running them
+    - name: Make deployment scripts executable
+      run: |
+        chmod +x ./scripts/*.sh
+        chmod +x ./k8s/*.sh
+        ls -la ./scripts/
+        ls -la ./k8s/
+    
+    # ✅ FIX: Use absolute path or cd to workspace first
+    - name: Deploy to environment
+      run: |
+        # Ensure we're in the correct directory
+        cd ${{ github.workspace }}
+        
+        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+        echo "🚀 Deploying to $ENVIRONMENT environment..."
+        
+        # Run the deployment script with absolute path
+        "${{ github.workspace }}/scripts/deploy-environment.sh" "$ENVIRONMENT"
+      env:
+        KUBECONFIG: ~/.kube/config
+    
+    - name: Verify deployment
+      run: |
+        cd ${{ github.workspace }}
+        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+        NAMESPACE="green-agent-$ENVIRONMENT"
+        
+        # Wait for pods to be ready
+        kubectl wait --for=condition=ready pod \
+          -l app=green-agent \
+          -n $NAMESPACE \
+          --timeout=300s || true
+        
+        # Check deployment status
+        kubectl get pods -n $NAMESPACE
+        kubectl get hpa -n $NAMESPACE
+    
+    # ✅ FIX: Updated to v4 with proper paths
+    - name: Upload Deployment Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: deployment-logs-${{ github.event.inputs.environment || 'staging' }}
+        path: |
+          ${{ github.workspace }}/kubectl-logs.txt
+          ${{ github.workspace }}/deployment-status.json
+        retention-days: 14
+        compression-level: 6
+        if-no-files-found: warn
+    
+    - name: Notify Success
+      if: success()
+      run: |
+        echo "✅ Deployment to ${{ github.event.inputs.environment || 'staging' }} successful!"
+    
+    - name: Notify Failure
+      if: failure()
+      run: |
+        echo "❌ Deployment to ${{ github.event.inputs.environment || 'staging' }} failed!"
+        # Collect debug info
+        kubectl get events -n "green-agent-${{ github.event.inputs.environment || 'staging' }}" || true
+        exit 1
