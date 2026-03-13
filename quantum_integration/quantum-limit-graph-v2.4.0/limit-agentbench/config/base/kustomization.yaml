@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: green-agent
+
+# Common labels for all resources
+commonLabels:
+  app: green-agent
+  version: "5.0.0"
+  managed-by: kustomize
+
+# Resources to include
+resources:
+- ray-cluster.yaml
+- service.yaml
+- configmap.yaml
+- secrets.yaml
+- hpa.yaml
+- network-policy.yaml
+- monitoring.yaml
+
+# ConfigMap generator
+configMapGenerator:
+- name: green-agent-config
+  files:
+  - green_agent_config.yaml
+
+# Secret generator (uses secrets.env file)
+secretGenerator:
+- name: green-agent-secrets
+  envs:
+  - secrets.env
+
+# Image configuration
+images:
+- name: ghcr.io/nurcholishadam/green_agent
+  newTag: v5.0.0
+
+# Name prefix (overridden by overlays)
+namePrefix: ""
+
+# Common annotations
+commonAnnotations:
+  app.kubernetes.io/part-of: green-agent
+  app.kubernetes.io/managed-by: kustomize
