@@ -1,11 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-production
-
-bases:
+resources:
 - ../../base
 
+namespace: green-agent-production
 namePrefix: prod-
 
 commonLabels:
@@ -35,11 +34,9 @@ secretGenerator:
 - name: green-agent-secrets
   behavior: merge
   literals:
-  - CARBON_API_KEY=production-carbon-api-key
-  - SLACK_WEBHOOK=production-slack-webhook
-  - API_KEYS=production-api-keys
-  - DATABASE_PASSWORD=production-db-password
-  - REDIS_PASSWORD=production-redis-password
+  - CARBON_API_KEY=${CARBON_API_KEY}
+  - SLACK_WEBHOOK=${SLACK_WEBHOOK}
+  - API_KEYS=${API_KEYS}
 
 images:
 - name: ghcr.io/nurcholishadam/green_agent
