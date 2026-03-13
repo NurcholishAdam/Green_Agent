@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: green-agent-config
+data:
+  green_agent_config.yaml: |
+    system:
+      version: "5.0.0-dev"
+      mode: "unified"
+      debug: true
+      log_level: "DEBUG"
+    
+    dashboard:
+      enabled: true
+      host: "0.0.0.0"
+      port: 8000
+    
+    ray:
+      enabled: false
+      num_workers: 2
+    
+    carbon:
+      default_region: "US-CA"
+      api_provider: "simulation"
+      eco_mode_threshold: 200
+    
+    quantum:
+      enabled: false
+      backend: "simulator"
+    
+    monitoring:
+      prometheus:
+        enabled: true
+      logging:
+        level: "DEBUG"
+    
+    development:
+      enable_profiling: true
+      enable_debug_endpoints: true
+      mock_carbon_api: true
+      simulate_quantum: true
+    
+    security:
+      enable_auth: false
+      tls:
+        enabled: false
