@@ -1,0 +1,85 @@
+name: Deploy Green Agent
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - development
+        - staging
+        - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up kubectl
+      uses: Azure/setup-kubectl@v4
+      with:
+        version: 'v1.28.0'
+    
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+        chmod 600 ~/.kube/config
+    
+    - name: Deploy to environment
+      run: |
+        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+        ./scripts/deploy-environment.sh $ENVIRONMENT
+    
+    - name: Verify deployment
+      run: |
+        ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+        NAMESPACE="green-agent-$ENVIRONMENT"
+        kubectl wait --for=condition=available \
+          deployment/${ENVIRONMENT:0:4}-green-agent-cluster-head \
+          -n $NAMESPACE \
+          --timeout=300s
+    
+    # ✅ FIXED: Updated to v4
+    - name: Upload Deployment Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: deployment-logs-${{ github.event.inputs.environment || 'staging' }}
+        path: |
+          kubectl-logs.txt
+          deployment-status.json
+        retention-days: 14
+        compression-level: 6
+    
+    - name: Notify Success
+      if: success()
+      run: |
+        echo "✅ Deployment to ${{ github.event.inputs.environment || 'staging' }} successful!"
+    
+    - name: Notify Failure
+      if: failure()
+      run: |
+        echo "❌ Deployment to ${{ github.event.inputs.environment || 'staging' }} failed!"
+        exit 1
