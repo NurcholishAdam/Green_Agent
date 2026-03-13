@@ -1,0 +1,26 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: green-agent-cluster
+spec:
+  headGroupSpec:
+    template:
+      spec:
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          fsGroup: 1000
+        containers:
+        - name: ray-head
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+              - ALL
+          volumeMounts:
+          - name: tmp-volume
+            mountPath: /tmp
+        volumes:
+        - name: tmp-volume
+          emptyDir: {}
