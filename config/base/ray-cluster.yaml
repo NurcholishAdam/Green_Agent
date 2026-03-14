@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-config
+  namespace: green-agent
+data:
+  config: "ray-cluster-placeholder"

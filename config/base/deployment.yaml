@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: green-agent
+  namespace: green-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: green-agent
+  template:
+    metadata:
+      labels:
+        app: green-agent
+    spec:
+      containers:
+      - name: green-agent
+        image: green-agent:latest
+        ports:
+        - containerPort: 8000
