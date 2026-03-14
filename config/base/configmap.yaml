@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: green-agent-config
+  namespace: green-agent
+data:
+  VERSION: "5.0.0"
+  ENVIRONMENT: "base"
+  RAY_WORKERS: "4"
+  CARBON_REGION: "US-CA"

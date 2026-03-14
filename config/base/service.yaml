@@ -4,7 +4,13 @@ metadata:
   name: green-agent
   namespace: green-agent
 spec:
+  type: ClusterIP
   selector:
     app: green-agent
   ports:
-  - port: 8000
+  - name: api
+    port: 8000
+    targetPort: 8000
+  - name: ray-dashboard
+    port: 8265
+    targetPort: 8265

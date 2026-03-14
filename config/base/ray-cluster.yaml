@@ -1,7 +1,29 @@
+# Ray Cluster Configuration for Green Agent
+# This is a placeholder - actual Ray cluster should be configured separately
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: ray-config
+  name: ray-cluster-config
   namespace: green-agent
 data:
-  config: "ray-cluster-placeholder"
+  ray-config.yaml: |
+    # Ray cluster configuration
+    cluster_name: green-agent-ray
+    max_workers: 8
+    upscaling_speed: 1.0
+    idle_timeout_minutes: 5
+    
+    head_node_type: head.default
+    available_node_types:
+      head.default:
+        min_workers: 0
+        max_workers: 0
+        resources: {}
+      
+      worker.default:
+        min_workers: 2
+        max_workers: 8
+        resources:
+          CPU: 4
+          memory: 8000000000

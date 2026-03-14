@@ -1,24 +1,24 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-dev
+namespace: green-agent-staging
 
 bases:
   - ../../base
 
-namePrefix: dev-
+namePrefix: staging-
 
 commonLabels:
-  environment: development
+  environment: staging
 
 configMapGenerator:
   - name: green-agent-config
     behavior: merge
     literals:
-      - ENVIRONMENT=development
-      - RAY_WORKERS=2
-      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=staging
+      - RAY_WORKERS=4
+      - LOG_LEVEL=INFO
 
 replicas:
   - name: green-agent
-    count: 1
+    count: 2
