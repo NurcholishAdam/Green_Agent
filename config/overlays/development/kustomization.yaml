@@ -1,25 +1,9 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-test
+namespace: green-agent-dev
 
 resources:
   - ../../base
 
 namePrefix: dev-
-
-commonLabels:
-  environment: development
-
-# Patch the configmap instead of merging
-patches:
-  - patch: |-
-      - op: replace
-        path: /data/ENVIRONMENT
-        value: development
-      - op: replace
-        path: /data/RAY_WORKERS
-        value: "2"
-    target:
-      kind: ConfigMap
-      name: green-agent-config
