@@ -1,9 +1,12 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
-   kind: Kustomization
+kind: Kustomization
 
-   namespace: green-agent-test
+namespace: green-agent-test
 
-   resources:
-     - ../../base
+resources:
+  - ../../base
 
-   namePrefix: dev-
+namePrefix: dev-
+
+commonLabels:
+  environment: development
