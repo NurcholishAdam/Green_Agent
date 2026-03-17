@@ -1,9 +1,9 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-dev
+namespace: green-agent-test
 
-bases:
+resources:
   - ../../base
 
 namePrefix: dev-
@@ -11,14 +11,15 @@ namePrefix: dev-
 commonLabels:
   environment: development
 
-configMapGenerator:
-  - name: green-agent-config
-    behavior: merge
-    literals:
-      - ENVIRONMENT=development
-      - RAY_WORKERS=2
-      - LOG_LEVEL=DEBUG
-
-replicas:
-  - name: green-agent
-    count: 1
+# Patch the configmap instead of merging
+patches:
+  - patch: |-
+      - op: replace
+        path: /data/ENVIRONMENT
+        value: development
+      - op: replace
+        path: /data/RAY_WORKERS
+        value: "2"
+    target:
+      kind: ConfigMap
+      name: green-agent-config
