@@ -740,7 +740,7 @@ We welcome contributions!
 
 ```bash
 # Clone your fork
-git clone https://github.com/YOUR_USERNAME/Green_Agent.git
+git clone https://github.com/NurcholishAdam/Green_Agent.git
 cd Green_Agent
 
 # Create development environment
