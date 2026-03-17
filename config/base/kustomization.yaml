@@ -12,4 +12,3 @@ resources:
 
 commonLabels:
   app: green-agent
-  version: v5.0
