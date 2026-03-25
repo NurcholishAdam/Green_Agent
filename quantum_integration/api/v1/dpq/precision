@@ -1,0 +1,117 @@
+# OpenAPI 3.0 Specification (excerpt)
+
+paths:
+  /api/v1/dpq/precision:
+    get:
+      summary: Get current precision configuration
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  region:
+                    type: string
+                  current_precision:
+                    type: string
+                    enum: [fp32, fp16, int8, int4]
+                  carbon_zone:
+                    type: string
+                    enum: [green, yellow, red, critical]
+                  carbon_intensity:
+                    type: number
+                    format: float
+                  last_transition:
+                    type: string
+                    format: date-time
+                    
+    post:
+      summary: Manually trigger precision transition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                region:
+                  type: string
+                target_precision:
+                  type: string
+                  enum: [fp32, fp16, int8, int4]
+                force:
+                  type: boolean
+                  default: false
+                  description: Bypass carbon zone policy
+      responses:
+        '202':
+          description: Transition initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionRequest'
+                
+  /api/v1/dpq/precision/{region}/models:
+    get:
+      summary: List models and their precision variants
+      parameters:
+        - name: region
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        variants:
+                          type: object
+                          properties:
+                            fp32:
+                              $ref: '#/components/schemas/ModelVariant'
+                            fp16:
+                              $ref: '#/components/schemas/ModelVariant'
+                            int8:
+                              $ref: '#/components/schemas/ModelVariant'
+                            int4:
+                              $ref: '#/components/schemas/ModelVariant'
+                              
+components:
+  schemas:
+    ModelVariant:
+      type: object
+      properties:
+        available:
+          type: boolean
+        size_mb:
+          type: number
+          format: float
+        accuracy:
+          type: number
+          format: float
+        last_converted:
+          type: string
+          format: date-time
+          
+    TransitionRequest:
+      type: object
+      properties:
+        request_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, in_progress, completed, failed]
+        estimated_completion:
+          type: string
+          format: date-time
