@@ -1,34 +1,29 @@
 """
-Carbon-Aware Decision Core
+Green Agent v5.0.0 - Carbon-Aware Decision Core
+Layer 3: Makes sustainability-focused scheduling decisions
 
-NEW: Makes sustainability-focused execution decisions
+File: src/decision/carbon_aware_decision_core.py
+Status: FOUNDATIONAL - Tier 1
 """
 
-from typing import Dict, Any
+from typing import Dict, List, Optional
 from dataclasses import dataclass
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ExecutionDecision:
-    """Decision for task execution"""
-    action: str  # execute_full, execute_throttled, defer, reject
-    carbon_zone: str  # green, yellow, red, critical
-    power_budget: float  # 0.0 to 1.0
-    carbon_intensity: float
-    reason: str
-    policy: str
-    estimated_savings: float = 0.0
+    action: str
+    power_budget: float
+    carbon_zone: str
+    reasoning: List[str]
+    deferred_until: Optional[datetime] = None
+
 
 class CarbonAwareDecisionCore:
-    """
-    Make carbon-aware decisions for task execution
-    
-    Features:
-    - Zone-based decision making
-    - Policy enforcement
-    - Carbon budget tracking
-    - Deadline awareness
-    """
-    
     def __init__(self, config: Dict):
         self.config = config
         self.thresholds = {
@@ -38,32 +33,59 @@ class CarbonAwareDecisionCore:
             'critical': 600
         }
         self.policy_mode = config.get('policy', {}).get('mode', 'moderate')
+        self.weights = config.get('policy', {}).get('weights', {
+            'carbon_importance': 0.4,
+            'performance_importance': 0.3,
+            'cost_importance': 0.2,
+            'deadline_importance': 0.1
+        })
     
     async def initialize(self):
-        """Initialize decision core"""
-        print(f"✅ Carbon-aware decision core initialized (policy: {self.policy_mode})")
+        logger.info("CarbonAwareDecisionCore initialized")
     
-    async def evaluate(self, profile: Any, carbon_intensity: float) -> ExecutionDecision:
-        """
-        Evaluate task and make decision based on carbon intensity
-        
-        Args:
-            profile: WorkloadProfile from interpreter
-            carbon_intensity: Current grid carbon intensity (gCO2/kWh)
-        
-        Returns:
-            ExecutionDecision with action and metadata
-        """
-        # Determine carbon zone
+    async def evaluate(self, profile, carbon_intensity: float) -> ExecutionDecision:
         zone = self._get_carbon_zone(carbon_intensity)
+        reasoning = [f"Carbon intensity: {carbon_intensity} gCO2/kWh ({zone})"]
         
-        # Apply policy based on zone and task priority
-        decision = self._apply_policy(profile, zone, carbon_intensity)
-        
-        return decision
+        if zone == 'green':
+            return ExecutionDecision(
+                action='execute_full',
+                power_budget=1.0,
+                carbon_zone=zone,
+                reasoning=reasoning
+            )
+        elif zone == 'yellow':
+            return ExecutionDecision(
+                action='execute_throttled',
+                power_budget=0.6,
+                carbon_zone=zone,
+                reasoning=reasoning
+            )
+        elif zone == 'red':
+            if profile.deferrable:
+                return ExecutionDecision(
+                    action='defer',
+                    power_budget=0.0,
+                    carbon_zone=zone,
+                    reasoning=reasoning + ["Task deferred due to high carbon"],
+                    deferred_until=datetime.now()
+                )
+            else:
+                return ExecutionDecision(
+                    action='execute_minimal',
+                    power_budget=0.3,
+                    carbon_zone=zone,
+                    reasoning=reasoning
+                )
+        else:
+            return ExecutionDecision(
+                action='defer',
+                power_budget=0.0,
+                carbon_zone=zone,
+                reasoning=reasoning + ["Critical carbon zone - all non-essential tasks deferred"]
+            )
     
     def _get_carbon_zone(self, intensity: float) -> str:
-        """Determine carbon zone from intensity"""
         if intensity < self.thresholds['green']:
             return 'green'
         elif intensity < self.thresholds['yellow']:
@@ -72,76 +94,3 @@ class CarbonAwareDecisionCore:
             return 'red'
         else:
             return 'critical'
-    
-    def _apply_policy(self, profile: Any, zone: str, intensity: float) -> ExecutionDecision:
-        """Apply policy rules to make decision"""
-        
-        if zone == 'green':
-            # Green zone: full execution
-            return ExecutionDecision(
-                action='execute_full',
-                carbon_zone='green',
-                power_budget=1.0,
-                carbon_intensity=intensity,
-                reason=f'Low carbon ({intensity:.0f} gCO2/kWh) - optimal for compute',
-                policy=self.policy_mode,
-                estimated_savings=0.0
-            )
-        
-        elif zone == 'yellow':
-            # Yellow zone: throttled execution
-            return ExecutionDecision(
-                action='execute_throttled',
-                carbon_zone='yellow',
-                power_budget=0.6,
-                carbon_intensity=intensity,
-                reason=f'Medium carbon ({intensity:.0f} gCO2/kWh) - throttling recommended',
-                policy=self.policy_mode,
-                estimated_savings=profile.energy_estimate * 0.4
-            )
-        
-        elif zone == 'red':
-            # Red zone: minimal execution or defer
-            if profile.deferrable and profile.priority < 7:
-                return ExecutionDecision(
-                    action='defer',
-                    carbon_zone='red',
-                    power_budget=0.0,
-                    carbon_intensity=intensity,
-                    reason=f'High carbon ({intensity:.0f} gCO2/kWh) - deferring non-urgent task',
-                    policy=self.policy_mode,
-                    estimated_savings=profile.energy_estimate
-                )
-            else:
-                return ExecutionDecision(
-                    action='execute_minimal',
-                    carbon_zone='red',
-                    power_budget=0.3,
-                    carbon_intensity=intensity,
-                    reason=f'High carbon ({intensity:.0f} gCO2/kWh) - minimal execution',
-                    policy=self.policy_mode,
-                    estimated_savings=profile.energy_estimate * 0.7
-                )
-        
-        else:  # critical
-            # Critical zone: only urgent tasks
-            if profile.priority >= 9 and not profile.deferrable:
-                return ExecutionDecision(
-                    action='execute_minimal',
-                    carbon_zone='critical',
-                    power_budget=0.1,
-                    carbon_intensity=intensity,
-                    reason=f'Critical carbon ({intensity:.0f} gCO2/kWh) - emergency execution only',
-                    policy=self.policy_mode,
-                    estimated_savings=profile.energy_estimate * 0.9
-                )
-            else:
-                return ExecutionDecision(
-                    action='defer',
-                    carbon_zone='critical',
-                    power_budget=0.0,
-                    carbon_intensity=intensity,
-                    reason=f'Critical carbon ({intensity:.0f} gCO2/kWh) - task deferred',
-                    policy=self.policy_mode,
-                    estimated_savings=profile.energy_estimate
-                )
