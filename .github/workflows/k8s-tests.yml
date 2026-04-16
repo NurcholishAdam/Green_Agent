@@ -1,0 +1,63 @@
+name: Kubernetes Integration Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  TEST_NAMESPACE: green-agent-test
+  KIND_VERSION: 'v0.20.0'
+
+jobs:
+  k8s-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: 'v1.28.0'
+    
+    - name: Set up Kind cluster
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+        kind create cluster --name green-agent-test
+        kubectl wait --for=condition=ready node --all --timeout=60s
+    
+    - name: Deploy Green Agent
+      run: |
+        kubectl create namespace ${{ env.TEST_NAMESPACE }}
+        kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
+        kubectl wait --for=condition=ready pod -l app=green-agent -n ${{ env.TEST_NAMESPACE }} --timeout=300s
+    
+    - name: Install Test Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r tests/requirements-tests.txt
+    
+    - name: Run K8s Integration Tests
+      run: |
+        pytest tests/k8s/ -v --asyncio-mode=auto --junitxml=k8s-test-results.xml
+    
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: k8s-test-results
+        path: k8s-test-results.xml
+        retention-days: 7
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        kind delete cluster --name green-agent-test || true
