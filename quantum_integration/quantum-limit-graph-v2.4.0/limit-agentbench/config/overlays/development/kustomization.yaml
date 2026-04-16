@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: green-agent-dev
+namePrefix: dev-
+
+resources:
+- ../../base
+
+commonLabels:
+  environment: development
+
+configMapGenerator:
+- name: green-agent-config
+  behavior: merge
+  literals:
+  - LOG_LEVEL=DEBUG
+  - RAY_ENABLED=false
+  - CARBON_API_PROVIDER=simulation
+
+images:
+- name: ghcr.io/nurcholishadam/green_agent
+  newTag: v5.0.0-dev
+
+replicas:
+- name: green-agent-cluster
+  count: 2
