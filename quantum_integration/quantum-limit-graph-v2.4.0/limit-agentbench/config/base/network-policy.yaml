@@ -12,15 +12,12 @@ spec:
   - Ingress
   - Egress
   ingress:
-  # Allow dashboard access
   - from: []
     ports:
     - protocol: TCP
       port: 8000
     - protocol: TCP
       port: 8265
-  
-  # Allow internal cluster communication
   - from:
     - podSelector:
         matchLabels:
@@ -28,19 +25,7 @@ spec:
     ports:
     - protocol: TCP
       port: 6379
-    - protocol: TCP
-      port: 10001
-  
-  # Allow monitoring
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          name: monitoring
-    ports:
-    - protocol: TCP
-      port: 9090
   egress:
-  # Allow DNS
   - to:
     - namespaceSelector: {}
     ports:
@@ -48,28 +33,9 @@ spec:
       port: 53
     - protocol: TCP
       port: 53
-  
-  # Allow HTTPS for APIs
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
-        except:
-        - 10.0.0.0/8
-        - 172.16.0.0/12
-        - 192.168.0.0/16
     ports:
     - protocol: TCP
       port: 443
-  
-  # Allow internal communication
-  - to:
-    - podSelector:
-        matchLabels:
-          app: green-agent
-    ports:
-    - protocol: TCP
-      port: 6379
-    - protocol: TCP
-      port: 10001
-    - protocol: TCP
-      port: 8000
