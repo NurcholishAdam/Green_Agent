@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: green-agent-staging
+namePrefix: staging-
+
+resources:
+- ../../base
+
+commonLabels:
+  environment: staging
+
+configMapGenerator:
+- name: green-agent-config
+  behavior: merge
+  literals:
+  - LOG_LEVEL=INFO
+  - RAY_ENABLED=true
+  - CARBON_API_PROVIDER=electricitymap
+
+images:
+- name: ghcr.io/nurcholishadam/green_agent
+  newTag: v5.0.0-rc1
+
+replicas:
+- name: green-agent-cluster
+  count: 4
