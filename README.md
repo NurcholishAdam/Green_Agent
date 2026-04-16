@@ -364,6 +364,6 @@ SOFTWARE.
 [![Deployed on GitHub Actions](https://img.shields.io/badge/deployed_on-GitHub_Actions-2088FF?logo=githubactions)](https://github.com/features/actions)
 [![Tested with Kind](https://img.shields.io/badge/tested_with-Kind-326CE5?logo=kubernetes)](https://kind.sigs.k8s.io/)
 
-**Status:** ✅ Production Ready | **Version:** 5.0.0 | **Last Updated:** March 2026
+**Status:** ✅ Production Ready | **Version:** 5.0.0 | **Last Updated:** April 2026
 
 </div>
