@@ -5,24 +5,7 @@ namespace: green-agent
 
 commonLabels:
   app: green-agent
-  version: "5.0.0"
-  managed-by: kustomize
 
 resources:
 - ray-cluster.yaml
 - service.yaml
-- hpa.yaml
-- network-policy.yaml
-
-configMapGenerator:
-- name: green-agent-config
-  files:
-  - green_agent_config.yaml
-
-images:
-- name: ghcr.io/nurcholishadam/green_agent
-  newTag: v5.0.0
-
-commonAnnotations:
-  app.kubernetes.io/part-of: green-agent
-  app.kubernetes.io/managed-by: kustomize
