@@ -28,16 +28,13 @@ jobs:
       with:
         version: ${{ env.KUBECTL_VERSION }}
     
-    # ✅ STEP 1: Create Kind cluster with optimized config
     - name: Set up Kind cluster
       run: |
         echo "🚀 Setting up Kind cluster..."
-        
         curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
         chmod +x ./kind
         sudo mv ./kind /usr/local/bin/kind
         
-        # Create cluster with extra resources for CI
         cat <<EOF | kind create cluster --config=- --name green-agent-test
         kind: Cluster
         apiVersion: kind.x-k8s.io/v1alpha4
@@ -59,10 +56,8 @@ jobs:
             protocol: TCP
         EOF
         
-        # Wait for cluster
         kubectl wait --for=condition=ready node --all --timeout=60s
         
-        # Install metrics-server for HPA
         kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
         kubectl patch deployment metrics-server -n kube-system \
           --type='json' -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
@@ -70,65 +65,52 @@ jobs:
         echo "✅ Kind cluster ready"
       shell: bash
     
-    # ✅ STEP 2: Build and load Docker image into Kind (CRITICAL)
     - name: Build and load Docker image
       run: |
         echo "🔨 Building Docker image: ${{ env.LOCAL_IMAGE }}..."
-        
-        # Build image
         docker build -t ${{ env.LOCAL_IMAGE }} .
         
-        # Load into Kind cluster (THIS IS THE KEY STEP)
         echo "📦 Loading image into Kind..."
         kind load docker-image ${{ env.LOCAL_IMAGE }} --name green-agent-test
         
-        # Verify image is in cluster
         echo "🔍 Verifying image in cluster..."
-        if ! docker exec green-agent-test-control-plane crictl images | grep -q "green-agent:test"; then
+        if docker exec green-agent-test-control-plane crictl images | grep -qE "(docker.io/library/)?green-agent.*test"; then
+          echo "✅ Image found in cluster"
+        else
           echo "❌ Image not found in cluster!"
-          docker exec green-agent-test-control-plane crictl images
+          docker exec green-agent-test-control-plane crictl images | grep -E "green-agent|REPOSITORY"
           exit 1
         fi
-        
-        echo "✅ Image loaded successfully"
       shell: bash
     
-    # ✅ STEP 3: Deploy with proper image reference
     - name: Deploy Green Agent
       run: |
         echo "🚀 Deploying to namespace: ${{ env.TEST_NAMESPACE }}..."
         
-        # Create namespace
         kubectl create namespace ${{ env.TEST_NAMESPACE }} 2>/dev/null || true
         
-        # Apply kustomize (client-side apply, NO --server-side)
         echo "▶ Applying configuration..."
         kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
         
-        # Override image to use local build (not registry)
         echo "▶ Setting local image..."
         kubectl set image deployment/dev-green-agent \
-          ray-head=${{ env.LOCAL_IMAGE }} \
-          ray-worker=${{ env.LOCAL_IMAGE }} \
+          ray-head=docker.io/library/green-agent:test \
+          ray-worker=docker.io/library/green-agent:test \
           -n ${{ env.TEST_NAMESPACE }}
         
-        # Show what was deployed
         echo "📋 Deployed resources:"
         kubectl get all -n ${{ env.TEST_NAMESPACE }}
         
         echo "✅ Deployment initiated"
       shell: bash
     
-    # ✅ STEP 4: Wait for pods WITH DIAGNOSTICS
-    - name: Wait for pods with full diagnostics
+    - name: Wait for pods with diagnostics
       run: |
         echo "⏳ Waiting for pods to be Ready (timeout: 300s)..."
         
-        # Show initial state
         echo "📋 Initial pod status:"
         kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o wide
         
-        # Wait for pods with detailed error output on failure
         if ! kubectl wait --for=condition=ready pod \
             -l app=green-agent \
             -n ${{ env.TEST_NAMESPACE }} \
@@ -138,34 +120,28 @@ jobs:
           echo "❌ Pod readiness timeout - FULL DIAGNOSTICS:"
           echo "==========================================="
           
-          # Pod details
           echo ""
           echo "🔍 Pod description:"
           kubectl describe pod -l app=green-agent -n ${{ env.TEST_NAMESPACE }} 2>&1 | tail -50
           
-          # Pod logs
           echo ""
-          echo "📋 Pod logs (last 100 lines):"
-          kubectl logs -l app=green-agent -n ${{ env.TEST_NAMESPACE }} --tail=100 2>&1 || echo "(no logs available)"
+          echo "📋 Pod logs:"
+          kubectl logs -l app=green-agent -n ${{ env.TEST_NAMESPACE }} --tail=100 2>&1 || echo "(no logs)"
           
-          # Events
           echo ""
           echo "📅 Recent events:"
           kubectl get events -n ${{ env.TEST_NAMESPACE }} --sort-by='.lastTimestamp' 2>&1 | tail -20
           
-          # Image status
           echo ""
-          echo "🖼️ Container image status:"
+          echo "🖼️ Container images:"
           kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[*].image}{"\n"}{end}' 2>&1 || true
           
-          # Deployment status
           echo ""
           echo "📊 Deployment status:"
           kubectl get deployment -n ${{ env.TEST_NAMESPACE }} -o wide
           
           echo ""
           echo "==========================================="
-          echo "❌ Deployment failed - see diagnostics above"
           exit 1
         fi
         
@@ -173,7 +149,6 @@ jobs:
         kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o wide
       shell: bash
     
-    # ✅ STEP 5: Run tests
     - name: Install test dependencies
       run: |
         python -m pip install --upgrade pip
@@ -189,7 +164,6 @@ jobs:
           --tb=short
       shell: bash
     
-    # ✅ STEP 6: Upload results
     - name: Upload test results
       uses: actions/upload-artifact@v4
       if: always()
@@ -199,7 +173,6 @@ jobs:
         retention-days: 7
         if-no-files-found: warn
     
-    # ✅ STEP 7: Cleanup
     - name: Cleanup
       if: always()
       run: |
