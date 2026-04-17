@@ -1,52 +1,12 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-dev
+namespace: green-agent-test
 namePrefix: dev-
 
 resources:
 - ../../base
 
-commonLabels:
-  environment: development
-
-configMapGenerator:
-- name: green-agent-config
-  behavior: merge
-  literals:
-  - LOG_LEVEL=DEBUG
-  - RAY_ENABLED=false
-  - CARBON_API_PROVIDER=simulation
-
 images:
-- name: ghcr.io/nurcholishadam/green_agent
+- name: green-agent
   newTag: test
-
-replicas:
-- name: green-agent-cluster
-  count: 1
-
-patches:
-- target:
-    kind: RayCluster
-    name: green-agent-cluster
-  patch: |-
-    - op: replace
-      path: /spec/headGroupSpec/template/spec/containers/0/resources/requests
-      value:
-        cpu: "250m"
-        memory: "512Mi"
-    - op: replace
-      path: /spec/headGroupSpec/template/spec/containers/0/resources/limits
-      value:
-        cpu: "1"
-        memory: "2Gi"
-    - op: replace
-      path: /spec/workerGroupSpecs/0/replicas
-      value: 1
-    - op: replace
-      path: /spec/workerGroupSpecs/0/minReplicas
-      value: 1
-    - op: replace
-      path: /spec/workerGroupSpecs/0/maxReplicas
-      value: 2
