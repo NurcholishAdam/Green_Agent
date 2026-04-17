@@ -14,3 +14,22 @@ containers:
   image: ghcr.io/nurcholishadam/green_agent:v5.0.0
   imagePullPolicy: IfNotPresent  # ✅ CRITICAL: Use local image in Kind
   # ... rest of config
+
+# Make probes more forgiving for CI environment:
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 60    # ✅ Increased from 30s
+  periodSeconds: 20          # ✅ Increased from 10s
+  timeoutSeconds: 10         # ✅ Increased from 5s
+  failureThreshold: 5        # ✅ Increased from 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
+  initialDelaySeconds: 30    # ✅ Increased from 10s
+  periodSeconds: 10          # ✅ Increased from 5s
+  timeoutSeconds: 5          # ✅ Increased from 3s
+  failureThreshold: 5        # ✅ Increased from 3
