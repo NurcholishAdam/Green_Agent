@@ -1,0 +1,41 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: green-agent-network-policy
+  labels:
+    app: green-agent
+spec:
+  podSelector:
+    matchLabels:
+      app: green-agent
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8265
+  - from:
+    - podSelector:
+        matchLabels:
+          app: green-agent
+    ports:
+    - protocol: TCP
+      port: 6379
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 443
