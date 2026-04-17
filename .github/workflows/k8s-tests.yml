@@ -9,7 +9,8 @@ on:
 env:
   TEST_NAMESPACE: green-agent-test
   KIND_VERSION: 'v0.20.0'
-  RAY_VERSION: '2.7.0'
+  KUBERAY_CHART_VERSION: '1.1.0'  # ✅ Correct Helm chart version
+  RAY_VERSION: '2.7.0'            # Ray version (for rayVersion field)
   LOCAL_IMAGE: green-agent:test
 
 jobs:
@@ -18,23 +19,19 @@ jobs:
     timeout-minutes: 30
     
     steps:
-    # 1. Checkout code
     - name: Checkout
       uses: actions/checkout@v4
     
-    # 2. Install kubectl
     - name: Install kubectl
       uses: azure/setup-kubectl@v4
       with:
         version: 'v1.28.0'
     
-    # 3. Install Helm
     - name: Install Helm
       uses: azure/setup-helm@v4
       with:
         version: 'v3.13.0'
     
-    # 4. Create Kind cluster
     - name: Create Kind cluster
       run: |
         curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
@@ -44,30 +41,44 @@ jobs:
         kubectl wait --for=condition=ready node --all --timeout=60s
       shell: bash
     
-    # 5. Install Ray Operator
+    # ✅ FIX: Use correct chart version + latest repo update
     - name: Install Ray Operator
       run: |
-        echo "📦 Installing Ray Operator..."
+        echo "📦 Installing KubeRay Operator..."
+        
+        # Add repo
         helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+        
+        # ✅ CRITICAL: Update repo to get latest chart versions
         helm repo update
+        
+        # ✅ Use correct chart version (1.1.0, not 2.7.0)
         helm install kuberay-operator kuberay/kuberay-operator \
-          --version ${{ env.RAY_VERSION }} \
+          --version ${{ env.KUBERAY_CHART_VERSION }} \
           --namespace ray-system \
           --create-namespace \
           --wait --timeout 5m
+        
+        # Wait for CRDs
         kubectl wait --for=condition=established crd/rayclusters.ray.io --timeout=60s
-        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=kuberay-operator -n ray-system --timeout=120s
+        
+        # Wait for operator pod
+        kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/name=kuberay-operator \
+          -n ray-system \
+          --timeout=120s
+        
         echo "✅ Ray Operator ready"
+        kubectl get crd | grep ray
+        kubectl get pods -n ray-system
       shell: bash
     
-    # 6. Build and load Docker image
     - name: Build and load image
       run: |
         docker build -t ${{ env.LOCAL_IMAGE }} .
         kind load docker-image ${{ env.LOCAL_IMAGE }} --name green-agent-test
       shell: bash
     
-    # 7. Deploy Green Agent
     - name: Deploy Green Agent
       run: |
         kubectl create namespace ${{ env.TEST_NAMESPACE }}
@@ -78,7 +89,6 @@ jobs:
           -n ${{ env.TEST_NAMESPACE }}
       shell: bash
     
-    # 8. Wait for pods
     - name: Wait for pods
       run: |
         kubectl wait --for=condition=ready pod \
@@ -88,14 +98,12 @@ jobs:
         kubectl get pods -n ${{ env.TEST_NAMESPACE }}
       shell: bash
     
-    # 9. Run tests
     - name: Run tests
       run: |
         pip install -r tests/requirements-tests.txt
         pytest tests/k8s/ -v --junitxml=k8s-test-results.xml
       shell: bash
     
-    # 10. Upload results
     - name: Upload results
       uses: actions/upload-artifact@v4
       if: always()
@@ -103,7 +111,6 @@ jobs:
         name: k8s-test-results
         path: k8s-test-results.xml
     
-    # 11. Cleanup
     - name: Cleanup
       if: always()
       run: kind delete cluster --name green-agent-test || true
