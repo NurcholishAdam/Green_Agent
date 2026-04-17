@@ -17,8 +17,8 @@ spec:
       spec:
         containers:
         - name: ray-head
-          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
-          imagePullPolicy: IfNotPresent  # ✅ CRITICAL: Use local image in Kind
+          image: docker.io/library/green-agent:v5.0.0
+          imagePullPolicy: IfNotPresent
           ports:
           - containerPort: 6379
           - containerPort: 8265
@@ -26,55 +26,51 @@ spec:
           - containerPort: 9090
           resources:
             requests:
-              cpu: "500m"    # ✅ Reduced for CI
-              memory: "1Gi"  # ✅ Reduced for CI
+              cpu: "500m"
+              memory: "1Gi"
             limits:
               cpu: "2"
               memory: "4Gi"
           
-          # ✅ Health probes in CORRECT location (container spec)
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 60    # ✅ Relaxed for slow CI startup
+            initialDelaySeconds: 60
             periodSeconds: 20
             timeoutSeconds: 10
             failureThreshold: 5
-            successThreshold: 1
           
           readinessProbe:
             httpGet:
               path: /ready
               port: 8000
-            initialDelaySeconds: 30    # ✅ Relaxed for CI
+            initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 5
-            successThreshold: 1
           
-          startupProbe:  # ✅ Added: Allows slow startup in CI
+          startupProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 30  # Allow up to 5 minutes for startup
+            failureThreshold: 30
           
           volumeMounts:
           - name: config-volume
             mountPath: /app/config
           - name: data-volume
             mountPath: /app/data
-            readOnly: false
         
         volumes:
         - name: config-volume
           configMap:
             name: green-agent-config
         - name: data-volume
-          emptyDir: {}  # ✅ Use emptyDir for CI (no PVC needed)
+          emptyDir: {}
   
   workerGroupSpecs:
   - replicas: 2
@@ -91,8 +87,8 @@ spec:
       spec:
         containers:
         - name: ray-worker
-          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
-          imagePullPolicy: IfNotPresent  # ✅ Use local image
+          image: docker.io/library/green-agent:v5.0.0
+          imagePullPolicy: IfNotPresent
           resources:
             requests:
               cpu: "500m"
