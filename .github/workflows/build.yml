@@ -47,29 +47,19 @@ jobs:
         tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         cache-from: type=gha
 
-    # ✅ FIX 1: Trivy with correct SARIF output path + handle empty results
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         format: 'sarif'
-        output: 'trivy-results.sarif'  # ✅ Explicit output file
+        output: 'trivy-results.sarif'
         severity: 'CRITICAL,HIGH'
-        exit-code: '0'  # ✅ Don't fail workflow if no vulnerabilities
+        exit-code: '0'
         ignore-unfixed: true
 
-    # ✅ FIX 2: Only upload SARIF if file exists (handles empty results)
-    - name: Upload Trivy scan results to GitHub
-      uses: github/codeql-action/upload-sarif@v4  # ✅ Updated to v4
-      with:
-        sarif_file: 'trivy-results.sarif'
-      if: always() && hashFiles('trivy-results.sarif') != ''
-
-    # ✅ FIX 3: Fallback - create empty SARIF if Trivy found nothing
-    - name: Create empty SARIF if no vulnerabilities found
+    - name: Create empty SARIF if no vulnerabilities
       if: always() && hashFiles('trivy-results.sarif') == ''
       run: |
-        echo "⚠️ No vulnerabilities found or SARIF not generated - creating empty report"
         cat > trivy-results.sarif << 'EOF'
 {
   "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -87,8 +77,7 @@ jobs:
 }
 EOF
 
-    # ✅ FIX 4: Upload SARIF after ensuring file exists
-    - name: Upload Trivy scan results to GitHub (retry)
+    - name: Upload Trivy scan results to GitHub
       uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: 'trivy-results.sarif'
