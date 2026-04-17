@@ -1,9 +1,7 @@
 """
 Green Agent v5.0.0 - Carbon-Aware Decision Core
 Layer 3: Makes sustainability-focused scheduling decisions
-
 File: src/decision/carbon_aware_decision_core.py
-Status: FOUNDATIONAL - Tier 1
 """
 
 from typing import Dict, List, Optional
@@ -16,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ExecutionDecision:
+    """Execution decision with carbon awareness"""
     action: str
     power_budget: float
     carbon_zone: str
@@ -24,6 +23,10 @@ class ExecutionDecision:
 
 
 class CarbonAwareDecisionCore:
+    """
+    Carbon-aware decision engine that schedules tasks based on grid carbon intensity
+    """
+    
     def __init__(self, config: Dict):
         self.config = config
         self.thresholds = {
@@ -41,13 +44,26 @@ class CarbonAwareDecisionCore:
         })
     
     async def initialize(self):
+        """Initialize the decision core"""
         logger.info("CarbonAwareDecisionCore initialized")
     
     async def evaluate(self, profile, carbon_intensity: float) -> ExecutionDecision:
+        """
+        Evaluate task and make carbon-aware execution decision
+        
+        Args:
+            profile: WorkloadProfile from interpreter
+            carbon_intensity: Current grid carbon intensity (gCO2/kWh)
+            
+        Returns:
+            ExecutionDecision with action and power budget
+        """
         zone = self._get_carbon_zone(carbon_intensity)
         reasoning = [f"Carbon intensity: {carbon_intensity} gCO2/kWh ({zone})"]
         
+        # Make decision based on carbon zone and task properties
         if zone == 'green':
+            # Optimal conditions - run at full power
             return ExecutionDecision(
                 action='execute_full',
                 power_budget=1.0,
@@ -55,6 +71,7 @@ class CarbonAwareDecisionCore:
                 reasoning=reasoning
             )
         elif zone == 'yellow':
+            # Moderate carbon - throttle execution
             return ExecutionDecision(
                 action='execute_throttled',
                 power_budget=0.6,
@@ -62,6 +79,7 @@ class CarbonAwareDecisionCore:
                 reasoning=reasoning
             )
         elif zone == 'red':
+            # High carbon - defer if possible, minimal execution otherwise
             if profile.deferrable:
                 return ExecutionDecision(
                     action='defer',
@@ -77,7 +95,8 @@ class CarbonAwareDecisionCore:
                     carbon_zone=zone,
                     reasoning=reasoning
                 )
-        else:
+        else:  # critical
+            # Critical carbon - defer all non-essential tasks
             return ExecutionDecision(
                 action='defer',
                 power_budget=0.0,
@@ -86,6 +105,7 @@ class CarbonAwareDecisionCore:
             )
     
     def _get_carbon_zone(self, intensity: float) -> str:
+        """Determine carbon zone from intensity value"""
         if intensity < self.thresholds['green']:
             return 'green'
         elif intensity < self.thresholds['yellow']:
