@@ -1,8 +1,13 @@
+# config/base/configmap.yaml - CORRECT
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: green-agent-config
-  namespace: green-agent
+  labels:
+    app: green-agent
 data:
-  VERSION: "5.0.0"
-  RAY_WORKERS: "4"
+  green_agent_config.yaml: |
+    system:
+      version: "5.0.0"
+      mode: "unified"
+    # ... config data only, NO probe fields
