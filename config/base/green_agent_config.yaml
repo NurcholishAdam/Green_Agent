@@ -1,0 +1,49 @@
+system:
+  version: "5.0.0"
+  mode: "unified"
+  debug: false
+  log_level: "INFO"
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  update_interval_seconds: 5
+
+ray:
+  enabled: true
+  num_workers: 4
+  min_workers: 2
+  max_workers: 20
+  dashboard_port: 8265
+
+carbon:
+  default_region: "US-CA"
+  api_provider: "simulation"
+  eco_mode_threshold: 200
+  defer_threshold: 400
+
+policy:
+  mode: "moderate"
+  weights:
+    carbon_importance: 0.4
+    performance_importance: 0.3
+    cost_importance: 0.2
+    deadline_importance: 0.1
+
+quantum:
+  enabled: false
+  backend: "simulator"
+
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  logging:
+    level: "INFO"
+    format: "json"
+
+security:
+  enable_auth: false
+  tls:
+    enabled: false
