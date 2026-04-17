@@ -1,101 +1,65 @@
 apiVersion: ray.io/v1
 kind: RayCluster
-metadata:
+meta
   name: green-agent-cluster
   labels:
     app: green-agent
 spec:
-  rayVersion: '2.7.0'  # ✅ Add Ray version
+  rayVersion: '2.7.0'
   headGroupSpec:
     rayStartParams:
       dashboard-host: '0.0.0.0'
-      num-cpus: '4'
+      num-cpus: '2'
     template:
-      metadata:
+      meta
         labels:
           app: green-agent
           component: head
       spec:
         containers:
         - name: ray-head
-          image: docker.io/library/green-agent:v5.0.0
+          image: green-agent:test
           imagePullPolicy: IfNotPresent
           ports:
-          - containerPort: 6379
-          - containerPort: 8265
           - containerPort: 8000
-          - containerPort: 9090
+          - containerPort: 8265
           resources:
             requests:
               cpu: "500m"
               memory: "1Gi"
             limits:
-              cpu: "2"
-              memory: "4Gi"
+              cpu: "1"
+              memory: "2Gi"
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 60
-            periodSeconds: 20
-            timeoutSeconds: 10
-            failureThreshold: 5
+            initialDelaySeconds: 30
+            periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /ready
               port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 5
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 30
-          volumeMounts:
-          - name: config-volume
-            mountPath: /app/config
-          - name: data-volume
-            mountPath: /app/data
-        volumes:
-        - name: config-volume
-          configMap:
-            name: green-agent-config
-        - name: data-volume
-          emptyDir: {}
-  
+            initialDelaySeconds: 15
+            periodSeconds: 5
   workerGroupSpecs:
   - replicas: 1
     minReplicas: 1
     maxReplicas: 2
-    groupName: standard-workers
+    groupName: workers
     rayStartParams:
       num-cpus: '2'
     template:
-      metadata:
+      meta
         labels:
           app: green-agent
           component: worker
       spec:
         containers:
         - name: ray-worker
-          image: docker.io/library/green-agent:v5.0.0
+          image: green-agent:test
           imagePullPolicy: IfNotPresent
           resources:
             requests:
               cpu: "500m"
               memory: "1Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
-          volumeMounts:
-          - name: config-volume
-            mountPath: /app/config
-        volumes:
-        - name: config-volume
-          configMap:
-            name: green-agent-config
