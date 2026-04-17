@@ -1,28 +1,208 @@
-# Replace the "Deploy Green Agent to Kind" step with this:
+name: Kubernetes Integration Tests
 
-- name: Deploy Green Agent to Kind
-  run: |
-    echo "🚀 Deploying Green Agent to test namespace..."
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  TEST_NAMESPACE: green-agent-test
+  KIND_VERSION: 'v0.20.0'
+  KUBECTL_VERSION: 'v1.28.0'
+  LOCAL_IMAGE: green-agent:test
+
+jobs:
+  k8s-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     
-    # Create namespace (ignore annotation warning)
-    kubectl create namespace ${{ env.TEST_NAMESPACE }} 2>/dev/null || true
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     
-    # ✅ FIX 1: Use client-side apply (no --server-side) for kustomize
-    # Server-side apply has issues with mixed resource types in kustomize output
-    echo "▶ Applying base configuration..."
-    kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: ${{ env.KUBECTL_VERSION }}
     
-    # ✅ FIX 2: Override image to use local build (not registry)
-    echo "▶ Setting local image..."
-    kubectl set image deployment/dev-green-agent \
-      ray-head=${{ env.LOCAL_IMAGE }} \
-      ray-worker=${{ env.LOCAL_IMAGE }} \
-      -n ${{ env.TEST_NAMESPACE }}
+    # ✅ STEP 1: Create Kind cluster with optimized config
+    - name: Set up Kind cluster
+      run: |
+        echo "🚀 Setting up Kind cluster..."
+        
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+        
+        # Create cluster with extra resources for CI
+        cat <<EOF | kind create cluster --config=- --name green-agent-test
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+          kubeadmConfigPatches:
+          - |
+            kind: InitConfiguration
+            nodeRegistration:
+              kubeletExtraArgs:
+                node-labels: "ingress-ready=true"
+                system-reserved: memory=512Mi,cpu=500m
+          extraPortMappings:
+          - containerPort: 80
+            hostPort: 80
+            protocol: TCP
+          - containerPort: 8265
+            hostPort: 8265
+            protocol: TCP
+        EOF
+        
+        # Wait for cluster
+        kubectl wait --for=condition=ready node --all --timeout=60s
+        
+        # Install metrics-server for HPA
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        kubectl patch deployment metrics-server -n kube-system \
+          --type='json' -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+        
+        echo "✅ Kind cluster ready"
+      shell: bash
     
-    # ✅ FIX 3: Wait for rollout (not individual pods)
-    echo "▶ Waiting for deployment rollout..."
-    kubectl rollout status deployment/dev-green-agent -n ${{ env.TEST_NAMESPACE }} --timeout=300s
+    # ✅ STEP 2: Build and load Docker image into Kind (CRITICAL)
+    - name: Build and load Docker image
+      run: |
+        echo "🔨 Building Docker image: ${{ env.LOCAL_IMAGE }}..."
+        
+        # Build image
+        docker build -t ${{ env.LOCAL_IMAGE }} .
+        
+        # Load into Kind cluster (THIS IS THE KEY STEP)
+        echo "📦 Loading image into Kind..."
+        kind load docker-image ${{ env.LOCAL_IMAGE }} --name green-agent-test
+        
+        # Verify image is in cluster
+        echo "🔍 Verifying image in cluster..."
+        if ! docker exec green-agent-test-control-plane crictl images | grep -q "green-agent:test"; then
+          echo "❌ Image not found in cluster!"
+          docker exec green-agent-test-control-plane crictl images
+          exit 1
+        fi
+        
+        echo "✅ Image loaded successfully"
+      shell: bash
     
-    echo "✅ Deployment complete"
-    kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o wide
-  shell: bash
+    # ✅ STEP 3: Deploy with proper image reference
+    - name: Deploy Green Agent
+      run: |
+        echo "🚀 Deploying to namespace: ${{ env.TEST_NAMESPACE }}..."
+        
+        # Create namespace
+        kubectl create namespace ${{ env.TEST_NAMESPACE }} 2>/dev/null || true
+        
+        # Apply kustomize (client-side apply, NO --server-side)
+        echo "▶ Applying configuration..."
+        kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
+        
+        # Override image to use local build (not registry)
+        echo "▶ Setting local image..."
+        kubectl set image deployment/dev-green-agent \
+          ray-head=${{ env.LOCAL_IMAGE }} \
+          ray-worker=${{ env.LOCAL_IMAGE }} \
+          -n ${{ env.TEST_NAMESPACE }}
+        
+        # Show what was deployed
+        echo "📋 Deployed resources:"
+        kubectl get all -n ${{ env.TEST_NAMESPACE }}
+        
+        echo "✅ Deployment initiated"
+      shell: bash
+    
+    # ✅ STEP 4: Wait for pods WITH DIAGNOSTICS
+    - name: Wait for pods with full diagnostics
+      run: |
+        echo "⏳ Waiting for pods to be Ready (timeout: 300s)..."
+        
+        # Show initial state
+        echo "📋 Initial pod status:"
+        kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o wide
+        
+        # Wait for pods with detailed error output on failure
+        if ! kubectl wait --for=condition=ready pod \
+            -l app=green-agent \
+            -n ${{ env.TEST_NAMESPACE }} \
+            --timeout=300s 2>&1; then
+          
+          echo ""
+          echo "❌ Pod readiness timeout - FULL DIAGNOSTICS:"
+          echo "==========================================="
+          
+          # Pod details
+          echo ""
+          echo "🔍 Pod description:"
+          kubectl describe pod -l app=green-agent -n ${{ env.TEST_NAMESPACE }} 2>&1 | tail -50
+          
+          # Pod logs
+          echo ""
+          echo "📋 Pod logs (last 100 lines):"
+          kubectl logs -l app=green-agent -n ${{ env.TEST_NAMESPACE }} --tail=100 2>&1 || echo "(no logs available)"
+          
+          # Events
+          echo ""
+          echo "📅 Recent events:"
+          kubectl get events -n ${{ env.TEST_NAMESPACE }} --sort-by='.lastTimestamp' 2>&1 | tail -20
+          
+          # Image status
+          echo ""
+          echo "🖼️ Container image status:"
+          kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[*].image}{"\n"}{end}' 2>&1 || true
+          
+          # Deployment status
+          echo ""
+          echo "📊 Deployment status:"
+          kubectl get deployment -n ${{ env.TEST_NAMESPACE }} -o wide
+          
+          echo ""
+          echo "==========================================="
+          echo "❌ Deployment failed - see diagnostics above"
+          exit 1
+        fi
+        
+        echo "✅ All pods Ready!"
+        kubectl get pods -n ${{ env.TEST_NAMESPACE }} -o wide
+      shell: bash
+    
+    # ✅ STEP 5: Run tests
+    - name: Install test dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r tests/requirements-tests.txt
+      shell: bash
+    
+    - name: Run K8s integration tests
+      run: |
+        echo "🧪 Running tests..."
+        pytest tests/k8s/ -v \
+          --asyncio-mode=auto \
+          --junitxml=k8s-test-results.xml \
+          --tb=short
+      shell: bash
+    
+    # ✅ STEP 6: Upload results
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: k8s-test-results
+        path: k8s-test-results.xml
+        retention-days: 7
+        if-no-files-found: warn
+    
+    # ✅ STEP 7: Cleanup
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "🧹 Cleaning up..."
+        kind delete cluster --name green-agent-test || true
+      shell: bash
