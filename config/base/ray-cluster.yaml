@@ -1,35 +1,99 @@
-apiVersion: v1
-kind: ConfigMap
+# config/base/ray-cluster.yaml
+apiVersion: ray.io/v1
+kind: RayCluster
 metadata:
-  name: ray-cluster-config
-  namespace: green-agent
-data:
-  ray-config.yaml: |
-    cluster_name: green-agent-ray
-    max_workers: 8
-    
-# Add this to the container spec in ray-cluster.yaml:
-containers:
-- name: ray-head
-  image: ghcr.io/nurcholishadam/green_agent:v5.0.0
-  imagePullPolicy: IfNotPresent  # ✅ CRITICAL: Use local image in Kind
-  # ... rest of config
-
-# Make probes more forgiving for CI environment:
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 60    # ✅ Increased from 30s
-  periodSeconds: 20          # ✅ Increased from 10s
-  timeoutSeconds: 10         # ✅ Increased from 5s
-  failureThreshold: 5        # ✅ Increased from 3
-
-readinessProbe:
-  httpGet:
-    path: /ready
-    port: 8000
-  initialDelaySeconds: 30    # ✅ Increased from 10s
-  periodSeconds: 10          # ✅ Increased from 5s
-  timeoutSeconds: 5          # ✅ Increased from 3s
-  failureThreshold: 5        # ✅ Increased from 3
+  name: green-agent-cluster
+  labels:
+    app: green-agent
+spec:
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+      num-cpus: '4'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: head
+      spec:
+        containers:
+        - name: ray-head
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+          imagePullPolicy: IfNotPresent  # ✅ Use local image in Kind
+          ports:
+          - containerPort: 6379
+          - containerPort: 8265
+          - containerPort: 8000
+          - containerPort: 9090
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          
+          # ✅ Health probes MUST be in container spec (not ConfigMap)
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60    # ✅ Relaxed for CI
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 5
+          
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 30    # ✅ Relaxed for CI
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+          - name: data-volume
+            mountPath: /app/data
+        
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: green-agent-data-pvc
+  
+  workerGroupSpecs:
+  - replicas: 4
+    minReplicas: 2
+    maxReplicas: 20
+    groupName: standard-workers
+    rayStartParams:
+      num-cpus: '2'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+      spec:
+        containers:
+        - name: ray-worker
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
