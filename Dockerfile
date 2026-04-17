@@ -17,7 +17,7 @@ COPY . .
 # Create directories
 RUN mkdir -p config data logs results
 
-# Set environment variables for fast startup
+# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     MODE=unified \
