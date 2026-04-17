@@ -10,17 +10,22 @@ resources:
 commonLabels:
   environment: development
 
-# ✅ Override for CI: Use local image, reduced resources
+configMapGenerator:
+- name: green-agent-config
+  behavior: merge
+  literals:
+  - LOG_LEVEL=DEBUG
+  - RAY_ENABLED=false
+  - CARBON_API_PROVIDER=simulation
+
 images:
 - name: ghcr.io/nurcholishadam/green_agent
-  newTag: test  # Will be overridden by kubectl set image anyway
+  newTag: test
 
-# ✅ Reduce replicas for CI
 replicas:
 - name: green-agent-cluster
   count: 1
 
-# ✅ Patches for CI environment
 patches:
 - target:
     kind: RayCluster
