@@ -1,12 +1,47 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-test
+namespace: green-agent-dev
+namePrefix: dev-
 
 resources:
-  - ../../base
-
-namePrefix: dev-
+- ../../base
 
 commonLabels:
   environment: development
+
+# ✅ Override for CI: Use local image, reduced resources
+images:
+- name: ghcr.io/nurcholishadam/green_agent
+  newTag: test  # Will be overridden by kubectl set image anyway
+
+# ✅ Reduce replicas for CI
+replicas:
+- name: green-agent-cluster
+  count: 1
+
+# ✅ Patches for CI environment
+patches:
+- target:
+    kind: RayCluster
+    name: green-agent-cluster
+  patch: |-
+    - op: replace
+      path: /spec/headGroupSpec/template/spec/containers/0/resources/requests
+      value:
+        cpu: "250m"
+        memory: "512Mi"
+    - op: replace
+      path: /spec/headGroupSpec/template/spec/containers/0/resources/limits
+      value:
+        cpu: "1"
+        memory: "2Gi"
+    - op: replace
+      path: /spec/workerGroupSpecs/0/replicas
+      value: 1
+    - op: replace
+      path: /spec/workerGroupSpecs/0/minReplicas
+      value: 1
+    - op: replace
+      path: /spec/workerGroupSpecs/0/maxReplicas
+      value: 2
