@@ -7,3 +7,10 @@ data:
   ray-config.yaml: |
     cluster_name: green-agent-ray
     max_workers: 8
+    
+# Add this to the container spec in ray-cluster.yaml:
+containers:
+- name: ray-head
+  image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+  imagePullPolicy: IfNotPresent  # ✅ CRITICAL: Use local image in Kind
+  # ... rest of config
