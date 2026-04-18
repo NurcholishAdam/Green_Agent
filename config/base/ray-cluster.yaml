@@ -16,10 +16,11 @@ spec:
           app: green-agent
           component: head
       spec:
-        containers:
-        - name: ray-head
-          image: green-agent:test
-          imagePullPolicy: IfNotPresent
+      containers:
+      - name: ray-head
+      image: green-agent:v5.0.0  # ✅ Base name (kustomize will override tag)
+      imagePullPolicy: IfNotPresent
+  # ... rest of config
           ports:
           - containerPort: 8000
           - containerPort: 8265
