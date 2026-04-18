@@ -79,16 +79,25 @@ jobs:
         kind load docker-image ${{ env.LOCAL_IMAGE }} --name green-agent-test
       shell: bash
     
-    - name: Deploy Green Agent
-      run: |
-        kubectl create namespace ${{ env.TEST_NAMESPACE }}
-        kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
-        kubectl set image deployment/dev-green-agent \
-          ray-head=${{ env.LOCAL_IMAGE }} \
-          ray-worker=${{ env.LOCAL_IMAGE }} \
-          -n ${{ env.TEST_NAMESPACE }}
-      shell: bash
+    # In .github/workflows/k8s-tests.yml, replace the "Deploy Green Agent" step:
+
+- name: Deploy Green Agent
+  run: |
+    echo "🚀 Deploying to namespace: ${{ env.TEST_NAMESPACE }}..."
     
+    # Create namespace
+    kubectl create namespace ${{ env.TEST_NAMESPACE }} 2>/dev/null || true
+    
+    # Apply kustomize (image is set via kustomization.yaml images: field)
+    echo "▶ Applying configuration..."
+    kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
+    
+    # ✅ FIX: Remove kubectl set image - not needed for RayCluster
+    # The image is already set by kustomize
+    
+    echo "✅ Deployment initiated"
+    kubectl get all -n ${{ env.TEST_NAMESPACE }}
+  shell: bash    
     - name: Wait for pods
       run: |
         kubectl wait --for=condition=ready pod \
