@@ -7,6 +7,7 @@ namePrefix: dev-
 resources:
 - ../../base
 
+# ✅ This sets the image for all containers in the base resources
 images:
 - name: green-agent
   newTag: test
