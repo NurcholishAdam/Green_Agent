@@ -1,6 +1,6 @@
 apiVersion: ray.io/v1
 kind: RayCluster
-meta
+metadata:
   name: green-agent-cluster
   labels:
     app: green-agent
@@ -11,7 +11,7 @@ spec:
       dashboard-host: '0.0.0.0'
       num-cpus: '2'
     template:
-      meta
+      metadata:
         labels:
           app: green-agent
           component: head
@@ -50,7 +50,7 @@ spec:
     rayStartParams:
       num-cpus: '2'
     template:
-      meta
+      metadata:
         labels:
           app: green-agent
           component: worker
