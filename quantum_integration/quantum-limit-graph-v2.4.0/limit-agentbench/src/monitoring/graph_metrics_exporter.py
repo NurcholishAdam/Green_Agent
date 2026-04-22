@@ -1,21 +1,16 @@
 """
-graph_metrics_exporter.py  —  Recommendation 3 (slim version)
-===============================================================
+graph_metrics_exporter.py — Fixed Version (Metric Type + Cardinality)
+=====================================================================
 Exposes Green Agent graph health metrics in Prometheus text format.
 Works with any Prometheus scrape configuration; no database dependency.
 Includes a static Grafana dashboard JSON template (Layer 11).
 
-Why "slim" instead of full Grafana integration
-------------------------------------------------
-Grafana does not consume Python objects directly. The standard integration
-chain is:
-
-    Green Agent → Prometheus metrics → Prometheus scraper → Grafana
-
-The correct module is therefore a metrics *exporter*, not a "Grafana layer".
-Adding Prometheus pushgateway, InfluxDB, or a full time-series store would
-add ~3 dependencies and significant deployment complexity for zero additional
-analytical value over what the exporter already provides.
+Changes in this version:
+- ✅ Fixed metric type: green_agent_execution_graphs_active (gauge) instead of _total
+- ✅ Added max_edges_export config to prevent cardinality explosion
+- ✅ Added error handling in HTTP handler
+- ✅ Removed unused ts variable
+- ✅ Added thread-safety documentation
 
 Two modes
 ----------
@@ -43,13 +38,15 @@ import http.server
 import json
 import threading
 import time
+import sys
+import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
-import sys, os
+# Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.graph_registry import GraphRegistry, GraphType
-from core.causal_graph import CausalGraph
+from core.causal_graph import CausalGraph, Edge
 from core.policy_graph import PolicyGraph
 
 
@@ -60,11 +57,22 @@ from core.policy_graph import PolicyGraph
 class GraphMetricsExporter:
     """
     Collects metrics from GraphRegistry and renders Prometheus text format.
+    
+    Thread Safety:
+    - This class assumes GraphRegistry and graph objects are immutable after
+      registration, or that read operations are thread-safe.
+    - If concurrent modification is possible, wrap collect() with a read lock.
     """
 
-    def __init__(self, registry: GraphRegistry, job_name: str = "green_agent"):
+    def __init__(
+        self, 
+        registry: GraphRegistry, 
+        job_name: str = "green_agent",
+        max_edges_export: int = 100  # ✅ NEW: Prevent cardinality explosion
+    ):
         self.registry = registry
         self.job_name = job_name
+        self.max_edges_export = max_edges_export  # ✅ NEW: Configurable limit
         self._server: Optional[http.server.HTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
 
@@ -72,64 +80,85 @@ class GraphMetricsExporter:
     # Metric collection
     # ------------------------------------------------------------------
 
-    def collect(self) -> dict:
+    def collect(self) -> Dict[str, tuple]:
         """
         Gather all graph metrics into a flat dict.
         Keys are Prometheus metric names; values are (value, labels) tuples.
+        
+        Returns:
+            dict: {metric_name: (value, {label_key: label_value, ...})}
         """
         health = self.registry.health()
-        metrics: dict = {}
-        ts = int(time.time() * 1000)   # Unix ms timestamp
+        metrics: Dict[str, tuple] = {}
 
-        # Execution count
-        metrics["green_agent_execution_graphs_total"] = (
-            health["execution_count"], {}
+        # ✅ FIX 1: Use _active suffix for gauge (not _total which implies counter)
+        # Execution count: number of graphs currently being executed (can go up/down)
+        metrics["green_agent_execution_graphs_active"] = (
+            health.get("execution_count", 0), {}
         )
 
         for gtype_str, info in health.get("singletons", {}).items():
             labels = {"graph_type": gtype_str}
 
             if "node_count" in info:
-                metrics[f"green_agent_graph_nodes"] = (
+                metrics["green_agent_graph_nodes"] = (
                     info["node_count"], labels
                 )
             if "edge_count" in info:
-                metrics[f"green_agent_graph_edges"] = (
+                metrics["green_agent_graph_edges"] = (
                     info["edge_count"], labels
                 )
             if "anomaly_count" in info:
-                metrics[f"green_agent_anomalies_active"] = (
+                metrics["green_agent_anomalies_active"] = (
                     info["anomaly_count"], labels
                 )
             if "ideal_path_count" in info:
-                metrics[f"green_agent_ideal_paths_registered"] = (
+                # This is a cumulative count → use _total suffix with counter type
+                metrics["green_agent_ideal_paths_total"] = (
                     info["ideal_path_count"], {}
                 )
 
-        # Per-edge weights for causal graph (enables heatmap panel)
+        # ✅ FIX 2: Limit edge exports to prevent cardinality explosion
+        # Causal graph edge weights
         causal: Optional[CausalGraph] = self.registry.get(GraphType.CAUSAL)
         if causal:
-            for edge in causal.edges:
+            # Sort by weight descending, take top-K to limit cardinality
+            sorted_edges = sorted(
+                causal.edges, 
+                key=lambda e: e.weight, 
+                reverse=True
+            )[:self.max_edges_export]
+            
+            for edge in sorted_edges:
                 edge_labels = {
                     "source": edge.source_id,
                     "target": edge.target_id,
                     "label": edge.label,
                 }
-                metrics[f"green_agent_causal_edge_weight"] = (
+                metrics["green_agent_causal_edge_weight"] = (
                     round(edge.weight, 4), edge_labels
                 )
-                metrics[f"green_agent_causal_edge_confidence"] = (
+                metrics["green_agent_causal_edge_confidence"] = (
                     round(edge.confidence, 4), edge_labels
                 )
 
-        # Per-edge weights for policy graph
+        # Policy graph edge weights
         policy: Optional[PolicyGraph] = self.registry.get(GraphType.POLICY)
         if policy:
-            for edge_dict in policy.export_weights():
+            # Use export_weights() abstraction from policy graph
+            all_edges = policy.export_weights()
+            # Limit to top-K by weight to control cardinality
+            sorted_edges = sorted(
+                all_edges, 
+                key=lambda e: e.get("weight", 0), 
+                reverse=True
+            )[:self.max_edges_export]
+            
+            for edge_dict in sorted_edges:
                 plabels = {
                     "source": edge_dict["source"],
                     "target": edge_dict["target"],
-                    "context_tag": edge_dict["context_tag"],
+                    "context_tag": edge_dict.get("context_tag", "default"),
                 }
                 metrics["green_agent_policy_edge_weight"] = (
                     edge_dict["weight"], plabels
@@ -145,9 +174,12 @@ class GraphMetricsExporter:
         """
         Render all metrics in Prometheus exposition format.
         Each distinct metric name gets one # HELP and one # TYPE line.
+        
+        Returns:
+            str: Prometheus text format metrics
         """
         metrics = self.collect()
-        lines: list[str] = []
+        lines: List[str] = []
         seen_names: set[str] = set()
 
         for name, (value, labels) in metrics.items():
@@ -155,12 +187,16 @@ class GraphMetricsExporter:
             base = name.split("{")[0]
             if base not in seen_names:
                 lines.append(f"# HELP {base} Green Agent graph metric")
-                lines.append(f"# TYPE {base} gauge")
+                # ✅ FIX 1: Use correct metric type based on name convention
+                if name.endswith("_total"):
+                    lines.append(f"# TYPE {base} counter")
+                else:
+                    lines.append(f"# TYPE {base} gauge")
                 seen_names.add(base)
 
             if labels:
                 label_str = ",".join(
-                    f'{k}="{v}"' for k, v in labels.items()
+                    f'{k}="{v}"' for k, v in sorted(labels.items())
                 )
                 lines.append(f'{base}{{{label_str}}} {value}')
             else:
@@ -182,17 +218,30 @@ class GraphMetricsExporter:
 
         class MetricsHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path == "/metrics":
-                    body = exporter.render().encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type",
-                                     "text/plain; version=0.0.4; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
+                try:  # ✅ FIX 3: Error handling to prevent server crash
+                    if self.path == "/metrics":
+                        body = exporter.render().encode()
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type",
+                            "text/plain; version=0.0.4; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                except Exception as e:
+                    # Log error but don't crash server
+                    print(
+                        f"[GraphMetricsExporter] Error rendering metrics: {e}",
+                        file=sys.stderr
+                    )
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
                     self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
+                    self.wfile.write(b"Internal server error\n")
 
             def log_message(self, *args):
                 pass  # suppress access log noise
@@ -205,8 +254,11 @@ class GraphMetricsExporter:
         print(f"[GraphMetricsExporter] Prometheus endpoint: http://{host}:{port}/metrics")
 
     def stop_http_server(self):
+        """Stop the HTTP server gracefully."""
         if self._server:
             self._server.shutdown()
+            if self._server_thread:
+                self._server_thread.join(timeout=5)
 
     # ------------------------------------------------------------------
     # Grafana dashboard template
@@ -248,14 +300,14 @@ class GraphMetricsExporter:
                     gridPos={"x": 12, "y": 0, "w": 6, "h": 4},
                 ),
                 self._panel_stat(
-                    id=4, title="Ideal paths registered",
-                    expr="green_agent_ideal_paths_registered",
+                    id=4, title="Ideal paths (total)",
+                    expr="green_agent_ideal_paths_total",
                     gridPos={"x": 18, "y": 0, "w": 6, "h": 4},
                 ),
                 self._panel_timeseries(
                     id=5,
                     title="Causal edge weights (top edges)",
-                    expr='topk(10, green_agent_causal_edge_weight)',
+                    expr=f'topk({self.max_edges_export}, green_agent_causal_edge_weight)',
                     legend="{{source}} → {{target}}",
                     gridPos={"x": 0, "y": 4, "w": 24, "h": 8},
                 ),
@@ -268,9 +320,9 @@ class GraphMetricsExporter:
                 ),
                 self._panel_timeseries(
                     id=7,
-                    title="Total execution graphs",
-                    expr="green_agent_execution_graphs_total",
-                    legend="executions",
+                    title="Active execution graphs",
+                    expr="green_agent_execution_graphs_active",
+                    legend="active_executions",
                     gridPos={"x": 0, "y": 20, "w": 12, "h": 6},
                 ),
             ],
@@ -280,6 +332,7 @@ class GraphMetricsExporter:
         return json.dumps(dashboard, indent=2)
 
     def save_dashboard(self, path: str = "./grafana_dashboard.json"):
+        """Save Grafana dashboard JSON to file."""
         with open(path, "w") as f:
             f.write(self.grafana_dashboard())
         print(f"[GraphMetricsExporter] Grafana dashboard saved → {path}")
@@ -289,10 +342,18 @@ class GraphMetricsExporter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _panel_stat(id: int, title: str, expr: str,
-                    gridPos: dict, color: str = "green") -> dict:
+    def _panel_stat(
+        id: int, 
+        title: str, 
+        expr: str,
+        gridPos: dict, 
+        color: str = "green"
+    ) -> dict:
+        """Create a Grafana stat panel."""
         return {
-            "id": id, "type": "stat", "title": title,
+            "id": id, 
+            "type": "stat", 
+            "title": title,
             "gridPos": gridPos,
             "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
             "fieldConfig": {
@@ -309,13 +370,72 @@ class GraphMetricsExporter:
         }
 
     @staticmethod
-    def _panel_timeseries(id: int, title: str, expr: str,
-                          legend: str, gridPos: dict) -> dict:
+    def _panel_timeseries(
+        id: int, 
+        title: str, 
+        expr: str,
+        legend: str, 
+        gridPos: dict
+    ) -> dict:
+        """Create a Grafana timeseries panel."""
         return {
-            "id": id, "type": "timeseries", "title": title,
+            "id": id, 
+            "type": "timeseries", 
+            "title": title,
             "gridPos": gridPos,
-            "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
-            "fieldConfig": {"defaults": {"custom": {"lineWidth": 1}}},
+            "options": {
+                "legend": {"displayMode": "list", "placement": "bottom"}
+            },
+            "fieldConfig": {
+                "defaults": {"custom": {"lineWidth": 1}}
+            },
             "targets": [{"expr": expr, "legendFormat": legend}],
             "datasource": {"type": "prometheus"},
         }
+
+
+# ---------------------------------------------------------------------------
+# Standalone execution for testing
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Demo mode: create mock registry and start server
+    print("[GraphMetricsExporter] Starting in demo mode...")
+    
+    # Create a minimal mock registry for demo
+    class MockRegistry:
+        def health(self):
+            return {
+                "execution_count": 5,
+                "singletons": {
+                    "causal": {
+                        "node_count": 42,
+                        "edge_count": 89,
+                        "anomaly_count": 2,
+                        "ideal_path_count": 12,
+                    },
+                    "policy": {
+                        "node_count": 28,
+                        "edge_count": 56,
+                    }
+                }
+            }
+        
+        def get(self, graph_type):
+            return None  # Return None for demo
+    
+    registry = MockRegistry()
+    exporter = GraphMetricsExporter(registry, max_edges_export=50)
+    
+    # Start HTTP server
+    exporter.start_http_server(port=8000)
+    
+    print("Demo server running at http://localhost:8000/metrics")
+    print("Press Ctrl+C to stop")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        exporter.stop_http_server()
+        print("\nDemo server stopped")
