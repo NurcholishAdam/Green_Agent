@@ -1,0 +1,138 @@
+# alertmanager_templates/green_agent.slack
+{{ define "green_agent.slack.title" }}
+[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] Green Agent Alert
+{{- end }}
+
+{{ define "green_agent.slack.text" }}
+{{- if gt (len .Alerts.Firing) 0 -}}
+{{ range .Alerts.Firing }}
+*Alert:* {{ .Annotations.summary }}
+*Severity:* {{ .Labels.severity }}
+*Status:* {{ .Status }}
+*Started:* {{ .StartsAt.Format "2006-01-02 15:04:05 MST" }}
+
+*Description:*
+{{ .Annotations.description }}
+
+*Labels:*
+{{- range .Labels.SortedPairs }}
+  • {{ .Name }}: {{ .Value }}
+{{- end }}
+
+*Runbook:* {{ .Annotations.runbook_url }}
+*Dashboard:* {{ .Annotations.dashboard_url }}
+---
+{{ end }}
+{{- else -}}
+✅ All Green Agent alerts resolved
+{{- end }}
+{{- end }}
+
+{{ define "green_agent.slack.color" }}
+{{- if eq .Status "firing" -}}
+  {{- if eq .CommonLabels.severity "critical" -}}danger
+  {{- else if eq .CommonLabels.severity "warning" -}}warning
+  {{- else -}}good
+  {{- end -}}
+{{- else -}}good
+{{- end }}
+{{- end }}
+
+# alertmanager_templates/green_agent.pagerduty
+{{ define "green_agent.pagerduty.title" }}
+[{{ .Status | toUpper }}] Green Agent: {{ .CommonLabels.alertname }}
+{{- end }}
+
+{{ define "green_agent.pagerduty.description" }}
+{{- if gt (len .Alerts.Firing) 0 -}}
+{{ range .Alerts.Firing }}
+Alert: {{ .Annotations.summary }}
+Severity: {{ .Labels.severity }}
+Started: {{ .StartsAt.Format "2006-01-02 15:04:05 MST" }}
+
+{{ .Annotations.description }}
+
+Runbook: {{ .Annotations.runbook_url }}
+Dashboard: {{ .Annotations.dashboard_url }}
+---
+{{ end }}
+{{- else -}}
+All Green Agent alerts resolved
+{{- end }}
+{{- end }}
+
+# alertmanager.yml - Configuration
+global:
+  resolve_timeout: 5m
+  slack_api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+  pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+templates:
+  - 'alertmanager_templates/green_agent.slack'
+  - 'alertmanager_templates/green_agent.pagerduty'
+
+route:
+  group_by: ['alertname', 'severity', 'environment']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'green-agent-slack'
+  routes:
+    # Critical alerts → PagerDuty + Slack
+    - match:
+        severity: critical
+      receiver: 'green-agent-pagerduty'
+      continue: true
+    
+    # Warning alerts → Slack only
+    - match:
+        severity: warning
+      receiver: 'green-agent-slack'
+    
+    # Info alerts → Slack (low priority channel)
+    - match:
+        severity: info
+      receiver: 'green-agent-slack-info'
+      group_wait: 1m
+      group_interval: 10m
+
+receivers:
+  - name: 'green-agent-slack'
+    slack_configs:
+      - channel: '#green-agent-alerts'
+        send_resolved: true
+        title: '{{ template "green_agent.slack.title" . }}'
+        text: '{{ template "green_agent.slack.text" . }}'
+        color: '{{ template "green_agent.slack.color" . }}'
+        username: 'Green Agent Bot'
+        icon_emoji: ':leafygreen:'
+
+  - name: 'green-agent-slack-info'
+    slack_configs:
+      - channel: '#green-agent-info'
+        send_resolved: true
+        title: '{{ template "green_agent.slack.title" . }}'
+        text: '{{ template "green_agent.slack.text" . }}'
+        color: '#36a64f'
+        username: 'Green Agent Bot'
+        icon_emoji: ':chart_with_upwards_trend:'
+
+  - name: 'green-agent-pagerduty'
+    pagerduty_configs:
+      - service_key: 'YOUR_PAGERDUTY_SERVICE_KEY'
+        severity: '{{ if eq .CommonLabels.severity "critical" }}critical{{ else }}error{{ end }}'
+        description: '{{ template "green_agent.pagerduty.description" . }}'
+        client: 'Green Agent'
+        client_url: 'https://grafana.example.com/d/green_agent_graphs'
+        details:
+          alertname: '{{ .CommonLabels.alertname }}'
+          severity: '{{ .CommonLabels.severity }}'
+          environment: '{{ .CommonLabels.environment }}'
+
+inhibit_rules:
+  # Critical alerts inhibit warnings for same alertname
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'environment']
