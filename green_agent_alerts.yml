@@ -1,0 +1,301 @@
+# green_agent_alerts.yml
+# Prometheus alerting rules for Green Agent anomalies
+# 
+# Usage:
+#   1. Save this file in your Prometheus config directory
+#   2. Add to prometheus.yml:
+#      rule_files:
+#        - "green_agent_alerts.yml"
+#   3. Reload Prometheus: kill -HUP <prometheus_pid> or use /-/reload endpoint
+#
+# Alert routing (example for Alertmanager):
+#   route:
+#     group_by: ['alertname', 'severity']
+#     routes:
+#     - match:
+#         severity: critical
+#       receiver: 'pagerduty-critical'
+#     - match:
+#         severity: warning
+#       receiver: 'slack-warnings'
+
+groups:
+- name: green_agent_graph_health
+  interval: 30s  # Evaluate rules every 30 seconds
+  rules:
+  
+  # -----------------------------------------------------------------------
+  # Critical Alerts (page on-call)
+  # -----------------------------------------------------------------------
+  
+  - alert: GreenAgentHighAnomalyRate
+    expr: |
+      green_agent_anomalies_active{graph_type="causal"} > 10
+    for: 5m
+    labels:
+      severity: critical
+      team: ai-platform
+      component: causal-graph
+    annotations:
+      summary: "High anomaly rate in causal graph"
+      description: |
+        {{ $labels.graph_type }} graph has {{ $value }} active anomalies 
+        (threshold: 10) for more than 5 minutes.
+        
+        This may indicate:
+        - Data quality issues in carbon forecasting
+        - Policy constraint violations
+        - Unexpected execution patterns
+        
+        Investigate: 
+        - Grafana dashboard: Green Agent — Graph Health
+        - Logs: grep "anomaly" in green-agent logs
+      runbook_url: https://wiki.example.com/runbooks/green-agent-anomalies
+      dashboard_url: https://grafana.example.com/d/green_agent_graphs
+  
+  - alert: GreenAgentExecutionGraphsStalled
+    expr: |
+      # No change in active execution graphs for 10 minutes
+      changes(green_agent_execution_graphs_active[10m]) == 0
+      and
+      green_agent_execution_graphs_active > 0
+    for: 10m
+    labels:
+      severity: critical
+      team: ai-platform
+      component: orchestration
+    annotations:
+      summary: "Green Agent execution graphs appear stalled"
+      description: |
+        Active execution graphs count has not changed for 10 minutes 
+        while showing {{ $value }} active graphs.
+        
+        Possible causes:
+        - Ray cluster workers not responding
+        - Task queue backup
+        - Resource exhaustion
+        
+        Check:
+        - Ray dashboard: http://<head-node>:8265
+        - Kubernetes pods: kubectl get pods -l app=green-agent
+        - Metrics: green_agent_graph_nodes, green_agent_graph_edges
+      runbook_url: https://wiki.example.com/runbooks/green-agent-stalled
+  
+  - alert: GreenAgentCarbonLedgerWriteFailure
+    expr: |
+      # No new ideal paths registered for 30 minutes while executions ongoing
+      changes(green_agent_ideal_paths_total[30m]) == 0
+      and
+      green_agent_execution_graphs_active > 0
+    for: 30m
+    labels:
+      severity: critical
+      team: ai-platform
+      component: carbon-ledger
+    annotations:
+      summary: "Carbon ledger may not be recording executions"
+      description: |
+        No new ideal paths registered in 30 minutes despite 
+        {{ $value }} active execution graphs.
+        
+        This may indicate:
+        - DAG carbon ledger write failures
+        - Database connectivity issues
+        - Permission errors
+        
+        Investigate:
+        - Logs: grep "ledger" or "write" in green-agent logs
+        - Database: check connectivity and disk space
+        - Metrics: any error counters in green_agent_* metrics
+      runbook_url: https://wiki.example.com/runbooks/green-agent-ledger-failure
+  
+  # -----------------------------------------------------------------------
+  # Warning Alerts (notify team, no page)
+  # -----------------------------------------------------------------------
+  
+  - alert: GreenAgentHighCausalEdgeWeightVariance
+    expr: |
+      # High variance in causal edge weights may indicate instability
+      stddev by (label) (green_agent_causal_edge_weight) > 0.3
+    for: 15m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: causal-inference
+    annotations:
+      summary: "High variance in causal edge weights"
+      description: |
+        Causal edge weights for label "{{ $labels.label }}" 
+        have high variance (stddev > 0.3).
+        
+        This may indicate:
+        - Model retraining in progress
+        - Data distribution shift
+        - Insufficient training data for certain edges
+        
+        Monitor:
+        - Grafana panel: "Causal edge weights (top edges)"
+        - Check if variance decreases after model update
+      runbook_url: https://wiki.example.com/runbooks/green-agent-edge-variance
+  
+  - alert: GreenAgentPolicyEdgeWeightDrift
+    expr: |
+      # Policy edge weights changing rapidly may indicate policy instability
+      abs(deriv(green_agent_policy_edge_weight[1h])) > 0.1
+    for: 1h
+    labels:
+      severity: warning
+      team: ai-platform
+      component: policy-engine
+    annotations:
+      summary: "Policy edge weights drifting rapidly"
+      description: |
+        Policy edge weight for {{ $labels.source }} → {{ $labels.target }} 
+        is changing by > 0.1 per hour.
+        
+        This may indicate:
+        - Policy adaptation in response to new data
+        - Overfitting to recent patterns
+        - Configuration changes
+        
+        Review:
+        - Recent policy updates in version control
+        - Carbon zone distribution changes
+        - Grafana panel: "Policy edge weights"
+      runbook_url: https://wiki.example.com/runbooks/green-agent-policy-drift
+  
+  - alert: GreenAgentGraphSizeGrowingRapidly
+    expr: |
+      # Graph growing faster than expected may indicate memory leak or data issue
+      rate(green_agent_graph_nodes[1h]) > 10
+      or
+      rate(green_agent_graph_edges[1h]) > 20
+    for: 1h
+    labels:
+      severity: warning
+      team: ai-platform
+      component: graph-registry
+    annotations:
+      summary: "Graph size growing rapidly"
+      description: |
+        {{ $labels.graph_type }} graph is growing at 
+        {{ printf "%.1f" $value }} nodes/edges per hour.
+        
+        Expected growth: < 10 nodes/hour, < 20 edges/hour
+        
+        Possible causes:
+        - Memory leak in graph construction
+        - Duplicate node/edge registration
+        - Unbounded cache growth
+        
+        Check:
+        - Memory usage: container_memory_usage_bytes{container="green-agent"}
+        - Registry logs: grep "register" for duplicate warnings
+      runbook_url: https://wiki.example.com/runbooks/green-agent-graph-growth
+  
+  - alert: GreenAgentMetricsExporterLatencyHigh
+    expr: |
+      # Prometheus scrape duration for green-agent metrics is high
+      scrape_duration_seconds{job="green-agent"} > 5
+    for: 5m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: metrics-exporter
+    annotations:
+      summary: "Green Agent metrics exporter responding slowly"
+      description: |
+        Prometheus scrape of green-agent metrics took {{ $value }}s 
+        (threshold: 5s).
+        
+        This may indicate:
+        - GraphRegistry.collect() is slow (large graphs)
+        - Network latency to exporter
+        - Exporter resource constraints
+        
+        Investigate:
+        - Exporter logs for slow queries
+        - Reduce max_edges_export if graphs are large
+        - Check exporter CPU/memory usage
+      runbook_url: https://wiki.example.com/runbooks/green-agent-exporter-latency
+  
+  # -----------------------------------------------------------------------
+  # Info Alerts (log only, for trending)
+  # -----------------------------------------------------------------------
+  
+  - alert: GreenAgentCarbonZoneDistributionChange
+    expr: |
+      # Significant change in anomaly distribution across carbon zones
+      abs(
+        green_agent_anomalies_active{graph_type="causal", carbon_zone="green"}
+        - ignoring(carbon_zone) group_left
+        green_agent_anomalies_active{graph_type="causal", carbon_zone="green"} offset 1h
+      ) > 5
+    for: 1h
+    labels:
+      severity: info
+      team: ai-platform
+      component: carbon-monitoring
+    annotations:
+      summary: "Anomaly distribution across carbon zones changed"
+      description: |
+        Anomaly count in {{ $labels.carbon_zone }} zone changed by 
+        {{ printf "%.0f" $value }} compared to 1 hour ago.
+        
+        This is informational — monitor for patterns:
+        - More anomalies in red zones may indicate carbon-aware scheduling working
+        - More anomalies in green zones may indicate data quality issues
+        
+        No action required unless correlated with other alerts.
+      runbook_url: https://wiki.example.com/runbooks/green-agent-zone-trends
+  
+  - alert: GreenAgentIdealPathsGrowth
+    expr: |
+      # Track growth rate of ideal paths (informational)
+      rate(green_agent_ideal_paths_total[24h]) > 100
+    for: 24h
+    labels:
+      severity: info
+      team: ai-platform
+      component: carbon-ledger
+    annotations:
+      summary: "Ideal paths registered growing steadily"
+      description: |
+        {{ printf "%.1f" $value }} ideal paths registered per day 
+        over the last 24 hours.
+        
+        This is expected growth as the system learns — 
+        no action required unless growth is unexpected.
+        
+        Use for capacity planning:
+        - Ledger storage requirements
+        - Query performance monitoring
+      runbook_url: https://wiki.example.com/runbooks/green-agent-capacity-planning
+
+# -----------------------------------------------------------------------
+# Recording Rules (pre-compute expensive queries)
+# -----------------------------------------------------------------------
+- name: green_agent_recording_rules
+  interval: 1m
+  rules:
+  
+  # Pre-compute anomaly rate per graph type for dashboards
+  - record: green_agent:anomaly_rate:per_graph_type
+    expr: |
+      sum by (graph_type) (green_agent_anomalies_active) 
+      / 
+      sum by (graph_type) (green_agent_graph_nodes)
+    
+  # Pre-compute edge weight statistics for causal graph
+  - record: green_agent:causal_edge_weight:stats
+    expr: |
+      avg(green_agent_causal_edge_weight) without (source, target, label)
+    
+  # Pre-compute policy edge weight distribution
+  - record: green_agent:policy_edge_weight:percentile_90
+    expr: |
+      histogram_quantile(0.90, 
+        sum by (le) (
+          rate(green_agent_policy_edge_weight_bucket[5m])
+        )
+      )
