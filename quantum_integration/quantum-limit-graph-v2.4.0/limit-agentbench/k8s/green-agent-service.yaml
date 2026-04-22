@@ -1,0 +1,27 @@
+# k8s/green-agent-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: green-agent-metrics
+  namespace: green-agent-production
+  labels:
+    app: green-agent
+    component: metrics
+  annotations:
+    # Prometheus auto-discovery annotations
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+    prometheus.io/scheme: "http"
+    # Optional: Custom scrape interval for this service
+    prometheus.io/scrape_interval: "30s"
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: green-agent
+    component: head
