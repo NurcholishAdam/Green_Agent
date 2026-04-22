@@ -1,0 +1,237 @@
+# prometheus.yml — Green Agent Scrape Configuration
+# Add this to your main prometheus.yml or include via rule_files
+
+global:
+  scrape_interval: 30s          # Default scrape interval
+  evaluation_interval: 30s      # Default evaluation interval
+  external_labels:
+    cluster: '{{ .Cluster }}'   # Optional: set via template
+    environment: '{{ .Environment }}'
+
+# ---------------------------------------------------------------------------
+# Scrape Configurations for Green Agent
+# ---------------------------------------------------------------------------
+
+scrape_configs:
+
+  # -----------------------------------------------------------------------
+  # Option 1: Kubernetes Service Discovery (Production)
+  # -----------------------------------------------------------------------
+  - job_name: 'green-agent'
+    honor_labels: true          # Preserve labels from exporter
+    honor_timestamps: true
+    scrape_interval: 30s        # Scrape every 30 seconds
+    scrape_timeout: 10s         # Timeout per scrape
+    metrics_path: /metrics      # Default, but explicit is clearer
+    scheme: http                # Use https if TLS enabled
+    
+    # Kubernetes service discovery
+    kubernetes_sd_configs:
+    - role: endpoints
+      namespaces:
+        names:
+        - green-agent-production
+        - green-agent-staging
+        - green-agent-dev
+    
+    # Relabeling: Filter to only Green Agent metrics endpoints
+    relabel_configs:
+    # Keep only endpoints with the correct annotation
+    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+      action: keep
+      regex: true
+    
+    # Use the annotated port if specified
+    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
+      action: replace
+      target_label: __metrics_port__
+      regex: (\d+)
+    
+    # Replace the port in the address
+    - source_labels: [__address__, __metrics_port__]
+      action: replace
+      regex: ([^:]+)(?::\d+)?;(\d+)
+      replacement: $1:$2
+      target_label: __address__
+    
+    # Add useful labels from Kubernetes metadata
+    - source_labels: [__meta_kubernetes_namespace]
+      action: replace
+      target_label: kubernetes_namespace
+    
+    - source_labels: [__meta_kubernetes_pod_name]
+      action: replace
+      target_label: pod
+    
+    - source_labels: [__meta_kubernetes_pod_node_name]
+      action: replace
+      target_label: node
+    
+    - source_labels: [__meta_kubernetes_pod_label_app]
+      action: replace
+      target_label: app
+    
+    - source_labels: [__meta_kubernetes_pod_label_component]
+      action: replace
+      target_label: component
+    
+    # Add environment label from namespace
+    - source_labels: [__meta_kubernetes_namespace]
+      action: replace
+      target_label: environment
+      regex: green-agent-(.*)
+      replacement: $1
+    
+    # Metric relabeling: Drop high-cardinality or unnecessary metrics
+    metric_relabel_configs:
+    # Drop metrics with too many label combinations (prevent cardinality explosion)
+    - source_labels: [__name__]
+      regex: 'green_agent_.*_edge_weight'
+      action: keep
+      # Only keep edge weight metrics for top edges (already limited by exporter)
+    
+    # Add job-level labels to all Green Agent metrics
+    - target_label: job
+      replacement: green-agent
+    
+    # -----------------------------------------------------------------------
+    # Option 2: Static Config (Local Development / Bare Metal)
+    # -----------------------------------------------------------------------
+  - job_name: 'green-agent-static'
+    honor_labels: true
+    scrape_interval: 15s        # More frequent for dev
+    scrape_timeout: 5s
+    metrics_path: /metrics
+    scheme: http
+    
+    static_configs:
+    - targets:
+      - 'localhost:8000'                    # Local dev
+      - 'green-agent-dev.example.com:8000'  # Dev server
+      - '10.0.0.50:8000'                    # Bare metal IP
+      labels:
+        environment: development
+        team: ai-platform
+    
+    # Optional: Basic auth if exporter is protected
+    # basic_auth:
+    #   username: 'prometheus'
+    #   password_file: /etc/prometheus/secrets/green-agent-password
+    
+    # Optional: TLS config if using HTTPS
+    # tls_config:
+    #   ca_file: /etc/prometheus/certs/ca.crt
+    #   cert_file: /etc/prometheus/certs/client.crt
+    #   key_file: /etc/prometheus/certs/client.key
+    #   insecure_skip_verify: false
+    
+    # Metric filtering for static config
+    metric_relabel_configs:
+    # Drop process metrics if not needed (reduces storage)
+    - source_labels: [__name__]
+      regex: 'process_.*'
+      action: drop
+    
+    # Keep only Green Agent specific metrics
+    - source_labels: [__name__]
+      regex: 'green_agent_.*'
+      action: keep
+
+  # -----------------------------------------------------------------------
+  # Option 3: File-Based Service Discovery (Hybrid Deployments)
+  # -----------------------------------------------------------------------
+  - job_name: 'green-agent-file-sd'
+    honor_labels: true
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    scheme: http
+    
+    file_sd_configs:
+    - files:
+      - '/etc/prometheus/green-agent-targets.yml'
+      refresh_interval: 1m    # Check for target changes every minute
+    
+    # Same relabeling as Kubernetes config
+    relabel_configs:
+    - source_labels: [environment]
+      action: replace
+      target_label: environment
+    
+    - source_labels: [datacenter]
+      action: replace
+      target_label: datacenter
+
+  # -----------------------------------------------------------------------
+  # Option 4: Consul Service Discovery (If Using Consul)
+  # -----------------------------------------------------------------------
+  - job_name: 'green-agent-consul'
+    honor_labels: true
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    scheme: http
+    
+    consul_sd_configs:
+    - server: 'consul.example.com:8500'
+      services: ['green-agent']
+      tags: ['metrics']
+      # Optional: Filter by datacenter
+      # datacenter: 'us-east-1'
+    
+    relabel_configs:
+    # Extract service metadata as labels
+    - source_labels: [__meta_consul_service]
+      action: replace
+      target_label: service
+    
+    - source_labels: [__meta_consul_tags]
+      action: replace
+      target_label: tags
+      regex: '(.*)'
+      replacement: '$1'
+
+# ---------------------------------------------------------------------------
+# Alerting Configuration (if using Alertmanager)
+# ---------------------------------------------------------------------------
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      - 'alertmanager.example.com:9093'
+    scheme: http
+    timeout: 10s
+    # Optional: Basic auth for Alertmanager
+    # basic_auth:
+    #   username: 'alertmanager'
+    #   password_file: /etc/prometheus/secrets/alertmanager-password
+
+# ---------------------------------------------------------------------------
+# Rule Files (include Green Agent alerts)
+# ---------------------------------------------------------------------------
+rule_files:
+  - 'rules/green_agent_alerts.yml'      # Our custom alerts
+  - 'rules/green_agent_recording.yml'   # Optional: pre-computed metrics
+
+# ---------------------------------------------------------------------------
+# Remote Write (Optional: Send to Thanos/Cortex/Mimir)
+# ---------------------------------------------------------------------------
+# remote_write:
+# - url: 'https://thanos-receive.example.com/api/v1/receive'
+#   remote_timeout: 30s
+#   queue_config:
+#     max_samples_per_send: 1000
+#     capacity: 10000
+#     max_shards: 50
+#   # Optional: TLS and auth for remote write
+#   tls_config:
+#     ca_file: /etc/prometheus/certs/ca.crt
+#   basic_auth:
+#     username: 'prometheus'
+#     password_file: /etc/prometheus/secrets/remote-write-password
+#   # Optional: Write relabeling to add external labels
+#   write_relabel_configs:
+#   - source_labels: [environment]
+#     target_label: env
+#   - source_labels: [cluster]
+#     target_label: cluster_id
