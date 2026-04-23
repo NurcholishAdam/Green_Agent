@@ -1,179 +1,105 @@
-"""
-Green Agent v5.0.0 - Workload Interpreter
-Layer 0: Analyzes task requirements and complexity
-File: src/interpretation/workload_interpreter.py
-"""
+# src/interpretation/workload_interpreter.py (EXTENDED)
 
-from typing import Dict
-from dataclasses import dataclass
+from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
-import logging
-
-logger = logging.getLogger(__name__)
-
+from .helium_profile import HeliumProfile, HardwareType
 
 @dataclass
 class WorkloadProfile:
-    """Profile of a workload's resource and carbon requirements"""
+    """Enhanced workload profile with helium awareness"""
     task_id: str
-    complexity: float  # 0.0-1.0
+    complexity_score: float  # 0.0-1.0
     energy_estimate_kwh: float
     carbon_estimate_kg: float
-    memory_estimate_mb: float
-    cpu_estimate_percent: float
+    resource_requirements: Dict[str, Any]
     deferrable: bool
     priority: int  # 1-10
-    deadline: datetime = None
-
+    
+    # NEW: Helium awareness
+    helium_profile: Optional[HeliumProfile] = None
+    
+    # Metadata
+    timestamp: datetime = field(default_factory=datetime.now)
+    source: str = "workload_interpreter"
 
 class WorkloadInterpreter:
     """
-    Interprets task specifications into executable workload profiles
+    Enhanced workload interpreter with helium dependency scoring
     """
     
-    def __init__(self, config: Dict):
-        self.config = config
-    
-    async def initialize(self):
-        """Initialize the interpreter"""
-        logger.info("WorkloadInterpreter initialized")
-    
-    async def analyze(self, task: Dict) -> WorkloadProfile:
-        """
-        Analyze a task and create a workload profile
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.enable_helium_analysis = self.config.get('enable_helium_analysis', True)
         
-        Args:
-            task: Task dictionary with type, priority, etc.
+    def analyze_task(self, task_json: Dict[str, Any]) -> WorkloadProfile:
+        """
+        Analyze incoming task and create workload profile with helium metrics
+        """
+        
+        # Existing complexity analysis
+        complexity_score = self._calculate_complexity(task_json)
+        energy_estimate = self._estimate_energy(task_json)
+        carbon_estimate = self._estimate_carbon(energy_estimate)
+        
+        # Resource requirements
+        resource_reqs = self._extract_resource_requirements(task_json)
+        
+        # Priority and deferrability
+        priority = task_json.get('priority', 5)
+        deferrable = task_json.get('deferrable', True)
+        
+        # Create base profile
+        profile = WorkloadProfile(
+            task_id=task_json.get('task_id', 'unknown'),
+            complexity_score=complexity_score,
+            energy_estimate_kwh=energy_estimate,
+            carbon_estimate_kg=carbon_estimate,
+            resource_requirements=resource_reqs,
+            deferrable=deferrable,
+            priority=priority
+        )
+        
+        # NEW: Helium dependency analysis
+        if self.enable_helium_analysis:
+            profile.helium_profile = HeliumProfile.from_task_config(task_json)
             
-        Returns:
-            WorkloadProfile with resource estimates
-        """
-        task_id = task.get('id', 'unknown')
-        task_type = task.get('type', 'unknown')
+            # Adjust energy estimate based on helium constraints
+            if profile.helium_profile.dependency_score > 0.8:
+                profile.energy_estimate_kwh *= 1.2  # High-dependency tasks use more energy
         
-        # Estimate complexity based on task type
-        complexity = self._estimate_complexity(task_type, task)
-        
-        # Estimate resource requirements
-        energy = self._estimate_energy(complexity, task)
-        carbon = energy * 0.4  # Simplified: 0.4 kg CO2 per kWh
-        
-        return WorkloadProfile(
-            task_id=task_id,
-            complexity=complexity,
-            energy_estimate_kwh=energy,
-            carbon_estimate_kg=carbon,
-            memory_estimate_mb=complexity * 1000,
-            cpu_estimate_percent=complexity * 100,
-            deferrable=task.get('deferrable', False),
-            priority=task.get('priority', 5),
-            deadline=task.get('deadline')
-        )
+        return profile
     
-    def _estimate_complexity(self, task_type: str, task: Dict) -> float:
-        """Estimate task complexity from type and parameters"""
-        # Base complexity by task type
-        base_complexity = {
-            'ml_inference': 0.5,
-            'ml_training': 0.9,
-            'data_processing': 0.4,
-            'api_call': 0.2,
-            'batch_job': 0.6,
-            'quantum_simulation': 0.8,
-        }.get(task_type, 0.5)
+    def _calculate_complexity(self, task_json: Dict) -> float:
+        """Calculate task complexity score"""
+        model_size = task_json.get('model_config', {}).get('size_gb', 0)
+        data_volume = task_json.get('data_volume_gb', 0)
         
-        # Adjust based on task parameters
-        model_size = task.get('model_size', 'small')
-        size_factor = {'tiny': 0.3, 'small': 0.5, 'medium': 0.7, 'large': 0.9, 'xlarge': 1.0}.get(model_size, 0.5)
-        
-        input_size = task.get('input_size_mb', 0)
-        data_factor = min(1.0, input_size / 1000)  # Cap at 1.0
-        
-        # Combine factors
-        complexity = base_complexity * (0.5 + 0.3 * size_factor + 0.2 * data_factor)
-        return min(1.0, max(0.0, complexity))
+        # Simple complexity heuristic
+        complexity = min(1.0, (model_size / 100) + (data_volume / 1000))
+        return complexity
     
-    def _estimate_energy(self, complexity: float, task: Dict) -> float:
-        """Estimate energy consumption from complexity"""
-        # Base energy per complexity unit (kWh)
-        base_energy = 1.5
-        
-        # Adjust for task-specific factors
-        model_type = task.get('model', 'generic')
-        model_factor = {
-            'llama-7b': 1.2,
-            'llama-13b': 1.8,
-            'llama-70b': 3.5,
-            'bert-base': 0.8,
-            'generic': 1.0,
-        }.get(model_type, 1.0)
-        
-        # Calculate final estimate
-        energy = base_energy * complexity * model_factor
-        return round(energy, 3)
-
-# src/interpretation/workload_interpreter.py (Extended)
-
-class HeliumDependencyLevel(Enum):
-    CRITICAL = "critical"      # Large GPU/TPU training clusters
-    HIGH = "high"              # Single GPU training, inference servers
-    MODERATE = "moderate"      # CPU-only but data-intensive
-    LOW = "low"                # Basic CPU inference
-    NEGLIGIBLE = "negligible"  # Edge devices, quantized models
-
-@dataclass
-class HeliumProfile:
-    dependency_score: float  # 0.0 to 1.0 (1.0 = highest helium dependency)
-    hardware_type: str       # 'gpu_cluster', 'single_gpu', 'cpu', 'quantum', 'edge'
-    estimated_helium_impact: float  # Arbitrary units per task
-    scarcity_tolerance: float  # 0.0-1.0 (ability to run on constrained helium)
-
-class WorkloadInterpreter:
-    def analyze_task(self, task_json: dict) -> WorkloadProfile:
-        # Existing complexity analysis...
-        
-        # NEW: Helium dependency scoring
-        helium_profile = self._calculate_helium_dependency(task_json)
-        
-        workload_profile.helium_profile = helium_profile
-        return workload_profile
-    
-    def _calculate_helium_dependency(self, task_json: dict) -> HeliumProfile:
+    def _estimate_energy(self, task_json: Dict) -> float:
+        """Estimate energy consumption in kWh"""
+        # Placeholder - in production, use actual power models
         hardware_req = task_json.get('hardware_requirements', {})
+        gpu_count = hardware_req.get('gpu_count', 0)
         
-        # Score based on hardware type
-        if hardware_req.get('gpu_count', 0) > 4:
-            dependency_score = 0.95
-            hardware_type = 'gpu_cluster'
-            scarcity_tolerance = 0.2  # Low tolerance - needs helium cooling
-        elif hardware_req.get('gpu_count', 0) > 0:
-            dependency_score = 0.75
-            hardware_type = 'single_gpu'
-            scarcity_tolerance = 0.4
-        elif hardware_req.get('tpu_accelerator', False):
-            dependency_score = 0.85
-            hardware_type = 'tpu'
-            scarcity_tolerance = 0.3
-        elif hardware_req.get('quantum_circuit', False):
-            dependency_score = 0.99  # Quantum computing extremely helium-dependent
-            hardware_type = 'quantum'
-            scarcity_tolerance = 0.1
-        else:
-            dependency_score = 0.1
-            hardware_type = 'cpu'
-            scarcity_tolerance = 0.9
+        base_energy = 0.1  # kWh
+        gpu_energy = gpu_count * 0.3  # kWh per GPU
         
-        # Adjust for model size and training duration
-        model_size_gb = task_json.get('model_size_gb', 0)
-        training_hours = task_json.get('estimated_training_hours', 0)
-        
-        if model_size_gb > 50 or training_hours > 100:
-            dependency_score = min(1.0, dependency_score * 1.3)
-        
-        return HeliumProfile(
-            dependency_score=dependency_score,
-            hardware_type=hardware_type,
-            estimated_helium_impact=dependency_score * 100,  # Example scaling
-            scarcity_tolerance=scarcity_tolerance
-        )
+        return base_energy + gpu_energy
+    
+    def _estimate_carbon(self, energy_kwh: float) -> float:
+        """Estimate carbon emissions in kg CO2"""
+        # Average grid carbon intensity ~0.4 kg CO2/kWh
+        return energy_kwh * 0.4
+    
+    def _extract_resource_requirements(self, task_json: Dict) -> Dict:
+        """Extract resource requirements from task config"""
+        return {
+            'cpu_cores': task_json.get('hardware_requirements', {}).get('cpu_cores', 2),
+            'memory_gb': task_json.get('hardware_requirements', {}).get('memory_gb', 8),
+            'gpu_count': task_json.get('hardware_requirements', {}).get('gpu_count', 0),
+            'storage_gb': task_json.get('data_volume_gb', 10)
+        }
