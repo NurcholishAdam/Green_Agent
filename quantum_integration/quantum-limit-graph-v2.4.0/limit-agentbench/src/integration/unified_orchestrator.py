@@ -1,202 +1,175 @@
-"""
-Green Agent v5.0.0 - Unified Orchestrator
-Central coordination layer managing all 12 execution layers
-File: src/integration/unified_orchestrator.py
-"""
+# src/integration/unified_orchestrator.py (EXTENDED)
 
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
-from datetime import datetime
+from typing import Dict, Optional, Any
 import asyncio
 import logging
-from enum import Enum
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-class ExecutionMode(Enum):
-    """Supported execution modes"""
-    LEGACY = "legacy"
-    UNIFIED = "unified"
-    COMPARE = "compare"
-
-
-class CarbonZone(Enum):
-    """Carbon intensity zones"""
-    GREEN = "green"        # < 50 gCO2/kWh
-    YELLOW = "yellow"      # 50-200 gCO2/kWh
-    RED = "red"            # 200-400 gCO2/kWh
-    CRITICAL = "critical"  # > 400 gCO2/kWh
-
-
-@dataclass
-class WorkloadProfile:
-    """Layer 0: Workload interpretation result"""
-    task_id: str
-    complexity: float  # 0.0-1.0
-    energy_estimate_kwh: float
-    carbon_estimate_kg: float
-    memory_estimate_mb: float
-    cpu_estimate_percent: float
-    deferrable: bool
-    priority: int  # 1-10
-    deadline: Optional[datetime] = None
-
-
-@dataclass
-class ExecutionDecision:
-    """Layer 3: Carbon-aware decision"""
-    action: str  # execute_full, execute_throttled, defer, execute_minimal
-    power_budget: float  # 0.0-1.0
-    carbon_zone: CarbonZone
-    reasoning: List[str] = field(default_factory=list)
-    deferred_until: Optional[datetime] = None
-
-
-@dataclass
-class UnifiedResult:
-    """Final execution result across all layers"""
-    task_id: str
-    success: bool
-    execution_time: float
-    accuracy: float
-    energy_consumed: float
-    carbon_emitted: float
-    negawatt_reward: float
-    carbon_zone: str
-    metrics: Dict[str, Any] = field(default_factory=dict)
-    errors: List[str] = field(default_factory=list)
-
-
-class UnifiedGreenAgent:
+class UnifiedOrchestrator:
     """
-    Main orchestrator coordinating all 12 layers
+    Unified orchestrator integrating all 12 layers with helium awareness
     """
     
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.mode = ExecutionMode(config.get('system', {}).get('mode', 'unified'))
-        self.debug = config.get('system', {}).get('debug', False)
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
         
-        # Components (initialized in initialize())
-        self.interpreter = None
-        self.decision_core = None
-        self.executor = None
-        self.carbon_forecaster = None
-        self.carbon_ledger = None
-        self.dashboard = None
+        # Initialize all layers with helium awareness
+        from src.interpretation.workload_interpreter import WorkloadInterpreter
+        from src.governance.helium_policy_adapter import HeliumPolicyAdapter
+        from src.decision.carbon_aware_decision_core import CarbonAwareDecisionCore
+        from src.optimization.ml_optimizer import HeliumAwareMLOptimizer, HeliumAwareDataOptimizer
+        from src.distributed.ray_cluster_manager import HeliumAwareRayExecutor
+        from src.carbon.helium_monitor import HeliumMonitor
+        from src.carbon.carbon_ledger import ExtendedCarbonLedger
+        from src.governance.benchmark_engine import HeliumAwareBenchmarkEngine
+        
+        # Layer 0
+        self.workload_interpreter = WorkloadInterpreter(config)
+        
+        # Layer 1 (with helium policy)
+        self.helium_policy = HeliumPolicyAdapter(config)
+        
+        # Layer 3 (enhanced)
+        self.decision_core = CarbonAwareDecisionCore(config)
+        
+        # Layer 4-5 (helium-aware)
+        self.ml_optimizer = HeliumAwareMLOptimizer(config)
+        self.data_optimizer = HeliumAwareDataOptimizer(config)
+        
+        # Layer 6
+        self.executor = HeliumAwareRayExecutor(config)
+        
+        # Layer 7
+        self.helium_monitor = HeliumMonitor(config)
+        
+        # Layer 8
+        self.carbon_ledger = ExtendedCarbonLedger(config)
+        
+        # Layer 9
+        self.benchmark_engine = HeliumAwareBenchmarkEngine(config)
         
         # State
-        self.running = False
-        self.tasks_executed = 0
-        self.start_time = datetime.now()
-        
-        logger.info(f"UnifiedGreenAgent initialized in {self.mode.value} mode")
+        self.is_running = False
     
-    async def initialize(self):
-        """Initialize all components"""
-        logger.info("Initializing Unified Green Agent components...")
+    async def process_task(self, task_json: Dict) -> Dict:
+        """
+        Process a single task through all 12 layers with helium awareness
+        """
+        task_id = task_json.get('task_id', 'unknown')
+        logger.info(f"Processing task {task_id} with helium-aware orchestrator")
         
-        # Import and initialize components
-        from src.interpretation.workload_interpreter import WorkloadInterpreter
-        from src.decision.carbon_aware_decision_core import CarbonAwareDecisionCore
-        from src.distributed.ray_cluster_manager import RayExecutor
-        from src.carbon.forecasting_engine import CarbonForecaster
-        from src.governance.carbon_ledger import CarbonLedger
+        # LAYER 0: Workload Interpretation
+        workload_profile = self.workload_interpreter.analyze_task(task_json)
+        logger.info(f"Layer 0: WorkloadProfile created (helium dependency: {workload_profile.helium_profile.dependency_score if workload_profile.helium_profile else 'N/A'})")
         
-        self.interpreter = WorkloadInterpreter(self.config)
-        self.decision_core = CarbonAwareDecisionCore(self.config)
-        self.executor = RayExecutor(self.config)
-        self.carbon_forecaster = CarbonForecaster(self.config)
-        self.carbon_ledger = CarbonLedger(self.config)
+        # LAYER 1: Get helium supply status and adapt policy
+        helium_supply = await self.helium_monitor.get_current_supply()
+        adapted_policy = self.helium_policy.adapt_policy(workload_profile, None)
         
-        # Initialize each component
-        await self.interpreter.initialize()
-        await self.decision_core.initialize()
-        await self.executor.initialize()
-        await self.carbon_forecaster.initialize()
-        await self.carbon_ledger.initialize()
+        if adapted_policy.action == 'defer':
+            logger.info(f"Layer 1: Task deferred due to {adapted_policy.reason}")
+            return {
+                'status': 'deferred',
+                'task_id': task_id,
+                'reason': adapted_policy.reason,
+                'helium_aware': adapted_policy.helium_aware
+            }
         
-        self.running = True
-        logger.info("✅ Unified Green Agent initialized")
-    
-    async def shutdown(self):
-        """Gracefully shutdown all components"""
-        logger.info("Shutting down Unified Green Agent...")
-        self.running = False
-        
-        if self.executor:
-            await self.executor.shutdown()
-        if self.carbon_ledger:
-            await self.carbon_ledger.shutdown()
-        
-        logger.info("✅ Unified Green Agent shutdown complete")
-    
-    async def execute_task(self, task: Dict[str, Any]) -> UnifiedResult:
-        """Execute a single task through all 12 layers"""
-        start_time = datetime.now()
-        task_id = task.get('id', 'unknown')
-        
-        logger.info(f"Executing task {task_id} in {self.mode.value} mode")
-        
-        try:
-            # Layer 0: Interpret workload
-            profile = await self.interpreter.analyze(task)
-            
-            # Layer 7: Get carbon intensity
-            carbon_intensity = await self.carbon_forecaster.get_current_intensity()
-            
-            # Layer 3: Carbon-aware decision
-            decision = await self.decision_core.evaluate(profile, carbon_intensity)
-            
-            # Layer 6: Distributed execution
-            result = await self.executor.run(task, profile, decision)
-            
-            # Layer 8: Record carbon metrics
-            await self.carbon_ledger.record(result, decision)
-            
-            # Update counters
-            self.tasks_executed += 1
-            
-            logger.info(f"Task {task_id} completed successfully")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Task {task_id} failed: {str(e)}")
-            return self._create_error_result(task_id, str(e), start_time)
-    
-    def _create_error_result(self, task_id: str, error: str, start_time: datetime) -> UnifiedResult:
-        """Create error result when task fails"""
-        return UnifiedResult(
-            task_id=task_id,
-            success=False,
-            execution_time=(datetime.now() - start_time).total_seconds(),
-            accuracy=0.0,
-            energy_consumed=0.0,
-            carbon_emitted=0.0,
-            negawatt_reward=0.0,
-            carbon_zone="unknown",
-            errors=[error]
+        # LAYER 3: Carbon-Aware Decision with Helium Zones
+        carbon_intensity = self._get_carbon_intensity()  # Placeholder
+        execution_decision = self.decision_core.make_decision(
+            workload_profile, carbon_intensity, helium_supply
         )
-
-
-# Test entry point
-async def main():
-    """Test the orchestrator"""
-    config = {'system': {'mode': 'unified', 'debug': True}}
-    agent = UnifiedGreenAgent(config)
-    await agent.initialize()
+        logger.info(f"Layer 3: Decision={execution_decision.action}, HeliumZone={execution_decision.helium_zone}")
+        
+        # LAYER 4-5: Optimize model and data
+        optimization_config = {}
+        if execution_decision.helium_aware_flag:
+            # Apply helium-aware optimizations
+            model_opt_results = self.ml_optimizer.optimize_model(task_json.get('model'), execution_decision)
+            data_opt_results = self.data_optimizer.optimize_data_pipeline(task_json.get('data'), execution_decision)
+            optimization_config = {
+                'model': model_opt_results,
+                'data': data_opt_results
+            }
+        
+        # LAYER 6: Execute with helium-aware routing
+        execution_result = await self.executor.execute_task(
+            task_json, workload_profile, execution_decision
+        )
+        logger.info(f"Layer 6: Execution complete on {execution_result.worker_type}, helium_usage={execution_result.helium_usage:.3f}")
+        
+        # LAYER 7-8: Account for helium usage
+        ledger_entry = self.carbon_ledger.add_entry(
+            execution_result, execution_decision, helium_supply
+        )
+        logger.info(f"Layer 8: Ledger entry created with hash {ledger_entry.hash[:8]}...")
+        
+        # LAYER 9: Benchmark with helium metrics
+        benchmark_report = self.benchmark_engine.update_pareto_frontier(
+            execution_result, helium_supply
+        )
+        logger.info(f"Layer 9: Helium efficiency={benchmark_report.helium_efficiency:.2f}, resilience={benchmark_report.helium_resilience_score:.2f}")
+        
+        # Record helium usage for future policy learning
+        await self.helium_policy.record_helium_usage(
+            task_id, execution_result.helium_usage, {'success': execution_result.success}
+        )
+        
+        # Return comprehensive result
+        return {
+            'status': 'completed' if execution_result.success else 'failed',
+            'task_id': task_id,
+            'execution_decision': {
+                'action': execution_decision.action,
+                'carbon_zone': execution_decision.carbon_zone.value,
+                'helium_zone': execution_decision.helium_zone.value if execution_decision.helium_zone else None,
+                'power_budget': execution_decision.power_budget
+            },
+            'execution_result': {
+                'accuracy': execution_result.accuracy,
+                'energy_kwh': execution_result.energy_consumed_kwh,
+                'carbon_kg': execution_result.carbon_emitted_kg,
+                'helium_usage': execution_result.helium_usage,
+                'worker_type': execution_result.worker_type,
+                'fallback_used': execution_result.fallback_used
+            },
+            'benchmark': {
+                'helium_efficiency': benchmark_report.helium_efficiency,
+                'helium_resilience_score': benchmark_report.helium_resilience_score,
+                'recommendations': benchmark_report.recommendations
+            },
+            'ledger_hash': ledger_entry.hash
+        }
     
-    task = {'id': 'test_001', 'type': 'ml_inference', 'priority': 5, 'deferrable': True}
-    result = await agent.execute_task(task)
+    def _get_carbon_intensity(self) -> float:
+        """Placeholder for carbon intensity API call"""
+        # In production, call Layer 7 Carbon Monitoring
+        return 150.0  # Example value
     
-    print(f"\n✅ Task {result.task_id}: {'Success' if result.success else 'Failed'}")
-    print(f"   Energy: {result.energy_consumed:.4f} kWh")
-    print(f"   Carbon: {result.carbon_emitted:.4f} kg CO2")
+    async def get_helium_status(self) -> Dict:
+        """Get current helium supply status"""
+        supply = await self.helium_monitor.get_current_supply()
+        if supply:
+            return {
+                'scarcity_level': supply.scarcity_level.value,
+                'scarcity_score': supply.scarcity_score,
+                'spot_price_usd': supply.spot_price_usd_per_liter,
+                'fab_inventory_days': supply.fab_inventory_days,
+                'timestamp': supply.timestamp.isoformat()
+            }
+        return {'error': 'No data available'}
     
-    await agent.shutdown()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    async def get_helium_report(self) -> Dict:
+        """Get comprehensive helium report"""
+        ledger_report = self.carbon_ledger.get_helium_efficiency_report()
+        helium_status = await self.get_helium_status()
+        ranking = self.benchmark_engine.get_helium_ranking(5)
+        
+        return {
+            'current_supply': helium_status,
+            'efficiency_report': ledger_report,
+            'top_efficient_tasks': ranking,
+            'worker_pools': self.executor.get_worker_pool_status()
+        }
