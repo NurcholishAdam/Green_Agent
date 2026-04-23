@@ -1,4 +1,4 @@
-# 🌱 Green Agent v5.0.0 - Complete Architecture Documentation
+# 🌱 Green Agent v5.0.0
 
 ## Sustainable AI Orchestration Platform with Helium-Aware Resource Management
 
