@@ -1,6 +1,6 @@
 # 🌱 Green Agent v5.0.0
 
-## Sustainable AI Orchestration Platform with Helium-Aware Resource Management
+## Sustainable AI Orchestration Platform with Carbon & Helium-Aware Resource Management
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9+-green.svg)](https://www.python.org/)
