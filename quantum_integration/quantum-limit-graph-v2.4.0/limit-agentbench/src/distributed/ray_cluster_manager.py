@@ -1,162 +1,272 @@
-"""
-Green Agent v5.0.0 - Ray Cluster Manager
-Layer 6: Distributed execution via Ray cluster
-File: src/distributed/ray_cluster_manager.py
-"""
+# src/distributed/ray_cluster_manager.py (EXTENDED)
 
-from typing import Dict
+from typing import Dict, List, Optional, Any
+from enum import Enum
 from dataclasses import dataclass
-from datetime import datetime
-import logging
 import asyncio
+import logging
 
 logger = logging.getLogger(__name__)
 
+class WorkerType(Enum):
+    """Worker pool types with helium footprints"""
+    STANDARD_CPU = "standard_cpu"
+    GPU_SINGLE = "gpu_single"
+    GPU_CLUSTER = "gpu_cluster"
+    TPU = "tpu"
+    QUANTUM = "quantum"
+    
+    @property
+    def helium_footprint(self) -> float:
+        footprints = {
+            WorkerType.STANDARD_CPU: 0.10,
+            WorkerType.GPU_SINGLE: 0.75,
+            WorkerType.GPU_CLUSTER: 0.95,
+            WorkerType.TPU: 0.85,
+            WorkerType.QUANTUM: 0.99
+        }
+        return footprints[self]
 
 @dataclass
-class UnifiedResult:
-    """Execution result from distributed layer"""
-    task_id: str
+class ExecutionResult:
+    """Enhanced execution result with helium metrics"""
     success: bool
-    execution_time: float
+    task_id: str
     accuracy: float
-    energy_consumed: float
-    carbon_emitted: float
-    negawatt_reward: float
-    carbon_zone: str
+    energy_consumed_kwh: float
+    carbon_emitted_kg: float
+    execution_time_ms: int
+    worker_type: str
+    
+    # NEW: Helium metrics
+    helium_usage: float = 0.0
+    helium_zone: Optional[str] = None
+    fallback_used: bool = False
+    optimization_level: str = "none"
 
-
-class RayExecutor:
+class HeliumAwareRayExecutor:
     """
-    Distributed executor using Ray cluster
+    Ray executor with helium-aware routing and fallback paths
     """
     
-    def __init__(self, config: Dict):
-        self.config = config
-        self.ray_enabled = config.get('ray', {}).get('enabled', False)
-        self.num_workers = config.get('ray', {}).get('num_workers', 4)
-        self._ray_initialized = False
-    
-    async def initialize(self):
-        """Initialize Ray executor"""
-        logger.info(f"RayExecutor initialized (enabled={self.ray_enabled}, workers={self.num_workers})")
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.ray_address = self.config.get('ray_address', 'auto')
         
-        if self.ray_enabled:
-            try:
-                import ray
-                if not ray.is_initialized():
-                    ray.init(ignore_reinit_error=True, address='auto')
-                self._ray_initialized = True
-                logger.info("Ray cluster connected")
-            except Exception as e:
-                logger.warning(f"Ray initialization failed: {e}, falling back to local execution")
-                self.ray_enabled = False
+        # Worker pool configuration
+        self.worker_pools = {
+            WorkerType.STANDARD_CPU: {
+                'available': True,
+                'capacity': self.config.get('cpu_workers', 10),
+                'helium_footprint': 0.10,
+                'cost_factor': 1.0
+            },
+            WorkerType.GPU_SINGLE: {
+                'available': self.config.get('gpu_available', True),
+                'capacity': self.config.get('gpu_workers', 4),
+                'helium_footprint': 0.75,
+                'cost_factor': 3.0
+            },
+            WorkerType.GPU_CLUSTER: {
+                'available': self.config.get('gpu_cluster_available', True),
+                'capacity': self.config.get('gpu_cluster_workers', 2),
+                'helium_footprint': 0.95,
+                'cost_factor': 8.0
+            },
+            WorkerType.TPU: {
+                'available': self.config.get('tpu_available', False),
+                'capacity': self.config.get('tpu_workers', 2),
+                'helium_footprint': 0.85,
+                'cost_factor': 5.0
+            },
+            WorkerType.QUANTUM: {
+                'available': self.config.get('quantum_available', False),
+                'capacity': self.config.get('quantum_workers', 1),
+                'helium_footprint': 0.99,
+                'cost_factor': 20.0
+            }
+        }
+        
+        # Fallback configuration
+        self.fallback_enabled = self.config.get('fallback_enabled', True)
+        self.execution_timeout_seconds = self.config.get('execution_timeout', 300)
     
-    async def shutdown(self):
-        """Shutdown Ray executor"""
-        if self._ray_initialized:
-            try:
-                import ray
-                ray.shutdown()
-                logger.info("Ray cluster disconnected")
-            except Exception as e:
-                logger.warning(f"Ray shutdown failed: {e}")
-        logger.info("RayExecutor shutdown complete")
-    
-    async def run(self, task: Dict, profile, decision) -> UnifiedResult:
+    async def execute_task(self, task: Any, workload_profile, 
+                          execution_decision) -> ExecutionResult:
         """
-        Execute task via distributed or local execution
-        
-        Args:
-            task: Task specification
-            profile: WorkloadProfile from interpreter
-            decision: ExecutionDecision from carbon core
-            
-        Returns:
-            UnifiedResult with execution metrics
+        Execute task with helium-aware routing
         """
-        start_time = datetime.now()
         
-        if self.ray_enabled and self._ray_initialized:
-            result = await self._execute_on_ray(task, profile, decision)
-        else:
-            result = await self._execute_local(task, profile, decision)
+        helium_profile = getattr(workload_profile, 'helium_profile', None)
         
-        # Calculate final metrics
-        result.execution_time = (datetime.now() - start_time).total_seconds()
+        # Determine target worker type based on helium constraints
+        target_worker = self._select_worker_pool(execution_decision, helium_profile)
+        
+        if not target_worker:
+            # No suitable worker available, try fallback
+            if self.fallback_enabled:
+                return await self._execute_fallback(task, workload_profile, execution_decision)
+            else:
+                return ExecutionResult(
+                    success=False,
+                    task_id=getattr(task, 'id', 'unknown'),
+                    accuracy=0.0,
+                    energy_consumed_kwh=0.0,
+                    carbon_emitted_kg=0.0,
+                    execution_time_ms=0,
+                    worker_type='none',
+                    helium_usage=0.0,
+                    fallback_used=False
+                )
+        
+        # Execute on selected worker
+        logger.info(f"Executing task on {target_worker.value} (helium footprint: {self.worker_pools[target_worker]['helium_footprint']})")
+        
+        # Simulate execution (in production, actual Ray submission)
+        import random
+        execution_time = random.uniform(100, 1000)  # ms
+        
+        # Calculate helium usage based on worker type and power budget
+        helium_usage = (self.worker_pools[target_worker]['helium_footprint'] * 
+                       (1 - execution_decision.power_budget) * 0.5 +
+                       execution_decision.power_budget * 0.5)
+        
+        result = ExecutionResult(
+            success=True,
+            task_id=getattr(task, 'id', 'unknown'),
+            accuracy=0.95 * execution_decision.power_budget,  # Simulated accuracy drop
+            energy_consumed_kwh=0.5 * execution_decision.power_budget,
+            carbon_emitted_kg=0.2 * execution_decision.power_budget,
+            execution_time_ms=execution_time,
+            worker_type=target_worker.value,
+            helium_usage=helium_usage,
+            helium_zone=execution_decision.helium_zone.value if execution_decision.helium_zone else None,
+            fallback_used=False,
+            optimization_level=self._get_optimization_level(execution_decision)
+        )
+        
         return result
     
-    async def _execute_on_ray(self, task: Dict, profile, decision) -> UnifiedResult:
-        """Execute task on Ray cluster"""
-        try:
-            import ray
-            
-            # Define remote task function
-            @ray.remote
-            def execute_remote_task(task_data, power_budget):
-                import random
-                import time
-                
-                # Simulate work with power budget scaling
-                work_time = 0.1 * power_budget
-                time.sleep(work_time)
-                
-                # Simulate accuracy based on power budget
-                base_accuracy = 0.92
-                accuracy = base_accuracy + random.uniform(-0.02, 0.02) * power_budget
-                
-                # Simulate energy consumption
-                base_energy = task_data.get('energy_estimate', 1.0)
-                energy = base_energy * power_budget * random.uniform(0.9, 1.1)
-                
-                return {
-                    'success': True,
-                    'accuracy': accuracy,
-                    'energy': energy
-                }
-            
-            # Execute remotely
-            remote_func = execute_remote_task.remote(
-                {'energy_estimate': profile.energy_estimate_kwh},
-                decision.power_budget
-            )
-            result = await remote_func
-            
-            return UnifiedResult(
-                task_id=task.get('id', 'unknown'),
-                success=result['success'],
-                execution_time=0.1,  # Will be updated by caller
-                accuracy=result['accuracy'],
-                energy_consumed=result['energy'],
-                carbon_emitted=result['energy'] * 0.4,
-                negawatt_reward=self._calculate_negawatt(profile.energy_estimate_kwh, result['energy']),
-                carbon_zone=decision.carbon_zone
-            )
-            
-        except Exception as e:
-            logger.warning(f"Ray execution failed: {e}, falling back to local")
-            return await self._execute_local(task, profile, decision)
-    
-    async def _execute_local(self, task: Dict, profile, decision) -> UnifiedResult:
-        """Execute task locally (fallback)"""
-        await asyncio.sleep(0.1)  # Simulate work
+    def _select_worker_pool(self, execution_decision, helium_profile) -> Optional[WorkerType]:
+        """
+        Select appropriate worker pool based on helium constraints
+        """
         
-        energy = profile.energy_estimate_kwh * decision.power_budget
-        
-        return UnifiedResult(
-            task_id=task.get('id', 'unknown'),
-            success=True,
-            execution_time=0.1,
-            accuracy=0.92,
-            energy_consumed=energy,
-            carbon_emitted=energy * 0.4,
-            negawatt_reward=self._calculate_negawatt(profile.energy_estimate_kwh, energy),
-            carbon_zone=decision.carbon_zone
-        )
+        # Check if helium is constraining
+        if (execution_decision.helium_aware_flag and 
+            execution_decision.helium_zone and
+            execution_decision.helium_zone.value in ['helium_red', 'helium_critical']):
+            
+            # Helium scarce - prefer low-footprint workers
+            if helium_profile and helium_profile.can_run_on_cpu:
+                return WorkerType.STANDARD_CPU
+            else:
+                # Try single GPU as compromise
+                if self.worker_pools[WorkerType.GPU_SINGLE]['available']:
+                    return WorkerType.GPU_SINGLE
+                else:
+                    return WorkerType.STANDARD_CPU
+                    
+        elif (execution_decision.helium_aware_flag and 
+              execution_decision.helium_zone and
+              execution_decision.helium_zone.value == 'helium_yellow'):
+            
+            # Helium caution - prefer single GPU over clusters
+            if self.worker_pools[WorkerType.GPU_SINGLE]['available']:
+                return WorkerType.GPU_SINGLE
+            elif self.worker_pools[WorkerType.STANDARD_CPU]['available']:
+                return WorkerType.STANDARD_CPU
+            else:
+                return WorkerType.GPU_CLUSTER  # Last resort
+        else:
+            # Normal conditions - use optimal hardware based on workload
+            if helium_profile:
+                if helium_profile.dependency_score > 0.8:
+                    return WorkerType.GPU_CLUSTER
+                elif helium_profile.dependency_score > 0.5:
+                    return WorkerType.GPU_SINGLE
+                else:
+                    return WorkerType.STANDARD_CPU
+            else:
+                return WorkerType.STANDARD_CPU
     
-    def _calculate_negawatt(self, baseline: float, actual: float) -> float:
-        """Calculate negawatt reward for energy savings"""
-        if baseline <= 0:
-            return 0.0
-        savings_ratio = (baseline - actual) / baseline
-        return min(10.0, max(0.0, savings_ratio * 10))
+    async def _execute_fallback(self, task, workload_profile, execution_decision) -> ExecutionResult:
+        """
+        Execute fallback path for critical helium scarcity
+        """
+        logger.warning(f"Executing fallback for task {getattr(task, 'id', 'unknown')} due to helium scarcity")
+        
+        # Option 1: Use distilled model if available
+        helium_profile = getattr(workload_profile, 'helium_profile', None)
+        
+        if helium_profile and helium_profile.can_use_distilled_model:
+            logger.info("Fallback: Using distilled model")
+            # Simulate distilled model execution
+            return ExecutionResult(
+                success=True,
+                task_id=getattr(task, 'id', 'unknown'),
+                accuracy=0.85,  # 15% accuracy drop
+                energy_consumed_kwh=0.2,
+                carbon_emitted_kg=0.08,
+                execution_time_ms=150,
+                worker_type='distilled_cpu',
+                helium_usage=0.1,
+                fallback_used=True,
+                optimization_level='distilled'
+            )
+        
+        # Option 2: Execute on CPU with degraded performance
+        elif helium_profile and helium_profile.can_run_on_cpu:
+            logger.info("Fallback: Executing on CPU")
+            return ExecutionResult(
+                success=True,
+                task_id=getattr(task, 'id', 'unknown'),
+                accuracy=0.70,  # 30% accuracy drop
+                energy_consumed_kwh=0.15,
+                carbon_emitted_kg=0.06,
+                execution_time_ms=500,  # Much slower
+                worker_type='cpu_fallback',
+                helium_usage=0.05,
+                fallback_used=True,
+                optimization_level='degraded'
+            )
+        
+        # Option 3: Defer
+        else:
+            logger.warning("Fallback: Deferring task due to no viable path")
+            return ExecutionResult(
+                success=False,
+                task_id=getattr(task, 'id', 'unknown'),
+                accuracy=0.0,
+                energy_consumed_kwh=0.0,
+                carbon_emitted_kg=0.0,
+                execution_time_ms=0,
+                worker_type='none',
+                helium_usage=0.0,
+                fallback_used=True
+            )
+    
+    def _get_optimization_level(self, execution_decision) -> str:
+        """Determine optimization level based on execution decision"""
+        if not execution_decision.helium_aware_flag:
+            return 'none'
+        
+        if execution_decision.power_budget >= 0.8:
+            return 'light'
+        elif execution_decision.power_budget >= 0.5:
+            return 'moderate'
+        elif execution_decision.power_budget >= 0.2:
+            return 'aggressive'
+        else:
+            return 'deferred'
+    
+    def get_worker_pool_status(self) -> Dict:
+        """Get current status of all worker pools"""
+        return {
+            worker.value: {
+                'available': config['available'],
+                'capacity': config['capacity'],
+                'helium_footprint': config['helium_footprint']
+            }
+            for worker, config in self.worker_pools.items()
+        }
