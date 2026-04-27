@@ -1,6 +1,37 @@
-# Add this scrape config:
+# Prometheus Configuration for Green Agent v5.0.0
+# ================================================
+# Deploy alongside Green Agent to scrape metrics and evaluate alerting rules
 
+global:
+  scrape_interval: 30s          # How often to scrape targets
+  evaluation_interval: 30s      # How often to evaluate rules
+  external_labels:
+    cluster: 'green-agent-prod'
+    environment: 'production'
+    region: 'us-east-1'
+
+# Rule files for alerting and recording
+rule_files:
+  - "rules/green_agent_alerts.yml"
+  - "rules/helium_alerts.yml"      # ✅ Helium-specific alerts
+  - "rules/green_agent_recording.yml"
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+      scheme: http
+      timeout: 10s
+
+# Scrape configurations
 scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ✅ Green Agent metrics (includes helium metrics automatically)
   - job_name: 'green-agent'
     honor_labels: true
     scrape_interval: 30s
@@ -8,25 +39,68 @@ scrape_configs:
     metrics_path: /metrics
     scheme: http
     
+    # Kubernetes service discovery
     kubernetes_sd_configs:
-    - role: endpoints
-      namespaces:
-        names:
-        - green-agent-production
+      - role: endpoints
+        namespaces:
+          names:
+            - green-agent-production
+            - green-agent-staging
+            - green-agent-dev
     
+    # Relabeling for auto-discovery
     relabel_configs:
-    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
-      action: keep
-      regex: true
-    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
-      action: replace
-      target_label: __metrics_port__
-      regex: (\d+)
-    - source_labels: [__address__, __metrics_port__]
-      action: replace
-      regex: ([^:]+)(?::\d+)?;(\d+)
-      replacement: $1:$2
-      target_label: __address__
-    
-    # ✅ Helium metrics are automatically included via graph_metrics_exporter
-    # No additional config needed - they share the same /metrics endpoint
+      # Keep only endpoints annotated for Prometheus scraping
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      
+      # Use annotated port if specified
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
+        action: replace
+        target_label: __metrics_port__
+        regex: (\d+)
+      
+      # Replace address with correct port
+      - source_labels: [__address__, __metrics_port__]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      
+      # Add Kubernetes metadata as labels
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: replace
+        target_label: app
+      
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        action: replace
+        target_label: component
+
+  # Optional: Node exporter for infrastructure metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 15s
+
+# Remote write configuration (Optional: for Thanos/Cortex/Mimir)
+# remote_write:
+#   - url: 'https://thanos-receive.example.com/api/v1/receive'
+#     remote_timeout: 30s
+#     queue_config:
+#       max_samples_per_send: 1000
+#       capacity: 10000
+#       max_shards: 50
+#     tls_config:
+#       ca_file: /etc/prometheus/certs/ca.crt
+#     basic_auth:
+#       username: 'prometheus'
+#       password_file: /etc/prometheus/secrets/remote-write-password
