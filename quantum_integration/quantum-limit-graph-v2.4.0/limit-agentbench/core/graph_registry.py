@@ -330,3 +330,24 @@ class GraphRegistry:
         # Inject the recommended zone into the next policy decision context
         # by updating a lightweight "override" attribute the PolicyGraph reads
         policy._meta_zone_override = zone_map.get(action, None)
+
+# Add this method to the GraphRegistry class:
+
+def register_helium_monitor(self, monitor: 'HeliumMonitor'):
+    """
+    Register HeliumMonitor for metrics collection
+    
+    Args:
+        monitor: HeliumMonitor instance to register
+    """
+    self._helium_monitor = monitor
+    logger.info("HeliumMonitor registered with GraphRegistry")
+
+def get_helium_monitor(self) -> Optional['HeliumMonitor']:
+    """
+    Get registered HeliumMonitor instance
+    
+    Returns:
+        HeliumMonitor instance or None if not registered
+    """
+    return getattr(self, '_helium_monitor', None)  
