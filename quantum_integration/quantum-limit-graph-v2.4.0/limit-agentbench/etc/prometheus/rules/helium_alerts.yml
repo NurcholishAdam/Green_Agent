@@ -1,0 +1,132 @@
+# helium_alerts.yml — Prometheus alerting rules for helium supply monitoring
+#
+# Add to prometheus.yml:
+# rule_files:
+#   - "rules/helium_alerts.yml"
+
+groups:
+- name: helium_supply_alerts
+  interval: 30s
+  rules:
+  
+  # Critical: Severe helium shortage
+  - alert: HeliumSupplySevere
+    expr: |
+      green_agent_helium_scarcity_level{job="green-agent"} == 3
+    for: 5m
+    labels:
+      severity: critical
+      team: supply-chain
+      component: helium-monitor
+    annotations:
+      summary: "Severe helium supply shortage detected"
+      description: |
+        Helium scarcity level is SEVERE for more than 5 minutes.
+        
+        Current price: ${{ $labels.spot_price }} per liter
+        Inventory: {{ $labels.inventory_days }} days
+        
+        Actions:
+        - Defer non-essential helium-intensive jobs
+        - Activate emergency procurement protocols
+        - Notify fabrication facilities
+        
+        Runbook: https://wiki.example.com/runbooks/helium-severe-shortage
+      runbook_url: https://wiki.example.com/runbooks/helium-severe-shortage
+      dashboard_url: https://grafana.example.com/d/green_agent_graphs_helium
+  
+  # Critical: Price spike
+  - alert: HeliumPriceSpike
+    expr: |
+      green_agent_helium_price_premium_usd{job="green-agent"} > 5.0
+    for: 10m
+    labels:
+      severity: critical
+      team: finance
+      component: helium-monitor
+    annotations:
+      summary: "Helium price spike detected"
+      description: |
+        Helium price premium is ${{ $value }}/L above baseline 
+        (baseline: $4.0/L) for more than 10 minutes.
+        
+        Current spot price: ${{ $value | add 4.0 }}/L
+        
+        Impact:
+        - Increased operational costs for helium-dependent processes
+        - May trigger policy changes for cost-sensitive workloads
+        
+        Review procurement strategy and workload scheduling.
+      runbook_url: https://wiki.example.com/runbooks/helium-price-spike
+  
+  # Warning: Critical scarcity
+  - alert: HeliumSupplyCritical
+    expr: |
+      green_agent_helium_scarcity_level{job="green-agent"} == 2
+    for: 15m
+    labels:
+      severity: warning
+      team: supply-chain
+      component: helium-monitor
+    annotations:
+      summary: "Critical helium supply constraint"
+      description: |
+        Helium scarcity level is CRITICAL for more than 15 minutes.
+        
+        Monitor for escalation to SEVERE level.
+        Consider pre-emptive workload adjustments.
+      runbook_url: https://wiki.example.com/runbooks/helium-critical
+  
+  # Warning: Low inventory
+  - alert: HeliumInventoryLow
+    expr: |
+      green_agent_helium_fab_inventory_days{job="green-agent"} < 10
+    for: 1h
+    labels:
+      severity: warning
+      team: operations
+      component: helium-monitor
+    annotations:
+      summary: "Low helium inventory at fabrication facilities"
+      description: |
+        Fabrication facility helium inventory is {{ $value }} days, 
+        below threshold of 10 days.
+        
+        Risk: Production delays if supply disrupted.
+        
+        Actions:
+        - Review procurement schedule
+        - Assess alternative supply chains
+      runbook_url: https://wiki.example.com/runbooks/helium-low-inventory
+  
+  # Info: Caution level
+  - alert: HeliumSupplyCaution
+    expr: |
+      green_agent_helium_scarcity_level{job="green-agent"} == 1
+    for: 30m
+    labels:
+      severity: info
+      team: supply-chain
+      component: helium-monitor
+    annotations:
+      summary: "Helium supply entering caution zone"
+      description: |
+        Helium scarcity level is CAUTION for more than 30 minutes.
+        
+        Monitor for trends — no immediate action required.
+      runbook_url: https://wiki.example.com/runbooks/helium-trends
+
+# Recording rules for efficiency
+- name: helium_recording_rules
+  interval: 1m
+  rules:
+  
+  # Pre-compute scarcity trend
+  - record: helium:scarcity_score:rate1h
+    expr: |
+      rate(green_agent_helium_scarcity_score{job="green-agent"}[1h])
+  
+  # Pre-compute price volatility
+  - record: helium:price_volatility:stddev6h
+    expr: |
+      stddev_over_time(green_agent_helium_spot_price_usd{job="green-agent"}[6h])
