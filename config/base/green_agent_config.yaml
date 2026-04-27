@@ -1,14 +1,12 @@
+# Green Agent v5.0.0 Base Configuration
+# =======================================
+# Copy to config/overlays/{development,staging,production}/ and modify as needed
+
 system:
   version: "5.0.0"
-  mode: "unified"
+  mode: "unified"          # legacy | unified | compare
   debug: false
-  log_level: "INFO"
-
-dashboard:
-  enabled: true
-  host: "0.0.0.0"
-  port: 8000
-  update_interval_seconds: 5
+  log_level: "INFO"        # DEBUG | INFO | WARNING | ERROR
 
 ray:
   enabled: true
@@ -18,45 +16,56 @@ ray:
   dashboard_port: 8265
 
 carbon:
+  api_provider: "simulation"    # simulation | electricitymap | carbonintensity
   default_region: "US-CA"
-  api_provider: "simulation"
-  eco_mode_threshold: 200
-  defer_threshold: 400
+  eco_mode_threshold: 200       # gCO2/kWh for yellow zone
+  defer_threshold: 400          # gCO2/kWh for red zone
+  api_key_env_var: "CARBON_API_KEY"
 
-policy:
-  mode: "moderate"
-  weights:
-    carbon_importance: 0.4
-    performance_importance: 0.3
-    cost_importance: 0.2
-    deadline_importance: 0.1
-
-quantum:
-  enabled: false
-  backend: "simulator"
+helium:
+  enabled: false                # Set to true to enable helium supply monitoring
+  api_endpoints:
+    primary: "https://api.helium-monitor.example.com/v1/supply"
+    backup: "https://backup.helium-api.example.com/v1/status"
+  api_key_env_var: "HELIUM_API_KEY"  # Loads from environment if set
+  update_interval_seconds: 900       # 15 minutes between API fetches
+  history_buffer_size: 100           # Keep last N signals in memory
+  max_retries: 3                     # API retry attempts
+  base_retry_delay: 1.0              # Base delay for exponential backoff (seconds)
+  simulation_enabled: true           # Fallback to simulation on API failure
+  simulation_seed: null              # Set integer for deterministic testing (e.g., 42)
 
 monitoring:
   prometheus:
     enabled: true
-    port: 9090
+    port: 8000
+    metrics_path: "/metrics"
+    max_edges_export: 100      # Limit edge metrics to prevent cardinality explosion
   logging:
     level: "INFO"
     format: "json"
+    file: "logs/green_agent.log"
 
 security:
   enable_auth: false
   tls:
     enabled: false
+    cert_file: ""
+    key_file: ""
+  rbac:
+    enabled: true
+    default_policy: "deny"
 
-# Add this section to the config file:
+quantum:
+  enabled: false
+  backend: "simulator"         # simulator | ibm | rigetti | ionq
+  qubit_count: 12
+  error_mitigation: ["ZNE", "PEC"]
 
-helium:
-  enabled: false  # Set to true to enable helium monitoring
-  api_endpoints:
-    primary: https://api.helium-monitor.example.com/v1/supply
-    backup: https://backup.helium-api.example.com/v1/status
-  api_key_env_var: HELIUM_API_KEY  # Load API key from environment
-  update_interval_seconds: 900  # 15 minutes
-  history_buffer_size: 100
-  simulation_enabled: true  # Enable fallback simulation
-  simulation_seed: null  # Set integer for deterministic testing
+policy:
+  mode: "moderate"             # conservative | moderate | aggressive
+  weights:
+    carbon_importance: 0.4
+    performance_importance: 0.3
+    cost_importance: 0.2
+    deadline_importance: 0.1
