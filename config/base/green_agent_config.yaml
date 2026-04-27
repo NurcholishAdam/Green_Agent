@@ -47,3 +47,16 @@ security:
   enable_auth: false
   tls:
     enabled: false
+
+# Add this section to the config file:
+
+helium:
+  enabled: false  # Set to true to enable helium monitoring
+  api_endpoints:
+    primary: https://api.helium-monitor.example.com/v1/supply
+    backup: https://backup.helium-api.example.com/v1/status
+  api_key_env_var: HELIUM_API_KEY  # Load API key from environment
+  update_interval_seconds: 900  # 15 minutes
+  history_buffer_size: 100
+  simulation_enabled: true  # Enable fallback simulation
+  simulation_seed: null  # Set integer for deterministic testing
