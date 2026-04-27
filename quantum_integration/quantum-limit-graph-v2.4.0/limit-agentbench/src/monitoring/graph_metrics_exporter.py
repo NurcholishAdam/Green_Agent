@@ -1,19 +1,14 @@
 """
-graph_metrics_exporter.py — Fixed Version (Metric Type + Cardinality)
-=====================================================================
-Exposes Green Agent graph health metrics in Prometheus text format.
+graph_metrics_exporter.py — Production Metrics Exporter for Green Agent
+========================================================================
+
+Exposes Green Agent graph health and helium supply metrics in Prometheus text format.
 Works with any Prometheus scrape configuration; no database dependency.
 Includes a static Grafana dashboard JSON template (Layer 11).
 
-Changes in this version:
-- ✅ Fixed metric type: green_agent_execution_graphs_active (gauge) instead of _total
-- ✅ Added max_edges_export config to prevent cardinality explosion
-- ✅ Added error handling in HTTP handler
-- ✅ Removed unused ts variable
-- ✅ Added thread-safety documentation
+File Location: src/monitoring/graph_metrics_exporter.py
 
-Two modes
-----------
+Two modes:
 1. HTTP server mode (production):
        exporter = GraphMetricsExporter(registry)
        exporter.start_http_server(port=8000)
@@ -23,15 +18,15 @@ Two modes
        text = exporter.render()      # returns Prometheus text format
        dashboard = exporter.grafana_dashboard()  # returns JSON string
 
-Grafana dashboard
------------------
+Grafana dashboard:
     exporter.save_dashboard("./grafana_dashboard.json")
-Import that file into Grafana via Dashboards → Import → Upload JSON file.
+Import via Grafana UI: Dashboards → Import → Upload JSON file.
+
 Pre-configured panels:
   • Graph node/edge counts (causal, policy)
   • Anomaly rate over time
-  • Execution count
-  • Learned edge weight heatmap data
+  • Helium scarcity level and price
+  • Causal/policy edge weight heatmaps
 """
 
 import http.server
@@ -41,13 +36,20 @@ import time
 import sys
 import os
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.graph_registry import GraphRegistry, GraphType
-from core.causal_graph import CausalGraph, Edge
-from core.policy_graph import PolicyGraph
+
+# Type checking imports to avoid circular dependencies
+if TYPE_CHECKING:
+    from core.graph_registry import GraphRegistry, GraphType
+    from core.causal_graph import CausalGraph, Edge
+    from core.policy_graph import PolicyGraph
+    from carbon.helium_monitor import HeliumMonitor
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +60,12 @@ class GraphMetricsExporter:
     """
     Collects metrics from GraphRegistry and renders Prometheus text format.
     
+    Supports:
+    - Graph metrics (nodes, edges, anomalies)
+    - Causal graph edge weights and confidence
+    - Policy graph edge weights
+    - Helium supply chain metrics (if HeliumMonitor configured)
+    
     Thread Safety:
     - This class assumes GraphRegistry and graph objects are immutable after
       registration, or that read operations are thread-safe.
@@ -66,15 +74,29 @@ class GraphMetricsExporter:
 
     def __init__(
         self, 
-        registry: GraphRegistry, 
+        registry: 'GraphRegistry', 
         job_name: str = "green_agent",
-        max_edges_export: int = 100  # ✅ NEW: Prevent cardinality explosion
+        max_edges_export: int = 100,
+        helium_monitor: Optional['HeliumMonitor'] = None
     ):
+        """
+        Initialize metrics exporter
+        
+        Args:
+            registry: GraphRegistry instance for accessing graph data
+            job_name: Prometheus job label for this exporter
+            max_edges_export: Max edges to export per graph type (prevent cardinality explosion)
+            helium_monitor: Optional HeliumMonitor instance for helium metrics
+        """
         self.registry = registry
         self.job_name = job_name
-        self.max_edges_export = max_edges_export  # ✅ NEW: Configurable limit
+        self.max_edges_export = max_edges_export
+        self.helium_monitor = helium_monitor  # Optional helium metrics source
+        
         self._server: Optional[http.server.HTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
+        
+        logger.info(f"GraphMetricsExporter initialized (job={job_name}, max_edges={max_edges_export})")
 
     # ------------------------------------------------------------------
     # Metric collection
@@ -82,7 +104,8 @@ class GraphMetricsExporter:
 
     def collect(self) -> Dict[str, tuple]:
         """
-        Gather all graph metrics into a flat dict.
+        Gather all graph and helium metrics into a flat dict.
+        
         Keys are Prometheus metric names; values are (value, labels) tuples.
         
         Returns:
@@ -91,12 +114,12 @@ class GraphMetricsExporter:
         health = self.registry.health()
         metrics: Dict[str, tuple] = {}
 
-        # ✅ FIX 1: Use _active suffix for gauge (not _total which implies counter)
-        # Execution count: number of graphs currently being executed (can go up/down)
+        # Execution metric: active execution graphs (gauge, not counter)
         metrics["green_agent_execution_graphs_active"] = (
             health.get("execution_count", 0), {}
         )
 
+        # Graph-level metrics (nodes, edges, anomalies) by graph type
         for gtype_str, info in health.get("singletons", {}).items():
             labels = {"graph_type": gtype_str}
 
@@ -113,14 +136,13 @@ class GraphMetricsExporter:
                     info["anomaly_count"], labels
                 )
             if "ideal_path_count" in info:
-                # This is a cumulative count → use _total suffix with counter type
+                # Cumulative count → use _total suffix with counter type
                 metrics["green_agent_ideal_paths_total"] = (
                     info["ideal_path_count"], {}
                 )
 
-        # ✅ FIX 2: Limit edge exports to prevent cardinality explosion
-        # Causal graph edge weights
-        causal: Optional[CausalGraph] = self.registry.get(GraphType.CAUSAL)
+        # Causal graph edge weights (limited by max_edges_export to control cardinality)
+        causal: Optional['CausalGraph'] = self.registry.get(GraphType.CAUSAL)
         if causal:
             # Sort by weight descending, take top-K to limit cardinality
             sorted_edges = sorted(
@@ -142,12 +164,10 @@ class GraphMetricsExporter:
                     round(edge.confidence, 4), edge_labels
                 )
 
-        # Policy graph edge weights
-        policy: Optional[PolicyGraph] = self.registry.get(GraphType.POLICY)
+        # Policy graph edge weights (limited by max_edges_export)
+        policy: Optional['PolicyGraph'] = self.registry.get(GraphType.POLICY)
         if policy:
-            # Use export_weights() abstraction from policy graph
             all_edges = policy.export_weights()
-            # Limit to top-K by weight to control cardinality
             sorted_edges = sorted(
                 all_edges, 
                 key=lambda e: e.get("weight", 0), 
@@ -164,6 +184,76 @@ class GraphMetricsExporter:
                     edge_dict["weight"], plabels
                 )
 
+        # ✅ NEW: Helium supply chain metrics (if monitor configured)
+        helium_metrics = self._collect_helium_metrics()
+        metrics.update(helium_metrics)
+
+        return metrics
+
+    def _collect_helium_metrics(self) -> Dict[str, tuple]:
+        """
+        Collect helium-specific metrics for Prometheus exposition
+        
+        Returns:
+            Dict mapping metric names to (value, labels) tuples
+        """
+        metrics = {}
+        
+        if self.helium_monitor is None:
+            return metrics  # No helium monitor configured
+        
+        # Get current helium signal
+        signal = self.helium_monitor.get_current_supply()
+        if signal is None:
+            return metrics  # No signal available yet
+        
+        # Map scarcity level enum to numeric gauge (0=NORMAL, 1=CAUTION, 2=CRITICAL, 3=SEVERE)
+        from carbon.helium_monitor import HeliumScarcityLevel
+        scarcity_numeric = {
+            HeliumScarcityLevel.NORMAL: 0,
+            HeliumScarcityLevel.CAUTION: 1,
+            HeliumScarcityLevel.CRITICAL: 2,
+            HeliumScarcityLevel.SEVERE: 3,
+        }
+        
+        # Scarcity level gauge
+        metrics["green_agent_helium_scarcity_level"] = (
+            scarcity_numeric[signal.scarcity_level],
+            {"source": signal.source, "job": self.job_name}
+        )
+        
+        # Scarcity score (0.0 to 1.0)
+        metrics["green_agent_helium_scarcity_score"] = (
+            signal.scarcity_score,
+            {"source": signal.source, "job": self.job_name}
+        )
+        
+        # Spot price in USD per liter
+        metrics["green_agent_helium_spot_price_usd"] = (
+            signal.spot_price_usd_per_liter,
+            {"job": self.job_name}
+        )
+        
+        # Fabrication facility inventory days
+        metrics["green_agent_helium_fab_inventory_days"] = (
+            signal.fab_inventory_days,
+            {"job": self.job_name}
+        )
+        
+        # Count of active vendor alerts
+        metrics["green_agent_helium_vendor_alerts_count"] = (
+            len(signal.vendor_alerts),
+            {"job": self.job_name}
+        )
+        
+        # Price premium over baseline ($4.0/L)
+        baseline_price = 4.0
+        premium = max(0.0, signal.spot_price_usd_per_liter - baseline_price)
+        metrics["green_agent_helium_price_premium_usd"] = (
+            premium,
+            {"job": self.job_name}
+        )
+        
         return metrics
 
     # ------------------------------------------------------------------
@@ -173,27 +263,32 @@ class GraphMetricsExporter:
     def render(self) -> str:
         """
         Render all metrics in Prometheus exposition format.
+        
         Each distinct metric name gets one # HELP and one # TYPE line.
+        Metric type is inferred from name convention:
+        - *_total → counter
+        - others → gauge
         
         Returns:
-            str: Prometheus text format metrics
+            str: Prometheus text format metrics string
         """
         metrics = self.collect()
         lines: List[str] = []
         seen_names: set[str] = set()
 
         for name, (value, labels) in metrics.items():
-            # Deduplicate HELP/TYPE headers
+            # Deduplicate HELP/TYPE headers per unique metric base name
             base = name.split("{")[0]
             if base not in seen_names:
                 lines.append(f"# HELP {base} Green Agent graph metric")
-                # ✅ FIX 1: Use correct metric type based on name convention
+                # Infer metric type from naming convention
                 if name.endswith("_total"):
                     lines.append(f"# TYPE {base} counter")
                 else:
                     lines.append(f"# TYPE {base} gauge")
                 seen_names.add(base)
 
+            # Format labels as {key="value", ...}
             if labels:
                 label_str = ",".join(
                     f'{k}="{v}"' for k, v in sorted(labels.items())
@@ -212,13 +307,18 @@ class GraphMetricsExporter:
     def start_http_server(self, port: int = 8000, host: str = "0.0.0.0"):
         """
         Start a lightweight HTTP server that serves /metrics on demand.
+        
         Runs in a daemon thread — stops automatically when the process exits.
+        
+        Args:
+            port: Port to listen on (default: 8000)
+            host: Host to bind to (default: 0.0.0.0)
         """
         exporter = self
 
         class MetricsHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                try:  # ✅ FIX 3: Error handling to prevent server crash
+                try:  # ✅ Error handling to prevent server crash
                     if self.path == "/metrics":
                         body = exporter.render().encode()
                         self.send_response(200)
@@ -267,22 +367,26 @@ class GraphMetricsExporter:
     def grafana_dashboard(self) -> str:
         """
         Returns a Grafana dashboard JSON string.
-        Import via Dashboards → Import → Upload JSON file.
-
+        
+        Import via Grafana UI: Dashboards → Import → Upload JSON file.
+        
         Pre-configured panels:
           Row 1: Graph node counts (causal, policy)
-          Row 2: Active anomaly count  |  Ideal paths registered
-          Row 3: Causal edge weight heatmap
-          Row 4: Policy edge weight time series
+          Row 2: Active anomaly count | Ideal paths registered
+          Row 3: Helium scarcity level | Spot price
+          Row 4: Causal edge weight heatmap
+          Row 5: Policy edge weight time series
+          Row 6: Execution graphs active
         """
         dashboard = {
-            "title": "Green Agent — Graph Health",
-            "uid": "green_agent_graphs",
-            "tags": ["green-agent", "graphs", "sustainability"],
+            "title": "Green Agent — Graph & Helium Health",
+            "uid": "green_agent_graphs_helium",
+            "tags": ["green-agent", "graphs", "sustainability", "helium"],
             "refresh": "10s",
             "time": {"from": "now-1h", "to": "now"},
             "templating": {"list": []},
             "panels": [
+                # Row 1: Graph node counts
                 self._panel_stat(
                     id=1, title="Causal graph nodes",
                     expr='green_agent_graph_nodes{graph_type="causal"}',
@@ -293,6 +397,7 @@ class GraphMetricsExporter:
                     expr='green_agent_graph_nodes{graph_type="policy"}',
                     gridPos={"x": 6, "y": 0, "w": 6, "h": 4},
                 ),
+                # Row 2: Anomalies and ideal paths
                 self._panel_stat(
                     id=3, title="Active anomalies",
                     expr='green_agent_anomalies_active{graph_type="causal"}',
@@ -304,26 +409,73 @@ class GraphMetricsExporter:
                     expr="green_agent_ideal_paths_total",
                     gridPos={"x": 18, "y": 0, "w": 6, "h": 4},
                 ),
+                # Row 3: Helium metrics
+                self._panel_stat(
+                    id=5, title="Helium scarcity level",
+                    expr='green_agent_helium_scarcity_level',
+                    color="orange",
+                    thresholds=[
+                        {"color": "green", "value": None},
+                        {"color": "yellow", "value": 1},
+                        {"color": "red", "value": 2},
+                        {"color": "dark-red", "value": 3},
+                    ],
+                    gridPos={"x": 0, "y": 4, "w": 6, "h": 4},
+                ),
+                self._panel_stat(
+                    id=6, title="Helium spot price ($/L)",
+                    expr="green_agent_helium_spot_price_usd",
+                    color="blue",
+                    gridPos={"x": 6, "y": 4, "w": 6, "h": 4},
+                ),
+                self._panel_stat(
+                    id=7, title="Fab inventory (days)",
+                    expr="green_agent_helium_fab_inventory_days",
+                    color="green",
+                    thresholds=[
+                        {"color": "red", "value": None},
+                        {"color": "yellow", "value": 10},
+                        {"color": "green", "value": 20},
+                    ],
+                    gridPos={"x": 12, "y": 4, "w": 6, "h": 4},
+                ),
+                self._panel_stat(
+                    id=8, title="Price premium ($/L)",
+                    expr="green_agent_helium_price_premium_usd",
+                    color="purple",
+                    gridPos={"x": 18, "y": 4, "w": 6, "h": 4},
+                ),
+                # Row 4: Causal edge weights
                 self._panel_timeseries(
-                    id=5,
+                    id=9,
                     title="Causal edge weights (top edges)",
                     expr=f'topk({self.max_edges_export}, green_agent_causal_edge_weight)',
                     legend="{{source}} → {{target}}",
-                    gridPos={"x": 0, "y": 4, "w": 24, "h": 8},
+                    gridPos={"x": 0, "y": 8, "w": 24, "h": 8},
                 ),
+                # Row 5: Policy edge weights
                 self._panel_timeseries(
-                    id=6,
+                    id=10,
                     title="Policy edge weights",
                     expr="green_agent_policy_edge_weight",
-                    legend="{{source}} → {{target}}",
-                    gridPos={"x": 0, "y": 12, "w": 24, "h": 8},
+                    legend="{{source}} → {{target}} ({{context_tag}})",
+                    gridPos={"x": 0, "y": 16, "w": 24, "h": 8},
                 ),
+                # Row 6: Execution graphs
                 self._panel_timeseries(
-                    id=7,
+                    id=11,
                     title="Active execution graphs",
                     expr="green_agent_execution_graphs_active",
                     legend="active_executions",
-                    gridPos={"x": 0, "y": 20, "w": 12, "h": 6},
+                    gridPos={"x": 0, "y": 24, "w": 12, "h": 6},
+                ),
+                # Row 6: Helium scarcity trend
+                self._panel_timeseries(
+                    id=12,
+                    title="Helium scarcity score trend",
+                    expr="green_agent_helium_scarcity_score",
+                    legend="scarcity_score",
+                    gridPos={"x": 12, "y": 24, "w": 12, "h": 6},
                 ),
             ],
             "schemaVersion": 36,
@@ -347,21 +499,38 @@ class GraphMetricsExporter:
         title: str, 
         expr: str,
         gridPos: dict, 
-        color: str = "green"
+        color: str = "green",
+        thresholds: Optional[List[Dict]] = None
     ) -> dict:
         """Create a Grafana stat panel."""
+        if thresholds is None:
+            thresholds = [
+                {"color": color, "value": None},
+            ]
+        
         return {
             "id": id, 
             "type": "stat", 
             "title": title,
             "gridPos": gridPos,
-            "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+            "options": {
+                "colorMode": "value",
+                "graphMode": "area",
+                "justifyMode": "auto",
+                "orientation": "auto",
+                "reduceOptions": {
+                    "calcs": ["lastNotNull"],
+                    "fields": "",
+                    "values": False
+                },
+                "textMode": "auto"
+            },
             "fieldConfig": {
                 "defaults": {
                     "color": {"mode": "fixed", "fixedColor": color},
                     "thresholds": {
                         "mode": "absolute",
-                        "steps": [{"color": color, "value": None}],
+                        "steps": thresholds,
                     },
                 }
             },
@@ -424,8 +593,27 @@ if __name__ == "__main__":
         def get(self, graph_type):
             return None  # Return None for demo
     
+    # Create mock helium monitor for demo
+    class MockHeliumMonitor:
+        def get_current_supply(self):
+            from carbon.helium_monitor import HeliumScarcityLevel, HeliumSupplySignal
+            return HeliumSupplySignal(
+                timestamp=datetime.now(),
+                scarcity_level=HeliumScarcityLevel.CAUTION,
+                scarcity_score=0.4,
+                spot_price_usd_per_liter=5.5,
+                fab_inventory_days=20,
+                vendor_alerts=['Test alert'],
+                source='demo'
+            )
+    
     registry = MockRegistry()
-    exporter = GraphMetricsExporter(registry, max_edges_export=50)
+    helium_monitor = MockHeliumMonitor()
+    exporter = GraphMetricsExporter(
+        registry, 
+        max_edges_export=50,
+        helium_monitor=helium_monitor
+    )
     
     # Start HTTP server
     exporter.start_http_server(port=8000)
