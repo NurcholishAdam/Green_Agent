@@ -1,0 +1,32 @@
+# Add this scrape config:
+
+scrape_configs:
+  - job_name: 'green-agent'
+    honor_labels: true
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    scheme: http
+    
+    kubernetes_sd_configs:
+    - role: endpoints
+      namespaces:
+        names:
+        - green-agent-production
+    
+    relabel_configs:
+    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+      action: keep
+      regex: true
+    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
+      action: replace
+      target_label: __metrics_port__
+      regex: (\d+)
+    - source_labels: [__address__, __metrics_port__]
+      action: replace
+      regex: ([^:]+)(?::\d+)?;(\d+)
+      replacement: $1:$2
+      target_label: __address__
+    
+    # ✅ Helium metrics are automatically included via graph_metrics_exporter
+    # No additional config needed - they share the same /metrics endpoint
