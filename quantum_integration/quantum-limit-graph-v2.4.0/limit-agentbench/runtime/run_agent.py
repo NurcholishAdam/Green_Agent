@@ -3,7 +3,7 @@
 Green Agent v5.0.0 - Main Entry Point
 File: runtime/run_agent.py
 """
-
+from carbon.helium_monitor import HeliumMonitor
 import asyncio
 import argparse
 import logging
@@ -90,6 +90,29 @@ async def main():
     finally:
         await agent.shutdown()
 
+
+# Add this import at the top:
+from carbon.helium_monitor import HeliumMonitor
+
+# In the main() function, after initializing other components:
+async def main():
+    # ... existing initialization code ...
+    
+    # Initialize helium monitor (optional)
+    helium_config = config.get('helium', {})
+    helium_monitor = None
+    if helium_config.get('enabled', False):
+        helium_monitor = HeliumMonitor(helium_config)
+        logger.info("HeliumMonitor initialized")
+    
+    # Pass helium_monitor to GraphMetricsExporter
+    from monitoring.graph_metrics_exporter import GraphMetricsExporter
+    exporter = GraphMetricsExporter(
+        registry=registry,
+        helium_monitor=helium_monitor
+    )
+    
+    # ... rest of existing code ...
 
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
