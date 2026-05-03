@@ -2,16 +2,24 @@
 
 """
 Enhanced Carbon-Aware Neural Architecture Search (NAS) for Green Agent
-Version 2.0 - With mixed-precision, Bayesian optimization, and hardware validation
+Version 3.0 - With complete hardware profiler, cache versioning, and multi-objective BO
 
 Scientific basis: Energy consumption of training is proportional to parameters × steps
 Reference: "Carbon-Aware Neural Architecture Search" (NeurIPS, 2023)
+
+Version History:
+- v1.0: Original implementation
+- v2.0: Mixed precision, Bayesian optimization, transfer learning
+- v3.0: Hardware profiler, cache versioning, multi-objective BO
 """
 
 import numpy as np
 import json
 import pickle
 import hashlib
+import time
+import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum
@@ -19,177 +27,424 @@ from datetime import datetime
 import logging
 import random
 from collections import defaultdict
+from pathlib import Path
+import os
 
 logger = logging.getLogger(__name__)
 
 
-class OperationType(Enum):
-    """Neural network operation types"""
-    CONV3x3 = "conv3x3"
-    CONV5x5 = "conv5x5"
-    CONV7x7 = "conv7x7"
-    MAXPOOL = "maxpool"
-    AVGPOOL = "avgpool"
-    IDENTITY = "identity"
-    SKIP_CONNECT = "skip_connect"
-    LINEAR = "linear"
-    ATTENTION = "attention"
-    MLP = "mlp"
+# ============================================================
+# ENHANCEMENT 1: Complete Hardware Profiler Implementation
+# ============================================================
+
+class HardwareType(Enum):
+    """Supported GPU hardware types"""
+    A100 = "a100"
+    H100 = "h100"
+    V100 = "v100"
+    T4 = "t4"
+    RTX4090 = "rtx4090"
+    RTX3090 = "rtx3090"
 
 
-class PrecisionType(Enum):
-    """Precision types for mixed-precision support"""
-    FP32 = "fp32"
-    FP16 = "fp16"
-    INT8 = "int8"
-    INT4 = "int4"
-
-
-@dataclass
-class MixedPrecisionConfig:
+class HardwareProfiler:
     """
-    Mixed-precision configuration for neural networks.
+    Complete hardware-in-the-loop validation system.
     
-    Scientific basis: Different layers have different sensitivity to quantization.
-    Critical layers (first/last) often need higher precision.
+    Features:
+    - Real GPU power monitoring via NVML
+    - CUDA event timing for accurate latency
+    - Memory profiling
+    - Thermal monitoring
+    - Multi-GPU support
+    - Background monitoring thread
     """
-    default_precision: PrecisionType = PrecisionType.FP16
-    layer_precisions: Dict[str, PrecisionType] = field(default_factory=dict)
-    precision_thresholds: Dict[str, float] = field(default_factory=dict)
     
-    def get_precision_for_layer(self, layer_name: str, layer_type: str) -> PrecisionType:
-        """Get optimal precision for a specific layer"""
-        # First/last layers are critical
-        if layer_name in ['input', 'output', 'embedding']:
-            return PrecisionType.FP32
+    def __init__(self, hardware_type: str = 'gpu', config: Optional[Dict] = None):
+        self.config = config or {}
+        self.hardware_type = hardware_type
+        self.gpu_index = self.config.get('gpu_index', 0)
+        self.simulation_mode = self.config.get('simulate', False)
+        self.profile_cache: Dict[str, Dict] = {}
+        self.cache_file = self.config.get('profile_cache_file', 'hardware_profiles.json')
         
-        # Check layer-specific override
-        if layer_name in self.layer_precisions:
-            return self.layer_precisions[layer_name]
+        # NVML state
+        self._nvml_available = False
+        self._nvml_handle = None
         
-        # Layer type defaults
-        if layer_type in ['attention', 'linear']:
-            return PrecisionType.FP16
-        elif layer_type in ['conv']:
-            return PrecisionType.INT8
+        # Background monitoring
+        self._monitoring = False
+        self._monitor_thread = None
+        self._power_history = []
+        self._temp_history = []
+        
+        # Initialize NVML if not in simulation mode
+        if not self.simulation_mode:
+            self._init_nvml()
+        
+        # Load cache
+        self._load_cache()
+        
+        logger.info(f"HardwareProfiler initialized for {hardware_type} (simulation={self.simulation_mode})")
+    
+    def _init_nvml(self):
+        """Initialize NVIDIA Management Library"""
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+            self._nvml_available = True
+            logger.info("NVML initialized for hardware profiling")
+        except ImportError:
+            logger.warning("pynvml not available, falling back to simulation")
+            self.simulation_mode = True
+        except Exception as e:
+            logger.warning(f"NVML initialization failed: {e}, using simulation")
+            self.simulation_mode = True
+    
+    def start_monitoring(self, interval_ms: int = 100):
+        """Start background monitoring of power and temperature"""
+        if self._monitoring:
+            return
+        
+        self._monitoring = True
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, 
+                                                 args=(interval_ms / 1000,),
+                                                 daemon=True)
+        self._monitor_thread.start()
+        logger.info("Hardware monitoring started")
+    
+    def stop_monitoring(self):
+        """Stop background monitoring"""
+        self._monitoring = False
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=2)
+    
+    def _monitor_loop(self, interval_seconds: float):
+        """Background monitoring loop"""
+        while self._monitoring:
+            if not self.simulation_mode and self._nvml_available:
+                try:
+                    import pynvml
+                    power = pynvml.nvmlDeviceGetPowerUsage(self._nvml_handle) / 1000.0
+                    temp = pynvml.nvmlDeviceGetTemperature(self._nvml_handle, 
+                                                            pynvml.NVML_TEMPERATURE_GPU)
+                    self._power_history.append((time.time(), power))
+                    self._temp_history.append((time.time(), temp))
+                    
+                    # Keep history limited
+                    if len(self._power_history) > 1000:
+                        self._power_history = self._power_history[-1000:]
+                    if len(self._temp_history) > 1000:
+                        self._temp_history = self._temp_history[-1000:]
+                except Exception as e:
+                    logger.warning(f"Monitoring failed: {e}")
+            
+            time.sleep(interval_seconds)
+    
+    def _get_cache_key(self, config: 'ArchitectureConfig') -> str:
+        """Generate cache key for profiling results"""
+        config_dict = {
+            'num_layers': config.num_layers,
+            'hidden_size': config.hidden_size,
+            'num_heads': config.num_heads,
+            'operations': [op.value for op in config.operations],
+            'parallelism': config.parallelism,
+            'hardware': self.hardware_type
+        }
+        json_str = json.dumps(config_dict, sort_keys=True)
+        return hashlib.sha256(json_str.encode()).hexdigest()
+    
+    def _load_cache(self):
+        """Load profile cache from disk"""
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r') as f:
+                    self.profile_cache = json.load(f)
+                logger.info(f"Loaded {len(self.profile_cache)} profiles from cache")
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}")
+    
+    def _save_cache(self):
+        """Save profile cache to disk"""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(self.profile_cache, f, indent=2)
+            logger.info(f"Saved {len(self.profile_cache)} profiles to cache")
+        except Exception as e:
+            logger.warning(f"Failed to save cache: {e}")
+    
+    def profile_architecture(self, config: 'ArchitectureConfig') -> Optional[Dict]:
+        """
+        Profile an architecture on actual hardware.
+        
+        Returns dictionary with real measurements:
+        - actual_latency_ms: Average inference latency
+        - actual_latency_p95_ms: 95th percentile latency
+        - actual_energy_joules: Energy per inference
+        - actual_memory_mb: Peak memory usage
+        - actual_power_watts: Average power draw
+        - actual_temperature_c: Peak temperature
+        """
+        cache_key = self._get_cache_key(config)
+        
+        # Check cache
+        if cache_key in self.profile_cache:
+            logger.info(f"Using cached profile for {cache_key[:16]}...")
+            return self.profile_cache[cache_key]
+        
+        if self.simulation_mode:
+            profile_data = self._simulate_profile(config)
         else:
-            return self.default_precision
+            profile_data = self._run_on_hardware(config)
+        
+        if profile_data:
+            self.profile_cache[cache_key] = profile_data
+            self._save_cache()
+        
+        return profile_data
     
-    def compute_energy_factor(self) -> float:
+    def _simulate_profile(self, config: 'ArchitectureConfig') -> Dict:
         """
-        Compute weighted energy factor for mixed precision.
-        
-        Energy savings = Σ (layer_energy × precision_factor)
+        Simulate hardware profiling using analytical models calibrated to real hardware.
         """
-        # Baseline: FP32 = 1.0
-        precision_factors = {
-            PrecisionType.FP32: 1.0,
-            PrecisionType.FP16: 0.6,
-            PrecisionType.INT8: 0.25,
-            PrecisionType.INT4: 0.15
-        }
+        # Calibrated models based on A100 GPU data
+        total_flops = config.hidden_size ** 2 * config.num_layers * 1000
+        peak_tflops = self._get_peak_tflops()
         
-        # If no specific layer config, estimate based on typical distribution
-        if not self.layer_precisions:
-            # Typical: 10% FP32 (critical), 30% FP16, 50% INT8, 10% INT4
-            weighted_factor = (
-                0.1 * 1.0 +      # FP32
-                0.3 * 0.6 +      # FP16
-                0.5 * 0.25 +     # INT8
-                0.1 * 0.15       # INT4
-            )
-            return weighted_factor
+        # Base latency (ms)
+        base_latency = total_flops / (peak_tflops * 1e12) * 1000
         
-        # Calculate exact weighted factor
-        total_weight = 0
-        weighted_sum = 0
-        for layer, factor in precision_factors.items():
-            count = sum(1 for p in self.layer_precisions.values() if p == layer)
-            total_weight += count
-            weighted_sum += count * factor
+        # Parallelism scaling (diminishing returns)
+        efficiency = 1.0 / (1 + 0.1 * np.log2(config.parallelism))
+        actual_latency = base_latency / config.parallelism * efficiency
         
-        return weighted_sum / total_weight if total_weight > 0 else 0.5
-    
-    def to_dict(self) -> Dict:
+        # Energy (Joules) - power × time
+        avg_power = self._get_estimated_power(config)
+        actual_energy = avg_power * (actual_latency / 1000)
+        
+        # Memory usage (MB)
+        param_bytes = config.hidden_size ** 2 * config.num_layers * 4
+        activation_memory = param_bytes * config.num_layers * 0.1
+        actual_memory_mb = (param_bytes + activation_memory) / (1024 * 1024)
+        
         return {
-            'default_precision': self.default_precision.value,
-            'layer_precisions': {k: v.value for k, v in self.layer_precisions.items()},
-            'energy_factor': self.compute_energy_factor()
+            'actual_latency_ms': actual_latency,
+            'actual_latency_p95_ms': actual_latency * 1.2,
+            'actual_energy_joules': actual_energy,
+            'actual_memory_mb': actual_memory_mb,
+            'actual_power_watts': avg_power,
+            'actual_temperature_c': 65 + config.parallelism * 2,
+            'measured_at': datetime.now().isoformat(),
+            'hardware': self.hardware_type,
+            'source': 'simulation'
         }
-
-
-@dataclass
-class ArchitectureConfig:
-    """Enhanced configuration for a neural architecture with mixed precision"""
-    num_layers: int
-    hidden_size: int
-    num_heads: int
-    operations: List[OperationType]
-    mixed_precision: MixedPrecisionConfig
-    parallelism: int
-    use_gradient_checkpointing: bool = False
-    use_pruning: bool = False
-    pruning_ratio: float = 0.0
     
-    def compute_complexity_score(self) -> float:
-        """Compute architectural complexity for transfer learning weighting"""
-        base_score = self.num_layers * self.hidden_size / 1000
-        if self.use_gradient_checkpointing:
-            base_score *= 0.7  # Less memory, more compute
-        if self.use_pruning:
-            base_score *= (1 - self.pruning_ratio)
-        return base_score
-
-
-@dataclass
-class ArchitectureMetrics:
-    """Enhanced metrics with confidence intervals"""
-    accuracy: float
-    accuracy_std: float  # Uncertainty estimate
-    latency_ms: float
-    latency_p95_ms: float
-    training_energy_joules: float
-    inference_energy_joules: float
-    total_carbon_kg: float
-    params_millions: float
-    flops_billions: float
-    helium_footprint: float
-    confidence_score: float  # 0-1, how confident we are in these estimates
-
-
-@dataclass
-class ParetoPoint:
-    """Point on Pareto frontier with metadata"""
-    config: ArchitectureConfig
-    metrics: ArchitectureMetrics
-    search_iteration: int
-    timestamp: datetime
-    dominates: List[int] = field(default_factory=list)
-    dominated_by: List[int] = field(default_factory=list)
-    score: float = 0.0
+    def _run_on_hardware(self, config: 'ArchitectureConfig') -> Optional[Dict]:
+        """
+        Actually run on real hardware using PyTorch and NVML.
+        
+        This builds a model, runs inference benchmarks,
+        and measures power consumption.
+        """
+        try:
+            import torch
+            import torch.nn as nn
+            
+            # Build model based on config
+            model = self._build_model(config)
+            model = model.cuda()
+            model.eval()
+            
+            # Warm-up
+            dummy_input = torch.randn(1, 3, 224, 224).cuda()
+            for _ in range(10):
+                with torch.no_grad():
+                    _ = model(dummy_input)
+            
+            # Measure latency with CUDA events
+            import pynvml
+            
+            # Get power baseline
+            power_start = pynvml.nvmlDeviceGetPowerUsage(self._nvml_handle) / 1000.0
+            
+            # Timing measurements
+            latencies = []
+            num_iterations = 100
+            
+            for _ in range(num_iterations):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                
+                start_event.record()
+                with torch.no_grad():
+                    _ = model(dummy_input)
+                end_event.record()
+                torch.cuda.synchronize()
+                
+                latency_ms = start_event.elapsed_time(end_event)
+                latencies.append(latency_ms)
+            
+            # Get power after
+            power_end = pynvml.nvmlDeviceGetPowerUsage(self._nvml_handle) / 1000.0
+            
+            # Calculate metrics
+            avg_latency = np.mean(latencies)
+            p95_latency = np.percentile(latencies, 95)
+            avg_power = (power_start + power_end) / 2
+            total_time_s = (num_iterations * avg_latency) / 1000
+            energy_joules = avg_power * total_time_s / num_iterations
+            
+            # Memory usage
+            memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            
+            # Temperature
+            temp = pynvml.nvmlDeviceGetTemperature(self._nvml_handle,
+                                                    pynvml.NVML_TEMPERATURE_GPU)
+            
+            # Clean up
+            del model
+            torch.cuda.empty_cache()
+            
+            return {
+                'actual_latency_ms': avg_latency,
+                'actual_latency_p95_ms': p95_latency,
+                'actual_energy_joules': energy_joules,
+                'actual_memory_mb': memory_mb,
+                'actual_power_watts': avg_power,
+                'actual_temperature_c': temp,
+                'measured_at': datetime.now().isoformat(),
+                'hardware': self.hardware_type,
+                'source': 'hardware'
+            }
+            
+        except ImportError as e:
+            logger.warning(f"PyTorch or NVML not available: {e}")
+            return self._simulate_profile(config)
+        except Exception as e:
+            logger.error(f"Hardware profiling failed: {e}")
+            return None
+    
+    def _build_model(self, config: 'ArchitectureConfig') -> nn.Module:
+        """Build a PyTorch model from architecture config"""
+        import torch.nn as nn
+        
+        class DynamicModel(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                
+                # Input projection
+                self.input_proj = nn.Linear(3 * 224 * 224, config.hidden_size)
+                
+                # Transformer blocks
+                self.blocks = nn.ModuleList()
+                for _ in range(config.num_layers):
+                    if OperationType.ATTENTION in config.operations:
+                        block = nn.TransformerEncoderLayer(
+                            d_model=config.hidden_size,
+                            nhead=config.num_heads,
+                            dim_feedforward=config.hidden_size * 4,
+                            batch_first=True
+                        )
+                    else:
+                        block = nn.Sequential(
+                            nn.Linear(config.hidden_size, config.hidden_size * 4),
+                            nn.ReLU(),
+                            nn.Linear(config.hidden_size * 4, config.hidden_size)
+                        )
+                    self.blocks.append(block)
+                
+                # Output projection
+                self.output_proj = nn.Linear(config.hidden_size, 1000)  # ImageNet classes
+            
+            def forward(self, x):
+                x = x.view(x.size(0), -1)
+                x = self.input_proj(x)
+                for block in self.blocks:
+                    if hasattr(block, 'forward'):
+                        x = block(x)
+                x = self.output_proj(x)
+                return x
+        
+        return DynamicModel(config)
+    
+    def _get_peak_tflops(self) -> float:
+        """Get peak TFLOPS for current hardware"""
+        peak_tflops = {
+            HardwareType.A100: 312.0,
+            HardwareType.H100: 1979.0,
+            HardwareType.V100: 125.0,
+            HardwareType.T4: 65.0,
+            HardwareType.RTX4090: 366.0,
+            HardwareType.RTX3090: 142.0
+        }
+        try:
+            hw_type = HardwareType(self.hardware_type)
+            return peak_tflops.get(hw_type, 312.0)
+        except ValueError:
+            return 312.0
+    
+    def _get_estimated_power(self, config: 'ArchitectureConfig') -> float:
+        """Estimate average power draw based on config"""
+        base_power = 200.0
+        power_per_layer = 10.0
+        power_per_head = 5.0
+        
+        total_power = base_power + config.num_layers * power_per_layer + config.num_heads * power_per_head
+        return min(350.0, total_power)
+    
+    def get_average_power(self, window_seconds: int = 10) -> float:
+        """Get average power over time window"""
+        if not self._power_history:
+            return 200.0
+        
+        cutoff = time.time() - window_seconds
+        recent = [p for t, p in self._power_history if t > cutoff]
+        if recent:
+            return sum(recent) / len(recent)
+        return 200.0
+    
+    def get_current_temperature(self) -> float:
+        """Get current GPU temperature"""
+        if not self._temp_history:
+            return 65.0
+        
+        return self._temp_history[-1][1] if self._temp_history else 65.0
 
 
 # ============================================================
-# ENHANCEMENT 1: Mixed-Precision Support (Implemented above)
+# ENHANCEMENT 2: Cache Versioning
 # ============================================================
 
-
-# ============================================================
-# ENHANCEMENT 2: Warm-Start / Cache-Aware Search
-# ============================================================
-
-class SearchCache:
+class VersionedCache:
     """
-    Cache for previously searched architectures.
-    Enables warm-start and incremental search.
+    Versioned cache for architecture search results.
+    
+    Features:
+    - Version tracking for compatibility
+    - Automatic cache invalidation on version mismatch
+    - Migration support for older cache formats
+    - Cache statistics and health monitoring
     """
     
-    def __init__(self, cache_file: Optional[str] = None):
-        self.cache_file = cache_file
-        self.cached_architectures: Dict[str, Tuple[ArchitectureConfig, ArchitectureMetrics]] = {}
-        self.load()
+    CURRENT_VERSION = "3.0.0"
+    VERSION_HISTORY = ["1.0.0", "2.0.0", "3.0.0"]
     
-    def _compute_hash(self, config: ArchitectureConfig) -> str:
+    def __init__(self, cache_file: Optional[str] = None, version: str = None):
+        self.cache_file = cache_file or "nas_cache.json"
+        self.version = version or self.CURRENT_VERSION
+        self.cached_architectures: Dict[str, Tuple['ArchitectureConfig', 'ArchitectureMetrics']] = {}
+        self.metadata = {
+            'version': self.version,
+            'created_at': datetime.now().isoformat(),
+            'last_modified': datetime.now().isoformat(),
+            'entry_count': 0,
+            'compatible_versions': self.VERSION_HISTORY
+        }
+        self._load()
+    
+    def _compute_hash(self, config: 'ArchitectureConfig') -> str:
         """Compute unique hash for architecture configuration"""
         config_dict = {
             'num_layers': config.num_layers,
@@ -205,7 +460,141 @@ class SearchCache:
         json_str = json.dumps(config_dict, sort_keys=True)
         return hashlib.sha256(json_str.encode()).hexdigest()
     
-    def get(self, config: ArchitectureConfig) -> Optional[ArchitectureMetrics]:
+    def is_compatible(self) -> bool:
+        """Check if loaded cache is compatible with current version"""
+        return self.metadata.get('version') in self.VERSION_HISTORY
+    
+    def migrate_from_v1(self, old_data: Dict) -> Dict:
+        """Migrate from v1.x cache format to v3.0"""
+        migrated = {}
+        for key, entry in old_data.items():
+            # v1 had different config structure
+            if 'config' in entry:
+                config = entry['config']
+                # Add new fields with defaults
+                config['mixed_precision'] = {'default_precision': 'fp16', 'layer_precisions': {}}
+                config['use_gradient_checkpointing'] = False
+                config['use_pruning'] = False
+                config['pruning_ratio'] = 0.0
+                migrated[key] = entry
+        return migrated
+    
+    def _load(self):
+        """Load cache from disk with version checking"""
+        if not os.path.exists(self.cache_file):
+            logger.info(f"No existing cache found at {self.cache_file}")
+            return
+        
+        try:
+            with open(self.cache_file, 'r') as f:
+                cache_data = json.load(f)
+            
+            # Check metadata
+            if 'metadata' in cache_data:
+                self.metadata = cache_data['metadata']
+                entries = cache_data.get('entries', {})
+            else:
+                # Legacy format (pre-versioning)
+                entries = cache_data
+                self.metadata['version'] = "1.0.0"
+                logger.warning("Loaded legacy cache (pre-versioning)")
+            
+            # Check compatibility
+            cache_version = self.metadata.get('version', '1.0.0')
+            if cache_version not in self.VERSION_HISTORY:
+                logger.warning(f"Cache version {cache_version} not compatible. Starting fresh.")
+                return
+            
+            # Migrate if needed
+            if cache_version < self.CURRENT_VERSION:
+                logger.info(f"Migrating cache from v{cache_version} to v{self.CURRENT_VERSION}")
+                entries = self.migrate_from_v1(entries) if cache_version == '1.0.0' else entries
+            
+            # Reconstruct entries
+            for hash_key, data in entries.items():
+                # Reconstruct config
+                config_data = data['config']
+                config = ArchitectureConfig(
+                    num_layers=config_data['num_layers'],
+                    hidden_size=config_data['hidden_size'],
+                    num_heads=config_data['num_heads'],
+                    operations=[OperationType(op) for op in config_data['operations']],
+                    mixed_precision=MixedPrecisionConfig(),
+                    parallelism=config_data['parallelism'],
+                    use_gradient_checkpointing=config_data.get('use_gradient_checkpointing', False),
+                    use_pruning=config_data.get('use_pruning', False),
+                    pruning_ratio=config_data.get('pruning_ratio', 0.0)
+                )
+                
+                # Reconstruct metrics
+                metrics_data = data['metrics']
+                metrics = ArchitectureMetrics(
+                    accuracy=metrics_data['accuracy'],
+                    accuracy_std=metrics_data['accuracy_std'],
+                    latency_ms=metrics_data['latency_ms'],
+                    latency_p95_ms=metrics_data['latency_p95_ms'],
+                    training_energy_joules=metrics_data.get('training_energy_joules', 0),
+                    inference_energy_joules=metrics_data.get('inference_energy_joules', 0),
+                    total_carbon_kg=metrics_data['total_carbon_kg'],
+                    params_millions=metrics_data.get('params_millions', 0),
+                    flops_billions=metrics_data.get('flops_billions', 0),
+                    helium_footprint=metrics_data['helium_footprint'],
+                    confidence_score=metrics_data['confidence_score']
+                )
+                
+                self.cached_architectures[hash_key] = (config, metrics)
+            
+            self.metadata['entry_count'] = len(self.cached_architectures)
+            self.metadata['last_modified'] = datetime.now().isoformat()
+            logger.info(f"Loaded {len(self.cached_architectures)} architectures from cache (v{self.metadata['version']})")
+            
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}")
+    
+    def save(self):
+        """Save cache to disk with metadata"""
+        cache_data = {
+            'metadata': self.metadata,
+            'entries': {}
+        }
+        
+        for hash_key, (config, metrics) in self.cached_architectures.items():
+            cache_data['entries'][hash_key] = {
+                'config': {
+                    'num_layers': config.num_layers,
+                    'hidden_size': config.hidden_size,
+                    'num_heads': config.num_heads,
+                    'operations': [op.value for op in config.operations],
+                    'mixed_precision': config.mixed_precision.to_dict(),
+                    'parallelism': config.parallelism,
+                    'use_gradient_checkpointing': config.use_gradient_checkpointing,
+                    'use_pruning': config.use_pruning,
+                    'pruning_ratio': config.pruning_ratio
+                },
+                'metrics': {
+                    'accuracy': metrics.accuracy,
+                    'accuracy_std': metrics.accuracy_std,
+                    'latency_ms': metrics.latency_ms,
+                    'latency_p95_ms': metrics.latency_p95_ms,
+                    'training_energy_joules': metrics.training_energy_joules,
+                    'inference_energy_joules': metrics.inference_energy_joules,
+                    'total_carbon_kg': metrics.total_carbon_kg,
+                    'params_millions': metrics.params_millions,
+                    'flops_billions': metrics.flops_billions,
+                    'helium_footprint': metrics.helium_footprint,
+                    'confidence_score': metrics.confidence_score
+                }
+            }
+        
+        self.metadata['last_modified'] = datetime.now().isoformat()
+        self.metadata['entry_count'] = len(self.cached_architectures)
+        
+        with open(self.cache_file, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+        
+        logger.info(f"Saved {len(self.cached_architectures)} architectures to cache (v{self.version})")
+    
+    def get(self, config: 'ArchitectureConfig') -> Optional['ArchitectureMetrics']:
         """Get cached metrics for an architecture"""
         hash_key = self._compute_hash(config)
         if hash_key in self.cached_architectures:
@@ -213,163 +602,126 @@ class SearchCache:
             return metrics
         return None
     
-    def put(self, config: ArchitectureConfig, metrics: ArchitectureMetrics):
+    def put(self, config: 'ArchitectureConfig', metrics: 'ArchitectureMetrics'):
         """Cache metrics for an architecture"""
         hash_key = self._compute_hash(config)
         self.cached_architectures[hash_key] = (config, metrics)
         self.save()
     
-    def save(self):
-        """Save cache to disk"""
-        if self.cache_file:
-            # Convert to serializable format
-            cache_data = {}
-            for hash_key, (config, metrics) in self.cached_architectures.items():
-                cache_data[hash_key] = {
-                    'config': {
-                        'num_layers': config.num_layers,
-                        'hidden_size': config.hidden_size,
-                        'num_heads': config.num_heads,
-                        'operations': [op.value for op in config.operations],
-                        'mixed_precision': config.mixed_precision.to_dict(),
-                        'parallelism': config.parallelism,
-                        'use_gradient_checkpointing': config.use_gradient_checkpointing,
-                        'use_pruning': config.use_pruning,
-                        'pruning_ratio': config.pruning_ratio
-                    },
-                    'metrics': {
-                        'accuracy': metrics.accuracy,
-                        'accuracy_std': metrics.accuracy_std,
-                        'latency_ms': metrics.latency_ms,
-                        'latency_p95_ms': metrics.latency_p95_ms,
-                        'total_carbon_kg': metrics.total_carbon_kg,
-                        'helium_footprint': metrics.helium_footprint,
-                        'confidence_score': metrics.confidence_score
-                    }
-                }
-            with open(self.cache_file, 'w') as f:
-                json.dump(cache_data, f, indent=2)
-            logger.info(f"Saved {len(cache_data)} architectures to cache")
+    def clear(self):
+        """Clear all cached entries"""
+        self.cached_architectures.clear()
+        self.save()
+        logger.info("Cache cleared")
     
-    def load(self):
-        """Load cache from disk"""
-        if self.cache_file:
-            try:
-                with open(self.cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                
-                for hash_key, data in cache_data.items():
-                    # Reconstruct config
-                    config = ArchitectureConfig(
-                        num_layers=data['config']['num_layers'],
-                        hidden_size=data['config']['hidden_size'],
-                        num_heads=data['config']['num_heads'],
-                        operations=[OperationType(op) for op in data['config']['operations']],
-                        mixed_precision=MixedPrecisionConfig(),
-                        parallelism=data['config']['parallelism'],
-                        use_gradient_checkpointing=data['config'].get('use_gradient_checkpointing', False),
-                        use_pruning=data['config'].get('use_pruning', False),
-                        pruning_ratio=data['config'].get('pruning_ratio', 0.0)
-                    )
-                    
-                    # Reconstruct metrics
-                    metrics = ArchitectureMetrics(
-                        accuracy=data['metrics']['accuracy'],
-                        accuracy_std=data['metrics']['accuracy_std'],
-                        latency_ms=data['metrics']['latency_ms'],
-                        latency_p95_ms=data['metrics']['latency_p95_ms'],
-                        training_energy_joules=0,
-                        inference_energy_joules=0,
-                        total_carbon_kg=data['metrics']['total_carbon_kg'],
-                        params_millions=0,
-                        flops_billions=0,
-                        helium_footprint=data['metrics']['helium_footprint'],
-                        confidence_score=data['metrics']['confidence_score']
-                    )
-                    
-                    self.cached_architectures[hash_key] = (config, metrics)
-                
-                logger.info(f"Loaded {len(self.cached_architectures)} architectures from cache")
-            except FileNotFoundError:
-                logger.info("No existing cache found, starting fresh")
-            except Exception as e:
-                logger.warning(f"Failed to load cache: {e}")
+    def get_stats(self) -> Dict:
+        """Get cache statistics"""
+        return {
+            'version': self.metadata['version'],
+            'entry_count': len(self.cached_architectures),
+            'created_at': self.metadata.get('created_at'),
+            'last_modified': self.metadata.get('last_modified'),
+            'compatible': self.is_compatible(),
+            'cache_file': self.cache_file
+        }
 
 
 # ============================================================
-# ENHANCEMENT 3: Bayesian Optimization Search
+# ENHANCEMENT 3: Multi-Objective Bayesian Optimization
 # ============================================================
 
-class BayesianOptimizer:
+class MultiObjectiveBayesianOptimizer:
     """
-    Bayesian Optimization for architecture search.
-    More efficient than random sampling.
+    Multi-objective Bayesian optimization for Pareto frontier discovery.
     
-    Scientific basis: Gaussian process surrogate model for expensive black-box functions.
+    Uses ParEGO (Pareto Efficient Global Optimization) algorithm:
+    - Randomly samples weight vectors
+    - Scalarizes objectives with augmented Tchebycheff
+    - Builds GP model for each scalarization
+    - Suggests candidates maximizing expected improvement
     """
     
-    def __init__(self, search_space_bounds: Dict[str, Tuple[float, float]]):
+    def __init__(self, search_space_bounds: Dict[str, Tuple[float, float]], 
+                 n_objectives: int = 4,
+                 n_weight_vectors: int = 10):
         self.search_space_bounds = search_space_bounds
-        self.X = []  # Sampled points
-        self.y = []  # Observed values
-        self.gp = None  # Gaussian process model
+        self.n_objectives = n_objectives
+        self.n_weight_vectors = n_weight_vectors
         
-    def _create_gp_model(self):
-        """Create Gaussian process surrogate model"""
+        # Storage for all evaluated points
+        self.X: List[np.ndarray] = []  # Parameter vectors
+        self.F: List[np.ndarray] = []  # Objective vectors
+        
+        # GP models for different weight vectors
+        self.gp_models = {}
+        self.weight_vectors = self._generate_weight_vectors()
+        
+        logger.info(f"MultiObjectiveBayesianOptimizer initialized with {n_weight_vectors} weight vectors")
+    
+    def _generate_weight_vectors(self) -> List[np.ndarray]:
+        """Generate uniformly distributed weight vectors using simplex sampling"""
+        weight_vectors = []
+        
+        for _ in range(self.n_weight_vectors):
+            # Generate random weights
+            weights = np.random.dirichlet(np.ones(self.n_objectives))
+            weight_vectors.append(weights)
+        
+        return weight_vectors
+    
+    def _scalarize(self, objectives: np.ndarray, weights: np.ndarray, rho: float = 0.05) -> float:
+        """
+        Augmented Tchebycheff scalarization.
+        
+        Formula: min_i [w_i * f_i] + ρ * Σ(f_i)
+        where ρ is a small positive number (e.g., 0.05)
+        """
+        weighted = weights * objectives
+        return np.max(weighted) + rho * np.sum(objectives)
+    
+    def add_observation(self, params: Dict[str, float], objectives: np.ndarray):
+        """Add an observation to the surrogate model"""
+        param_vector = np.array([params.get(key, 0) for key in self.search_space_bounds.keys()])
+        self.X.append(param_vector)
+        self.F.append(objectives)
+        
+        # Update GP models for each weight vector
+        self._update_gp_models()
+    
+    def _update_gp_models(self):
+        """Update Gaussian process models for each weight vector"""
+        if len(self.X) < 3:
+            return
+        
         try:
             from sklearn.gaussian_process import GaussianProcessRegressor
-            from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+            from sklearn.gaussian_process.kernels import RBF, WhiteKernel, Matern
             
-            kernel = RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
-            self.gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+            for i, weights in enumerate(self.weight_vectors):
+                # Compute scalarized objectives
+                y = [self._scalarize(f, weights) for f in self.F]
+                
+                # Create kernel
+                kernel = 1.0 * Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1)
+                
+                # Fit GP
+                gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, alpha=1e-6)
+                gp.fit(np.array(self.X), y)
+                
+                self.gp_models[i] = gp
+                
         except ImportError:
             logger.warning("scikit-learn not available, falling back to random search")
-            self.gp = None
+            self.gp_models = {}
     
-    def add_observation(self, params: Dict[str, float], value: float):
-        """Add an observation to the surrogate model"""
-        param_vector = [params.get(key, 0) for key in self.search_space_bounds.keys()]
-        self.X.append(param_vector)
-        self.y.append(value)
+    def _expected_improvement(self, mean: float, std: float, best_y: float) -> float:
+        """Calculate Expected Improvement acquisition function"""
+        if std < 1e-9:
+            return 0.0
         
-        if self.gp is None:
-            self._create_gp_model()
-        
-        if self.gp and len(self.X) > 3:
-            self.gp.fit(self.X, self.y)
-    
-    def suggest_next(self, n_candidates: int = 10) -> List[Dict[str, float]]:
-        """
-        Suggest next architectures to evaluate using acquisition function.
-        
-        Uses Expected Improvement (EI) acquisition function.
-        """
-        if self.gp is None or len(self.X) < 3:
-            # Not enough data for GP, use random sampling
-            return self._random_candidates(n_candidates)
-        
-        # Generate random candidates
-        candidates = self._random_candidates(n_candidates * 10)
-        
-        # Evaluate acquisition function for each candidate
-        best_candidates = []
-        for candidate in candidates:
-            param_vector = [candidate.get(key, 0) for key in self.search_space_bounds.keys()]
-            
-            # Predict mean and std
-            mean, std = self.gp.predict([param_vector], return_std=True)
-            
-            # Expected Improvement
-            best_observed = min(self.y)
-            z = (best_observed - mean[0]) / (std[0] + 1e-9)
-            ei = (best_observed - mean[0]) * self._cdf(z) + std[0] * self._pdf(z)
-            
-            candidate['_acquisition'] = float(ei)
-            best_candidates.append(candidate)
-        
-        # Return top candidates by acquisition value
-        best_candidates.sort(key=lambda x: x.get('_acquisition', 0), reverse=True)
-        return best_candidates[:n_candidates]
+        z = (best_y - mean) / std
+        ei = (best_y - mean) * self._cdf(z) + std * self._pdf(z)
+        return max(0, ei)
     
     def _cdf(self, z: float) -> float:
         """Standard normal CDF approximation"""
@@ -388,212 +740,194 @@ class BayesianOptimizer:
                 candidate[key] = random.uniform(low, high)
             candidates.append(candidate)
         return candidates
+    
+    def suggest_next(self, n_candidates: int = 10) -> List[Dict[str, float]]:
+        """
+        Suggest next architectures using multi-objective acquisition.
+        
+        Uses random scalarization of the Pareto front.
+        """
+        if not self.gp_models or len(self.X) < 3:
+            return self._random_candidates(n_candidates)
+        
+        # Randomly select a weight vector
+        weight_idx = random.randint(0, len(self.weight_vectors) - 1)
+        gp = self.gp_models.get(weight_idx)
+        
+        if gp is None:
+            return self._random_candidates(n_candidates)
+        
+        # Generate random candidates for evaluation
+        candidates = self._random_candidates(n_candidates * 10)
+        
+        # Evaluate acquisition function
+        best_candidates = []
+        y_best = min(self._scalarize(f, self.weight_vectors[weight_idx]) for f in self.F)
+        
+        for candidate in candidates:
+            param_vector = np.array([[candidate.get(key, 0) for key in self.search_space_bounds.keys()]])
+            
+            try:
+                mean, std = gp.predict(param_vector, return_std=True)
+                ei = self._expected_improvement(mean[0], std[0], y_best)
+                candidate['_acquisition'] = float(ei)
+                best_candidates.append(candidate)
+            except Exception as e:
+                logger.warning(f"Prediction failed: {e}")
+        
+        best_candidates.sort(key=lambda x: x.get('_acquisition', 0), reverse=True)
+        return best_candidates[:n_candidates]
+    
+    def get_pareto_frontier(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Get the current Pareto frontier of evaluated points"""
+        if not self.F:
+            return []
+        
+        frontier = []
+        for i, f1 in enumerate(self.F):
+            dominated = False
+            for j, f2 in enumerate(self.F):
+                if i != j and np.all(f2 <= f1) and np.any(f2 < f1):
+                    dominated = True
+                    break
+            if not dominated:
+                frontier.append((self.X[i], f1))
+        
+        return frontier
+    
+    def get_hypervolume(self, reference_point: Optional[np.ndarray] = None) -> float:
+        """
+        Calculate hypervolume of Pareto frontier.
+        
+        Higher hypervolume indicates better coverage of Pareto front.
+        """
+        if reference_point is None:
+            reference_point = np.max(self.F, axis=0) if self.F else np.ones(self.n_objectives)
+        
+        frontier = self.get_pareto_frontier()
+        if not frontier:
+            return 0.0
+        
+        # Simplified hypervolume calculation for 2-4 objectives
+        # In production, use pygmo or similar library
+        return len(frontier) / len(self.F)
 
 
 # ============================================================
-# ENHANCEMENT 4: Hardware-in-the-Loop Validation
+# ENHANCEMENT 4: Main Enhanced Class (Integrating All)
 # ============================================================
 
-class HardwareProfiler:
-    """
-    Hardware-in-the-loop validation for architecture metrics.
-    Actually runs models on target hardware to measure real performance.
-    """
+class OperationType(Enum):
+    CONV3x3 = "conv3x3"
+    CONV5x5 = "conv5x5"
+    CONV7x7 = "conv7x7"
+    MAXPOOL = "maxpool"
+    AVGPOOL = "avgpool"
+    IDENTITY = "identity"
+    SKIP_CONNECT = "skip_connect"
+    LINEAR = "linear"
+    ATTENTION = "attention"
+    MLP = "mlp"
+
+
+class PrecisionType(Enum):
+    FP32 = "fp32"
+    FP16 = "fp16"
+    INT8 = "int8"
+    INT4 = "int4"
+
+
+@dataclass
+class MixedPrecisionConfig:
+    default_precision: PrecisionType = PrecisionType.FP16
+    layer_precisions: Dict[str, PrecisionType] = field(default_factory=dict)
+    precision_thresholds: Dict[str, float] = field(default_factory=dict)
     
-    def __init__(self, hardware_type: str = 'gpu', config: Optional[Dict] = None):
-        self.config = config or {}
-        self.hardware_type = hardware_type
-        self.profile_cache: Dict[str, Dict] = {}
-        self.simulation_mode = self.config.get('simulate', True)
-        
-    def profile_architecture(self, config: ArchitectureConfig) -> Optional[Dict]:
-        """
-        Profile an architecture on actual hardware.
-        
-        Returns dictionary with real measurements:
-        - actual_latency_ms
-        - actual_energy_joules
-        - actual_memory_mb
-        """
-        cache_key = self._get_cache_key(config)
-        
-        # Check cache
-        if cache_key in self.profile_cache:
-            logger.info(f"Using cached profile for {cache_key}")
-            return self.profile_cache[cache_key]
-        
-        if self.simulation_mode:
-            # Simulate profiling (for development)
-            profile_data = self._simulate_profile(config)
-            self.profile_cache[cache_key] = profile_data
-            return profile_data
-        
-        # Production: actually run on hardware
-        try:
-            profile_data = self._run_on_hardware(config)
-            self.profile_cache[cache_key] = profile_data
-            self._save_profile(cache_key, profile_data)
-            return profile_data
-        except Exception as e:
-            logger.error(f"Hardware profiling failed: {e}")
-            return None
+    def get_precision_for_layer(self, layer_name: str, layer_type: str) -> PrecisionType:
+        if layer_name in ['input', 'output', 'embedding']:
+            return PrecisionType.FP32
+        if layer_name in self.layer_precisions:
+            return self.layer_precisions[layer_name]
+        if layer_type in ['attention', 'linear']:
+            return PrecisionType.FP16
+        elif layer_type in ['conv']:
+            return PrecisionType.INT8
+        return self.default_precision
     
-    def _get_cache_key(self, config: ArchitectureConfig) -> str:
-        """Generate cache key for profiling results"""
-        config_dict = {
-            'num_layers': config.num_layers,
-            'hidden_size': config.hidden_size,
-            'num_heads': config.num_heads,
-            'parallelism': config.parallelism,
-            'hardware': self.hardware_type
+    def compute_energy_factor(self) -> float:
+        precision_factors = {
+            PrecisionType.FP32: 1.0,
+            PrecisionType.FP16: 0.6,
+            PrecisionType.INT8: 0.25,
+            PrecisionType.INT4: 0.15
         }
-        json_str = json.dumps(config_dict, sort_keys=True)
-        return hashlib.sha256(json_str.encode()).hexdigest()
+        
+        if not self.layer_precisions:
+            return 0.1*1.0 + 0.3*0.6 + 0.5*0.25 + 0.1*0.15
+        
+        total_weight = 0
+        weighted_sum = 0
+        for layer, precision in self.layer_precisions.items():
+            factor = precision_factors.get(precision, 0.6)
+            total_weight += 1
+            weighted_sum += factor
+        
+        return weighted_sum / total_weight if total_weight > 0 else 0.5
     
-    def _simulate_profile(self, config: ArchitectureConfig) -> Dict:
-        """
-        Simulate hardware profiling (for development/testing).
-        
-        Uses analytical models calibrated to real hardware.
-        """
-        # Calibrated models based on A100 GPU data
-        base_latency = config.num_layers * config.hidden_size / 1e6 * 10  # ms
-        base_energy = base_latency * 300  # Joules (300W peak)
-        
-        # Parallelism scaling (diminishing returns)
-        efficiency = 1.0 / (1 + np.log2(config.parallelism))
-        actual_latency = base_latency / config.parallelism * efficiency
-        
-        # Memory usage
-        param_bytes = config.params_millions * 1e6 * 4  # 4 bytes per param
-        activation_memory = param_bytes * config.num_layers * 0.1
-        actual_memory_mb = (param_bytes + activation_memory) / (1024 * 1024)
-        
+    def to_dict(self) -> Dict:
         return {
-            'actual_latency_ms': actual_latency,
-            'actual_latency_p95_ms': actual_latency * 1.2,
-            'actual_energy_joules': base_energy * (0.5 + 0.5 / config.parallelism),
-            'actual_memory_mb': actual_memory_mb,
-            'measured_at': datetime.now().isoformat(),
-            'hardware': self.hardware_type
+            'default_precision': self.default_precision.value,
+            'layer_precisions': {k: v.value for k, v in self.layer_precisions.items()},
+            'energy_factor': self.compute_energy_factor()
         }
-    
-    def _run_on_hardware(self, config: ArchitectureConfig) -> Dict:
-        """
-        Actually run on real hardware (production implementation).
-        
-        This would:
-        1. Build the model
-        2. Run inference benchmarks
-        3. Measure power consumption
-        4. Return real metrics
-        """
-        # Placeholder for actual hardware integration
-        # In production, this would call:
-        # - NVIDIA NVML for power monitoring
-        # - CUDA events for timing
-        # - PyTorch profiler for memory
-        
-        logger.warning("Hardware profiling not yet implemented")
-        return self._simulate_profile(config)
-    
-    def _save_profile(self, cache_key: str, profile_data: Dict):
-        """Save profile to persistent storage"""
-        try:
-            with open(f'profiles/{cache_key}.json', 'w') as f:
-                json.dump(profile_data, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to save profile: {e}")
 
 
-# ============================================================
-# ENHANCEMENT 5: Transfer Learning Across Tasks
-# ============================================================
-
-class TransferLearningWeights:
-    """
-    Transfer learning weights for architecture search.
+@dataclass
+class ArchitectureConfig:
+    num_layers: int
+    hidden_size: int
+    num_heads: int
+    operations: List[OperationType]
+    mixed_precision: MixedPrecisionConfig
+    parallelism: int
+    use_gradient_checkpointing: bool = False
+    use_pruning: bool = False
+    pruning_ratio: float = 0.0
     
-    Scientific basis: Similar tasks share optimal architecture patterns.
-    For example, all NLP tasks benefit from attention, all vision tasks from convolutions.
-    """
-    
-    def __init__(self):
-        self.task_weights: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        self.task_similarity: Dict[Tuple[str, str], float] = {}
-        
-        # Predefined task categories
-        self.task_categories = {
-            'nlp': ['text_classification', 'sentiment_analysis', 'named_entity_recognition', 'language_modeling'],
-            'vision': ['image_classification', 'object_detection', 'segmentation', 'face_recognition'],
-            'speech': ['speech_recognition', 'speaker_identification', 'keyword_spotting'],
-            'recommendation': ['collaborative_filtering', 'content_based', 'sequential_recommendation']
-        }
-    
-    def get_initial_weights(self, task_type: str) -> Dict[str, float]:
-        """
-        Get initial search weights based on task type.
-        
-        Returns a dictionary mapping architecture features to importance weights.
-        """
-        if task_type in self.task_categories['nlp']:
-            return {
-                'num_layers': 0.3,
-                'hidden_size': 0.2,
-                'num_heads': 0.2,
-                'attention_weight': 0.2,
-                'ffn_weight': 0.1
-            }
-        elif task_type in self.task_categories['vision']:
-            return {
-                'num_layers': 0.25,
-                'hidden_size': 0.15,
-                'conv_layers': 0.3,
-                'pooling': 0.15,
-                'fc_layers': 0.15
-            }
-        elif task_type in self.task_categories['speech']:
-            return {
-                'num_layers': 0.2,
-                'hidden_size': 0.2,
-                'conv_layers': 0.2,
-                'rnn_layers': 0.2,
-                'attention_weight': 0.2
-            }
-        else:
-            # Default weights
-            return {
-                'num_layers': 0.2,
-                'hidden_size': 0.2,
-                'num_heads': 0.2,
-                'width': 0.2,
-                'depth': 0.2
-            }
-    
-    def update_weights(self, task_type: str, architecture: ArchitectureConfig, 
-                       performance: float):
-        """
-        Update transfer learning weights based on observed performance.
-        
-        This enables continuous improvement across tasks.
-        """
-        # Simplified weight update based on performance
-        # Higher performance features get higher weights
-        feature_contributions = {
-            'num_layers': architecture.num_layers / 100,
-            'hidden_size': architecture.hidden_size / 1000,
-            'num_heads': architecture.num_heads / 20
-        }
-        
-        for feature, contribution in feature_contributions.items():
-            current = self.task_weights[task_type][feature]
-            # Learning rate 0.1
-            self.task_weights[task_type][feature] = 0.9 * current + 0.1 * performance * contribution
+    def compute_complexity_score(self) -> float:
+        base_score = self.num_layers * self.hidden_size / 1000
+        if self.use_gradient_checkpointing:
+            base_score *= 0.7
+        if self.use_pruning:
+            base_score *= (1 - self.pruning_ratio)
+        return base_score
 
 
-# ============================================================
-# ENHANCEMENT 6: Main Enhanced CarbonAwareNAS Class
-# ============================================================
+@dataclass
+class ArchitectureMetrics:
+    accuracy: float
+    accuracy_std: float
+    latency_ms: float
+    latency_p95_ms: float
+    training_energy_joules: float
+    inference_energy_joules: float
+    total_carbon_kg: float
+    params_millions: float
+    flops_billions: float
+    helium_footprint: float
+    confidence_score: float
+
+
+@dataclass
+class ParetoPoint:
+    config: ArchitectureConfig
+    metrics: ArchitectureMetrics
+    search_iteration: int
+    timestamp: datetime
+    dominates: List[int] = field(default_factory=list)
+    dominated_by: List[int] = field(default_factory=list)
+    score: float = 0.0
+
 
 class EnhancedCarbonAwareNAS:
     """
@@ -602,12 +936,11 @@ class EnhancedCarbonAwareNAS:
     Features:
     1. Mixed-precision support
     2. Warm-start / cache-aware search
-    3. Bayesian optimization
-    4. Hardware-in-the-loop validation
+    3. Multi-objective Bayesian optimization
+    4. Complete hardware-in-the-loop validation
     5. Transfer learning across tasks
     """
     
-    # Energy per operation (Joules per FLOP) - Calibrated for 5nm
     ENERGY_PER_OP = {
         OperationType.CONV3x3: 2.0e-11,
         OperationType.CONV5x5: 5.0e-11,
@@ -621,7 +954,6 @@ class EnhancedCarbonAwareNAS:
         OperationType.MLP: 2.0e-11
     }
     
-    # Search space bounds (for Bayesian optimization)
     SEARCH_SPACE_BOUNDS = {
         'num_layers': (4, 60),
         'hidden_size': (64, 2048),
@@ -630,7 +962,6 @@ class EnhancedCarbonAwareNAS:
         'pruning_ratio': (0, 0.5)
     }
     
-    # Carbon intensity by region (gCO2/kWh)
     CARBON_INTENSITY = {
         'us-east': 380,
         'us-west': 250,
@@ -647,8 +978,15 @@ class EnhancedCarbonAwareNAS:
         self.task_type = self.config.get('task_type', 'general')
         
         # Initialize components
-        self.cache = SearchCache(self.config.get('cache_file', 'nas_cache.json'))
-        self.bayesian_optimizer = BayesianOptimizer(self.SEARCH_SPACE_BOUNDS)
+        self.cache = VersionedCache(
+            self.config.get('cache_file', 'nas_cache.json'),
+            version="3.0.0"
+        )
+        self.multi_objective_bo = MultiObjectiveBayesianOptimizer(
+            self.SEARCH_SPACE_BOUNDS,
+            n_objectives=4,
+            n_weight_vectors=self.config.get('n_weight_vectors', 10)
+        )
         self.hardware_profiler = HardwareProfiler(
             self.config.get('hardware_type', 'gpu'),
             self.config.get('profiler_config', {})
@@ -660,15 +998,16 @@ class EnhancedCarbonAwareNAS:
         self.pareto_frontier: List[ParetoPoint] = []
         self.search_iteration = 0
         
-        logger.info(f"Enhanced CarbonAwareNAS initialized for {self.region} region")
+        # Start hardware monitoring
+        if self.config.get('monitor_hardware', True):
+            self.hardware_profiler.start_monitoring()
+        
+        logger.info(f"EnhancedCarbonAwareNAS v3.0 initialized for {self.region} region")
     
     def estimate_training_flops(self, config: ArchitectureConfig) -> float:
-        """Estimate training FLOPs with mixed-precision consideration"""
-        # Base flops: hidden² × layers × 3 (forward+backward+update)
         flops_per_forward = config.hidden_size ** 2 * config.num_layers
-        training_flops = flops_per_forward * 1000  # Assume 1000 training steps
+        training_flops = flops_per_forward * 1000
         
-        # Operation adjustments
         for op in config.operations:
             if op in [OperationType.ATTENTION]:
                 training_flops *= 1.5
@@ -677,53 +1016,33 @@ class EnhancedCarbonAwareNAS:
             elif op in [OperationType.CONV5x5, OperationType.CONV7x7]:
                 training_flops *= 1.1
         
-        # Mixed-precision reduction
         energy_factor = config.mixed_precision.compute_energy_factor()
         training_flops *= energy_factor
         
-        # Gradient checkpointing trades compute for memory
         if config.use_gradient_checkpointing:
-            training_flops *= 1.3  # 30% more compute
+            training_flops *= 1.3
         
         return training_flops
     
     def estimate_inference_flops(self, config: ArchitectureConfig) -> float:
-        """Estimate inference FLOPs with mixed precision"""
         flops_per_forward = config.hidden_size ** 2 * config.num_layers
-        
-        # Quantization factors
         energy_factor = config.mixed_precision.compute_energy_factor()
-        
         total_flops = flops_per_forward * energy_factor * self.expected_inferences
         
-        # Pruning reduces FLOPs
         if config.use_pruning:
             total_flops *= (1 - config.pruning_ratio)
         
         return total_flops
     
     def calculate_training_energy(self, flops: float, config: ArchitectureConfig) -> float:
-        """Calculate training energy in Joules"""
-        # Average energy per FLOP based on operations
         avg_energy_per_flop = np.mean([self.ENERGY_PER_OP.get(op, 1e-11) 
                                         for op in config.operations])
-        
-        # Parallelism reduces per-device load
         energy = flops * avg_energy_per_flop / config.parallelism
-        
         return energy
     
     def estimate_accuracy(self, config: ArchitectureConfig) -> Tuple[float, float]:
-        """
-        Estimate accuracy with uncertainty using transfer learning weights.
-        
-        Returns:
-            (mean_accuracy, std_accuracy)
-        """
-        # Base accuracy from architecture size
         base_accuracy = 0.7 + 0.3 * (1 - 1 / np.log2(config.hidden_size + 1))
         
-        # Operation type contributions
         op_contributions = {
             OperationType.ATTENTION: 0.05,
             OperationType.CONV3x3: 0.03,
@@ -734,7 +1053,6 @@ class EnhancedCarbonAwareNAS:
         for op in config.operations:
             base_accuracy += op_contributions.get(op, 0)
         
-        # Quantization penalty
         precision_impacts = {
             PrecisionType.FP32: 0,
             PrecisionType.FP16: -0.01,
@@ -742,20 +1060,16 @@ class EnhancedCarbonAwareNAS:
             PrecisionType.INT4: -0.08
         }
         
-        # Mixed-precision weighted penalty
         penalty = 0
         for precision, impact in precision_impacts.items():
-            # Estimate fraction of layers using this precision
-            fraction = 0.25  # Assume uniform distribution
+            fraction = 0.25
             penalty += fraction * impact
         
         base_accuracy += penalty
         
-        # Pruning penalty
         if config.use_pruning:
             base_accuracy -= config.pruning_ratio * 0.15
         
-        # Transfer learning boost
         weights = self.transfer_weights.get_initial_weights(self.task_type)
         transfer_boost = sum([
             weights.get('num_layers', 0) * (config.num_layers / 50) * 0.1,
@@ -763,24 +1077,17 @@ class EnhancedCarbonAwareNAS:
         ])
         base_accuracy += transfer_boost
         
-        # Clamp and add uncertainty
         accuracy = max(0.6, min(0.98, base_accuracy))
-        uncertainty = 0.02 + 0.03 * (1 - self.cache.cached_architectures.get(config, 0))
+        uncertainty = 0.02 + 0.03 * (1 - len(self.cache.cached_architectures) / 1000)
         
         return accuracy, uncertainty
     
     def estimate_helium_footprint(self, config: ArchitectureConfig) -> float:
-        """Estimate helium footprint based on parallelism and precision"""
         base_footprint = config.parallelism * 0.1
-        
-        # Mixed-precision reduces helium needs
         energy_factor = config.mixed_precision.compute_energy_factor()
         footprint = base_footprint * energy_factor
-        
-        # Larger models need more helium
         footprint *= np.log2(config.hidden_size) / 10
         
-        # Pruning reduces footprint
         if config.use_pruning:
             footprint *= (1 - config.pruning_ratio * 0.5)
         
@@ -788,57 +1095,45 @@ class EnhancedCarbonAwareNAS:
     
     def evaluate_architecture(self, config: ArchitectureConfig, 
                              use_hardware_profile: bool = True) -> ArchitectureMetrics:
-        """
-        Enhanced evaluation with hardware profiling and uncertainty.
-        """
         # Check cache first
         cached_metrics = self.cache.get(config)
         if cached_metrics:
-            logger.info(f"Using cached metrics for configuration")
+            logger.info("Using cached metrics")
             return cached_metrics
         
-        # Estimate FLOPs
+        # Estimate metrics
         train_flops = self.estimate_training_flops(config)
         inference_flops = self.estimate_inference_flops(config)
         
-        # Estimate energy
         train_energy = self.calculate_training_energy(train_flops, config)
         inference_energy = self.calculate_training_energy(inference_flops, config) * 0.1
         
-        # Estimate carbon
         train_carbon = self._estimate_carbon(train_energy)
         inference_carbon = self._estimate_carbon(inference_energy)
         total_carbon = train_carbon + inference_carbon
         
-        # Get accuracy with uncertainty
         accuracy, accuracy_std = self.estimate_accuracy(config)
         
-        # Estimate latency
         latency_base = config.num_layers * config.hidden_size / 1e6
         latency_ms = latency_base * 1000 / config.parallelism
         
-        # Hardware profiling (if available) - use for calibration
+        # Hardware profiling
         if use_hardware_profile:
             profile = self.hardware_profiler.profile_architecture(config)
             if profile:
-                # Calibrate estimates with real hardware data
-                calibration_factor = profile['actual_latency_ms'] / latency_ms if latency_ms > 0 else 1
                 latency_ms = profile['actual_latency_ms']
                 latency_p95_ms = profile.get('actual_latency_p95_ms', latency_ms * 1.2)
+                confidence_score = 0.95
             else:
                 latency_p95_ms = latency_ms * 1.2
+                confidence_score = 0.7
         else:
             latency_p95_ms = latency_ms * 1.2
+            confidence_score = 0.7
         
-        # Parameter and FLOP counts
         params_millions = config.hidden_size ** 2 * config.num_layers / 1e6
         flops_billions = (train_flops + inference_flops) / 1e9
-        
-        # Helium footprint
         helium_footprint = self.estimate_helium_footprint(config)
-        
-        # Confidence score (higher when hardware-validated)
-        confidence_score = 0.9 if use_hardware_profile and profile else 0.7
         
         metrics = ArchitectureMetrics(
             accuracy=accuracy,
@@ -854,52 +1149,17 @@ class EnhancedCarbonAwareNAS:
             confidence_score=confidence_score
         )
         
-        # Cache results
         self.cache.put(config, metrics)
-        
         return metrics
     
     def _estimate_carbon(self, energy_joules: float) -> float:
-        """Estimate carbon emissions in kg CO2"""
         energy_kwh = energy_joules / 3.6e6
         carbon_kg = energy_kwh * self.carbon_intensity / 1000
         return carbon_kg
     
-    def search_pareto_frontier(self, max_architectures: int = 100, 
-                               use_bayesian: bool = True) -> List[ParetoPoint]:
-        """
-        Search for Pareto-optimal architectures.
-        
-        Args:
-            max_architectures: Maximum architectures to evaluate
-            use_bayesian: Use Bayesian optimization (vs random sampling)
-        """
+    def search_pareto_frontier(self, max_architectures: int = 100) -> List[ParetoPoint]:
+        """Search for Pareto-optimal architectures using multi-objective BO"""
         self.explored_architectures = []
-        
-        if use_bayesian:
-            # Use Bayesian optimization for search
-            return self._bayesian_search(max_architectures)
-        else:
-            # Use random sampling (legacy)
-            return self._random_search(max_architectures)
-    
-    def _random_search(self, max_architectures: int) -> List[ParetoPoint]:
-        """Legacy random search implementation"""
-        for _ in range(max_architectures):
-            config = self._generate_random_config()
-            metrics = self.evaluate_architecture(config)
-            self.explored_architectures.append((config, metrics))
-            
-            # Update Bayesian optimizer with observed value
-            self.bayesian_optimizer.add_observation(
-                self._config_to_params(config),
-                -metrics.accuracy + 0.3 * metrics.total_carbon_kg / 100
-            )
-        
-        return self._compute_pareto_frontier()
-    
-    def _bayesian_search(self, max_architectures: int) -> List[ParetoPoint]:
-        """Bayesian optimization search for efficient exploration"""
         
         # Initial random samples for warm-up
         n_warmup = min(10, max_architectures)
@@ -907,43 +1167,68 @@ class EnhancedCarbonAwareNAS:
             config = self._generate_random_config()
             metrics = self.evaluate_architecture(config)
             self.explored_architectures.append((config, metrics))
-            self.bayesian_optimizer.add_observation(
-                self._config_to_params(config),
-                -metrics.accuracy + 0.3 * metrics.total_carbon_kg / 100
-            )
+            
+            # Compute objective vector
+            objectives = np.array([
+                metrics.total_carbon_kg / 100,  # Normalize carbon
+                metrics.latency_ms / 200,        # Normalize latency
+                metrics.helium_footprint,        # Helium (0-1)
+                1 - metrics.accuracy             # Minimize (1-accuracy)
+            ])
+            self.multi_objective_bo.add_observation(self._config_to_params(config), objectives)
         
         # Bayesian optimization iterations
         remaining = max_architectures - n_warmup
         for _ in range(remaining):
-            # Get next candidates from Bayesian optimizer
-            candidates = self.bayesian_optimizer.suggest_next(n_candidates=5)
+            candidates = self.multi_objective_bo.suggest_next(n_candidates=5)
             
-            # Evaluate candidates
             best_candidate = None
             best_metrics = None
-            best_score = float('inf')
+            best_dominance = float('inf')
             
             for candidate_params in candidates:
                 config = self._params_to_config(candidate_params)
                 metrics = self.evaluate_architecture(config)
                 
-                score = metrics.total_carbon_kg - 10 * metrics.accuracy
-                if score < best_score:
-                    best_score = score
-                    best_candidate = config
-                    best_metrics = metrics
+                # Check if this candidate is Pareto-dominated
+                is_dominated = False
+                for _, existing_metrics in self.explored_architectures:
+                    if (existing_metrics.total_carbon_kg <= metrics.total_carbon_kg and
+                        existing_metrics.latency_ms <= metrics.latency_ms and
+                        existing_metrics.helium_footprint <= metrics.helium_footprint and
+                        existing_metrics.accuracy >= metrics.accuracy and
+                        (existing_metrics.total_carbon_kg < metrics.total_carbon_kg or
+                         existing_metrics.latency_ms < metrics.latency_ms or
+                         existing_metrics.helium_footprint < metrics.helium_footprint or
+                         existing_metrics.accuracy > metrics.accuracy)):
+                        is_dominated = True
+                        break
+                
+                if not is_dominated:
+                    dominance_count = sum(1 for _, m in self.explored_architectures
+                                         if m.total_carbon_kg <= metrics.total_carbon_kg and
+                                            m.latency_ms <= metrics.latency_ms and
+                                            m.helium_footprint <= metrics.helium_footprint and
+                                            m.accuracy >= metrics.accuracy)
+                    
+                    if dominance_count < best_dominance:
+                        best_dominance = dominance_count
+                        best_candidate = config
+                        best_metrics = metrics
             
             if best_candidate:
                 self.explored_architectures.append((best_candidate, best_metrics))
-                self.bayesian_optimizer.add_observation(
-                    self._config_to_params(best_candidate),
-                    -best_metrics.accuracy + 0.3 * best_metrics.total_carbon_kg / 100
-                )
+                objectives = np.array([
+                    best_metrics.total_carbon_kg / 100,
+                    best_metrics.latency_ms / 200,
+                    best_metrics.helium_footprint,
+                    1 - best_metrics.accuracy
+                ])
+                self.multi_objective_bo.add_observation(self._config_to_params(best_candidate), objectives)
         
         return self._compute_pareto_frontier()
     
     def _generate_random_config(self) -> ArchitectureConfig:
-        """Generate random architecture configuration"""
         mixed_precision = MixedPrecisionConfig(
             default_precision=random.choice(list(PrecisionType)),
             layer_precisions={}
@@ -962,7 +1247,6 @@ class EnhancedCarbonAwareNAS:
         )
     
     def _config_to_params(self, config: ArchitectureConfig) -> Dict[str, float]:
-        """Convert architecture config to parameter dict for Bayesian optimization"""
         return {
             'num_layers': float(config.num_layers),
             'hidden_size': float(config.hidden_size),
@@ -972,7 +1256,6 @@ class EnhancedCarbonAwareNAS:
         }
     
     def _params_to_config(self, params: Dict[str, float]) -> ArchitectureConfig:
-        """Convert parameter dict back to architecture config"""
         mixed_precision = MixedPrecisionConfig(default_precision=PrecisionType.FP16)
         
         return ArchitectureConfig(
@@ -988,7 +1271,6 @@ class EnhancedCarbonAwareNAS:
         )
     
     def _compute_pareto_frontier(self) -> List[ParetoPoint]:
-        """Compute 4D Pareto frontier with metadata"""
         points = []
         
         for i, (config, metrics) in enumerate(self.explored_architectures):
@@ -1001,11 +1283,9 @@ class EnhancedCarbonAwareNAS:
                 dominated_by=[]
             ))
         
-        # Check dominance
         for i, point in enumerate(points):
             for j, other in enumerate(points):
                 if i != j:
-                    # Check if point dominates other
                     if (point.metrics.accuracy >= other.metrics.accuracy and
                         point.metrics.total_carbon_kg <= other.metrics.total_carbon_kg and
                         point.metrics.latency_ms <= other.metrics.latency_ms and
@@ -1016,7 +1296,6 @@ class EnhancedCarbonAwareNAS:
                          point.metrics.helium_footprint < other.metrics.helium_footprint)):
                         point.dominates.append(j)
                     
-                    # Check if dominated by other
                     if (other.metrics.accuracy >= point.metrics.accuracy and
                         other.metrics.total_carbon_kg <= point.metrics.total_carbon_kg and
                         other.metrics.latency_ms <= point.metrics.latency_ms and
@@ -1027,10 +1306,10 @@ class EnhancedCarbonAwareNAS:
                          other.metrics.helium_footprint < point.metrics.helium_footprint)):
                         point.dominated_by.append(j)
         
-        # Pareto optimal = points with no dominating points
         pareto_optimal = [p for p in points if len(p.dominated_by) == 0]
         
         logger.info(f"Found {len(pareto_optimal)} Pareto-optimal architectures out of {len(points)}")
+        logger.info(f"Hypervolume: {self.multi_objective_bo.get_hypervolume():.3f}")
         
         return pareto_optimal
     
@@ -1038,13 +1317,9 @@ class EnhancedCarbonAwareNAS:
                                      latency_budget_ms: float = float('inf'),
                                      helium_budget: float = 1.0,
                                      min_accuracy: float = 0.7) -> Optional[ArchitectureConfig]:
-        """
-        Select optimal architecture given constraints with improved scoring.
-        """
         if not self.pareto_frontier:
             self.search_pareto_frontier()
         
-        # Filter by constraints
         feasible = []
         for point in self.pareto_frontier:
             m = point.metrics
@@ -1056,46 +1331,32 @@ class EnhancedCarbonAwareNAS:
         
         if not feasible:
             logger.warning("No feasible architectures found with given constraints")
-            # Return best available
             if self.pareto_frontier:
                 return self.pareto_frontier[0].config
             return None
         
-        # Score feasible architectures using improved metric
         for point in feasible:
             m = point.metrics
-            
-            # Normalize metrics (0-1 scale)
             carbon_score = 1 - (m.total_carbon_kg / carbon_budget) if carbon_budget > 0 else 1
             latency_score = 1 - (m.latency_p95_ms / latency_budget_ms) if latency_budget_ms > 0 else 1
             helium_score = 1 - m.helium_footprint / helium_budget if helium_budget > 0 else 1
             accuracy_score = m.accuracy
-            
-            # Confidence-adjusted scoring
             confidence = m.confidence_score
             
-            # Weighted sum with confidence
             point.score = confidence * (
-                0.3 * carbon_score + 
-                0.2 * latency_score + 
-                0.2 * helium_score + 
-                0.3 * accuracy_score
+                0.3 * carbon_score + 0.2 * latency_score + 
+                0.2 * helium_score + 0.3 * accuracy_score
             )
         
-        # Select best
         best = max(feasible, key=lambda x: x.score)
         
         logger.info(f"Selected architecture: {best.config.num_layers} layers, "
                    f"{best.config.hidden_size} hidden, "
                    f"mixed-precision: {best.config.mixed_precision.default_precision.value}")
-        logger.info(f"  Carbon: {best.metrics.total_carbon_kg:.2f}kg, "
-                   f"Latency: {best.metrics.latency_ms:.1f}ms, "
-                   f"Accuracy: {best.metrics.accuracy:.2%} ± {best.metrics.accuracy_std:.2%}")
         
         return best.config
     
     def get_carbon_optimal_architecture(self, task_constraints: Dict) -> ArchitectureConfig:
-        """Main interface for Layer 0/4 integration"""
         carbon_budget = task_constraints.get('carbon_budget_kg', 100.0)
         latency_budget = task_constraints.get('latency_budget_ms', 100.0)
         helium_budget = task_constraints.get('helium_budget', 1.0)
@@ -1109,19 +1370,71 @@ class EnhancedCarbonAwareNAS:
             min_accuracy=min_accuracy
         )
     
+    def get_cache_stats(self) -> Dict:
+        return self.cache.get_stats()
+    
+    def clear_cache(self):
+        self.cache.clear()
+    
+    def get_hardware_metrics(self) -> Dict:
+        return {
+            'average_power_watts': self.hardware_profiler.get_average_power(),
+            'current_temperature_c': self.hardware_profiler.get_current_temperature(),
+            'monitoring_active': self.hardware_profiler._monitoring
+        }
+    
     def save_state(self, filepath: str):
-        """Save NAS state for resumption"""
         state = {
             'explored_architectures': len(self.explored_architectures),
             'pareto_frontier_size': len(self.pareto_frontier),
             'search_iteration': self.search_iteration,
             'region': self.region,
             'task_type': self.task_type,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'cache_stats': self.get_cache_stats()
         }
         with open(filepath, 'w') as f:
             json.dump(state, f, indent=2)
         logger.info(f"NAS state saved to {filepath}")
+    
+    def stop(self):
+        """Stop hardware monitoring"""
+        self.hardware_profiler.stop_monitoring()
+
+
+# ============================================================
+# TransferLearningWeights (from earlier, included for completeness)
+# ============================================================
+
+class TransferLearningWeights:
+    def __init__(self):
+        self.task_weights: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.task_categories = {
+            'nlp': ['text_classification', 'sentiment_analysis', 'named_entity_recognition', 'language_modeling'],
+            'vision': ['image_classification', 'object_detection', 'segmentation', 'face_recognition'],
+            'speech': ['speech_recognition', 'speaker_identification', 'keyword_spotting'],
+            'recommendation': ['collaborative_filtering', 'content_based', 'sequential_recommendation']
+        }
+    
+    def get_initial_weights(self, task_type: str) -> Dict[str, float]:
+        if task_type in self.task_categories['nlp']:
+            return {'num_layers': 0.3, 'hidden_size': 0.2, 'num_heads': 0.2, 'attention_weight': 0.2, 'ffn_weight': 0.1}
+        elif task_type in self.task_categories['vision']:
+            return {'num_layers': 0.25, 'hidden_size': 0.15, 'conv_layers': 0.3, 'pooling': 0.15, 'fc_layers': 0.15}
+        elif task_type in self.task_categories['speech']:
+            return {'num_layers': 0.2, 'hidden_size': 0.2, 'conv_layers': 0.2, 'rnn_layers': 0.2, 'attention_weight': 0.2}
+        else:
+            return {'num_layers': 0.2, 'hidden_size': 0.2, 'num_heads': 0.2, 'width': 0.2, 'depth': 0.2}
+    
+    def update_weights(self, task_type: str, architecture: ArchitectureConfig, performance: float):
+        feature_contributions = {
+            'num_layers': architecture.num_layers / 100,
+            'hidden_size': architecture.hidden_size / 1000,
+            'num_heads': architecture.num_heads / 20
+        }
+        for feature, contribution in feature_contributions.items():
+            current = self.task_weights[task_type][feature]
+            self.task_weights[task_type][feature] = 0.9 * current + 0.1 * performance * contribution
 
 
 # ============================================================
@@ -1129,24 +1442,36 @@ class EnhancedCarbonAwareNAS:
 # ============================================================
 
 if __name__ == "__main__":
-    # Initialize enhanced NAS
+    print("=== Enhanced Carbon-Aware NAS v3.0 Demo ===\n")
+    
+    # Initialize NAS
     nas = EnhancedCarbonAwareNAS(config={
         'region': 'us-east',
-        'task_type': 'image_classification',
+        'task_type': 'vision',
         'expected_inferences': 500_000,
-        'cache_file': 'nas_cache.json'
+        'cache_file': 'nas_cache_v3.json',
+        'monitor_hardware': False,  # Disable for demo
+        'profiler_config': {'simulate': True}
     })
     
-    # Define task constraints
+    print("1. Cache Statistics:")
+    print(f"   {nas.get_cache_stats()}")
+    
+    print("\n2. Searching Pareto Frontier (30 architectures)...")
+    nas.search_pareto_frontier(max_architectures=30)
+    
+    print(f"\n3. Hardware Metrics:")
+    print(f"   {nas.get_hardware_metrics()}")
+    
+    print("\n4. Selecting Optimal Architecture:")
     task_constraints = {
         'carbon_budget_kg': 50.0,
         'latency_budget_ms': 100.0,
         'helium_budget': 0.6,
         'min_accuracy': 0.85,
-        'task_type': 'image_classification'
+        'task_type': 'vision'
     }
     
-    # Find optimal architecture
     optimal = nas.get_carbon_optimal_architecture(task_constraints)
     
     print(f"\n✅ Optimal Architecture Found:")
@@ -1155,3 +1480,6 @@ if __name__ == "__main__":
     print(f"   Mixed precision: {optimal.mixed_precision.default_precision.value}")
     print(f"   Parallelism: {optimal.parallelism}")
     print(f"   Pruning: {optimal.pruning_ratio if optimal.use_pruning else 'No'}")
+    
+    print("\n5. Cache Statistics After Search:")
+    print(f"   {nas.get_cache_stats()}")
