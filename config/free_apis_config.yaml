@@ -1,0 +1,28 @@
+# config/free_apis_config.yaml
+# Configuration for free API integrations
+
+# General settings
+cache_ttl: 300  # Cache TTL in seconds
+use_community_data: true
+
+# Self-hosted ElectricityMap
+self_hosted_url: "http://localhost:8000"
+
+# Region settings
+default_region: "us-east"
+
+# Data collection
+community_data:
+  enabled: true
+  auto_contribute: false  # Set to true to auto-contribute observations
+  anonymize: true
+  
+# Fallback settings
+fallback:
+  use_static_data: true
+  use_simulation: true
+  
+# Rate limiting
+rate_limits:
+  weather_calls_per_minute: 10
+  grid_calls_per_minute: 30
