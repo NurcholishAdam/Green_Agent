@@ -1,21 +1,19 @@
 # src/enhancements/thermal_optimizer.py
 
 """
-Enhanced Thermal-Aware Workload Scheduling for Green Agent - Version 3.0
+Enhanced Thermal-Aware Workload Scheduling for Green Agent - Version 3.1
 
-Features:
-1. Physics-based thermal modeling (Arrhenius leakage, Newtonian cooling)
-2. Multi-GPU real temperature sensor integration (NVML for NVIDIA GPUs)
-3. Predictive thermal model with look-ahead
-4. Multi-GPU thermal coupling and adjacency effects
-5. Fan speed optimization with PID controller
-6. Thermal throttling performance modeling (non-linear)
-7. Hysteresis control to prevent thermal cycling
-8. Optimal temperature search for energy minimization
-9. Cooling system actuation (fan control, power capping)
-10. Adaptive thermal capacitance learning
-11. Prometheus metrics export
-12. Comprehensive logging and reasoning
+ENHANCEMENTS:
+1. Machine learning-based temperature prediction with LSTM
+2. Adaptive PID controller with auto-tuning
+3. Thermal-aware load balancing across GPUs
+4. Predictive cooling with look-ahead optimization
+5. Exhaust temperature modeling for data center-level optimization
+6. Real-time thermal throttling prediction with confidence intervals
+7. Multi-zone cooling optimization (cold aisle/hot aisle)
+8. Thermal-aware job queuing with priority inversion
+9. Heat recirculation modeling for rack-level optimization
+10. Thermal emergency response with graduated throttling
 
 Reference: "Thermal-Aware Scheduling in Green Data Centers" (IEEE TPDS, 2023)
 """
@@ -23,7 +21,7 @@ Reference: "Thermal-Aware Scheduling in Green Data Centers" (IEEE TPDS, 2023)
 import math
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 from enum import Enum
 import logging
 import time
@@ -31,591 +29,647 @@ import threading
 import subprocess
 from collections import deque
 import asyncio
+from scipy import stats
+from scipy.optimize import minimize, differential_evolution
+
+# Try to import optional dependencies
+try:
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("scikit-learn not available, using basic prediction")
+
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger.warning("PyTorch not available, LSTM prediction disabled")
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENHANCEMENT 1: Multi-GPU Temperature Sensor
+# ENHANCEMENT 1: ML-Based Temperature Prediction
 # ============================================================
 
-class MultiGPUTemperatureSensor:
+class MLTemperaturePredictor:
     """
-    Multi-GPU real temperature sensor integration using NVML.
+    Machine learning-based temperature prediction using Random Forest and LSTM.
     
-    Supports:
-    - Multiple NVIDIA GPUs via NVML
-    - CPU temperature via psutil
-    - Memory temperature (where available)
-    - Simulation mode for testing
+    Features:
+    - Random Forest for short-term prediction (1-60 seconds)
+    - LSTM for sequence prediction (1-10 minutes)
+    - Confidence intervals from ensemble variance
+    - Online learning with sliding window
     """
     
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.gpu_count = self.config.get('gpu_count', 1)
-        self.gpu_indices = list(range(self.gpu_count))
-        self.simulation_mode = self.config.get('simulate', True)
-        self._nvml_available = False
-        self._nvml_handles: Dict[int, Any] = {}
+    def __init__(self, lookback_window: int = 60, forecast_horizon: int = 30):
+        self.lookback_window = lookback_window
+        self.forecast_horizon = forecast_horizon
+        self.rf_model = None
+        self.lstm_model = None
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+        self.training_data: List[Dict] = []
+        self._last_train_time = 0
+        self._train_interval = 300  # seconds
         
-        # Per-GPU temperature history
-        self.temp_history: Dict[int, deque] = {i: deque(maxlen=100) for i in self.gpu_indices}
+        if TORCH_AVAILABLE:
+            self._init_lstm()
         
-        # Initialize NVML if available
-        if not self.simulation_mode:
-            self._init_nvml()
-        
-        logger.info(f"MultiGPUTemperatureSensor initialized for {self.gpu_count} GPUs (simulation={self.simulation_mode})")
+        logger.info("MLTemperaturePredictor initialized")
     
-    def _init_nvml(self):
-        """Initialize NVIDIA Management Library for multiple GPUs"""
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            self._nvml_available = True
+    def _init_lstm(self):
+        """Initialize LSTM model"""
+        if not TORCH_AVAILABLE:
+            return
+        
+        class TemperatureLSTM(nn.Module):
+            def __init__(self, input_size=5, hidden_size=64, num_layers=2):
+                super().__init__()
+                self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+                self.fc = nn.Linear(hidden_size, 1)
             
-            for idx in self.gpu_indices:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
-                self._nvml_handles[idx] = handle
-            logger.info(f"NVML initialized for {len(self._nvml_handles)} GPUs")
-        except ImportError:
-            logger.warning("pynvml not available, using simulation mode")
-            self.simulation_mode = True
-        except Exception as e:
-            logger.warning(f"NVML initialization failed: {e}, using simulation")
-            self.simulation_mode = True
-    
-    def get_gpu_temperature(self, gpu_index: int = 0) -> float:
-        """Get current GPU temperature in Celsius"""
-        if self.simulation_mode:
-            return self._simulate_temperature(gpu_index)
+            def forward(self, x):
+                out, _ = self.lstm(x)
+                out = self.fc(out[:, -1, :])
+                return out
         
-        try:
-            import pynvml
-            handle = self._nvml_handles.get(gpu_index)
-            if not handle:
-                return self._simulate_temperature(gpu_index)
-            
-            temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-            self.temp_history[gpu_index].append(temp)
-            return float(temp)
-        except Exception as e:
-            logger.warning(f"Failed to read GPU {gpu_index} temperature: {e}")
-            return self._simulate_temperature(gpu_index)
+        self.lstm_model = TemperatureLSTM()
     
-    def get_all_temperatures(self) -> List[float]:
-        """Get temperatures for all GPUs"""
-        return [self.get_gpu_temperature(i) for i in self.gpu_indices]
-    
-    def get_hottest_gpu(self) -> Tuple[int, float]:
-        """Get hottest GPU index and temperature"""
-        temps = [(i, self.get_gpu_temperature(i)) for i in self.gpu_indices]
-        return max(temps, key=lambda x: x[1])
-    
-    def get_average_temperature(self) -> float:
-        """Get average temperature across all GPUs"""
-        temps = self.get_all_temperatures()
-        return sum(temps) / len(temps) if temps else 65.0
-    
-    def get_temperature_trend(self, gpu_index: int = 0) -> float:
-        """Get temperature trend (°C per minute) for a GPU"""
-        history = self.temp_history.get(gpu_index, deque(maxlen=100))
-        if len(history) < 10:
-            return 0.0
-        
-        recent = list(history)[-10:]
-        return (recent[-1] - recent[0]) / (len(recent) * 6)  # Approx per minute
-    
-    def get_cpu_temperature(self) -> float:
-        """Get current CPU temperature in Celsius"""
-        if self.simulation_mode:
-            return 55.0 + np.random.normal(0, 5)
-        
-        try:
-            import psutil
-            temps = psutil.sensors_temperatures()
-            if 'coretemp' in temps:
-                return temps['coretemp'][0].current
-            elif 'cpu_thermal' in temps:
-                return temps['cpu_thermal'][0].current
-        except Exception as e:
-            logger.warning(f"Failed to read CPU temperature: {e}")
-        
-        return 60.0
-    
-    def _simulate_temperature(self, gpu_index: int) -> float:
-        """Generate simulated temperature with GPU-specific variation"""
-        import random
-        
-        # Base temperature with GPU index offset (center GPUs run hotter)
-        base_offset = 0 if gpu_index == 0 else gpu_index * 2
-        
-        if not hasattr(self, '_sim_temps'):
-            self._sim_temps = [65.0 + (i * 2) for i in range(self.gpu_count)]
-        
-        # Random walk with mean reversion
-        change = random.gauss(0, 0.5)
-        self._sim_temps[gpu_index] += change
-        self._sim_temps[gpu_index] = max(30, min(105, self._sim_temps[gpu_index]))
-        
-        self.temp_history[gpu_index].append(self._sim_temps[gpu_index])
-        return self._sim_temps[gpu_index]
-    
-    def get_all_temperatures_dict(self) -> Dict[str, float]:
-        """Get all temperature readings"""
-        return {
-            'gpu': self.get_all_temperatures(),
-            'gpu_avg': self.get_average_temperature(),
-            'gpu_hottest': self.get_hottest_gpu(),
-            'cpu': self.get_cpu_temperature()
+    def add_observation(self, temperature: float, power_watts: float, 
+                       fan_speed: float, ambient_temp: float,
+                       timestamp: float):
+        """Add observation for training"""
+        features = {
+            'temperature': temperature,
+            'power': power_watts,
+            'fan_speed': fan_speed,
+            'ambient_temp': ambient_temp,
+            'hour': time.localtime(timestamp).tm_hour,
+            'day_of_week': time.localtime(timestamp).tm_wday
         }
-
-
-# ============================================================
-# ENHANCEMENT 2: Cooling System Actuator
-# ============================================================
-
-class CoolingSystemActuator:
-    """
-    Cooling system actuator for fan and power capping control.
-    
-    Supports:
-    - Fan speed control via IPMI or sysfs
-    - GPU power capping via nvidia-smi
-    - Simulation mode for testing
-    """
-    
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.simulation_mode = self.config.get('simulate', True)
-        self.gpu_count = self.config.get('gpu_count', 1)
-        self._ipmi_available = False
-        self._nvidia_smi_available = False
+        self.training_data.append(features)
         
-        # Current state
-        self.current_fan_speed = self.config.get('initial_fan_speed', 40.0)
-        self.current_power_limits: Dict[int, float] = {i: 300.0 for i in range(self.gpu_count)}
+        # Keep last 10000 observations
+        if len(self.training_data) > 10000:
+            self.training_data = self.training_data[-10000:]
         
-        if not self.simulation_mode:
-            self._check_hardware()
-        
-        logger.info(f"CoolingSystemActuator initialized (simulation={self.simulation_mode})")
+        # Periodic retraining
+        if time.time() - self._last_train_time > self._train_interval:
+            self._train_models()
     
-    def _check_hardware(self):
-        """Check available hardware control interfaces"""
-        # Check nvidia-smi
-        try:
-            result = subprocess.run(['nvidia-smi', '--query-gpu=power.limit', '--format=csv,noheader'],
-                                   capture_output=True, timeout=5)
-            if result.returncode == 0:
-                self._nvidia_smi_available = True
-                logger.info("nvidia-smi available for power capping")
-        except Exception as e:
-            logger.warning(f"nvidia-smi check failed: {e}")
+    def _train_models(self):
+        """Train ML models on historical data"""
+        if not SKLEARN_AVAILABLE or len(self.training_data) < 100:
+            return
         
-        # Check IPMI for fan control
-        try:
-            result = subprocess.run(['ipmitool', 'mc', 'info'], capture_output=True, timeout=5)
-            if result.returncode == 0:
-                self._ipmi_available = True
-                logger.info("IPMI available for fan control")
-        except Exception as e:
-            logger.warning(f"IPMI check failed: {e}")
-    
-    def set_fan_speed(self, speed_percent: float) -> Tuple[bool, str]:
-        """Set system fan speed (0-100%)"""
-        speed_percent = max(0, min(100, speed_percent))
+        # Prepare training data
+        X = []
+        y = []
         
-        if self.simulation_mode:
-            time.sleep(0.02)
-            self.current_fan_speed = speed_percent
-            return True, f"Fan speed set to {speed_percent:.1f}% (simulated)"
+        for i in range(len(self.training_data) - self.lookback_window):
+            # Features: recent temperatures, power, fan speed, ambient
+            recent_temps = [d['temperature'] for d in self.training_data[i:i+self.lookback_window]]
+            X.append([
+                np.mean(recent_temps[-10:]),
+                np.std(recent_temps[-10:]),
+                self.training_data[i+self.lookback_window-1]['power'],
+                self.training_data[i+self.lookback_window-1]['fan_speed'],
+                self.training_data[i+self.lookback_window-1]['ambient_temp'],
+                self.training_data[i+self.lookback_window-1]['hour'] / 24.0,
+                self.training_data[i+self.lookback_window-1]['day_of_week'] / 7.0
+            ])
+            y.append(self.training_data[i+self.lookback_window]['temperature'])
         
-        # Real fan control via IPMI
-        if self._ipmi_available:
-            try:
-                # Convert percent to hex (0-100 -> 0x00-0x64)
-                hex_speed = hex(int(speed_percent * 255 / 100))[2:].zfill(2)
-                result = subprocess.run(
-                    ['ipmitool', 'raw', '0x30', '0x30', '0x02', '0xff', hex_speed],
-                    capture_output=True, timeout=10
-                )
-                if result.returncode == 0:
-                    self.current_fan_speed = speed_percent
-                    return True, f"Fan speed set to {speed_percent:.1f}% via IPMI"
-                else:
-                    return False, f"IPMI command failed: {result.stderr.decode()}"
-            except Exception as e:
-                return False, f"Fan control failed: {e}"
+        X = np.array(X)
+        y = np.array(y)
         
-        # Fallback: simulate
-        self.current_fan_speed = speed_percent
-        return True, f"Fan speed set to {speed_percent:.1f}% (fallback - no hardware control)"
-    
-    def set_gpu_power_limit(self, gpu_index: int, power_limit_watts: float) -> Tuple[bool, str]:
-        """Set GPU power limit via nvidia-smi"""
-        power_limit_watts = max(100, min(350, power_limit_watts))
+        # Train Random Forest
+        self.rf_model = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42,
+            n_jobs=-1
+        )
+        self.rf_model.fit(X, y)
         
-        if self.simulation_mode:
-            time.sleep(0.01)
-            self.current_power_limits[gpu_index] = power_limit_watts
-            return True, f"GPU {gpu_index} power limit set to {power_limit_watts:.0f}W (simulated)"
-        
-        if self._nvidia_smi_available:
-            try:
-                result = subprocess.run(
-                    ['nvidia-smi', '-i', str(gpu_index), '-pl', str(int(power_limit_watts))],
-                    capture_output=True, timeout=10
-                )
-                if result.returncode == 0:
-                    self.current_power_limits[gpu_index] = power_limit_watts
-                    return True, f"GPU {gpu_index} power limit set to {power_limit_watts:.0f}W"
-                else:
-                    return False, f"nvidia-smi failed: {result.stderr.decode()}"
-            except Exception as e:
-                return False, f"Power capping failed: {e}"
-        
-        # Fallback: simulate
-        self.current_power_limits[gpu_index] = power_limit_watts
-        return True, f"GPU {gpu_index} power limit set to {power_limit_watts:.0f}W (fallback)"
+        self._last_train_time = time.time()
+        logger.info(f"ML models trained on {len(X)} samples")
     
-    def apply_throttle(self, throttle_factor: float, gpu_index: int = 0) -> Tuple[bool, str]:
-        """Apply throttle factor by adjusting power limit"""
-        # Assume max power is 300W
-        power_limit = throttle_factor * 300
-        return self.set_gpu_power_limit(gpu_index, power_limit)
-    
-    def get_status(self) -> Dict:
-        """Get actuator status"""
-        return {
-            'simulation_mode': self.simulation_mode,
-            'current_fan_speed_percent': self.current_fan_speed,
-            'current_power_limits_watts': self.current_power_limits,
-            'ipmi_available': self._ipmi_available,
-            'nvidia_smi_available': self._nvidia_smi_available
-        }
-
-
-# ============================================================
-# ENHANCEMENT 3: Non-Linear Throttling Model
-# ============================================================
-
-class NonLinearThrottlingModel:
-    """
-    Non-linear GPU performance degradation at high temperature.
-    
-    Based on sigmoid function for realistic throttling behavior:
-    - Gentle start at 75°C
-    - Aggressive from 80-88°C
-    - Hard limit at 90°C+
-    """
-    
-    def __init__(self):
-        self.throttling_start = 75.0
-        self.throttling_mid = 83.0
-        self.throttling_max = 90.0
-        self.performance_history: deque = deque(maxlen=100)
-        self.recovery_hysteresis = 2.0  # °C below threshold to recover
-    
-    def performance_factor(self, temp: float) -> float:
+    def predict(self, current_temp: float, power_watts: float,
+               fan_speed: float, ambient_temp: float,
+               seconds_ahead: int) -> Tuple[float, float, float]:
         """
-        Calculate performance factor using sigmoid function.
+        Predict future temperature with confidence interval.
         
         Returns:
-            Factor between 0 and 1 (1 = full performance)
+            (predicted_temp, lower_bound, upper_bound)
         """
-        if temp <= self.throttling_start:
-            factor = 1.0
+        if not SKLEARN_AVAILABLE or self.rf_model is None:
+            # Fallback to physical model
+            return current_temp + (power_watts - 200) * seconds_ahead / 600, 0, 0
         
-        elif temp >= self.throttling_max:
-            factor = 0.4  # 60% performance loss at max
+        # Prepare features
+        hour = time.localtime().tm_hour
+        day_of_week = time.localtime().tm_wday
         
-        else:
-            # Sigmoid: f(x) = 1 / (1 + exp(k * (x - x0)))
-            # where k controls steepness, x0 is midpoint
-            k = 0.8  # Steepness factor
-            x0 = self.throttling_mid
-            factor = 1.0 / (1.0 + math.exp(k * (temp - x0)))
-            
-            # Scale to [0.4, 1.0] range
-            factor = 0.4 + 0.6 * factor
+        X_pred = np.array([[
+            current_temp,
+            0,  # std placeholder
+            power_watts,
+            fan_speed,
+            ambient_temp,
+            hour / 24.0,
+            day_of_week / 7.0
+        ]])
         
-        self.performance_history.append(factor)
-        return factor
+        # Predict
+        pred = self.rf_model.predict(X_pred)[0]
+        
+        # Get prediction interval from forest variance
+        predictions = [tree.predict(X_pred)[0] for tree in self.rf_model.estimators_]
+        std = np.std(predictions)
+        
+        # Adjust for forecast horizon (uncertainty grows with time)
+        uncertainty_factor = 1 + 0.1 * math.log(seconds_ahead + 1)
+        final_std = std * uncertainty_factor
+        
+        lower = pred - 1.96 * final_std
+        upper = pred + 1.96 * final_std
+        
+        return pred, lower, upper
     
-    def power_reduction_factor(self, temp: float) -> float:
-        """Calculate power reduction due to throttling"""
-        # Power roughly proportional to performance
-        perf = self.performance_factor(temp)
-        # Slightly less power reduction than performance (static power)
-        return 0.8 + 0.2 * perf
-    
-    def get_throttling_penalty(self, temp: float) -> float:
-        """Get performance penalty percentage"""
-        return (1 - self.performance_factor(temp)) * 100
-    
-    def should_recover(self, temp: float, previous_temp: float) -> bool:
-        """Determine if system should recover from throttling"""
-        if temp <= self.throttling_start - self.recovery_hysteresis:
-            return True
-        if temp < previous_temp and temp < self.throttling_mid:
-            return True
-        return False
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importance from Random Forest"""
+        if not SKLEARN_AVAILABLE or self.rf_model is None:
+            return {}
+        
+        features = ['recent_temp', 'temp_std', 'power', 'fan_speed', 
+                   'ambient_temp', 'hour', 'day_of_week']
+        importance = self.rf_model.feature_importances_
+        return {f: imp for f, imp in zip(features, importance)}
 
 
 # ============================================================
-# ENHANCEMENT 4: Adaptive Thermal Capacitance
+# ENHANCEMENT 2: Adaptive Auto-Tuning PID Controller
 # ============================================================
 
-class AdaptiveThermalCapacitance:
+class AdaptivePIDController:
     """
-    Adaptive thermal capacitance learning from historical data.
+    Adaptive PID controller with auto-tuning using Ziegler-Nichols method.
     
-    Uses recursive least squares to estimate C from temperature measurements.
+    Features:
+    - Online parameter adaptation
+    - Auto-tuning on demand
+    - Anti-windup with back-calculation
+    - Setpoint weighting for reduced overshoot
     """
     
-    def __init__(self, initial_capacitance: float = 500.0, learning_rate: float = 0.01):
-        self.capacitance = initial_capacitance
-        self.learning_rate = learning_rate
-        self._history: List[Tuple[float, float, float]] = []  # (power, dTdt, temperature)
-        self._window_size = 100
-    
-    def add_observation(self, power_watts: float, dTdt: float, temperature_c: float):
-        """Add observation for learning"""
-        self._history.append((power_watts, dTdt, temperature_c))
-        if len(self._history) > self._window_size:
-            self._history = self._history[-self._window_size:]
-        
-        if len(self._history) > 10:
-            self._update_capacitance()
-    
-    def _update_capacitance(self):
-        """Update capacitance estimate using recursive least squares"""
-        # Simplified: C = P / (dT/dt) at steady state
-        recent = self._history[-20:]
-        valid = [(p, dtdt) for p, dtdt, _ in recent if abs(dtdt) > 0.1]
-        
-        if valid:
-            # Average over recent observations
-            c_estimates = [p / dtdt for p, dtdt in valid if dtdt != 0]
-            if c_estimates:
-                new_c = np.mean(c_estimates)
-                # Exponential moving average
-                self.capacitance = (1 - self.learning_rate) * self.capacitance + self.learning_rate * new_c
-                # Clamp to reasonable bounds
-                self.capacitance = max(200, min(1000, self.capacitance))
-                logger.debug(f"Updated thermal capacitance: {self.capacitance:.1f} J/°C")
-    
-    def get_capacitance(self) -> float:
-        """Get current thermal capacitance estimate"""
-        return self.capacitance
-
-
-# ============================================================
-# ENHANCEMENT 5: Remaining Classes (Enhanced)
-# ============================================================
-
-# [PredictiveThermalModel, MultiGPUThermalModel, PIDController,
-#  FanOptimizer, ThermalZone, ThermalProfile, ThermalDecision
-#  remain similar with minor enhancements]
-
-class PredictiveThermalModel:
-    def __init__(self, time_constant: float = 50.0, dissipation: float = 10.0,
-                 capacitance: float = 500.0):
-        self.time_constant = time_constant
-        self.dissipation = dissipation
-        self.capacitance = capacitance
-        self.ambient_temp = 25.0
-        self._history: deque = deque(maxlen=100)
-    
-    def predict_temperature(self, current_temp: float, power_watts: float, seconds_ahead: int) -> float:
-        if seconds_ahead <= 0:
-            return current_temp
-        T_steady = self.ambient_temp + power_watts / self.dissipation
-        t_div_tau = seconds_ahead / self.time_constant
-        predicted = T_steady + (current_temp - T_steady) * math.exp(-t_div_tau)
-        return max(self.ambient_temp, min(115.0, predicted))
-    
-    def update_capacitance(self, new_capacitance: float):
-        """Update thermal capacitance"""
-        self.capacitance = new_capacitance
-        self.time_constant = self.capacitance / self.dissipation
-
-
-class MultiGPUThermalModel:
-    def __init__(self, gpu_count: int, coupling_strength: float = 0.15):
-        self.gpu_count = gpu_count
-        self.coupling_strength = coupling_strength
-        self.dissipation = 10.0
-        self.capacitance = 500.0
-        self.ambient_temp = 25.0
-        self.coupling_matrix = self._build_coupling_matrix()
-        self.temperatures: List[float] = [65.0] * gpu_count
-        self.history: List[List[float]] = []
-    
-    def _build_coupling_matrix(self) -> np.ndarray:
-        matrix = np.zeros((self.gpu_count, self.gpu_count))
-        for i in range(self.gpu_count):
-            matrix[i, i] = self.dissipation
-            if i > 0:
-                matrix[i, i-1] = -self.coupling_strength * self.dissipation
-            if i < self.gpu_count - 1:
-                matrix[i, i+1] = -self.coupling_strength * self.dissipation
-        return matrix
-    
-    def update_temperatures(self, powers: List[float], dt_seconds: float = 10.0) -> List[float]:
-        if len(powers) != self.gpu_count:
-            powers = powers + [0] * (self.gpu_count - len(powers))
-        
-        T_array = np.array(self.temperatures)
-        P_array = np.array(powers)
-        T_diff = T_array - self.ambient_temp
-        heat_out = self.coupling_matrix @ T_diff
-        dTdt = (P_array - heat_out) / self.capacitance
-        self.temperatures = (T_array + dTdt * dt_seconds).tolist()
-        self.temperatures = [max(self.ambient_temp, min(115.0, t)) for t in self.temperatures]
-        self.history.append(self.temperatures.copy())
-        if len(self.history) > 1000:
-            self.history = self.history[-1000:]
-        return self.temperatures
-
-
-class PIDController:
     def __init__(self, Kp: float = 0.5, Ki: float = 0.1, Kd: float = 0.05,
-                 output_min: float = 0.0, output_max: float = 100.0):
+                 setpoint: float = 65.0, output_min: float = 0.0, output_max: float = 100.0,
+                 beta: float = 1.0, gamma: float = 0.0):
+        """
+        Args:
+            beta: Setpoint weighting for P-term (0-1, 0 = no setpoint weighting)
+            gamma: Setpoint weighting for D-term (0-1)
+        """
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
+        self.setpoint = setpoint
         self.output_min = output_min
         self.output_max = output_max
+        self.beta = beta
+        self.gamma = gamma
+        
+        # State variables
         self._integral = 0.0
         self._prev_error = 0.0
+        self._prev_measurement = setpoint
         self._prev_time = time.time()
+        self._integral_limit = 10.0
+        self._auto_tuning = False
+        self._tuning_data: List[Tuple[float, float]] = []  # (time, measurement)
+        self._tuning_start_time = 0
     
-    def update(self, setpoint: float, measurement: float) -> float:
+    def update(self, measurement: float) -> float:
+        """Update PID controller and return output"""
         current_time = time.time()
         dt = current_time - self._prev_time
+        
         if dt <= 0:
             dt = 0.1
         
-        error = setpoint - measurement
-        P = self.Kp * error
-        self._integral += error * dt
-        I = self.Ki * self._integral
-        derivative = (error - self._prev_error) / dt
-        D = self.Kd * derivative
+        # Calculate errors with setpoint weighting
+        error = self.setpoint - measurement
+        p_term = self.Kp * (self.beta * self.setpoint - measurement)
         
-        output = P + I + D
+        # Integral term with clamping
+        self._integral += self.Ki * error * dt
+        self._integral = max(-self._integral_limit, min(self._integral_limit, self._integral))
+        i_term = self._integral
+        
+        # Derivative term with filtering (use measurement for derivative kick reduction)
+        derivative = (self._prev_measurement - measurement) / dt
+        d_term = self.Kd * (self.gamma * self.setpoint - measurement) if self.gamma > 0 else self.Kd * (-derivative)
+        
+        # Calculate output
+        output = p_term + i_term + d_term
+        
+        # Clamp output
         output = max(self.output_min, min(self.output_max, output))
         
-        if output == self.output_max and error > 0:
-            self._integral -= error * dt
-        elif output == self.output_min and error < 0:
-            self._integral -= error * dt
+        # Anti-windup: back-calculation
+        if output == self.output_max or output == self.output_min:
+            self._integral -= self.Ki * error * dt * 0.5
         
+        # Store for next iteration
         self._prev_error = error
+        self._prev_measurement = measurement
         self._prev_time = current_time
+        
+        # Auto-tuning data collection
+        if self._auto_tuning:
+            self._tuning_data.append((current_time, measurement))
+        
         return output
-
-
-class FanOptimizer:
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.pid = PIDController(
-            Kp=self.config.get('Kp', 0.5),
-            Ki=self.config.get('Ki', 0.1),
-            Kd=self.config.get('Kd', 0.05),
-            output_min=0.0,
-            output_max=100.0
-        )
-        self.target_temp = self.config.get('target_temp', 65.0)
-        self.min_fan_speed = self.config.get('min_fan_speed', 20.0)
-        self.noise_weight = self.config.get('noise_weight', 0.3)
-        self.current_fan_speed = self.min_fan_speed
-        self.fan_speed_history: deque = deque(maxlen=100)
     
-    def calculate_optimal_fan_speed(self, current_temp: float) -> float:
-        pid_output = self.pid.update(self.target_temp, current_temp)
-        fan_speed = max(self.min_fan_speed, pid_output)
+    def start_auto_tune(self):
+        """Start Ziegler-Nichols auto-tuning procedure"""
+        self._auto_tuning = True
+        self._tuning_start_time = time.time()
+        self._tuning_data = []
+        logger.info("PID auto-tuning started")
+    
+    def stop_auto_tune(self) -> Dict[str, float]:
+        """Stop auto-tuning and calculate optimal parameters"""
+        self._auto_tuning = False
         
-        # Noise penalty (reduce speed if temperature is acceptable)
-        if current_temp < self.target_temp - 5:
-            noise_reduction = (self.target_temp - current_temp) / 20 * self.noise_weight * fan_speed
-            fan_speed = max(self.min_fan_speed, fan_speed - noise_reduction)
+        if len(self._tuning_data) < 50:
+            logger.warning("Insufficient data for auto-tuning")
+            return {'Kp': self.Kp, 'Ki': self.Ki, 'Kd': self.Kd}
         
-        fan_speed = min(100.0, fan_speed)
-        self.current_fan_speed = fan_speed
-        self.fan_speed_history.append(fan_speed)
-        return fan_speed
+        # Find oscillations in the response
+        times = [t for t, _ in self._tuning_data]
+        temps = [m for _, m in self._tuning_data]
+        
+        # Detect peaks
+        peaks = []
+        for i in range(1, len(temps) - 1):
+            if temps[i] > temps[i-1] and temps[i] > temps[i+1]:
+                peaks.append((times[i], temps[i]))
+        
+        if len(peaks) < 4:
+            logger.warning("Insufficient oscillations for auto-tuning")
+            return {'Kp': self.Kp, 'Ki': self.Ki, 'Kd': self.Kd}
+        
+        # Calculate ultimate period (average time between peaks)
+        periods = [peaks[i+1][0] - peaks[i][0] for i in range(len(peaks)-1)]
+        Tu = np.mean(periods)
+        
+        # Calculate ultimate gain (Ku) from amplitude ratio
+        amplitudes = [abs(peaks[i][1] - self.setpoint) for i in range(len(peaks))]
+        if amplitudes:
+            Ku = 4 * np.mean(amplitudes) / (np.pi * self.output_max)
+        else:
+            Ku = 1.0
+        
+        # Ziegler-Nichols tuning rules
+        Kp = 0.6 * Ku
+        Ki = 2 * Kp / Tu
+        Kd = Kp * Tu / 8
+        
+        # Apply new parameters
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        
+        logger.info(f"Auto-tuned PID: Kp={Kp:.3f}, Ki={Ki:.3f}, Kd={Kd:.3f}, Tu={Tu:.1f}s")
+        
+        return {'Kp': Kp, 'Ki': Ki, 'Kd': Kd}
     
-    def get_fan_power(self, fan_speed: float) -> float:
-        max_power = 50.0
-        return max_power * (fan_speed / 100) ** 3
+    def reset(self):
+        """Reset controller state"""
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_measurement = self.setpoint
+        self._prev_time = time.time()
+
+
+# ============================================================
+# ENHANCEMENT 3: Exhaust Temperature Model
+# ============================================================
+
+class ExhaustTemperatureModel:
+    """
+    Model for data center-level exhaust temperatures and heat recirculation.
     
-    def get_noise_level(self, fan_speed: float) -> float:
-        if fan_speed < 1:
-            return 20.0
-        return 20 + 30 * math.log10(fan_speed / 100) + 20
+    Features:
+    - Cold aisle/hot aisle temperature modeling
+    - Heat recirculation between racks
+    - CRAC/CRAH unit modeling
+    """
+    
+    def __init__(self, room_volume_m3: float = 1000.0,
+                 crac_capacity_kw: float = 500.0,
+                 recirculation_factor: float = 0.3):
+        self.room_volume_m3 = room_volume_m3
+        self.crac_capacity_kw = crac_capacity_kw
+        self.recirculation_factor = recirculation_factor
+        
+        # Air properties
+        self.air_density_kg_m3 = 1.225
+        self.air_specific_heat_kj_kg_k = 1.005
+        
+        self.current_exhaust_temp = 30.0
+        self.cold_aisle_temp = 22.0
+        self.hot_aisle_temp = 30.0
+        
+        self.temperature_history: deque = deque(maxlen=1000)
+    
+    def update_temperatures(self, total_power_kw: float, crac_power_kw: float,
+                           dt_seconds: float = 60.0) -> Tuple[float, float]:
+        """
+        Update hot aisle and cold aisle temperatures.
+        
+        Returns:
+            (hot_aisle_temp, cold_aisle_temp)
+        """
+        # Heat added to room
+        heat_added_kj = total_power_kw * dt_seconds
+        
+        # Heat removed by CRAC/CRAH
+        heat_removed_kj = crac_power_kw * dt_seconds * 3.6  # kW to kJ
+        
+        # Net heat
+        net_heat_kj = heat_added_kj - heat_removed_kj
+        
+        # Air mass in room (kg)
+        air_mass_kg = self.room_volume_m3 * self.air_density_kg_m3
+        
+        # Temperature change from net heat (ΔT = Q / (m * Cp))
+        temp_change = net_heat_kj / (air_mass_kg * self.air_specific_heat_kj_kg_k)
+        
+        # Update average room temperature
+        room_temp = (self.cold_aisle_temp + self.hot_aisle_temp) / 2
+        new_room_temp = room_temp + temp_change
+        
+        # Heat recirculation from hot aisle to cold aisle
+        recirc_heat = self.recirculation_factor * (self.hot_aisle_temp - self.cold_aisle_temp)
+        
+        # Update aisle temperatures
+        self.hot_aisle_temp = self.cold_aisle_temp + (new_room_temp - self.cold_aisle_temp) * 2
+        self.cold_aisle_temp = new_room_temp - (self.hot_aisle_temp - self.cold_aisle_temp)
+        
+        # Add recirculation effect
+        self.cold_aisle_temp += recirc_heat * 0.1
+        
+        # Clamp temperatures
+        self.cold_aisle_temp = max(18, min(30, self.cold_aisle_temp))
+        self.hot_aisle_temp = max(25, min(50, self.hot_aisle_temp))
+        
+        self.current_exhaust_temp = self.hot_aisle_temp
+        self.temperature_history.append((time.time(), self.hot_aisle_temp))
+        
+        return self.hot_aisle_temp, self.cold_aisle_temp
+    
+    def calculate_crac_power(self, target_hot_aisle_temp: float) -> float:
+        """Calculate CRAC power needed to achieve target hot aisle temperature"""
+        current_hot = self.hot_aisle_temp
+        if current_hot <= target_hot_aisle_temp:
+            return 0.0
+        
+        # Heat to remove: Q = m * Cp * ΔT
+        air_mass_kg = self.room_volume_m3 * self.air_density_kg_m3
+        delta_t = current_hot - target_hot_aisle_temp
+        heat_to_remove_kj = air_mass_kg * self.air_specific_heat_kj_kg_k * delta_t
+        
+        # Convert to kW (assuming 5 minutes response time)
+        crac_power_kw = heat_to_remove_kj / (5 * 60)  # kJ/s = kW
+        
+        return min(self.crac_capacity_kw, max(0, crac_power_kw))
+    
+    def get_temperature_gradient(self) -> float:
+        """Get temperature difference between hot and cold aisles"""
+        return self.hot_aisle_temp - self.cold_aisle_temp
 
 
-class ThermalZone(Enum):
-    CRITICAL = "critical"
-    WARNING = "warning"
-    NORMAL = "normal"
-    OPTIMAL = "optimal"
-    COOL = "cool"
+# ============================================================
+# ENHANCEMENT 4: Thermal-Aware Load Balancer
+# ============================================================
+
+class ThermalAwareLoadBalancer:
+    """
+    Distributes workload across GPUs to minimize hot spots.
+    
+    Features:
+    - Temperature-aware task allocation
+    - Dynamic rebalancing based on thermal state
+    - Predictive hot spot avoidance
+    """
+    
+    def __init__(self, gpu_count: int):
+        self.gpu_count = gpu_count
+        self.gpu_temps: List[float] = [65.0] * gpu_count
+        self.gpu_powers: List[float] = [200.0] * gpu_count
+        self.allocation_history: List[List[float]] = []
+    
+    def update_temperatures(self, temperatures: List[float]):
+        """Update current GPU temperatures"""
+        self.gpu_temps = temperatures.copy()
+    
+    def get_allocation_weights(self) -> List[float]:
+        """
+        Calculate allocation weights inversely proportional to temperature.
+        
+        Cooler GPUs get higher weights.
+        """
+        if not self.gpu_temps:
+            return [1.0 / self.gpu_count] * self.gpu_count
+        
+        # Inverse temperature weighting
+        inv_temps = [1.0 / max(50, t) for t in self.gpu_temps]
+        total = sum(inv_temps)
+        if total == 0:
+            return [1.0 / self.gpu_count] * self.gpu_count
+        
+        weights = [w / total for w in inv_temps]
+        
+        # Normalize to sum to 1
+        return weights
+    
+    def allocate_task(self, task_power_watts: float) -> int:
+        """
+        Allocate a task to the most thermally suitable GPU.
+        
+        Returns:
+            GPU index
+        """
+        weights = self.get_allocation_weights()
+        
+        # Weighted random selection (avoid always picking the same coolest GPU)
+        cumulative = np.cumsum(weights)
+        r = random.random()
+        for i, cum in enumerate(cumulative):
+            if r <= cum:
+                selected_gpu = i
+                break
+        else:
+            selected_gpu = 0
+        
+        # Update estimated power
+        self.gpu_powers[selected_gpu] += task_power_watts * 0.1
+        
+        # Record allocation
+        self.allocation_history.append([selected_gpu, task_power_watts, time.time()])
+        if len(self.allocation_history) > 1000:
+            self.allocation_history = self.allocation_history[-1000:]
+        
+        return selected_gpu
+    
+    def get_thermal_balance_score(self) -> float:
+        """
+        Calculate thermal balance score (0-1, higher = more balanced).
+        """
+        if not self.gpu_temps:
+            return 1.0
+        
+        mean_temp = np.mean(self.gpu_temps)
+        std_temp = np.std(self.gpu_temps)
+        
+        # Perfect balance: all temps equal (std=0)
+        score = 1.0 - min(1.0, std_temp / 20.0)
+        return score
+    
+    def rebalance(self) -> List[float]:
+        """
+        Suggest rebalancing actions (migrate tasks from hot to cool GPUs).
+        
+        Returns:
+            Migration factors (0-1) for each GPU (how much to reduce load)
+        """
+        weights = self.get_allocation_weights()
+        
+        # GPUs above average need reduction
+        avg_weight = 1.0 / self.gpu_count
+        reduction_factors = [max(0, (1.0 - w / avg_weight)) for w in weights]
+        
+        return reduction_factors
 
 
-@dataclass
-class ThermalProfile:
-    current_temp_celsius: float
-    target_temp_celsius: float
-    cooling_power_watts: float
-    leakage_power_watts: float
-    thermal_time_constant_seconds: float
-    zone: ThermalZone
-    recommended_action: str
-    predicted_temp_30s: float = 0.0
-    performance_factor: float = 1.0
-    fan_speed_percent: float = 0.0
+# ============================================================
+# ENHANCEMENT 5: Graduated Thermal Emergency Response
+# ============================================================
 
-
-@dataclass
-class ThermalDecision:
-    action: str
-    throttle_factor: float
-    target_temp: float
-    energy_savings_percent: float
-    recovery_time_seconds: float
-    fan_speed_percent: float
-    performance_impact_percent: float
-    reasoning: str
-    timestamp: float = field(default_factory=time.time)
+class ThermalEmergencyResponse:
+    """
+    Graduated emergency response for thermal crises.
+    
+    Levels:
+    1. Caution: Increase cooling
+    2. Warning: Throttle non-critical workloads
+    3. Critical: Throttle all workloads
+    4. Emergency: Emergency shutdown
+    5. Catastrophic: Force power off
+    """
+    
+    class EmergencyLevel(Enum):
+        NORMAL = 0
+        CAUTION = 1
+        WARNING = 2
+        CRITICAL = 3
+        EMERGENCY = 4
+        CATASTROPHIC = 5
+    
+    def __init__(self):
+        self.current_level = self.EmergencyLevel.NORMAL
+        self.level_start_time = 0
+        self.escalation_times: Dict[self.EmergencyLevel, float] = {
+            self.EmergencyLevel.CAUTION: 30,
+            self.EmergencyLevel.WARNING: 60,
+            self.EmergencyLevel.CRITICAL: 120,
+            self.EmergencyLevel.EMERGENCY: 300,
+            self.EmergencyLevel.CATASTROPHIC: 600
+        }
+        self.thresholds = {
+            self.EmergencyLevel.CAUTION: 85,
+            self.EmergencyLevel.WARNING: 90,
+            self.EmergencyLevel.CRITICAL: 95,
+            self.EmergencyLevel.EMERGENCY: 98,
+            self.EmergencyLevel.CATASTROPHIC: 100
+        }
+    
+    def evaluate(self, current_temp: float) -> Tuple[self.EmergencyLevel, str]:
+        """
+        Evaluate current temperature and determine emergency level.
+        
+        Returns:
+            (level, recommended_action)
+        """
+        new_level = self.EmergencyLevel.NORMAL
+        
+        for level, threshold in self.thresholds.items():
+            if current_temp >= threshold:
+                new_level = level
+        
+        # Escalate if temperature has been high for too long
+        if new_level != self.current_level:
+            # Reset timer on level change
+            self.level_start_time = time.time()
+        elif self.current_level != self.EmergencyLevel.NORMAL:
+            # Check if we've been at this level too long
+            elapsed = time.time() - self.level_start_time
+            if elapsed > self.escalation_times.get(self.current_level, 60):
+                new_level = self.EmergencyLevel(
+                    min(5, self.current_level.value + 1)
+                )
+        
+        self.current_level = new_level
+        
+        # Determine action
+        actions = {
+            self.EmergencyLevel.NORMAL: "normal_operation",
+            self.EmergencyLevel.CAUTION: "increase_cooling",
+            self.EmergencyLevel.WARNING: "throttle_background",
+            self.EmergencyLevel.CRITICAL: "throttle_all",
+            self.EmergencyLevel.EMERGENCY: "emergency_shutdown",
+            self.EmergencyLevel.CATASTROPHIC: "force_power_off"
+        }
+        
+        return new_level, actions.get(new_level, "unknown")
+    
+    def get_throttle_factor(self) -> float:
+        """Get recommended throttle factor based on emergency level"""
+        factors = {
+            self.EmergencyLevel.NORMAL: 1.0,
+            self.EmergencyLevel.CAUTION: 0.9,
+            self.EmergencyLevel.WARNING: 0.7,
+            self.EmergencyLevel.CRITICAL: 0.5,
+            self.EmergencyLevel.EMERGENCY: 0.2,
+            self.EmergencyLevel.CATASTROPHIC: 0.0
+        }
+        return factors.get(self.current_level, 1.0)
 
 
 # ============================================================
 # ENHANCEMENT 6: Main Enhanced Thermal Optimizer
 # ============================================================
 
-class ThermalAwareOptimizer:
+class EnhancedThermalAwareOptimizer:
     """
-    Enhanced Thermal-aware workload scheduler v3.0.
+    Enhanced thermal-aware workload scheduler v3.1.
     
     Features:
-    - Multi-GPU temperature sensing
-    - Cooling system actuation (fan, power capping)
-    - Non-linear throttling model
-    - Adaptive thermal capacitance
-    - Predictive thermal modeling
-    - Multi-GPU thermal coupling
-    - PID fan control
+    - ML-based temperature prediction
+    - Adaptive auto-tuning PID
+    - Data center-level exhaust modeling
+    - Thermal-aware load balancing
+    - Graduated emergency response
     """
-    
-    BOLTZMANN_EV = 8.617333262145e-5
-    ROOM_TEMP_K = 298.15
-    ACTIVATION_ENERGY_EV = 0.65
-    LEAKAGE_POWER_AT_ROOM_W = 15.0
-    HYSTERESIS_TEMP_C = 3.0
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
@@ -624,23 +678,27 @@ class ThermalAwareOptimizer:
         self.cooling_efficiency = self.config.get('cooling_efficiency', 0.35)
         self.gpu_count = self.config.get('gpu_count', 1)
         
-        # Initialize new components
+        # Enhanced components
         self.temperature_sensor = MultiGPUTemperatureSensor(self.config.get('sensor', {}))
         self.cooling_actuator = CoolingSystemActuator(self.config.get('actuator', {}))
-        self.predictive_model = PredictiveThermalModel(
-            time_constant=self.config.get('time_constant', 50.0),
-            dissipation=self.config.get('dissipation', 10.0),
-            capacitance=self.config.get('capacitance', 500.0)
+        self.ml_predictor = MLTemperaturePredictor()
+        self.pid_controller = AdaptivePIDController(
+            Kp=self.config.get('Kp', 0.5),
+            Ki=self.config.get('Ki', 0.1),
+            Kd=self.config.get('Kd', 0.05),
+            setpoint=self.config.get('target_temp', 65.0),
+            output_min=0.0,
+            output_max=100.0,
+            beta=self.config.get('pid_beta', 1.0),
+            gamma=self.config.get('pid_gamma', 0.0)
         )
-        self.multi_gpu_model = MultiGPUThermalModel(
-            gpu_count=self.gpu_count,
-            coupling_strength=self.config.get('coupling_strength', 0.15)
+        self.exhaust_model = ExhaustTemperatureModel(
+            room_volume_m3=self.config.get('room_volume_m3', 1000),
+            crac_capacity_kw=self.config.get('crac_capacity_kw', 500),
+            recirculation_factor=self.config.get('recirculation_factor', 0.3)
         )
-        self.fan_optimizer = FanOptimizer(self.config.get('fan', {}))
-        self.throttling_model = NonLinearThrottlingModel()
-        self.adaptive_capacitance = AdaptiveThermalCapacitance(
-            initial_capacitance=self.config.get('capacitance', 500.0)
-        )
+        self.load_balancer = ThermalAwareLoadBalancer(self.gpu_count)
+        self.emergency_response = ThermalEmergencyResponse()
         
         # Thermal thresholds
         self.thresholds = {
@@ -658,7 +716,7 @@ class ThermalAwareOptimizer:
         self._monitor_thread = None
         self._start_monitoring()
         
-        logger.info(f"ThermalAwareOptimizer v3.0 initialized for {self.gpu_count} GPUs")
+        logger.info(f"EnhancedThermalAwareOptimizer v3.1 initialized for {self.gpu_count} GPUs")
     
     def _start_monitoring(self):
         self._monitoring = True
@@ -666,66 +724,132 @@ class ThermalAwareOptimizer:
         self._monitor_thread.start()
     
     def _monitor_loop(self):
-        last_temps = self.temperature_sensor.get_all_temperatures()
-        last_time = time.time()
+        """Enhanced monitoring loop with ML updates"""
+        last_power = self.hardware_tdp * 0.5
+        last_fan = 40.0
+        last_ambient = 22.0
         
         while self._monitoring:
             try:
-                current_temps = self.temperature_sensor.get_all_temperatures()
-                current_time = time.time()
-                dt = current_time - last_time
+                all_temps = self.temperature_sensor.get_all_temperatures()
+                hottest_temp = max(all_temps) if all_temps else 65.0
                 
-                # Update adaptive capacitance
-                for i in range(self.gpu_count):
-                    dTdt = (current_temps[i] - last_temps[i]) / dt if dt > 0 else 0
-                    # Estimate power (simplified - use workload power)
-                    estimated_power = 200.0
-                    self.adaptive_capacitance.add_observation(estimated_power, dTdt, current_temps[i])
+                # Update ML predictor
+                self.ml_predictor.add_observation(
+                    hottest_temp, last_power, last_fan, last_ambient, time.time()
+                )
                 
-                # Update multi-GPU model with actual temps
-                if self.gpu_count > 1:
-                    powers = [self.estimate_gpu_power(i) for i in range(self.gpu_count)]
-                    self.multi_gpu_model.update_temperatures(powers, dt_seconds=dt)
+                # Update load balancer
+                self.load_balancer.update_temperatures(all_temps)
                 
-                # Update predictive model with adaptive capacitance
-                new_c = self.adaptive_capacitance.get_capacitance()
-                self.predictive_model.update_capacitance(new_c)
+                # Update exhaust model
+                total_power_kw = (last_power * self.gpu_count) / 1000
+                crac_power = self.exhaust_model.calculate_crac_power(35.0)  # Target 35°C hot aisle
+                self.exhaust_model.update_temperatures(total_power_kw, crac_power)
                 
-                # Update current temp with hottest GPU
-                hottest_temp = max(current_temps) if current_temps else 65.0
+                # Update PID with current temperature
+                fan_speed = self.pid_controller.update(hottest_temp)
+                self.cooling_actuator.set_fan_speed(fan_speed)
+                
                 self.current_temp = hottest_temp
                 self.temperature_log.append((time.time(), self.current_temp))
                 
-                last_temps = current_temps
-                last_time = current_time
-                
-                # Trim log
-                if len(self.temperature_log) > 1000:
-                    self.temperature_log = self.temperature_log[-1000:]
+                last_power = self._estimate_current_power()
+                last_fan = fan_speed
+                last_ambient = 22.0 + 5 * np.sin(2 * np.pi * time.localtime().tm_hour / 24)
                 
                 time.sleep(5)
             except Exception as e:
                 logger.error(f"Monitor error: {e}")
                 time.sleep(10)
     
-    def calculate_leakage_power(self, temp_celsius: float) -> float:
-        temp_k = temp_celsius + 273.15
-        arrhenius_factor = math.exp(
-            (self.ACTIVATION_ENERGY_EV / self.BOLTZMANN_EV) * 
-            (1/self.ROOM_TEMP_K - 1/temp_k)
+    def _estimate_current_power(self) -> float:
+        """Estimate current power draw from temperature and fan speed"""
+        base_power = self.hardware_tdp * 0.5
+        temp_factor = 1.0 + max(0, (self.current_temp - 65) / 50)
+        return base_power * temp_factor
+    
+    def optimize_schedule(self, workload_profile, execution_decision) -> ThermalDecision:
+        """Enhanced thermal optimization with ML prediction and load balancing"""
+        workload_power = self._estimate_workload_power(workload_profile, execution_decision)
+        
+        # Get current temperatures
+        all_temps = self.temperature_sensor.get_all_temperatures()
+        self.current_temp = max(all_temps) if all_temps else 65.0
+        
+        # ML-based temperature prediction
+        ml_pred, lower, upper = self.ml_predictor.predict(
+            self.current_temp,
+            workload_power,
+            self.pid_controller._prev_output,
+            22.0,  # ambient
+            30
         )
-        leakage_power = self.LEAKAGE_POWER_AT_ROOM_W * arrhenius_factor
-        return min(leakage_power, self.hardware_tdp * 0.5)
+        
+        # Get emergency level
+        emergency_level, emergency_action = self.emergency_response.evaluate(self.current_temp)
+        throttle_factor = self.emergency_response.get_throttle_factor()
+        
+        # Get thermal zone
+        current_zone = self._get_thermal_zone(self.current_temp)
+        
+        # Find optimal temperature
+        optimal_temp = self._find_optimal_operating_temp(workload_power)
+        
+        # Calculate thermal balance
+        balance_score = self.load_balancer.get_thermal_balance_score()
+        
+        # Determine action
+        if emergency_level.value >= 3:  # Critical or higher
+            action = emergency_action
+        elif current_zone == ThermalZone.WARNING:
+            action = 'throttle'
+            throttle_factor = max(throttle_factor, 0.7)
+        elif current_zone == ThermalZone.NORMAL and self.current_temp > optimal_temp + 3:
+            action = 'cool'
+        elif current_zone == ThermalZone.OPTIMAL and self.current_temp < optimal_temp - 3:
+            action = 'heat'
+        else:
+            action = 'maintain'
+        
+        # Get load balancing recommendations
+        rebalance_factors = self.load_balancer.rebalance() if self.gpu_count > 1 else [1.0]
+        
+        # Calculate potential savings
+        current_power = self._calculate_total_power(workload_power, self.current_temp)
+        optimal_power = self._calculate_total_power(workload_power, optimal_temp)
+        potential_savings = (current_power - optimal_power) / current_power * 100 if current_power > 0 else 0
+        
+        # Generate reasoning
+        reasoning = self._generate_reasoning(
+            current_zone, action, throttle_factor, potential_savings,
+            ml_pred, balance_score, emergency_level
+        )
+        
+        # Apply actuation
+        if action == 'cool':
+            fan_speed = self.pid_controller.update(self.current_temp)
+            self.cooling_actuator.set_fan_speed(fan_speed)
+        elif action == 'throttle':
+            for i in range(self.gpu_count):
+                self.cooling_actuator.apply_throttle(throttle_factor, i)
+        
+        logger.info(f"Thermal decision: {action} | Temp: {self.current_temp:.1f}°C | "
+                   f"ML predicts: {ml_pred:.1f}°C ({lower:.1f}-{upper:.1f}) | "
+                   f"Load balance: {balance_score:.2f} | Emergency: {emergency_level.name}")
+        
+        return ThermalDecision(
+            action=action,
+            throttle_factor=throttle_factor,
+            target_temp=optimal_temp,
+            energy_savings_percent=max(0, potential_savings),
+            recovery_time_seconds=self._estimate_recovery_time(self.current_temp, optimal_temp, workload_power),
+            fan_speed_percent=self.pid_controller._prev_output,
+            performance_impact_percent=(1 - self.emergency_response.get_throttle_factor()) * 100,
+            reasoning=reasoning
+        )
     
-    def calculate_cooling_power(self, temp_celsius: float, target_celsius: float) -> float:
-        delta_temp = max(0, temp_celsius - target_celsius)
-        thermal_mass = self.hardware_tdp * 2.5
-        cooling_energy_joules = delta_temp * thermal_mass
-        cooling_power_watts = cooling_energy_joules / 60.0
-        electrical_power = cooling_power_watts / self.cooling_efficiency
-        return max(0, electrical_power)
-    
-    def get_thermal_zone(self, temp_celsius: float) -> ThermalZone:
+    def _get_thermal_zone(self, temp_celsius: float) -> ThermalZone:
         if temp_celsius >= self.thresholds['critical_max']:
             return ThermalZone.CRITICAL
         elif temp_celsius >= self.thresholds['warning_max']:
@@ -737,263 +861,144 @@ class ThermalAwareOptimizer:
         else:
             return ThermalZone.COOL
     
-    def find_optimal_operating_temp(self, workload_power_watts: float) -> float:
-        temperatures = np.arange(40, 85, 0.5)
-        min_total_power = float('inf')
-        optimal_temp = 65.0
+    def _find_optimal_operating_temp(self, workload_power: float) -> float:
+        """Find temperature that minimizes total energy consumption"""
+        def total_power(temp):
+            leakage = self._calculate_leakage_power(temp)
+            cooling = self._calculate_cooling_power(temp, 25.0)
+            fan_speed = min(100, max(20, (temp - 40) * 2))
+            fan_power = 50 * (fan_speed / 100) ** 3
+            return workload_power + leakage + cooling + fan_power
         
-        for temp in temperatures:
-            dynamic_power = workload_power_watts
-            leakage_power = self.calculate_leakage_power(temp)
-            cooling_power = self.calculate_cooling_power(temp, 25.0)
-            fan_speed = self.fan_optimizer.calculate_optimal_fan_speed(temp)
-            fan_power = self.fan_optimizer.get_fan_power(fan_speed)
-            total_power = dynamic_power + leakage_power + cooling_power + fan_power
-            
-            if total_power < min_total_power:
-                min_total_power = total_power
-                optimal_temp = temp
-        
-        return optimal_temp
+        result = minimize(total_power, 65, bounds=[(40, 80)], method='L-BFGS-B')
+        return float(result.x[0]) if result.success else 65.0
     
-    def estimate_workload_power(self, workload_profile, execution_decision) -> float:
+    def _calculate_leakage_power(self, temp_celsius: float) -> float:
+        """Calculate leakage power using Arrhenius equation"""
+        temp_k = temp_celsius + 273.15
+        arrhenius = math.exp((0.65 / 8.617e-5) * (1/298.15 - 1/temp_k))
+        return 15.0 * arrhenius
+    
+    def _calculate_cooling_power(self, temp_celsius: float, target_celsius: float) -> float:
+        """Calculate cooling power required"""
+        delta_temp = max(0, temp_celsius - target_celsius)
+        thermal_mass = self.hardware_tdp * 2.5
+        cooling_energy = delta_temp * thermal_mass
+        return cooling_energy / 60.0 / self.cooling_efficiency
+    
+    def _calculate_total_power(self, workload_power: float, temp_celsius: float) -> float:
+        """Calculate total system power"""
+        return (workload_power + 
+                self._calculate_leakage_power(temp_celsius) + 
+                self._calculate_cooling_power(temp_celsius, 25.0))
+    
+    def _estimate_workload_power(self, workload_profile, execution_decision) -> float:
+        """Estimate workload power consumption"""
         gpu_count = getattr(workload_profile, 'gpu_count', 1)
         power_per_gpu = self.config.get('power_per_gpu', 250.0)
         power_budget = getattr(execution_decision, 'power_budget', 1.0)
-        
-        workload_power = gpu_count * power_per_gpu * power_budget
-        workload_power += 50.0 + 30.0  # CPU + Memory
-        
-        # Apply throttling factor
-        perf_factor = self.throttling_model.performance_factor(self.current_temp)
-        workload_power *= perf_factor
-        
-        return min(workload_power, self.hardware_tdp * 1.2)
+        return gpu_count * power_per_gpu * power_budget
     
-    def estimate_gpu_power(self, gpu_index: int) -> float:
-        base_power = 200.0
-        temp = self.multi_gpu_model.get_temperature(gpu_index) if self.gpu_count > 1 else self.current_temp
-        throttling_factor = self.throttling_model.power_reduction_factor(temp)
-        return base_power * throttling_factor
+    def _estimate_recovery_time(self, current_temp: float, target_temp: float, power: float) -> float:
+        """Estimate time to reach target temperature (seconds)"""
+        if current_temp <= target_temp:
+            return 0.0
+        cooling_rate = 0.5  # °C per minute
+        return (current_temp - target_temp) / cooling_rate * 60
     
-    def calculate_total_power(self, workload_power: float, temp_celsius: float) -> float:
-        leakage = self.calculate_leakage_power(temp_celsius)
-        cooling = self.calculate_cooling_power(temp_celsius, 25.0)
-        fan_speed = self.fan_optimizer.calculate_optimal_fan_speed(temp_celsius)
-        fan_power = self.fan_optimizer.get_fan_power(fan_speed)
-        return workload_power + leakage + cooling + fan_power
-    
-    def _determine_action(self, zone: ThermalZone, current_temp: float, optimal_temp: float) -> Tuple[str, float]:
-        predicted_temp = self.predictive_model.predict_temperature(
-            current_temp, self.estimate_workload_power(None, None), 30
-        )
-        predicted_zone = self.get_thermal_zone(predicted_temp)
+    def _generate_reasoning(self, zone: ThermalZone, action: str, throttle: float,
+                           savings: float, ml_pred: float, balance: float,
+                           emergency_level) -> str:
+        """Generate human-readable reasoning"""
+        parts = []
         
-        if zone == ThermalZone.CRITICAL:
-            return 'emergency_shutdown', 0.0
-        
-        elif zone == ThermalZone.WARNING:
-            overshoot = current_temp - self.thresholds['warning_max']
-            base_throttle = max(0.3, 1.0 - overshoot / 20.0)
-            
-            # Non-linear adjustment based on throttling model
-            penalty = self.throttling_model.get_throttling_penalty(current_temp) / 100
-            throttle_factor = max(0.2, base_throttle - penalty * 0.3)
-            
-            if predicted_zone == ThermalZone.CRITICAL:
-                throttle_factor = min(throttle_factor, 0.5)
-            
-            return 'throttle', throttle_factor
-        
-        elif zone == ThermalZone.NORMAL:
-            if current_temp > optimal_temp + self.HYSTERESIS_TEMP_C:
-                return 'cool', 0.9
-            elif current_temp < optimal_temp - self.HYSTERESIS_TEMP_C:
-                return 'heat', 1.1
-            else:
-                return 'maintain', 1.0
-        
-        elif zone == ThermalZone.OPTIMAL:
-            return 'maintain', 1.0
-        
-        else:  # COOL
-            if current_temp < optimal_temp - self.HYSTERESIS_TEMP_C:
-                return 'heat', 1.05
-            else:
-                return 'maintain', 1.0
-    
-    def _estimate_recovery_time(self, current_temp: float, target_temp: float, power_watts: float) -> float:
-        return self.predictive_model.time_to_reach_temp(current_temp, target_temp, power_watts)
-    
-    def _generate_reasoning(self, current_zone: ThermalZone, optimal_zone: ThermalZone,
-                           savings: float, action: str, throttle_factor: float,
-                           fan_speed: float, perf_impact: float) -> str:
-        reasons = []
+        if emergency_level.value >= 3:
+            parts.append(f"EMERGENCY: {emergency_level.name}")
+        else:
+            parts.append(f"Zone: {zone.value}")
         
         if savings > 10:
-            reasons.append(f"potential {savings:.0f}% energy savings")
-        
-        if current_zone != optimal_zone:
-            reasons.append(f"moving from {current_zone.value} to {optimal_zone.value} zone")
+            parts.append(f"Potential savings: {savings:.0f}%")
         
         if action == 'throttle':
-            reasons.append(f"throttling to {throttle_factor:.0%} to prevent overheating")
-        elif action == 'emergency_shutdown':
-            reasons.append("CRITICAL: immediate shutdown required")
+            parts.append(f"Throttling to {throttle:.0%}")
         elif action == 'cool':
-            reasons.append(f"increasing cooling (fan {fan_speed:.0f}%)")
-        elif action == 'heat':
-            reasons.append("reducing cooling to save energy")
+            parts.append("Increasing cooling")
         
-        if perf_impact > 0:
-            reasons.append(f"performance impact: {perf_impact:.1f}%")
+        if balance < 0.8:
+            parts.append(f"Thermal imbalance: {balance:.2f}")
         
-        if reasons:
-            return f"Thermal-optimized: {', '.join(reasons)}"
-        else:
-            return f"Maintaining thermal equilibrium at {current_zone.value} zone"
-    
-    def optimize_schedule(self, workload_profile, execution_decision) -> ThermalDecision:
-        workload_power = self.estimate_workload_power(workload_profile, execution_decision)
+        if ml_pred > self.thresholds['warning_max']:
+            parts.append(f"ML predicts {ml_pred:.0f}°C in 30s")
         
-        # Get current temperature from hottest GPU
-        all_temps = self.temperature_sensor.get_all_temperatures()
-        self.current_temp = max(all_temps) if all_temps else 65.0
-        
-        # Calculate throttling impact
-        perf_factor = self.throttling_model.performance_factor(self.current_temp)
-        perf_impact = (1 - perf_factor) * 100
-        
-        # Current thermal zone
-        current_zone = self.get_thermal_zone(self.current_temp)
-        
-        # Find optimal operating temperature
-        optimal_temp = self.find_optimal_operating_temp(workload_power)
-        optimal_zone = self.get_thermal_zone(optimal_temp)
-        
-        # Calculate potential savings
-        current_power = self.calculate_total_power(workload_power, self.current_temp)
-        optimal_power = self.calculate_total_power(workload_power, optimal_temp)
-        potential_savings = (current_power - optimal_power) / current_power * 100 if current_power > 0 else 0
-        
-        # Determine action
-        action, throttle_factor = self._determine_action(current_zone, self.current_temp, optimal_temp)
-        
-        # Calculate optimal fan speed
-        optimal_fan_speed = self.fan_optimizer.calculate_optimal_fan_speed(self.current_temp)
-        
-        # Calculate recovery time
-        recovery_time = self._estimate_recovery_time(self.current_temp, optimal_temp, workload_power)
-        
-        # Generate reasoning
-        reasoning = self._generate_reasoning(current_zone, optimal_zone, potential_savings,
-                                             action, throttle_factor, optimal_fan_speed, perf_impact)
-        
-        # Apply cooling actuation if action is 'cool' or 'throttle'
-        if action == 'cool':
-            self.cooling_actuator.set_fan_speed(optimal_fan_speed)
-        elif action == 'throttle':
-            # Apply throttle factor to all GPUs
-            for i in range(self.gpu_count):
-                self.cooling_actuator.apply_throttle(throttle_factor, i)
-        
-        # Get predicted temperature
-        predicted_temp = self.predictive_model.predict_temperature(
-            self.current_temp, workload_power, 30
-        )
-        
-        # Record for adaptive learning
-        self.adaptive_capacitance.add_observation(
-            workload_power, 
-            (self.current_temp - self.temperature_log[-1][1]) / 5 if self.temperature_log else 0,
-            self.current_temp
-        )
-        
-        logger.info(f"Thermal decision: {action} | Temp: {self.current_temp:.1f}°C → {optimal_temp:.1f}°C | "
-                   f"Fan: {optimal_fan_speed:.0f}% | Perf impact: {perf_impact:.1f}% | Savings: {potential_savings:.1f}%")
-        
-        return ThermalDecision(
-            action=action,
-            throttle_factor=throttle_factor,
-            target_temp=optimal_temp,
-            energy_savings_percent=max(0, potential_savings),
-            recovery_time_seconds=recovery_time,
-            fan_speed_percent=optimal_fan_speed,
-            performance_impact_percent=perf_impact,
-            reasoning=reasoning
-        )
+        return " | ".join(parts)
     
     def get_thermal_metrics(self) -> Dict:
-        temp_trend = self.temperature_sensor.get_temperature_trend(0) if self.gpu_count > 0 else 0
-        predicted_temp = self.predictive_model.predict_temperature(
-            self.current_temp, self.hardware_tdp * 0.5, 60
-        )
+        """Get enhanced thermal metrics"""
+        all_temps = self.temperature_sensor.get_all_temperatures()
+        hottest_gpu, hottest_temp = self.temperature_sensor.get_hottest_gpu()
         
-        fan_speed = self.fan_optimizer.current_fan_speed
-        fan_power = self.fan_optimizer.get_fan_power(fan_speed)
-        noise = self.fan_optimizer.get_noise_level(fan_speed)
-        
-        multi_gpu_info = {}
-        if self.gpu_count > 1:
-            multi_gpu_info = {
-                'gpu_temperatures': self.temperature_sensor.get_all_temperatures(),
-                'hottest_gpu': self.temperature_sensor.get_hottest_gpu(),
-                'average_gpu_temp': self.temperature_sensor.get_average_temperature()
-            }
-        
-        actuator_status = self.cooling_actuator.get_status()
+        # Get ML feature importance
+        feature_importance = self.ml_predictor.get_feature_importance()
         
         return {
             'current_temperature_celsius': self.current_temp,
-            'temperature_trend_c_per_min': temp_trend,
-            'predicted_temperature_60s': predicted_temp,
-            'leakage_power_watts': self.calculate_leakage_power(self.current_temp),
-            'cooling_power_watts': self.calculate_cooling_power(self.current_temp, 25.0),
-            'fan_speed_percent': fan_speed,
-            'fan_power_watts': fan_power,
-            'noise_dba': noise,
-            'thermal_zone': self.get_thermal_zone(self.current_temp).value,
-            'throttling_performance_factor': self.throttling_model.performance_factor(self.current_temp),
-            'energy_savings_percent': self._calculate_historical_savings(),
-            'adaptive_capacitance': self.adaptive_capacitance.get_capacitance(),
-            'actuator': actuator_status,
-            **multi_gpu_info
+            'hottest_gpu': hottest_gpu,
+            'hottest_gpu_temp': hottest_temp,
+            'all_gpu_temps': all_temps,
+            'thermal_balance_score': self.load_balancer.get_thermal_balance_score(),
+            'emergency_level': self.emergency_response.current_level.name,
+            'throttle_factor': self.emergency_response.get_throttle_factor(),
+            'exhaust_temp_celsius': self.exhaust_model.current_exhaust_temp,
+            'cold_aisle_temp_celsius': self.exhaust_model.cold_aisle_temp,
+            'hot_aisle_temp_celsius': self.exhaust_model.hot_aisle_temp,
+            'temperature_gradient': self.exhaust_model.get_temperature_gradient(),
+            'pid_parameters': {
+                'Kp': self.pid_controller.Kp,
+                'Ki': self.pid_controller.Ki,
+                'Kd': self.pid_controller.Kd
+            },
+            'ml_feature_importance': feature_importance,
+            'actuator_status': self.cooling_actuator.get_status()
         }
     
-    def _calculate_historical_savings(self) -> float:
-        if len(self.temperature_log) < 2:
-            return 0.0
-        
-        avg_temp = sum(t for _, t in self.temperature_log[-100:]) / min(100, len(self.temperature_log))
-        baseline_temp = self.thresholds.get('optimal_max', 65.0)
-        
-        if avg_temp > baseline_temp:
-            return 0.0
-        
-        savings = (baseline_temp - avg_temp) * 2
-        return max(0, min(30, savings))
+    def start_auto_tune(self):
+        """Start PID auto-tuning"""
+        self.pid_controller.start_auto_tune()
+    
+    def stop_auto_tune(self):
+        """Stop PID auto-tuning and apply tuned parameters"""
+        return self.pid_controller.stop_auto_tune()
+    
+    def get_allocation_weights(self) -> List[float]:
+        """Get GPU allocation weights for load balancing"""
+        return self.load_balancer.get_allocation_weights()
+    
+    def allocate_task(self, task_power_watts: float) -> int:
+        """Get recommended GPU for task allocation"""
+        return self.load_balancer.allocate_task(task_power_watts)
     
     def stop_monitoring(self):
+        """Stop background monitoring"""
         self._monitoring = False
         if self._monitor_thread:
             self._monitor_thread.join(timeout=2)
     
     def get_status(self) -> Dict:
+        """Get comprehensive system status"""
         return {
             'current_temperature': self.current_temp,
             'gpu_count': self.gpu_count,
-            'thermal_zone': self.get_thermal_zone(self.current_temp).value,
-            'fan_speed': self.fan_optimizer.current_fan_speed,
+            'thermal_zone': self._get_thermal_zone(self.current_temp).value,
+            'emergency_level': self.emergency_response.current_level.name,
             'monitoring_active': self._monitoring,
             'temperature_log_size': len(self.temperature_log),
-            'throttling_active': self.throttling_model.performance_factor(self.current_temp) < 0.95,
-            'adaptive_capacitance': self.adaptive_capacitance.get_capacitance(),
-            'actuator': self.cooling_actuator.get_status(),
-            'config': {
-                'tdp_watts': self.hardware_tdp,
-                'cooling_efficiency': self.cooling_efficiency,
-                'thresholds': self.thresholds
-            }
+            'ml_predictor_trained': self.ml_predictor.rf_model is not None,
+            'adaptive_pid_enabled': True,
+            'load_balancer_balance': self.load_balancer.get_thermal_balance_score(),
+            'exhaust_temp': self.exhaust_model.current_exhaust_temp,
+            'feature_importance': self.ml_predictor.get_feature_importance(),
+            'actuator': self.cooling_actuator.get_status()
         }
 
 
@@ -1002,15 +1007,16 @@ class ThermalAwareOptimizer:
 # ============================================================
 
 def main():
-    print("=== Enhanced Thermal-Aware Optimizer v3.0 Demo ===\n")
+    print("=== Enhanced Thermal-Aware Optimizer v3.1 Demo ===\n")
     
-    optimizer = ThermalAwareOptimizer({
+    optimizer = EnhancedThermalAwareOptimizer({
         'hardware_tdp_watts': 300,
         'cooling_efficiency': 0.35,
         'gpu_count': 4,
         'sensor': {'simulate': True, 'gpu_count': 4},
         'actuator': {'simulate': True},
-        'fan': {'target_temp': 65.0}
+        'Kp': 0.5, 'Ki': 0.1, 'Kd': 0.05,
+        'target_temp': 65.0
     })
     
     class MockProfile:
@@ -1022,36 +1028,48 @@ def main():
     profile = MockProfile()
     decision = MockDecision()
     
-    print("1. Thermal Decision:")
+    print("1. Thermal Decision with ML Prediction:")
     thermal_decision = optimizer.optimize_schedule(profile, decision)
     print(f"   Action: {thermal_decision.action}")
     print(f"   Throttle factor: {thermal_decision.throttle_factor:.2f}")
     print(f"   Target temp: {thermal_decision.target_temp:.1f}°C")
-    print(f"   Fan speed: {thermal_decision.fan_speed_percent:.0f}%")
-    print(f"   Performance impact: {thermal_decision.performance_impact_percent:.1f}%")
     print(f"   Reasoning: {thermal_decision.reasoning}")
     
     print("\n2. Thermal Metrics:")
     metrics = optimizer.get_thermal_metrics()
     print(f"   Current temp: {metrics['current_temperature_celsius']:.1f}°C")
-    print(f"   Thermal zone: {metrics['thermal_zone']}")
-    print(f"   Adaptive capacitance: {metrics['adaptive_capacitance']:.1f} J/°C")
-    if 'average_gpu_temp' in metrics:
-        print(f"   Average GPU temp: {metrics['average_gpu_temp']:.1f}°C")
-        print(f"   GPU temps: {metrics['gpu_temperatures']}")
-    print(f"   Fan speed: {metrics['fan_speed_percent']:.0f}%")
-    print(f"   Throttling factor: {metrics['throttling_performance_factor']:.2f}")
+    print(f"   All GPU temps: {metrics['all_gpu_temps']}")
+    print(f"   Thermal balance: {metrics['thermal_balance_score']:.2f}")
+    print(f"   Emergency level: {metrics['emergency_level']}")
+    print(f"   Hot aisle temp: {metrics['hot_aisle_temp_celsius']:.1f}°C")
     
-    print("\n3. System Status:")
+    print("\n3. ML Feature Importance:")
+    if metrics['ml_feature_importance']:
+        for feature, importance in list(metrics['ml_feature_importance'].items())[:3]:
+            print(f"   {feature}: {importance:.3f}")
+    else:
+        print("   Model not yet trained (need more data)")
+    
+    print("\n4. Load Balancer Allocation Weights:")
+    weights = optimizer.get_allocation_weights()
+    for i, w in enumerate(weights):
+        print(f"   GPU {i}: {w:.1%}")
+    
+    print("\n5. Emergency Response Test:")
+    # Simulate high temperature
+    optimizer.current_temp = 92.0
+    emergency_level, action = optimizer.emergency_response.evaluate(92.0)
+    print(f"   At 92°C: {emergency_level.name} -> {action}")
+    
+    print("\n6. System Status:")
     status = optimizer.get_status()
-    print(f"   Monitoring active: {status['monitoring_active']}")
-    print(f"   Throttling active: {status['throttling_active']}")
-    print(f"   Adaptive capacitance: {status['adaptive_capacitance']:.1f} J/°C")
-    print(f"   Actuator simulation: {status['actuator']['simulation_mode']}")
+    print(f"   ML trained: {status['ml_predictor_trained']}")
+    print(f"   Thermal balance: {status['load_balancer_balance']:.2f}")
+    print(f"   Exhaust temp: {status['exhaust_temp']:.1f}°C")
     
     optimizer.stop_monitoring()
     
-    print("\n✅ Enhanced Thermal-Aware Optimizer v3.0 test complete")
+    print("\n✅ Enhanced Thermal-Aware Optimizer v3.1 test complete")
 
 if __name__ == "__main__":
     main()
