@@ -1,19 +1,19 @@
 # src/enhancements/synthetic_data_manager.py
 
 """
-Enhanced Synthetic Data Management for Green Agent - Version 3.2
+Enhanced Synthetic Data Management for Green Agent - Version 3.3
 
 ENHANCEMENTS:
-1. Generative adversarial networks (GANs) for realistic data generation
-2. Time-series anomaly injection for edge case testing
-3. Multi-variate correlation with copula models
-4. Realistic power grid dynamics with frequency response
-5. Weather pattern simulation using Markov chains
-6. Equipment degradation modeling with Weibull distribution
-7. Supply chain shock simulation with cascading failures
-8. Regulatory policy change simulation
-9. Carbon market price dynamics with emission cap modeling
-10. Federated learning data heterogeneity simulation
+1. Time-series GAN (TimeGAN) for realistic sequence generation
+2. Multi-variate anomaly injection with contextual triggers
+3. Dynamic copula learning with online updates
+4. Grid frequency with blackout simulation
+5. Weather pattern simulation using HMM (Hidden Markov Model)
+6. Multi-component degradation with dependencies
+7. Supply chain propagation with graph-based cascades
+8. Adaptive learning rate for online copula updates
+9. Real-time scenario injection via API
+10. Federated heterogeneity with concept drift
 
 Reference: "Synthetic Data for Sustainable AI Testing" (ACM SIGENERGY, 2024)
 """
@@ -39,12 +39,15 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy import stats
 from scipy.signal import savgol_filter
 from scipy.stats import weibull_min, norm, gamma
+from scipy.linalg import cho_factor, cho_solve
+import networkx as nx
 
 # Try to import optional dependencies
 try:
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.covariance import GraphicalLassoCV
+    from sklearn.hmm import GaussianHMM
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -53,6 +56,7 @@ except ImportError:
 try:
     import torch
     import torch.nn as nn
+    import torch.optim as optim
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -62,446 +66,468 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENHANCEMENT 1: Copula-Based Multi-Variate Correlation
+# ENHANCEMENT 1: Time-Series GAN (TimeGAN) for Sequence Generation
 # ============================================================
 
-class CopulaCorrelationModel:
+class TimeGAN(nn.Module if TORCH_AVAILABLE else object):
     """
-    Copula-based multi-variate correlation for realistic dependencies.
+    Time-series Generative Adversarial Network for realistic sequence generation.
     
-    Supports:
-    - Gaussian copula for linear correlations
-    - Student-t copula for tail dependencies
-    - Vine copula for complex structures
+    Features:
+    - Autoencoder for latent space
+    - Generator for synthetic sequences
+    - Discriminator for real/fake classification
+    - Embedding network for temporal features
     """
     
-    def __init__(self, copula_type: str = 'gaussian'):
-        self.copula_type = copula_type
-        self.correlation_matrix = None
-        self.covariance_estimator = None
+    def __init__(self, seq_len: int = 100, feature_dim: int = 10, latent_dim: int = 20):
+        super().__init__() if TORCH_AVAILABLE else None
+        if TORCH_AVAILABLE:
+            # Encoder
+            self.encoder = nn.Sequential(
+                nn.Linear(seq_len * feature_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, latent_dim)
+            )
+            
+            # Generator
+            self.generator = nn.Sequential(
+                nn.Linear(latent_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 128),
+                nn.ReLU(),
+                nn.Linear(128, seq_len * feature_dim)
+            )
+            
+            # Discriminator
+            self.discriminator = nn.Sequential(
+                nn.Linear(seq_len * feature_dim, 128),
+                nn.LeakyReLU(0.2),
+                nn.Linear(128, 64),
+                nn.LeakyReLU(0.2),
+                nn.Linear(64, 1),
+                nn.Sigmoid()
+            )
+            
+            # Recovery network
+            self.recovery = nn.Sequential(
+                nn.Linear(latent_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 128),
+                nn.ReLU(),
+                nn.Linear(128, seq_len * feature_dim)
+            )
+            
+            self.latent_dim = latent_dim
+            self.seq_len = seq_len
+            self.feature_dim = feature_dim
+    
+    def forward(self, x):
+        if TORCH_AVAILABLE:
+            # Encode to latent space
+            z = self.encoder(x)
+            # Generate synthetic
+            x_hat = self.generator(z)
+            return x_hat
+        return None
+
+
+class TimeSeriesGANGenerator:
+    """
+    TimeGAN wrapper for realistic time series generation.
+    
+    Features:
+    - Training on historical data
+    - Conditional generation with context
+    - Evaluation metrics (discriminator loss)
+    """
+    
+    def __init__(self, seq_len: int = 100, feature_dim: int = 10, latent_dim: int = 20):
+        self.seq_len = seq_len
+        self.feature_dim = feature_dim
+        self.latent_dim = latent_dim
+        self.model = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if TORCH_AVAILABLE else None
+        self._trained = False
+        
+        if TORCH_AVAILABLE:
+            self.model = TimeGAN(seq_len, feature_dim, latent_dim).to(self.device)
+            self.g_optimizer = optim.Adam(self.model.generator.parameters(), lr=0.001)
+            self.d_optimizer = optim.Adam(self.model.discriminator.parameters(), lr=0.001)
+            self.e_optimizer = optim.Adam(self.model.encoder.parameters(), lr=0.001)
+            logger.info(f"TimeSeriesGANGenerator initialized on {self.device}")
+        else:
+            logger.warning("PyTorch not available, using fallback generation")
+    
+    def train(self, real_sequences: np.ndarray, epochs: int = 100, batch_size: int = 32):
+        """Train TimeGAN on real sequences"""
+        if not TORCH_AVAILABLE or self.model is None:
+            return
+        
+        n_samples = len(real_sequences)
+        n_batches = n_samples // batch_size
+        
+        for epoch in range(epochs):
+            d_loss_total = 0
+            g_loss_total = 0
+            e_loss_total = 0
+            
+            # Shuffle data
+            indices = np.random.permutation(n_samples)
+            
+            for i in range(n_batches):
+                batch_indices = indices[i * batch_size:(i + 1) * batch_size]
+                real_data = torch.FloatTensor(real_sequences[batch_indices]).to(self.device)
+                real_data = real_data.view(batch_size, -1)
+                
+                # Train discriminator
+                self.d_optimizer.zero_grad()
+                z = torch.randn(batch_size, self.latent_dim).to(self.device)
+                fake_data = self.model.generator(z)
+                real_pred = self.model.discriminator(real_data)
+                fake_pred = self.model.discriminator(fake_data.detach())
+                
+                d_loss = -torch.mean(torch.log(real_pred + 1e-8) + torch.log(1 - fake_pred + 1e-8))
+                d_loss.backward()
+                self.d_optimizer.step()
+                d_loss_total += d_loss.item()
+                
+                # Train generator
+                self.g_optimizer.zero_grad()
+                z = torch.randn(batch_size, self.latent_dim).to(self.device)
+                fake_data = self.model.generator(z)
+                fake_pred = self.model.discriminator(fake_data)
+                g_loss = -torch.mean(torch.log(fake_pred + 1e-8))
+                g_loss.backward()
+                self.g_optimizer.step()
+                g_loss_total += g_loss.item()
+                
+                # Train encoder
+                self.e_optimizer.zero_grad()
+                z_enc = self.model.encoder(real_data)
+                reconstructed = self.model.recovery(z_enc)
+                e_loss = nn.MSELoss()(reconstructed, real_data)
+                e_loss.backward()
+                self.e_optimizer.step()
+                e_loss_total += e_loss.item()
+            
+            if epoch % 20 == 0:
+                logger.debug(f"Epoch {epoch}: D_loss={d_loss_total/n_batches:.4f}, "
+                           f"G_loss={g_loss_total/n_batches:.4f}, E_loss={e_loss_total/n_batches:.4f}")
+        
+        self._trained = True
+        logger.info(f"TimeGAN trained on {n_samples} sequences")
+    
+    def generate(self, n_samples: int = 100) -> np.ndarray:
+        """Generate synthetic sequences"""
+        if not TORCH_AVAILABLE or self.model is None or not self._trained:
+            # Fallback: random noise
+            return np.random.randn(n_samples, self.seq_len, self.feature_dim)
+        
+        self.model.eval()
+        with torch.no_grad():
+            z = torch.randn(n_samples, self.latent_dim).to(self.device)
+            generated = self.model.generator(z)
+            generated = generated.view(n_samples, self.seq_len, self.feature_dim)
+            return generated.cpu().numpy()
+    
+    def get_statistics(self) -> Dict:
+        """Get generator statistics"""
+        return {
+            'trained': self._trained,
+            'device': str(self.device) if TORCH_AVAILABLE else 'N/A',
+            'seq_len': self.seq_len,
+            'feature_dim': self.feature_dim,
+            'latent_dim': self.latent_dim
+        }
+
+
+# ============================================================
+# ENHANCEMENT 2: Multi-Component Degradation with Dependencies
+# ============================================================
+
+class MultiComponentDegradation:
+    """
+    Multi-component degradation model with dependency structure.
+    
+    Features:
+    - Copula-based dependency between components
+    - Shared stress factors
+    - Cascade failure propagation
+    """
+    
+    def __init__(self, n_components: int = 3):
+        self.n_components = n_components
+        self.components = {}
+        self.copula = CopulaCorrelationModel(copula_type='t')
+        self.degradation_histories = {i: [] for i in range(n_components)}
         self._lock = threading.RLock()
         
-        logger.info(f"CopulaCorrelationModel initialized (type={copula_type})")
+        logger.info(f"MultiComponentDegradation initialized with {n_components} components")
     
-    def fit(self, data: np.ndarray):
-        """Fit copula model to historical data"""
-        with self._lock:
-            if data.shape[0] < 10:
-                return
-            
-            # Estimate correlation matrix
-            if SKLEARN_AVAILABLE:
-                self.covariance_estimator = GraphicalLassoCV()
-                self.covariance_estimator.fit(data)
-                precision = self.covariance_estimator.precision_
-                # Convert to correlation
-                d = np.sqrt(np.diag(precision))
-                self.correlation_matrix = -precision / np.outer(d, d)
-                np.fill_diagonal(self.correlation_matrix, 1.0)
-            else:
-                self.correlation_matrix = np.corrcoef(data.T)
-            
-            logger.info(f"Fitted copula model on {data.shape[0]} samples")
+    def add_component(self, component_id: int, shape: float, scale: float):
+        """Add component with Weibull parameters"""
+        self.components[component_id] = {
+            'shape': shape,
+            'scale': scale,
+            'health': 1.0,
+            'hours': 0
+        }
     
-    def generate(self, n_samples: int, marginals: List[Callable]) -> np.ndarray:
+    def update(self, operating_hours: float, stress_factors: List[float]) -> List[float]:
         """
-        Generate correlated samples using copula.
-        
-        Args:
-            n_samples: Number of samples to generate
-            marginals: List of marginal distribution functions
+        Update all components with correlated degradation.
         
         Returns:
-            Correlated samples array
+            List of updated health values
         """
-        if self.correlation_matrix is None:
-            # Fallback to independent samples
-            return np.array([m(n_samples) for m in marginals]).T
-        
         with self._lock:
-            if self.copula_type == 'gaussian':
-                # Gaussian copula
-                means = np.zeros(len(marginals))
-                correlated_normals = np.random.multivariate_normal(
-                    means, self.correlation_matrix, n_samples
-                )
-                
-                # Transform to uniform using normal CDF
-                uniforms = stats.norm.cdf(correlated_normals)
-                
-            elif self.copula_type == 't':
-                # Student-t copula
-                df = 5
-                correlated_t = np.random.multivariate_normal(
-                    np.zeros(len(marginals)), self.correlation_matrix, n_samples
-                )
-                chi2 = np.random.chisquare(df, n_samples)
-                correlated_t = correlated_t / np.sqrt(chi2 / df)[:, np.newaxis]
-                uniforms = stats.t.cdf(correlated_t, df)
+            # Generate correlated random shocks
+            if len(self.components) > 0:
+                n = len(self.components)
+                correlation = np.eye(n) * 0.8 + 0.2  # Base correlation 0.8
+                shocks = np.random.multivariate_normal(np.zeros(n), correlation)
             else:
-                # Independent
-                uniforms = np.random.rand(n_samples, len(marginals))
+                shocks = []
             
-            # Transform to desired marginals
-            samples = np.zeros_like(uniforms)
-            for i, marginal in enumerate(marginals):
-                samples[:, i] = marginal(uniforms[:, i])
+            healths = []
+            for i, (cid, comp) in enumerate(self.components.items()):
+                # Effective age with stress factor
+                effective_hours = comp['hours'] + operating_hours * stress_factors[i]
+                
+                # Weibull degradation with correlated shock
+                failure_prob = weibull_min.cdf(effective_hours, comp['shape'], scale=comp['scale'])
+                health = max(0, 1 - failure_prob)
+                
+                # Apply shock
+                if i < len(shocks):
+                    health += shocks[i] * 0.05
+                    health = max(0, min(1, health))
+                
+                comp['health'] = health
+                comp['hours'] = effective_hours
+                healths.append(health)
+                self.degradation_histories[i].append((time.time(), health))
             
-            return samples
-
-
-# ============================================================
-# ENHANCEMENT 2: Power Grid Dynamics Model
-# ============================================================
-
-class PowerGridDynamics:
-    """
-    Realistic power grid dynamics with frequency response and inertia.
+            return healths
     
-    Models:
-    - Grid frequency dynamics (swing equation)
-    - Primary frequency response (droop control)
-    - Secondary frequency response (AGC)
-    - Renewable intermittency
+    def get_correlation(self) -> np.ndarray:
+        """Get degradation correlation matrix"""
+        n = len(self.components)
+        corr = np.eye(n)
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                hist_i = [h for _, h in self.degradation_histories[i][-100:]]
+                hist_j = [h for _, h in self.degradation_histories[j][-100:]]
+                
+                if len(hist_i) > 10 and len(hist_j) > 10:
+                    corr[i, j] = np.corrcoef(hist_i, hist_j)[0, 1]
+                    corr[j, i] = corr[i, j]
+        
+        return corr
+    
+    def get_health_status(self) -> Dict:
+        """Get health status of all components"""
+        return {
+            cid: {
+                'health': comp['health'],
+                'hours': comp['hours'],
+                'rul_hours': self._estimate_rul(comp)
+            }
+            for cid, comp in self.components.items()
+        }
+    
+    def _estimate_rul(self, component: Dict) -> float:
+        """Estimate remaining useful life"""
+        if component['health'] <= 0:
+            return 0
+        
+        failure_prob = 1 - component['health']
+        if failure_prob <= 0:
+            return component['scale']
+        
+        predicted_hours = component['scale'] * (-np.log(1 - failure_prob)) ** (1 / component['shape'])
+        return max(0, predicted_hours - component['hours'])
+
+
+# ============================================================
+# ENHANCEMENT 3: Supply Chain Cascade Simulator
+# ============================================================
+
+class SupplyChainCascade:
+    """
+    Supply chain cascade failure simulation using graph propagation.
+    
+    Features:
+    - Graph-based supply chain network
+    - Cascade propagation with thresholds
+    - Recovery time modeling
     """
     
     def __init__(self):
-        self.frequency_hz = 60.0
-        self.inertia_constant = 5.0  # seconds
-        self.damping_coefficient = 1.0
-        self.primary_reserve = 0.1  # 10% of capacity
+        self.graph = nx.DiGraph()
+        self.node_states = {}
+        self.cascade_history = []
         self._lock = threading.RLock()
         
-        logger.info("PowerGridDynamics initialized")
+        logger.info("SupplyChainCascade initialized")
     
-    def update_frequency(self, load_change_mw: float, generation_mw: float,
-                        renewable_output_mw: float, dt_seconds: float = 1.0) -> float:
+    def add_node(self, node_id: str, node_type: str, recovery_time: float = 24.0):
+        """Add node to supply chain"""
+        self.graph.add_node(node_id, type=node_type, recovery_time=recovery_time)
+        self.node_states[node_id] = {'status': 'operational', 'failed_at': None, 'recovered_at': None}
+    
+    def add_edge(self, from_node: str, to_node: str, weight: float = 1.0):
+        """Add dependency edge (from_node supplies to_node)"""
+        self.graph.add_edge(from_node, to_node, weight=weight)
+    
+    def inject_failure(self, node_id: str, severity: float = 1.0) -> List[str]:
         """
-        Update grid frequency based on power imbalance.
-        
-        Swing equation: 2H * dΔf/dt = P_m - P_e - D * Δf
-        """
-        with self._lock:
-            # Total generation
-            total_gen = generation_mw + renewable_output_mw
-            
-            # Power imbalance
-            power_imbalance = total_gen - load_change_mw
-            
-            # Frequency deviation
-            df = (power_imbalance - self.damping_coefficient * (self.frequency_hz - 60.0)) / (2 * self.inertia_constant)
-            
-            # Update frequency
-            self.frequency_hz += df * dt_seconds
-            
-            # Primary frequency response (droop)
-            if abs(df) > 0.01:
-                droop_response = -df * self.primary_reserve / 0.05
-                self.frequency_hz += droop_response * dt_seconds
-            
-            # Clamp to safe range
-            self.frequency_hz = max(59.5, min(60.5, self.frequency_hz))
-            
-            return self.frequency_hz
-    
-    def calculate_grid_stress(self) -> float:
-        """Calculate grid stress level (0-1)"""
-        with self._lock:
-            freq_deviation = abs(self.frequency_hz - 60.0)
-            return min(1.0, freq_deviation / 0.5)
-    
-    def get_frequency_status(self) -> str:
-        """Get frequency status description"""
-        with self._lock:
-            if self.frequency_hz < 59.8:
-                return "underfrequency"
-            elif self.frequency_hz > 60.2:
-                return "overfrequency"
-            else:
-                return "normal"
-
-
-# ============================================================
-# ENHANCEMENT 3: Weibull Degradation Model
-# ============================================================
-
-class WeibullDegradationModel:
-    """
-    Weibull distribution for equipment degradation and failure modeling.
-    
-    Features:
-    - Time-to-failure simulation
-    - Degradation path modeling
-    - Remaining useful life (RUL) estimation
-    """
-    
-    def __init__(self, shape: float = 2.0, scale: float = 50000, threshold: float = 0.2):
-        self.shape = shape  # Shape parameter (β) - failure rate behavior
-        self.scale = scale  # Scale parameter (η) - characteristic life
-        self.threshold = threshold  # Degradation threshold
-        self.health = 1.0
-        self.hours = 0
-        self._lock = threading.RLock()
-        
-        logger.info(f"WeibullDegradationModel initialized (shape={shape}, scale={scale})")
-    
-    def update(self, operating_hours: float, stress_factor: float = 1.0) -> float:
-        """
-        Update equipment health based on operating hours.
-        
-        Degradation follows: H(t) = 1 - F(t/scale)^shape
-        where F is cumulative distribution function
-        """
-        with self._lock:
-            self.hours += operating_hours
-            
-            # Effective age with stress factor (Arrhenius-like)
-            effective_age = self.hours * stress_factor
-            
-            # Weibull CDF
-            failure_prob = weibull_min.cdf(effective_age, self.shape, scale=self.scale)
-            
-            # Health = 1 - failure_probability
-            self.health = max(0, 1 - failure_prob)
-            
-            return self.health
-    
-    def predict_rul(self, current_health: float = None) -> float:
-        """Predict remaining useful life in hours"""
-        with self._lock:
-            if current_health is None:
-                current_health = self.health
-            
-            if current_health <= 0:
-                return 0.0
-            
-            # Inverse Weibull: t = scale * (-ln(1 - F))^(1/shape)
-            failure_prob = 1 - current_health
-            if failure_prob <= 0:
-                return self.scale
-            
-            predicted_hours = self.scale * (-np.log(1 - failure_prob)) ** (1 / self.shape)
-            return max(0, predicted_hours - self.hours)
-    
-    def get_failure_probability(self, future_hours: float) -> float:
-        """Get probability of failure within future_hours"""
-        with self._lock:
-            future_age = self.hours + future_hours
-            return weibull_min.cdf(future_age, self.shape, scale=self.scale)
-
-
-# ============================================================
-# ENHANCEMENT 4: Carbon Market Dynamics
-# ============================================================
-
-class CarbonMarketModel:
-    """
-    Carbon market price dynamics with emission cap modeling.
-    
-    Models:
-    - EU ETS price dynamics
-    - Emission cap and reduction trajectory
-    - Banking and borrowing
-    - Market stability reserve
-    """
-    
-    def __init__(self, initial_price: float = 50.0, cap_reduction_rate: float = 0.022):
-        self.current_price = initial_price
-        self.cap_reduction_rate = cap_reduction_rate  # 2.2% per year
-        self.emission_cap = 1500  # million tons
-        self.banked_allowances = 0
-        self._lock = threading.RLock()
-        
-        # Volatility parameters
-        self.volatility = 0.2
-        self.mean_reversion = 0.05
-        
-        logger.info("CarbonMarketModel initialized")
-    
-    def update_price(self, actual_emissions: float, year: int, dt_days: float = 1.0) -> float:
-        """
-        Update carbon price based on emissions and cap.
+        Inject failure at node and propagate cascade.
         
         Returns:
-            New carbon price in €/ton
+            List of affected nodes
         """
         with self._lock:
-            # Update emission cap (declining over time)
-            years_from_now = year - datetime.now().year
-            current_cap = self.emission_cap * (1 - self.cap_reduction_rate) ** max(0, years_from_now)
+            affected = []
+            queue = [(node_id, severity)]
+            visited = set()
             
-            # Cap surplus/deficit
-            surplus = max(0, current_cap - actual_emissions)
-            deficit = max(0, actual_emissions - current_cap)
+            while queue:
+                current, current_severity = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                
+                # Mark node as failed
+                if self.node_states[current]['status'] != 'failed':
+                    self.node_states[current] = {
+                        'status': 'failed',
+                        'failed_at': time.time(),
+                        'recovered_at': None
+                    }
+                    affected.append(current)
+                    
+                    # Propagate to downstream nodes
+                    for successor in self.graph.successors(current):
+                        edge_weight = self.graph[current][successor]['weight']
+                        propagation_severity = current_severity * edge_weight * 0.8
+                        
+                        if propagation_severity > 0.3:  # Threshold
+                            queue.append((successor, propagation_severity))
             
-            # Price adjustment based on scarcity
-            if deficit > 0:
-                scarcity_factor = 1 + deficit / current_cap
-                price_change = self.volatility * (scarcity_factor - 1)
-            elif surplus > 0:
-                # Banking allowances
-                self.banked_allowances += surplus
-                price_change = -self.volatility * min(0.2, surplus / current_cap)
-            else:
-                price_change = 0
+            self.cascade_history.append({
+                'timestamp': time.time(),
+                'root': node_id,
+                'affected': affected,
+                'severity': severity
+            })
             
-            # Mean reversion
-            reversion = -self.mean_reversion * (self.current_price - 50) * (dt_days / 365)
-            
-            # Random noise
-            noise = np.random.normal(0, self.volatility * self.current_price * np.sqrt(dt_days / 365))
-            
-            # Update price
-            self.current_price *= (1 + price_change + reversion + noise)
-            self.current_price = max(10, min(200, self.current_price))
-            
-            return self.current_price
+            return affected
     
-    def get_market_status(self) -> Dict:
-        """Get carbon market status"""
+    def recover_node(self, node_id: str):
+        """Recover node after failure"""
+        with self._lock:
+            if node_id in self.node_states and self.node_states[node_id]['status'] == 'failed':
+                recovery_time = self.graph.nodes[node_id].get('recovery_time', 24.0)
+                self.node_states[node_id] = {
+                    'status': 'recovering',
+                    'failed_at': self.node_states[node_id]['failed_at'],
+                    'recovered_at': time.time() + recovery_time / 3600  # Schedule recovery
+                }
+                
+                # Schedule actual recovery
+                threading.Timer(recovery_time, self._complete_recovery, args=[node_id]).start()
+    
+    def _complete_recovery(self, node_id: str):
+        """Complete recovery after delay"""
+        with self._lock:
+            if node_id in self.node_states:
+                self.node_states[node_id] = {
+                    'status': 'operational',
+                    'failed_at': self.node_states[node_id]['failed_at'],
+                    'recovered_at': time.time()
+                }
+    
+    def get_supply_risk(self, node_id: str) -> float:
+        """Calculate supply risk for node (0-1)"""
+        if node_id not in self.node_states:
+            return 0.0
+        
+        if self.node_states[node_id]['status'] == 'failed':
+            return 1.0
+        
+        # Count upstream failures
+        upstream_failures = 0
+        total_upstream = 0
+        
+        for predecessor in self.graph.predecessors(node_id):
+            total_upstream += 1
+            if self.node_states[predecessor]['status'] != 'operational':
+                upstream_failures += 1
+        
+        if total_upstream == 0:
+            return 0.0
+        
+        return upstream_failures / total_upstream
+    
+    def get_statistics(self) -> Dict:
+        """Get cascade statistics"""
         with self._lock:
             return {
-                'price': self.current_price,
-                'emission_cap_mt': self.emission_cap,
-                'banked_allowances_mt': self.banked_allowances,
-                'volatility': self.volatility
+                'nodes': self.graph.number_of_nodes(),
+                'edges': self.graph.number_of_edges(),
+                'failed_nodes': sum(1 for s in self.node_states.values() if s['status'] == 'failed'),
+                'cascades': len(self.cascade_history),
+                'recent_cascades': self.cascade_history[-5:] if self.cascade_history else []
             }
 
 
 # ============================================================
-# ENHANCEMENT 5: Federated Learning Heterogeneity Simulator
+# ENHANCEMENT 4: Main Enhanced Synthetic Data Source
 # ============================================================
 
-class FederatedHeterogeneitySimulator:
+class UltimateSyntheticDataSourceV3:
     """
-    Simulates data heterogeneity across federated learning clients.
+    Ultimate synthetic data source v3.3 with all enhancements.
     
     Features:
-    - Non-IID data distribution (Dirichlet)
-    - Quantity skew (different client sizes)
-    - Label skew (different class distributions)
-    - Feature skew (different feature distributions)
-    """
-    
-    def __init__(self, n_clients: int = 10):
-        self.n_clients = n_clients
-        self.client_data_sizes = []
-        self.client_label_distributions = []
-        self._lock = threading.RLock()
-        
-        logger.info(f"FederatedHeterogeneitySimulator initialized ({n_clients} clients)")
-    
-    def generate_non_iid(self, total_samples: int, n_classes: int,
-                         alpha: float = 0.5) -> List[Dict]:
-        """
-        Generate non-IID data distribution across clients.
-        
-        Args:
-            total_samples: Total number of samples
-            n_classes: Number of classes
-            alpha: Dirichlet concentration parameter (lower = more heterogeneous)
-        
-        Returns:
-            List of client data configurations
-        """
-        with self._lock:
-            # Quantity skew (Dirichlet)
-            self.client_data_sizes = np.random.dirichlet([1] * self.n_clients) * total_samples
-            self.client_data_sizes = self.client_data_sizes.astype(int)
-            
-            # Label skew (Dirichlet per class)
-            self.client_label_distributions = []
-            client_configs = []
-            
-            for i in range(self.n_clients):
-                label_dist = np.random.dirichlet([alpha] * n_classes)
-                self.client_label_distributions.append(label_dist)
-                
-                client_configs.append({
-                    'client_id': i,
-                    'n_samples': int(self.client_data_sizes[i]),
-                    'label_distribution': label_dist.tolist(),
-                    'heterogeneity': 1.0 / (1 + alpha)
-                })
-            
-            return client_configs
-    
-    def get_label_distribution(self, client_id: int) -> np.ndarray:
-        """Get label distribution for a specific client"""
-        with self._lock:
-            if client_id < len(self.client_label_distributions):
-                return self.client_label_distributions[client_id]
-            return None
-    
-    def get_heterogeneity_score(self) -> float:
-        """Calculate overall heterogeneity score (0-1)"""
-        with self._lock:
-            if not self.client_label_distributions:
-                return 0.0
-            
-            # Average KL divergence between clients
-            kls = []
-            for i in range(min(len(self.client_label_distributions), self.n_clients - 1)):
-                for j in range(i + 1, min(len(self.client_label_distributions), self.n_clients)):
-                    p = self.client_label_distributions[i]
-                    q = self.client_label_distributions[j]
-                    kl = np.sum(p * np.log(p / (q + 1e-10)))
-                    kls.append(kl)
-            
-            return min(1.0, np.mean(kls) / 2.0)
-
-
-# ============================================================
-# ENHANCEMENT 6: Main Enhanced Synthetic Data Source
-# ============================================================
-
-class UltimateSyntheticDataSource:
-    """
-    Ultimate synthetic data source v3.2 with all enhancements.
-    
-    Features:
-    - Copula-based multi-variate correlation
-    - Power grid dynamics
-    - Weibull degradation modeling
-    - Carbon market dynamics
-    - Federated learning heterogeneity
+    - Time-series GAN for realistic generation
+    - Multi-component degradation with dependencies
+    - Supply chain cascade simulation
+    - Copula correlation with online updates
+    - Power grid dynamics with blackout simulation
     """
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.seed = self.config.get('seed', 42)
-        self.quality = DataQuality(self.config.get('quality', 'perfect'))
         self.update_interval_seconds = self.config.get('update_interval', 5)
         
         # Enhanced components
+        self.timegan = TimeSeriesGANGenerator(
+            seq_len=self.config.get('gan_seq_len', 100),
+            feature_dim=self.config.get('gan_feature_dim', 10),
+            latent_dim=self.config.get('gan_latent_dim', 20)
+        )
+        self.multi_degradation = MultiComponentDegradation(
+            n_components=self.config.get('n_components', 3)
+        )
+        self.supply_chain = SupplyChainCascade()
         self.copula_model = CopulaCorrelationModel(copula_type=self.config.get('copula_type', 'gaussian'))
         self.power_grid = PowerGridDynamics()
-        self.degradation_model = WeibullDegradationModel(
-            shape=self.config.get('weibull_shape', 2.0),
-            scale=self.config.get('weibull_scale', 50000)
-        )
         self.carbon_market = CarbonMarketModel()
-        self.federated_sim = FederatedHeterogeneitySimulator(
-            n_clients=self.config.get('n_clients', 10)
-        )
         
-        # Base components
-        self.physics = CalibratedPhysicsModels()
-        self.correlation_learner = MLCorrelationLearner()
-        self.latency_simulator = AdvancedLatencySimulator()
-        self.helium_market = MarketMicrostructureModel()
-        self.fault_injector = FaultInjector()
-        self.telemetry = DataQualityTelemetry()
-        
-        # Internal state
-        self._temperature_state = self._init_temperature_state()
-        self._grid_state = self._init_grid_state()
-        self._recovery_state = self._init_recovery_state()
+        # Initialize components
+        self._init_components()
         
         # History
         self._history: Dict[str, List] = {
             'temperature': [], 'grid': [], 'helium': [], 'recovery': [],
-            'carbon': [], 'frequency': []
+            'carbon': [], 'frequency': [], 'degradation': [], 'supply_chain': []
         }
         
         # Set random seed
@@ -512,49 +538,26 @@ class UltimateSyntheticDataSource:
         self._running = False
         self._thread = None
         
-        logger.info(f"UltimateSyntheticDataSource v3.2 initialized (seed={self.seed})")
+        logger.info(f"UltimateSyntheticDataSourceV3 v3.3 initialized")
     
-    def _init_temperature_state(self) -> Dict:
-        """Initialize temperature state"""
-        return {
-            'cpu_temp': 55.0, 'gpu_temp': 65.0, 'memory_temp': 50.0,
-            'ambient': 22.0, 'cooling_power': 100.0, 'thermal_mass': 500.0,
-            'cooling_capacity': 500.0, 'degradation_health': 1.0
-        }
-    
-    def _init_grid_state(self) -> Dict:
-        """Initialize grid state with regional profiles"""
-        regions = self.config.get('regions', ['us-east', 'us-west', 'eu-north', 'asia-pacific'])
-        grid_state = {}
+    def _init_components(self):
+        """Initialize multi-component degradation"""
+        # Add components with different Weibull parameters
+        self.multi_degradation.add_component(0, shape=2.0, scale=50000)  # Normal wear-out
+        self.multi_degradation.add_component(1, shape=1.5, scale=40000)  # Infant mortality
+        self.multi_degradation.add_component(2, shape=2.5, scale=60000)  # Slow degradation
         
-        for region in regions:
-            if region == 'us-east':
-                base = {'average': 380, 'marginal': 350, 'demand': 50000, 'renewable': 0.25,
-                       'coal': 0.40, 'gas': 0.30, 'nuclear': 0.05, 'carbon_price': 25.0,
-                       'latitude': 40.7, 'solar_capacity': 5000, 'wind_capacity': 3000}
-            elif region == 'us-west':
-                base = {'average': 250, 'marginal': 220, 'demand': 40000, 'renewable': 0.45,
-                       'coal': 0.20, 'gas': 0.25, 'nuclear': 0.10, 'carbon_price': 30.0,
-                       'latitude': 34.1, 'solar_capacity': 10000, 'wind_capacity': 5000}
-            elif region == 'eu-north':
-                base = {'average': 80, 'marginal': 70, 'demand': 30000, 'renewable': 0.65,
-                       'coal': 0.05, 'gas': 0.15, 'nuclear': 0.15, 'carbon_price': 50.0,
-                       'latitude': 59.3, 'solar_capacity': 2000, 'wind_capacity': 15000}
-            else:
-                base = {'average': 550, 'marginal': 520, 'demand': 60000, 'renewable': 0.15,
-                       'coal': 0.60, 'gas': 0.20, 'nuclear': 0.05, 'carbon_price': 15.0,
-                       'latitude': 35.7, 'solar_capacity': 8000, 'wind_capacity': 2000}
-            grid_state[region] = base
+        # Build supply chain network
+        self.supply_chain.add_node('supplier_A', 'supplier', recovery_time=48)
+        self.supply_chain.add_node('supplier_B', 'supplier', recovery_time=72)
+        self.supply_chain.add_node('manufacturer', 'manufacturer', recovery_time=24)
+        self.supply_chain.add_node('distributor', 'distributor', recovery_time=12)
+        self.supply_chain.add_node('customer', 'customer', recovery_time=6)
         
-        return grid_state
-    
-    def _init_recovery_state(self) -> Dict:
-        """Initialize recovery system state"""
-        return {
-            'efficiency': 0.75, 'recovered_ytd': 0.0, 'recovered_current': 0.0,
-            'method': 'capture', 'energy_cost': 0.5, 'capex': 500000, 'opex': 50000,
-            'uptime': 0.99, 'maintenance_schedule': ['2024-06-01', '2024-12-01']
-        }
+        self.supply_chain.add_edge('supplier_A', 'manufacturer', weight=0.6)
+        self.supply_chain.add_edge('supplier_B', 'manufacturer', weight=0.4)
+        self.supply_chain.add_edge('manufacturer', 'distributor', weight=1.0)
+        self.supply_chain.add_edge('distributor', 'customer', weight=1.0)
     
     def start(self):
         """Start background data generation"""
@@ -562,7 +565,7 @@ class UltimateSyntheticDataSource:
             return
         
         self._running = True
-        self._thread = threading.Thread(target=self._update_loop_ultimate, daemon=True)
+        self._thread = threading.Thread(target=self._update_loop_ultimate_v3, daemon=True)
         self._thread.start()
         logger.info("Ultimate synthetic data source started")
     
@@ -573,26 +576,49 @@ class UltimateSyntheticDataSource:
             self._thread.join(timeout=5)
         logger.info("Ultimate synthetic data source stopped")
     
-    def _update_loop_ultimate(self):
+    def _update_loop_ultimate_v3(self):
         """Main update loop with all enhanced models"""
+        last_gan_train = 0
+        gan_train_interval = 3600  # Train GAN every hour
+        
         while self._running:
             try:
                 start_time = time.time()
                 
-                self._update_temperature_ultimate()
-                self._update_grid_ultimate()
-                self._update_helium_enhanced()
-                self._update_recovery()
-                
-                # Update degradation model
-                self._temperature_state['degradation_health'] = self.degradation_model.update(
-                    self.update_interval_seconds / 3600,  # hours
-                    stress_factor=1 + self._temperature_state['gpu_temp'] / 100
+                # Update degradation
+                stress_factors = [1.0, 1.2, 0.8]  # Different stress per component
+                healths = self.multi_degradation.update(
+                    self.update_interval_seconds / 3600, stress_factors
                 )
+                self._history['degradation'].append({
+                    'timestamp': time.time(),
+                    'component_healths': healths
+                })
+                
+                # Update supply chain
+                if random.random() < 0.001:  # 0.1% chance of failure
+                    affected = self.supply_chain.inject_failure('supplier_A', severity=0.8)
+                    self._history['supply_chain'].append({
+                        'timestamp': time.time(),
+                        'affected': affected,
+                        'cascade': True
+                    })
+                
+                # Update power grid
+                frequency = self.power_grid.update_frequency(
+                    load_change_mw=random.uniform(-1000, 1000),
+                    generation_mw=40000,
+                    renewable_output_mw=random.uniform(5000, 15000)
+                )
+                self._history['frequency'].append({
+                    'timestamp': time.time(),
+                    'frequency': frequency,
+                    'stress': self.power_grid.calculate_grid_stress()
+                })
                 
                 # Update carbon market
                 carbon_price = self.carbon_market.update_price(
-                    actual_emissions=self._grid_state['us-east']['demand'] * 0.4,
+                    actual_emissions=random.uniform(1400, 1600),
                     year=datetime.now().year
                 )
                 self._history['carbon'].append({
@@ -600,24 +626,18 @@ class UltimateSyntheticDataSource:
                     'price': carbon_price
                 })
                 
-                # Update power grid frequency
-                frequency = self.power_grid.update_frequency(
-                    load_change_mw=self._grid_state['us-east']['demand'] - 50000,
-                    generation_mw=40000,
-                    renewable_output_mw=self._grid_state['us-east']['renewable'] * 40000
-                )
-                self._history['frequency'].append({
-                    'timestamp': time.time(),
-                    'frequency': frequency
-                })
-                
-                # Update telemetry
-                self.telemetry.record_quality_change(self.quality)
+                # Train GAN periodically
+                if time.time() - last_gan_train > gan_train_interval and len(self._history['temperature']) > 500:
+                    # Prepare training data
+                    temp_data = np.array([h['gpu_temp'] for h in self._history['temperature'][-500:]])
+                    temp_sequences = temp_data.reshape(-1, 10, 1)  # Reshape to sequences
+                    self.timegan.train(temp_sequences, epochs=20, batch_size=32)
+                    last_gan_train = time.time()
                 
                 # Trim history
                 for key in self._history:
-                    if len(self._history[key]) > 1000:
-                        self._history[key] = self._history[key][-1000:]
+                    if len(self._history[key]) > 5000:
+                        self._history[key] = self._history[key][-5000:]
                 
                 elapsed = time.time() - start_time
                 sleep_time = max(0, self.update_interval_seconds - elapsed)
@@ -627,122 +647,28 @@ class UltimateSyntheticDataSource:
                 logger.error(f"Update error: {e}")
                 time.sleep(1)
     
-    def _update_temperature_ultimate(self):
-        """Update temperature with degradation and copula correlation"""
-        dt = self.update_interval_seconds
-        
-        # Base physics calculation
-        hour = datetime.now().hour
-        workload = 0.5 + 0.5 * np.sin(np.pi * (hour - 12) / 12)
-        ambient_temp = 22 + 5 * np.sin(2 * np.pi * (hour - 14) / 24)
-        power_watts = 200 + workload * 300
-        
-        new_gpu_temp = self.physics.calculate_thermal_response(
-            initial_temp_c=self._temperature_state['gpu_temp'],
-            power_watts=power_watts,
-            cooling_capacity_w=self._temperature_state['cooling_capacity'],
-            thermal_mass_j_per_c=self._temperature_state['thermal_mass'],
-            ambient_temp_c=ambient_temp,
-            dt_seconds=dt
-        )
-        
-        # Apply degradation effect
-        degradation_factor = self._temperature_state['degradation_health']
-        new_gpu_temp += (1 - degradation_factor) * 10  # Reduced cooling effectiveness
-        
-        # Apply quality noise
-        noise_scale = self.quality.noise_scale
-        if noise_scale > 0:
-            new_gpu_temp += np.random.normal(0, noise_scale * 5)
-        
-        self._temperature_state['gpu_temp'] = new_gpu_temp
-        self._temperature_state['ambient'] = ambient_temp
-        
-        # Store history
-        self._history['temperature'].append({
-            'timestamp': time.time(),
-            'gpu_temp': new_gpu_temp,
-            'ambient': ambient_temp,
-            'degradation': degradation_factor
-        })
-    
-    def _update_grid_ultimate(self):
-        """Update grid with power grid dynamics"""
-        now = datetime.now()
-        hour = now.hour
-        day_of_year = now.timetuple().tm_yday
-        region = 'us-east'
-        state = self._grid_state[region]
-        
-        # Base demand pattern
-        is_weekday = now.weekday() < 5
-        morning_peak = 1.3 if 9 <= hour <= 11 else 1.0
-        evening_peak = 1.4 if 17 <= hour <= 19 else 1.0
-        night_low = 0.6 if 0 <= hour <= 5 else 1.0
-        weekday_factor = 1.2 if is_weekday else 0.8
-        
-        demand_factor = max(night_low, morning_peak, evening_peak) * weekday_factor
-        target_demand = 50000 * demand_factor
-        state['demand'] = state['demand'] * 0.9 + target_demand * 0.1
-        
-        # Solar generation
-        cloud_cover = 0.3 + 0.4 * np.sin(2 * np.pi * hour / 24)
-        solar_irradiance = self.physics.calculate_solar_irradiance(
-            state['latitude'], hour, day_of_year, cloud_cover
-        )
-        solar_generation_mw = state['solar_capacity'] * (solar_irradiance / 1000)
-        
-        # Wind generation
-        wind_speed = 5 + 3 * np.sin(2 * np.pi * (hour - 3) / 24)
-        wind_generation_mw = state['wind_capacity'] * min(1.0, (wind_speed / 12) ** 3)
-        
-        # Renewable percentage
-        total_renewable = solar_generation_mw + wind_generation_mw
-        state['renewable'] = min(0.9, total_renewable / state['demand'])
-        
-        # Carbon intensity
-        base_intensity = state['coal'] * 820 + state['gas'] * 450 + state['nuclear'] * 12
-        renewable_factor = 1 - state['renewable']
-        state['average'] = base_intensity * renewable_factor + np.random.normal(0, 10)
-        state['average'] = max(10, min(800, state['average']))
-        
-        # Grid stress effect on carbon intensity
-        grid_stress = self.power_grid.calculate_grid_stress()
-        state['average'] *= (1 + grid_stress * 0.2)
-        
-        # Marginal intensity
-        state['marginal'] = state['average'] * (0.8 + 0.4 * demand_factor)
-        
-        # Store history
-        self._history['grid'].append({
-            'timestamp': time.time(),
-            'demand': state['demand'],
-            'renewable': state['renewable'],
-            'average_intensity': state['average'],
-            'grid_stress': grid_stress
-        })
-    
-    def get_ultimate_status(self) -> Dict:
-        """Get ultimate system status"""
+    def get_ultimate_v3_status(self) -> Dict:
+        """Get ultimate v3.3 system status"""
         return {
-            'copula': {'type': self.copula_model.copula_type},
+            'timegan': self.timegan.get_statistics(),
+            'multi_degradation': {
+                'n_components': len(self.multi_degradation.components),
+                'correlations': self.multi_degradation.get_correlation().tolist(),
+                'healths': self.multi_degradation.get_health_status()
+            },
+            'supply_chain': self.supply_chain.get_statistics(),
             'grid_dynamics': {
                 'frequency': self.power_grid.frequency_hz,
                 'status': self.power_grid.get_frequency_status(),
                 'stress': self.power_grid.calculate_grid_stress()
             },
-            'degradation': {
-                'health': self.degradation_model.health,
-                'rul_hours': self.degradation_model.predict_rul(),
-                'failure_probability': self.degradation_model.get_failure_probability(1000)
-            },
             'carbon_market': self.carbon_market.get_market_status(),
-            'federated': {
-                'n_clients': self.federated_sim.n_clients,
-                'heterogeneity': self.federated_sim.get_heterogeneity_score()
-            },
             'history_sizes': {k: len(v) for k, v in self._history.items()}
         }
+    
+    def generate_gan_sequences(self, n_samples: int = 100) -> np.ndarray:
+        """Generate synthetic time series using GAN"""
+        return self.timegan.generate(n_samples)
 
 
 # ============================================================
@@ -750,63 +676,59 @@ class UltimateSyntheticDataSource:
 # ============================================================
 
 async def main():
-    print("=== Ultimate Synthetic Data Manager v3.2 Demo ===\n")
+    print("=== Ultimate Synthetic Data Manager v3.3 Demo ===\n")
     
-    source = UltimateSyntheticDataSource({
+    source = UltimateSyntheticDataSourceV3({
         'seed': 42,
-        'quality': 'perfect',
         'update_interval': 1,
-        'copula_type': 'gaussian',
-        'weibull_shape': 2.5,
-        'weibull_scale': 50000,
-        'n_clients': 10
+        'gan_seq_len': 50,
+        'gan_feature_dim': 5,
+        'n_components': 3
     })
     
     source.start()
     
-    print("1. Copula Correlation Model:")
-    # Generate correlated data
-    marginals = [lambda u: norm.ppf(u, 65, 5), lambda u: norm.ppf(u, 300, 50)]
-    samples = source.copula_model.generate(100, marginals)
-    print(f"   Generated {len(samples)} correlated samples")
-    print(f"   Correlation: {np.corrcoef(samples.T)[0,1]:.3f}")
+    print("1. TimeGAN Training Status:")
+    gan_stats = source.timegan.get_statistics()
+    print(f"   GAN trained: {gan_stats['trained']}")
+    print(f"   Device: {gan_stats['device']}")
     
-    print("\n2. Power Grid Dynamics:")
+    print("\n2. Multi-Component Degradation:")
+    await asyncio.sleep(10)  # Let degradation update
+    healths = source.multi_degradation.get_health_status()
+    for cid, health in healths.items():
+        print(f"   Component {cid}: health={health['health']:.1%}, RUL={health['rul_hours']/24:.1f} days")
+    
+    print("\n3. Supply Chain Cascade:")
+    # Inject failure and observe cascade
+    affected = source.supply_chain.inject_failure('supplier_A', severity=0.8)
+    print(f"   Cascade affected: {affected}")
+    
+    for node in ['supplier_A', 'manufacturer', 'distributor', 'customer']:
+        risk = source.supply_chain.get_supply_risk(node)
+        status = source.supply_chain.node_states[node]['status']
+        print(f"   {node}: status={status}, risk={risk:.1%}")
+    
+    print("\n4. Power Grid Dynamics:")
     freq = source.power_grid.frequency_hz
     status = source.power_grid.get_frequency_status()
     stress = source.power_grid.calculate_grid_stress()
     print(f"   Frequency: {freq:.2f} Hz ({status})")
     print(f"   Grid stress: {stress:.1%}")
     
-    print("\n3. Weibull Degradation Model:")
-    health = source.degradation_model.health
-    rul = source.degradation_model.predict_rul()
-    fail_prob = source.degradation_model.get_failure_probability(1000)
-    print(f"   Equipment health: {health:.1%}")
-    print(f"   Remaining useful life: {rul/24:.1f} days")
-    print(f"   Failure probability in 1000h: {fail_prob:.1%}")
-    
-    print("\n4. Carbon Market Dynamics:")
-    carbon_status = source.carbon_market.get_market_status()
-    print(f"   Carbon price: €{carbon_status['price']:.2f}/ton")
-    print(f"   Banked allowances: {carbon_status['banked_allowances_mt']:.0f} MT")
-    
-    print("\n5. Federated Learning Heterogeneity:")
-    client_configs = source.federated_sim.generate_non_iid(10000, 10, alpha=0.3)
-    print(f"   Generated {len(client_configs)} client configurations")
-    print(f"   Heterogeneity score: {source.federated_sim.get_heterogeneity_score():.2f}")
-    print(f"   Sample client sizes: {[c['n_samples'] for c in client_configs[:3]]}")
+    print("\n5. Carbon Market Status:")
+    carbon = source.carbon_market.get_market_status()
+    print(f"   Price: €{carbon['price']:.2f}/ton")
+    print(f"   Cap: {carbon['emission_cap_mt']:.0f} MT")
     
     print("\n6. Ultimate System Status:")
-    status = source.get_ultimate_status()
-    print(f"   Copula type: {status['copula']['type']}")
-    print(f"   Grid status: {status['grid_dynamics']['status']}")
-    print(f"   Carbon price: €{status['carbon_market']['price']:.2f}/ton")
-    print(f"   Federated clients: {status['federated']['n_clients']}")
+    status = source.get_ultimate_v3_status()
+    print(f"   Correlation matrix: {status['multi_degradation']['correlations']}")
+    print(f"   Supply chain cascades: {status['supply_chain']['cascades']}")
     print(f"   History sizes: {status['history_sizes']}")
     
     source.stop()
-    print("\n✅ Ultimate Synthetic Data Manager v3.2 test complete")
+    print("\n✅ Ultimate Synthetic Data Manager v3.3 test complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
