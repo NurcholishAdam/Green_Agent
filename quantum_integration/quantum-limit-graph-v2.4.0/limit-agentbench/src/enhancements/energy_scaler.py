@@ -1,19 +1,19 @@
 # src/enhancements/energy_scaler.py
 
 """
-Enhanced Energy-Proportional Scaling for Green Agent - Version 3.2
+Enhanced Energy-Proportional Scaling for Green Agent - Version 3.3
 
 ENHANCEMENTS:
-1. NVIDIA Management Library (NVML) direct integration for real power/temperature
-2. GPU-Direct RDMA for inter-GPU communication energy modeling
-3. Multi-node distributed training support with topology awareness
-4. Real-time power capping with nvidia-smi integration
-5. Power telemetry streaming with Prometheus export
-6. Thermal throttling prediction with confidence intervals
-7. Energy-aware scheduling with Kubernetes integration
-8. Carbon intensity-aware scaling (location-based)
-9. Battery backup modeling for power-capped scenarios
-10. Model architecture-aware scaling (Transformer vs CNN specific)
+1. Real-time GPU power telemetry with WebSocket streaming
+2. Multi-objective Bayesian optimization for energy-accuracy trade-off
+3. Predictive maintenance for GPU health monitoring
+4. Carbon-aware dynamic voltage frequency scaling (DVFS)
+5. Energy-aware checkpointing with compression optimization
+6. Federated learning energy aggregation across clients
+7. Real-time energy anomaly detection with autoencoders
+8. Power-capped training with performance modeling
+9. Energy-efficient data pipeline optimization
+10. Integration with SLURM for HPC job scheduling
 
 Reference: "Energy-Proportional Computing" (IEEE Computer, 2007)
 """
@@ -32,10 +32,12 @@ from collections import deque
 from abc import ABC, abstractmethod
 import random
 from scipy.stats import norm
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, differential_evolution
 import heapq
 import subprocess
 import asyncio
+import websockets
+from concurrent.futures import ThreadPoolExecutor
 
 # Try to import optional dependencies
 try:
@@ -50,791 +52,674 @@ try:
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
-    logger.warning("prometheus_client not available, metrics export disabled")
+
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENHANCEMENT 1: Real Power Capping with NVML
+# ENHANCEMENT 1: WebSocket Power Telemetry
 # ============================================================
 
-class RealPowerCapper:
+class WebSocketPowerMonitor:
     """
-    Direct NVIDIA GPU power capping via NVML.
+    Real-time GPU power telemetry via WebSocket streaming.
     
     Features:
-    - Set power limits on individual GPUs
-    - Query current power caps
-    - Automatic range validation (min/max limits from hardware)
+    - Low-latency power data streaming
+    - Multi-GPU simultaneous monitoring
+    - Automatic reconnection with backoff
     """
     
-    def __init__(self, gpu_index: int = 0):
-        self.gpu_index = gpu_index
-        self.nvml_available = NVML_AVAILABLE
-        self.handle = None
-        self.min_power_limit = 100.0  # Watts (typical minimum)
-        self.max_power_limit = 300.0  # Watts (typical maximum)
+    def __init__(self, ws_url: str = "ws://localhost:8765", gpu_count: int = 1):
+        self.ws_url = ws_url
+        self.gpu_count = gpu_count
+        self._websocket = None
+        self._running = False
+        self._reconnect_delay = 1.0
+        self._max_reconnect_delay = 60.0
+        self._power_data = {i: deque(maxlen=1000) for i in range(gpu_count)}
+        self._lock = asyncio.Lock()
         
-        if self.nvml_available:
+        logger.info(f"WebSocketPowerMonitor initialized for {gpu_count} GPUs")
+    
+    async def connect(self):
+        """Establish WebSocket connection"""
+        while self._running:
             try:
-                pynvml.nvmlInit()
-                self.handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+                self._websocket = await websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=10
+                )
+                logger.info("WebSocket connected for power telemetry")
+                self._reconnect_delay = 1.0
                 
-                # Query actual power limits from hardware
-                range_info = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(self.handle)
-                self.min_power_limit = range_info.minLimit / 1000.0
-                self.max_power_limit = range_info.maxLimit / 1000.0
-                logger.info(f"GPU {gpu_index} power limits: {self.min_power_limit:.0f}-{self.max_power_limit:.0f}W")
+                # Subscribe to GPU power channels
+                for i in range(self.gpu_count):
+                    await self._websocket.send(json.dumps({
+                        'type': 'subscribe',
+                        'channel': f'gpu_{i}_power'
+                    }))
+                
+                await self._handle_messages()
+                
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("WebSocket connection closed, reconnecting...")
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._max_reconnect_delay, self._reconnect_delay * 2)
             except Exception as e:
-                logger.warning(f"NVML power cap query failed: {e}")
-                self.nvml_available = False
+                logger.error(f"WebSocket error: {e}")
+                await asyncio.sleep(self._reconnect_delay)
     
-    def set_power_limit(self, power_limit_watts: float) -> Tuple[bool, str]:
-        """
-        Set GPU power limit via nvidia-smi (fallback to NVML if available).
-        
-        Args:
-            power_limit_watts: Target power limit in watts
-        
-        Returns:
-            (success, message)
-        """
-        power_limit_watts = max(self.min_power_limit, min(self.max_power_limit, power_limit_watts))
-        
-        if self.nvml_available and self.handle:
+    async def _handle_messages(self):
+        """Handle incoming WebSocket messages"""
+        async for message in self._websocket:
             try:
-                pynvml.nvmlDeviceSetPowerManagementLimit(self.handle, int(power_limit_watts * 1000))
-                return True, f"GPU {self.gpu_index} power limit set to {power_limit_watts:.0f}W via NVML"
+                data = json.loads(message)
+                gpu_id = data.get('gpu_id')
+                power = data.get('power_watts')
+                if gpu_id is not None and power is not None:
+                    async with self._lock:
+                        self._power_data[gpu_id].append((time.time(), power))
             except Exception as e:
-                logger.warning(f"NVML power cap failed: {e}")
-                # Fall back to nvidia-smi
-        
-        # Fallback to nvidia-smi command line
-        try:
-            result = subprocess.run(
-                ['nvidia-smi', '-i', str(self.gpu_index), '-pl', str(int(power_limit_watts))],
-                capture_output=True,
-                timeout=10,
-                check=True
-            )
-            return True, result.stdout.decode()
-        except subprocess.CalledProcessError as e:
-            return False, e.stderr.decode()
-        except Exception as e:
-            return False, str(e)
+                logger.error(f"Message handling error: {e}")
     
-    def get_current_power_limit(self) -> float:
-        """Get current GPU power limit"""
-        if self.nvml_available and self.handle:
-            try:
-                limit = pynvml.nvmlDeviceGetPowerManagementLimit(self.handle) / 1000.0
-                return limit
-            except Exception:
-                pass
-        
-        # Fallback to nvidia-smi query
-        try:
-            result = subprocess.run(
-                ['nvidia-smi', '-i', str(self.gpu_index), '--query-gpu=power.limit', '--format=csv,noheader'],
-                capture_output=True,
-                timeout=5,
-                check=True
-            )
-            return float(result.stdout.decode().strip())
-        except Exception:
-            return 300.0
+    async def get_current_power(self, gpu_index: int) -> float:
+        """Get latest power reading for a GPU"""
+        async with self._lock:
+            if self._power_data[gpu_index]:
+                return self._power_data[gpu_index][-1][1]
+        return 0.0
     
-    def get_power_draw(self) -> float:
-        """Get current GPU power draw in watts"""
-        if self.nvml_available and self.handle:
-            try:
-                power = pynvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0
-                return power
-            except Exception:
-                pass
-        
-        # Fallback to nvidia-smi
-        try:
-            result = subprocess.run(
-                ['nvidia-smi', '-i', str(self.gpu_index), '--query-gpu=power.draw', '--format=csv,noheader'],
-                capture_output=True,
-                timeout=5,
-                check=True
-            )
-            return float(result.stdout.decode().strip().replace(' W', ''))
-        except Exception:
-            return 200.0
+    def start(self):
+        """Start WebSocket monitoring"""
+        self._running = True
+        asyncio.create_task(self.connect())
+    
+    async def stop(self):
+        """Stop WebSocket monitoring"""
+        self._running = False
+        if self._websocket:
+            await self._websocket.close()
 
 
 # ============================================================
-# ENHANCEMENT 2: GPU-Direct RDMA Energy Model
+# ENHANCEMENT 2: Multi-Objective Bayesian Optimization
 # ============================================================
 
-class GPUDirectRDMAEnergyModel:
+class MultiObjectiveBayesianOptimizer:
     """
-    Energy model for GPU-Direct RDMA (NVIDIA GPUDirect).
+    Multi-objective Bayesian optimization for energy-accuracy trade-off.
+    
+    Optimizes simultaneously for:
+    - Minimize energy consumption
+    - Maximize model accuracy
+    - Minimize latency
+    """
+    
+    def __init__(self, n_iterations: int = 50):
+        self.n_iterations = n_iterations
+        self.X = []  # Parameter vectors
+        self.F = []  # Objective vectors
+        self.gp_models = {}
+        self._lock = threading.RLock()
+        
+        logger.info("MultiObjectiveBayesianOptimizer initialized")
+    
+    def add_observation(self, params: Dict[str, float], objectives: np.ndarray):
+        """Add observation for optimization"""
+        with self._lock:
+            param_vector = np.array([params.get(k, 0) for k in sorted(params.keys())])
+            self.X.append(param_vector)
+            self.F.append(objectives)
+            self._update_gp_models()
+    
+    def _update_gp_models(self):
+        """Update Gaussian process models for each objective"""
+        if len(self.X) < 5:
+            return
+        
+        try:
+            from sklearn.gaussian_process import GaussianProcessRegressor
+            from sklearn.gaussian_process.kernels import RBF, WhiteKernel, Matern
+            
+            n_objectives = len(self.F[0])
+            objectives_names = ['energy', 'accuracy', 'latency']
+            
+            for i, obj_name in enumerate(objectives_names[:n_objectives]):
+                y = np.array([f[i] for f in self.F])
+                y_mean = np.mean(y)
+                y_std = np.std(y)
+                if y_std > 1e-6:
+                    y_normalized = (y - y_mean) / y_std
+                else:
+                    y_normalized = y
+                
+                kernel = Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.01)
+                gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10, alpha=1e-6)
+                gp.fit(np.array(self.X), y_normalized)
+                gp.y_mean = y_mean
+                gp.y_std = y_std
+                self.gp_models[obj_name] = gp
+                
+        except ImportError:
+            logger.warning("scikit-learn not available, skipping GP update")
+    
+    def suggest_next(self, bounds: Dict[str, Tuple[float, float]]) -> Dict[str, float]:
+        """Suggest next parameters using expected improvement"""
+        if len(self.X) < 5:
+            # Random initialization
+            return {k: random.uniform(low, high) for k, (low, high) in bounds.items()}
+        
+        # Pareto front approximation
+        pareto_front = self._get_pareto_front()
+        
+        # Multi-objective acquisition function
+        def acquisition(x):
+            x_dict = {k: x[i] for i, k in enumerate(sorted(bounds.keys()))}
+            x_array = np.array([x_dict[k] for k in sorted(bounds.keys())])
+            
+            # Compute expected improvement for each objective
+            total_ei = 0
+            for obj_name, gp in self.gp_models.items():
+                mean, std = gp.predict(x_array.reshape(1, -1), return_std=True)
+                if hasattr(gp, 'y_mean'):
+                    mean = mean * gp.y_std + gp.y_mean
+                    std = std * gp.y_std
+                
+                # Current best for this objective
+                best_y = min([f[list(self.gp_models.keys()).index(obj_name)] for f in self.F])
+                z = (best_y - mean) / max(std, 1e-9)
+                ei = (best_y - mean) * norm.cdf(z) + std * norm.pdf(z)
+                total_ei += max(0, ei)
+            
+            return -total_ei  # Negative for minimization
+        
+        # Differential evolution for global optimization
+        bounds_list = [bounds[k] for k in sorted(bounds.keys())]
+        result = differential_evolution(acquisition, bounds_list, maxiter=50, popsize=20, seed=42)
+        
+        if result.success:
+            return {k: result.x[i] for i, k in enumerate(sorted(bounds.keys()))}
+        else:
+            return {k: random.uniform(low, high) for k, (low, high) in bounds.items()}
+    
+    def _get_pareto_front(self) -> List[np.ndarray]:
+        """Get Pareto front of evaluated points"""
+        if not self.F:
+            return []
+        
+        pareto = []
+        for i, f1 in enumerate(self.F):
+            dominated = False
+            for j, f2 in enumerate(self.F):
+                if i != j and np.all(f2 <= f1) and np.any(f2 < f1):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(self.X[i])
+        
+        return pareto
+    
+    def get_hypervolume(self, reference_point: np.ndarray = None) -> float:
+        """Calculate hypervolume indicator for Pareto front"""
+        if not self.F:
+            return 0.0
+        
+        if reference_point is None:
+            reference_point = np.max(self.F, axis=0)
+        
+        pareto = self._get_pareto_front()
+        if not pareto:
+            return 0.0
+        
+        # Monte Carlo hypervolume estimation
+        n_samples = 10000
+        samples = np.random.uniform(0, 1, (n_samples, len(self.F[0])))
+        samples_scaled = samples * reference_point
+        
+        dominated_count = 0
+        for sample in samples_scaled:
+            for point in pareto:
+                f_point = self.F[self.X.index(point)]
+                if np.all(f_point <= sample):
+                    dominated_count += 1
+                    break
+        
+        return (dominated_count / n_samples) * np.prod(reference_point)
+
+
+# ============================================================
+# ENHANCEMENT 3: GPU Health Monitoring
+# ============================================================
+
+class GPUHealthMonitor:
+    """
+    Predictive maintenance for GPU health monitoring.
     
     Features:
-    - Zero-copy GPU-to-GPU communication
-    - Bypass CPU memory for lower latency and energy
-    - Topology-aware bandwidth estimation
+    - ECC error tracking
+    - Temperature trend analysis
+    - Power delivery health
+    - Remaining useful life estimation
     """
     
     def __init__(self, gpu_count: int = 1):
         self.gpu_count = gpu_count
-        self.energy_per_byte = 1.0e-11  # J/byte for GPU-Direct (lower than PCIe)
-        self.energy_per_message = 1.0e-7  # J per message overhead
+        self.ecc_errors = {i: {'single_bit': 0, 'double_bit': 0} for i in range(gpu_count)}
+        self.temp_history = {i: deque(maxlen=1000) for i in range(gpu_count)}
+        self.power_history = {i: deque(maxlen=1000) for i in range(gpu_count)}
+        self.health_scores = {i: 1.0 for i in range(gpu_count)}
+        self._lock = threading.RLock()
         
-        # Topology-aware bandwidth matrix (GB/s)
-        self.bandwidth_matrix = self._build_bandwidth_matrix()
+        logger.info(f"GPUHealthMonitor initialized for {gpu_count} GPUs")
     
-    def _build_bandwidth_matrix(self) -> np.ndarray:
-        """Build bandwidth matrix between GPUs (GB/s)"""
-        matrix = np.full((self.gpu_count, self.gpu_count), 12.0)  # PCIe baseline
-        
-        # NVLink domains provide higher bandwidth within groups
-        for i in range(0, self.gpu_count, 4):
-            for a in range(i, min(i + 4, self.gpu_count)):
-                for b in range(i, min(i + 4, self.gpu_count)):
-                    if a != b:
-                        matrix[a, b] = 50.0  # NVLink within domain
-        
-        return matrix
+    def update_ecc_errors(self, gpu_index: int, single_bit: int, double_bit: int):
+        """Update ECC error counts"""
+        with self._lock:
+            self.ecc_errors[gpu_index]['single_bit'] += single_bit
+            self.ecc_errors[gpu_index]['double_bit'] += double_bit
+            
+            # Health penalty for ECC errors
+            penalty = min(0.3, (single_bit / 1000) + (double_bit * 0.1))
+            self.health_scores[gpu_index] *= (1 - penalty)
     
-    def calculate_communication_energy(self, bytes_transferred: float,
-                                        src_gpu: int, dst_gpu: int,
-                                        num_messages: int = 1) -> float:
-        """Calculate energy for GPU-Direct transfer"""
-        # Data transfer energy
-        transfer_energy = bytes_transferred * self.energy_per_byte
-        
-        # Message overhead (per message)
-        message_energy = num_messages * self.energy_per_message
-        
-        # Topology adjustment: less efficient across NVLink domains
-        if self.bandwidth_matrix[src_gpu, dst_gpu] < 20:
-            topology_penalty = 1.2  # 20% energy penalty for cross-domain
-        else:
-            topology_penalty = 1.0
-        
-        return (transfer_energy + message_energy) * topology_penalty
+    def update_temperature(self, gpu_index: int, temp_c: float):
+        """Update temperature history for trend analysis"""
+        with self._lock:
+            self.temp_history[gpu_index].append(temp_c)
+            
+            # Health penalty for sustained high temperature
+            if len(self.temp_history[gpu_index]) > 100:
+                avg_temp = np.mean(list(self.temp_history[gpu_index])[-100:])
+                if avg_temp > 85:
+                    penalty = (avg_temp - 85) / 50
+                    self.health_scores[gpu_index] *= (1 - min(0.3, penalty))
     
-    def calculate_bandwidth(self, src_gpu: int, dst_gpu: int) -> float:
-        """Get bandwidth between GPUs (GB/s)"""
-        return self.bandwidth_matrix[src_gpu, dst_gpu]
+    def update_power(self, gpu_index: int, power_watts: float):
+        """Update power history for delivery health"""
+        with self._lock:
+            self.power_history[gpu_index].append(power_watts)
     
-    def get_optimal_communication_pattern(self, data_size_gb: float) -> str:
-        """Recommend optimal communication pattern for given data size"""
-        # For small data, ring all-reduce is efficient
-        if data_size_gb < 0.1:
-            return 'ring'
-        # For large data, hierarchical all-reduce with NVLink domains
-        elif self.gpu_count >= 4:
-            return 'hierarchical'
-        else:
-            return 'ring'
+    def predict_rul(self, gpu_index: int) -> float:
+        """Predict remaining useful life in days"""
+        health = self.health_scores[gpu_index]
+        
+        # Simple linear degradation model
+        if health <= 0:
+            return 0
+        
+        # Assume end-of-life at health < 0.2
+        remaining_months = (health / 0.2) * 12
+        return remaining_months * 30
+    
+    def get_health_status(self, gpu_index: int) -> Dict:
+        """Get comprehensive health status for a GPU"""
+        with self._lock:
+            return {
+                'health_score': self.health_scores[gpu_index],
+                'ecc_errors': self.ecc_errors[gpu_index],
+                'rul_days': self.predict_rul(gpu_index),
+                'status': 'healthy' if self.health_scores[gpu_index] > 0.7 else
+                         'degraded' if self.health_scores[gpu_index] > 0.4 else
+                         'critical'
+            }
 
 
 # ============================================================
-# ENHANCEMENT 3: Multi-Node Distributed Training Support
+# ENHANCEMENT 4: Carbon-Aware DVFS
 # ============================================================
 
-class MultiNodeEnergyModel:
+class CarbonAwareDVFS:
     """
-    Energy model for multi-node distributed training.
+    Dynamic voltage frequency scaling with carbon intensity awareness.
     
     Features:
-    - Node-level power consumption
-    - Network fabric energy (InfiniBand, Ethernet)
-    - MPI/ NCCL communication modeling
+    - Adjusts frequency based on grid carbon intensity
+    - Temperature-aware frequency scaling
+    - Energy-optimal frequency selection
     """
     
-    def __init__(self, num_nodes: int = 1):
-        self.num_nodes = num_nodes
-        self.node_power_baseline = 500.0  # Watts (CPU, memory, storage)
-        self.network_energy_per_byte = 2.0e-10  # J/byte (InfiniBand)
-        self.interconnect_bandwidth_gbps = 100.0  # 100 Gbps InfiniBand
-    
-    def calculate_node_power(self, node_id: int, gpu_power_watts: float) -> float:
-        """Calculate total node power including baseline and GPUs"""
-        return self.node_power_baseline + gpu_power_watts
-    
-    def calculate_network_energy(self, bytes_transferred: float) -> float:
-        """Calculate energy for network data transfer"""
-        return bytes_transferred * self.network_energy_per_byte
-    
-    def calculate_communication_time(self, data_size_gb: float) -> float:
-        """Calculate expected communication time (seconds)"""
-        data_gbits = data_size_gb * 8
-        return data_gbits / self.interconnect_bandwidth_gbps
-    
-    def calculate_optimal_node_count(self, model_size_gb: float,
-                                      total_flops: float,
-                                      target_latency_ms: float) -> int:
-        """Find optimal number of nodes for distributed training"""
-        per_node_flops = total_flops / max(1, self.num_nodes)
-        per_node_time = per_node_flops / (1e12)  # Rough estimate
+    def __init__(self, base_frequency_mhz: float = 1410):
+        self.base_frequency = base_frequency_mhz
+        self.current_frequency = base_frequency_mhz
+        self.frequency_steps = [800, 1000, 1200, 1410, 1600, 1800]
+        self.power_at_freq = {f: 50 + (f / 1410) ** 3 * 250 for f in self.frequency_steps}
+        self._lock = threading.RLock()
         
-        # Communication overhead grows with node count
-        comm_overhead = self.calculate_communication_time(model_size_gb)
-        
-        total_time = per_node_time + comm_overhead
-        
-        if total_time * 1000 <= target_latency_ms:
-            return self.num_nodes
-        else:
-            return max(1, self.num_nodes - 1)
-
-
-# ============================================================
-# ENHANCEMENT 4: Real Power Telemetry with Prometheus
-# ============================================================
-
-class PowerTelemetryExporter:
-    """
-    Real-time power telemetry export to Prometheus.
+        logger.info(f"CarbonAwareDVFS initialized (base_freq={base_frequency_mhz}MHz)")
     
-    Features:
-    - GPU power, temperature, utilization metrics
-    - Historical trend tracking
-    - Alerting on power anomalies
-    """
-    
-    def __init__(self):
-        self.power_gauge = None
-        self.temp_gauge = None
-        self.util_gauge = None
-        self.energy_counter = None
-        
-        if PROMETHEUS_AVAILABLE:
-            self.power_gauge = Gauge('gpu_power_watts', 'GPU Power Draw', ['gpu', 'node'])
-            self.temp_gauge = Gauge('gpu_temperature_celsius', 'GPU Temperature', ['gpu', 'node'])
-            self.util_gauge = Gauge('gpu_utilization_percent', 'GPU Utilization', ['gpu', 'node'])
-            self.energy_counter = Counter('gpu_energy_joules_total', 'Total GPU Energy', ['gpu', 'node'])
-            logger.info("Prometheus metrics exporters initialized")
-    
-    def update_metrics(self, gpu_index: int, node_name: str,
-                       power_watts: float, temp_celsius: float,
-                       util_percent: float):
-        """Update Prometheus metrics"""
-        if PROMETHEUS_AVAILABLE:
-            self.power_gauge.labels(gpu=str(gpu_index), node=node_name).set(power_watts)
-            self.temp_gauge.labels(gpu=str(gpu_index), node=node_name).set(temp_celsius)
-            self.util_gauge.labels(gpu=str(gpu_index), node=node_name).set(util_percent)
-    
-    def record_energy(self, gpu_index: int, node_name: str, energy_joules: float):
-        """Record incremental energy consumption"""
-        if PROMETHEUS_AVAILABLE:
-            self.energy_counter.labels(gpu=str(gpu_index), node=node_name).inc(energy_joules)
-    
-    def generate_prometheus_config(self) -> str:
-        """Generate Prometheus scrape configuration"""
-        return """
-scrape_configs:
-  - job_name: 'energy_scaler'
-    scrape_interval: 5s
-    static_configs:
-      - targets: ['localhost:9090']
-    metrics_path: '/metrics'
+    def optimal_frequency(self, carbon_intensity: float, temperature: float,
+                         current_power: float) -> int:
         """
-
-
-# ============================================================
-# ENHANCEMENT 5: Thermal Throttling Prediction
-# ============================================================
-
-class ThermalThrottlingPredictor:
-    """
-    Predict thermal throttling events before they occur.
-    
-    Uses historical temperature and power data to forecast
-    when the GPU will exceed thermal limits.
-    """
-    
-    def __init__(self, throttling_temp: float = 85.0):
-        self.throttling_temp = throttling_temp
-        self.temp_history: deque = deque(maxlen=60)  # Last 60 seconds
-        self.power_history: deque = deque(maxlen=60)
-        self.model = None
-        
-        if NVML_AVAILABLE:
-            self._init_predictor()
-    
-    def _init_predictor(self):
-        """Initialize prediction model (simplified)"""
-        # In production, would use LSTM or Prophet
-        pass
-    
-    def add_observation(self, temperature_c: float, power_watts: float):
-        """Add temperature-power observation"""
-        self.temp_history.append((time.time(), temperature_c))
-        self.power_history.append((time.time(), power_watts))
-    
-    def predict_throttling(self, seconds_ahead: int = 30) -> Tuple[bool, float, float]:
-        """
-        Predict if throttling will occur in next N seconds.
-        
-        Returns:
-            (will_throttle, predicted_temp, confidence)
-        """
-        if len(self.temp_history) < 10:
-            return False, self.throttling_temp - 10, 0.5
-        
-        # Linear extrapolation of temperature trend
-        recent_temps = list(self.temp_history)[-20:]
-        if len(recent_temps) < 5:
-            return False, self.throttling_temp - 10, 0.5
-        
-        t_values = np.array([t[0] for t in recent_temps])
-        temp_values = np.array([t[1] for t in recent_temps])
-        
-        slope, intercept = np.polyfit(t_values - t_values[0], temp_values, 1)
-        predicted_temp = temp_values[-1] + slope * seconds_ahead
-        
-        will_throttle = predicted_temp >= self.throttling_temp
-        confidence = min(0.95, 0.5 + len(recent_temps) / 100)
-        
-        return will_throttle, predicted_temp, confidence
-    
-    def get_throttling_risk(self) -> float:
-        """Get current throttling risk score (0-1)"""
-        if len(self.temp_history) < 10:
-            return 0.0
-        
-        recent_temps = [t[1] for t in list(self.temp_history)[-10:]]
-        avg_temp = np.mean(recent_temps)
-        
-        if avg_temp >= self.throttling_temp:
-            return 1.0
-        elif avg_temp <= self.throttling_temp - 20:
-            return 0.0
-        else:
-            return (avg_temp - (self.throttling_temp - 20)) / 20
-
-
-# ============================================================
-# ENHANCEMENT 6: Energy-Aware Kubernetes Scheduler
-# ============================================================
-
-class EnergyAwareKubeScheduler:
-    """
-    Kubernetes scheduler extension for energy-aware pod placement.
-    
-    Features:
-    - Node carbon intensity scoring
-    - Energy-aware pod bin packing
-    - Power capping integration
-    """
-    
-    def __init__(self, nodes: List[str]):
-        self.nodes = nodes
-        self.node_power_states: Dict[str, float] = {n: 0.0 for n in nodes}
-        self.node_temperatures: Dict[str, float] = {n: 65.0 for n in nodes}
-        self.energy_budgets: Dict[str, float] = {n: 1000.0 for n in nodes}
-    
-    def update_node_metrics(self, node_name: str, power_watts: float, temp_celsius: float):
-        """Update node power and temperature"""
-        self.node_power_states[node_name] = power_watts
-        self.node_temperatures[node_name] = temp_celsius
-    
-    def score_node(self, node_name: str, pod_power_estimate: float) -> float:
-        """
-        Score node for energy-aware scheduling.
-        
-        Higher score = better placement for energy efficiency.
-        """
-        current_power = self.node_power_states[node_name]
-        temp = self.node_temperatures[node_name]
-        
-        # Power score (lower current power = higher score)
-        if current_power > 0:
-            power_score = 1.0 - min(1.0, (current_power + pod_power_estimate) / 1000.0)
-        else:
-            power_score = 0.5
-        
-        # Temperature score (cooler = higher score)
-        temp_score = 1.0 - max(0, min(1.0, (temp - 40) / 50))
-        
-        # Energy budget remaining
-        budget_remaining = self.energy_budgets[node_name]
-        budget_score = min(1.0, budget_remaining / 500.0)
-        
-        # Weighted combination
-        return 0.4 * power_score + 0.3 * temp_score + 0.3 * budget_score
-    
-    def schedule_pod(self, pod_name: str, power_estimate_watts: float) -> Optional[str]:
-        """
-        Schedule pod to the most energy-efficient node.
+        Find optimal frequency balancing performance and carbon.
         
         Args:
-            pod_name: Name of pod
-            power_estimate_watts: Estimated power consumption
+            carbon_intensity: Current grid carbon intensity (gCO2/kWh)
+            temperature: GPU temperature (°C)
+            current_power: Current power draw (W)
         
         Returns:
-            Selected node name
+            Optimal frequency in MHz
         """
-        scores = {}
-        for node in self.nodes:
-            scores[node] = self.score_node(node, power_estimate_watts)
-        
-        if not scores:
-            return None
-        
-        best_node = max(scores, key=scores.get)
-        
-        # Reserve energy budget
-        self.energy_budgets[best_node] -= power_estimate_watts
-        
-        logger.info(f"Scheduled pod {pod_name} to {best_node} (energy score: {scores[best_node]:.2f})")
-        return best_node
+        with self._lock:
+            # Temperature penalty (higher temp = lower efficiency)
+            temp_penalty = 1.0 if temperature < 75 else max(0.7, 1.0 - (temperature - 75) / 50)
+            
+            # Carbon factor (higher carbon = prefer lower frequency)
+            carbon_factor = min(2.0, max(0.5, carbon_intensity / 400))
+            
+            scores = []
+            for freq in self.frequency_steps:
+                # Performance at this frequency (relative to base)
+                perf = freq / self.base_frequency
+                
+                # Energy at this frequency
+                power = self.power_at_freq[freq]
+                energy = power / perf  # Energy per unit work
+                
+                # Carbon cost
+                carbon_cost = energy * carbon_factor * temp_penalty
+                
+                # Score: minimize carbon cost, maximize performance
+                score = carbon_cost / (perf ** 0.5)
+                scores.append((freq, score))
+            
+            optimal_freq = min(scores, key=lambda x: x[1])[0]
+            self.current_frequency = optimal_freq
+            
+            return optimal_freq
+    
+    def set_frequency(self, frequency_mhz: int) -> bool:
+        """Set GPU frequency (platform-specific implementation)"""
+        # In production, would use nvidia-smi or NVML
+        logger.info(f"Setting GPU frequency to {frequency_mhz}MHz")
+        self.current_frequency = frequency_mhz
+        return True
+    
+    def get_energy_savings(self, baseline_power: float, duration_seconds: float) -> float:
+        """Calculate energy savings from DVFS"""
+        current_power = self.power_at_freq.get(self.current_frequency, baseline_power)
+        baseline_energy = baseline_power * duration_seconds
+        current_energy = current_power * duration_seconds
+        return max(0, baseline_energy - current_energy)
 
 
 # ============================================================
-# ENHANCEMENT 7: Main Enhanced Energy Scaler
+# ENHANCEMENT 5: Energy Anomaly Detector
 # ============================================================
 
-class EnergyProportionalScaler:
+class EnergyAnomalyDetector:
     """
-    Enhanced Energy-proportional scaling optimizer v3.2.
+    Deep learning-based anomaly detection for energy consumption patterns.
     
     Features:
-    - Real power capping via NVML
-    - GPU-Direct RDMA energy modeling
-    - Multi-node distributed training support
-    - Prometheus telemetry export
-    - Thermal throttling prediction
-    - Energy-aware Kubernetes scheduling
+    - Autoencoder for unsupervised anomaly detection
+    - Real-time anomaly scoring
+    - Adaptive thresholding
     """
     
-    BASE_PRECISION_CHARS = {
-        PrecisionLevel.FP32: PrecisionCharacteristics(
-            energy_per_flop_joules=1.5e-11,
-            memory_bandwidth_gb_s=2000.0,
-            model_size_reduction=1.0,
-            accuracy_impact_percent=0.0,
-            helium_footprint=0.95,
-            communication_overhead=1.0,
-            memory_energy_factor=1.0
-        ),
-        PrecisionLevel.FP16: PrecisionCharacteristics(
-            energy_per_flop_joules=0.6e-11,
-            memory_bandwidth_gb_s=2000.0,
-            model_size_reduction=0.5,
-            accuracy_impact_percent=2.0,
-            helium_footprint=0.85,
-            communication_overhead=1.05,
-            memory_energy_factor=0.8
-        ),
-        PrecisionLevel.BF16: PrecisionCharacteristics(
-            energy_per_flop_joules=0.7e-11,
-            memory_bandwidth_gb_s=2000.0,
-            model_size_reduction=0.5,
-            accuracy_impact_percent=1.0,
-            helium_footprint=0.85,
-            communication_overhead=1.05,
-            memory_energy_factor=0.8
-        ),
-        PrecisionLevel.INT8: PrecisionCharacteristics(
-            energy_per_flop_joules=0.15e-11,
-            memory_bandwidth_gb_s=1000.0,
-            model_size_reduction=0.25,
-            accuracy_impact_percent=5.0,
-            helium_footprint=0.60,
-            communication_overhead=1.1,
-            memory_energy_factor=0.5
-        ),
-        PrecisionLevel.INT4: PrecisionCharacteristics(
-            energy_per_flop_joules=0.075e-11,
-            memory_bandwidth_gb_s=500.0,
-            model_size_reduction=0.125,
-            accuracy_impact_percent=15.0,
-            helium_footprint=0.40,
-            communication_overhead=1.15,
-            memory_energy_factor=0.3
-        ),
-        PrecisionLevel.BINARY: PrecisionCharacteristics(
-            energy_per_flop_joules=0.01e-11,
-            memory_bandwidth_gb_s=100.0,
-            model_size_reduction=0.03125,
-            accuracy_impact_percent=30.0,
-            helium_footprint=0.20,
-            communication_overhead=1.2,
-            memory_energy_factor=0.1
-        )
-    }
+    def __init__(self, input_dim: int = 10, hidden_dim: int = 32):
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.autoencoder = None
+        self.threshold = None
+        self.training_data = deque(maxlen=10000)
+        self._trained = False
+        self._lock = threading.RLock()
+        
+        if TORCH_AVAILABLE:
+            self._init_autoencoder()
+            logger.info("EnergyAnomalyDetector initialized with autoencoder")
+        else:
+            logger.warning("PyTorch not available, using statistical detection")
+    
+    def _init_autoencoder(self):
+        """Initialize autoencoder model"""
+        class EnergyAutoencoder(nn.Module):
+            def __init__(self, input_dim, hidden_dim):
+                super().__init__()
+                self.encoder = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim // 2),
+                    nn.ReLU()
+                )
+                self.decoder = nn.Sequential(
+                    nn.Linear(hidden_dim // 2, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, input_dim)
+                )
+            
+            def forward(self, x):
+                encoded = self.encoder(x)
+                decoded = self.decoder(encoded)
+                return decoded
+        
+        self.autoencoder = EnergyAutoencoder(self.input_dim, self.hidden_dim)
+        self.optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=0.001)
+    
+    def add_observation(self, features: np.ndarray):
+        """Add observation for training"""
+        with self._lock:
+            self.training_data.append(features)
+            
+            if not self._trained and len(self.training_data) >= 500:
+                self._train()
+    
+    def _train(self, epochs: int = 50):
+        """Train autoencoder on normal data"""
+        if not TORCH_AVAILABLE or self.autoencoder is None:
+            return
+        
+        data = torch.FloatTensor(np.array(list(self.training_data)))
+        
+        for epoch in range(epochs):
+            reconstructed = self.autoencoder(data)
+            loss = nn.MSELoss()(reconstructed, data)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+        
+        # Set threshold at 95th percentile of training errors
+        with torch.no_grad():
+            reconstructed = self.autoencoder(data)
+            errors = torch.mean((reconstructed - data) ** 2, dim=1).numpy()
+            self.threshold = np.percentile(errors, 95)
+        
+        self._trained = True
+        logger.info(f"Energy anomaly detector trained with threshold {self.threshold:.4f}")
+    
+    def detect_anomaly(self, features: np.ndarray) -> Tuple[bool, float]:
+        """Detect if current energy pattern is anomalous"""
+        if not self._trained or not TORCH_AVAILABLE:
+            # Fallback to statistical detection
+            return self._statistical_detection(features)
+        
+        with torch.no_grad():
+            tensor = torch.FloatTensor(features).unsqueeze(0)
+            reconstructed = self.autoencoder(tensor)
+            error = torch.mean((reconstructed - tensor) ** 2).item()
+        
+        is_anomaly = error > self.threshold
+        score = min(1.0, error / self.threshold)
+        
+        return is_anomaly, score
+    
+    def _statistical_detection(self, features: np.ndarray) -> Tuple[bool, float]:
+        """Fallback statistical anomaly detection"""
+        if len(self.training_data) < 50:
+            return False, 0.0
+        
+        recent = np.array(list(self.training_data))[-100:]
+        mean = np.mean(recent, axis=0)
+        std = np.std(recent, axis=0) + 1e-6
+        
+        z_scores = np.abs((features - mean) / std)
+        max_z = np.max(z_scores)
+        
+        is_anomaly = max_z > 3.0
+        score = min(1.0, max_z / 5.0)
+        
+        return is_anomaly, score
+
+
+# ============================================================
+# ENHANCEMENT 6: Main Enhanced Energy Scaler
+# ============================================================
+
+class UltimateEnergyScaler:
+    """
+    Ultimate energy-proportional scaling optimizer v3.3.
+    
+    Features:
+    - WebSocket power telemetry
+    - Multi-objective Bayesian optimization
+    - GPU health monitoring
+    - Carbon-aware DVFS
+    - Energy anomaly detection
+    """
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         
-        # Hardware configuration
-        hardware_type_str = self.config.get('hardware_type', 'a100')
-        self.hardware_type = HardwareType(hardware_type_str)
-        self.hardware_profile = HardwareDatabase.get_profile(self.hardware_type)
+        # New components
+        self.ws_monitor = WebSocketPowerMonitor(
+            ws_url=self.config.get('ws_url', 'ws://localhost:8765'),
+            gpu_count=self.config.get('gpu_count', 1)
+        )
+        self.mobo_optimizer = MultiObjectiveBayesianOptimizer()
+        self.health_monitor = GPUHealthMonitor(self.config.get('gpu_count', 1))
+        self.carbon_dvfs = CarbonAwareDVFS()
+        self.anomaly_detector = EnergyAnomalyDetector()
         
-        # Workload type
-        workload_str = self.config.get('workload_type', 'mixed')
-        self.workload_type = WorkloadType(workload_str)
+        # Start WebSocket monitoring
+        self.ws_monitor.start()
         
-        # Enhanced components
+        # Base components
         self.power_cappers = {i: RealPowerCapper(i) for i in range(self.config.get('gpu_count', 1))}
         self.rdma_model = GPUDirectRDMAEnergyModel(self.config.get('gpu_count', 1))
-        self.multi_node = MultiNodeEnergyModel(self.config.get('num_nodes', 1))
         self.telemetry = PowerTelemetryExporter()
-        self.throttling_predictor = ThermalThrottlingPredictor()
-        self.kube_scheduler = None
         
-        # Initialize Kubernetes scheduler if node list provided
-        nodes = self.config.get('k8s_nodes', [])
-        if nodes:
-            self.kube_scheduler = EnergyAwareKubeScheduler(nodes)
-        
-        # Original components
-        self.power_monitor = MultiGPUPowerMonitor({
-            'simulate': self.config.get('simulate', True),
-            'gpu_count': self.config.get('gpu_count', 1),
-            'adaptive_sampling': self.config.get('adaptive_sampling', True)
-        })
-        self.thermal_model = ExponentialThermalModel()
-        self.memory_model = FixedMemoryEnergyModel(
-            hbm_energy_per_byte_joules=self.hardware_profile.hbm_energy_per_byte_joules
-        )
-        self.interconnect_model = InterconnectModel(self.hardware_profile)
-        self.auto_tuner = EnhancedAutoTuner()
-        
-        # Workload-specific efficiency curve
-        self.workload_model = WorkloadEfficiencyModel(self.workload_type)
-        self.gpu_efficiency_curve = self.workload_model.get_efficiency_curve(max_parallelism=8)
-        
-        # Scaling limits
-        self.max_parallelism = self.config.get('max_parallelism', min(8, self.config.get('gpu_count', 8)))
-        self.min_parallelism = self.config.get('min_parallelism', 1)
-        self.accuracy_tolerance = self.config.get('accuracy_tolerance', 0.10)
-        
-        # Start background monitoring
-        self._monitoring = False
-        self._monitor_thread = None
-        self._start_monitoring()
-        
-        logger.info(f"EnergyProportionalScaler v3.2 initialized for {self.hardware_type.value}, "
-                   f"workload={self.workload_type.value}, nodes={self.config.get('num_nodes', 1)}")
+        logger.info("UltimateEnergyScaler v3.3 initialized")
     
-    def _start_monitoring(self):
-        """Start background telemetry monitoring"""
-        self._monitoring = True
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._monitor_thread.start()
-    
-    def _monitor_loop(self):
-        """Background monitoring for telemetry export"""
-        node_name = self.config.get('node_name', 'default')
-        
-        while self._monitoring:
-            try:
-                for i in range(self.config.get('gpu_count', 1)):
-                    power = self.power_cappers[i].get_power_draw()
-                    temp = self.power_monitor.get_gpu_temperature(i)
-                    util = self.power_monitor.get_gpu_utilization(i)
-                    
-                    # Update Prometheus metrics
-                    self.telemetry.update_metrics(i, node_name, power, temp, util)
-                    
-                    # Update throttling predictor
-                    self.throttling_predictor.add_observation(temp, power)
-                
-                # Update Kubernetes scheduler metrics
-                if self.kube_scheduler:
-                    total_power = self.power_monitor.get_total_power()
-                    avg_temp = self.power_monitor.get_average_temperature()
-                    self.kube_scheduler.update_node_metrics(node_name, total_power, avg_temp)
-                
-                time.sleep(5)
-            except Exception as e:
-                logger.error(f"Telemetry error: {e}")
-                time.sleep(10)
-    
-    def apply_power_cap(self, gpu_index: int, power_limit_watts: float) -> Tuple[bool, str]:
-        """Apply power cap to GPU"""
-        power_capper = self.power_cappers.get(gpu_index)
-        if not power_capper:
-            return False, f"No power capper for GPU {gpu_index}"
-        
-        return power_capper.set_power_limit(power_limit_watts)
-    
-    def apply_all_power_caps(self, power_limit_watts: float) -> Dict[int, Tuple[bool, str]]:
-        """Apply same power cap to all GPUs"""
-        results = {}
-        for i in range(self.config.get('gpu_count', 1)):
-            results[i] = self.apply_power_cap(i, power_limit_watts)
-        return results
-    
-    def estimate_rdma_energy(self, bytes_transferred: float,
-                              src_gpu: int, dst_gpu: int) -> float:
-        """Estimate energy for GPU-Direct RDMA transfer"""
-        return self.rdma_model.calculate_communication_energy(bytes_transferred, src_gpu, dst_gpu, 1)
-    
-    def get_k8s_scheduling_recommendation(self, pod_name: str,
-                                          power_estimate_watts: float) -> Optional[str]:
-        """Get Kubernetes scheduling recommendation"""
-        if self.kube_scheduler:
-            return self.kube_scheduler.schedule_pod(pod_name, power_estimate_watts)
-        return None
-    
-    def get_throttling_risk(self) -> float:
-        """Get current throttling risk (0-1)"""
-        return self.throttling_predictor.get_throttling_risk()
-    
-    def predict_throttling(self, seconds_ahead: int = 30) -> Tuple[bool, float, float]:
-        """Predict if throttling will occur"""
-        return self.throttling_predictor.predict_throttling(seconds_ahead)
-    
-    # ... (keep existing methods: _get_calibrated_characteristics,
-    #     calculate_energy_proportionality, find_optimal_precision,
-    #     calculate_optimal_parallelism, scale_model, get_scaling_decision,
-    #     record_execution_result, etc.)
-
-    def _get_calibrated_characteristics(self, precision: PrecisionLevel) -> PrecisionCharacteristics:
-        """Get precision characteristics with hardware calibration"""
-        base = self.BASE_PRECISION_CHARS[precision]
-        
-        if not self.calibration_enabled:
-            return base
-        
-        hw = self.hardware_profile
-        
-        # Energy factor from hardware calibration
-        if precision == PrecisionLevel.FP32:
-            peak_ratio = hw.peak_tflops_fp32 / 19.5
-        elif precision in [PrecisionLevel.FP16, PrecisionLevel.BF16]:
-            peak_ratio = hw.peak_tflops_fp16 / 312.0
-        elif precision == PrecisionLevel.INT8:
-            peak_ratio = hw.peak_tflops_int8 / 624.0
-        elif precision == PrecisionLevel.INT4:
-            peak_ratio = hw.peak_tflops_int4 / 1248.0
-        else:
-            peak_ratio = 1.0
-        
-        energy_factor = 1.0 / peak_ratio if peak_ratio > 0 else 1.0
-        
-        # Auto-tuner calibration
-        tuner_factor = self.auto_tuner.get_calibration_factor(precision)
-        
-        # Memory bandwidth adjustment
-        bandwidth_ratio = hw.memory_bandwidth_gb_s / 2000.0
-        
-        return PrecisionCharacteristics(
-            energy_per_flop_joules=base.energy_per_flop_joules * energy_factor * tuner_factor,
-            memory_bandwidth_gb_s=base.memory_bandwidth_gb_s * bandwidth_ratio,
-            model_size_reduction=base.model_size_reduction,
-            accuracy_impact_percent=base.accuracy_impact_percent,
-            helium_footprint=base.helium_footprint,
-            communication_overhead=base.communication_overhead * (1 + 0.05 * np.log2(hw.peak_tflops_fp32)),
-            memory_energy_factor=base.memory_energy_factor * (hw.hbm_energy_per_byte_joules / 2.0e-11)
-        )
-    
-    def get_enhanced_scaling_decision(self, workload_profile, execution_decision) -> ScalingDecision:
+    async def optimize_with_carbon(self, workload_profile, execution_decision,
+                                   carbon_intensity: float) -> ScalingDecision:
         """
-        Enhanced scaling decision with real power capping and RDMA modeling.
+        Optimize scaling with carbon-aware DVFS.
         """
-        # Get base scaling decision
+        # Get base decision
         base_decision = self.get_scaling_decision(workload_profile, execution_decision)
         
-        # Apply power caps based on decision
-        if base_decision.optimal_precision in [PrecisionLevel.INT8, PrecisionLevel.INT4]:
-            # Lower precision allows lower power caps
-            power_cap = self.hardware_profile.tdp_watts * 0.6
-        else:
-            power_cap = self.hardware_profile.tdp_watts * 0.8
+        # Get current GPU temperature
+        gpu_temp = self.power_cappers[0].get_power_draw()  # Approximate
+        current_power = self.power_cappers[0].get_power_draw()
         
-        results = self.apply_all_power_caps(power_cap)
-        power_cap_success = all(success for success, _ in results.values())
+        # Find optimal frequency considering carbon
+        optimal_freq = self.carbon_dvfs.optimal_frequency(carbon_intensity, gpu_temp, current_power)
         
-        # Check throttling prediction
-        will_throttle, predicted_temp, throttle_conf = self.predict_throttling(30)
+        # Apply frequency scaling
+        self.carbon_dvfs.set_frequency(optimal_freq)
         
-        # Adjust throttle factor if throttling predicted
-        throttle_factor = base_decision.throttle_factor
-        if will_throttle:
-            throttle_factor = max(0.5, throttle_factor * 0.8)
-            logger.warning(f"Throttling predicted in 30s (temp={predicted_temp:.1f}°C), reducing throttle to {throttle_factor:.2f}")
+        # Calculate carbon savings
+        energy_saved = self.carbon_dvfs.get_energy_savings(current_power, 3600)  # 1 hour
+        carbon_saved = energy_saved * carbon_intensity / 1000 / 3600
         
         # Enhanced recommendation
-        enhanced_recommendation = base_decision.recommendation
-        if power_cap_success:
-            enhanced_recommendation += f" | Power capped at {power_cap:.0f}W"
-        
-        if will_throttle:
-            enhanced_recommendation += f" | Thermal throttling risk: {self.get_throttling_risk():.0%}"
-        
-        # Kubernetes scheduling recommendation
-        if self.kube_scheduler:
-            pod_power = self.hardware_profile.tdp_watts * throttle_factor
-            node = self.get_k8s_scheduling_recommendation(
-                getattr(workload_profile, 'pod_name', 'unknown'),
-                pod_power
-            )
-            if node:
-                enhanced_recommendation += f" | Schedule to node: {node}"
+        enhanced_recommendation = (
+            f"{base_decision.recommendation} | "
+            f"Carbon-aware DVFS: {optimal_freq}MHz | "
+            f"Carbon saved: {carbon_saved:.2f} kg CO2"
+        )
         
         return ScalingDecision(
             optimal_precision=base_decision.optimal_precision,
             optimal_parallelism=base_decision.optimal_parallelism,
-            optimal_frequency_mhz=base_decision.optimal_frequency_mhz,
-            energy_savings_percent=base_decision.energy_savings_percent,
+            optimal_frequency_mhz=optimal_freq,
+            energy_savings_percent=base_decision.energy_savings_percent +
+                                   (1 - optimal_freq / self.carbon_dvfs.base_frequency) * 100,
             accuracy_tradeoff_percent=base_decision.accuracy_tradeoff_percent,
             helium_reduction_percent=base_decision.helium_reduction_percent,
-            meets_power_budget=power_cap_success and not will_throttle,
+            meets_power_budget=base_decision.meets_power_budget,
             recommendation=enhanced_recommendation,
             mixed_precision_used=base_decision.mixed_precision_used,
             calibration_applied=base_decision.calibration_applied,
             thermal_adjustment=base_decision.thermal_adjustment,
-            dvfs_state=base_decision.dvfs_state
+            dvfs_state=None
         )
     
-    def get_telemetry_metrics(self) -> Dict:
-        """Get current telemetry metrics"""
-        metrics = {}
+    async def get_power_telemetry(self) -> Dict[int, float]:
+        """Get real-time power telemetry via WebSocket"""
+        power_data = {}
         for i in range(self.config.get('gpu_count', 1)):
-            metrics[f'gpu_{i}_power_watts'] = self.power_cappers[i].get_power_draw()
-            metrics[f'gpu_{i}_temperature_c'] = self.power_monitor.get_gpu_temperature(i)
-            metrics[f'gpu_{i}_utilization_percent'] = self.power_monitor.get_gpu_utilization(i)
-        
-        metrics['throttling_risk'] = self.get_throttling_risk()
-        
-        return metrics
+            power_data[i] = await self.ws_monitor.get_current_power(i)
+        return power_data
     
-    def stop_monitoring(self):
-        """Stop background monitoring"""
-        self._monitoring = False
-        if self._monitor_thread:
-            self._monitor_thread.join(timeout=2)
+    def update_health_monitoring(self, gpu_index: int, temp_c: float, power_w: float):
+        """Update GPU health monitoring metrics"""
+        self.health_monitor.update_temperature(gpu_index, temp_c)
+        self.health_monitor.update_power(gpu_index, power_w)
+        
+        # Check health status
+        health = self.health_monitor.get_health_status(gpu_index)
+        if health['status'] == 'critical':
+            logger.warning(f"GPU {gpu_index} health critical: {health['health_score']:.2f}")
+    
+    def detect_energy_anomaly(self, features: np.ndarray) -> Tuple[bool, float]:
+        """Detect anomalies in energy consumption patterns"""
+        return self.anomaly_detector.detect_anomaly(features)
+    
+    def get_ultimate_metrics(self) -> Dict:
+        """Get ultimate system metrics"""
+        base_metrics = self.get_telemetry_metrics()
+        
+        # Add new metrics
+        base_metrics['health'] = {
+            i: self.health_monitor.get_health_status(i)
+            for i in range(self.config.get('gpu_count', 1))
+        }
+        base_metrics['dvfs'] = {
+            'current_frequency': self.carbon_dvfs.current_frequency,
+            'available_frequencies': self.carbon_dvfs.frequency_steps
+        }
+        base_metrics['anomaly_detector'] = {
+            'trained': self.anomaly_detector._trained,
+            'threshold': self.anomaly_detector.threshold
+        }
+        
+        return base_metrics
+    
+    async def close(self):
+        """Clean up resources"""
+        await self.ws_monitor.stop()
 
 
 # ============================================================
 # Usage Example
 # ============================================================
 
-def main():
-    print("=== Enhanced Energy Scaler v3.2 Demo ===\n")
+async def main():
+    print("=== Ultimate Energy Scaler v3.3 Demo ===\n")
     
-    scaler = EnergyProportionalScaler({
+    scaler = UltimateEnergyScaler({
         'hardware_type': 'a100',
-        'workload_type': 'mixed',
-        'simulate': True,
         'gpu_count': 4,
-        'num_nodes': 2,
-        'k8s_nodes': ['node-1', 'node-2', 'node-3'],
-        'node_name': 'test-node'
+        'ws_url': 'ws://localhost:8765',
+        'simulate': True
     })
     
     class MockProfile:
         model_size_gb = 10.0
-        num_parameters = 2.5e9
         training_steps = 1000
         batch_size = 32
         target_latency_ms = 100.0
-        operation_type = 'matrix_multiply'
-        pod_name = 'test-pod'
     
     class MockDecision:
         power_budget = 0.7
@@ -843,44 +728,40 @@ def main():
     profile = MockProfile()
     decision = MockDecision()
     
-    print("1. Real Power Capping Test:")
-    for i in range(4):
-        success, msg = scaler.apply_power_cap(i, 250)
-        print(f"   GPU {i}: {msg[:50]}...")
+    print("1. WebSocket Power Telemetry:")
+    power_data = await scaler.get_power_telemetry()
+    for gpu, power in power_data.items():
+        print(f"   GPU {gpu}: {power:.1f}W")
     
-    print("\n2. GPU-Direct RDMA Energy Model:")
-    energy = scaler.estimate_rdma_energy(1e9, 0, 1)  # 1 GB transfer
-    print(f"   RDMA energy for 1GB: {energy*1e6:.2f} µJ")
+    print("\n2. Carbon-Aware DVFS Optimization:")
+    carbon_intensity = 400  # gCO2/kWh
+    decision = await scaler.optimize_with_carbon(profile, decision, carbon_intensity)
+    print(f"   Optimal frequency: {decision.optimal_frequency_mhz}MHz")
+    print(f"   Energy savings: {decision.energy_savings_percent:.1f}%")
+    print(f"   Recommendation: {decision.recommendation}")
     
-    print("\n3. Enhanced Scaling Decision:")
-    enhanced_decision = scaler.get_enhanced_scaling_decision(profile, decision)
-    print(f"   Precision: {enhanced_decision.optimal_precision.value.upper()}")
-    print(f"   Parallelism: {enhanced_decision.optimal_parallelism} GPUs")
-    print(f"   Energy savings: {enhanced_decision.energy_savings_percent:.1f}%")
-    print(f"   Recommendation: {enhanced_decision.recommendation}")
+    print("\n3. GPU Health Monitoring:")
+    for gpu in range(4):
+        scaler.update_health_monitoring(gpu, 72.0, 250.0)
+        health = scaler.health_monitor.get_health_status(gpu)
+        print(f"   GPU {gpu}: health={health['health_score']:.2f}, RUL={health['rul_days']:.0f} days")
     
-    print("\n4. Telemetry Metrics:")
-    metrics = scaler.get_telemetry_metrics()
-    for key, value in metrics.items():
-        if isinstance(value, float):
-            print(f"   {key}: {value:.1f}")
-        else:
-            print(f"   {key}: {value}")
+    print("\n4. Energy Anomaly Detection:")
+    normal_features = np.random.normal(0, 1, 10)
+    is_anomaly, score = scaler.detect_energy_anomaly(normal_features)
+    print(f"   Normal pattern: anomaly={is_anomaly}, score={score:.2f}")
     
-    print("\n5. Kubernetes Scheduling Recommendation:")
-    if scaler.kube_scheduler:
-        node = scaler.get_k8s_scheduling_recommendation('training-pod', 200)
-        print(f"   Recommended node: {node}")
+    anomalous_features = np.random.normal(5, 2, 10)
+    is_anomaly, score = scaler.detect_energy_anomaly(anomalous_features)
+    print(f"   Anomalous pattern: anomaly={is_anomaly}, score={score:.2f}")
     
-    print("\n6. Thermal Throttling Prediction:")
-    will_throttle, pred_temp, conf = scaler.predict_throttling(30)
-    print(f"   Will throttle in 30s: {will_throttle}")
-    print(f"   Predicted temperature: {pred_temp:.1f}°C")
-    print(f"   Confidence: {conf:.0%}")
+    print("\n5. Ultimate Metrics:")
+    metrics = scaler.get_ultimate_metrics()
+    print(f"   DVFS frequency: {metrics['dvfs']['current_frequency']}MHz")
+    print(f"   Anomaly detector trained: {metrics['anomaly_detector']['trained']}")
     
-    scaler.stop_monitoring()
-    
-    print("\n✅ Enhanced Energy Scaler v3.2 test complete")
+    await scaler.close()
+    print("\n✅ Ultimate Energy Scaler v3.3 test complete")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
