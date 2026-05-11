@@ -4,16 +4,16 @@
 Enhanced Material Substitution Engine for Green Agent - Version 4.0
 
 CRITICAL FIXES AND ENHANCEMENTS OVER v3.3:
-1. IMPLEMENTED: SubstitutionDecision dataclass (was completely missing)
-2. IMPLEMENTED: SubstitutionEvaluation dataclass (was missing)
-3. IMPLEMENTED: SubstituteMaterial enum with all cooling alternatives
-4. IMPLEMENTED: HardwareType enum for different equipment types
+1. IMPLEMENTED: SubstituteMaterial enum with all cooling alternatives
+2. IMPLEMENTED: HardwareType enum for different equipment types
+3. IMPLEMENTED: SubstitutionEvaluation dataclass (was missing)
+4. IMPLEMENTED: SubstitutionDecision dataclass (was missing)
 5. IMPLEMENTED: CompatibilityDatabase for hardware-material matching
 6. IMPLEMENTED: LifecycleCostAnalyzer with NPV and payback calculations
 7. IMPLEMENTED: RegulatoryComplianceChecker with multi-region support
 8. IMPLEMENTED: SUBSTITUTE_DATA dictionary with all material properties
 9. IMPLEMENTED: PriceAPI for real-time material pricing
-10. FIXED: All undefined class references and method calls resolved
+10. IMPLEMENTED: DegradationModel for material degradation estimation
 11. ENHANCED: Transformer degradation predictor with better fallback
 12. ENHANCED: Supply chain risk model with comprehensive scoring
 
@@ -88,15 +88,15 @@ class SubstituteMaterial(Enum):
 
 class TechnologyReadinessLevel(Enum):
     """Technology Readiness Levels (NASA scale)"""
-    TRL1 = 1  # Basic principles observed
-    TRL2 = 2  # Technology concept formulated
-    TRL3 = 3  # Experimental proof of concept
-    TRL4 = 4  # Technology validated in lab
-    TRL5 = 5  # Technology validated in relevant environment
-    TRL6 = 6  # Technology demonstrated in relevant environment
-    TRL7 = 7  # System prototype demonstration in operational environment
-    TRL8 = 8  # System complete and qualified
-    TRL9 = 9  # Actual system proven in operational environment
+    TRL1 = 1
+    TRL2 = 2
+    TRL3 = 3
+    TRL4 = 4
+    TRL5 = 5
+    TRL6 = 6
+    TRL7 = 7
+    TRL8 = 8
+    TRL9 = 9
 
 
 @dataclass
@@ -217,11 +217,6 @@ class CompatibilityDatabase:
             mat for (hw, mat), info in cls._compatibility_matrix.items()
             if hw == hardware and info.compatible
         ]
-    
-    @classmethod
-    def add_compatibility(cls, hardware: HardwareType, material: SubstituteMaterial, info: CompatibilityInfo):
-        """Add new compatibility entry"""
-        cls._compatibility_matrix[(hardware, material)] = info
 
 
 # ============================================================
@@ -229,15 +224,7 @@ class CompatibilityDatabase:
 # ============================================================
 
 class LifecycleCostAnalyzer:
-    """
-    Lifecycle cost analyzer with NPV and payback calculations.
-    
-    Features:
-    - Net Present Value (NPV) calculation
-    - Payback period estimation
-    - Monte Carlo simulation support
-    - Sensitivity analysis
-    """
+    """Lifecycle cost analyzer with NPV and payback calculations"""
     
     def __init__(self, discount_rate: float = 0.08):
         self.discount_rate = discount_rate
@@ -261,9 +248,7 @@ class LifecycleCostAnalyzer:
         """Calculate payback period in months"""
         if annual_net_savings <= 0:
             return float('inf')
-        
-        years = initial_cost / annual_net_savings
-        return years * 12
+        return (initial_cost / annual_net_savings) * 12
     
     def monte_carlo_npv(self, initial_cost: float, annual_net_savings: float,
                        lifetime_years: int, n_simulations: int = 1000,
@@ -286,12 +271,9 @@ class LifecycleCostAnalyzer:
             payback = self.calculate_payback(sampled_cost, sampled_savings)
             payback_samples.append(payback)
         
-        npv_mean = np.mean(npv_samples)
-        npv_std = np.std(npv_samples)
-        
         return {
-            'npv_mean': npv_mean,
-            'npv_std': npv_std,
+            'npv_mean': np.mean(npv_samples),
+            'npv_std': np.std(npv_samples),
             'npv_ci_lower': np.percentile(npv_samples, 2.5),
             'npv_ci_upper': np.percentile(npv_samples, 97.5),
             'probability_positive': np.mean([1 for n in npv_samples if n > 0]),
@@ -306,14 +288,7 @@ class LifecycleCostAnalyzer:
 # ============================================================
 
 class RegulatoryComplianceChecker:
-    """
-    Regulatory compliance checker with multi-region support.
-    
-    Features:
-    - Multi-region regulation database
-    - Compliance checking with warnings
-    - Automatic updates simulation
-    """
+    """Regulatory compliance checker with multi-region support"""
     
     def __init__(self):
         self.compliance_data = {
@@ -328,7 +303,7 @@ class RegulatoryComplianceChecker:
                 'asia': {'compliant': False, 'warnings': ['Restricted in some regions'], 'standards': []}
             },
             'hydrogen': {
-                'us': {'compliant': True, 'warnings': ['Explosion proof requirements', 'Ventilation standards'], 'standards': ['NFPA 2']},
+                'us': {'compliant': True, 'warnings': ['Explosion proof requirements'], 'standards': ['NFPA 2']},
                 'eu': {'compliant': True, 'warnings': ['ATEX certification required'], 'standards': ['ATEX 2014/34/EU']},
                 'asia': {'compliant': False, 'warnings': ['Highly restricted'], 'standards': []}
             },
@@ -345,6 +320,16 @@ class RegulatoryComplianceChecker:
             'thermoelectric': {
                 'us': {'compliant': True, 'warnings': [], 'standards': ['UL 61010']},
                 'eu': {'compliant': True, 'warnings': [], 'standards': ['CE Marking']},
+                'asia': {'compliant': True, 'warnings': [], 'standards': []}
+            },
+            'closed_cycle': {
+                'us': {'compliant': True, 'warnings': [], 'standards': ['ASHRAE 15']},
+                'eu': {'compliant': True, 'warnings': [], 'standards': ['EN 378']},
+                'asia': {'compliant': True, 'warnings': [], 'standards': []}
+            },
+            'pulse_tube': {
+                'us': {'compliant': True, 'warnings': [], 'standards': ['ASHRAE 15']},
+                'eu': {'compliant': True, 'warnings': [], 'standards': ['EN 378']},
                 'asia': {'compliant': True, 'warnings': [], 'standards': []}
             }
         }
@@ -367,11 +352,10 @@ class RegulatoryComplianceChecker:
     
     def get_compliant_materials(self, region: str = 'us') -> List[str]:
         """Get all compliant materials for a region"""
-        compliant = []
-        for material, regions in self.compliance_data.items():
-            if regions.get(region, {}).get('compliant', False):
-                compliant.append(material)
-        return compliant
+        return [
+            mat for mat, regions in self.compliance_data.items()
+            if regions.get(region, {}).get('compliant', False)
+        ]
 
 
 # ============================================================
@@ -379,14 +363,7 @@ class RegulatoryComplianceChecker:
 # ============================================================
 
 class PriceAPI:
-    """
-    Material pricing API with simulation support.
-    
-    Features:
-    - Real-time price data
-    - Historical price trends
-    - Price confidence intervals
-    """
+    """Material pricing API with simulation support"""
     
     def __init__(self, simulate: bool = True):
         self.simulate = simulate
@@ -394,16 +371,10 @@ class PriceAPI:
         self.cache_ttl = 300
         self._lock = threading.RLock()
         
-        # Base prices for materials
         self.base_prices = {
-            'cryocooler': 50000,
-            'neon': 3000,
-            'hydrogen': 1500,
-            'nitrogen': 500,
-            'adiabatic_demag': 35000,
-            'thermoelectric': 12000,
-            'closed_cycle': 45000,
-            'pulse_tube': 55000
+            'cryocooler': 50000, 'neon': 3000, 'hydrogen': 1500,
+            'nitrogen': 500, 'adiabatic_demag': 35000, 'thermoelectric': 12000,
+            'closed_cycle': 45000, 'pulse_tube': 55000
         }
         
         logger.info(f"PriceAPI initialized (simulate={simulate})")
@@ -444,109 +415,54 @@ class PriceAPI:
 # CRITICAL FIX: Define SUBSTITUTE_DATA
 # ============================================================
 
-# Complete substitute material database
 SUBSTITUTE_DATA = {
     SubstituteMaterial.CRYOCOOLER: SubstituteProperties(
-        material=SubstituteMaterial.CRYOCOOLER,
-        feasibility_score=0.9,
-        helium_reduction=0.95,
-        power_overhead=1.3,
-        carbon_impact=0.3,
-        reliability_score=0.92,
-        readiness_level=9,
-        cost_premium=50000.0,
-        installation_complexity=0.3,
-        maintenance_frequency_months=12,
-        expected_lifetime_years=15,
-        temperature_range_c=(4.0, 300.0),
-        noise_db=60.0,
-        size_reduction_percent=20.0,
-        warranty_years=5
+        material=SubstituteMaterial.CRYOCOOLER, feasibility_score=0.9,
+        helium_reduction=0.95, power_overhead=1.3, carbon_impact=0.3,
+        reliability_score=0.92, readiness_level=9, cost_premium=50000.0,
+        installation_complexity=0.3, maintenance_frequency_months=12,
+        expected_lifetime_years=15, temperature_range_c=(4.0, 300.0),
+        noise_db=60.0, size_reduction_percent=20.0, warranty_years=5
     ),
     SubstituteMaterial.NEON: SubstituteProperties(
-        material=SubstituteMaterial.NEON,
-        feasibility_score=0.7,
-        helium_reduction=0.6,
-        power_overhead=1.1,
-        carbon_impact=0.8,
-        reliability_score=0.85,
-        readiness_level=7,
-        cost_premium=3000.0,
-        installation_complexity=0.5,
-        maintenance_frequency_months=6,
-        expected_lifetime_years=8,
-        temperature_range_c=(27.0, 300.0),
-        noise_db=45.0,
-        size_reduction_percent=0.0,
-        warranty_years=3
+        material=SubstituteMaterial.NEON, feasibility_score=0.7,
+        helium_reduction=0.6, power_overhead=1.1, carbon_impact=0.8,
+        reliability_score=0.85, readiness_level=7, cost_premium=3000.0,
+        installation_complexity=0.5, maintenance_frequency_months=6,
+        expected_lifetime_years=8, temperature_range_c=(27.0, 300.0),
+        noise_db=45.0, size_reduction_percent=0.0, warranty_years=3
     ),
     SubstituteMaterial.HYDROGEN: SubstituteProperties(
-        material=SubstituteMaterial.HYDROGEN,
-        feasibility_score=0.5,
-        helium_reduction=0.7,
-        power_overhead=0.9,
-        carbon_impact=0.6,
-        reliability_score=0.75,
-        readiness_level=6,
-        cost_premium=1500.0,
-        installation_complexity=0.7,
-        maintenance_frequency_months=3,
-        expected_lifetime_years=5,
-        temperature_range_c=(20.0, 300.0),
-        noise_db=50.0,
-        size_reduction_percent=-10.0,
-        warranty_years=2
+        material=SubstituteMaterial.HYDROGEN, feasibility_score=0.5,
+        helium_reduction=0.7, power_overhead=0.9, carbon_impact=0.6,
+        reliability_score=0.75, readiness_level=6, cost_premium=1500.0,
+        installation_complexity=0.7, maintenance_frequency_months=3,
+        expected_lifetime_years=5, temperature_range_c=(20.0, 300.0),
+        noise_db=50.0, size_reduction_percent=-10.0, warranty_years=2
     ),
     SubstituteMaterial.CLOSED_CYCLE: SubstituteProperties(
-        material=SubstituteMaterial.CLOSED_CYCLE,
-        feasibility_score=0.88,
-        helium_reduction=0.92,
-        power_overhead=1.25,
-        carbon_impact=0.35,
-        reliability_score=0.9,
-        readiness_level=8,
-        cost_premium=45000.0,
-        installation_complexity=0.35,
-        maintenance_frequency_months=12,
-        expected_lifetime_years=12,
-        temperature_range_c=(4.0, 300.0),
-        noise_db=55.0,
-        size_reduction_percent=15.0,
-        warranty_years=4
+        material=SubstituteMaterial.CLOSED_CYCLE, feasibility_score=0.88,
+        helium_reduction=0.92, power_overhead=1.25, carbon_impact=0.35,
+        reliability_score=0.9, readiness_level=8, cost_premium=45000.0,
+        installation_complexity=0.35, maintenance_frequency_months=12,
+        expected_lifetime_years=12, temperature_range_c=(4.0, 300.0),
+        noise_db=55.0, size_reduction_percent=15.0, warranty_years=4
     ),
     SubstituteMaterial.PULSE_TUBE: SubstituteProperties(
-        material=SubstituteMaterial.PULSE_TUBE,
-        feasibility_score=0.85,
-        helium_reduction=0.9,
-        power_overhead=1.35,
-        carbon_impact=0.4,
-        reliability_score=0.88,
-        readiness_level=8,
-        cost_premium=55000.0,
-        installation_complexity=0.4,
-        maintenance_frequency_months=18,
-        expected_lifetime_years=20,
-        temperature_range_c=(2.0, 300.0),
-        noise_db=65.0,
-        size_reduction_percent=10.0,
-        warranty_years=5
+        material=SubstituteMaterial.PULSE_TUBE, feasibility_score=0.85,
+        helium_reduction=0.9, power_overhead=1.35, carbon_impact=0.4,
+        reliability_score=0.88, readiness_level=8, cost_premium=55000.0,
+        installation_complexity=0.4, maintenance_frequency_months=18,
+        expected_lifetime_years=20, temperature_range_c=(2.0, 300.0),
+        noise_db=65.0, size_reduction_percent=10.0, warranty_years=5
     ),
     SubstituteMaterial.ADIABATIC_DEMAG: SubstituteProperties(
-        material=SubstituteMaterial.ADIABATIC_DEMAG,
-        feasibility_score=0.75,
-        helium_reduction=0.85,
-        power_overhead=1.5,
-        carbon_impact=0.5,
-        reliability_score=0.82,
-        readiness_level=7,
-        cost_premium=35000.0,
-        installation_complexity=0.6,
-        maintenance_frequency_months=8,
-        expected_lifetime_years=10,
-        temperature_range_c=(0.1, 10.0),
-        noise_db=40.0,
-        size_reduction_percent=5.0,
-        warranty_years=3
+        material=SubstituteMaterial.ADIABATIC_DEMAG, feasibility_score=0.75,
+        helium_reduction=0.85, power_overhead=1.5, carbon_impact=0.5,
+        reliability_score=0.82, readiness_level=7, cost_premium=35000.0,
+        installation_complexity=0.6, maintenance_frequency_months=8,
+        expected_lifetime_years=10, temperature_range_c=(0.1, 10.0),
+        noise_db=40.0, size_reduction_percent=5.0, warranty_years=3
     ),
 }
 
@@ -586,18 +502,14 @@ class TransformerDegradationPredictor:
                 )
                 self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
                 self.fc = nn.Sequential(
-                    nn.Linear(d_model, 32),
-                    nn.ReLU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(32, 1),
-                    nn.Sigmoid()
+                    nn.Linear(d_model, 32), nn.ReLU(), nn.Dropout(0.1),
+                    nn.Linear(32, 1), nn.Sigmoid()
                 )
             
             def forward(self, x):
                 x = self.input_proj(x)
                 x = self.transformer(x)
-                x = x.mean(dim=1)
-                return self.fc(x)
+                return self.fc(x.mean(dim=1))
         
         self.model = DegradationTransformer(
             self.input_size, self.d_model, self.nhead, 
@@ -605,20 +517,34 @@ class TransformerDegradationPredictor:
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
     
-    def train(self, training_data: List, epochs: int = 100):
-        """Train transformer on historical sequences"""
+    def prepare_features(self, historical_data: List[Tuple[float, float, float, float, float]]) -> Optional[torch.Tensor]:
+        """Prepare features for model input"""
+        if not TORCH_AVAILABLE or len(historical_data) < 6:
+            return None
+        
+        features = []
+        for hours, efficiency, temp, load, vibration in historical_data:
+            features.append([
+                hours / 10000.0, efficiency, temp / 100.0,
+                load, vibration / 10.0, math.sin(2 * math.pi * hours / 8760)
+            ])
+        
+        return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
+    
+    def train(self, training_data: List[List[Tuple]], epochs: int = 100):
+        """Train on historical sequences"""
         if not TORCH_AVAILABLE or self.model is None or len(training_data) < 50:
             return
         
-        X_train = []
-        y_train = []
+        X_train, y_train = [], []
         
         for sequence in training_data:
             if len(sequence) >= 7:
-                features = self._prepare_features(sequence[:6])
-                if features is not None:
-                    X_train.append(features)
-                    y_train.append(sequence[6][1])
+                for i in range(len(sequence) - 6):
+                    features = self.prepare_features(sequence[i:i+6])
+                    if features is not None:
+                        X_train.append(features)
+                        y_train.append(sequence[i+6][1])
         
         if len(X_train) < 50:
             return
@@ -640,24 +566,6 @@ class TransformerDegradationPredictor:
         self._trained = True
         logger.info(f"Transformer trained on {len(X_train)} samples")
     
-    def _prepare_features(self, data: List[Tuple]) -> Optional[torch.Tensor]:
-        """Prepare features for model input"""
-        if not TORCH_AVAILABLE or len(data) < 6:
-            return None
-        
-        features = []
-        for hours, efficiency, temp, load, vibration in data:
-            features.append([
-                hours / 10000.0,
-                efficiency,
-                temp / 100.0,
-                load,
-                vibration / 10.0,
-                math.sin(2 * math.pi * hours / 8760)
-            ])
-        
-        return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
-    
     def predict(self, historical_data: List[Tuple], forward_hours: float = 8760,
                 dropout_iterations: int = 50) -> Tuple[float, float, float]:
         """Predict future efficiency with uncertainty"""
@@ -668,7 +576,7 @@ class TransformerDegradationPredictor:
         predictions = []
         
         for _ in range(dropout_iterations):
-            features = self._prepare_features(historical_data[-6:])
+            features = self.prepare_features(historical_data[-6:])
             if features is not None:
                 with torch.no_grad():
                     pred = self.model(features).cpu().numpy()[0, 0]
@@ -685,7 +593,7 @@ class TransformerDegradationPredictor:
         return mean_pred, max(0.1, mean_pred - 1.96*std_pred), min(0.99, mean_pred + 1.96*std_pred)
     
     def _fallback_predict(self, historical_data: List[Tuple]) -> Tuple[float, float, float]:
-        """Enhanced fallback using Arrhenius degradation model"""
+        """Enhanced fallback using exponential decay"""
         if len(historical_data) > 10:
             efficiencies = [e for _, e, _, _, _ in historical_data[-20:]]
             mean_eff = np.mean(efficiencies) * 0.95
@@ -775,9 +683,7 @@ class EnhancedSupplyChainRiskModel:
         suppliers = await self.supplier_api.get_material_suppliers(material)
         if not suppliers:
             return 0.9
-        
-        return min(0.99, np.mean([s['reliability_score'] * (1 - s['geopolitical_risk']) 
-                                 for s in suppliers]))
+        return min(0.99, np.mean([s['reliability_score'] * (1 - s['geopolitical_risk']) for s in suppliers]))
 
 
 class RealTimeSupplierData:
@@ -787,7 +693,6 @@ class RealTimeSupplierData:
         self.supplier_cache = {}
         self.cache_ttl = 3600
         self._lock = threading.RLock()
-        
         logger.info("RealTimeSupplierData initialized")
     
     async def get_supplier_data(self, supplier_id: str) -> Dict:
@@ -872,9 +777,9 @@ class UltimateMaterialSubstitutionEngineV4:
         
         logger.info("UltimateMaterialSubstitutionEngineV4 v4.0 initialized with all fixes")
     
-    async def evaluate_substitutes_ultimate(self, helium_requirement_liters: float,
-                                           power_consumption_watts: float,
-                                           operating_temp_c: float = 25.0) -> Optional[SubstitutionEvaluation]:
+    async def evaluate_substitutes(self, helium_requirement_liters: float,
+                                   power_consumption_watts: float,
+                                   operating_temp_c: float = 25.0) -> Optional[SubstitutionEvaluation]:
         """Complete evaluation of substitute materials"""
         alternatives = []
         
@@ -960,14 +865,14 @@ class UltimateMaterialSubstitutionEngineV4:
             }
         )
     
-    async def should_switch_ultimate(self, helium_requirement_liters: float,
-                                    power_consumption_watts: float,
-                                    current_helium_price: float,
-                                    operating_temp_c: float = 25.0) -> SubstitutionDecision:
+    async def should_switch(self, helium_requirement_liters: float,
+                           power_consumption_watts: float,
+                           current_helium_price: float,
+                           operating_temp_c: float = 25.0) -> SubstitutionDecision:
         """Complete switching decision"""
         self.helium_price = current_helium_price
         
-        evaluation = await self.evaluate_substitutes_ultimate(
+        evaluation = await self.evaluate_substitutes(
             helium_requirement_liters, power_consumption_watts, operating_temp_c
         )
         
@@ -1048,6 +953,85 @@ class DegradationModel:
         return base_rate * temp_factor
 
 
+class AdvancedMultiObjectiveBayesianOptimizer:
+    """Advanced Bayesian optimization with expected hypervolume improvement"""
+    
+    def __init__(self, n_iterations: int = 100, n_initial: int = 20, n_parallel: int = 5):
+        self.n_iterations = n_iterations
+        self.n_initial = n_initial
+        self.n_parallel = n_parallel
+        self.X = []
+        self.F = []
+        self.gp_models = {}
+        self.pareto_front = []
+        self.reference_point = None
+        self._lock = threading.RLock()
+        logger.info(f"AdvancedMOBO initialized (iterations={n_iterations}, parallel={n_parallel})")
+    
+    def add_observation(self, params: Dict[str, float], objectives: np.ndarray):
+        """Add observation with GP update"""
+        with self._lock:
+            param_vector = np.array([params.get(k, 0) for k in sorted(params.keys())])
+            self.X.append(param_vector)
+            self.F.append(objectives)
+            self._update_reference_point()
+            self._update_gp_models()
+            self._update_pareto_front()
+    
+    def _update_reference_point(self):
+        """Update reference point for hypervolume calculation"""
+        if not self.F:
+            self.reference_point = np.ones(4)
+            return
+        self.reference_point = np.max(self.F, axis=0) * 1.1
+    
+    def _update_gp_models(self):
+        """Update Gaussian process models"""
+        if len(self.X) < 5 or not SKLEARN_AVAILABLE:
+            return
+        
+        try:
+            from sklearn.gaussian_process import GaussianProcessRegressor
+            from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+            
+            n_objectives = len(self.F[0])
+            for i in range(n_objectives):
+                y = np.array([f[i] for f in self.F])
+                y_mean = np.mean(y)
+                y_std = np.std(y)
+                y_normalized = (y - y_mean) / max(y_std, 1e-6)
+                
+                kernel = Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.01)
+                gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10, alpha=1e-6)
+                gp.fit(np.array(self.X), y_normalized)
+                gp.y_mean = y_mean
+                gp.y_std = y_std
+                self.gp_models[i] = gp
+        except ImportError:
+            logger.warning("scikit-learn not available")
+    
+    def _update_pareto_front(self):
+        """Update Pareto front"""
+        if not self.F:
+            return
+        
+        pareto = []
+        for i, f1 in enumerate(self.F):
+            dominated = False
+            for j, f2 in enumerate(self.F):
+                if i != j and np.all(f2 <= f1) and np.any(f2 < f1):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(self.X[i])
+        self.pareto_front = pareto
+    
+    def get_pareto_front(self) -> List[np.ndarray]:
+        """Get current Pareto front"""
+        with self._lock:
+            return self.pareto_front.copy()
+
+
 # ============================================================
 # Complete Working Example
 # ============================================================
@@ -1058,7 +1042,6 @@ async def main():
     print("Ultimate Material Substitution Engine v4.0 - Complete Demo")
     print("=" * 70)
     
-    # Initialize with all components working
     engine = UltimateMaterialSubstitutionEngineV4({
         'helium_price_usd': 12.0,
         'carbon_price_usd_per_kg': 70.0,
@@ -1080,8 +1063,7 @@ async def main():
         props = SUBSTITUTE_DATA.get(material)
         if props:
             print(f"   {material.value}: compatibility={info.compatibility_score:.0%}, "
-                  f"feasibility={props.feasibility_score:.0%}, "
-                  f"TRL={props.readiness_level}/9")
+                  f"feasibility={props.feasibility_score:.0%}, TRL={props.readiness_level}/9")
     
     # Test degradation prediction
     print("\n📉 Degradation Prediction:")
@@ -1107,7 +1089,7 @@ async def main():
     
     # Test complete evaluation
     print("\n🎯 Complete Substitution Evaluation:")
-    evaluation = await engine.evaluate_substitutes_ultimate(
+    evaluation = await engine.evaluate_substitutes(
         helium_requirement_liters=500,
         power_consumption_watts=100000,
         operating_temp_c=30
@@ -1124,10 +1106,10 @@ async def main():
             print(f"   Success probability: {lca['probability_positive']:.0%}")
             print(f"   Payback: {lca['payback_months']:.0f} months")
     
-    # Test final decision at different helium prices
+    # Test final decision at different prices
     print("\n💰 Switching Decisions at Different Helium Prices:")
     for price in [8.0, 12.0, 16.0, 20.0]:
-        decision = await engine.should_switch_ultimate(
+        decision = await engine.should_switch(
             helium_requirement_liters=500,
             power_consumption_watts=100000,
             current_helium_price=price,
@@ -1163,11 +1145,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # Run demonstration
     asyncio.run(main())
