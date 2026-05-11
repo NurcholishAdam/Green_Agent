@@ -17,8 +17,6 @@ CRITICAL FIXES AND ENHANCEMENTS OVER v3.3:
 11. IMPLEMENTED: FederatedPhaseAggregator (was undefined)
 12. IMPLEMENTED: decompose_workload_enhanced method
 13. FIXED: All undefined class references and method calls resolved
-14. ENHANCED: Better simulation data for testing
-15. ENHANCED: Complete phase energy calculation pipeline
 
 Reference:
 - "Phase-Aware Energy Modeling for ML Workloads" (IEEE HPCA, 2024)
@@ -129,7 +127,7 @@ class PhaseEnergyProfile:
     
     def get_carbon_estimate(self, grid_intensity_gco2_per_kwh: float = 400.0) -> float:
         """Estimate carbon emissions"""
-        return self.predicted_energy_kwh * grid_intensity_gco2_per_kwh / 1000  # kg CO2
+        return self.predicted_energy_kwh * grid_intensity_gco2_per_kwh / 1000
 
 
 # ============================================================
@@ -137,49 +135,26 @@ class PhaseEnergyProfile:
 # ============================================================
 
 class GPUMemoryHierarchy:
-    """
-    GPU memory hierarchy energy model.
+    """GPU memory hierarchy energy model"""
     
-    Features:
-    - Configurable for different GPU models
-    - L1, L2, HBM energy parameters
-    - Static power estimation
-    """
-    
-    # GPU specifications
     GPU_SPECS = {
         'A100': {
-            'l1_size_kb': 192,
-            'l2_size_mb': 40,
-            'hbm_size_gb': 80,
-            'hbm_bandwidth_gb_s': 2039,
-            'l1_energy_per_byte': 0.0001,
-            'l2_energy_per_byte': 0.0005,
-            'hbm_energy_per_byte': 0.003,
-            'static_power_watts': 50,
-            'tdp_watts': 400
+            'l1_size_kb': 192, 'l2_size_mb': 40, 'hbm_size_gb': 80,
+            'hbm_bandwidth_gb_s': 2039, 'l1_energy_per_byte': 0.0001,
+            'l2_energy_per_byte': 0.0005, 'hbm_energy_per_byte': 0.003,
+            'static_power_watts': 50, 'tdp_watts': 400
         },
         'H100': {
-            'l1_size_kb': 256,
-            'l2_size_mb': 50,
-            'hbm_size_gb': 80,
-            'hbm_bandwidth_gb_s': 3350,
-            'l1_energy_per_byte': 0.00008,
-            'l2_energy_per_byte': 0.0004,
-            'hbm_energy_per_byte': 0.0025,
-            'static_power_watts': 60,
-            'tdp_watts': 700
+            'l1_size_kb': 256, 'l2_size_mb': 50, 'hbm_size_gb': 80,
+            'hbm_bandwidth_gb_s': 3350, 'l1_energy_per_byte': 0.00008,
+            'l2_energy_per_byte': 0.0004, 'hbm_energy_per_byte': 0.0025,
+            'static_power_watts': 60, 'tdp_watts': 700
         },
         'V100': {
-            'l1_size_kb': 128,
-            'l2_size_mb': 6,
-            'hbm_size_gb': 32,
-            'hbm_bandwidth_gb_s': 900,
-            'l1_energy_per_byte': 0.00015,
-            'l2_energy_per_byte': 0.0006,
-            'hbm_energy_per_byte': 0.004,
-            'static_power_watts': 40,
-            'tdp_watts': 300
+            'l1_size_kb': 128, 'l2_size_mb': 6, 'hbm_size_gb': 32,
+            'hbm_bandwidth_gb_s': 900, 'l1_energy_per_byte': 0.00015,
+            'l2_energy_per_byte': 0.0006, 'hbm_energy_per_byte': 0.004,
+            'static_power_watts': 40, 'tdp_watts': 300
         }
     }
     
@@ -196,7 +171,6 @@ class GPUMemoryHierarchy:
         l1_hit = self.cache_hit_rates['l1']
         l2_hit = self.cache_hit_rates['l2']
         
-        # Access pattern adjustment
         if access_pattern == 'sequential':
             l1_hit *= 0.95
             l2_hit *= 0.98
@@ -233,21 +207,14 @@ class GPUMemoryHierarchy:
 # ============================================================
 
 class HardwareCalibrator:
-    """
-    Hardware-specific energy calibration.
-    
-    Features:
-    - Per-operation energy costs
-    - Network energy costs
-    - Calibration factors
-    """
+    """Hardware-specific energy calibration"""
     
     def __init__(self, hardware_model: str = 'A100'):
         self.hardware_model = hardware_model
         self.calibration_data = {
             'A100': {
-                'compute_energy_per_tflop': 0.15,  # Joules per TFLOP
-                'network_energy_per_byte': 0.0001,  # Joules per byte
+                'compute_energy_per_tflop': 0.15,
+                'network_energy_per_byte': 0.0001,
                 'static_power_watts': 50,
                 'calibration_factor': 1.0
             },
@@ -266,9 +233,7 @@ class HardwareCalibrator:
     
     def get_energy_per_flop(self, precision: str = 'fp32') -> float:
         """Get energy per floating point operation"""
-        base = self.data['compute_energy_per_tflop'] / 1e12  # Convert to per FLOP
-        
-        # Precision adjustment
+        base = self.data['compute_energy_per_tflop'] / 1e12
         if precision in ['fp16', 'bf16']:
             return base * 0.5
         elif precision == 'int8':
@@ -297,36 +262,22 @@ class HardwareCalibrator:
 # ============================================================
 
 class TensorCoreModel:
-    """
-    Tensor core energy and performance model.
-    
-    Features:
-    - Precision-specific throughput
-    - Sparsity acceleration
-    - Energy efficiency modeling
-    """
+    """Tensor core energy and performance model"""
     
     def __init__(self, gpu_model: str = 'A100'):
         self.gpu_model = gpu_model
         self.tc_utilization = 0.0
         
-        # Tensor core specifications
         self.tc_specs = {
             'A100': {
-                'fp16_tflops': 312,
-                'bf16_tflops': 312,
-                'tf32_tflops': 156,
-                'int8_tops': 624,
-                'fp16_energy_per_tflop': 0.08,
-                'sparsity_speedup': 2.0
+                'fp16_tflops': 312, 'bf16_tflops': 312,
+                'tf32_tflops': 156, 'int8_tops': 624,
+                'fp16_energy_per_tflop': 0.08, 'sparsity_speedup': 2.0
             },
             'H100': {
-                'fp16_tflops': 990,
-                'bf16_tflops': 990,
-                'tf32_tflops': 495,
-                'int8_tops': 1980,
-                'fp16_energy_per_tflop': 0.05,
-                'sparsity_speedup': 2.0
+                'fp16_tflops': 990, 'bf16_tflops': 990,
+                'tf32_tflops': 495, 'int8_tops': 1980,
+                'fp16_energy_per_tflop': 0.05, 'sparsity_speedup': 2.0
             }
         }
         
@@ -338,14 +289,10 @@ class TensorCoreModel:
                         use_tensor_core: bool = True) -> float:
         """Calculate energy using tensor cores"""
         if not use_tensor_core or self.tc_utilization < 0.1:
-            # Fallback to CUDA core energy
             cuda_energy_per_flop = 0.2 / 1e12
             return flops * cuda_energy_per_flop
         
-        # Tensor core energy
         tc_energy_per_flop = self.specs.get('fp16_energy_per_tflop', 0.08) / 1e12
-        
-        # Effective utilization
         effective_flops = flops * self.tc_utilization
         
         return effective_flops * tc_energy_per_flop
@@ -373,21 +320,13 @@ class TensorCoreModel:
 # ============================================================
 
 class MultiGPUCounter:
-    """
-    Multi-GPU hardware counter with simulation support.
-    
-    Features:
-    - Multi-GPU metric aggregation
-    - Simulation mode for testing
-    - Realistic hardware counter values
-    """
+    """Multi-GPU hardware counter with simulation support"""
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.simulate = self.config.get('simulate', True)
         self.gpu_count = self.config.get('gpu_count', 4)
         self._lock = threading.RLock()
-        self._counter_data = {}
         
         logger.info(f"MultiGPUCounter initialized (gpus={self.gpu_count}, simulate={self.simulate})")
     
@@ -400,7 +339,6 @@ class MultiGPUCounter:
     
     def _simulate_counters(self) -> Dict[str, float]:
         """Simulate realistic hardware counters"""
-        # Base utilization varies with time
         base_util = 50 + 30 * np.sin(time.time() / 60)
         
         return {
@@ -431,13 +369,7 @@ class MultiGPUCounter:
 # ============================================================
 
 class ExponentialThermalModel:
-    """
-    Exponential thermal model for leakage power.
-    
-    Features:
-    - Temperature-dependent leakage calculation
-    - Thermal time constant modeling
-    """
+    """Exponential thermal model for leakage power"""
     
     def __init__(self, ambient_temp_c: float = 25.0, thermal_time_constant_s: float = 100.0):
         self.ambient_temp_c = ambient_temp_c
@@ -448,22 +380,17 @@ class ExponentialThermalModel:
     
     def calculate_leakage_factor(self, temperature_c: float) -> float:
         """Calculate leakage power factor based on temperature"""
-        # Exponential temperature dependence
         delta_t = temperature_c - self.ambient_temp_c
         if delta_t <= 0:
             return 1.0
-        
-        # Leakage doubles approximately every 10°C
         return 2.0 ** (delta_t / 10.0)
     
     def predict_temperature(self, current_temp: float, power_watts: float,
                           dt_seconds: float) -> float:
         """Predict temperature after time dt"""
-        thermal_resistance = 0.2  # °C/W
-        thermal_capacitance = 500  # J/°C
-        
+        thermal_resistance = 0.2
+        thermal_capacitance = 500
         dT = (power_watts - (current_temp - self.ambient_temp_c) / thermal_resistance) * dt_seconds / thermal_capacitance
-        
         return current_temp + dT
 
 
@@ -472,14 +399,7 @@ class ExponentialThermalModel:
 # ============================================================
 
 class RealTimeEnergyAccountant:
-    """
-    Real-time energy accounting and tracking.
-    
-    Features:
-    - Per-phase energy tracking
-    - Cumulative energy calculation
-    - Power history
-    """
+    """Real-time energy accounting and tracking"""
     
     def __init__(self):
         self.current_phase = PhaseType.IDLE.value
@@ -495,14 +415,12 @@ class RealTimeEnergyAccountant:
         """Start tracking a new phase"""
         with self._lock:
             if self.current_phase != phase:
-                # Close previous phase
                 if self.current_phase in self.phase_start_time:
                     elapsed = time.time() - self.phase_start_time[self.current_phase]
                     self.phase_energy[self.current_phase] = self.phase_energy.get(
                         self.current_phase, 0
                     ) + elapsed * self._get_avg_power()
                 
-                # Start new phase
                 self.current_phase = phase
                 self.phase_start_time[phase] = time.time()
     
@@ -510,13 +428,12 @@ class RealTimeEnergyAccountant:
         """Record power measurement"""
         with self._lock:
             self.power_history.append((time.time(), power_watts))
-            self.total_energy_joules += power_watts * 0.5  # 0.5 second sampling
+            self.total_energy_joules += power_watts * 0.5
     
     def _get_avg_power(self) -> float:
         """Get average power over last 10 samples"""
         if len(self.power_history) < 10:
             return 200.0
-        
         recent = list(self.power_history)[-10:]
         return np.mean([p for _, p in recent])
     
@@ -544,14 +461,7 @@ class RealTimeEnergyAccountant:
 # ============================================================
 
 class EnergyAwareDeadlineScheduler:
-    """
-    Energy-aware scheduling with deadline constraints.
-    
-    Features:
-    - Carbon-aware time shifting
-    - Energy-optimal scheduling windows
-    - Schedule statistics tracking
-    """
+    """Energy-aware scheduling with deadline constraints"""
     
     def __init__(self):
         self.schedule_history: List[Dict] = []
@@ -607,14 +517,7 @@ class EnergyAwareDeadlineScheduler:
 # ============================================================
 
 class FederatedPhaseAggregator:
-    """
-    Federated learning aggregator for phase energy profiles.
-    
-    Features:
-    - Multi-client profile aggregation
-    - Differential privacy support
-    - Client statistics tracking
-    """
+    """Federated learning aggregator for phase energy profiles"""
     
     def __init__(self):
         self.client_profiles: Dict[str, List[PhaseEnergyProfile]] = {}
@@ -642,12 +545,10 @@ class FederatedPhaseAggregator:
             if not all_profiles:
                 return PhaseEnergyProfile()
             
-            # Aggregate metrics
             total_energy = np.mean([p.total_energy_joules for p in all_profiles])
             total_time = np.mean([p.total_time_ms for p in all_profiles])
             total_energy_std = np.std([p.total_energy_joules for p in all_profiles])
             
-            # Aggregate phase breakdowns
             phase_breakdown = {}
             for profile in all_profiles:
                 for phase, energy in profile.phase_breakdown.items():
@@ -655,7 +556,6 @@ class FederatedPhaseAggregator:
             for phase in phase_breakdown:
                 phase_breakdown[phase] /= len(all_profiles)
             
-            # Add noise if differential privacy enabled
             if use_differential_privacy:
                 noise_scale = total_energy * 0.01
                 total_energy += np.random.laplace(0, noise_scale)
@@ -949,8 +849,6 @@ class UltimatePhaseAwareEnergyModelV4:
     def decompose_workload_enhanced(self, task_config: Dict) -> List[WorkloadPhase]:
         """
         CRITICAL FIX: Implement workload decomposition.
-        
-        Breaks down a high-level task config into individual workload phases.
         """
         phases = []
         model_config = task_config.get('model_config', {})
@@ -1297,9 +1195,9 @@ async def main():
     print(f"   Confidence: {profile.confidence:.1%}")
     
     print("\n   Phase Energy Breakdown:")
-    for phase, energy in profile.phase_breakdown.items():
+    for phase_name, energy in profile.phase_breakdown.items():
         pct = energy / profile.total_energy_joules * 100
-        print(f"     {phase}: {energy/1000:.1f} kJ ({pct:.1f}%)")
+        print(f"     {phase_name}: {energy/1000:.1f} kJ ({pct:.1f}%)")
     
     if profile.recommendations:
         print("\n   Recommendations:")
