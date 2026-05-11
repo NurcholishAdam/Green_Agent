@@ -14,8 +14,6 @@ CRITICAL FIXES AND ENHANCEMENTS OVER v3.3:
 8. ENHANCED: Wasserstein RO with improved scenario generation
 9. ENHANCED: Conformal calibration with adaptive windows
 10. ENHANCED: Multi-fidelity tuning with better acquisition functions
-11. ADDED: Decision explanation with feature importance
-12. ADDED: Complete decision pipeline with carbon-aware scoring
 
 Reference: "Decision Theory Under Uncertainty" (Savage, 1951)
 """
@@ -139,17 +137,6 @@ class RegretDecision:
     def is_confident(self, threshold: float = 0.7) -> bool:
         """Check if decision meets confidence threshold"""
         return self.calibrated_confidence >= threshold
-    
-    def get_alternative_actions(self, top_k: int = 3) -> List[Tuple[str, float]]:
-        """Get top alternative actions with regret values"""
-        if not self.regret_matrix:
-            return []
-        
-        sorted_actions = sorted(
-            [(k, v) for k, v in self.regret_matrix.items() if k != self.selected_action],
-            key=lambda x: x[1]
-        )
-        return sorted_actions[:top_k]
 
 
 @dataclass
@@ -185,13 +172,10 @@ class BayesianDeepBandit(nn.Module if TORCH_AVAILABLE else object):
         if TORCH_AVAILABLE:
             if x.dim() == 1:
                 x = x.unsqueeze(0)
-            
             x = torch.relu(self.bn1(self.fc1(x)) if x.size(0) > 1 else self.fc1(x))
             if mc_dropout:
                 x = self.dropout(x)
             x = torch.relu(self.bn2(self.fc2(x)) if x.size(0) > 1 else self.fc2(x))
-            if mc_dropout:
-                x = self.dropout(x)
             return self.fc3(x)
         return None
 
@@ -218,15 +202,13 @@ class DeepBayesianBandit:
             self.training_steps = 0
             logger.info(f"DeepBayesianBandit initialized on {self.device}")
         else:
-            logger.warning("PyTorch not available, using LinUCB fallback")
+            logger.warning("PyTorch not available, using random fallback")
             self.model = None
-            self.A = np.eye(state_dim)  # For LinUCB
-            self.b = np.zeros((state_dim, action_dim))
     
     def get_action(self, state: np.ndarray, available_actions: List[int]) -> int:
         """Thompson sampling with uncertainty"""
         if not TORCH_AVAILABLE or self.model is None:
-            return self._linucb_action(state, available_actions)
+            return random.choice(available_actions) if available_actions else 0
         
         self.model.train()
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
@@ -250,21 +232,6 @@ class DeepBayesianBandit:
             return available_actions[0]
         
         return max(available_q, key=available_q.get)
-    
-    def _linucb_action(self, state: np.ndarray, available_actions: List[int]) -> int:
-        """LinUCB fallback for action selection"""
-        alpha = 1.0
-        A_inv = np.linalg.inv(self.A)
-        theta = A_inv @ self.b
-        
-        scores = []
-        for a in available_actions:
-            x = np.zeros(len(state))
-            x[a % len(state)] = 1
-            p = theta[:, a].dot(state) + alpha * np.sqrt(state.dot(A_inv).dot(state))
-            scores.append((a, p))
-        
-        return max(scores, key=lambda x: x[1])[0]
     
     def update(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray):
         """Store experience and train"""
@@ -301,7 +268,7 @@ class DeepBayesianBandit:
     def get_statistics(self) -> Dict:
         """Get bandit statistics"""
         if not TORCH_AVAILABLE or self.model is None:
-            return {'available': False, 'method': 'LinUCB'}
+            return {'available': False}
         
         return {
             'available': True,
@@ -329,7 +296,7 @@ class EnhancedWassersteinRO:
         logger.info(f"EnhancedWassersteinRO initialized (ε={epsilon}, scenarios={n_scenarios})")
     
     def generate_scenarios(self, historical_regrets: Dict[str, List[float]]) -> Dict[str, List[float]]:
-        """Generate synthetic scenarios using kernel density estimation"""
+        """Generate synthetic scenarios with tail risk"""
         generated = {}
         
         for action, regrets in historical_regrets.items():
@@ -340,11 +307,10 @@ class EnhancedWassersteinRO:
             mean = np.mean(regrets)
             std = np.std(regrets)
             
-            # Fit skewed distribution for more realistic scenarios
             n_new = self.n_scenarios - len(regrets)
             if n_new > 0:
                 new_regrets = np.random.normal(mean, std, n_new)
-                # Add some tail risk scenarios
+                # Add tail risk scenarios
                 tail_regrets = np.random.normal(mean * 1.5, std * 2, int(n_new * 0.1))
                 combined = np.concatenate([regrets, new_regrets, tail_regrets])
                 generated[action] = combined.tolist()
@@ -356,7 +322,7 @@ class EnhancedWassersteinRO:
     def compute_robust_regret_enhanced(self, regret_matrix: Dict[str, Dict[str, float]],
                                         scenarios: List[str],
                                         confidence_level: float = 0.95) -> Dict[str, float]:
-        """Compute enhanced distributionally robust regret"""
+        """Compute distributionally robust regret"""
         n_bootstrap = 2000
         action_robust_regrets = {action: [] for action in regret_matrix}
         
@@ -365,7 +331,6 @@ class EnhancedWassersteinRO:
             
             for action in regret_matrix:
                 regrets = [regret_matrix[action].get(s, 1.0) for s in sampled_scenarios]
-                # Wasserstein robust regret with epsilon adjustment
                 worst_case = np.max(regrets) * (1 + self.epsilon * np.random.uniform(0.5, 1.5))
                 action_robust_regrets[action].append(worst_case)
         
@@ -385,8 +350,7 @@ class EnhancedWassersteinRO:
         probs = np.ones(n_scenarios) / n_scenarios
         
         def objective(weights):
-            weights = np.array(weights)
-            weights = np.clip(weights, 0, 1)
+            weights = np.abs(weights)
             weights = weights / max(weights.sum(), 1e-6)
             total_regret = 0
             for action in regret_matrix:
@@ -472,17 +436,6 @@ class ConformalDecisionCalibrator:
             
             return max(0.1, min(0.99, calibrated))
     
-    def add_online_observation(self, confidence: float, was_correct: bool):
-        """Add single observation for online calibration"""
-        with self._lock:
-            score = 0.0 if was_correct else 1.0
-            self.calibration_scores.append((confidence, score))
-            
-            if len(self.calibration_scores) % 100 == 0:
-                self.calibration_scores = deque(
-                    sorted(self.calibration_scores, key=lambda x: x[0])
-                )
-    
     def get_statistics(self) -> Dict:
         """Get calibrator statistics"""
         with self._lock:
@@ -547,7 +500,6 @@ class UltimateRegretMinimizationOptimizerV4:
         )
         
         self.decision_history: List[RegretDecision] = []
-        self.scenario_regrets: List[ScenarioRegret] = []
         
         logger.info("UltimateRegretMinimizationOptimizerV4 v4.0 initialized with all fixes")
     
@@ -623,7 +575,6 @@ class UltimateRegretMinimizationOptimizerV4:
             context.get('utilization', 50) / 100
         ]
         
-        # Pad to required dimension
         state_dim = self.config.get('state_dim', 10)
         while len(state_features) < state_dim:
             state_features.append(0.0)
@@ -701,16 +652,9 @@ class UltimateRegretMinimizationOptimizerV4:
         reward = 1.0 - max_regret
         self.deep_bandit.update(state, bandit_action, reward, state)
         
-        # Update calibrator
-        self.calibrator.add_online_observation(raw_confidence, max_regret < 0.3)
-        
         self.decision_history.append(decision)
         
         return decision
-    
-    def update_bandit(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray):
-        """Update deep bandit with observed reward"""
-        self.deep_bandit.update(state, action, reward, next_state)
     
     def calibrate_with_history(self, history_entries: List[Tuple[RegretDecision, bool]]):
         """Calibrate decisions using historical outcomes"""
@@ -743,7 +687,6 @@ class UltimateRegretMinimizationOptimizerV4:
         
         best_params = self.hyper_tuner.get_best_params()
         
-        # Apply best parameters
         self.objective_weights[Objective.CARBON] = best_params['carbon_weight']
         self.objective_weights[Objective.HELIUM] = best_params['helium_weight']
         self.objective_weights[Objective.LATENCY] = best_params['latency_weight']
@@ -776,9 +719,97 @@ class UltimateRegretMinimizationOptimizerV4:
                 }
                 for d in recent_decisions
             ],
-            'avg_confidence': np.mean([d.calibrated_confidence for d in recent_decisions]) if recent_decisions else 0,
-            'calibration_samples': self.calibrator.get_statistics()['samples']
+            'avg_confidence': np.mean([d.calibrated_confidence for d in recent_decisions]) if recent_decisions else 0
         }
+
+
+# ============================================================
+# SUPPORTING CLASSES
+# ============================================================
+
+class MultiFidelityBayesianTuner:
+    """Multi-fidelity Bayesian hyperparameter tuning"""
+    
+    def __init__(self, bounds: Dict[str, Tuple[float, float]], 
+                 n_iterations: int = 50,
+                 fidelity_levels: List[float] = [0.1, 0.5, 1.0]):
+        self.bounds = bounds
+        self.n_iterations = n_iterations
+        self.fidelity_levels = fidelity_levels
+        self.X = []
+        self.y = []
+        self.fidelities = []
+        self.gp_model = None
+        
+        logger.info(f"MultiFidelityBayesianTuner initialized with {len(bounds)} parameters")
+    
+    def suggest_params(self) -> Tuple[Dict[str, float], float]:
+        """Suggest next hyperparameters with fidelity recommendation"""
+        if len(self.X) < 10:
+            return {k: random.uniform(low, high) for k, (low, high) in self.bounds.items()}, 0.1
+        
+        try:
+            kernel = Matern(nu=2.5) + WhiteKernel()
+            self.gp_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+            self.gp_model.fit(np.array(self.X), self.y)
+            
+            best_x = None
+            best_ei = -float('inf')
+            best_fidelity = 0.1
+            
+            for _ in range(50):
+                candidate = {k: random.uniform(low, high) for k, (low, high) in self.bounds.items()}
+                x = np.array([candidate[k] for k in sorted(self.bounds.keys())]).reshape(1, -1)
+                
+                mean, std = self.gp_model.predict(x, return_std=True)
+                ei = self._expected_improvement(mean[0], std[0])
+                
+                if std[0] > 0.2:
+                    fidelity = 0.5
+                elif ei > 0.05:
+                    fidelity = 0.1
+                else:
+                    fidelity = 1.0
+                
+                if ei > best_ei:
+                    best_ei = ei
+                    best_x = candidate
+                    best_fidelity = fidelity
+            
+            return best_x if best_x else {k: (low + high) / 2 for k, (low, high) in self.bounds.items()}, best_fidelity
+            
+        except ImportError:
+            return {k: random.uniform(low, high) for k, (low, high) in self.bounds.items()}, 0.1
+    
+    def _expected_improvement(self, mean: float, std: float, best_y: float = None) -> float:
+        """Calculate expected improvement"""
+        if best_y is None and self.y:
+            best_y = min(self.y)
+        elif best_y is None:
+            return 1.0
+        
+        if std < 1e-6:
+            return 0.0
+        
+        z = (best_y - mean) / std
+        return max(0, (best_y - mean) * stats.norm.cdf(z) + std * stats.norm.pdf(z))
+    
+    def add_observation(self, params: Dict[str, float], value: float, fidelity: float):
+        """Add observation at given fidelity"""
+        x = [params[k] for k in sorted(self.bounds.keys())]
+        self.X.append(x)
+        self.y.append(value)
+        self.fidelities.append(fidelity)
+    
+    def get_best_params(self) -> Dict[str, float]:
+        """Get best parameters from high-fidelity evaluations"""
+        high_fidelity_indices = [i for i, f in enumerate(self.fidelities) if f >= 0.9]
+        if not high_fidelity_indices:
+            return {k: (low + high) / 2 for k, (low, high) in self.bounds.items()}
+        
+        best_idx = min(high_fidelity_indices, key=lambda i: self.y[i])
+        best_x = self.X[best_idx]
+        return {k: best_x[i] for i, k in enumerate(sorted(self.bounds.keys()))}
 
 
 # ============================================================
@@ -791,7 +822,6 @@ async def main():
     print("Ultimate Regret Minimization Optimizer v4.0 - Complete Demo")
     print("=" * 70)
     
-    # Initialize with all components working
     optimizer = UltimateRegretMinimizationOptimizerV4({
         'state_dim': 8,
         'action_space': ['execute', 'throttle', 'defer'],
@@ -802,7 +832,7 @@ async def main():
     print("\n✅ All dependencies resolved and components initialized")
     print(f"   Objectives: {[o.value for o in Objective]}")
     print(f"   State dimension: {optimizer.config['state_dim']}")
-    print(f"   Initial weights: {optimizer.objective_weights}")
+    print(f"   Initial weights: {dict(optimizer.objective_weights)}")
     
     # Test regret calculation
     print("\n📊 Regret Calculation Test:")
@@ -864,7 +894,6 @@ async def main():
     
     optimizer.calibrate_with_history(history)
     
-    # Test calibration effect
     test_confidences = [0.5, 0.7, 0.85, 0.95]
     print("   Calibration effect:")
     for conf in test_confidences:
@@ -914,9 +943,7 @@ async def main():
     report = optimizer.get_ultimate_report()
     print(f"   Decisions: {report['decision_history_count']}")
     print(f"   Bandit trained: {report['deep_bandit']['trained']}")
-    print(f"   Calibration samples: {report['calibration_samples']}")
     print(f"   Avg confidence: {report['avg_confidence']:.2%}")
-    print(f"   Weights: {report['objective_weights']}")
     
     print("\n" + "=" * 70)
     print("✅ Ultimate Regret Minimization Optimizer v4.0 - All Systems Operational")
@@ -926,7 +953,6 @@ async def main():
     print("   - Conformal calibration for trustworthy confidence")
     print("   - Robust optimization with Wasserstein DRO")
     print("   - Multi-fidelity Bayesian hyperparameter tuning")
-    print("   - Decision explanation with alternatives and recommendations")
     print("=" * 70)
 
 
