@@ -33,6 +33,7 @@ jobs:
           tags: |
             ghcr.io/nurcholishadam/green_agent:latest
             ghcr.io/nurcholishadam/green_agent:main
+          docker load < green-agent.tar
       
           
     
