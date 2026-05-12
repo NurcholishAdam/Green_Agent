@@ -38,13 +38,13 @@ jobs:
           tags: |
             ghcr.io/nurcholishadam/green_agent:main
 
-- name: Test connectivity to ghcr.io
-  run: |
-    echo "Testing DNS resolution..."
-    python3 -c "import socket; print(socket.gethostbyname('ghcr.io'))" || echo "DNS resolution FAILED"
-    echo "Testing TCP connection to port 443..."
-    python3 -c "
-    import socket
+      - name: Test connectivity to ghcr.io
+      run: |
+        echo "Testing DNS resolution..."
+        python3 -c "import socket; print(socket.gethostbyname('ghcr.io'))" || echo "DNS resolution FAILED"
+        echo "Testing TCP connection to port 443..."
+        python3 -c "
+        import socket
     try:
         sock = socket.create_connection(('ghcr.io', 443), timeout=10)
         print('TCP connection SUCCESS')
