@@ -6,7 +6,7 @@ on:
 
 permissions:
   contents: read
-  packages: write  # Essential permission for pushing to GHCR
+  packages: write
 
 jobs:
   build-and-push:
@@ -24,7 +24,6 @@ jobs:
 
       - name: Build and tag Docker image
         run: |
-          # ${{ github.repository }} is always lowercase, e.g., nurcholishadam/green_agent
           docker build -t ghcr.io/${{ github.repository }}:main .
           docker tag ghcr.io/${{ github.repository }}:main ghcr.io/${{ github.repository }}:latest
 
