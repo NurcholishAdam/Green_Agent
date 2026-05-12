@@ -1,3 +1,4 @@
+cat > .github/workflows/docker-build.yml << 'EOF'
 name: Build and Push Docker Image
 
 on:
@@ -31,3 +32,4 @@ jobs:
         run: |
           docker push ghcr.io/${{ github.repository }}:main
           docker push ghcr.io/${{ github.repository }}:latest
+EOF
