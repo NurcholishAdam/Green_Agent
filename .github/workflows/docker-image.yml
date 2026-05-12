@@ -24,13 +24,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Step 2: Build the image and tag it correctly
-      - name: Build Docker image
-        run: |
-          # Build the image with the 'main' tag (matching the current branch)
-          docker build -t ghcr.io/${{ github.repository }}:main .
-          # Also tag it as 'latest' so you can push both
-          docker tag ghcr.io/${{ github.repository }}:main ghcr.io/${{ github.repository }}:latest
-
+      - name: Build and tag Docker image
+      run: |
+      # ${{ github.repository }} is already lowercase, e.g., "nurcholishadam/green_agent"
+      docker build -t ghcr.io/${{ github.repository }}:main .
+      docker tag ghcr.io/${{ github.repository }}:main ghcr.io/${{ github.repository }}:latest
+      
       # Step 3: Push the tagged images
       - name: Push Docker images
         run: |
