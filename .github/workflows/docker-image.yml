@@ -25,13 +25,13 @@ jobs:
 
       # Step 2: Build the image and tag it correctly
       - name: Build and tag Docker image
-      run: |
-      # ${{ github.repository }} is already lowercase, e.g., "nurcholishadam/green_agent"
-      docker build -t ghcr.io/${{ github.repository }}:main .
-      docker tag ghcr.io/${{ github.repository }}:main ghcr.io/${{ github.repository }}:latest
+       run: |
+         # The repository name from GitHub Actions is always lowercase
+         docker build -t ghcr.io/${{ github.repository }}:main .
+         docker tag ghcr.io/${{ github.repository }}:main ghcr.io/${{ github.repository }}:latest
       
-      # Step 3: Push the tagged images
-      - name: Push Docker images
-        run: |
-          docker push ghcr.io/${{ github.repository }}:main
-          docker push ghcr.io/${{ github.repository }}:latest
+     # Step 3: Push the tagged images
+     - name: Push Docker images
+       run: |
+       docker push ghcr.io/${{ github.repository }}:main
+       docker push ghcr.io/${{ github.repository }}:latest 
