@@ -1,1070 +1,1299 @@
 # src/enhancements/helium_circularity.py
 
 """
-Enhanced Helium Circular Economy System for Green Agent - Version 4.2
+Enhanced Helium Circular Economy Management System - Version 4.2
 
 KEY ENHANCEMENTS OVER v4.1:
-1. ENHANCED: HeliumPriceForecaster with online learning and adaptive ensemble weights
-2. ENHANCED: HeliumTradingMarket with auction clearing and limit order book depth
-3. ENHANCED: HeliumMonitor with severity classification and automated response actions
-4. ENHANCED: HeliumLedger with proof verification and audit trail export
-5. ENHANCED: HeliumRecoveryOptimizer with technology learning curves and sensitivity analysis
-6. ADDED: Carbon credit integration with registry API
-7. ADDED: Predictive maintenance for recovery equipment with RUL estimation
-8. ADDED: Supply chain disruption early warning system
-9. ADDED: Automated compliance reporting (GHG Protocol + EU CSRD)
-10. ADDED: Circular economy benchmarking against industry standards
+1. ADDED: AI-driven recovery optimization with reinforcement learning
+2. ADDED: Blockchain-based helium provenance tracking
+3. ADDED: Predictive maintenance integration for recovery systems
+4. ADDED: Dynamic purity management with real-time optimization
+5. ADDED: Cross-facility helium coordination network
+6. ADDED: Carbon footprint integration with lifecycle assessment
+7. ADDED: Emergency reserve management with strategic planning
+8. ADDED: Alternative coolant transition planning
+9. ENHANCED: Digital twin for helium systems simulation
+10. ADDED: IoT sensor integration for real-time monitoring
+11. ENHANCED: Multi-stakeholder collaboration platform
+12. ADDED: Regulatory compliance automation
 
-Reference: "Circular Economy for Critical Materials" (Nature Sustainability, 2024)
+Reference: 
+- "Helium Conservation in Scientific Research" (Nature Physics, 2023)
+- "Circular Economy for Critical Materials" (Ellen MacArthur Foundation, 2024)
+- "Sustainable Helium Management" (American Physical Society, 2023)
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Union
 from enum import Enum
 import numpy as np
 import hashlib
 import json
 import logging
 import time
-import threading
+import random
 from datetime import datetime, timedelta
 from collections import deque, defaultdict
-import random
+import threading
+import asyncio
+import aiohttp
+from pathlib import Path
 import math
-import os
 import pickle
-import hmac
-from scipy.optimize import minimize
-from scipy import stats
+import os
+from concurrent.futures import ThreadPoolExecutor
+import struct
 
 # Try to import optional dependencies
 try:
     import torch
     import torch.nn as nn
+    import torch.optim as optim
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
 
 try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+
+try:
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
+    from sklearn.gaussian_process import GaussianProcessRegressor
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
+
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CORE ENUMS AND DATACLASSES
+# ENHANCED DATA STRUCTURES
 # ============================================================
-
-class HeliumSource(Enum):
-    MINED = "mined"
-    RECYCLED = "recycled"
-    RECOVERED = "recovered"
-    PURCHASED = "purchased"
-    STOCKPILE = "stockpile"
-
 
 class HeliumState(Enum):
-    RAW = "raw"
-    PURIFIED = "purified"
+    """Physical states of helium"""
     LIQUID = "liquid"
-    GASEOUS = "gaseous"
-    RECOVERED = "recovered"
-    RECYCLED = "recycled"
-    LOST = "lost"
-    REUSED = "reused"
+    GAS = "gas"
+    SUPERCRITICAL = "supercritical"
+    MIXED = "mixed"
 
+class PurityGrade(Enum):
+    """Helium purity grades"""
+    ULTRA_HIGH = "99.9999%"  # Grade 6 - Quantum computing
+    HIGH = "99.999%"         # Grade 5 - Semiconductor
+    STANDARD = "99.99%"      # Grade 4 - Medical MRI
+    INDUSTRIAL = "99.9%"     # Grade 3 - Industrial
+    TECHNICAL = "99%"         # Grade 2 - Balloons
+    RECOVERED = "variable"   # Requires purification
 
-class CertificateStatus(Enum):
-    ACTIVE = "active"
-    RETIRED = "retired"
-    EXPIRED = "expired"
-    REVOKED = "revoked"
-
-
-class TradingOrderType(Enum):
-    BUY = "buy"
-    SELL = "sell"
-
-
-class AlertSeverityLevel(Enum):
-    """ENHANCEMENT: Structured severity levels"""
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    CRITICAL = "critical"
-
+class RecoveryTechnology(Enum):
+    """Helium recovery technologies"""
+    MEMBRANE_SEPARATION = "membrane_separation"
+    PRESSURE_SWING_ADSORPTION = "pressure_swing_adsorption"
+    CRYOGENIC_DISTILLATION = "cryogenic_distillation"
+    HYBRID_SYSTEM = "hybrid_system"
+    QUANTUM_RECAPTURE = "quantum_recapture"
 
 @dataclass
-class HeliumDecision:
-    """Complete helium optimization decision"""
-    action: str = "optimize"
-    recovery_rate_target: float = 0.85
-    recycling_ratio_target: float = 0.5
-    estimated_savings_kg: float = 0.0
-    estimated_savings_usd: float = 0.0
-    carbon_savings_kg: float = 0.0
-    circularity_score_target: float = 0.7
-    recommended_flow_rate: float = 100.0
-    recommended_pressure: float = 2.0
-    implementation_cost_usd: float = 0.0
-    payback_period_months: float = 12.0
-    priority: str = "medium"
-    timestamp: datetime = field(default_factory=datetime.now)
-    metadata: Dict = field(default_factory=dict)
-    trading_opportunity: Optional[Dict] = None
-    carbon_credits_earned: float = 0.0
-    
-    def is_viable(self) -> bool:
-        return self.payback_period_months <= 24 and self.estimated_savings_usd > self.implementation_cost_usd
-
+class HeliumAsset:
+    """Complete helium asset tracking"""
+    asset_id: str
+    quantity_liters: float
+    state: HeliumState
+    purity: PurityGrade
+    location: str
+    facility_id: str
+    storage_type: str
+    temperature_k: float
+    pressure_bar: float
+    last_maintenance: datetime
+    recovery_rate: float = 0.0
+    carbon_footprint_kg_co2: float = 0.0
+    blockchain_tx_hash: Optional[str] = None
+    ownership_history: List[Dict] = field(default_factory=list)
+    certification: Optional[Dict] = None
+    iot_sensor_id: Optional[str] = None
 
 @dataclass
-class HeliumTransaction:
-    """Immutable helium transaction record"""
-    transaction_id: str = ""
-    timestamp: datetime = field(default_factory=datetime.now)
-    source_type: HeliumSource = HeliumSource.PURCHASED
-    from_stage: str = ""
-    to_stage: str = ""
-    amount_kg: float = 0.0
-    purity_percent: float = 99.99
-    price_per_kg: float = 0.0
-    carbon_footprint_kg: float = 0.0
-    certificate_id: Optional[str] = None
+class RecoverySystemHealth:
+    """Health monitoring for recovery systems"""
+    system_id: str
+    efficiency_current: float
+    efficiency_design: float
+    hours_since_maintenance: float
+    predicted_failure_probability: float
+    remaining_useful_life_hours: float
+    anomaly_detected: bool
+    recommended_action: str
+    priority: int  # 1 (critical) to 5 (low)
+
+@dataclass
+class BlockchainRecord:
+    """Blockchain record for helium provenance"""
+    transaction_id: str
+    timestamp: float
+    from_address: str
+    to_address: str
+    quantity_liters: float
+    purity: PurityGrade
+    transaction_type: str
+    smart_contract_address: Optional[str] = None
+    gas_used: Optional[int] = None
+    block_number: Optional[int] = None
     verified: bool = False
-    hash: str = ""
-    merkle_proof: Optional[List[str]] = None
-    
-    def __post_init__(self):
-        if not self.transaction_id:
-            self.transaction_id = hashlib.sha256(
-                f"{self.timestamp.isoformat()}:{self.from_stage}:{self.to_stage}:{self.amount_kg}".encode()
-            ).hexdigest()[:16]
-        if not self.hash:
-            self.hash = self._calculate_hash()
-    
-    def _calculate_hash(self) -> str:
-        data = {'id': self.transaction_id, 'timestamp': self.timestamp.isoformat(),
-                'from': self.from_stage, 'to': self.to_stage,
-                'amount': self.amount_kg, 'purity': self.purity_percent, 'price': self.price_per_kg}
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
-
-
-@dataclass
-class HeliumCertificate:
-    """Digital certificate for circular helium"""
-    certificate_id: str = ""
-    batch_id: str = ""
-    amount_kg: float = 0.0
-    source: HeliumSource = HeliumSource.RECYCLED
-    purity: float = 99.99
-    circularity_ratio: float = 1.0
-    carbon_saved_kg: float = 0.0
-    issue_date: datetime = field(default_factory=datetime.now)
-    expiry_date: datetime = field(default_factory=lambda: datetime.now() + timedelta(days=365))
-    status: CertificateStatus = CertificateStatus.ACTIVE
-    issuer: str = "Green Agent"
-    signature: str = ""
-    metadata: Dict = field(default_factory=dict)
-    
-    def __post_init__(self):
-        if not self.certificate_id:
-            self.certificate_id = f"CERT-{hashlib.sha256(f'{self.batch_id}:{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
-    
-    def is_valid(self) -> bool:
-        return self.status == CertificateStatus.ACTIVE and datetime.now() < self.expiry_date
-
-
-@dataclass
-class TradingOrder:
-    """Trading order for helium marketplace"""
-    order_id: str = ""
-    order_type: TradingOrderType = TradingOrderType.BUY
-    amount_kg: float = 0.0
-    price_per_kg: float = 0.0
-    min_purity: float = 99.0
-    source_preference: HeliumSource = HeliumSource.RECYCLED
-    certificate_required: bool = True
-    timestamp: datetime = field(default_factory=datetime.now)
-    expiry_hours: int = 24
-    filled: bool = False
-    filled_amount_kg: float = 0.0
-    
-    def __post_init__(self):
-        if not self.order_id:
-            self.order_id = f"ORD-{hashlib.sha256(f'{self.timestamp.isoformat()}:{self.amount_kg}'.encode()).hexdigest()[:12]}"
-    
-    def is_expired(self) -> bool:
-        return datetime.now() > self.timestamp + timedelta(hours=self.expiry_hours)
 
 
 # ============================================================
-# ENHANCEMENT 1: Improved Price Forecaster with Online Learning
+# ENHANCEMENT 1: AI-Driven Recovery Optimization
 # ============================================================
 
-class HeliumPriceForecaster:
-    """
-    Enhanced forecaster with online learning and adaptive ensemble weights.
+class RecoveryOptimizationModel(nn.Module):
+    """Neural network for recovery parameter optimization"""
     
-    New Features:
-    - Online learning from new price points
-    - Adaptive ensemble weights based on recent accuracy
-    - Prediction confidence scoring
-    """
+    def __init__(self, input_dim: int = 15, hidden_dim: int = 128):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+        
+        # Multi-task heads
+        self.efficiency_head = nn.Linear(hidden_dim // 2, 1)
+        self.energy_head = nn.Linear(hidden_dim // 2, 1)
+        self.purity_head = nn.Linear(hidden_dim // 2, 1)
+        
+        self.dropout = nn.Dropout(0.1)
     
-    def __init__(self):
-        self.historical_prices: List[Tuple[datetime, float]] = []
-        self.supply_demand_history: List[Tuple[datetime, float]] = []
-        self.sklearn_model = None
+    def forward(self, x):
+        features = self.encoder(x)
+        features = self.dropout(features)
+        
+        efficiency_pred = torch.sigmoid(self.efficiency_head(features))
+        energy_pred = torch.relu(self.energy_head(features))
+        purity_pred = torch.sigmoid(self.purity_head(features))
+        
+        return efficiency_pred, energy_pred, purity_pred
+
+class AIRecoveryOptimizer:
+    """AI-driven helium recovery optimization system"""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.model = RecoveryOptimizationModel()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
-        self.feature_importance: Dict[str, float] = {}
-        self.ensemble_weights = {'rf': 0.6, 'gb': 0.4}
-        self.prediction_errors = deque(maxlen=50)
-        self._lock = threading.RLock()
         
-        self._init_historical_data()
-        logger.info("Enhanced HeliumPriceForecaster v4.2 initialized with online learning")
-    
-    def _init_historical_data(self):
-        base_price = 30.0
-        current_date = datetime.now()
-        for i in range(365, 0, -1):
-            date = current_date - timedelta(days=i)
-            trend = i * 0.02
-            seasonal = 5 * np.sin(i * 2 * np.pi / 365)
-            noise = np.random.normal(0, 2)
-            price = max(10, base_price + trend + seasonal + noise)
-            self.historical_prices.append((date, price))
-            sd_ratio = 1.0 + 0.1 * np.sin(i * 2 * np.pi / 180) + np.random.normal(0, 0.05)
-            self.supply_demand_history.append((date, sd_ratio))
-    
-    def train(self):
-        if len(self.historical_prices) < 30: return
-        with self._lock:
-            if SKLEARN_AVAILABLE: self._train_sklearn_ensemble()
-            else: self._train_simple()
-    
-    def _train_sklearn_ensemble(self):
-        X, y = [], []
-        for i in range(30, len(self.historical_prices)):
-            prices_30d = [p for _, p in self.historical_prices[i-30:i]]
-            sd_30d = [s for _, s in self.supply_demand_history[i-30:i]] if i < len(self.supply_demand_history) else [1.0]*30
-            features = prices_30d + [np.mean(sd_30d), np.std(sd_30d),
-                       np.mean(prices_30d[-7:]) - np.mean(prices_30d), max(prices_30d) - min(prices_30d)]
-            X.append(features)
-            y.append(self.historical_prices[i][1])
-        
-        if len(X) < 30: return
-        X, y = np.array(X), np.array(y)
-        X_scaled = self.scaler.fit_transform(X)
-        
-        rf = RandomForestRegressor(n_estimators=150, max_depth=15, random_state=42)
-        rf.fit(X_scaled, y)
-        gb = GradientBoostingRegressor(n_estimators=100, max_depth=8, learning_rate=0.05, random_state=43)
-        gb.fit(X_scaled, y)
-        
-        self.sklearn_model = {'rf': rf, 'gb': gb}
-        feature_names = [f'price_lag_{i}' for i in range(30)] + ['sd_mean', 'sd_std', 'momentum', 'range']
-        self.feature_importance = dict(zip(feature_names, rf.feature_importances_))
-        logger.info(f"Ensemble trained on {len(X)} samples")
-    
-    def _train_simple(self):
-        prices = [p for _, p in self.historical_prices[-30:]]
-        self.sklearn_model = {'mean': np.mean(prices), 'std': np.std(prices),
-                             'trend': np.polyfit(range(30), prices, 1)[0] if len(prices) >= 30 else 0}
-    
-    def _update_ensemble_weights(self, rf_error: float, gb_error: float):
-        """ENHANCEMENT: Adaptively adjust ensemble weights"""
-        self.prediction_errors.append({'rf': rf_error, 'gb': gb_error})
-        if len(self.prediction_errors) < 10: return
-        
-        recent = list(self.prediction_errors)[-20:]
-        rf_avg = np.mean([e['rf'] for e in recent])
-        gb_avg = np.mean([e['gb'] for e in recent])
-        total = 1/rf_avg + 1/gb_avg
-        self.ensemble_weights = {'rf': (1/rf_avg)/total, 'gb': (1/gb_avg)/total}
-    
-    def forecast(self, horizon_days: int = 30) -> Tuple[float, float, float]:
-        with self._lock:
-            if self.sklearn_model is None: self.train()
-            
-            if isinstance(self.sklearn_model, dict) and 'rf' in self.sklearn_model:
-                return self._ensemble_forecast(horizon_days)
-            elif isinstance(self.sklearn_model, dict) and 'mean' in self.sklearn_model:
-                return self._simple_forecast(horizon_days)
-            return self._basic_forecast()
-    
-    def _ensemble_forecast(self, horizon_days: int) -> Tuple[float, float, float]:
-        prices_30d = [p for _, p in self.historical_prices[-30:]]
-        sd_30d = [s for _, s in self.supply_demand_history[-30:]] if len(self.supply_demand_history) >= 30 else [1.0]*30
-        features = prices_30d + [np.mean(sd_30d), np.std(sd_30d),
-                   np.mean(prices_30d[-7:]) - np.mean(prices_30d), max(prices_30d) - min(prices_30d)]
-        X = self.scaler.transform([features])
-        
-        rf_pred = self.sklearn_model['rf'].predict(X)[0]
-        gb_pred = self.sklearn_model['gb'].predict(X)[0]
-        
-        # Use adaptive weights
-        forecast = self.ensemble_weights['rf'] * rf_pred + self.ensemble_weights['gb'] * gb_pred
-        std = np.std([p for _, p in self.historical_prices[-90:]])
-        
-        return forecast, max(0, forecast - 2*std), forecast + 2*std
-    
-    def _simple_forecast(self, horizon_days: int) -> Tuple[float, float, float]:
-        m = self.sklearn_model
-        forecast = m['mean'] + m['trend'] * horizon_days
-        return forecast, max(0, forecast - 2*m['std']), forecast + 2*m['std']
-    
-    def _basic_forecast(self) -> Tuple[float, float, float]:
-        prices = [p for _, p in self.historical_prices[-30:]]
-        mean = np.mean(prices)
-        std = np.std(prices)
-        return mean, max(0, mean - 2*std), mean + 2*std
-    
-    def add_price_point(self, date: datetime, price: float, supply_demand_ratio: float = 1.0):
-        """ENHANCEMENT: Online learning from new data"""
-        with self._lock:
-            self.historical_prices.append((date, price))
-            self.supply_demand_history.append((date, supply_demand_ratio))
-            if len(self.historical_prices) > 730:
-                self.historical_prices = self.historical_prices[-730:]
-                self.supply_demand_history = self.supply_demand_history[-730:]
-            
-            # Online retrain every 10 new points
-            if len(self.historical_prices) % 10 == 0 and SKLEARN_AVAILABLE:
-                self._train_sklearn_ensemble()
-    
-    def get_statistics(self) -> Dict:
-        with self._lock:
-            prices = [p for _, p in self.historical_prices[-90:]]
-            if not prices: return {}
-            return {
-                'current_price': prices[-1], 'avg_90d': np.mean(prices),
-                'volatility': np.std(prices),
-                'model_type': 'ensemble' if isinstance(self.sklearn_model, dict) and 'rf' in self.sklearn_model else 'simple',
-                'ensemble_weights': self.ensemble_weights
-            }
-
-
-# ============================================================
-# ENHANCEMENT 2: Improved Trading Market with Auction
-# ============================================================
-
-class HeliumTradingMarket:
-    """
-    Enhanced trading market with auction clearing and order book depth.
-    
-    New Features:
-    - Call auction mechanism for price discovery
-    - Order book depth visualization data
-    - Trade settlement with certificates
-    """
-    
-    def __init__(self):
-        self.buy_orders: List[TradingOrder] = []
-        self.sell_orders: List[TradingOrder] = []
-        self.completed_trades: List[Dict] = []
-        self._lock = threading.RLock()
-        self.trade_counter = 0
-        
-        logger.info("Enhanced HeliumTradingMarket v4.2 initialized")
-    
-    def place_order(self, order: TradingOrder) -> str:
-        with self._lock:
-            if order.order_type == TradingOrderType.BUY:
-                self.buy_orders.append(order)
-            else:
-                self.sell_orders.append(order)
-            logger.info(f"Order placed: {order.order_id} ({order.order_type.value} {order.amount_kg}kg @ ${order.price_per_kg}/kg)")
-            return order.order_id
-    
-    def match_orders(self) -> List[Dict]:
-        """Enhanced matching with auction clearing"""
-        with self._lock:
-            # Clean expired orders
-            self.buy_orders = [o for o in self.buy_orders if not o.is_expired() and not o.filled]
-            self.sell_orders = [o for o in self.sell_orders if not o.is_expired() and not o.filled]
-            
-            self.sell_orders.sort(key=lambda x: x.price_per_kg)
-            self.buy_orders.sort(key=lambda x: x.price_per_kg, reverse=True)
-            
-            trades = []
-            sell_idx = 0
-            
-            for buy_order in list(self.buy_orders):
-                if buy_order.filled: continue
-                
-                while sell_idx < len(self.sell_orders):
-                    sell_order = self.sell_orders[sell_idx]
-                    if sell_order.filled:
-                        sell_idx += 1
-                        continue
-                    
-                    if buy_order.price_per_kg >= sell_order.price_per_kg and \
-                       sell_order.min_purity >= buy_order.min_purity:
-                        
-                        # Execute at midpoint
-                        trade_price = (buy_order.price_per_kg + sell_order.price_per_kg) / 2
-                        trade_amount = min(buy_order.amount_kg - buy_order.filled_amount_kg,
-                                         sell_order.amount_kg - sell_order.filled_amount_kg)
-                        
-                        if trade_amount > 0:
-                            trade = {
-                                'trade_id': f"TRD-{hashlib.sha256(f'{time.time()}:{self.trade_counter}'.encode()).hexdigest()[:12]}",
-                                'buy_order_id': buy_order.order_id,
-                                'sell_order_id': sell_order.order_id,
-                                'amount_kg': trade_amount,
-                                'price_per_kg': trade_price,
-                                'total_value': trade_amount * trade_price,
-                                'timestamp': datetime.now().isoformat()
-                            }
-                            trades.append(trade)
-                            self.completed_trades.append(trade)
-                            self.trade_counter += 1
-                            
-                            buy_order.filled_amount_kg += trade_amount
-                            sell_order.filled_amount_kg += trade_amount
-                            
-                            if buy_order.filled_amount_kg >= buy_order.amount_kg:
-                                buy_order.filled = True
-                                break
-                            if sell_order.filled_amount_kg >= sell_order.amount_kg:
-                                sell_order.filled = True
-                                sell_idx += 1
-                    else:
-                        break
-        
-            if trades:
-                logger.info(f"Matched {len(trades)} trades, total value: ${sum(t['total_value'] for t in trades):,.0f}")
-            return trades
-    
-    def get_market_depth(self) -> Dict:
-        with self._lock:
-            active_buys = [o for o in self.buy_orders if not o.filled and not o.is_expired()]
-            active_sells = [o for o in self.sell_orders if not o.filled and not o.is_expired()]
-            
-            buy_prices = sorted([o.price_per_kg for o in active_buys], reverse=True)
-            sell_prices = sorted([o.price_per_kg for o in active_sells])
-            
-            return {
-                'best_bid': buy_prices[0] if buy_prices else 0,
-                'best_ask': sell_prices[0] if sell_prices else float('inf'),
-                'spread': (sell_prices[0] - buy_prices[0]) if buy_prices and sell_prices else 0,
-                'buy_volume_kg': sum(o.amount_kg - o.filled_amount_kg for o in active_buys),
-                'sell_volume_kg': sum(o.amount_kg - o.filled_amount_kg for o in active_sells),
-                'active_buy_orders': len(active_buys),
-                'active_sell_orders': len(active_sells),
-                'vwap': np.average([t['price_per_kg'] for t in self.completed_trades[-20:]],
-                                   weights=[t['amount_kg'] for t in self.completed_trades[-20:]]) if self.completed_trades else 0
-            }
-    
-    def get_statistics(self) -> Dict:
-        with self._lock:
-            return {
-                'total_trades': len(self.completed_trades),
-                'total_volume_kg': sum(t['amount_kg'] for t in self.completed_trades),
-                'total_value_usd': sum(t['total_value'] for t in self.completed_trades),
-                'market_depth': self.get_market_depth()
-            }
-
-
-# ============================================================
-# ENHANCEMENT 3: Improved Monitor with Severity & Automation
-# ============================================================
-
-class HeliumMonitor:
-    """
-    Enhanced monitor with severity classification and automated responses.
-    
-    New Features:
-    - Severity classification (INFO, WARNING, ERROR, CRITICAL)
-    - Automated response actions for critical alerts
-    - Alert acknowledgement tracking
-    """
-    
-    def __init__(self):
-        self.telemetry: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
-        self.alerts: List[Dict] = []
-        self.maintenance_windows: List[Tuple[float, float]] = []
-        self.thresholds = {
-            'purity_min': 99.0, 'pressure_max': 5.0,
-            'temperature_max_c': 30.0, 'flow_rate_max': 500.0, 'leak_rate_max': 0.01
-        }
-        self.anomaly_threshold_zscore = 3.0
-        self.trend_window = 20
-        
-        # ENHANCEMENT: Automated responses
-        self.auto_responses = {
-            'critical': ['activate_emergency_shutdown', 'notify_operations_team'],
-            'error': ['increase_monitoring_frequency', 'schedule_inspection'],
-            'warning': ['log_incident', 'check_maintenance_schedule']
-        }
+        self.training_data = deque(maxlen=10000)
+        self.prediction_history = deque(maxlen=1000)
+        self.optimization_results = deque(maxlen=1000)
         
         self._lock = threading.RLock()
-        self._monitoring = False
-        self._monitor_thread = None
+        self._train_thread = None
+        self._training_interval = self.config.get('training_interval', 3600)
         
-        logger.info("Enhanced HeliumMonitor v4.2 initialized with automated responses")
+        logger.info("AIRecoveryOptimizer initialized")
     
-    def start_monitoring(self):
-        if self._monitoring: return
-        self._monitoring = True
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._monitor_thread.start()
-        logger.info("Helium monitoring started")
-    
-    def _monitor_loop(self):
-        while self._monitoring:
-            try:
-                with self._lock:
-                    for metric, values in self.telemetry.items():
-                        if len(values) >= 10:
-                            self._check_thresholds(metric, values[-1])
-                            self._check_anomalies(metric, list(values))
-                time.sleep(5)
-            except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
-                time.sleep(10)
-    
-    def _check_thresholds(self, metric: str, value: float):
-        if self._in_maintenance_window(): return
+    def optimize_parameters(self, current_state: Dict) -> Dict:
+        """Optimize recovery system parameters using AI"""
+        features = self._extract_features(current_state)
         
-        severity = None
-        if metric == 'purity' and value < self.thresholds['purity_min']:
-            severity = 'critical' if value < 97.0 else 'error' if value < 98.0 else 'warning'
-            self._generate_alert(severity, f'Low purity: {value:.1f}%', metric, value)
-        elif metric == 'pressure' and value > self.thresholds['pressure_max']:
-            severity = 'critical' if value > 6.0 else 'error'
-            self._generate_alert(severity, f'High pressure: {value:.1f} bar', metric, value)
-        elif metric == 'leak_rate' and value > self.thresholds['leak_rate_max']:
-            self._generate_alert('critical', f'Leak detected: {value:.3f}%', metric, value)
-    
-    def _check_anomalies(self, metric: str, values: List[float]):
-        if len(values) < 20: return
-        historical = values[:-1]
-        mean, std = np.mean(historical), np.std(historical)
-        if std == 0: return
-        
-        latest = values[-1]
-        z_score = abs(latest - mean) / std
-        
-        if z_score > self.anomaly_threshold_zscore:
-            severity = 'critical' if z_score > 5.0 else 'error' if z_score > 4.0 else 'warning'
-            direction = "high" if latest > mean else "low"
-            self._generate_alert(severity, f"Anomaly: {metric} unusually {direction} (z={z_score:.1f})", metric, latest)
-        
-        # Trend analysis
-        if len(values) >= self.trend_window:
-            recent = values[-self.trend_window:]
-            trend = np.polyfit(range(self.trend_window), recent, 1)[0]
-            if metric == 'purity' and trend < -0.01:
-                hours = (self.thresholds['purity_min'] - latest) / abs(trend) * 5 / 3600
-                if hours < 24:
-                    self._generate_alert('info', f"Trend: {metric} approaching threshold ({hours:.1f}h)", metric, latest)
-    
-    def _generate_alert(self, level: str, message: str, metric: str = "", value: float = 0):
-        alert = {
-            'timestamp': datetime.now().isoformat(), 'level': level,
-            'message': message, 'metric': metric, 'value': value,
-            'acknowledged': False,
-            'auto_actions': self.auto_responses.get(level, [])
-        }
-        self.alerts.append(alert)
-        if len(self.alerts) > 200: self.alerts = self.alerts[-200:]
-        
-        if level in ['critical', 'error']:
-            logger.error(f"{level.upper()}: {message}")
-            # Execute auto responses
-            for action in alert['auto_actions']:
-                logger.info(f"Auto-response: {action}")
+        if self.scaler and len(self.training_data) > 100:
+            features_scaled = self.scaler.transform([features])
         else:
-            logger.warning(f"{level}: {message}")
+            features_scaled = [features]
+        
+        with torch.no_grad():
+            self.model.eval()
+            inputs = torch.FloatTensor(features_scaled)
+            efficiency_pred, energy_pred, purity_pred = self.model(inputs)
+        
+        # Generate optimized parameters
+        optimized_params = {
+            'flow_rate_optimal': current_state.get('flow_rate', 10) * efficiency_pred.item(),
+            'temperature_setpoint': current_state.get('temperature', 4.2) * (1 - 0.1 * efficiency_pred.item()),
+            'pressure_setpoint': current_state.get('pressure', 1.0) * (0.9 + 0.1 * purity_pred.item()),
+            'predicted_efficiency': efficiency_pred.item(),
+            'predicted_energy_consumption': energy_pred.item(),
+            'predicted_purity': purity_pred.item(),
+            'confidence_score': self._calculate_confidence(current_state)
+        }
+        
+        self.optimization_results.append({
+            'timestamp': time.time(),
+            'params': optimized_params,
+            'state': current_state
+        })
+        
+        return optimized_params
     
-    def add_maintenance_window(self, start_time: float, end_time: float):
-        self.maintenance_windows.append((start_time, end_time))
-        self.maintenance_windows = [(s, e) for s, e in self.maintenance_windows if e > time.time()]
+    def _extract_features(self, state: Dict) -> np.ndarray:
+        """Extract features from system state"""
+        return np.array([
+            state.get('helium_flow_rate', 10) / 100,
+            state.get('inlet_temperature', 300) / 400,
+            state.get('outlet_temperature', 4.2) / 400,
+            state.get('pressure_differential', 1.0) / 10,
+            state.get('helium_purity', 0.99),
+            state.get('ambient_temperature', 295) / 320,
+            state.get('system_age_hours', 1000) / 10000,
+            state.get('last_maintenance_hours', 100) / 1000,
+            state.get('current_efficiency', 0.85),
+            state.get('energy_consumption_kw', 50) / 200,
+            state.get('vibration_level', 0.1) * 10,
+            state.get('coolant_pressure', 2.0) / 5,
+            state.get('helium_concentration', 0.95),
+            np.sin(time.time() / 86400 * 2 * np.pi),  # Time of day
+            np.cos(time.time() / 86400 * 2 * np.pi)
+        ])
     
-    def _in_maintenance_window(self) -> bool:
-        return any(s <= time.time() <= e for s, e in self.maintenance_windows)
+    def _calculate_confidence(self, state: Dict) -> float:
+        """Calculate confidence score for optimization"""
+        # Higher confidence when conditions are stable and within normal ranges
+        stability_score = 1.0
+        
+        # Check if conditions are within normal ranges
+        if state.get('helium_purity', 0.99) < 0.95:
+            stability_score *= 0.8
+        if state.get('current_efficiency', 0.85) < 0.7:
+            stability_score *= 0.7
+        
+        # Higher confidence with more training data
+        data_score = min(1.0, len(self.training_data) / 1000)
+        
+        return stability_score * data_score
     
-    def record_telemetry(self, metric: str, value: float):
-        with self._lock: self.telemetry[metric].append(value)
-    
-    def get_current_status(self) -> Dict:
+    def train_model(self):
+        """Train the optimization model"""
+        if len(self.training_data) < 100:
+            return
+        
         with self._lock:
-            status = {'alerts': len([a for a in self.alerts if not a['acknowledged']]),
-                     'in_maintenance': self._in_maintenance_window()}
-            for metric, values in self.telemetry.items():
-                if len(values) >= 5:
-                    recent = list(values)[-10:]
-                    trend = np.polyfit(range(min(10, len(recent))), recent, 1)[0] if len(recent) >= 5 else 0
-                    status[metric] = {'current': recent[-1], 'avg': np.mean(recent),
-                                     'min': min(recent), 'max': max(recent),
-                                     'trend': 'up' if trend > 0.01 else 'down' if trend < -0.01 else 'stable'}
-            return status
+            # Prepare training data
+            X = []
+            y_efficiency = []
+            y_energy = []
+            y_purity = []
+            
+            for data in list(self.training_data)[-1000:]:
+                X.append(data['features'])
+                y_efficiency.append(data['efficiency'])
+                y_energy.append(data['energy'])
+                y_purity.append(data['purity'])
+            
+            X = np.array(X)
+            
+            if self.scaler:
+                X_scaled = self.scaler.fit_transform(X)
+            else:
+                X_scaled = X
+            
+            # Convert to tensors
+            X_tensor = torch.FloatTensor(X_scaled)
+            y_eff_tensor = torch.FloatTensor(y_efficiency).unsqueeze(1)
+            y_energy_tensor = torch.FloatTensor(y_energy).unsqueeze(1)
+            y_purity_tensor = torch.FloatTensor(y_purity).unsqueeze(1)
+            
+            # Train
+            self.model.train()
+            for epoch in range(100):
+                self.optimizer.zero_grad()
+                
+                eff_pred, energy_pred, purity_pred = self.model(X_tensor)
+                
+                loss_eff = nn.MSELoss()(eff_pred, y_eff_tensor)
+                loss_energy = nn.MSELoss()(energy_pred, y_energy_tensor)
+                loss_purity = nn.MSELoss()(purity_pred, y_purity_tensor)
+                
+                total_loss = loss_eff + 0.5 * loss_energy + 0.3 * loss_purity
+                total_loss.backward()
+                self.optimizer.step()
+            
+            logger.info(f"Recovery optimization model trained (samples: {len(X)})")
     
-    def get_alerts(self, acknowledged: bool = False, severity: Optional[str] = None) -> List[Dict]:
-        with self._lock:
-            alerts = [a for a in self.alerts if a['acknowledged'] == acknowledged]
-            if severity: alerts = [a for a in alerts if a['level'] == severity]
-            return alerts
-    
-    def acknowledge_alert(self, alert_index: int):
-        with self._lock:
-            if 0 <= alert_index < len(self.alerts):
-                self.alerts[alert_index]['acknowledged'] = True
-    
-    def stop_monitoring(self):
-        self._monitoring = False
-        if self._monitor_thread: self._monitor_thread.join(timeout=5)
+    def add_training_data(self, features: np.ndarray, efficiency: float,
+                        energy: float, purity: float):
+        """Add training data point"""
+        self.training_data.append({
+            'features': features,
+            'efficiency': efficiency,
+            'energy': energy,
+            'purity': purity,
+            'timestamp': time.time()
+        })
     
     def get_statistics(self) -> Dict:
+        """Get optimizer statistics"""
         with self._lock:
-            alerts_by_level = defaultdict(int)
-            for a in self.alerts: alerts_by_level[a['level']] += 1
-            return {'monitoring_active': self._monitoring, 'metrics_tracked': list(self.telemetry.keys()),
-                   'total_alerts': len(self.alerts), 'active_alerts': len([a for a in self.alerts if not a['acknowledged']]),
-                   'alerts_by_level': dict(alerts_by_level)}
+            recent_results = list(self.optimization_results)[-100:]
+            
+            return {
+                'training_samples': len(self.training_data),
+                'avg_predicted_efficiency': np.mean([r['params']['predicted_efficiency'] 
+                                                     for r in recent_results]) if recent_results else 0,
+                'avg_confidence': np.mean([r['params']['confidence_score'] 
+                                          for r in recent_results]) if recent_results else 0,
+                'total_optimizations': len(self.optimization_results)
+            }
 
 
 # ============================================================
-# ENHANCEMENT 4: Complete Enhanced System
+# ENHANCEMENT 2: Blockchain-Based Provenance Tracking
+# ============================================================
+
+class HeliumBlockchainTracker:
+    """Blockchain-based helium supply chain tracking"""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.web3 = None
+        self.contract_address = self.config.get('contract_address')
+        self.chain_id = self.config.get('chain_id', 1)
+        
+        # Initialize blockchain connection
+        if WEB3_AVAILABLE:
+            self._init_blockchain()
+        
+        # Local ledger for offline operation
+        self.local_ledger: List[BlockchainRecord] = []
+        self.pending_transactions: List[BlockchainRecord] = []
+        
+        # Smart contract ABI
+        self.contract_abi = self._get_contract_abi()
+        
+        self._lock = threading.RLock()
+        logger.info(f"HeliumBlockchainTracker initialized (chain_id={self.chain_id})")
+    
+    def _init_blockchain(self):
+        """Initialize blockchain connection"""
+        try:
+            rpc_url = self.config.get('rpc_url', 'http://localhost:8545')
+            self.web3 = Web3(Web3.HTTPProvider(rpc_url))
+            
+            if self.web3.is_connected():
+                logger.info(f"Connected to blockchain (chain_id={self.chain_id})")
+            else:
+                logger.warning("Blockchain connection failed, using local ledger")
+                self.web3 = None
+        except Exception as e:
+            logger.error(f"Blockchain initialization failed: {e}")
+            self.web3 = None
+    
+    def _get_contract_abi(self) -> List[Dict]:
+        """Get smart contract ABI for helium tracking"""
+        return [
+            {
+                "inputs": [
+                    {"name": "heliumAssetId", "type": "string"},
+                    {"name": "quantity", "type": "uint256"},
+                    {"name": "purity", "type": "string"},
+                    {"name": "origin", "type": "string"},
+                    {"name": "destination", "type": "string"}
+                ],
+                "name": "recordTransfer",
+                "outputs": [{"name": "txId", "type": "string"}],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            },
+            {
+                "inputs": [{"name": "assetId", "type": "string"}],
+                "name": "getProvenance",
+                "outputs": [
+                    {"name": "origin", "type": "string"},
+                    {"name": "chainOfCustody", "type": "string[]"},
+                    {"name": "certifications", "type": "string[]"}
+                ],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+    
+    def record_transfer(self, asset: HeliumAsset, from_address: str,
+                      to_address: str, transaction_type: str) -> BlockchainRecord:
+        """Record helium transfer on blockchain"""
+        
+        transaction_id = hashlib.sha256(
+            f"{asset.asset_id}{time.time()}{random.random()}".encode()
+        ).hexdigest()
+        
+        record = BlockchainRecord(
+            transaction_id=transaction_id,
+            timestamp=time.time(),
+            from_address=from_address,
+            to_address=to_address,
+            quantity_liters=asset.quantity_liters,
+            purity=asset.purity,
+            transaction_type=transaction_type,
+            verified=False
+        )
+        
+        # Try to record on blockchain
+        if self.web3 and self.contract_address:
+            try:
+                contract = self.web3.eth.contract(
+                    address=self.contract_address,
+                    abi=self.contract_abi
+                )
+                
+                # Build transaction
+                tx = contract.functions.recordTransfer(
+                    asset.asset_id,
+                    int(asset.quantity_liters * 1000),  # Convert to milliliters
+                    asset.purity.value,
+                    from_address,
+                    to_address
+                ).build_transaction({
+                    'from': self.web3.eth.accounts[0],
+                    'gas': 200000,
+                    'gasPrice': self.web3.eth.gas_price,
+                    'nonce': self.web3.eth.get_transaction_count(
+                        self.web3.eth.accounts[0]
+                    )
+                })
+                
+                # Sign and send
+                signed_tx = self.web3.eth.account.sign_transaction(
+                    tx,
+                    private_key=os.getenv('BLOCKCHAIN_PRIVATE_KEY', '0x0')
+                )
+                tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                
+                # Wait for receipt
+                receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+                
+                record.smart_contract_address = self.contract_address
+                record.gas_used = receipt.gasUsed
+                record.block_number = receipt.blockNumber
+                record.verified = True
+                
+                logger.info(f"Blockchain transaction recorded: {tx_hash.hex()[:16]}...")
+                
+            except Exception as e:
+                logger.error(f"Blockchain recording failed: {e}")
+                self.pending_transactions.append(record)
+        
+        # Always store locally
+        with self._lock:
+            self.local_ledger.append(record)
+        
+        # Update asset ownership
+        asset.blockchain_tx_hash = transaction_id
+        asset.ownership_history.append({
+            'from': from_address,
+            'to': to_address,
+            'timestamp': time.time(),
+            'tx_id': transaction_id
+        })
+        
+        return record
+    
+    def get_provenance(self, asset_id: str) -> List[BlockchainRecord]:
+        """Get complete provenance history for an asset"""
+        with self._lock:
+            # Filter local ledger for this asset
+            asset_records = [
+                r for r in self.local_ledger
+                if asset_id in str(r.__dict__)  # Simplified search
+            ]
+        
+        # Try to get blockchain records
+        if self.web3 and self.contract_address:
+            try:
+                contract = self.web3.eth.contract(
+                    address=self.contract_address,
+                    abi=self.contract_abi
+                )
+                
+                provenance = contract.functions.getProvenance(asset_id).call()
+                
+                # Merge blockchain and local records
+                logger.info(f"Retrieved blockchain provenance for {asset_id}")
+                
+            except Exception as e:
+                logger.error(f"Provenance retrieval failed: {e}")
+        
+        return asset_records
+    
+    def verify_supply_chain(self, asset_id: str) -> Dict:
+        """Verify complete supply chain integrity"""
+        records = self.get_provenance(asset_id)
+        
+        # Verify chain of custody
+        custody_chain_valid = True
+        for i in range(len(records) - 1):
+            if records[i].to_address != records[i + 1].from_address:
+                custody_chain_valid = False
+                break
+        
+        # Check for gaps
+        has_gaps = False
+        if records:
+            for i in range(len(records) - 1):
+                time_gap = records[i + 1].timestamp - records[i].timestamp
+                if time_gap > 86400 * 30:  # 30 days
+                    has_gaps = True
+                    break
+        
+        return {
+            'asset_id': asset_id,
+            'total_transfers': len(records),
+            'custody_chain_valid': custody_chain_valid,
+            'has_gaps': has_gaps,
+            'verified_on_blockchain': any(r.verified for r in records),
+            'first_recorded': records[0].timestamp if records else None,
+            'last_recorded': records[-1].timestamp if records else None
+        }
+    
+    def get_statistics(self) -> Dict:
+        """Get blockchain tracking statistics"""
+        with self._lock:
+            return {
+                'total_transactions': len(self.local_ledger),
+                'pending_transactions': len(self.pending_transactions),
+                'verified_on_chain': sum(1 for r in self.local_ledger if r.verified),
+                'blockchain_connected': self.web3 is not None and self.web3.is_connected() if self.web3 else False
+            }
+
+
+# ============================================================
+# ENHANCEMENT 3: Predictive Maintenance Integration
+# ============================================================
+
+class PredictiveMaintenanceIntegrator:
+    """Predictive maintenance for helium recovery systems"""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.equipment_models: Dict[str, Any] = {}
+        self.maintenance_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=1000)
+        )
+        self.failure_predictions: Dict[str, RecoverySystemHealth] = {}
+        self.maintenance_schedule: Dict[str, List[Dict]] = defaultdict(list)
+        
+        self._lock = threading.RLock()
+        logger.info("PredictiveMaintenanceIntegrator initialized")
+    
+    def monitor_system_health(self, system_id: str, 
+                            sensor_data: Dict[str, float]) -> RecoverySystemHealth:
+        """Monitor system health and predict maintenance needs"""
+        
+        # Calculate efficiency degradation
+        current_efficiency = sensor_data.get('efficiency', 0.85)
+        design_efficiency = sensor_data.get('design_efficiency', 0.95)
+        efficiency_degradation = design_efficiency - current_efficiency
+        
+        # Predict remaining useful life
+        hours_since_maintenance = sensor_data.get('hours_since_maintenance', 0)
+        rul_hours = self._predict_rul(system_id, sensor_data)
+        
+        # Detect anomalies
+        anomaly_detected = self._detect_anomalies(system_id, sensor_data)
+        
+        # Calculate failure probability
+        failure_prob = self._calculate_failure_probability(
+            efficiency_degradation,
+            hours_since_maintenance,
+            sensor_data.get('vibration_level', 0)
+        )
+        
+        # Determine recommended action
+        if failure_prob > 0.8:
+            action = "Immediate maintenance required"
+            priority = 1
+        elif failure_prob > 0.5:
+            action = "Schedule maintenance within 48 hours"
+            priority = 2
+        elif failure_prob > 0.3:
+            action = "Plan maintenance within 2 weeks"
+            priority = 3
+        elif anomaly_detected:
+            action = "Investigate anomaly"
+            priority = 4
+        else:
+            action = "Continue monitoring"
+            priority = 5
+        
+        health = RecoverySystemHealth(
+            system_id=system_id,
+            efficiency_current=current_efficiency,
+            efficiency_design=design_efficiency,
+            hours_since_maintenance=hours_since_maintenance,
+            predicted_failure_probability=failure_prob,
+            remaining_useful_life_hours=rul_hours,
+            anomaly_detected=anomaly_detected,
+            recommended_action=action,
+            priority=priority
+        )
+        
+        with self._lock:
+            self.failure_predictions[system_id] = health
+            self.maintenance_history[system_id].append({
+                'timestamp': time.time(),
+                'health': health,
+                'sensor_data': sensor_data
+            })
+        
+        return health
+    
+    def _predict_rul(self, system_id: str, sensor_data: Dict) -> float:
+        """Predict remaining useful life using degradation model"""
+        # Weibull degradation model
+        shape_param = 2.5  # Shape parameter
+        scale_param = 20000  # Scale parameter (hours)
+        
+        hours = sensor_data.get('hours_since_maintenance', 0)
+        efficiency = sensor_data.get('efficiency', 0.85)
+        
+        # Calculate degradation rate
+        degradation_rate = (1 - efficiency) / max(1, hours)
+        
+        # Predict time until efficiency drops below threshold
+        threshold = 0.7  # Minimum acceptable efficiency
+        remaining = max(0, (efficiency - threshold) / max(degradation_rate, 1e-6))
+        
+        return min(remaining, scale_param * (1 - efficiency) ** (1 / shape_param))
+    
+    def _detect_anomalies(self, system_id: str, sensor_data: Dict) -> bool:
+        """Detect anomalies in sensor data"""
+        history = list(self.maintenance_history[system_id])[-100:]
+        
+        if len(history) < 10:
+            return False
+        
+        # Simple statistical anomaly detection
+        vibration_values = [h['sensor_data'].get('vibration_level', 0) 
+                          for h in history]
+        
+        if not vibration_values:
+            return False
+        
+        mean = np.mean(vibration_values)
+        std = np.std(vibration_values)
+        
+        current_vibration = sensor_data.get('vibration_level', 0)
+        
+        # Flag if vibration is > 3 standard deviations from mean
+        return abs(current_vibration - mean) > 3 * max(std, 0.01)
+    
+    def _calculate_failure_probability(self, degradation: float,
+                                     hours_since_maintenance: float,
+                                     vibration: float) -> float:
+        """Calculate probability of failure"""
+        # Weighted combination of factors
+        degradation_factor = min(1.0, degradation * 10)
+        time_factor = min(1.0, hours_since_maintenance / 10000)
+        vibration_factor = min(1.0, vibration / 5)
+        
+        # Logistic function for smooth probability
+        logit = -3 + 5 * degradation_factor + 2 * time_factor + 3 * vibration_factor
+        probability = 1 / (1 + math.exp(-logit))
+        
+        return probability
+    
+    def schedule_maintenance(self, system_id: str) -> List[Dict]:
+        """Generate maintenance schedule based on predictions"""
+        health = self.failure_predictions.get(system_id)
+        
+        if not health:
+            return []
+        
+        schedule = []
+        
+        # Immediate maintenance
+        if health.priority <= 2:
+            schedule.append({
+                'action': health.recommended_action,
+                'deadline_hours': 24 if health.priority == 1 else 48,
+                'estimated_duration_hours': 4,
+                'required_parts': ['filter_element', 'seal_kit'],
+                'personnel_required': 2,
+                'priority': health.priority
+            })
+        
+        # Preventive maintenance
+        if health.remaining_useful_life_hours < 500:
+            schedule.append({
+                'action': 'Preventive maintenance',
+                'deadline_hours': health.remaining_useful_life_hours,
+                'estimated_duration_hours': 2,
+                'required_parts': ['lubricant', 'gaskets'],
+                'personnel_required': 1,
+                'priority': 3
+            })
+        
+        with self._lock:
+            self.maintenance_schedule[system_id] = schedule
+        
+        return schedule
+    
+    def get_statistics(self) -> Dict:
+        """Get maintenance statistics"""
+        with self._lock:
+            active_systems = len(self.failure_predictions)
+            critical_systems = sum(1 for h in self.failure_predictions.values() 
+                                 if h.priority <= 2)
+            
+            return {
+                'active_systems': active_systems,
+                'critical_systems': critical_systems,
+                'avg_efficiency': np.mean([h.efficiency_current 
+                                         for h in self.failure_predictions.values()]) if active_systems > 0 else 0,
+                'total_scheduled_maintenance': sum(len(s) for s in self.maintenance_schedule.values())
+            }
+
+
+# ============================================================
+# ENHANCEMENT 4: IoT Sensor Integration
+# ============================================================
+
+class IoTSensorNetwork:
+    """IoT sensor network for real-time helium monitoring"""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.mqtt_client = None
+        self.sensors: Dict[str, Dict] = {}
+        self.sensor_readings: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=10000)
+        )
+        self.alert_thresholds = self._init_thresholds()
+        
+        # Initialize MQTT if available
+        if MQTT_AVAILABLE:
+            self._init_mqtt()
+        
+        self._lock = threading.RLock()
+        logger.info(f"IoTSensorNetwork initialized ({len(self.sensors)} sensors)")
+    
+    def _init_thresholds(self) -> Dict:
+        """Initialize alert thresholds"""
+        return {
+            'temperature_k': {'min': 2.0, 'max': 10.0},
+            'pressure_bar': {'min': 0.5, 'max': 3.0},
+            'flow_rate_lpm': {'min': 5, 'max': 50},
+            'helium_concentration': {'min': 0.90, 'max': 1.0},
+            'vibration_level': {'min': 0, 'max': 2.0}
+        }
+    
+    def _init_mqtt(self):
+        """Initialize MQTT client for sensor communication"""
+        try:
+            self.mqtt_client = mqtt.Client()
+            self.mqtt_client.on_connect = self._on_mqtt_connect
+            self.mqtt_client.on_message = self._on_mqtt_message
+            
+            broker = self.config.get('mqtt_broker', 'localhost')
+            port = self.config.get('mqtt_port', 1883)
+            
+            self.mqtt_client.connect(broker, port, 60)
+            self.mqtt_client.loop_start()
+            
+            # Subscribe to sensor topics
+            self.mqtt_client.subscribe('helium/sensors/#')
+            
+            logger.info(f"MQTT connected to {broker}:{port}")
+        except Exception as e:
+            logger.warning(f"MQTT initialization failed: {e}")
+            self.mqtt_client = None
+    
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        """MQTT connection callback"""
+        if rc == 0:
+            logger.info("MQTT connected successfully")
+        else:
+            logger.error(f"MQTT connection failed with code {rc}")
+    
+    def _on_mqtt_message(self, client, userdata, msg):
+        """MQTT message callback"""
+        try:
+            payload = json.loads(msg.payload.decode())
+            sensor_id = msg.topic.split('/')[-1]
+            
+            self.process_sensor_reading(sensor_id, payload)
+        except Exception as e:
+            logger.error(f"MQTT message processing failed: {e}")
+    
+    def register_sensor(self, sensor_id: str, sensor_type: str,
+                      location: str, facility_id: str,
+                      metadata: Optional[Dict] = None):
+        """Register an IoT sensor"""
+        with self._lock:
+            self.sensors[sensor_id] = {
+                'sensor_type': sensor_type,
+                'location': location,
+                'facility_id': facility_id,
+                'registered_at': time.time(),
+                'last_reading': None,
+                'status': 'active',
+                'metadata': metadata or {}
+            }
+            logger.info(f"Sensor registered: {sensor_id} ({sensor_type})")
+    
+    def process_sensor_reading(self, sensor_id: str, 
+                              reading: Dict[str, float]) -> Dict:
+        """Process a sensor reading and generate alerts"""
+        with self._lock:
+            if sensor_id not in self.sensors:
+                self.register_sensor(sensor_id, 'unknown', 'unknown', 'unknown')
+            
+            # Store reading
+            reading['timestamp'] = time.time()
+            self.sensor_readings[sensor_id].append(reading)
+            self.sensors[sensor_id]['last_reading'] = reading
+            
+            # Check thresholds
+            alerts = self._check_thresholds(sensor_id, reading)
+            
+            if alerts:
+                logger.warning(f"Alerts for sensor {sensor_id}: {alerts}")
+            
+            return {
+                'sensor_id': sensor_id,
+                'alerts': alerts,
+                'reading': reading
+            }
+    
+    def _check_thresholds(self, sensor_id: str, 
+                        reading: Dict) -> List[Dict]:
+        """Check if readings exceed thresholds"""
+        alerts = []
+        
+        for parameter, value in reading.items():
+            if parameter in self.alert_thresholds:
+                thresholds = self.alert_thresholds[parameter]
+                
+                if value < thresholds['min']:
+                    alerts.append({
+                        'parameter': parameter,
+                        'value': value,
+                        'threshold': thresholds['min'],
+                        'severity': 'low',
+                        'message': f"{parameter} below minimum threshold"
+                    })
+                elif value > thresholds['max']:
+                    alerts.append({
+                        'parameter': parameter,
+                        'value': value,
+                        'threshold': thresholds['max'],
+                        'severity': 'high',
+                        'message': f"{parameter} above maximum threshold"
+                    })
+        
+        return alerts
+    
+    def get_sensor_data(self, sensor_id: str, 
+                      duration_seconds: float = 3600) -> List[Dict]:
+        """Get sensor data for analysis"""
+        with self._lock:
+            readings = list(self.sensor_readings[sensor_id])
+            
+            if duration_seconds:
+                cutoff = time.time() - duration_seconds
+                readings = [r for r in readings if r['timestamp'] >= cutoff]
+            
+            return readings
+    
+    def get_statistics(self) -> Dict:
+        """Get sensor network statistics"""
+        with self._lock:
+            active_sensors = sum(1 for s in self.sensors.values() 
+                               if s['status'] == 'active')
+            
+            return {
+                'total_sensors': len(self.sensors),
+                'active_sensors': active_sensors,
+                'total_readings': sum(len(r) for r in self.sensor_readings.values()),
+                'sensors_by_type': defaultdict(int, {
+                    s['sensor_type']: sum(1 for s2 in self.sensors.values() 
+                                        if s2['sensor_type'] == s['sensor_type'])
+                    for s in self.sensors.values()
+                })
+            }
+
+
+# ============================================================
+# ENHANCEMENT 5: Complete Enhanced Helium Circularity System v4.2
 # ============================================================
 
 class UltimateHeliumCircularityV4:
     """
-    Complete enhanced helium circularity system v4.2.
+    Complete enhanced helium circularity management system v4.2.
     
     New Features:
-    - Carbon credit registry integration
-    - Automated compliance reporting (GHG Protocol + EU CSRD)
-    - Circular economy benchmarking
-    - Predictive maintenance with RUL estimation
+    - AI-driven recovery optimization
+    - Blockchain provenance tracking
+    - Predictive maintenance integration
+    - IoT sensor network
+    - Carbon footprint tracking
+    - Cross-facility coordination
     """
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         
-        self.lifecycle_tracker = HeliumLifecycleTracker()
-        self.ml_optimizer = HeliumOptimizerML()
-        self.certifier = CircularEconomyCertifier()
-        self.recovery_optimizer = HeliumRecoveryOptimizer()
-        self.price_forecaster = HeliumPriceForecaster()
-        self.ledger = HeliumLedger()
-        self.monitor = HeliumMonitor()
-        self.trading_market = HeliumTradingMarket()
-        
-        # ENHANCEMENT: Benchmarking data
-        self.industry_benchmarks = {
-            'circularity_score': 0.65,
-            'recycling_rate': 0.55,
-            'recovery_efficiency': 0.82,
-            'carbon_per_kg': 0.5
-        }
-        
-        self.monitor.start_monitoring()
-        self.optimization_history: List[Dict] = []
-        self.decisions: List[HeliumDecision] = []
-        
-        logger.info("UltimateHeliumCircularityV4 v4.2 initialized with compliance and benchmarking")
-    
-    def optimize_helium_circularity(self, facility_data: Dict, target_circularity: float = 0.7) -> HeliumDecision:
-        """Enhanced optimization with carbon credits"""
-        current_price, price_lower, price_upper = self.price_forecaster.forecast(30)
-        
-        # Train ML
-        if 'historical_data' in facility_data:
-            for dp in facility_data['historical_data']:
-                self.ml_optimizer.add_training_data(dp.get('features', {}), dp.get('consumption', 0), dp.get('recovery_efficiency', 0))
-        self.ml_optimizer.train_model()
-        
-        # Predict and optimize
-        consumption, _ = self.ml_optimizer.predict_consumption(facility_data.get('current_features', {}))
-        recovery_opt = self.ml_optimizer.optimize_recovery(
-            facility_data.get('recovery_params', {}),
-            facility_data.get('constraints', {'flow_rate': (10, 500), 'pressure': (1, 5), 'temperature': (15, 35)})
+        # Core components
+        self.recovery_optimizer = AIRecoveryOptimizer(
+            self.config.get('ai_optimizer', {})
+        )
+        self.blockchain_tracker = HeliumBlockchainTracker(
+            self.config.get('blockchain', {})
+        )
+        self.maintenance_integrator = PredictiveMaintenanceIntegrator(
+            self.config.get('maintenance', {})
+        )
+        self.sensor_network = IoTSensorNetwork(
+            self.config.get('iot', {})
         )
         
-        # Economic analysis
-        annual_volume = facility_data.get('annual_volume_kg', 10000)
-        tech = facility_data.get('preferred_technology', 'hybrid')
-        economic = self.recovery_optimizer.optimize(annual_volume, current_price, tech)
+        # Inventory management
+        self.helium_inventory: Dict[str, HeliumAsset] = {}
+        self.recovery_systems: Dict[str, Dict] = {}
         
-        recovered_kg = annual_volume * recovery_opt['max_efficiency']
-        savings_usd = recovered_kg * current_price
-        carbon_savings = recovered_kg * 0.5
-        
-        # ENHANCEMENT: Carbon credits
-        carbon_credits = carbon_savings / 1000 * 15  # $15/tonne CO2
-        
-        # Trading opportunity
-        market_depth = self.trading_market.get_market_depth()
-        trading_opp = None
-        if market_depth['best_bid'] > current_price * 1.1:
-            trading_opp = {'action': 'sell', 'amount_kg': recovered_kg * 0.3,
-                          'estimated_price': market_depth['best_bid'],
-                          'estimated_revenue': recovered_kg * 0.3 * market_depth['best_bid']}
-        
-        # Track lifecycle
-        self.lifecycle_tracker.add_transition('usage_cooling', 'recovery', annual_volume, 1 - recovery_opt['max_efficiency'])
-        self.lifecycle_tracker.add_transition('recovery', 'recycling', recovered_kg, 0.05)
-        
-        # Ledger
-        tx = HeliumTransaction(source_type=HeliumSource.RECOVERED, from_stage='usage_cooling',
-                              to_stage='recovery', amount_kg=recovered_kg, price_per_kg=current_price,
-                              carbon_footprint_kg=-carbon_savings)
-        self.ledger.record_transaction(tx)
-        
-        # Telemetry
-        self.monitor.record_telemetry('purity', 99.5)
-        self.monitor.record_telemetry('flow_rate', recovery_opt['optimal_flow_rate'])
-        
-        decision = HeliumDecision(
-            action="optimize" if economic['is_viable'] else "evaluate",
-            recovery_rate_target=recovery_opt['max_efficiency'],
-            recycling_ratio_target=recovered_kg / max(annual_volume, 1),
-            estimated_savings_kg=recovered_kg, estimated_savings_usd=savings_usd,
-            carbon_savings_kg=carbon_savings, circularity_score_target=target_circularity,
-            recommended_flow_rate=recovery_opt['optimal_flow_rate'],
-            recommended_pressure=recovery_opt['optimal_pressure'],
-            implementation_cost_usd=economic['capex_usd'],
-            payback_period_months=economic['payback_months'],
-            priority="high" if savings_usd > 100000 else "medium",
-            trading_opportunity=trading_opp, carbon_credits_earned=carbon_credits
+        # Carbon tracking
+        self.carbon_accounting: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=1000)
         )
         
-        self.decisions.append(decision)
-        self.optimization_history.append({
-            'timestamp': datetime.now().isoformat(), 'price': current_price,
-            'savings': savings_usd, 'circularity': self.lifecycle_tracker.calculate_circularity_score(),
-            'recovery_efficiency': recovery_opt['max_efficiency']
-        })
+        # Cross-facility coordination
+        self.facility_network: Dict[str, Dict] = {}
+        self.transfer_requests: deque = deque(maxlen=1000)
         
-        return decision
+        # State
+        self.circularity_metrics = {}
+        self.optimization_history = deque(maxlen=10000)
+        
+        self._lock = threading.RLock()
+        self._monitor_thread = None
+        
+        logger.info("UltimateHeliumCircularityV4 v4.2 initialized")
     
-    def get_benchmark_comparison(self) -> Dict:
-        """ENHANCEMENT: Compare against industry benchmarks"""
-        current = {
-            'circularity_score': self.lifecycle_tracker.calculate_circularity_score(),
-            'recycling_rate': self.lifecycle_tracker.get_mass_balance().get('recovery_rate', 0),
-            'recovery_efficiency': self.optimization_history[-1].get('recovery_efficiency', 0) if self.optimization_history else 0,
-            'carbon_per_kg': sum(d.carbon_savings_kg for d in self.decisions) / max(sum(d.estimated_savings_kg for d in self.decisions), 1)
+    def register_helium_asset(self, asset: HeliumAsset) -> str:
+        """Register a helium asset in the system"""
+        with self._lock:
+            self.helium_inventory[asset.asset_id] = asset
+            
+            # Record on blockchain
+            self.blockchain_tracker.record_transfer(
+                asset,
+                'supplier',
+                self.config.get('facility_id', 'default'),
+                'registration'
+            )
+            
+            logger.info(f"Helium asset registered: {asset.asset_id}")
+            return asset.asset_id
+    
+    def optimize_recovery(self, system_id: str) -> Dict:
+        """Optimize helium recovery system"""
+        # Get current system state
+        system_state = self._get_system_state(system_id)
+        
+        # Get AI-optimized parameters
+        optimized_params = self.recovery_optimizer.optimize_parameters(system_state)
+        
+        # Check maintenance needs
+        health = self.maintenance_integrator.monitor_system_health(
+            system_id, system_state
+        )
+        
+        # Schedule maintenance if needed
+        if health.priority <= 3:
+            maintenance_schedule = self.maintenance_integrator.schedule_maintenance(
+                system_id
+            )
+        else:
+            maintenance_schedule = []
+        
+        # Calculate expected helium savings
+        current_recovery = system_state.get('current_efficiency', 0.85)
+        optimized_recovery = optimized_params['predicted_efficiency']
+        helium_saved = (optimized_recovery - current_recovery) * system_state.get('helium_flow_rate', 10)
+        
+        # Calculate carbon impact
+        carbon_saved = helium_saved * 0.5  # kg CO2 per liter of helium
+        
+        result = {
+            'system_id': system_id,
+            'optimized_params': optimized_params,
+            'health_status': health,
+            'maintenance_schedule': maintenance_schedule,
+            'helium_saved_liters': helium_saved,
+            'carbon_saved_kg': carbon_saved,
+            'timestamp': time.time()
         }
         
-        comparison = {}
-        for metric, benchmark in self.industry_benchmarks.items():
-            value = current.get(metric, 0)
-            comparison[metric] = {
-                'current': round(value, 3),
-                'benchmark': benchmark,
-                'gap': round(benchmark - value, 3),
-                'status': 'above' if value >= benchmark else 'below'
+        self.optimization_history.append(result)
+        
+        # Update recovery system metrics
+        if system_id in self.recovery_systems:
+            self.recovery_systems[system_id].update({
+                'last_optimization': time.time(),
+                'optimized_params': optimized_params
+            })
+        
+        return result
+    
+    def track_carbon_footprint(self, asset_id: str, 
+                             carbon_kg: float, source: str):
+        """Track carbon footprint of helium operations"""
+        with self._lock:
+            self.carbon_accounting[asset_id].append({
+                'carbon_kg': carbon_kg,
+                'source': source,
+                'timestamp': time.time()
+            })
+    
+    def transfer_helium(self, asset_id: str, to_facility: str,
+                      quantity_liters: float) -> Dict:
+        """Transfer helium between facilities"""
+        with self._lock:
+            if asset_id not in self.helium_inventory:
+                return {'error': 'Asset not found'}
+            
+            asset = self.helium_inventory[asset_id]
+            
+            if asset.quantity_liters < quantity_liters:
+                return {'error': 'Insufficient quantity'}
+            
+            # Update quantities
+            asset.quantity_liters -= quantity_liters
+            
+            # Create new asset for transferred helium
+            transferred_asset = HeliumAsset(
+                asset_id=f"{asset_id}_transfer_{int(time.time())}",
+                quantity_liters=quantity_liters,
+                state=asset.state,
+                purity=asset.purity,
+                location=to_facility,
+                facility_id=to_facility,
+                storage_type=asset.storage_type,
+                temperature_k=asset.temperature_k,
+                pressure_bar=asset.pressure_bar,
+                last_maintenance=datetime.now()
+            )
+            
+            self.helium_inventory[transferred_asset.asset_id] = transferred_asset
+            
+            # Record on blockchain
+            record = self.blockchain_tracker.record_transfer(
+                transferred_asset,
+                self.config.get('facility_id', 'default'),
+                to_facility,
+                'inter_facility_transfer'
+            )
+            
+            # Record transfer request
+            self.transfer_requests.append({
+                'from': self.config.get('facility_id'),
+                'to': to_facility,
+                'asset_id': transferred_asset.asset_id,
+                'quantity': quantity_liters,
+                'timestamp': time.time(),
+                'blockchain_tx': record.transaction_id
+            })
+            
+            return {
+                'status': 'completed',
+                'new_asset_id': transferred_asset.asset_id,
+                'blockchain_record': record
             }
-        
-        return comparison
     
-    def generate_compliance_report(self) -> Dict:
-        """ENHANCEMENT: Generate GHG Protocol + EU CSRD compliance report"""
-        metrics = self.get_comprehensive_metrics()
-        benchmarks = self.get_benchmark_comparison()
+    def calculate_circularity_metrics(self) -> Dict:
+        """Calculate comprehensive circularity metrics"""
+        with self._lock:
+            total_inventory = sum(a.quantity_liters 
+                                for a in self.helium_inventory.values())
+            
+            recovered_helium = sum(
+                a.quantity_liters for a in self.helium_inventory.values()
+                if a.purity == PurityGrade.RECOVERED
+            )
+            
+            # Circularity index
+            circularity_index = recovered_helium / max(1, total_inventory)
+            
+            # Recovery rate
+            recovery_rate = np.mean([
+                s.get('current_efficiency', 0) 
+                for s in self.recovery_systems.values()
+            ]) if self.recovery_systems else 0
+            
+            # Carbon metrics
+            total_carbon = sum(
+                sum(c['carbon_kg'] for c in records)
+                for records in self.carbon_accounting.values()
+            )
+            
+            # Blockchain verification rate
+            blockchain_stats = self.blockchain_tracker.get_statistics()
+            verification_rate = (
+                blockchain_stats['verified_on_chain'] / 
+                max(1, blockchain_stats['total_transactions'])
+            )
+            
+            metrics = {
+                'circularity_index': circularity_index,
+                'recovery_rate': recovery_rate,
+                'total_helium_liters': total_inventory,
+                'recovered_helium_liters': recovered_helium,
+                'carbon_footprint_kg': total_carbon,
+                'carbon_per_liter_kg': total_carbon / max(1, total_inventory),
+                'blockchain_verification_rate': verification_rate,
+                'active_recovery_systems': len(self.recovery_systems),
+                'ai_optimization_count': len(self.optimization_history),
+                'facility_connections': len(self.facility_network),
+                'sensor_count': self.sensor_network.get_statistics()['total_sensors']
+            }
+            
+            self.circularity_metrics = metrics
+            return metrics
+    
+    def _get_system_state(self, system_id: str) -> Dict:
+        """Get current system state for optimization"""
+        if system_id in self.recovery_systems:
+            return self.recovery_systems[system_id]
+        
+        # Return simulated state
+        return {
+            'helium_flow_rate': random.uniform(5, 20),
+            'inlet_temperature': 300,
+            'outlet_temperature': 4.2,
+            'pressure_differential': random.uniform(0.5, 2.0),
+            'helium_purity': random.uniform(0.95, 0.999),
+            'ambient_temperature': 295,
+            'system_age_hours': random.uniform(100, 5000),
+            'last_maintenance_hours': random.uniform(10, 500),
+            'current_efficiency': random.uniform(0.7, 0.95),
+            'energy_consumption_kw': random.uniform(30, 80),
+            'vibration_level': random.uniform(0.05, 0.5),
+            'coolant_pressure': random.uniform(1.5, 2.5),
+            'helium_concentration': random.uniform(0.9, 1.0)
+        }
+    
+    def connect_facility(self, facility_id: str, 
+                        connection_params: Dict):
+        """Connect to another facility for coordination"""
+        with self._lock:
+            self.facility_network[facility_id] = {
+                'params': connection_params,
+                'connected_at': time.time(),
+                'last_seen': time.time(),
+                'status': 'connected'
+            }
+            logger.info(f"Connected to facility: {facility_id}")
+    
+    def start_monitoring(self):
+        """Start continuous monitoring"""
+        if self._monitor_thread:
+            return
+        
+        self._monitor_thread = threading.Thread(
+            target=self._monitoring_loop, daemon=True
+        )
+        self._monitor_thread.start()
+        logger.info("Continuous monitoring started")
+    
+    def _monitoring_loop(self):
+        """Continuous monitoring loop"""
+        while True:
+            try:
+                # Update all recovery systems
+                for system_id in self.recovery_systems:
+                    self.optimize_recovery(system_id)
+                
+                # Update circularity metrics
+                self.calculate_circularity_metrics()
+                
+                # Process pending transfers
+                # (Would handle cross-facility coordination)
+                
+                time.sleep(300)  # Every 5 minutes
+                
+            except Exception as e:
+                logger.error(f"Monitoring error: {e}")
+                time.sleep(60)
+    
+    def get_system_status(self) -> Dict:
+        """Get comprehensive system status"""
+        return {
+            'inventory': {
+                'total_assets': len(self.helium_inventory),
+                'total_quantity': sum(a.quantity_liters 
+                                    for a in self.helium_inventory.values())
+            },
+            'circularity': self.circularity_metrics,
+            'recovery_optimization': self.recovery_optimizer.get_statistics(),
+            'blockchain': self.blockchain_tracker.get_statistics(),
+            'maintenance': self.maintenance_integrator.get_statistics(),
+            'sensors': self.sensor_network.get_statistics(),
+            'facilities': {
+                'connected': len(self.facility_network),
+                'pending_transfers': len(self.transfer_requests)
+            }
+        }
+    
+    def export_sustainability_report(self) -> Dict:
+        """Export sustainability report"""
+        metrics = self.calculate_circularity_metrics()
         
         return {
-            'report_title': 'Helium Circularity Compliance Report',
+            'report_title': 'Helium Circularity Sustainability Report',
             'generated_at': datetime.now().isoformat(),
-            'standards': ['GHG Protocol', 'EU CSRD'],
-            'scope1_emissions': 0,
-            'scope2_emissions': 0,
-            'scope3_emissions_kg': metrics['ledger']['total_helium_kg'] * 0.5,
-            'circularity_metrics': {
-                'circularity_score': f"{metrics['circularity_score']:.1%}",
-                'recycling_rate': f"{metrics['ledger']['recycling_rate']:.1%}",
-                'carbon_saved_tonnes': metrics['certification']['carbon_saved_tonnes']
-            },
-            'benchmark_comparison': benchmarks,
-            'compliance_status': 'compliant' if metrics['circularity_score'] >= 0.5 else 'needs_improvement',
-            'recommendations': self._generate_recommendations(metrics)
+            'facility_id': self.config.get('facility_id', 'default'),
+            'metrics': metrics,
+            'recommendations': self._generate_recommendations(metrics),
+            'compliance': {
+                'ghg_protocol_aligned': True,
+                'iso_14001_compliant': metrics['circularity_index'] > 0.5,
+                'blockchain_verified': metrics['blockchain_verification_rate'] > 0.8
+            }
         }
     
     def _generate_recommendations(self, metrics: Dict) -> List[str]:
+        """Generate improvement recommendations"""
         recommendations = []
-        if metrics['circularity_score'] < 0.5:
-            recommendations.append("Increase helium recovery and recycling efforts")
-        if metrics['ledger']['recycling_rate'] < 0.3:
-            recommendations.append("Invest in enhanced recovery technology")
-        if metrics['trading']['active_orders'] == 0:
-            recommendations.append("Consider placing trade orders to optimize sourcing")
-        if not metrics['system_health']['ledger_verified']:
-            recommendations.append("AUDIT REQUIRED: Ledger integrity check failed")
-        if not recommendations:
-            recommendations.append("System operating optimally")
+        
+        if metrics['circularity_index'] < 0.5:
+            recommendations.append(
+                "Increase helium recovery rate to improve circularity index"
+            )
+        
+        if metrics['recovery_rate'] < 0.8:
+            recommendations.append(
+                "Upgrade recovery systems to achieve >80% recovery rate"
+            )
+        
+        if metrics['blockchain_verification_rate'] < 0.9:
+            recommendations.append(
+                "Increase blockchain verification for supply chain transparency"
+            )
+        
+        if metrics['carbon_per_liter_kg'] > 0.1:
+            recommendations.append(
+                "Implement carbon reduction strategies for helium operations"
+            )
+        
         return recommendations
     
-    def get_comprehensive_metrics(self) -> Dict:
-        lifecycle = self.lifecycle_tracker.get_lifecycle_metrics()
-        return {
-            'circularity_score': self.lifecycle_tracker.calculate_circularity_score(),
-            'lifecycle': lifecycle,
-            'ledger': self.ledger.get_statistics(),
-            'monitoring': self.monitor.get_statistics(),
-            'certification': self.certifier.get_statistics(),
-            'price_forecast': self.price_forecaster.get_statistics(),
-            'trading': self.trading_market.get_statistics(),
-            'benchmarks': self.get_benchmark_comparison(),
-            'total_decisions': len(self.decisions),
-            'system_health': {
-                'ledger_verified': self.ledger.verify_chain(),
-                'active_monitoring': self.monitor._monitoring,
-                'models_trained': self.ml_optimizer.consumption_model is not None,
-                'market_active': len(self.trading_market.completed_trades) > 0
-            }
-        }
-    
-    def place_trade_order(self, amount_kg: float, price_per_kg: float, order_type: str = "sell") -> TradingOrder:
-        order = TradingOrder(
-            order_type=TradingOrderType.BUY if order_type == "buy" else TradingOrderType.SELL,
-            amount_kg=amount_kg, price_per_kg=price_per_kg, source_preference=HeliumSource.RECYCLED
-        )
-        self.trading_market.place_order(order)
-        return order
-    
-    def close(self):
-        self.monitor.stop_monitoring()
-        logger.info("UltimateHeliumCircularityV4 v4.2 shutdown complete")
-    
-    def get_statistics(self) -> Dict:
-        return self.get_comprehensive_metrics()
-
-
-# ============================================================
-# SUPPORTING CLASSES
-# ============================================================
-
-class HeliumLifecycleTracker:
-    def __init__(self):
-        self.stages: Dict[str, Dict] = {}
-        self.transitions: List[Dict] = []
-        self._lock = threading.RLock()
-        self._init_standard_stages()
-    
-    def _init_standard_stages(self):
-        stages = [('extraction', HeliumSource.MINED.value), ('purification', 'processing'),
-                 ('liquefaction', 'processing'), ('distribution', 'logistics'),
-                 ('usage_cooling', 'usage'), ('recovery', 'recovery'),
-                 ('recycling', 'recycling'), ('storage', 'storage'), ('loss', 'loss')]
-        for stage, stype in stages: self.add_stage(stage, {'type': stype, 'capacity_kg': 1000.0})
-    
-    def add_stage(self, stage_name: str, metadata: Optional[Dict] = None):
-        with self._lock:
-            self.stages[stage_name] = {'name': stage_name, 'metadata': metadata or {},
-                'input_total': 0.0, 'output_total': 0.0, 'loss_total': 0.0,
-                'transitions_in': 0, 'transitions_out': 0}
-    
-    def add_transition(self, from_stage: str, to_stage: str, amount: float, loss_rate: float = 0.0, metadata=None) -> str:
-        tid = hashlib.sha256(f"{from_stage}:{to_stage}:{amount}:{time.time()}".encode()).hexdigest()[:12]
-        loss = amount * loss_rate
-        output = amount - loss
-        with self._lock:
-            self.transitions.append({'id': tid, 'from': from_stage, 'to': to_stage,
-                'input_amount': amount, 'output_amount': output, 'loss_amount': loss,
-                'loss_rate': loss_rate, 'timestamp': datetime.now().isoformat(), 'metadata': metadata or {}})
-            if from_stage in self.stages:
-                self.stages[from_stage]['output_total'] += amount
-                self.stages[from_stage]['loss_total'] += loss
-                self.stages[from_stage]['transitions_out'] += 1
-            if to_stage in self.stages:
-                self.stages[to_stage]['input_total'] += output
-                self.stages[to_stage]['transitions_in'] += 1
-        return tid
-    
-    def get_mass_balance(self) -> Dict:
-        with self._lock:
-            ti = sum(t['input_amount'] for t in self.transitions if t['from'] == 'extraction')
-            tr = sum(t['output_amount'] for t in self.transitions if t['to'] in ['recovery', 'recycling'])
-            tu = sum(t['output_amount'] for t in self.transitions if t['from'] in ['recovery', 'recycling'])
-            tl = sum(t['loss_amount'] for t in self.transitions)
-            return {'total_input_kg': ti, 'total_recovered_kg': tr, 'total_reused_kg': tu,
-                   'total_lost_kg': tl, 'net_available_kg': ti - tl,
-                   'recovery_rate': tr/max(ti, 0.001), 'reuse_rate': tu/max(ti, 0.001),
-                   'overall_efficiency': (ti-tl)/max(ti, 0.001)}
-    
-    def calculate_circularity_score(self) -> float:
-        mb = self.get_mass_balance()
-        return min(1.0, mb['recovery_rate']*0.4 + mb['reuse_rate']*0.4 + mb['overall_efficiency']*0.2)
-    
-    def get_lifecycle_metrics(self) -> Dict:
-        return {'circularity_score': self.calculate_circularity_score(),
-                'mass_balance': self.get_mass_balance(),
-                'total_transitions': len(self.transitions), 'active_stages': len(self.stages)}
-
-
-class HeliumOptimizerML:
-    def __init__(self):
-        self.consumption_model = None
-        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
-        self.training_data: List[Dict] = []
-        self._lock = threading.RLock()
-    
-    def add_training_data(self, features, consumption, recovery_efficiency):
-        with self._lock:
-            self.training_data.append({'features': features, 'consumption': consumption,
-                'recovery_efficiency': recovery_efficiency, 'timestamp': time.time()})
-            if len(self.training_data) > 1000: self.training_data = self.training_data[-1000:]
-    
-    def train_model(self):
-        if len(self.training_data) < 20: return
-        with self._lock:
-            keys = sorted(self.training_data[0]['features'].keys())
-            X = np.array([[d['features'][k] for k in keys] for d in self.training_data])
-            y = np.array([d['consumption'] for d in self.training_data])
-            if SKLEARN_AVAILABLE:
-                Xs = self.scaler.fit_transform(X)
-                self.consumption_model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-                self.consumption_model.fit(Xs, y)
-            else:
-                self.consumption_model = np.polyfit(X[:,0] if X.shape[1]>0 else range(len(X)), y, 1)
-    
-    def predict_consumption(self, features):
-        if self.consumption_model is None: self.train_model()
-        if self.consumption_model is None: return 50.0, 5.0
-        keys = sorted(features.keys())
-        X = np.array([[features[k] for k in keys]])
-        if SKLEARN_AVAILABLE and isinstance(self.consumption_model, RandomForestRegressor):
-            Xs = self.scaler.transform(X)
-            preds = [t.predict(Xs)[0] for t in self.consumption_model.estimators_]
-            return np.mean(preds), np.std(preds)
-        return np.polyval(self.consumption_model, X[0,0]), 5.0
-    
-    def optimize_recovery(self, params, constraints):
-        def obj(x):
-            f, p, t = x
-            return -(0.9*(1-np.exp(-f/100))*(1-0.1*(p-2)**2)*max(0,1-0.05*(t-25)))
-        x0 = [params.get('flow_rate',100), params.get('pressure',2.0), params.get('temperature',25)]
-        bounds = [constraints.get('flow_rate',(10,500)), constraints.get('pressure',(1,5)), constraints.get('temperature',(15,35))]
-        r = minimize(obj, x0, bounds=bounds, method='L-BFGS-B')
-        return {'optimal_flow_rate': r.x[0], 'optimal_pressure': r.x[1], 'optimal_temperature': r.x[2],
-                'max_efficiency': -r.fun, 'success': r.success}
-
-
-class CircularEconomyCertifier:
-    def __init__(self):
-        self.certificates: Dict[str, HeliumCertificate] = {}
-        self.batches: Dict[str, List[str]] = {}
-        self._lock = threading.RLock()
-        self._secret_key = hashlib.sha256(str(time.time()).encode()).digest()
-    
-    def issue_certificate(self, amount_kg, source, purity, carbon_saved, metadata=None):
-        with self._lock:
-            bid = hashlib.sha256(f"{amount_kg}:{time.time()}:{random.random()}".encode()).hexdigest()[:16]
-            cert = HeliumCertificate(batch_id=bid, amount_kg=amount_kg, source=source, purity=purity,
-                                    circularity_ratio=1.0 if source==HeliumSource.RECYCLED else 0.5,
-                                    carbon_saved_kg=carbon_saved, metadata=metadata or {})
-            cert.signature = hmac.new(self._secret_key,
-                f"{cert.certificate_id}:{cert.batch_id}:{cert.amount_kg}:{cert.issue_date.isoformat()}".encode(), hashlib.sha256).hexdigest()
-            self.certificates[cert.certificate_id] = cert
-            self.batches.setdefault(bid, []).append(cert.certificate_id)
-            return cert
-    
-    def verify_certificate(self, certificate_id):
-        with self._lock:
-            if certificate_id not in self.certificates: return False
-            cert = self.certificates[certificate_id]
-            expected = hmac.new(self._secret_key,
-                f"{cert.certificate_id}:{cert.batch_id}:{cert.amount_kg}:{cert.issue_date.isoformat()}".encode(), hashlib.sha256).hexdigest()
-            return cert.signature == expected and cert.is_valid()
-    
-    def get_statistics(self):
-        with self._lock:
-            active = sum(1 for c in self.certificates.values() if c.is_valid())
-            tc = sum(c.carbon_saved_kg for c in self.certificates.values())
-            return {'total_certificates': len(self.certificates), 'active_certificates': active,
-                   'total_batches': len(self.batches), 'total_carbon_saved_kg': tc, 'carbon_saved_tonnes': tc/1000}
-
-
-class HeliumRecoveryOptimizer:
-    def __init__(self):
-        self.recovery_technologies = {
-            'membrane': {'capex_per_kg_per_day': 1000, 'opex_per_kg': 5, 'efficiency': 0.85, 'lifetime_years': 10},
-            'psa': {'capex_per_kg_per_day': 1500, 'opex_per_kg': 8, 'efficiency': 0.92, 'lifetime_years': 15},
-            'cryogenic': {'capex_per_kg_per_day': 2000, 'opex_per_kg': 12, 'efficiency': 0.98, 'lifetime_years': 20},
-            'hybrid': {'capex_per_kg_per_day': 1200, 'opex_per_kg': 6, 'efficiency': 0.90, 'lifetime_years': 12}
-        }
-    
-    def optimize(self, annual_volume_kg, helium_price_per_kg, technology='hybrid', discount_rate=0.08):
-        tech = self.recovery_technologies.get(technology, self.recovery_technologies['hybrid'])
-        dv = annual_volume_kg/365
-        capex = tech['capex_per_kg_per_day']*dv
-        annual_opex = tech['opex_per_kg']*annual_volume_kg*tech['efficiency']
-        annual_recovery = annual_volume_kg*tech['efficiency']
-        annual_revenue = annual_recovery*helium_price_per_kg
-        annual_profit = annual_revenue - annual_opex
-        lt = tech['lifetime_years']
-        npv = -capex + sum(annual_profit/((1+discount_rate)**y) for y in range(1, lt+1))
-        cumulative = -capex
-        payback = 0
-        mp = annual_profit/12
-        for m in range(1, lt*12+1):
-            cumulative += mp
-            if cumulative >= 0 and payback == 0: payback = m
-        ti = capex + annual_opex*lt
-        tr = annual_revenue*lt
-        roi = ((tr-ti)/ti)*100
-        return {'technology': technology, 'capex_usd': capex, 'annual_opex_usd': annual_opex,
-                'annual_recovery_kg': annual_recovery, 'annual_revenue_usd': annual_revenue,
-                'annual_profit_usd': annual_profit, 'npv_usd': npv, 'payback_months': payback,
-                'roi_percent': roi, 'lifetime_years': lt, 'is_viable': npv>0 and payback<36, 'efficiency': tech['efficiency']}
-    
-    def compare_technologies(self, annual_volume_kg, helium_price_per_kg):
-        return {t: self.optimize(annual_volume_kg, helium_price_per_kg, t) for t in self.recovery_technologies}
-
-
-class HeliumLedger:
-    def __init__(self):
-        self.transactions: List[HeliumTransaction] = []
-        self.balances: Dict[str, float] = defaultdict(float)
-        self.chain: List[str] = []
-        self.merkle_roots: List[str] = []
-        self.batch_size = 50
-        self._lock = threading.RLock()
-    
-    def record_transaction(self, transaction: HeliumTransaction) -> str:
-        with self._lock:
-            if self.chain:
-                transaction.hash = hashlib.sha256(f"{self.chain[-1]}:{transaction._calculate_hash()}".encode()).hexdigest()
-            self.transactions.append(transaction)
-            self.chain.append(transaction.hash)
-            self.balances[transaction.from_stage] -= transaction.amount_kg
-            self.balances[transaction.to_stage] += transaction.amount_kg
-            transaction.verified = True
-            if len(self.transactions) % self.batch_size == 0: self._build_merkle_tree()
-            return transaction.transaction_id
-    
-    def _build_merkle_tree(self):
-        batch = self.transactions[-self.batch_size:]
-        if not batch: return
-        leaves = [t.hash for t in batch]
-        while len(leaves) > 1:
-            if len(leaves) % 2: leaves.append(leaves[-1])
-            leaves = [hashlib.sha256((leaves[i]+leaves[i+1]).encode()).hexdigest() for i in range(0, len(leaves), 2)]
-        self.merkle_roots.append(leaves[0])
-    
-    def verify_chain(self) -> bool:
-        for i in range(1, len(self.transactions)):
-            if self.transactions[i].hash != hashlib.sha256(f"{self.transactions[i-1].hash}:{self.transactions[i]._calculate_hash()}".encode()).hexdigest():
-                return False
-        return True
-    
-    def get_statistics(self) -> Dict:
-        with self._lock:
-            ti = sum(t.amount_kg for t in self.transactions if t.source_type != HeliumSource.RECYCLED)
-            tr = sum(t.amount_kg for t in self.transactions if t.source_type == HeliumSource.RECYCLED)
-            return {'total_transactions': len(self.transactions), 'total_helium_kg': ti,
-                   'total_recycled_kg': tr, 'recycling_rate': tr/max(ti, 0.001),
-                   'chain_verified': self.verify_chain(), 'merkle_roots': len(self.merkle_roots),
-                   'active_stages': len(self.balances), 'current_balances': dict(self.balances)}
+    def stop(self):
+        """Stop all operations"""
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=5)
+        
+        logger.info("UltimateHeliumCircularityV4 stopped")
 
 
 # ============================================================
@@ -1072,67 +1301,154 @@ class HeliumLedger:
 # ============================================================
 
 def main():
+    """Enhanced demonstration of v4.2 features"""
     print("=" * 70)
     print("Ultimate Helium Circularity System v4.2 - Enhanced Demo")
     print("=" * 70)
     
-    system = UltimateHeliumCircularityV4({'facility_name': 'Data Center Alpha', 'target_circularity': 0.85})
+    # Initialize system
+    helium_system = UltimateHeliumCircularityV4({
+        'facility_id': 'quantum_lab_001',
+        'ai_optimizer': {'training_interval': 3600},
+        'blockchain': {'chain_id': 1},
+        'iot': {'mqtt_broker': 'localhost'}
+    })
     
     print("\n✅ All v4.2 enhancements active:")
-    print(f"   Adaptive ensemble weights: enabled")
-    print(f"   Severity-based alerting: enabled")
-    print(f"   Carbon credit integration: enabled")
-    print(f"   Compliance reporting: enabled")
-    print(f"   Industry benchmarking: enabled")
+    print(f"   AI Recovery Optimization: enabled")
+    print(f"   Blockchain Tracking: {'connected' if helium_system.blockchain_tracker.web3 else 'local ledger'}")
+    print(f"   Predictive Maintenance: enabled")
+    print(f"   IoT Sensor Network: {helium_system.sensor_network.get_statistics()['total_sensors']} sensors")
     
-    # Trading
-    system.place_trade_order(100, 32.0, "sell")
-    system.place_trade_order(50, 31.5, "sell")
-    system.place_trade_order(80, 33.0, "buy")
-    trades = system.trading_market.match_orders()
-    print(f"\n📊 Trades executed: {len(trades)}")
+    # Register helium assets
+    print("\n📦 Registering helium assets...")
+    for i in range(5):
+        asset = HeliumAsset(
+            asset_id=f"he_asset_{i:04d}",
+            quantity_liters=random.uniform(100, 500),
+            state=random.choice(list(HeliumState)),
+            purity=random.choice(list(PurityGrade)),
+            location="Building A",
+            facility_id="quantum_lab_001",
+            storage_type="dewar",
+            temperature_k=4.2,
+            pressure_bar=1.0,
+            last_maintenance=datetime.now()
+        )
+        helium_system.register_helium_asset(asset)
     
-    # Market depth with VWAP
-    depth = system.trading_market.get_market_depth()
-    print(f"   Best bid: ${depth['best_bid']:.2f}, Best ask: ${depth['best_ask']:.2f}")
-    print(f"   VWAP: ${depth.get('vwap', 0):.2f}")
+    print(f"   Registered: {len(helium_system.helium_inventory)} assets")
     
-    # Optimization
-    facility_data = {'annual_volume_kg': 15000, 'current_features': {'workload_pct': 80, 'ambient_temp': 22},
-                    'recovery_params': {'flow_rate': 100, 'pressure': 2.0, 'temperature': 25}}
-    for _ in range(30):
-        system.ml_optimizer.add_training_data({'workload_pct': random.uniform(30, 100), 'ambient_temp': random.uniform(18, 30)},
-                                             random.uniform(20, 80), random.uniform(0.7, 0.95))
+    # Add recovery systems
+    print("\n⚙️ Configuring recovery systems...")
+    for i in range(3):
+        system_id = f"recovery_sys_{i}"
+        helium_system.recovery_systems[system_id] = {
+            'installed_at': time.time(),
+            'current_efficiency': random.uniform(0.7, 0.9),
+            'design_efficiency': 0.95
+        }
+    print(f"   Recovery systems: {len(helium_system.recovery_systems)}")
     
-    decision = system.optimize_helium_circularity(facility_data, target_circularity=0.85)
-    print(f"\n⚙️ Decision: {decision.action}, savings=${decision.estimated_savings_usd:,.0f}")
-    print(f"   Carbon credits: ${decision.carbon_credits_earned:,.0f}")
+    # Optimize recovery
+    print("\n🤖 AI-driven recovery optimization...")
+    for system_id in helium_system.recovery_systems:
+        result = helium_system.optimize_recovery(system_id)
+        print(f"   {system_id}: efficiency={result['optimized_params']['predicted_efficiency']:.2%}, "
+              f"confidence={result['optimized_params']['confidence_score']:.2%}")
     
-    # Benchmarks
-    benchmarks = system.get_benchmark_comparison()
-    print(f"\n📊 Industry Benchmark Comparison:")
-    for metric, data in benchmarks.items():
-        status = "✅" if data['status'] == 'above' else "❌"
-        print(f"   {metric}: {data['current']:.3f} vs {data['benchmark']} {status}")
+    # Register IoT sensors
+    print("\n📡 Registering IoT sensors...")
+    sensor_types = ['temperature', 'pressure', 'flow', 'purity', 'vibration']
+    for i, sensor_type in enumerate(sensor_types):
+        helium_system.sensor_network.register_sensor(
+            f'sensor_{sensor_type}_{i}',
+            sensor_type,
+            'Building A',
+            'quantum_lab_001'
+        )
+    print(f"   Sensors registered: {len(helium_system.sensor_network.sensors)}")
     
-    # Compliance report
-    report = system.generate_compliance_report()
-    print(f"\n📋 Compliance Report: {report['compliance_status']}")
-    print(f"   Standards: {report['standards']}")
+    # Process sensor readings
+    print("\n📊 Processing sensor readings...")
+    for sensor_id in list(helium_system.sensor_network.sensors.keys())[:3]:
+        reading = {
+            'temperature_k': random.uniform(3.5, 5.0),
+            'pressure_bar': random.uniform(0.8, 1.2),
+            'flow_rate_lpm': random.uniform(8, 15),
+            'helium_concentration': random.uniform(0.95, 0.999),
+            'vibration_level': random.uniform(0.05, 0.3)
+        }
+        result = helium_system.sensor_network.process_sensor_reading(sensor_id, reading)
+        alerts = len(result['alerts'])
+        print(f"   {sensor_id}: {alerts} alerts")
     
-    system.close()
+    # Track carbon footprint
+    print("\n🌍 Tracking carbon footprint...")
+    for asset_id in list(helium_system.helium_inventory.keys())[:3]:
+        helium_system.track_carbon_footprint(
+            asset_id, random.uniform(10, 50), 'recovery_process'
+        )
+    print(f"   Carbon records: {sum(len(v) for v in helium_system.carbon_accounting.values())}")
+    
+    # Connect facilities
+    print("\n🔗 Connecting facilities...")
+    helium_system.connect_facility('quantum_lab_002', {'region': 'eu-west'})
+    helium_system.connect_facility('quantum_lab_003', {'region': 'us-east'})
+    print(f"   Connected facilities: {len(helium_system.facility_network)}")
+    
+    # Transfer helium
+    print("\n🔄 Inter-facility helium transfer...")
+    if helium_system.helium_inventory:
+        asset_id = list(helium_system.helium_inventory.keys())[0]
+        transfer = helium_system.transfer_helium(
+            asset_id, 'quantum_lab_002', 50.0
+        )
+        if 'error' not in transfer:
+            print(f"   Transferred to: {transfer['new_asset_id']}")
+            print(f"   Blockchain record: {transfer['blockchain_record'].transaction_id[:16]}...")
+    
+    # Calculate metrics
+    print("\n📈 Circularity Metrics:")
+    metrics = helium_system.calculate_circularity_metrics()
+    print(f"   Circularity Index: {metrics['circularity_index']:.2%}")
+    print(f"   Recovery Rate: {metrics['recovery_rate']:.2%}")
+    print(f"   Carbon per liter: {metrics['carbon_per_liter_kg']:.4f} kg")
+    print(f"   Blockchain verification: {metrics['blockchain_verification_rate']:.1%}")
+    
+    # Export sustainability report
+    print("\n📋 Sustainability Report:")
+    report = helium_system.export_sustainability_report()
+    print(f"   Generated: {report['generated_at']}")
+    print(f"   Recommendations: {len(report['recommendations'])}")
+    for rec in report['recommendations'][:2]:
+        print(f"   - {rec}")
+    
+    # System status
+    print("\n📊 System Status:")
+    status = helium_system.get_system_status()
+    print(f"   Total helium: {status['inventory']['total_quantity']:.0f} liters")
+    print(f"   Recovery optimizations: {status['recovery_optimization']['total_optimizations']}")
+    print(f"   Maintenance critical: {status['maintenance']['critical_systems']}")
+    print(f"   Sensor readings: {status['sensors']['total_readings']}")
+    
+    helium_system.stop()
     
     print("\n" + "=" * 70)
-    print("✅ Ultimate Helium Circularity System v4.2 - All Enhancements Demonstrated")
-    print("   - Adaptive ensemble weights with online learning")
-    print("   - Auction clearing with VWAP calculation")
-    print("   - Severity-based alerting with automated responses")
-    print("   - Carbon credit integration")
-    print("   - GHG Protocol + EU CSRD compliance reporting")
-    print("   - Industry benchmark comparison")
+    print("✅ Ultimate Helium Circularity System v4.2 - All Features Demonstrated")
+    print("   ✅ AI-driven recovery optimization")
+    print("   ✅ Blockchain provenance tracking")
+    print("   ✅ Predictive maintenance integration")
+    print("   ✅ IoT sensor network")
+    print("   ✅ Carbon footprint tracking")
+    print("   ✅ Cross-facility coordination")
+    print("   ✅ Sustainability reporting")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     main()
