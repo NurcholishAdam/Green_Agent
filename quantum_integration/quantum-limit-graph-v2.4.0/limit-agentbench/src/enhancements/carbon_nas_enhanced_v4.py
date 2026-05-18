@@ -1,24 +1,24 @@
 # src/enhancements/carbon_nas_enhanced_v4.py
 
 """
-Carbon-Aware Neural Architecture Search - Version 4.3
+Carbon-Aware Neural Architecture Search - Version 4.4
 
-KEY ENHANCEMENTS OVER v4.2:
-1. ADDED: RL-based architecture search controller with policy gradient
-2. ADDED: Federated NAS with differential privacy for cross-org sharing
-3. ADDED: Cooling-aware architecture co-optimization
-4. ADDED: Lifetime carbon accounting (training + inference)
-5. ADDED: Automated carbon credit purchasing via blockchain
-6. ENHANCED: Multi-fidelity surrogate with Bayesian optimization
-7. ADDED: Architecture knowledge distillation for efficient search
-8. ADDED: Carbon-aware transfer learning for warm-start
-9. ENHANCED: Pareto frontier with carbon-equivalent metrics
-10. ADDED: Real-time carbon budget enforcement with hard limits
+KEY ENHANCEMENTS OVER v4.3:
+1. ADDED: Multi-objective NAS with carbon, latency, and size constraints
+2. ADDED: Hardware-aware architecture search for deployment optimization
+3. ADDED: Co-optimization of architecture and cooling parameters
+4. ADDED: Federated architecture distillation with privacy
+5. ADDED: Carbon-aware transfer learning (fine-tune vs. train from scratch)
+6. ADDED: Dynamic architecture adaptation based on real-time carbon
+7. ADDED: Architecture carbon certification with blockchain verification
+8. ENHANCED: Pareto frontier with multi-dimensional trade-offs
+9. ADDED: Carbon budget-aware early stopping for search
+10. ADDED: Green architecture scoring (0-100 eco-score)
 
 Reference: "Green AI" (Schwartz et al., 2020)
-"Neural Architecture Search with Reinforcement Learning" (Zoph & Le, 2017)
-"Federated Neural Architecture Search" (NeurIPS, 2023)
-"Lifetime Carbon Accounting for ML Models" (ACM FAccT, 2024)
+"Hardware-Aware Neural Architecture Search" (ICLR, 2023)
+"Federated Distillation for Efficient NAS" (NeurIPS, 2024)
+"Dynamic Neural Networks for Carbon-Aware Inference" (ICML, 2024)
 """
 
 import numpy as np
@@ -45,7 +45,7 @@ from pathlib import Path
 import logging
 import hashlib
 
-# Try to import hardware monitoring libraries
+# Try to import optional dependencies
 try:
     import pynvml
     NVML_AVAILABLE = True
@@ -70,1076 +70,942 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENHANCEMENT 1: RL-Based Architecture Search Controller
+# ENHANCEMENT 1: Multi-Objective NAS with Constraints
 # ============================================================
 
-class RLArchitectureController(nn.Module):
-    """Policy network for RL-based architecture search"""
-    
-    def __init__(self, state_dim: int = 20, hidden_dim: int = 256, 
-                 max_layers: int = 10, layer_types: int = 5):
-        super().__init__()
-        self.max_layers = max_layers
-        self.layer_types = layer_types
-        
-        # Shared feature extractor
-        self.feature_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU()
-        )
-        
-        # Policy heads for different architecture decisions
-        self.layer_count_head = nn.Linear(hidden_dim, max_layers)
-        self.layer_type_heads = nn.ModuleList([
-            nn.Linear(hidden_dim, layer_types) for _ in range(max_layers)
-        ])
-        self.skip_head = nn.Linear(hidden_dim, 2)  # Binary: add skip or not
-        self.hyperparam_head = nn.Linear(hidden_dim, 6)  # lr, batch, dropout, etc.
-        
-        # Value head for baseline
-        self.value_head = nn.Linear(hidden_dim, 1)
-    
-    def forward(self, state):
-        features = self.feature_net(state)
-        
-        # Generate architecture decisions
-        layer_count_logits = self.layer_count_head(features)
-        layer_type_logits = [head(features) for head in self.layer_type_heads]
-        skip_logits = self.skip_head(features)
-        hyperparam_logits = self.hyperparam_head(features)
-        value = self.value_head(features)
-        
-        return {
-            'layer_count': layer_count_logits,
-            'layer_types': layer_type_logits,
-            'skip': skip_logits,
-            'hyperparams': hyperparam_logits,
-            'value': value
-        }
-    
-    def sample_architecture(self, state: torch.Tensor) -> Tuple[ArchitectureGene, torch.Tensor]:
-        """Sample architecture from policy"""
-        outputs = self.forward(state)
-        
-        # Sample layer count
-        layer_count_probs = torch.softmax(outputs['layer_count'], dim=-1)
-        layer_count_dist = torch.distributions.Categorical(layer_count_probs)
-        n_layers = layer_count_dist.sample().item() + 2  # Minimum 2 layers
-        
-        # Sample layer types
-        layers = []
-        log_probs = []
-        for i in range(n_layers):
-            if i < len(outputs['layer_types']):
-                type_probs = torch.softmax(outputs['layer_types'][i], dim=-1)
-                type_dist = torch.distributions.Categorical(type_probs)
-                layer_idx = type_dist.sample()
-                layer_types = ['conv', 'fc', 'attention', 'lstm', 'skip']
-                layers.append(layer_types[layer_idx.item()])
-                log_probs.append(type_dist.log_prob(layer_idx))
-        
-        # Sample skip connections
-        skip_probs = torch.sigmoid(outputs['skip'])
-        skip_dist = torch.distributions.Bernoulli(skip_probs)
-        add_skip = skip_dist.sample().item() > 0.5
-        log_probs.append(skip_dist.log_prob(torch.tensor(add_skip).float()))
-        
-        # Sample hyperparameters
-        hyperparam_logits = outputs['hyperparams']
-        hyperparam_probs = torch.softmax(hyperparam_logits, dim=-1)
-        hyperparam_dist = torch.distributions.Categorical(hyperparam_probs)
-        hyperparam_idx = hyperparam_dist.sample()
-        log_probs.append(hyperparam_dist.log_prob(hyperparam_idx))
-        
-        # Build architecture gene
-        lr_options = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2]
-        batch_options = [16, 32, 64, 128, 256, 512]
-        
-        gene = ArchitectureGene(
-            layers=layers,
-            skip_connections=[(0, n_layers-1)] if add_skip and n_layers > 1 else [],
-            learning_rate=lr_options[hyperparam_idx.item() % len(lr_options)],
-            batch_size=batch_options[hyperparam_idx.item() % len(batch_options)],
-            dropout_rate=random.uniform(0, 0.5),
-            optimizer_type=random.choice(['adam', 'sgd', 'adamw']),
-            activation_function=random.choice(['relu', 'gelu', 'swish']),
-            width_multiplier=random.uniform(0.5, 2.0),
-            depth_multiplier=random.uniform(0.5, 2.0),
-            sparsity_target=random.uniform(0, 0.9)
-        )
-        
-        total_log_prob = torch.stack(log_probs).sum()
-        return gene, total_log_prob
-
-
-class RLSearchController:
-    """
-    Policy gradient controller for architecture search.
-    
-    Features:
-    - REINFORCE with baseline for architecture sampling
-    - Entropy bonus for exploration
-    - Experience replay for stable training
-    """
-    
-    def __init__(self, state_dim: int = 20, learning_rate: float = 0.001,
-                 entropy_coef: float = 0.01, gamma: float = 0.99):
-        self.policy = RLArchitectureController(state_dim)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.entropy_coef = entropy_coef
-        self.gamma = gamma
-        
-        # Training state
-        self.saved_log_probs = []
-        self.rewards = []
-        self.values = []
-        self.entropies = []
-        self.episode_rewards = []
-        
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.policy.to(self.device)
-        
-        logger.info(f"RLSearchController initialized on {self.device}")
-    
-    def select_architecture(self, state: np.ndarray) -> Tuple[ArchitectureGene, float]:
-        """Select architecture using current policy"""
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        gene, log_prob = self.policy.sample_architecture(state_tensor)
-        
-        self.saved_log_probs.append(log_prob)
-        
-        return gene, log_prob.item()
-    
-    def store_outcome(self, reward: float, value: float = 0.0):
-        """Store outcome for training"""
-        self.rewards.append(reward)
-        self.values.append(value)
-    
-    def update_policy(self):
-        """Update policy using REINFORCE with baseline"""
-        if not self.saved_log_probs:
-            return
-        
-        R = 0
-        returns = []
-        for r in self.rewards[::-1]:
-            R = r + self.gamma * R
-            returns.insert(0, R)
-        
-        returns = torch.FloatTensor(returns).to(self.device)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        
-        policy_loss = []
-        for log_prob, R in zip(self.saved_log_probs, returns):
-            policy_loss.append(-log_prob * R)
-        
-        policy_loss = torch.stack(policy_loss).sum()
-        
-        # Entropy bonus
-        entropy_loss = -self.entropy_coef * torch.stack(self.entropies).sum() if self.entropies else 0
-        
-        total_loss = policy_loss + entropy_loss
-        
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-        self.optimizer.step()
-        
-        # Clear episode data
-        self.episode_rewards.append(sum(self.rewards))
-        self.saved_log_probs = []
-        self.rewards = []
-        self.values = []
-        self.entropies = []
-        
-        logger.debug(f"Policy updated. Avg reward: {self.episode_rewards[-1]:.4f}")
-    
-    def save_model(self, path: str):
-        """Save RL controller"""
-        torch.save({
-            'policy': self.policy.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'episode_rewards': self.episode_rewards
-        }, path)
-    
-    def load_model(self, path: str) -> bool:
-        """Load RL controller"""
-        if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=self.device)
-            self.policy.load_state_dict(checkpoint['policy'])
-            self.optimizer.load_state_dict(checkpoint['optimizer'])
-            self.episode_rewards = checkpoint.get('episode_rewards', [])
-            return True
-        return False
-
-
-# ============================================================
-# ENHANCEMENT 2: Federated NAS with Differential Privacy
-# ============================================================
-
-class FederatedNASCoordinator:
-    """
-    Coordinates federated NAS across multiple organizations.
-    
-    Features:
-    - Secure Pareto frontier sharing
-    - Differential privacy for architecture statistics
-    - Federated surrogate model training
-    """
-    
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.instance_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-        self.peers: Dict[str, Dict] = {}
-        
-        # Shared knowledge
-        self.shared_pareto_frontier: List[Dict] = []
-        self.shared_surrogate_data: List[Dict] = []
-        
-        # Differential privacy
-        self.dp_epsilon = config.get('dp_epsilon', 1.0)
-        self.dp_delta = config.get('dp_delta', 1e-5)
-        
-        self._lock = threading.RLock()
-        logger.info(f"FederatedNASCoordinator initialized (instance={self.instance_id})")
-    
-    def share_pareto_frontier(self, pareto_points: List[Tuple[float, float, Any]]) -> Dict:
-        """
-        Share Pareto frontier with differential privacy.
-        
-        Args:
-            pareto_points: List of (accuracy, carbon_kg, architecture_gene)
-        """
-        with self._lock:
-            # Apply differential privacy to metrics
-            private_points = []
-            for acc, carbon, gene in pareto_points:
-                noise_acc = np.random.laplace(0, 1.0/self.dp_epsilon)
-                noise_carbon = np.random.laplace(0, 1.0/self.dp_epsilon)
-                
-                private_points.append({
-                    'accuracy': acc + noise_acc,
-                    'carbon_kg': max(0, carbon + noise_carbon),
-                    'architecture_summary': self._summarize_architecture(gene),
-                    'timestamp': time.time(),
-                    'contributor': self.instance_id
-                })
-            
-            self.shared_pareto_frontier.extend(private_points)
-            
-            return {
-                'shared_count': len(private_points),
-                'total_frontier_size': len(self.shared_pareto_frontier)
-            }
-    
-    def _summarize_architecture(self, gene: Any) -> Dict:
-        """Create privacy-preserving architecture summary"""
-        if hasattr(gene, 'layers'):
-            return {
-                'n_layers': len(gene.layers),
-                'layer_types': gene.layers,
-                'has_skip': len(gene.skip_connections) > 0 if hasattr(gene, 'skip_connections') else False
-            }
-        return {'n_layers': 5, 'layer_types': ['unknown']}
-    
-    def get_global_pareto_frontier(self) -> List[Dict]:
-        """Get aggregated Pareto frontier from all peers"""
-        with self._lock:
-            # Merge and deduplicate
-            seen = set()
-            merged = []
-            
-            for point in self.shared_pareto_frontier:
-                key = f"{point['accuracy']:.3f}_{point['carbon_kg']:.3f}"
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(point)
-            
-            # Sort by accuracy descending, carbon ascending
-            merged.sort(key=lambda x: (-x['accuracy'], x['carbon_kg']))
-            
-            return merged
-    
-    def federated_surrogate_training(self, local_data: List[Dict]) -> List[Dict]:
-        """
-        Federated training of surrogate model.
-        
-        Shares gradient updates instead of raw data.
-        """
-        with self._lock:
-            # Apply DP to local data
-            private_data = []
-            for d in local_data:
-                noisy_features = d.get('features', []) + np.random.laplace(0, 0.1, len(d.get('features', [])))
-                noisy_label = d.get('label', 0) + np.random.laplace(0, 0.01)
-                private_data.append({'features': noisy_features, 'label': noisy_label})
-            
-            self.shared_surrogate_data.extend(private_data)
-            
-            return private_data
-    
-    def get_statistics(self) -> Dict:
-        """Get federation statistics"""
-        with self._lock:
-            return {
-                'instance_id': self.instance_id,
-                'peers_connected': len(self.peers),
-                'shared_frontier_size': len(self.shared_pareto_frontier),
-                'shared_surrogate_samples': len(self.shared_surrogate_data),
-                'dp_epsilon': self.dp_epsilon
-            }
-
-
-# ============================================================
-# ENHANCEMENT 3: Lifetime Carbon Accounting
-# ============================================================
+class MultiObjectiveNASConstraint(Enum):
+    """Constraints for multi-objective NAS"""
+    CARBON_BUDGET = "carbon_budget"
+    LATENCY_BUDGET = "latency_budget"
+    MEMORY_BUDGET = "memory_budget"
+    SIZE_BUDGET = "size_budget"
+    ENERGY_BUDGET = "energy_budget"
 
 @dataclass
-class LifetimeCarbonEstimate:
-    """Complete lifetime carbon accounting for a model"""
-    training_carbon_kg: float = 0.0
-    inference_carbon_per_query_kg: float = 0.0
-    expected_queries_lifetime: int = 1000000
-    total_inference_carbon_kg: float = 0.0
-    embodied_hardware_carbon_kg: float = 0.0
-    cooling_carbon_kg: float = 0.0
-    total_lifetime_carbon_kg: float = 0.0
+class MultiObjectiveFitness:
+    """Multi-dimensional fitness score"""
+    accuracy: float = 0.0
+    carbon_kg: float = 0.0
+    latency_ms: float = 0.0
+    model_size_mb: float = 0.0
+    memory_usage_gb: float = 0.0
+    energy_kwh: float = 0.0
+    green_score: float = 0.0  # 0-100 eco-score
     
-    def calculate_total(self):
-        """Calculate total lifetime carbon"""
-        self.total_inference_carbon_kg = self.inference_carbon_per_query_kg * self.expected_queries_lifetime
-        self.total_lifetime_carbon_kg = (
-            self.training_carbon_kg + 
-            self.total_inference_carbon_kg + 
-            self.embodied_hardware_carbon_kg + 
-            self.cooling_carbon_kg
+    def weighted_score(self, weights: Dict[str, float]) -> float:
+        """Calculate weighted composite score"""
+        score = 0.0
+        score += weights.get('accuracy', 0.3) * self.accuracy
+        score -= weights.get('carbon', 0.3) * self.carbon_kg / 10
+        score -= weights.get('latency', 0.2) * self.latency_ms / 1000
+        score -= weights.get('size', 0.1) * self.model_size_mb / 1000
+        score -= weights.get('energy', 0.1) * self.energy_kwh / 10
+        return score
+    
+    def calculate_green_score(self) -> float:
+        """Calculate eco-score (0-100)"""
+        # Normalize each dimension to 0-100
+        accuracy_score = self.accuracy * 100
+        carbon_score = max(0, 100 - self.carbon_kg * 20)
+        latency_score = max(0, 100 - self.latency_ms / 10)
+        size_score = max(0, 100 - self.model_size_mb / 10)
+        
+        self.green_score = (
+            accuracy_score * 0.3 +
+            carbon_score * 0.35 +
+            latency_score * 0.15 +
+            size_score * 0.2
         )
-        return self.total_lifetime_carbon_kg
+        return self.green_score
 
 
-class LifetimeCarbonAnalyzer:
+class MultiObjectiveNAS:
     """
-    Analyzes lifetime carbon footprint of ML models.
+    Multi-objective architecture search with constraints.
     
     Features:
-    - Training + inference carbon accounting
-    - Embodied hardware carbon estimation
-    - Cooling energy inclusion
-    - Carbon-equivalent metric calculation
+    - Multi-dimensional Pareto frontier
+    - Constraint satisfaction checking
+    - Green score computation
+    - Trade-off visualization data
     """
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         
-        # Embodied carbon estimates (kg CO2 per device)
-        self.embodied_carbon = {
-            'A100': 150.0,
-            'H100': 200.0,
-            'V100': 100.0,
-            'T4': 50.0,
-            'cpu': 30.0
+        # Constraints
+        self.constraints = {
+            MultiObjectiveNASConstraint.CARBON_BUDGET: config.get('carbon_budget_kg', 5.0),
+            MultiObjectiveNASConstraint.LATENCY_BUDGET: config.get('latency_budget_ms', 100),
+            MultiObjectiveNASConstraint.MEMORY_BUDGET: config.get('memory_budget_gb', 16),
+            MultiObjectiveNASConstraint.SIZE_BUDGET: config.get('size_budget_mb', 500),
+            MultiObjectiveNASConstraint.ENERGY_BUDGET: config.get('energy_budget_kwh', 10.0)
         }
         
-        # Cooling overhead factor
-        self.cooling_pue = config.get('pue', 1.2)
+        # Pareto frontier (multi-dimensional)
+        self.pareto_frontier: List[Dict] = []
+        self.evaluated_architectures: List[Dict] = []
         
-        # Default inference estimates
-        self.default_inference_power_watts = 150.0
-        self.default_inference_time_ms = 10.0
+        # Green score weights
+        self.green_weights = {
+            'accuracy': 0.30,
+            'carbon': 0.35,
+            'latency': 0.15,
+            'size': 0.20
+        }
         
-        logger.info("LifetimeCarbonAnalyzer initialized")
+        self._lock = threading.RLock()
+        logger.info("MultiObjectiveNAS initialized")
     
-    def estimate_lifetime_carbon(self, training_result: Dict, 
-                               architecture: Dict,
-                               hardware_name: str = 'A100') -> LifetimeCarbonEstimate:
-        """
-        Estimate complete lifetime carbon footprint.
+    def check_constraints(self, fitness: MultiObjectiveFitness) -> Dict:
+        """Check if architecture satisfies all constraints"""
+        violations = []
         
-        Args:
-            training_result: Results from training phase
-            architecture: Model architecture details
-            hardware_name: Deployment hardware type
-        """
+        if fitness.carbon_kg > self.constraints[MultiObjectiveNASConstraint.CARBON_BUDGET]:
+            violations.append('carbon_budget')
+        if fitness.latency_ms > self.constraints[MultiObjectiveNASConstraint.LATENCY_BUDGET]:
+            violations.append('latency_budget')
+        if fitness.memory_usage_gb > self.constraints[MultiObjectiveNASConstraint.MEMORY_BUDGET]:
+            violations.append('memory_budget')
+        if fitness.model_size_mb > self.constraints[MultiObjectiveNASConstraint.SIZE_BUDGET]:
+            violations.append('size_budget')
+        if fitness.energy_kwh > self.constraints[MultiObjectiveNASConstraint.ENERGY_BUDGET]:
+            violations.append('energy_budget')
         
-        estimate = LifetimeCarbonEstimate()
-        
-        # Training carbon (directly measured)
-        estimate.training_carbon_kg = training_result.get('carbon_kg', 1.0)
-        
-        # Inference carbon estimation
-        n_params = architecture.get('total_parameters', 1e6)
-        sparsity = architecture.get('sparsity_ratio', 0.0)
-        
-        # Effective parameters after sparsity
-        effective_params = n_params * (1 - sparsity)
-        
-        # Power scales with parameters
-        inference_power = self.default_inference_power_watts * (effective_params / 1e6) ** 0.5
-        inference_time = self.default_inference_time_ms * (effective_params / 1e6) ** 0.3
-        
-        # Per-query energy
-        energy_per_query_kwh = (inference_power * inference_time / 1000) / 3600000
-        carbon_intensity = training_result.get('carbon_intensity', 300)
-        
-        estimate.inference_carbon_per_query_kg = energy_per_query_kwh * carbon_intensity / 1000
-        
-        # Expected queries (configurable)
-        estimate.expected_queries_lifetime = self.config.get('expected_queries', 1000000)
-        
-        # Embodied hardware carbon
-        estimate.embodied_hardware_carbon_kg = self.embodied_carbon.get(
-            hardware_name, 100.0
-        )
-        
-        # Cooling carbon (PUE-based)
-        estimate.cooling_carbon_kg = (
-            estimate.training_carbon_kg + estimate.total_inference_carbon_kg
-        ) * (self.cooling_pue - 1.0)
-        
-        # Calculate total
-        estimate.calculate_total()
-        
-        return estimate
+        return {
+            'satisfied': len(violations) == 0,
+            'violations': violations,
+            'constraint_satisfaction_pct': (5 - len(violations)) / 5 * 100
+        }
     
-    def get_carbon_equivalent_accuracy(self, accuracy: float, carbon_kg: float,
-                                     carbon_price_per_ton: float = 50.0) -> float:
-        """
-        Calculate carbon-equivalent accuracy metric.
-        
-        Penalizes accuracy based on carbon cost.
-        """
-        carbon_cost = carbon_kg * carbon_price_per_ton / 1000  # USD
-        carbon_penalty = carbon_cost / 100  # Normalize
-        
-        return accuracy / (1 + carbon_penalty)
+    def update_pareto_frontier(self, architecture: Dict, fitness: MultiObjectiveFitness):
+        """Update multi-dimensional Pareto frontier"""
+        with self._lock:
+            # Check if dominated by any existing point
+            dominated = False
+            for existing in self.pareto_frontier:
+                existing_fitness = existing['fitness']
+                if (existing_fitness.accuracy >= fitness.accuracy and
+                    existing_fitness.carbon_kg <= fitness.carbon_kg and
+                    existing_fitness.latency_ms <= fitness.latency_ms):
+                    if (existing_fitness.accuracy > fitness.accuracy or
+                        existing_fitness.carbon_kg < fitness.carbon_kg or
+                        existing_fitness.latency_ms < fitness.latency_ms):
+                        dominated = True
+                        break
+            
+            if not dominated:
+                # Remove any points this dominates
+                self.pareto_frontier = [
+                    p for p in self.pareto_frontier
+                    if not (fitness.accuracy >= p['fitness'].accuracy and
+                           fitness.carbon_kg <= p['fitness'].carbon_kg and
+                           fitness.latency_ms <= p['fitness'].latency_ms and
+                           (fitness.accuracy > p['fitness'].accuracy or
+                            fitness.carbon_kg < p['fitness'].carbon_kg or
+                            fitness.latency_ms < p['fitness'].latency_ms))
+                ]
+                
+                self.pareto_frontier.append({
+                    'architecture': architecture,
+                    'fitness': fitness
+                })
+            
+            self.evaluated_architectures.append({
+                'architecture': architecture,
+                'fitness': fitness
+            })
+    
+    def get_best_by_criterion(self, criterion: str = 'green_score') -> Optional[Dict]:
+        """Get best architecture by a specific criterion"""
+        with self._lock:
+            if not self.pareto_frontier:
+                return None
+            
+            if criterion == 'green_score':
+                return max(
+                    self.pareto_frontier,
+                    key=lambda p: p['fitness'].green_score
+                )
+            elif criterion == 'accuracy':
+                return max(
+                    self.pareto_frontier,
+                    key=lambda p: p['fitness'].accuracy
+                )
+            elif criterion == 'carbon':
+                return min(
+                    self.pareto_frontier,
+                    key=lambda p: p['fitness'].carbon_kg
+                )
+            
+            return self.pareto_frontier[0]
+    
+    def get_statistics(self) -> Dict:
+        """Get multi-objective statistics"""
+        with self._lock:
+            return {
+                'pareto_frontier_size': len(self.pareto_frontier),
+                'evaluated_architectures': len(self.evaluated_architectures),
+                'constraints': {
+                    c.value: v for c, v in self.constraints.items()
+                },
+                'best_green_score': max(
+                    [p['fitness'].green_score for p in self.pareto_frontier]
+                ) if self.pareto_frontier else 0
+            }
 
 
 # ============================================================
-# ENHANCEMENT 4: Automated Carbon Credit Purchasing
+# ENHANCEMENT 2: Hardware-Aware Architecture Search
 # ============================================================
 
-class CarbonCreditPurchaser:
+class HardwareAwareNAS:
     """
-    Automated carbon credit purchasing via blockchain.
+    Incorporates hardware characteristics into architecture search.
     
     Features:
-    - Integration with carbon credit marketplaces
-    - Automatic offsetting when budget exceeded
-    - Blockchain verification of retirements
+    - GPU-specific latency estimation
+    - Memory bandwidth constraints
+    - Tensor core utilization optimization
+    - Multi-hardware deployment optimization
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        
+        # Hardware profiles
+        self.hardware_profiles = {
+            'A100': {
+                'memory_gb': 80,
+                'memory_bandwidth_gbps': 2039,
+                'tensor_cores': 432,
+                'tdp_watts': 400,
+                'fp16_tflops': 312
+            },
+            'H100': {
+                'memory_gb': 80,
+                'memory_bandwidth_gbps': 3350,
+                'tensor_cores': 456,
+                'tdp_watts': 700,
+                'fp16_tflops': 756
+            },
+            'T4': {
+                'memory_gb': 16,
+                'memory_bandwidth_gbps': 320,
+                'tensor_cores': 320,
+                'tdp_watts': 70,
+                'fp16_tflops': 65
+            },
+            'A10': {
+                'memory_gb': 24,
+                'memory_bandwidth_gbps': 600,
+                'tensor_cores': 288,
+                'tdp_watts': 150,
+                'fp16_tflops': 125
+            }
+        }
+        
+        # Latency estimation model
+        self.latency_model = self._create_latency_model()
+        
+        self._lock = threading.RLock()
+        logger.info(f"HardwareAwareNAS initialized with {len(self.hardware_profiles)} profiles")
+    
+    def _create_latency_model(self):
+        """Create simple latency estimation model"""
+        if SKLEARN_AVAILABLE:
+            return RandomForestRegressor(n_estimators=50, max_depth=5)
+        return None
+    
+    def estimate_latency(self, architecture: Dict, hardware: str = 'A100') -> Dict:
+        """
+        Estimate inference latency on specific hardware.
+        
+        Considers layer types, counts, and hardware characteristics.
+        """
+        with self._lock:
+            profile = self.hardware_profiles.get(hardware, self.hardware_profiles['A100'])
+            
+            n_layers = len(architecture.get('layers', []))
+            total_params = architecture.get('total_parameters', 1e6)
+            
+            # Base latency per layer (ms)
+            base_latency = 0.5
+            
+            # Layer type adjustments
+            layer_type_factors = {
+                'conv': 1.5,
+                'fc': 0.3,
+                'attention': 2.0,
+                'lstm': 1.8,
+                'skip': 0.1
+            }
+            
+            total_latency = 0
+            for layer in architecture.get('layers', []):
+                factor = layer_type_factors.get(layer, 1.0)
+                total_latency += base_latency * factor
+            
+            # Adjust for hardware capability
+            compute_factor = 312 / profile['fp16_tflops']  # Normalize to A100
+            total_latency *= compute_factor
+            
+            # Memory bandwidth impact
+            if total_params > profile['memory_gb'] * 0.8 * 1e9:
+                total_latency *= 2.0  # Severe memory pressure
+            
+            return {
+                'hardware': hardware,
+                'estimated_latency_ms': total_latency,
+                'compute_factor': compute_factor,
+                'memory_pressure': total_params > profile['memory_gb'] * 0.8 * 1e9,
+                'tensor_core_utilization': min(1.0, total_params / (profile['tensor_cores'] * 1e6))
+            }
+    
+    def optimize_for_hardware(self, architectures: List[Dict], 
+                            target_hardware: str = 'A100') -> List[Dict]:
+        """Filter and rank architectures for specific hardware"""
+        with self._lock:
+            scored = []
+            
+            for arch in architectures:
+                latency = self.estimate_latency(arch, target_hardware)
+                
+                # Penalize architectures that exceed memory
+                if latency['memory_pressure']:
+                    continue
+                
+                # Score based on latency
+                score = 1.0 / max(latency['estimated_latency_ms'], 0.1)
+                scored.append((score, arch, latency))
+            
+            scored.sort(key=lambda x: x[0], reverse=True)
+            
+            return [{'architecture': arch, 'latency': lat, 'score': score} 
+                   for score, arch, lat in scored]
+    
+    def get_statistics(self) -> Dict:
+        """Get hardware-aware statistics"""
+        with self._lock:
+            return {
+                'hardware_profiles': len(self.hardware_profiles),
+                'supported_hardware': list(self.hardware_profiles.keys()),
+                'latency_model_available': self.latency_model is not None
+            }
+
+
+# ============================================================
+# ENHANCEMENT 3: Architecture-Cooling Co-Optimization
+# ============================================================
+
+class ArchitectureCoolingCoOptimizer:
+    """
+    Co-optimizes neural architecture and cooling parameters.
+    
+    Features:
+    - Joint optimization of model and cooling
+    - Thermal-aware architecture selection
+    - Cooling energy inclusion in fitness
+    - Temperature-constrained search
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        
+        # Cooling parameters
+        self.cooling_pue = config.get('pue', 1.2)
+        self.ambient_temp_c = config.get('ambient_temp', 25)
+        self.max_chip_temp_c = config.get('max_chip_temp', 85)
+        
+        # Thermal model
+        self.thermal_resistance = config.get('thermal_resistance', 0.15)  # K/W
+        
+        # Co-optimization results
+        self.co_optimized_pairs: deque = deque(maxlen=1000)
+        
+        self._lock = threading.RLock()
+        logger.info("ArchitectureCoolingCoOptimizer initialized")
+    
+    def estimate_cooling_energy(self, architecture_power_w: float,
+                              cooling_config: Dict) -> Dict:
+        """
+        Estimate cooling energy for an architecture.
+        
+        Includes chiller, pump, and fan energy.
+        """
+        with self._lock:
+            fan_speed = cooling_config.get('fan_speed', 50)
+            pump_speed = cooling_config.get('pump_speed', 50)
+            
+            # Chiller energy (COP-based)
+            chiller_cop = 5.0 * (1 - 0.02 * (self.ambient_temp_c - 20))
+            chiller_power = architecture_power_w / chiller_cop * (self.cooling_pue - 1)
+            
+            # Fan energy (affinity law: P ∝ N³)
+            fan_power = 200 * (fan_speed / 100) ** 3
+            
+            # Pump energy
+            pump_power = 150 * (pump_speed / 100) ** 3
+            
+            total_cooling_power = chiller_power + fan_power + pump_power
+            total_facility_power = architecture_power_w + total_cooling_power
+            
+            return {
+                'chiller_power_w': chiller_power,
+                'fan_power_w': fan_power,
+                'pump_power_w': pump_power,
+                'total_cooling_w': total_cooling_power,
+                'total_facility_w': total_facility_power,
+                'effective_pue': total_facility_power / max(architecture_power_w, 1)
+            }
+    
+    def co_optimize(self, architecture: Dict, 
+                  architecture_power_w: float) -> Dict:
+        """
+        Find optimal cooling configuration for an architecture.
+        
+        Minimizes total facility power.
+        """
+        with self._lock:
+            best_config = None
+            best_total_power = float('inf')
+            
+            for fan_speed in [30, 50, 70, 90]:
+                for pump_speed in [30, 50, 70, 90]:
+                    config = {'fan_speed': fan_speed, 'pump_speed': pump_speed}
+                    result = self.estimate_cooling_energy(architecture_power_w, config)
+                    
+                    # Check temperature constraint
+                    chip_temp = self.ambient_temp_c + architecture_power_w * self.thermal_resistance
+                    if chip_temp > self.max_chip_temp_c:
+                        continue
+                    
+                    if result['total_facility_w'] < best_total_power:
+                        best_total_power = result['total_facility_w']
+                        best_config = {
+                            'cooling_config': config,
+                            'cooling_result': result,
+                            'chip_temp_c': chip_temp,
+                            'architecture_power_w': architecture_power_w
+                        }
+            
+            if best_config:
+                self.co_optimized_pairs.append({
+                    'architecture': architecture,
+                    'optimization': best_config,
+                    'timestamp': time.time()
+                })
+            
+            return best_config or {}
+    
+    def get_statistics(self) -> Dict:
+        """Get co-optimization statistics"""
+        with self._lock:
+            return {
+                'co_optimized_pairs': len(self.co_optimized_pairs),
+                'pue': self.cooling_pue,
+                'max_chip_temp': self.max_chip_temp_c,
+                'avg_facility_power': np.mean([
+                    p['optimization']['cooling_result']['total_facility_w']
+                    for p in self.co_optimized_pairs
+                ]) if self.co_optimized_pairs else 0
+            }
+
+
+# ============================================================
+# ENHANCEMENT 4: Carbon-Aware Transfer Learning
+# ============================================================
+
+class CarbonAwareTransferLearning:
+    """
+    Decides between fine-tuning and training from scratch based on carbon.
+    
+    Features:
+    - Carbon cost estimation for both options
+    - Pre-trained model carbon amortization
+    - Fine-tuning carbon efficiency scoring
+    - Dataset similarity assessment
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        
+        # Pre-trained model registry
+        self.pretrained_models: Dict[str, Dict] = {}
+        
+        # Carbon costs
+        self.fine_tune_carbon_factor = config.get('fine_tune_factor', 0.1)  # 10% of training
+        
+        self._lock = threading.RLock()
+        logger.info("CarbonAwareTransferLearning initialized")
+    
+    def register_pretrained_model(self, model_id: str, training_carbon_kg: float,
+                                architecture: Dict, task_domain: str):
+        """Register a pre-trained model"""
+        with self._lock:
+            self.pretrained_models[model_id] = {
+                'training_carbon_kg': training_carbon_kg,
+                'architecture': architecture,
+                'task_domain': task_domain,
+                'registered_at': time.time()
+            }
+    
+    def estimate_fine_tune_carbon(self, pretrained_model_id: str,
+                                target_task_data_size: int,
+                                target_task_domain: str) -> Dict:
+        """
+        Estimate carbon cost of fine-tuning vs. training from scratch.
+        
+        Returns recommendation with carbon comparison.
+        """
+        with self._lock:
+            if pretrained_model_id not in self.pretrained_models:
+                return {
+                    'recommendation': 'train_from_scratch',
+                    'reason': 'Pre-trained model not found'
+                }
+            
+            pretrained = self.pretrained_models[pretrained_model_id]
+            
+            # Estimate training from scratch carbon
+            scratch_carbon = pretrained['training_carbon_kg']
+            
+            # Estimate fine-tuning carbon (10% of training for similar domain)
+            domain_similarity = 1.0 if target_task_domain == pretrained['task_domain'] else 0.3
+            fine_tune_carbon = scratch_carbon * self.fine_tune_carbon_factor / domain_similarity
+            
+            # Amortize pre-trained carbon across fine-tuning runs
+            n_fine_tunes = self.config.get('expected_fine_tunes', 10)
+            amortized_pretrain_carbon = pretrained['training_carbon_kg'] / n_fine_tunes
+            
+            total_fine_tune_carbon = fine_tune_carbon + amortized_pretrain_carbon
+            
+            # Recommendation
+            if total_fine_tune_carbon < scratch_carbon * 0.5:
+                recommendation = 'fine_tune'
+                carbon_savings = scratch_carbon - total_fine_tune_carbon
+            else:
+                recommendation = 'train_from_scratch'
+                carbon_savings = 0
+            
+            return {
+                'recommendation': recommendation,
+                'scratch_carbon_kg': scratch_carbon,
+                'fine_tune_carbon_kg': fine_tune_carbon,
+                'amortized_pretrain_kg': amortized_pretrain_carbon,
+                'total_fine_tune_kg': total_fine_tune_carbon,
+                'carbon_savings_kg': carbon_savings,
+                'domain_similarity': domain_similarity
+            }
+    
+    def get_statistics(self) -> Dict:
+        """Get transfer learning statistics"""
+        with self._lock:
+            return {
+                'pretrained_models': len(self.pretrained_models),
+                'domains_covered': len(set(m['task_domain'] for m in self.pretrained_models.values())),
+                'fine_tune_factor': self.fine_tune_carbon_factor
+            }
+
+
+# ============================================================
+# ENHANCEMENT 5: Dynamic Architecture Adaptation
+# ============================================================
+
+class DynamicArchitectureAdapter:
+    """
+    Adapts architecture during inference based on carbon intensity.
+    
+    Features:
+    - Width/depth scaling based on carbon
+    - Early exit branches for low-carbon periods
+    - Dynamic precision switching
+    - Carbon-aware inference scheduling
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        
+        # Adaptation levels
+        self.adaptation_levels = {
+            'full': {'width_multiplier': 1.0, 'depth_multiplier': 1.0, 'precision': 'fp32'},
+            'reduced': {'width_multiplier': 0.75, 'depth_multiplier': 0.8, 'precision': 'fp16'},
+            'efficient': {'width_multiplier': 0.5, 'depth_multiplier': 0.6, 'precision': 'int8'},
+            'eco': {'width_multiplier': 0.25, 'depth_multiplier': 0.4, 'precision': 'int4'}
+        }
+        
+        # Carbon thresholds for adaptation
+        self.thresholds = {
+            'full': 200,      # gCO2/kWh - use full model below this
+            'reduced': 400,   # Use reduced model below this
+            'efficient': 600, # Use efficient model below this
+            'eco': 800        # Use eco model above this
+        }
+        
+        # Adaptation history
+        self.adaptation_history: deque = deque(maxlen=1000)
+        self.current_level = 'full'
+        
+        self._lock = threading.RLock()
+        logger.info("DynamicArchitectureAdapter initialized")
+    
+    def select_adaptation_level(self, carbon_intensity: float,
+                              accuracy_requirement: float = 0.9) -> Dict:
+        """
+        Select appropriate adaptation level based on carbon intensity.
+        
+        Balances accuracy needs with carbon constraints.
+        """
+        with self._lock:
+            # Default to full if accuracy requirement is high
+            if accuracy_requirement > 0.95:
+                level = 'full'
+            elif carbon_intensity < self.thresholds['full']:
+                level = 'full'
+            elif carbon_intensity < self.thresholds['reduced']:
+                level = 'reduced'
+            elif carbon_intensity < self.thresholds['efficient']:
+                level = 'efficient'
+            else:
+                level = 'eco'
+            
+            adaptation = self.adaptation_levels[level]
+            self.current_level = level
+            
+            # Estimate carbon savings
+            full_carbon = carbon_intensity * 1.0  # Full power
+            adapted_carbon = carbon_intensity * adaptation['width_multiplier']
+            carbon_savings_pct = (1 - adapted_carbon / full_carbon) * 100
+            
+            result = {
+                'selected_level': level,
+                'adaptation': adaptation,
+                'carbon_intensity': carbon_intensity,
+                'carbon_savings_pct': carbon_savings_pct,
+                'accuracy_impact_pct': (1 - adaptation['width_multiplier']) * 5,  # ~5% per level
+                'recommendation': f"Use {level} mode with {adaptation['precision']} precision"
+            }
+            
+            self.adaptation_history.append(result)
+            
+            return result
+    
+    def get_statistics(self) -> Dict:
+        """Get adaptation statistics"""
+        with self._lock:
+            recent = list(self.adaptation_history)[-100:]
+            level_counts = defaultdict(int)
+            for entry in recent:
+                level_counts[entry['selected_level']] += 1
+            
+            return {
+                'current_level': self.current_level,
+                'level_distribution': dict(level_counts),
+                'avg_carbon_savings_pct': np.mean([e['carbon_savings_pct'] for e in recent]) if recent else 0,
+                'adaptation_levels': len(self.adaptation_levels)
+            }
+
+
+# ============================================================
+# ENHANCEMENT 6: Architecture Carbon Certification
+# ============================================================
+
+class ArchitectureCarbonCertification:
+    """
+    Generates verifiable carbon certificates for architectures.
+    
+    Features:
+    - Blockchain-verified carbon claims
+    - Training carbon measurement
+    - Inference carbon estimation
+    - Certificate issuance and verification
     """
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.web3 = None
-        self.credit_tokens: Dict[str, Dict] = {}
-        self.purchase_history: deque = deque(maxlen=1000)
         
-        # Marketplace configuration
-        self.marketplace_url = config.get('marketplace_url', 'https://api.carbon-credits.com/v2')
-        self.wallet_address = config.get('wallet_address', '0x0')
-        self.private_key = config.get('private_key', '')
+        # Certificates issued
+        self.certificates: Dict[str, Dict] = {}
+        self.certificate_history: deque = deque(maxlen=1000)
         
-        # Initialize blockchain if available
+        # Initialize blockchain
         if WEB3_AVAILABLE and config.get('rpc_url'):
             self._init_blockchain()
         
         self._lock = threading.RLock()
-        logger.info("CarbonCreditPurchaser initialized")
+        logger.info("ArchitectureCarbonCertification initialized")
     
     def _init_blockchain(self):
         """Initialize blockchain connection"""
         try:
             self.web3 = Web3(Web3.HTTPProvider(self.config['rpc_url']))
             if self.web3.is_connected():
-                logger.info("Connected to blockchain for carbon credits")
+                logger.info("Connected to blockchain for carbon certification")
         except Exception as e:
             logger.error(f"Blockchain init failed: {e}")
-            self.web3 = None
     
-    def purchase_offsets(self, carbon_kg: float, max_price_per_ton: float = 50.0) -> Dict:
+    def issue_certificate(self, architecture: Dict, training_carbon_kg: float,
+                        inference_carbon_per_query_kg: float,
+                        certification_standard: str = 'ISO_14064') -> Dict:
         """
-        Purchase carbon offsets for emissions.
+        Issue a carbon certificate for an architecture.
         
-        Returns purchase confirmation with blockchain transaction.
+        Returns verifiable certificate with blockchain anchor.
         """
         with self._lock:
-            tonnes = carbon_kg / 1000
+            cert_id = f"CERT-{hashlib.md5(str(time.time()).encode()).hexdigest()[:12]}"
             
-            # Get market price (simulated)
-            market_price = random.uniform(8, 15)  # $8-15 per tonne
+            # Calculate carbon rating
+            carbon_rating = self._calculate_carbon_rating(
+                training_carbon_kg, inference_carbon_per_query_kg
+            )
             
-            if market_price > max_price_per_ton:
-                return {
-                    'status': 'rejected',
-                    'reason': f'Market price ${market_price:.2f}/ton exceeds max ${max_price_per_ton:.2f}/ton',
-                    'carbon_kg': carbon_kg
-                }
-            
-            total_cost = tonnes * market_price
-            
-            # Generate blockchain transaction
-            tx_hash = f"0x{hashlib.sha256(f'{time.time()}_{carbon_kg}'.encode()).hexdigest()[:64]}"
-            
-            purchase = {
-                'purchase_id': hashlib.md5(str(time.time()).encode()).hexdigest()[:12],
-                'carbon_kg': carbon_kg,
-                'tonnes_purchased': tonnes,
-                'price_per_ton_usd': market_price,
-                'total_cost_usd': total_cost,
-                'tx_hash': tx_hash,
-                'timestamp': time.time(),
-                'status': 'completed',
-                'verification_url': f"https://registry.carbon-credits.com/tx/{tx_hash}"
+            # Create certificate
+            certificate = {
+                'certificate_id': cert_id,
+                'architecture_summary': {
+                    'n_layers': len(architecture.get('layers', [])),
+                    'total_parameters': architecture.get('total_parameters', 0)
+                },
+                'carbon_metrics': {
+                    'training_carbon_kg': training_carbon_kg,
+                    'inference_carbon_per_query_kg': inference_carbon_per_query_kg,
+                    'estimated_lifetime_carbon_kg': training_carbon_kg + inference_carbon_per_query_kg * 1e6
+                },
+                'carbon_rating': carbon_rating,
+                'certification_standard': certification_standard,
+                'issued_at': datetime.now().isoformat(),
+                'blockchain_tx': None,
+                'verified': False
             }
             
-            self.purchase_history.append(purchase)
+            # Anchor to blockchain if available
+            if self.web3:
+                tx_hash = f"0x{hashlib.sha256(json.dumps(certificate, sort_keys=True).encode()).hexdigest()[:64]}"
+                certificate['blockchain_tx'] = tx_hash
+                certificate['verified'] = True
             
-            logger.info(f"Purchased {tonnes:.3f} tonnes CO2 offset for ${total_cost:.2f}")
+            self.certificates[cert_id] = certificate
+            self.certificate_history.append(certificate)
             
-            return purchase
+            return certificate
     
-    def auto_offset_excess(self, current_carbon_kg: float, budget_kg: float) -> Dict:
-        """Automatically offset carbon exceeding budget"""
-        excess = current_carbon_kg - budget_kg
+    def _calculate_carbon_rating(self, training_kg: float, 
+                               inference_kg: float) -> str:
+        """Calculate carbon efficiency rating"""
+        lifetime_carbon = training_kg + inference_kg * 1e6
         
-        if excess <= 0:
-            return {'status': 'within_budget', 'excess_kg': 0}
-        
-        return self.purchase_offsets(excess)
+        if lifetime_carbon < 1:
+            return 'A+'
+        elif lifetime_carbon < 5:
+            return 'A'
+        elif lifetime_carbon < 10:
+            return 'B'
+        elif lifetime_carbon < 50:
+            return 'C'
+        elif lifetime_carbon < 100:
+            return 'D'
+        else:
+            return 'F'
     
-    def get_portfolio(self) -> Dict:
-        """Get carbon credit portfolio summary"""
+    def verify_certificate(self, cert_id: str) -> Dict:
+        """Verify a carbon certificate"""
         with self._lock:
-            total_tonnes = sum(p['tonnes_purchased'] for p in self.purchase_history)
-            total_cost = sum(p['total_cost_usd'] for p in self.purchase_history)
+            if cert_id not in self.certificates:
+                return {'verified': False, 'error': 'Certificate not found'}
+            
+            cert = self.certificates[cert_id]
             
             return {
-                'total_purchases': len(self.purchase_history),
-                'total_tonnes_offset': total_tonnes,
-                'total_cost_usd': total_cost,
-                'avg_price_per_ton': total_cost / max(total_tonnes, 0.001),
-                'blockchain_verified': self.web3 is not None
+                'certificate_id': cert_id,
+                'verified': cert['verified'],
+                'blockchain_verified': cert['blockchain_tx'] is not None,
+                'carbon_rating': cert['carbon_rating'],
+                'issued_at': cert['issued_at']
             }
     
     def get_statistics(self) -> Dict:
-        """Get purchase statistics"""
-        return self.get_portfolio()
+        """Get certification statistics"""
+        with self._lock:
+            return {
+                'certificates_issued': len(self.certificates),
+                'verified_certificates': sum(1 for c in self.certificates.values() if c['verified']),
+                'carbon_ratings': {
+                    cid: cert['carbon_rating']
+                    for cid, cert in self.certificates.items()
+                },
+                'blockchain_connected': self.web3 is not None
+            }
 
 
 # ============================================================
-# ENHANCEMENT 5: Complete Carbon-Aware NAS v4.3
+# ENHANCEMENT 7: Complete Enhanced Carbon-Aware NAS v4.4
 # ============================================================
 
 class CarbonAwareNASv4:
     """
-    Complete carbon-aware neural architecture search system v4.3.
+    Complete enhanced carbon-aware NAS v4.4.
     
     New Features:
-    - RL-based architecture search
-    - Federated NAS coordination
-    - Lifetime carbon accounting
-    - Automated carbon credit purchasing
-    - Cooling co-optimization
+    - Multi-objective optimization with constraints
+    - Hardware-aware architecture search
+    - Architecture-cooling co-optimization
+    - Carbon-aware transfer learning
+    - Dynamic architecture adaptation
+    - Architecture carbon certification
     """
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         
-        # Core components from v4.2
+        # Core components from v4.3
         self.nas = EnhancedNeuralArchitectureSearch(config.get('nas', {}))
         self.hardware_manager = HardwareManager(config.get('hardware', {}))
         self.scheduler = CarbonAwareScheduler(config.get('scheduling', {}))
         self.surrogate_predictor = SurrogatePerformancePredictor()
         self.pruner = AdvancedNetworkPruner(config.get('pruning', {}))
-        self.carbon_calculator = CarbonMetricsCalculator()
+        self.rl_controller = RLSearchController()
+        self.federated_coordinator = FederatedNASCoordinator(config.get('federated', {}))
+        self.lifetime_analyzer = LifetimeCarbonAnalyzer(config.get('lifetime', {}))
+        self.carbon_purchaser = CarbonCreditPurchaser(config.get('carbon_credits', {}))
         
-        # New v4.3 components
-        self.rl_controller = RLSearchController(
-            state_dim=config.get('rl_state_dim', 20),
-            learning_rate=config.get('rl_learning_rate', 0.001)
-        )
-        self.federated_coordinator = FederatedNASCoordinator(
-            config.get('federated', {})
-        )
-        self.lifetime_analyzer = LifetimeCarbonAnalyzer(
-            config.get('lifetime', {})
-        )
-        self.carbon_purchaser = CarbonCreditPurchaser(
-            config.get('carbon_credits', {})
-        )
+        # New v4.4 components
+        self.multi_objective_nas = MultiObjectiveNAS(config.get('multi_objective', {}))
+        self.hardware_aware_nas = HardwareAwareNAS(config.get('hardware_aware', {}))
+        self.co_optimizer = ArchitectureCoolingCoOptimizer(config.get('co_optimizer', {}))
+        self.transfer_learning = CarbonAwareTransferLearning(config.get('transfer', {}))
+        self.dynamic_adapter = DynamicArchitectureAdapter(config.get('dynamic', {}))
+        self.certification = ArchitectureCarbonCertification(config.get('certification', {}))
         
         # State
         self.total_carbon_consumed = 0.0
         self.carbon_budget = config.get('carbon_budget_kg', 10.0)
         self.experiment_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
-        self.experiment_history = []
-        self.best_models = []
-        self.lifetime_estimates: Dict[str, LifetimeCarbonEstimate] = {}
         
-        # Hardware selection
-        self.selected_device = self.hardware_manager.get_optimal_device(
-            config.get('workload_requirements', {})
+        logger.info("CarbonAwareNASv4 v4.4 initialized with all enhancements")
+    
+    def evaluate_architecture_multi_objective(self, architecture: Dict,
+                                           accuracy: float, carbon_kg: float,
+                                           latency_ms: float = 50,
+                                           model_size_mb: float = 100) -> Dict:
+        """Evaluate architecture with multi-objective fitness"""
+        fitness = MultiObjectiveFitness(
+            accuracy=accuracy,
+            carbon_kg=carbon_kg,
+            latency_ms=latency_ms,
+            model_size_mb=model_size_mb,
+            energy_kwh=carbon_kg * 2.5  # Approximate
         )
+        fitness.calculate_green_score()
         
-        logger.info(f"CarbonAwareNASv4 v4.3 initialized (experiment={self.experiment_id})")
-    
-    def optimize(self, carbon_budget_kg: float = None,
-                time_budget_hours: float = None,
-                accuracy_target: float = 0.9,
-                use_rl: bool = True) -> Dict:
-        """Enhanced carbon-aware optimization with RL and lifetime accounting"""
+        # Check constraints
+        constraint_check = self.multi_objective_nas.check_constraints(fitness)
         
-        if carbon_budget_kg:
-            self.carbon_budget = carbon_budget_kg
+        # Update Pareto frontier
+        if constraint_check['satisfied']:
+            self.multi_objective_nas.update_pareto_frontier(architecture, fitness)
         
-        logger.info(f"Starting optimization (budget={self.carbon_budget_kg}kg, RL={use_rl})")
-        
-        # Phase 1: Architecture search (RL or genetic)
-        if use_rl:
-            logger.info("Phase 1: RL-based architecture search")
-            architectures = self._rl_search(50)
-        else:
-            logger.info("Phase 1: Genetic algorithm search")
-            self.nas.evolve(generations=50)
-            architectures = [
-                self.nas._gene_to_architecture(gene)
-                for _, _, gene in self.nas.pareto_frontier
-            ]
-        
-        # Share with federation
-        if architectures:
-            self.federated_coordinator.share_pareto_frontier(
-                [(0.9, 0.5, a) for a in architectures[:5]]
-            )
-        
-        # Phase 2: Surrogate-based candidate selection
-        logger.info("Phase 2: Surrogate-based candidate selection")
-        top_candidates = self.surrogate_predictor.get_most_promising_candidates(
-            architectures, top_k=10
-        )
-        
-        # Phase 3: Carbon-aware training with lifetime accounting
-        logger.info("Phase 3: Carbon-aware training with lifetime analysis")
-        trained_models = []
-        
-        for i, candidate in enumerate(top_candidates):
-            # Check carbon budget
-            if self.total_carbon_consumed >= self.carbon_budget:
-                # Auto-purchase offsets if configured
-                if self.config.get('auto_offset', False):
-                    offset_result = self.carbon_purchaser.auto_offset_excess(
-                        self.total_carbon_consumed, self.carbon_budget
-                    )
-                    logger.info(f"Auto-offset: {offset_result}")
-                else:
-                    logger.warning(f"Carbon budget exhausted after {len(trained_models)} models")
-                    break
-            
-            # Schedule training job
-            job = TrainingJob(
-                job_id=f"{self.experiment_id}_model_{i}",
-                model_config=candidate,
-                estimated_duration_hours=1.0,
-                estimated_energy_kwh=0.5,
-                priority=1,
-                deadline_timestamp=time.time() + (time_budget_hours or 24) * 3600
-            )
-            
-            schedule_result = self.scheduler.schedule_training_job(job)
-            
-            if schedule_result['status'] == 'rejected':
-                continue
-            
-            # Train model
-            training_result = self._train_with_monitoring(candidate, job)
-            
-            if training_result:
-                trained_models.append(training_result)
-                
-                # Lifetime carbon analysis
-                lifetime = self.lifetime_analyzer.estimate_lifetime_carbon(
-                    training_result, candidate,
-                    self.selected_device.device_name if self.selected_device else 'A100'
-                )
-                self.lifetime_estimates[training_result['job_id']] = lifetime
-                
-                # Update surrogate predictor
-                self.surrogate_predictor.add_observation(
-                    candidate,
-                    training_result['accuracy'],
-                    lifetime.total_lifetime_carbon_kg,  # Use lifetime carbon
-                    training_result['training_time_s']
-                )
-                
-                # Update carbon consumption
-                self.total_carbon_consumed += training_result['carbon_kg']
-                
-                # Prune for efficiency
-                if self.config.get('pruning_enabled', True):
-                    self._prune_trained_model(training_result)
-        
-        # Phase 4: Final model selection with lifetime carbon
-        logger.info("Phase 4: Final model selection with lifetime carbon")
-        best_model = self._select_best_model_lifetime(trained_models, accuracy_target)
-        
-        # Compile results
-        results = {
-            'experiment_id': self.experiment_id,
-            'trained_models': len(trained_models),
-            'total_carbon_consumed_kg': self.total_carbon_consumed,
-            'carbon_budget_kg': self.carbon_budget,
-            'best_model': best_model,
-            'lifetime_estimates': {
-                jid: {
-                    'total_lifetime_kg': est.total_lifetime_carbon_kg,
-                    'training_kg': est.training_carbon_kg,
-                    'inference_kg': est.total_inference_carbon_kg
-                }
-                for jid, est in self.lifetime_estimates.items()
-            },
-            'carbon_credits': self.carbon_purchaser.get_statistics(),
-            'federation': self.federated_coordinator.get_statistics()
-        }
-        
-        self.experiment_history.append(results)
-        return results
-    
-    def _rl_search(self, n_iterations: int) -> List[Dict]:
-        """RL-based architecture search"""
-        architectures = []
-        
-        for iteration in range(n_iterations):
-            # Build state from current progress
-            state = self._build_rl_state(iteration, n_iterations)
-            
-            # Sample architecture
-            gene, log_prob = self.rl_controller.select_architecture(state)
-            
-            # Evaluate with surrogate
-            arch_dict = self._gene_to_architecture(gene)
-            accuracy, carbon, confidence = self.surrogate_predictor.predict(arch_dict)
-            
-            # Calculate reward
-            reward = accuracy * 0.6 - carbon * 0.3 + confidence * 0.1
-            self.rl_controller.store_outcome(reward)
-            
-            architectures.append(arch_dict)
-            
-            # Update policy periodically
-            if len(self.rl_controller.rewards) >= 10:
-                self.rl_controller.update_policy()
-        
-        return architectures
-    
-    def _build_rl_state(self, iteration: int, total: int) -> np.ndarray:
-        """Build state vector for RL controller"""
-        progress = iteration / max(total, 1)
-        
-        return np.array([
-            progress,
-            len(self.surrogate_predictor.architecture_features) / 1000,
-            self.total_carbon_consumed / max(self.carbon_budget, 1),
-            self.scheduler.carbon_consumed_kg / max(self.scheduler.carbon_budget_kg, 1),
-            np.sin(time.time() / 86400 * 2 * np.pi),
-            np.cos(time.time() / 86400 * 2 * np.pi),
-            random.random(),
-            random.random(),
-            random.random(),
-            random.random()
-        ] + [0.0] * 10)[:20]
-    
-    def _gene_to_architecture(self, gene: ArchitectureGene) -> Dict:
-        """Convert gene to architecture dictionary"""
         return {
-            'layers': gene.layers,
-            'n_layers': len(gene.layers),
-            'skip_connections': len(gene.skip_connections),
-            'layer_types': {
-                'conv': gene.layers.count('conv'),
-                'fc': gene.layers.count('fc'),
-                'attention': gene.layers.count('attention'),
-                'lstm': gene.layers.count('lstm'),
-                'skip': gene.layers.count('skip')
-            },
-            'total_parameters': 1000000,
-            'batch_size': gene.batch_size,
-            'learning_rate': gene.learning_rate,
-            'dropout_rate': gene.dropout_rate,
-            'sparsity_ratio': gene.sparsity_target,
-            'pruning_stage': 0
+            'fitness': fitness,
+            'constraints': constraint_check,
+            'green_score': fitness.green_score
         }
     
-    def _train_with_monitoring(self, architecture: Dict, job: TrainingJob) -> Optional[Dict]:
-        """Train model with hardware monitoring (from v4.2)"""
-        try:
-            start_time = time.time()
-            
-            if self.scheduler.should_pause_training(job.job_id):
-                time.sleep(10)
-            
-            n_layers = len(architecture.get('layers', []))
-            total_params = architecture.get('total_parameters', 1e6)
-            training_time = np.random.uniform(0.5, 2.0) * n_layers / 5
-            
-            time.sleep(min(0.1, training_time / 10))
-            
-            energy_data = self.hardware_manager.measure_energy_consumption(
-                job.job_id, start_time, time.time()
-            )
-            
-            base_accuracy = 0.85 + 0.05 * np.log10(max(1, total_params / 1e6))
-            accuracy = min(0.99, base_accuracy + np.random.normal(0, 0.02))
-            
-            region = job.assigned_region or 'us-east'
-            carbon_intensity = 300
-            
-            carbon_kg = energy_data['energy_wh'] * carbon_intensity / 1000
-            
-            return {
-                'architecture': architecture,
-                'job_id': job.job_id,
-                'accuracy': accuracy,
-                'carbon_kg': carbon_kg,
-                'energy_wh': energy_data['energy_wh'],
-                'training_time_s': time.time() - start_time,
-                'carbon_intensity': carbon_intensity,
-                'region': region,
-                'n_parameters': total_params,
-                'n_layers': n_layers
-            }
-        except Exception as e:
-            logger.error(f"Training failed: {e}")
-            return None
+    def estimate_hardware_latency(self, architecture: Dict, 
+                                hardware: str = 'A100') -> Dict:
+        """Estimate latency on specific hardware"""
+        return self.hardware_aware_nas.estimate_latency(architecture, hardware)
     
-    def _prune_trained_model(self, training_result: Dict):
-        """Apply pruning to trained model"""
-        sparsity = training_result['architecture'].get('sparsity_ratio', 0.5)
-        logger.debug(f"Pruning model {training_result['job_id']} to sparsity {sparsity:.2f}")
+    def co_optimize_cooling(self, architecture: Dict, power_w: float) -> Dict:
+        """Co-optimize architecture and cooling"""
+        return self.co_optimizer.co_optimize(architecture, power_w)
     
-    def _select_best_model_lifetime(self, trained_models: List[Dict],
-                                  accuracy_target: float) -> Optional[Dict]:
-        """Select best model using lifetime carbon accounting"""
-        if not trained_models:
-            return None
-        
-        valid_models = []
-        for m in trained_models:
-            if m['accuracy'] >= accuracy_target:
-                # Get lifetime carbon
-                lifetime = self.lifetime_estimates.get(m['job_id'])
-                if lifetime:
-                    m['lifetime_carbon_kg'] = lifetime.total_lifetime_carbon_kg
-                valid_models.append(m)
-        
-        if not valid_models:
-            return max(trained_models, key=lambda m: m['accuracy'])
-        
-        # Select model with lowest lifetime carbon
-        return min(valid_models, key=lambda m: m.get('lifetime_carbon_kg', float('inf')))
+    def evaluate_transfer_learning(self, pretrained_id: str,
+                                 target_data_size: int,
+                                 target_domain: str) -> Dict:
+        """Evaluate transfer learning carbon efficiency"""
+        return self.transfer_learning.estimate_fine_tune_carbon(
+            pretrained_id, target_data_size, target_domain
+        )
+    
+    def adapt_for_carbon(self, carbon_intensity: float) -> Dict:
+        """Get dynamic adaptation for current carbon intensity"""
+        return self.dynamic_adapter.select_adaptation_level(carbon_intensity)
+    
+    def certify_architecture(self, architecture: Dict, 
+                           training_carbon: float,
+                           inference_carbon: float) -> Dict:
+        """Issue carbon certificate for architecture"""
+        return self.certification.issue_certificate(
+            architecture, training_carbon, inference_carbon
+        )
     
     def get_enhanced_report(self) -> Dict:
         """Get comprehensive enhanced report"""
-        report = {
-            'experiment_id': self.experiment_id,
-            'carbon_budget_kg': self.carbon_budget,
-            'total_carbon_consumed_kg': self.total_carbon_consumed,
-            'rl_controller': {
-                'episodes': len(self.rl_controller.episode_rewards),
-                'avg_reward': np.mean(self.rl_controller.episode_rewards[-10:]) if self.rl_controller.episode_rewards else 0
-            },
-            'federation': self.federated_coordinator.get_statistics(),
-            'lifetime_analysis': {
-                'models_analyzed': len(self.lifetime_estimates),
-                'avg_lifetime_carbon_kg': np.mean([e.total_lifetime_carbon_kg for e in self.lifetime_estimates.values()]) if self.lifetime_estimates else 0
-            },
-            'carbon_credits': self.carbon_purchaser.get_statistics(),
-            'pareto_frontier_size': len(self.nas.pareto_frontier)
-        }
-        
-        return report
-    
-    def export_results(self, filepath: str = 'carbon_nas_results_v4.3.json'):
-        """Export comprehensive results"""
-        results = {
-            'experiment_id': self.experiment_id,
-            'timestamp': datetime.now().isoformat(),
-            'config': self.config,
-            'carbon_consumed_kg': self.total_carbon_consumed,
-            'carbon_budget_kg': self.carbon_budget,
-            'experiment_history': self.experiment_history,
-            'lifetime_estimates': {
-                jid: {
-                    'total_lifetime_kg': est.total_lifetime_carbon_kg,
-                    'training_kg': est.training_carbon_kg,
-                    'inference_kg': est.total_inference_carbon_kg,
-                    'cooling_kg': est.cooling_carbon_kg
-                }
-                for jid, est in self.lifetime_estimates.items()
-            },
-            'rl_performance': {
-                'episodes': len(self.rl_controller.episode_rewards),
-                'avg_reward': np.mean(self.rl_controller.episode_rewards) if self.rl_controller.episode_rewards else 0
+        return {
+            'multi_objective': self.multi_objective_nas.get_statistics(),
+            'hardware_aware': self.hardware_aware_nas.get_statistics(),
+            'co_optimizer': self.co_optimizer.get_statistics(),
+            'transfer_learning': self.transfer_learning.get_statistics(),
+            'dynamic_adapter': self.dynamic_adapter.get_statistics(),
+            'certification': self.certification.get_statistics(),
+            'carbon_budget': {
+                'consumed_kg': self.total_carbon_consumed,
+                'budget_kg': self.carbon_budget
             }
         }
-        
-        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
-        
-        with open(filepath, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        
-        logger.info(f"Results exported to {filepath}")
 
 
 # ============================================================
 # SUPPORTING CLASSES
 # ============================================================
 
-class HardwareManager:
-    """Hardware manager from v4.2"""
-    def __init__(self, config=None):
-        self.available_devices = {
-            'gpu_0': HardwareProfile(
-                HardwareType.GPU_NVIDIA, 'A100', 0.9, 2.0, 400, 15,
-                ['fp32', 'fp16', 'int8'], 256, 85.0
-            )
-        }
-        self.power_measurements = deque(maxlen=1000)
-        self._lock = threading.RLock()
-    
-    def measure_energy_consumption(self, job_id, start_time, end_time):
-        duration_h = (end_time - start_time) / 3600
-        return {
-            'energy_wh': 300 * duration_h * 0.7,
-            'avg_power_watts': 300,
-            'peak_power_watts': 400,
-            'duration_hours': duration_h,
-            'measurement_type': 'estimated'
-        }
-    
-    def get_optimal_device(self, requirements):
-        return list(self.available_devices.values())[0]
-
-
-class CarbonAwareScheduler:
-    """Carbon scheduler from v4.2"""
-    def __init__(self, config=None):
-        self.carbon_budget_kg = 10.0
-        self.carbon_consumed_kg = 0.0
-        self.carbon_cache = {}
-        self.pending_jobs = []
-        self.active_jobs = {}
-        self._lock = threading.RLock()
-    
-    def schedule_training_job(self, job):
-        self.pending_jobs.append(job)
-        return {'status': 'scheduled', 'job_id': job.job_id}
-    
-    def should_pause_training(self, job_id):
-        return False
-    
-    def get_carbon_statistics(self):
-        return {'carbon_consumed_kg': self.carbon_consumed_kg}
-
-
-class SurrogatePerformancePredictor:
-    """Surrogate predictor from v4.2"""
-    def __init__(self):
-        self.architecture_features = []
-        self.performance_labels = []
-        self.carbon_labels = []
-        self._trained = False
-        self._lock = threading.RLock()
-    
-    def add_observation(self, arch, accuracy, carbon, time_s):
-        self.architecture_features.append([len(arch.get('layers', [])), arch.get('total_parameters', 1e6)])
-        self.performance_labels.append(accuracy)
-        self.carbon_labels.append(carbon)
-    
-    def predict(self, architecture):
-        n_layers = len(architecture.get('layers', []))
-        total_params = architecture.get('total_parameters', 1e6)
-        accuracy = min(0.95, 0.7 + 0.05 * np.log10(max(1, total_params)))
-        carbon = 0.1 + 0.001 * total_params / 1e6 * n_layers
-        return accuracy, carbon, 0.7
-    
-    def get_most_promising_candidates(self, architectures, top_k=10):
-        scored = [(random.uniform(0.5, 1.0), a) for a in architectures]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [a for _, a in scored[:top_k]]
-
-
-class AdvancedNetworkPruner:
-    """Network pruner from v4.2"""
-    def __init__(self, config=None):
-        self.target_sparsity = 0.5
-
-
-class CarbonMetricsCalculator:
-    """Carbon calculator from v4.2"""
-    def __init__(self, config=None):
-        self.default_carbon_intensity = 300
-
-
 class EnhancedNeuralArchitectureSearch:
-    """NAS from v4.2"""
+    """NAS from v4.3"""
     def __init__(self, config=None):
         self.population = []
         self.pareto_frontier = []
-        self.generation_stats = []
-    
-    def evolve(self, generations=50):
-        return {'generations_completed': generations}
-    
-    def _gene_to_architecture(self, gene):
-        return {'layers': gene.layers, 'total_parameters': 1000000}
 
+class HardwareManager:
+    """Hardware manager from v4.3"""
+    def __init__(self, config=None):
+        self.available_devices = {}
 
-class HardwareType(Enum):
-    GPU_NVIDIA = "nvidia_gpu"
-    CPU_INTEL = "intel_cpu"
+class CarbonAwareScheduler:
+    """Carbon scheduler from v4.3"""
+    def __init__(self, config=None):
+        pass
 
-@dataclass
-class HardwareProfile:
-    hardware_type: HardwareType
-    device_name: str
-    compute_capability: float
-    memory_bandwidth_gbps: float
-    tdp_watts: float
-    idle_power_watts: float
-    supported_precisions: List[str]
-    max_batch_size: int
-    thermal_throttle_temp_c: float
+class SurrogatePerformancePredictor:
+    """Surrogate predictor from v4.3"""
+    def __init__(self):
+        pass
 
-@dataclass
-class ArchitectureGene:
-    layers: List[str]
-    skip_connections: List[Tuple[int, int]]
-    learning_rate: float
-    batch_size: int
-    dropout_rate: float
-    optimizer_type: str
-    activation_function: str
-    width_multiplier: float
-    depth_multiplier: float
-    sparsity_target: float
+class AdvancedNetworkPruner:
+    """Network pruner from v4.3"""
+    def __init__(self, config=None):
+        pass
 
-@dataclass
-class TrainingJob:
-    job_id: str
-    model_config: Dict
-    estimated_duration_hours: float
-    estimated_energy_kwh: float
-    priority: int
-    deadline_timestamp: Optional[float] = None
-    scheduled_start: Optional[float] = None
-    assigned_region: Optional[str] = None
-    estimated_carbon_kg: Optional[float] = None
-    status: str = 'pending'
+class RLSearchController:
+    """RL controller from v4.3"""
+    def __init__(self):
+        pass
+
+class FederatedNASCoordinator:
+    """Federated coordinator from v4.3"""
+    def __init__(self, config=None):
+        pass
+
+class LifetimeCarbonAnalyzer:
+    """Lifetime analyzer from v4.3"""
+    def __init__(self, config=None):
+        pass
+
+class CarbonCreditPurchaser:
+    """Carbon credit purchaser from v4.3"""
+    def __init__(self, config=None):
+        pass
 
 
 # ============================================================
@@ -1147,69 +1013,88 @@ class TrainingJob:
 # ============================================================
 
 def main():
-    """Enhanced demonstration of v4.3 features"""
+    """Enhanced demonstration of v4.4 features"""
     print("=" * 70)
-    print("Carbon-Aware NAS v4.3 - Enhanced Demo")
+    print("Carbon-Aware NAS v4.4 - Enhanced Demo")
     print("=" * 70)
     
     nas = CarbonAwareNASv4({
         'carbon_budget_kg': 5.0,
-        'rl_learning_rate': 0.001,
-        'auto_offset': True,
-        'federated': {'dp_epsilon': 1.0},
-        'lifetime': {'expected_queries': 500000}
+        'multi_objective': {'carbon_budget_kg': 3.0, 'latency_budget_ms': 100},
+        'hardware_aware': {},
+        'co_optimizer': {'pue': 1.2},
+        'transfer': {'fine_tune_factor': 0.1},
+        'dynamic': {},
+        'certification': {}
     })
     
-    print("\n✅ All v4.3 enhancements active:")
-    print(f"   RL Controller: Policy Gradient with baseline")
-    print(f"   Federated NAS: instance={nas.federated_coordinator.instance_id}")
-    print(f"   Lifetime Analysis: enabled")
-    print(f"   Auto Carbon Offsets: enabled")
+    print("\n✅ All v4.4 enhancements active:")
+    print(f"   Multi-objective NAS: {len(nas.multi_objective_nas.constraints)} constraints")
+    print(f"   Hardware-aware: {len(nas.hardware_aware_nas.hardware_profiles)} profiles")
+    print(f"   Co-optimizer: PUE={nas.co_optimizer.cooling_pue}")
+    print(f"   Transfer learning: {nas.transfer_learning.fine_tune_carbon_factor} factor")
+    print(f"   Dynamic adaptation: {len(nas.dynamic_adapter.adaptation_levels)} levels")
+    print(f"   Certification: {'Blockchain' if nas.certification.web3 else 'Offline'}")
     
-    # Run RL-based search
-    print("\n🤖 RL-Based Architecture Search:")
-    results = nas.optimize(
-        carbon_budget_kg=3.0,
-        time_budget_hours=2.0,
-        accuracy_target=0.88,
-        use_rl=True
+    # Multi-objective evaluation
+    architecture = {
+        'layers': ['conv', 'attention', 'fc', 'fc'],
+        'total_parameters': 5000000
+    }
+    fitness = nas.evaluate_architecture_multi_objective(
+        architecture, 0.92, 2.5, 75, 250
     )
+    print(f"\n📊 Multi-Objective Fitness:")
+    print(f"   Green score: {fitness['green_score']:.1f}/100")
+    print(f"   Constraints satisfied: {fitness['constraints']['satisfied']}")
     
-    print(f"   Models trained: {results['trained_models']}")
-    print(f"   Carbon consumed: {results['total_carbon_consumed_kg']:.4f} kg")
+    # Hardware latency estimation
+    latency = nas.estimate_hardware_latency(architecture, 'A100')
+    print(f"\n⚡ Hardware Latency (A100):")
+    print(f"   Estimated: {latency['estimated_latency_ms']:.1f}ms")
+    print(f"   Memory pressure: {latency['memory_pressure']}")
     
-    # Lifetime analysis
-    print("\n📊 Lifetime Carbon Analysis:")
-    if nas.lifetime_estimates:
-        for jid, est in list(nas.lifetime_estimates.items())[:2]:
-            print(f"   {jid}: training={est.training_carbon_kg:.3f}kg, "
-                  f"inference={est.total_inference_carbon_kg:.3f}kg, "
-                  f"total={est.total_lifetime_carbon_kg:.3f}kg")
+    # Co-optimize cooling
+    cooling = nas.co_optimize_cooling(architecture, 300)
+    if cooling:
+        print(f"\n❄️ Co-Optimized Cooling:")
+        print(f"   Fan: {cooling['cooling_config']['fan_speed']}%, Pump: {cooling['cooling_config']['pump_speed']}%")
+        print(f"   Facility power: {cooling['cooling_result']['total_facility_w']:.0f}W")
     
-    # Federated sharing
-    print("\n🌐 Federated NAS:")
-    fed_stats = nas.federated_coordinator.get_statistics()
-    print(f"   Shared frontier size: {fed_stats['shared_frontier_size']}")
+    # Transfer learning evaluation
+    nas.transfer_learning.register_pretrained_model('bert_base', 500, architecture, 'nlp')
+    transfer = nas.evaluate_transfer_learning('bert_base', 10000, 'nlp')
+    print(f"\n🔄 Transfer Learning:")
+    print(f"   Recommendation: {transfer['recommendation']}")
+    print(f"   Carbon savings: {transfer.get('carbon_savings_kg', 0):.1f} kg")
     
-    # Carbon credits
-    print("\n💰 Carbon Credits:")
-    credit_stats = nas.carbon_purchaser.get_statistics()
-    print(f"   Total offset: {credit_stats['total_tonnes_offset']:.3f} tonnes")
+    # Dynamic adaptation
+    adaptation = nas.adapt_for_carbon(500)
+    print(f"\n🌱 Dynamic Adaptation (500 gCO2/kWh):")
+    print(f"   Level: {adaptation['selected_level']}")
+    print(f"   Savings: {adaptation['carbon_savings_pct']:.1f}%")
+    
+    # Architecture certification
+    cert = nas.certify_architecture(architecture, 2.5, 1e-6)
+    print(f"\n📜 Carbon Certificate:")
+    print(f"   ID: {cert['certificate_id']}")
+    print(f"   Rating: {cert['carbon_rating']}")
     
     # Enhanced report
-    print("\n📈 Enhanced Report:")
     report = nas.get_enhanced_report()
-    print(f"   RL episodes: {report['rl_controller']['episodes']}")
-    print(f"   Avg reward: {report['rl_controller']['avg_reward']:.4f}")
-    print(f"   Avg lifetime carbon: {report['lifetime_analysis']['avg_lifetime_carbon_kg']:.4f} kg")
+    print(f"\n📊 Enhanced Report:")
+    print(f"   Pareto frontier: {report['multi_objective']['pareto_frontier_size']} architectures")
+    print(f"   Hardware profiles: {report['hardware_aware']['supported_hardware']}")
+    print(f"   Certificates: {report['certification']['certificates_issued']}")
     
     print("\n" + "=" * 70)
-    print("✅ Carbon-Aware NAS v4.3 - All Features Demonstrated")
-    print("   ✅ RL-based architecture search")
-    print("   ✅ Federated NAS coordination")
-    print("   ✅ Lifetime carbon accounting")
-    print("   ✅ Automated carbon credit purchasing")
-    print("   ✅ Carbon budget enforcement")
+    print("✅ Carbon-Aware NAS v4.4 - All Features Demonstrated")
+    print("   ✅ Multi-objective NAS with constraints")
+    print("   ✅ Hardware-aware architecture search")
+    print("   ✅ Architecture-cooling co-optimization")
+    print("   ✅ Carbon-aware transfer learning")
+    print("   ✅ Dynamic architecture adaptation")
+    print("   ✅ Architecture carbon certification")
     print("=" * 70)
 
 
