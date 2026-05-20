@@ -1,1174 +1,966 @@
 # src/enhancements/helium_circularity.py
 
 """
-Enhanced Helium Circular Economy Management System - Version 4.7
+Enhanced Helium Circularity Model for Green Agent - Version 4.8
+
+Models helium recovery and circularity for data center HDDs.
+Tracks helium-filled assets, optimizes recovery timing, and simulates
+market dynamics to maximize circularity and minimize costs.
 
 KEY ENHANCEMENTS OVER v4.6:
-1. FIXED: GPU acceleration for Transformer training (CUDA support)
-2. FIXED: Gas optimization for blockchain (batch minting)
-3. ADDED: Multi-chain support (Ethereum, Polygon, BSC)
-4. ADDED: Real-time alerting with threshold notifications
-5. ADDED: Automated trading with smart contracts
-6. ADDED: Digital twin calibration with real-time data
-7. ADDED: Supply chain API integration (supplier data)
-8. ADDED: NLP sentiment analysis with Transformers
-9. ADDED: LCA automation with real-time tracking
-10. ADDED: Batch token minting for gas efficiency
+1. IMPLEMENTED: Complete optimization engine with real cost functions
+2. IMPLEMENTED: Complete self-contained material registry
+3. IMPLEMENTED: Dynamic reporting with live simulation results
+4. IMPLEMENTED: Configurable simulation with async runner
+5. ADDED: HeliumMarket with dynamic pricing and supply/demand
+6. ADDED: Multi-asset portfolio optimization
+7. ADDED: Weibull failure distribution with real parameters
+8. ADDED: Recovery logistics cost modeling
+9. ADDED: Carbon credit integration for recovered helium
+10. ADDED: Comprehensive sensitivity analysis
 
-Reference: 
-- "Helium Conservation in Quantum Computing" (Nature Physics, 2024)
-- "Circular Economy for Critical Materials" (Ellen MacArthur Foundation, 2024)
-- "Helium Market Dynamics and Price Forecasting" (Resources Policy, 2024)
+Reference:
+- "Helium Recovery in Data Centers" (Seagate Technology, 2024)
+- "Circular Economy for Critical Materials" (Nature Sustainability, 2024)
+- "Helium Market Dynamics" (USGS Mineral Commodity Summaries, 2024)
+- "Weibull Analysis for HDD Failure Prediction" (IEEE TDMR, 2023)
 """
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable, Union
 from enum import Enum
 import numpy as np
-import hashlib
-import json
+from scipy import stats
+from scipy.optimize import minimize, differential_evolution
 import logging
+import asyncio
 import time
+import math
+import json
 import random
+import hashlib
 from datetime import datetime, timedelta
 from collections import deque, defaultdict
-import threading
-import asyncio
-import aiohttp
 from pathlib import Path
-import math
-import pickle
-import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
-import sqlite3
-from functools import wraps
-import asyncio
-import struct
-from typing import Optional
-
-# Try to import optional dependencies
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
-try:
-    from web3 import Web3
-    from web3.middleware import geth_poa_middleware
-    from web3.contract import Contract
-    WEB3_AVAILABLE = True
-except ImportError:
-    WEB3_AVAILABLE = False
-
-try:
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import mean_absolute_error, r2_score
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import websockets
-    WEBSOCKETS_AVAILABLE = True
-except ImportError:
-    WEBSOCKETS_AVAILABLE = False
-
-try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
-
-# Hardware communication libraries
-try:
-    from pymodbus.client import ModbusTcpClient
-    from pymodbus.exceptions import ModbusException
-    MODBUS_AVAILABLE = True
-except ImportError:
-    MODBUS_AVAILABLE = False
-
-try:
-    from opcua import Client as OPCUAClient
-    OPCUA_AVAILABLE = True
-except ImportError:
-    OPCUA_AVAILABLE = False
-
-try:
-    import serial
-    import serial.tools.list_ports
-    SERIAL_AVAILABLE = True
-except ImportError:
-    SERIAL_AVAILABLE = False
-
-# Transformers for NLP sentiment
-try:
-    from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
+import copy
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENHANCEMENT 1: GPU-Accelerated Transformer with CUDA
+# MODULE 1: CONFIGURATION AND CORE DATA TYPES
 # ============================================================
 
-class GPUAcceleratedTransformer(nn.Module):
-    """
-    GPU-accelerated Transformer for demand forecasting.
-    
-    Features:
-    - CUDA support for fast training
-    - Mixed precision training (AMP)
-    - Multi-GPU support (DataParallel)
-    - Gradient checkpointing for memory efficiency
-    """
-    
-    def __init__(self, input_dim: int = 10, d_model: int = 128,
-                 nhead: int = 8, num_layers: int = 3,
-                 dropout: float = 0.1, seq_length: int = 30,
-                 forecast_horizon: int = 24):
-        super().__init__()
-        
-        self.seq_length = seq_length
-        self.forecast_horizon = forecast_horizon
-        self.d_model = d_model
-        
-        # Check CUDA availability
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Transformer using device: {self.device}")
-        
-        # Input embedding
-        self.input_embedding = nn.Linear(input_dim, d_model).to(self.device)
-        self.pos_encoding = self._generate_positional_encoding(seq_length, d_model).to(self.device)
-        
-        # Transformer encoder with gradient checkpointing
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers, enable_nested_tensor=True
-        ).to(self.device)
-        
-        # Output layers
-        self.fc_out = nn.Sequential(
-            nn.Linear(d_model, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, forecast_horizon)
-        ).to(self.device)
-    
-    def _generate_positional_encoding(self, seq_len: int, d_model: int) -> torch.Tensor:
-        """Generate sinusoidal positional encoding"""
-        pe = torch.zeros(seq_len, d_model)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0)
-    
-    def forward(self, x):
-        x = self.input_embedding(x)
-        x = x + self.pos_encoding[:, :x.size(1), :]
-        x = self.transformer_encoder(x)
-        x = x[:, -1, :]
-        return self.fc_out(x)
+class RecoveryMethod(Enum):
+    """Helium recovery methods"""
+    DIRECT_CAPTURE = "direct_capture"
+    MEMBRANE_SEPARATION = "membrane_separation"
+    CRYOGENIC_DISTILLATION = "cryogenic_distillation"
+    PRESSURE_SWING_ADSORPTION = "pressure_swing_adsorption"
+    HYBRID = "hybrid"
 
 
-class AdvancedDemandForecaster:
-    """
-    GPU-accelerated demand forecasting with Transformer ensemble.
-    
-    Features:
-    - CUDA training and inference
-    - Mixed precision for speed
-    - Multi-GPU support
-    - Gradient accumulation for large models
-    """
-    
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        
-        # Models
-        self.transformer = None
-        self.lstm = None
-        self.rf_model = None
-        self.gb_model = None
-        
-        # Scalers
-        self.scaler_X = StandardScaler() if SKLEARN_AVAILABLE else None
-        self.scaler_y = StandardScaler() if SKLEARN_AVAILABLE else None
-        
-        # GPU settings
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.use_amp = config.get('use_amp', True) and torch.cuda.is_available()
-        self.gradient_accumulation = config.get('gradient_accumulation', 4)
-        
-        # Training data
-        self.training_data = None
-        self.val_data = None
-        
-        # Forecast cache
-        self.forecast_cache = {}
-        self.cache_ttl = 3600  # 1 hour
-        
-        # Mixed precision scaler
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
-        
-        self._lock = threading.RLock()
-        logger.info(f"AdvancedDemandForecaster initialized on {self.device}")
-    
-    def prepare_features(self, df: pd.DataFrame, sequence_length: int = 30) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepare features for Transformer/LSTM"""
-        if not PANDAS_AVAILABLE:
-            return None, None
-        
-        df = df.copy()
-        
-        # Time features
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df['day_of_week'] = df['date'].dt.dayofweek
-            df['month'] = df['date'].dt.month
-            df['quarter'] = df['date'].dt.quarter
-            df['day_of_year'] = df['date'].dt.dayofyear
-        
-        # Cyclical encoding
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24) if 'hour' in df.columns else 0
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24) if 'hour' in df.columns else 0
-        
-        # Lag features
-        for lag in [1, 3, 7, 14, 30]:
-            df[f'demand_lag_{lag}'] = df['demand'].shift(lag)
-        
-        # Rolling statistics
-        for window in [7, 14, 30]:
-            df[f'demand_ma_{window}'] = df['demand'].rolling(window).mean()
-            df[f'demand_std_{window}'] = df['demand'].rolling(window).std()
-        
-        # Price features
-        if 'price' in df.columns:
-            df['price_change'] = df['price'].pct_change()
-            df['price_ma_7'] = df['price'].rolling(7).mean()
-        
-        # Drop NaN
-        df = df.dropna()
-        
-        # Create sequences
-        feature_cols = [c for c in df.columns if c not in ['demand', 'date']]
-        X = df[feature_cols].values
-        y = df['demand'].values
-        
-        # Normalize
-        if self.scaler_X:
-            X = self.scaler_X.fit_transform(X)
-        if self.scaler_y:
-            y = self.scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
-        
-        # Create sequences
-        X_seq, y_seq = [], []
-        for i in range(len(X) - sequence_length - 30):
-            X_seq.append(X[i:i+sequence_length])
-            y_seq.append(y[i+sequence_length:i+sequence_length+30])
-        
-        return np.array(X_seq), np.array(y_seq)
-    
-    def train_transformer_gpu(self, X_seq: np.ndarray, y_seq: np.ndarray,
-                             epochs: int = 100, batch_size: int = 64) -> Dict:
-        """Train Transformer model on GPU"""
-        if not TORCH_AVAILABLE:
-            logger.warning("PyTorch not available")
-            return {'error': 'PyTorch not available'}
-        
-        input_dim = X_seq.shape[2]
-        
-        # Move model to GPU
-        self.transformer = GPUAcceleratedTransformer(
-            input_dim=input_dim,
-            d_model=128,
-            nhead=8,
-            num_layers=3,
-            seq_length=X_seq.shape[1],
-            forecast_horizon=30
-        ).to(self.device)
-        
-        # Multi-GPU support
-        if torch.cuda.device_count() > 1:
-            logger.info(f"Using {torch.cuda.device_count()} GPUs")
-            self.transformer = nn.DataParallel(self.transformer)
-        
-        # Split data
-        split_idx = int(len(X_seq) * 0.8)
-        X_train, X_val = X_seq[:split_idx], X_seq[split_idx:]
-        y_train, y_val = y_seq[:split_idx], y_seq[split_idx:]
-        
-        # Create data loaders
-        train_dataset = TensorDataset(
-            torch.FloatTensor(X_train).to(self.device),
-            torch.FloatTensor(y_train).to(self.device)
-        )
-        val_dataset = TensorDataset(
-            torch.FloatTensor(X_val).to(self.device),
-            torch.FloatTensor(y_val).to(self.device)
-        )
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size)
-        
-        optimizer = optim.AdamW(self.transformer.parameters(), lr=1e-4, weight_decay=1e-5)
-        criterion = nn.MSELoss()
-        
-        best_val_loss = float('inf')
-        training_history = []
-        
-        for epoch in range(epochs):
-            self.transformer.train()
-            train_loss = 0
-            
-            for i, (batch_X, batch_y) in enumerate(train_loader):
-                if self.use_amp:
-                    with torch.cuda.amp.autocast():
-                        output = self.transformer(batch_X)
-                        loss = criterion(output, batch_y) / self.gradient_accumulation
-                    
-                    self.scaler.scale(loss).backward()
-                    
-                    if (i + 1) % self.gradient_accumulation == 0:
-                        self.scaler.step(optimizer)
-                        self.scaler.update()
-                        optimizer.zero_grad()
-                else:
-                    output = self.transformer(batch_X)
-                    loss = criterion(output, batch_y)
-                    loss.backward()
-                    
-                    if (i + 1) % self.gradient_accumulation == 0:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                
-                train_loss += loss.item() * self.gradient_accumulation
-            
-            # Validation
-            self.transformer.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch_X, batch_y in val_loader:
-                    output = self.transformer(batch_X)
-                    val_loss += criterion(output, batch_y).item()
-            
-            avg_train_loss = train_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
-            
-            training_history.append({
-                'epoch': epoch + 1,
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss
-            })
-            
-            if (epoch + 1) % 10 == 0:
-                logger.info(f"Epoch {epoch+1}/{epochs} - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
-            
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                self._save_transformer_checkpoint()
-        
-        return {
-            'training_history': training_history,
-            'best_val_loss': best_val_loss,
-            'epochs': epochs,
-            'device': str(self.device)
-        }
-    
-    def _save_transformer_checkpoint(self):
-        """Save transformer checkpoint"""
-        checkpoint_dir = Path('checkpoints')
-        checkpoint_dir.mkdir(exist_ok=True)
-        
-        checkpoint = {
-            'model_state_dict': self.transformer.state_dict(),
-            'scaler_X': self.scaler_X,
-            'scaler_y': self.scaler_y
-        }
-        torch.save(checkpoint, checkpoint_dir / 'transformer_checkpoint.pt')
-    
-    def _load_transformer_checkpoint(self):
-        """Load transformer checkpoint"""
-        checkpoint_path = Path('checkpoints/transformer_checkpoint.pt')
-        if checkpoint_path.exists():
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            self.transformer.load_state_dict(checkpoint['model_state_dict'])
-            self.scaler_X = checkpoint['scaler_X']
-            self.scaler_y = checkpoint['scaler_y']
-            logger.info("Transformer checkpoint loaded")
-    
-    def get_statistics(self) -> Dict:
-        """Get forecaster statistics"""
-        with self._lock:
-            return {
-                'transformer_trained': self.transformer is not None,
-                'device': str(self.device),
-                'cuda_available': torch.cuda.is_available(),
-                'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                'use_amp': self.use_amp
-            }
+class AssetType(Enum):
+    """Types of helium-containing assets"""
+    HDD_HELIUM_FILLED = "hdd_helium_filled"
+    MRI_MAGNET = "mri_magnet"
+    LABORATORY_EQUIPMENT = "laboratory_equipment"
+    FIBER_OPTIC_MANUFACTURING = "fiber_optic"
 
 
-# ============================================================
-# ENHANCEMENT 2: Gas-Optimized Batch Token Minting
-# ============================================================
-
-class GasOptimizedBlockchainManager:
-    """
-    Gas-optimized blockchain manager with batch minting.
+@dataclass
+class CircularityConfig:
+    """Complete configuration for circularity analysis"""
     
-    Features:
-    - Batch token minting for gas efficiency
-    - Multi-chain support (Ethereum, Polygon, BSC)
-    - Transaction batching
-    - Gas price oracle
-    """
+    # Asset configuration
+    asset_type: AssetType = AssetType.HDD_HELIUM_FILLED
+    total_assets: int = 10000
+    helium_per_asset_liters: float = 1.0  # Liters of helium per HDD
     
-    # Multi-chain RPC endpoints
-    CHAINS = {
-        'ethereum': 'https://mainnet.infura.io/v3/',
-        'polygon': 'https://polygon-rpc.com',
-        'bsc': 'https://bsc-dataseed.binance.org',
-        'sepolia': 'https://sepolia.infura.io/v3/'
-    }
+    # Failure distribution (Weibull)
+    weibull_shape: float = 1.5  # Shape parameter (β)
+    weibull_scale: float = 5.0  # Scale parameter in years (η)
     
-    # Gas-optimized ERC-1155 ABI with batch minting
-    BATCH_MINT_ABI = json.loads('''
-    [
-        {"inputs":[{"name":"to","type":"address"},{"name":"ids","type":"uint256[]"},{"name":"amounts","type":"uint256[]"},{"name":"data","type":"bytes"}],"name":"mintBatch","outputs":[],"type":"function"},
-        {"inputs":[{"name":"from","type":"address"},{"name":"to","type":"address"},{"name":"ids","type":"uint256[]"},{"name":"amounts","type":"uint256[]"},{"name":"data","type":"bytes"}],"name":"safeBatchTransferFrom","outputs":[],"type":"function"},
-        {"constant":true,"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}
-    ]
-    ''')
+    # Recovery configuration
+    recovery_method: RecoveryMethod = RecoveryMethod.MEMBRANE_SEPARATION
+    recovery_efficiency: float = 0.85  # 85% recovery rate
+    collection_cost_per_unit_usd: float = 2.50
     
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.chain = config.get('chain', 'polygon')  # Default to Polygon for lower gas
-        self.web3 = None
-        self.contract = None
-        self.account = None
-        
-        # Batch minting queue
-        self.mint_queue = deque(maxlen=1000)
-        self.batch_size = config.get('batch_size', 10)
-        self.batch_interval = config.get('batch_interval', 60)  # seconds
-        
-        # Token registry
-        self.tokens: Dict[int, Dict] = {}
-        self.next_token_id = 1
-        
-        # Gas price oracle
-        self.gas_price_cache = {}
-        self.last_gas_update = 0
-        
-        # Background batch processor
-        self._running = False
-        self._batch_thread = None
-        
-        # Initialize Web3
-        if WEB3_AVAILABLE and config.get('rpc_url'):
-            self._init_web3()
-        
-        # Start batch processor
-        self.start_batch_processor()
-        
-        self._lock = threading.RLock()
-        logger.info(f"GasOptimizedBlockchainManager initialized on {self.chain}")
+    # Market configuration
+    helium_market_price_per_liter_usd: float = 3.50
+    price_volatility: float = 0.15
+    supply_growth_rate: float = 0.02
     
-    def _init_web3(self):
-        """Initialize Web3 connection for selected chain"""
-        try:
-            rpc_url = self.config.get('rpc_url') or self.CHAINS.get(self.chain)
-            if not rpc_url:
-                raise ValueError(f"Unknown chain: {self.chain}")
-            
-            self.web3 = Web3(Web3.HTTPProvider(rpc_url))
-            
-            if self.chain in ['polygon', 'bsc']:
-                self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
-            
-            if self.web3.is_connected():
-                logger.info(f"Connected to {self.chain} (chain ID: {self.web3.eth.chain_id})")
-                
-                if 'private_key' in self.config:
-                    self.account = self.web3.eth.account.from_key(self.config['private_key'])
-                    logger.info(f"Account loaded: {self.account.address}")
-                
-                if self.config.get('contract_address'):
-                    self.contract = self.web3.eth.contract(
-                        address=Web3.to_checksum_address(self.config['contract_address']),
-                        abi=self.BATCH_MINT_ABI
-                    )
-            else:
-                logger.warning(f"Failed to connect to {self.chain}")
-        except Exception as e:
-            logger.error(f"Web3 initialization failed: {e}")
+    # Simulation settings
+    simulation_years: int = 10
+    time_steps_per_year: int = 12  # Monthly
+    monte_carlo_runs: int = 1000
     
-    def get_gas_price(self) -> int:
-        """Get optimized gas price"""
-        try:
-            if self.web3:
-                gas_price = self.web3.eth.gas_price
-                
-                # Adjust for chain
-                if self.chain == 'polygon':
-                    # Polygon has minimum 30 Gwei
-                    gas_price = max(gas_price, 30 * 10**9)
-                elif self.chain == 'bsc':
-                    # BSC has minimum 5 Gwei
-                    gas_price = max(gas_price, 5 * 10**9)
-                
-                return gas_price
-        except Exception as e:
-            logger.error(f"Gas price fetch failed: {e}")
-        
-        # Fallback gas prices
-        fallback = {'ethereum': 50, 'polygon': 30, 'bsc': 5, 'sepolia': 10}
-        return fallback.get(self.chain, 30) * 10**9
+    # Optimization settings
+    optimization_horizon_years: int = 5
+    discount_rate: float = 0.05  # 5% discount rate
     
-    def queue_mint(self, amount: float, purity: str, source: str, recipient: str) -> int:
-        """Queue a token mint for batch processing"""
-        with self._lock:
-            token_id = self.next_token_id
-            self.next_token_id += 1
-            
-            self.mint_queue.append({
-                'token_id': token_id,
-                'amount': amount,
-                'purity': purity,
-                'source': source,
-                'recipient': recipient,
-                'timestamp': time.time()
-            })
-            
-            logger.info(f"Queued token {token_id} for minting")
-            return token_id
+    # Carbon credit settings
+    carbon_credit_per_kg_helium_usd: float = 50.0
+    co2_equivalent_per_liter_helium_kg: float = 0.5  # kg CO2 equivalent
     
-    def process_batch(self):
-        """Process queued mints in batch"""
-        with self._lock:
-            if not self.mint_queue or not self.web3 or not self.contract:
-                return
-            
-            batch = []
-            while self.mint_queue and len(batch) < self.batch_size:
-                batch.append(self.mint_queue.popleft())
-            
-            if not batch:
-                return
-            
-            # Prepare batch mint parameters
-            token_ids = [b['token_id'] for b in batch]
-            amounts = [int(b['amount'] * 1000) for b in batch]
-            
-            # Get optimal gas price
-            gas_price = self.get_gas_price()
-            
-            try:
-                # Build batch mint transaction
-                tx = self.contract.functions.mintBatch(
-                    self.account.address,
-                    token_ids,
-                    amounts,
-                    b''
-                ).build_transaction({
-                    'from': self.account.address,
-                    'nonce': self.web3.eth.get_transaction_count(self.account.address),
-                    'gas': 500000,  # Higher gas for batch
-                    'gasPrice': gas_price
-                })
-                
-                # Sign and send
-                signed_tx = self.account.sign_transaction(tx)
-                tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                
-                # Store token records
-                for b in batch:
-                    self.tokens[b['token_id']] = {
-                        'token_id': b['token_id'],
-                        'amount': b['amount'],
-                        'purity': b['purity'],
-                        'source': b['source'],
-                        'owner': b['recipient'],
-                        'timestamp': time.time(),
-                        'tx_hash': tx_hash.hex(),
-                        'batch_tx': True
-                    }
-                
-                logger.info(f"Batch minted {len(batch)} tokens in single transaction")
-            except Exception as e:
-                logger.error(f"Batch mint failed: {e}")
-                # Re-queue failed items
-                for b in batch:
-                    self.mint_queue.appendleft(b)
-    
-    def start_batch_processor(self):
-        """Start background batch processing thread"""
-        if self._running:
-            return
-        
-        self._running = True
-        self._batch_thread = threading.Thread(target=self._batch_loop, daemon=True)
-        self._batch_thread.start()
-        logger.info("Batch processor started")
-    
-    def _batch_loop(self):
-        """Background batch processing loop"""
-        while self._running:
-            try:
-                if len(self.mint_queue) >= self.batch_size:
-                    self.process_batch()
-                time.sleep(self.batch_interval)
-            except Exception as e:
-                logger.error(f"Batch loop error: {e}")
-                time.sleep(5)
-    
-    def stop_batch_processor(self):
-        """Stop batch processor"""
-        self._running = False
-        if self._batch_thread:
-            self._batch_thread.join(timeout=10)
-        logger.info("Batch processor stopped")
-    
-    def mint_helium_token(self, amount: float, purity: str, source: str, recipient: str) -> int:
-        """Queue token for batch minting"""
-        return self.queue_mint(amount, purity, source, recipient)
-    
-    def get_statistics(self) -> Dict:
-        """Get blockchain statistics"""
-        with self._lock:
-            return {
-                'web3_connected': self.web3 is not None and self.web3.is_connected() if self.web3 else False,
-                'chain': self.chain,
-                'queued_mints': len(self.mint_queue),
-                'batch_size': self.batch_size,
-                'total_tokens': len(self.tokens),
-                'total_helium_tracked': sum(t['amount'] for t in self.tokens.values()),
-                'gas_price_gwei': self.get_gas_price() / 10**9 if self.web3 else 0
-            }
+    # Output settings
+    output_dir: str = "circularity_output"
+    generate_report: bool = True
+    generate_plots: bool = False
 
 
-# ============================================================
-# ENHANCEMENT 3: Real-Time Alerting System
-# ============================================================
+@dataclass
+class HeliumAsset:
+    """Individual helium-containing asset"""
+    asset_id: str
+    asset_type: AssetType
+    installation_date: datetime
+    helium_volume_liters: float
+    initial_value_usd: float
+    current_condition: float = 1.0  # 1.0 = perfect, 0.0 = failed
+    
+    def get_age_years(self, reference_date: Optional[datetime] = None) -> float:
+        """Get asset age in years"""
+        if reference_date is None:
+            reference_date = datetime.now()
+        return (reference_date - self.installation_date).days / 365.25
 
-class RealTimeAlertSystem:
-    """
-    Real-time alerting with threshold notifications.
+
+@dataclass
+class HeliumMarket:
+    """Helium market dynamics model"""
     
-    Features:
-    - Threshold-based alerts
-    - Multi-channel notifications (Slack, Email, SMS)
-    - Alert escalation
-    - Alert history and analytics
-    """
+    base_price_per_liter_usd: float = 3.50
+    current_price: float = 3.50
+    price_volatility: float = 0.15
+    supply_growth_rate: float = 0.02
+    demand_growth_rate: float = 0.03
     
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        
-        # Alert thresholds
-        self.thresholds = {
-            'high_temperature': {'value': 80, 'unit': '°C', 'severity': 'critical'},
-            'low_purity': {'value': 99.9, 'unit': '%', 'severity': 'high'},
-            'high_pressure': {'value': 2.0, 'unit': 'bar', 'severity': 'warning'},
-            'low_helium': {'value': 1000, 'unit': 'L', 'severity': 'critical'},
-            'high_carbon': {'value': 500, 'unit': 'gCO2/kWh', 'severity': 'warning'}
-        }
-        
-        # Webhook URLs
-        self.slack_webhook = config.get('slack_webhook')
-        self.teams_webhook = config.get('teams_webhook')
-        
-        # Alert history
-        self.alert_history = deque(maxlen=10000)
-        self.active_alerts = {}
-        
-        # Escalation settings
-        self.escalation_delay = config.get('escalation_delay', 300)  # 5 minutes
-        self.escalation_levels = ['slack', 'teams', 'email', 'sms']
-        
-        self._lock = threading.RLock()
-        logger.info("RealTimeAlertSystem initialized")
+    # Market state
+    price_history: List[float] = field(default_factory=list)
+    supply_history: List[float] = field(default_factory=list)
+    demand_history: List[float] = field(default_factory=list)
+    shock_events: List[Dict] = field(default_factory=list)
     
-    def check_threshold(self, metric: str, value: float, sensor_id: str = None) -> Optional[Dict]:
-        """Check if metric exceeds threshold"""
-        if metric not in self.thresholds:
-            return None
+    def simulate_price_path(self, years: int, steps_per_year: int = 12) -> List[float]:
+        """
+        Simulate helium price path using geometric Brownian motion with
+        mean reversion to long-term supply/demand equilibrium.
+        """
+        total_steps = years * steps_per_year
+        dt = 1.0 / steps_per_year
         
-        threshold = self.thresholds[metric]
-        is_violation = value > threshold['value'] if 'high' in metric else value < threshold['value']
+        prices = [self.current_price]
         
-        if is_violation:
-            alert_key = f"{sensor_id}_{metric}" if sensor_id else metric
+        for t in range(1, total_steps + 1):
+            # Mean reversion to equilibrium price
+            equilibrium_price = self._calculate_equilibrium_price(t * dt)
+            mean_reversion_speed = 0.3
             
-            # Check if alert already active
-            if alert_key in self.active_alerts:
-                active = self.active_alerts[alert_key]
-                if time.time() - active['triggered_at'] < 60:  # Suppress duplicates for 60 seconds
-                    return None
+            # Random shock with GBM
+            random_shock = np.random.normal(0, 1)
+            price_change = (
+                mean_reversion_speed * (equilibrium_price - prices[-1]) * dt +
+                self.price_volatility * prices[-1] * random_shock * np.sqrt(dt)
+            )
             
-            alert = {
-                'alert_id': hashlib.md5(f"{alert_key}_{time.time()}".encode()).hexdigest()[:12],
-                'metric': metric,
-                'value': value,
-                'threshold': threshold['value'],
-                'severity': threshold['severity'],
-                'sensor_id': sensor_id,
-                'timestamp': time.time(),
-                'resolved': False
-            }
+            # Apply price floor
+            new_price = max(0.5, prices[-1] + price_change)
             
-            self.active_alerts[alert_key] = alert
-            self.alert_history.append(alert)
+            # Check for market shock events
+            new_price = self._apply_shock_events(new_price, t * dt)
             
-            # Send notification
-            self._send_notification(alert)
-            
-            return alert
+            prices.append(new_price)
         
-        # Check if resolved
-        for alert_key, active in list(self.active_alerts.items()):
-            if (sensor_id and sensor_id in alert_key) or metric in alert_key:
-                if not is_violation:
-                    active['resolved'] = True
-                    active['resolved_at'] = time.time()
-                    self._send_resolution_notification(active)
-                    del self.active_alerts[alert_key]
-        
-        return None
+        self.price_history = prices
+        return prices
     
-    def _send_notification(self, alert: Dict):
-        """Send alert notification"""
-        message = self._format_alert_message(alert)
-        
-        # Send to configured channels
-        if self.slack_webhook:
-            asyncio.create_task(self._send_slack(message))
-        
-        if self.teams_webhook:
-            asyncio.create_task(self._send_teams(message))
+    def _calculate_equilibrium_price(self, time_years: float) -> float:
+        """Calculate equilibrium price based on supply and demand"""
+        supply = self.base_price_per_liter_usd * (1 + self.supply_growth_rate) ** time_years
+        demand_pressure = (1 + self.demand_growth_rate) ** time_years
+        return supply * demand_pressure
     
-    def _send_resolution_notification(self, alert: Dict):
-        """Send resolution notification"""
-        message = f"✅ Alert resolved: {alert['metric']} returned to normal ({alert['value']:.2f})"
-        if self.slack_webhook:
-            asyncio.create_task(self._send_slack(message))
+    def _apply_shock_events(self, price: float, time_years: float) -> float:
+        """Apply market shock events"""
+        for shock in self.shock_events:
+            shock_time = shock.get('time_years', 0)
+            if abs(time_years - shock_time) < 0.1:
+                price *= shock.get('multiplier', 1.0)
+                logger.info(f"Market shock at year {time_years:.1f}: price → ${price:.2f}")
+        return price
     
-    def _format_alert_message(self, alert: Dict) -> str:
-        """Format alert message"""
-        severity_emoji = {
-            'critical': '🚨',
-            'high': '⚠️',
-            'warning': '🔔',
-            'info': 'ℹ️'
-        }
-        emoji = severity_emoji.get(alert['severity'], '🔔')
-        
-        return (f"{emoji} *ALERT*: {alert['metric']} = {alert['value']:.2f} "
-                f"(threshold: {alert['threshold']})\n"
-                f"Severity: {alert['severity'].upper()}\n"
-                f"Sensor: {alert.get('sensor_id', 'N/A')}")
-    
-    async def _send_slack(self, message: str):
-        """Send Slack notification"""
-        if not self.slack_webhook:
-            return
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                payload = {'text': message}
-                async with session.post(self.slack_webhook, json=payload) as response:
-                    if response.status != 200:
-                        logger.error(f"Slack notification failed: {response.status}")
-            except Exception as e:
-                logger.error(f"Slack error: {e}")
-    
-    async def _send_teams(self, message: str):
-        """Send Teams notification"""
-        if not self.teams_webhook:
-            return
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                payload = {
-                    "@type": "MessageCard",
-                    "@context": "http://schema.org/extensions",
-                    "text": message
-                }
-                async with session.post(self.teams_webhook, json=payload) as response:
-                    if response.status != 200:
-                        logger.error(f"Teams notification failed: {response.status}")
-            except Exception as e:
-                logger.error(f"Teams error: {e}")
-    
-    def get_active_alerts(self) -> List[Dict]:
-        """Get currently active alerts"""
-        with self._lock:
-            return [a for a in self.active_alerts.values() if not a['resolved']]
-    
-    def get_statistics(self) -> Dict:
-        """Get alert statistics"""
-        with self._lock:
-            recent = list(self.alert_history)[-100:]
-            return {
-                'total_alerts': len(self.alert_history),
-                'active_alerts': len(self.active_alerts),
-                'alerts_by_severity': {
-                    severity: sum(1 for a in recent if a['severity'] == severity)
-                    for severity in ['critical', 'high', 'warning', 'info']
-                }
-            }
-
-
-# ============================================================
-# ENHANCEMENT 4: Complete Enhanced Helium Circularity v4.7
-# ============================================================
-
-class UltimateHeliumCircularityV4:
-    """
-    Complete enhanced helium circularity management system v4.7.
-    
-    Enhanced Features:
-    - GPU-accelerated Transformer forecasting
-    - Gas-optimized batch token minting
-    - Multi-chain blockchain support
-    - Real-time alerting system
-    - Automated trading with smart contracts
-    - Digital twin calibration
-    """
-    
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        
-        # Enhanced components
-        self.sensor_network = RealCryogenicSensorNetwork(config.get('sensors', {}))
-        self.blockchain_manager = GasOptimizedBlockchainManager(config.get('blockchain', {}))
-        self.demand_forecaster = AdvancedDemandForecaster(config.get('forecast', {}))
-        self.alert_system = RealTimeAlertSystem(config.get('alerts', {}))
-        
-        # Original components
-        self.market_data = RealMarketDataProvider(config.get('market', {}))
-        self.quantum_recovery = QuantumHeliumRecovery(config.get('quantum', {}))
-        self.exchange = HeliumExchangeMarketplace(config.get('exchange', {}))
-        self.purity_optimizer = PurityCascadingOptimizer(config.get('purity', {}))
-        self.compliance = HeliumRegulatoryCompliance(config.get('compliance', {}))
-        
-        # Life cycle assessment
-        self.lca_metrics = {
-            'carbon_footprint_kg': 0.0,
-            'water_usage_l': 0.0,
-            'energy_consumption_mwh': 0.0
-        }
-        
-        # State
-        self.helium_inventory: Dict[str, Dict] = {}
-        self._running = False
-        
-        logger.info("UltimateHeliumCircularityV4 v4.7 initialized")
-    
-    def add_modbus_sensor(self, sensor_id: str, host: str, port: int,
-                         unit_id: int, register_address: int,
-                         threshold_metric: str = None):
-        """Add Modbus sensor with threshold monitoring"""
-        self.sensor_network.add_modbus_sensor(
-            sensor_id, host, port, unit_id, register_address
-        )
-        
-        # Register for alerting
-        if threshold_metric:
-            self.alert_system.thresholds[f"sensor_{sensor_id}"] = {
-                'value': 80, 'unit': '°C', 'severity': 'warning'
-            }
-    
-    async def monitor_sensors_with_alerts(self):
-        """Monitor sensors and trigger alerts on threshold violations"""
-        sensor_data = self.sensor_network.read_all_sensors()
-        
-        for sensor_id, value in sensor_data.items():
-            # Check temperature threshold
-            if 'temp' in sensor_id.lower():
-                self.alert_system.check_threshold('high_temperature', value, sensor_id)
-            elif 'purity' in sensor_id.lower():
-                self.alert_system.check_threshold('low_purity', value, sensor_id)
-            elif 'pressure' in sensor_id.lower():
-                self.alert_system.check_threshold('high_pressure', value, sensor_id)
-        
-        return sensor_data
-    
-    def register_helium_batch_batched(self, quantity_liters: float, purity: str,
-                                     source: str, owner_address: str) -> int:
-        """Register helium batch using batched minting"""
-        token_id = self.blockchain_manager.mint_helium_token(
-            quantity_liters, purity, source, owner_address
-        )
-        
-        self.helium_inventory[f"token_{token_id}"] = {
-            'token_id': token_id,
-            'quantity': quantity_liters,
-            'purity': purity,
-            'source': source,
-            'owner': owner_address,
-            'timestamp': time.time(),
-            'queued': True
-        }
-        
-        return token_id
-    
-    async def train_demand_forecaster_gpu(self, historical_data: pd.DataFrame) -> Dict:
-        """Train transformer on GPU"""
-        X_seq, y_seq = self.demand_forecaster.prepare_features(historical_data)
-        
-        if X_seq is None:
-            return {'error': 'Failed to prepare features'}
-        
-        # Train on GPU
-        result = self.demand_forecaster.train_transformer_gpu(X_seq, y_seq, epochs=50)
-        
-        # Also train ensemble
-        self.demand_forecaster.train_ensemble(
-            X_seq.reshape(X_seq.shape[0], -1), y_seq[:, 0]
-        )
-        
-        return result
-    
-    async def get_enhanced_report(self) -> Dict:
-        """Get comprehensive enhanced report"""
-        await self.update_market_prices()
-        active_alerts = self.alert_system.get_active_alerts()
-        
-        return {
-            'sensor_network': self.sensor_network.get_statistics(),
-            'blockchain': self.blockchain_manager.get_statistics(),
-            'demand_forecast': self.demand_forecaster.get_statistics(),
-            'alert_system': self.alert_system.get_statistics(),
-            'active_alerts': active_alerts,
-            'market_data': {
-                'spot_price': self.futures_market.spot_price,
-                'futures_curve': self.futures_market.futures_curve
-            },
-            'lca_metrics': self.lca_metrics,
-            'inventory': {
-                'total_assets': len(self.helium_inventory),
-                'total_quantity': sum(t.get('quantity', 0) for t in self.helium_inventory.values())
-            }
-        }
-    
-    async def update_market_prices(self):
-        """Update market prices"""
-        spot_price = await self.market_data.fetch_spot_price()
-        self.futures_market.spot_price = spot_price
-        logger.info(f"Market price updated: ${spot_price:.2f}/MCF")
-    
-    def start(self):
-        """Start background monitoring"""
-        if self._running:
-            return
-        
-        self._running = True
-        self.sensor_network.start_background_monitoring()
-        
-        # Start alert monitoring thread
-        self._alert_thread = threading.Thread(target=self._alert_loop, daemon=True)
-        self._alert_thread.start()
-        
-        logger.info("Helium circularity system started")
-    
-    def _alert_loop(self):
-        """Background alert monitoring loop"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        while self._running:
-            try:
-                loop.run_until_complete(self.monitor_sensors_with_alerts())
-                time.sleep(5)
-            except Exception as e:
-                logger.error(f"Alert loop error: {e}")
-                time.sleep(1)
-    
-    def stop(self):
-        """Stop the system"""
-        self._running = False
-        self.sensor_network.stop_monitoring()
-        self.blockchain_manager.stop_batch_processor()
-        logger.info("Helium circularity system stopped")
-    
-    def get_statistics(self) -> Dict:
-        """Get system statistics (async wrapper)"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self.get_enhanced_report())
-        finally:
-            loop.close()
-
-
-# ============================================================
-# UNIT TESTS
-# ============================================================
-
-class TestHeliumCircularity:
-    """Unit tests for helium circularity components"""
-    
-    @staticmethod
-    def test_gpu_transformer():
-        print("\nTesting GPU transformer...")
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            model = GPUAcceleratedTransformer()
-            print(f"✓ GPU transformer test passed (device: {model.device})")
-        else:
-            print("⚠ GPU not available, skipping test")
-    
-    @staticmethod
-    def test_batch_minting():
-        print("\nTesting batch minting...")
-        manager = GasOptimizedBlockchainManager({'batch_size': 5})
-        for i in range(3):
-            manager.queue_mint(100, '99.999%', 'test', '0x123')
-        assert manager.queued_mints == 3
-        print("✓ Batch minting test passed")
-    
-    @staticmethod
-    def test_alert_system():
-        print("\nTesting alert system...")
-        alerts = RealTimeAlertSystem({})
-        alert = alerts.check_threshold('high_temperature', 85, 'sensor_1')
-        assert alert is not None
-        assert alert['severity'] == 'critical'
-        print("✓ Alert system test passed")
-    
-    @staticmethod
-    def run_all():
-        """Run all tests"""
-        print("=" * 50)
-        print("Running Helium Circularity Unit Tests")
-        print("=" * 50)
-        
-        TestHeliumCircularity.test_gpu_transformer()
-        TestHeliumCircularity.test_batch_minting()
-        TestHeliumCircularity.test_alert_system()
-        
-        print("\n" + "=" * 50)
-        print("All tests passed! ✓")
-        print("=" * 50)
-
-
-# ============================================================
-# COMPLETE WORKING EXAMPLE
-# ============================================================
-
-async def main():
-    """Enhanced demonstration of v4.7 features"""
-    print("=" * 70)
-    print("Ultimate Helium Circularity System v4.7 - Enhanced Demo")
-    print("=" * 70)
-    
-    # Run unit tests
-    TestHeliumCircularity.run_all()
-    
-    # Initialize system
-    helium_system = UltimateHeliumCircularityV4({
-        'blockchain': {
-            'chain': 'polygon',
-            'batch_size': 10,
-            'batch_interval': 60,
-            'contract_address': os.environ.get('HELIUM_CONTRACT_ADDRESS')
-        },
-        'forecast': {
-            'use_amp': True,
-            'gradient_accumulation': 4
-        },
-        'alerts': {
-            'slack_webhook': os.environ.get('SLACK_WEBHOOK_URL'),
-            'escalation_delay': 300
-        },
-        'sensors': {},
-        'market': {
-            'cme_api_key': os.environ.get('CME_API_KEY')
-        },
-        'quantum': {'qubit_count': 100}
-    })
-    
-    print("\n✅ v4.7 Enhancements Active:")
-    print(f"   GPU Transformer: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-    print(f"   Batch minting: {helium_system.blockchain_manager.batch_size} tokens/batch")
-    print(f"   Blockchain: {helium_system.blockchain_manager.chain}")
-    print(f"   Alert system: Multi-channel notifications")
-    
-    # Add Modbus sensors
-    print("\n🌡 Adding sensors with alerting...")
-    helium_system.add_modbus_sensor('cryostat_temp', '192.168.1.100', 502, 1, 100)
-    helium_system.add_modbus_sensor('recovery_pressure', '192.168.1.101', 502, 1, 200)
-    
-    # Register helium batch using batched minting
-    print("\n🔗 Registering helium batch (queued)...")
-    token_id = helium_system.register_helium_batch_batched(
-        1000, '99.9999%', 'quantum_recovery', '0x742d35Cc6634C0532925a3b844Bc9e7595f90b36'
-    )
-    print(f"   Queued token ID: {token_id}")
-    print(f"   Batch queue size: {helium_system.blockchain_manager.queued_mints}")
-    
-    # Train GPU transformer
-    if PANDAS_AVAILABLE:
-        print("\n📊 Training GPU transformer...")
-        dates = pd.date_range('2024-01-01', periods=500)
-        historical_data = pd.DataFrame({
-            'date': dates,
-            'hour': dates.hour,
-            'demand': 1000 + 100 * np.sin(np.arange(500) * 2 * np.pi / 24) + np.random.normal(0, 50, 500),
-            'price': 200 + 10 * np.sin(np.arange(500) * 2 * np.pi / 30) + np.random.normal(0, 5, 500)
+    def add_shock_event(self, time_years: float, multiplier: float, description: str):
+        """Add a market shock event"""
+        self.shock_events.append({
+            'time_years': time_years,
+            'multiplier': multiplier,
+            'description': description
         })
+    
+    def get_price_at_time(self, time_years: float) -> float:
+        """Get helium price at a specific time"""
+        if not self.price_history:
+            return self.current_price
         
-        training_result = await helium_system.train_demand_forecaster_gpu(historical_data)
-        if 'error' not in training_result:
-            print(f"   Training epochs: {training_result.get('epochs', 0)}")
-            print(f"   Device: {training_result.get('device', 'CPU')}")
+        index = int(time_years * 12)
+        index = min(index, len(self.price_history) - 1)
+        return self.price_history[index]
     
-    # Test alert system
-    print("\n🚨 Testing alert system...")
-    alert = helium_system.alert_system.check_threshold('high_temperature', 85, 'cryostat_temp')
-    if alert:
-        print(f"   Alert triggered: {alert['metric']} = {alert['value']} (threshold: {alert['threshold']})")
+    def get_statistics(self) -> Dict:
+        """Get market statistics"""
+        if not self.price_history:
+            return {'current_price': self.current_price}
+        
+        prices = np.array(self.price_history)
+        return {
+            'current_price': prices[-1],
+            'mean_price': float(np.mean(prices)),
+            'min_price': float(np.min(prices)),
+            'max_price': float(np.max(prices)),
+            'volatility': float(np.std(prices) / np.mean(prices)) if np.mean(prices) > 0 else 0
+        }
+
+
+# ============================================================
+# MODULE 2: COMPLETE MATERIAL REGISTRY
+# ============================================================
+
+class HeliumMaterialRegistry:
+    """
+    Complete self-contained registry for helium material data.
     
-    # Get blockchain statistics
-    print("\n⛓️ Blockchain statistics:")
-    blockchain_stats = helium_system.blockchain_manager.get_statistics()
-    print(f"   Chain: {blockchain_stats['chain']}")
-    print(f"   Queued mints: {blockchain_stats['queued_mints']}")
-    print(f"   Gas price: {blockchain_stats['gas_price_gwei']:.0f} Gwei")
+    Features:
+    - Realistic recovery cost data by method
+    - Carbon intensity factors
+    - Market price history
+    - Regional pricing variations
+    """
     
-    # Enhanced report
-    report = await helium_system.get_enhanced_report()
-    print(f"\n📊 Final Report:")
-    print(f"   GPU available: {report['demand_forecast']['cuda_available']}")
-    print(f"   Active alerts: {report['alert_system']['active_alerts']}")
-    print(f"   Blockchain: {report['blockchain']['chain']}")
-    print(f"   Total helium tracked: {report['blockchain']['total_helium_tracked']:.0f}L")
+    def __init__(self):
+        # Recovery method specifications
+        self.recovery_methods = {
+            RecoveryMethod.DIRECT_CAPTURE: {
+                'efficiency': 0.75,
+                'cost_per_unit_usd': 3.00,
+                'energy_kwh_per_liter': 0.5,
+                'purity_pct': 95.0,
+                'setup_cost_usd': 50000
+            },
+            RecoveryMethod.MEMBRANE_SEPARATION: {
+                'efficiency': 0.85,
+                'cost_per_unit_usd': 2.50,
+                'energy_kwh_per_liter': 0.3,
+                'purity_pct': 98.0,
+                'setup_cost_usd': 75000
+            },
+            RecoveryMethod.CRYOGENIC_DISTILLATION: {
+                'efficiency': 0.95,
+                'cost_per_unit_usd': 5.00,
+                'energy_kwh_per_liter': 1.2,
+                'purity_pct': 99.9,
+                'setup_cost_usd': 150000
+            },
+            RecoveryMethod.PRESSURE_SWING_ADSORPTION: {
+                'efficiency': 0.80,
+                'cost_per_unit_usd': 2.00,
+                'energy_kwh_per_liter': 0.4,
+                'purity_pct': 97.0,
+                'setup_cost_usd': 60000
+            },
+            RecoveryMethod.HYBRID: {
+                'efficiency': 0.90,
+                'cost_per_unit_usd': 3.50,
+                'energy_kwh_per_liter': 0.6,
+                'purity_pct': 98.5,
+                'setup_cost_usd': 100000
+            }
+        }
+        
+        # Asset type specifications
+        self.asset_specs = {
+            AssetType.HDD_HELIUM_FILLED: {
+                'helium_volume_liters': 1.0,
+                'initial_value_usd': 300,
+                'weibull_shape': 1.5,
+                'weibull_scale_years': 5.0,
+                'recovery_factor': 0.9  # 90% of helium is recoverable
+            },
+            AssetType.MRI_MAGNET: {
+                'helium_volume_liters': 1500,
+                'initial_value_usd': 500000,
+                'weibull_shape': 2.0,
+                'weibull_scale_years': 15.0,
+                'recovery_factor': 0.95
+            },
+            AssetType.LABORATORY_EQUIPMENT: {
+                'helium_volume_liters': 50,
+                'initial_value_usd': 20000,
+                'weibull_shape': 2.5,
+                'weibull_scale_years': 8.0,
+                'recovery_factor': 0.8
+            }
+        }
+        
+        # Carbon intensity factors (kg CO2 per liter of virgin helium production)
+        self.carbon_factors = {
+            'virgin_production': 15.0,  # kg CO2 per liter
+            'recovery_processing': 2.0,  # kg CO2 per liter recovered
+            'transportation': 0.5  # kg CO2 per liter per 1000km
+        }
+        
+        # Regional pricing multipliers
+        self.regional_multipliers = {
+            'US': 1.0,
+            'EU': 1.2,
+            'Asia': 1.15,
+            'Middle_East': 0.85
+        }
+        
+        logger.info("HeliumMaterialRegistry initialized with complete specifications")
     
-    helium_system.stop()
+    def get_recovery_specs(self, method: RecoveryMethod) -> Dict:
+        """Get specifications for a recovery method"""
+        return self.recovery_methods.get(method, {})
+    
+    def get_asset_specs(self, asset_type: AssetType) -> Dict:
+        """Get specifications for an asset type"""
+        return self.asset_specs.get(asset_type, {})
+    
+    def get_carbon_factor(self, process: str) -> float:
+        """Get carbon intensity factor for a process"""
+        return self.carbon_factors.get(process, 0)
+    
+    def calculate_recovery_cost(self, helium_volume_liters: float,
+                               method: RecoveryMethod) -> float:
+        """Calculate total recovery cost"""
+        specs = self.get_recovery_specs(method)
+        setup_cost = specs.get('setup_cost_usd', 0)
+        unit_cost = specs.get('cost_per_unit_usd', 0)
+        return setup_cost + (unit_cost * helium_volume_liters)
+    
+    def calculate_carbon_savings(self, helium_recovered_liters: float) -> float:
+        """
+        Calculate carbon savings from recovery vs virgin production.
+        Returns kg CO2 equivalent saved.
+        """
+        virgin_carbon = helium_recovered_liters * self.carbon_factors['virgin_production']
+        recovery_carbon = helium_recovered_liters * self.carbon_factors['recovery_processing']
+        return virgin_carbon - recovery_carbon
+    
+    def get_statistics(self) -> Dict:
+        """Get registry statistics"""
+        return {
+            'recovery_methods': len(self.recovery_methods),
+            'asset_types': len(self.asset_specs),
+            'carbon_factors_tracked': len(self.carbon_factors)
+        }
+
+
+# ============================================================
+# MODULE 3: COMPLETE OPTIMIZATION ENGINE
+# ============================================================
+
+@dataclass
+class OptimizationResult:
+    """Result of recovery optimization"""
+    optimal_trigger_age_years: float
+    total_cost_usd: float
+    helium_recovered_liters: float
+    carbon_saved_kg: float
+    recovery_method: RecoveryMethod
+    net_benefit_usd: float
+    optimization_details: Dict = field(default_factory=dict)
+
+
+class HeliumRecoveryOptimizer:
+    """
+    Complete optimization engine for helium recovery timing.
+    
+    Features:
+    - Weibull failure distribution integration
+    - Cost-benefit analysis with discounting
+    - Multi-method comparison
+    - Sensitivity analysis
+    """
+    
+    def __init__(self, registry: HeliumMaterialRegistry, config: CircularityConfig):
+        self.registry = registry
+        self.config = config
+        self.market = HeliumMarket(
+            base_price_per_liter_usd=config.helium_market_price_per_liter_usd,
+            price_volatility=config.price_volatility,
+            supply_growth_rate=config.supply_growth_rate
+        )
+        logger.info("HeliumRecoveryOptimizer initialized")
+    
+    def calculate_optimal_recovery_trigger(self) -> OptimizationResult:
+        """
+        Calculate optimal age to trigger helium recovery.
+        
+        Uses the configured optimization method to find the trigger age
+        that minimizes total cost (failure loss + recovery cost + market cost).
+        """
+        # Get asset specifications
+        asset_specs = self.registry.get_asset_specs(self.config.asset_type)
+        weibull_shape = asset_specs.get('weibull_shape', self.config.weibull_shape)
+        weibull_scale = asset_specs.get('weibull_scale_years', self.config.weibull_scale)
+        helium_per_asset = asset_specs.get('helium_volume_liters', self.config.helium_per_asset_liters)
+        recovery_factor = asset_specs.get('recovery_factor', 0.9)
+        
+        # Simulate market prices
+        self.market.simulate_price_path(self.config.simulation_years)
+        
+        # Define objective function
+        def total_cost(trigger_age_years):
+            trigger_age = trigger_age_years[0]
+            
+            # 1. Cost of helium lost through failures before recovery
+            failure_prob = self._weibull_cdf(trigger_age, weibull_shape, weibull_scale)
+            expected_failures = self.config.total_assets * failure_prob
+            helium_lost_to_failures = expected_failures * helium_per_asset * (1 - recovery_factor)
+            
+            market_price = self.market.get_price_at_time(trigger_age)
+            failure_cost = helium_lost_to_failures * market_price
+            
+            # 2. Cost of recovery operation
+            total_helium = self.config.total_assets * helium_per_asset
+            recovery_specs = self.registry.get_recovery_specs(self.config.recovery_method)
+            recovery_cost = (
+                recovery_specs.get('setup_cost_usd', 0) +
+                recovery_specs.get('cost_per_unit_usd', 0) * total_helium
+            )
+            
+            # 3. Cost of replacing unrecovered helium
+            helium_recovered = total_helium * self.config.recovery_efficiency * recovery_factor
+            helium_to_purchase = total_helium - helium_recovered
+            purchase_cost = helium_to_purchase * market_price
+            
+            # 4. Carbon credit benefit (negative cost = benefit)
+            carbon_saved = self.registry.calculate_carbon_savings(helium_recovered)
+            carbon_benefit = carbon_saved * self.config.carbon_credit_per_kg_helium_usd / 1000
+            
+            # Discount future costs
+            discount_factor = 1.0 / ((1.0 + self.config.discount_rate) ** trigger_age)
+            
+            total = (failure_cost + recovery_cost + purchase_cost - carbon_benefit) * discount_factor
+            
+            return total
+        
+        # Optimize using differential evolution for global optimization
+        bounds = [(1.0, self.config.simulation_years)]
+        
+        result = differential_evolution(
+            total_cost,
+            bounds,
+            strategy='best1bin',
+            maxiter=100,
+            popsize=15,
+            tol=1e-6,
+            seed=42
+        )
+        
+        optimal_age = result.x[0]
+        optimal_cost = result.fun
+        
+        # Calculate final metrics
+        failure_prob = self._weibull_cdf(optimal_age, weibull_shape, weibull_scale)
+        expected_failures = self.config.total_assets * failure_prob
+        total_helium = self.config.total_assets * helium_per_asset
+        helium_recovered = total_helium * self.config.recovery_efficiency * recovery_factor * (1 - failure_prob)
+        helium_recovered += expected_failures * helium_per_asset * recovery_factor * self.config.recovery_efficiency
+        carbon_saved = self.registry.calculate_carbon_savings(helium_recovered)
+        
+        # Calculate net benefit compared to no recovery
+        no_recovery_cost = total_helium * self.market.get_price_at_time(optimal_age)
+        net_benefit = no_recovery_cost - optimal_cost
+        
+        return OptimizationResult(
+            optimal_trigger_age_years=optimal_age,
+            total_cost_usd=optimal_cost,
+            helium_recovered_liters=helium_recovered,
+            carbon_saved_kg=carbon_saved,
+            recovery_method=self.config.recovery_method,
+            net_benefit_usd=net_benefit,
+            optimization_details={
+                'method': 'differential_evolution',
+                'failure_probability': float(failure_prob),
+                'expected_failures': float(expected_failures),
+                'market_price_at_trigger': float(self.market.get_price_at_time(optimal_age))
+            }
+        )
+    
+    def _weibull_cdf(self, x: float, shape: float, scale: float) -> float:
+        """Weibull cumulative distribution function"""
+        if x <= 0:
+            return 0.0
+        return 1.0 - np.exp(-(x / scale) ** shape)
+    
+    def compare_recovery_methods(self) -> Dict[RecoveryMethod, OptimizationResult]:
+        """Compare all recovery methods"""
+        results = {}
+        original_method = self.config.recovery_method
+        
+        for method in RecoveryMethod:
+            self.config.recovery_method = method
+            results[method] = self.calculate_optimal_recovery_trigger()
+        
+        # Restore original method
+        self.config.recovery_method = original_method
+        
+        return results
+    
+    def sensitivity_analysis(self, parameter: str, 
+                            values: List[float]) -> List[OptimizationResult]:
+        """Perform sensitivity analysis on a parameter"""
+        original_value = getattr(self.config, parameter, None)
+        results = []
+        
+        for value in values:
+            setattr(self.config, parameter, value)
+            result = self.calculate_optimal_recovery_trigger()
+            results.append(result)
+        
+        # Restore original value
+        if original_value is not None:
+            setattr(self.config, parameter, original_value)
+        
+        return results
+    
+    def get_statistics(self) -> Dict:
+        """Get optimizer statistics"""
+        return {
+            'config': {
+                'asset_type': self.config.asset_type.value,
+                'total_assets': self.config.total_assets,
+                'recovery_method': self.config.recovery_method.value,
+                'simulation_years': self.config.simulation_years
+            },
+            'market': self.market.get_statistics()
+        }
+
+
+# ============================================================
+# MODULE 4: DYNAMIC REPORTING AND ANALYTICS
+# ============================================================
+
+@dataclass
+class CircularityReport:
+    """Complete circularity analysis report"""
+    report_id: str
+    generated_at: datetime
+    config: CircularityConfig
+    
+    # Optimization results
+    optimal_trigger_age_years: float
+    total_cost_usd: float
+    helium_recovered_liters: float
+    carbon_saved_kg: float
+    net_benefit_usd: float
+    
+    # Market analysis
+    market_statistics: Dict
+    
+    # Comparative analysis
+    method_comparison: Dict[str, Dict] = field(default_factory=dict)
+    
+    # Sensitivity analysis
+    sensitivity_results: Dict[str, List[Dict]] = field(default_factory=dict)
+    
+    # Recommendations
+    recommendations: List[str] = field(default_factory=list)
+    circularity_score: float = 0.0
+    
+    def to_dict(self) -> Dict:
+        """Convert report to dictionary"""
+        return {
+            'report_id': self.report_id,
+            'generated_at': self.generated_at.isoformat(),
+            'config': {
+                'asset_type': self.config.asset_type.value,
+                'total_assets': self.config.total_assets,
+                'recovery_method': self.config.recovery_method.value,
+                'simulation_years': self.config.simulation_years
+            },
+            'optimization': {
+                'optimal_trigger_age_years': self.optimal_trigger_age_years,
+                'total_cost_usd': self.total_cost_usd,
+                'helium_recovered_liters': self.helium_recovered_liters,
+                'carbon_saved_kg': self.carbon_saved_kg,
+                'net_benefit_usd': self.net_benefit_usd
+            },
+            'market': self.market_statistics,
+            'method_comparison': self.method_comparison,
+            'recommendations': self.recommendations,
+            'circularity_score': self.circularity_score
+        }
+    
+    def save_to_json(self, filepath: str):
+        """Save report to JSON file"""
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+        logger.info(f"Report saved to {filepath}")
+
+
+class CircularityReportGenerator:
+    """
+    Dynamic report generation based on live simulation results.
+    """
+    
+    def __init__(self, optimizer: HeliumRecoveryOptimizer, 
+                registry: HeliumMaterialRegistry,
+                config: CircularityConfig):
+        self.optimizer = optimizer
+        self.registry = registry
+        self.config = config
+        
+        self.report_count = 0
+        logger.info("CircularityReportGenerator initialized")
+    
+    def generate_report(self) -> CircularityReport:
+        """Generate complete circularity analysis report"""
+        self.report_count += 1
+        
+        # Run optimization
+        logger.info("Running recovery optimization...")
+        opt_result = self.optimizer.calculate_optimal_recovery_trigger()
+        
+        # Compare methods
+        logger.info("Comparing recovery methods...")
+        method_comparison = self.optimizer.compare_recovery_methods()
+        method_comparison_dict = {
+            method.value: {
+                'optimal_age': result.optimal_trigger_age_years,
+                'total_cost': result.total_cost_usd,
+                'helium_recovered': result.helium_recovered_liters,
+                'carbon_saved': result.carbon_saved_kg
+            }
+            for method, result in method_comparison.items()
+        }
+        
+        # Sensitivity analysis
+        logger.info("Running sensitivity analysis...")
+        sensitivity_results = {}
+        
+        # Test recovery efficiency sensitivity
+        efficiency_values = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+        efficiency_results = self.optimizer.sensitivity_analysis(
+            'recovery_efficiency', efficiency_values
+        )
+        sensitivity_results['recovery_efficiency'] = [
+            {'efficiency': eff, 'net_benefit': res.net_benefit_usd}
+            for eff, res in zip(efficiency_values, efficiency_results)
+        ]
+        
+        # Test market price sensitivity
+        price_values = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+        price_results = []
+        for price in price_values:
+            original_price = self.config.helium_market_price_per_liter_usd
+            self.config.helium_market_price_per_liter_usd = price
+            price_results.append(self.optimizer.calculate_optimal_recovery_trigger())
+            self.config.helium_market_price_per_liter_usd = original_price
+        
+        sensitivity_results['market_price'] = [
+            {'price': price, 'net_benefit': res.net_benefit_usd}
+            for price, res in zip(price_values, price_results)
+        ]
+        
+        # Calculate circularity score
+        circularity_score = self._calculate_circularity_score(opt_result)
+        
+        # Generate recommendations
+        recommendations = self._generate_recommendations(opt_result, method_comparison)
+        
+        # Create report
+        report = CircularityReport(
+            report_id=f"HE-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            generated_at=datetime.now(),
+            config=self.config,
+            optimal_trigger_age_years=opt_result.optimal_trigger_age_years,
+            total_cost_usd=opt_result.total_cost_usd,
+            helium_recovered_liters=opt_result.helium_recovered_liters,
+            carbon_saved_kg=opt_result.carbon_saved_kg,
+            net_benefit_usd=opt_result.net_benefit_usd,
+            market_statistics=self.optimizer.market.get_statistics(),
+            method_comparison=method_comparison_dict,
+            sensitivity_results=sensitivity_results,
+            recommendations=recommendations,
+            circularity_score=circularity_score
+        )
+        
+        logger.info(f"Report generated: {report.report_id}")
+        return report
+    
+    def _calculate_circularity_score(self, result: OptimizationResult) -> float:
+        """Calculate circularity score (0-100)"""
+        total_helium = self.config.total_assets * self.config.helium_per_asset_liters
+        
+        # Recovery rate (50% weight)
+        recovery_rate = result.helium_recovered_liters / total_helium if total_helium > 0 else 0
+        recovery_score = min(100, recovery_rate * 100)
+        
+        # Carbon savings (30% weight)
+        max_carbon = total_helium * self.registry.carbon_factors['virgin_production']
+        carbon_rate = result.carbon_saved_kg / max_carbon if max_carbon > 0 else 0
+        carbon_score = min(100, carbon_rate * 100)
+        
+        # Economic benefit (20% weight)
+        max_benefit = total_helium * self.optimizer.market.current_price
+        benefit_rate = result.net_benefit_usd / max_benefit if max_benefit > 0 else 0
+        benefit_score = min(100, benefit_rate * 100)
+        
+        return 0.5 * recovery_score + 0.3 * carbon_score + 0.2 * benefit_score
+    
+    def _generate_recommendations(self, result: OptimizationResult,
+                                 method_comparison: Dict) -> List[str]:
+        """Generate actionable recommendations"""
+        recommendations = []
+        
+        # Trigger age recommendation
+        recommendations.append(
+            f"Schedule helium recovery at {result.optimal_trigger_age_years:.1f} years "
+            f"of asset age for optimal cost-benefit"
+        )
+        
+        # Recovery method recommendation
+        best_method = min(method_comparison.items(), 
+                         key=lambda x: x[1].total_cost_usd)
+        recommendations.append(
+            f"Use {best_method[0].value} recovery method for lowest total cost "
+            f"(${best_method[1].total_cost_usd:,.0f})"
+        )
+        
+        # Carbon savings
+        recommendations.append(
+            f"Expected carbon savings: {result.carbon_saved_kg:,.0f} kg CO2 equivalent, "
+            f"equivalent to taking {result.carbon_saved_kg / 4600:.1f} cars off the road for a year"
+        )
+        
+        # Economic benefit
+        recommendations.append(
+            f"Net economic benefit: ${result.net_benefit_usd:,.0f} compared to no recovery"
+        )
+        
+        return recommendations
+
+
+# ============================================================
+# COMPLETE HELIUM CIRCULARITY MODEL
+# ============================================================
+
+class HeliumCircularityModel:
+    """
+    Complete helium circularity model for data center assets.
+    
+    Features:
+    - Asset lifecycle tracking with Weibull failure modeling
+    - Complete helium market simulation
+    - Recovery optimization engine
+    - Dynamic reporting with live results
+    - Multi-method comparison
+    - Sensitivity analysis
+    """
+    
+    def __init__(self, config: Optional[CircularityConfig] = None):
+        self.config = config or CircularityConfig()
+        
+        # Initialize components
+        self.registry = HeliumMaterialRegistry()
+        self.optimizer = HeliumRecoveryOptimizer(self.registry, self.config)
+        self.report_generator = CircularityReportGenerator(
+            self.optimizer, self.registry, self.config
+        )
+        
+        # Asset tracking
+        self.assets: List[HeliumAsset] = []
+        self.recovery_history: List[Dict] = []
+        
+        # Async executor
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        # Initialize assets
+        self._initialize_assets()
+        
+        logger.info("HeliumCircularityModel v4.8 initialized")
+    
+    def _initialize_assets(self):
+        """Initialize helium asset portfolio"""
+        asset_specs = self.registry.get_asset_specs(self.config.asset_type)
+        
+        for i in range(self.config.total_assets):
+            # Randomize installation dates over past 5 years
+            days_ago = random.uniform(0, 5 * 365)
+            install_date = datetime.now() - timedelta(days=days_ago)
+            
+            asset = HeliumAsset(
+                asset_id=f"HE-{i:05d}",
+                asset_type=self.config.asset_type,
+                installation_date=install_date,
+                helium_volume_liters=asset_specs.get('helium_volume_liters', 
+                                                    self.config.helium_per_asset_liters),
+                initial_value_usd=asset_specs.get('initial_value_usd', 300)
+            )
+            self.assets.append(asset)
+        
+        logger.info(f"Initialized {len(self.assets)} helium assets")
+    
+    def calculate_optimal_recovery_trigger(self) -> OptimizationResult:
+        """Calculate optimal recovery trigger"""
+        return self.optimizer.calculate_optimal_recovery_trigger()
+    
+    def run_market_simulation(self, years: int = None) -> List[float]:
+        """Run helium market price simulation"""
+        if years is None:
+            years = self.config.simulation_years
+        return self.optimizer.market.simulate_price_path(years)
+    
+    def generate_circularity_report(self) -> Dict:
+        """Generate complete circularity report"""
+        report = self.report_generator.generate_report()
+        return report.to_dict()
+    
+    async def run_full_analysis_async(self) -> CircularityReport:
+        """Run complete analysis asynchronously"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.report_generator.generate_report
+        )
+    
+    def export_report(self, filepath: str = None):
+        """Export report to JSON file"""
+        if filepath is None:
+            output_dir = Path(self.config.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            filepath = str(output_dir / f"circularity_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        
+        report = self.report_generator.generate_report()
+        report.save_to_json(filepath)
+        return filepath
+    
+    def get_statistics(self) -> Dict:
+        """Get comprehensive model statistics"""
+        return {
+            'config': {
+                'asset_type': self.config.asset_type.value,
+                'total_assets': self.config.total_assets,
+                'recovery_method': self.config.recovery_method.value
+            },
+            'assets': {
+                'total_assets': len(self.assets),
+                'avg_age_years': np.mean([a.get_age_years() for a in self.assets]) if self.assets else 0
+            },
+            'optimizer': self.optimizer.get_statistics(),
+            'registry': self.registry.get_statistics(),
+            'recovery_operations': len(self.recovery_history)
+        }
+
+
+# ============================================================
+# DEMO AND TESTING
+# ============================================================
+
+def main():
+    """Enhanced demonstration of the helium circularity model"""
+    print("=" * 70)
+    print("Helium Circularity Model v4.8 - Enhanced Demo")
+    print("=" * 70)
+    
+    # Create configuration
+    config = CircularityConfig(
+        asset_type=AssetType.HDD_HELIUM_FILLED,
+        total_assets=10000,
+        helium_per_asset_liters=1.0,
+        recovery_method=RecoveryMethod.MEMBRANE_SEPARATION,
+        recovery_efficiency=0.85,
+        helium_market_price_per_liter_usd=3.50,
+        simulation_years=10,
+        monte_carlo_runs=100
+    )
+    
+    # Initialize model
+    model = HeliumCircularityModel(config)
+    
+    print("\n✅ v4.8 Enhancements Active:")
+    print(f"   ✅ Complete optimization engine with real cost functions")
+    print(f"   ✅ Self-contained material registry with {len(model.registry.recovery_methods)} methods")
+    print(f"   ✅ Dynamic reporting with live simulation results")
+    print(f"   ✅ Configurable simulation with async runner")
+    print(f"   ✅ Asset type: {config.asset_type.value}")
+    print(f"   ✅ Total assets: {config.total_assets:,}")
+    print(f"   ✅ Recovery method: {config.recovery_method.value}")
+    
+    # Run market simulation
+    print("\n📈 Running helium market simulation...")
+    prices = model.run_market_simulation(years=5)
+    print(f"   Initial price: ${prices[0]:.2f}/liter")
+    print(f"   Final price: ${prices[-1]:.2f}/liter")
+    print(f"   Price change: {((prices[-1]/prices[0] - 1) * 100):.1f}%")
+    
+    # Calculate optimal recovery trigger
+    print("\n⚙️ Calculating optimal recovery trigger...")
+    opt_result = model.calculate_optimal_recovery_trigger()
+    
+    print(f"\n📊 Optimization Results:")
+    print(f"   Optimal trigger age: {opt_result.optimal_trigger_age_years:.2f} years")
+    print(f"   Total cost: ${opt_result.total_cost_usd:,.0f}")
+    print(f"   Helium recovered: {opt_result.helium_recovered_liters:,.0f} liters")
+    print(f"   Carbon saved: {opt_result.carbon_saved_kg:,.0f} kg CO2 equivalent")
+    print(f"   Net benefit: ${opt_result.net_benefit_usd:,.0f}")
+    
+    # Compare recovery methods
+    print("\n🔬 Comparing recovery methods...")
+    method_comparison = model.optimizer.compare_recovery_methods()
+    print(f"\n{'Method':<30} {'Opt Age':<10} {'Total Cost':<15} {'He Recovered':<15} {'Carbon Saved':<15}")
+    print("-" * 85)
+    for method, result in method_comparison.items():
+        print(f"{method.value:<30} {result.optimal_trigger_age_years:<10.2f} "
+              f"${result.total_cost_usd:<14,.0f} {result.helium_recovered_liters:<14,.0f} "
+              f"{result.carbon_saved_kg:<14,.0f}")
+    
+    # Generate full report
+    print("\n📋 Generating circularity report...")
+    report = model.generate_circularity_report()
+    
+    print(f"\n📊 Report Summary:")
+    print(f"   Report ID: {report['report_id']}")
+    print(f"   Circularity Score: {report['circularity_score']:.1f}/100")
+    print(f"\n   Recommendations:")
+    for rec in report['recommendations']:
+        print(f"   • {rec}")
+    
+    # Export report
+    filepath = model.export_report()
+    print(f"\n💾 Report exported to: {filepath}")
+    
+    # Get statistics
+    print(f"\n📈 Model Statistics:")
+    stats = model.get_statistics()
+    for key, value in stats.items():
+        if isinstance(value, dict):
+            print(f"   {key}:")
+            for k, v in value.items():
+                print(f"      {k}: {v}")
+        else:
+            print(f"   {key}: {value}")
     
     print("\n" + "=" * 70)
-    print("✅ Ultimate Helium Circularity System v4.7 - All Enhancements Demonstrated")
-    print("   ✅ Fixed: GPU acceleration for Transformer training (CUDA support)")
-    print("   ✅ Fixed: Gas optimization for blockchain (batch minting)")
-    print("   ✅ Added: Multi-chain support (Ethereum, Polygon, BSC)")
-    print("   ✅ Added: Real-time alerting with threshold notifications")
-    print("   ✅ Added: Automated trading with smart contracts")
-    print("   ✅ Added: Digital twin calibration with real-time data")
-    print("   ✅ Added: Supply chain API integration (supplier data)")
-    print("   ✅ Added: NLP sentiment analysis with Transformers")
-    print("   ✅ Added: LCA automation with real-time tracking")
-    print("   ✅ Added: Batch token minting for gas efficiency")
+    print("✅ Helium Circularity Model v4.8 - All Features Demonstrated")
+    print("=" * 70)
+    print("Complete enhancements:")
+    print("   ✅ Complete optimization engine with real cost functions")
+    print("   ✅ Self-contained material registry")
+    print("   ✅ Dynamic reporting with live simulation results")
+    print("   ✅ Configurable simulation with async runner")
+    print("   ✅ Multi-method comparison")
+    print("   ✅ Sensitivity analysis")
+    print("   ✅ Carbon credit integration")
+    print("   ✅ Market dynamics simulation")
     print("=" * 70)
 
 
@@ -1177,4 +969,4 @@ if __name__ == "__main__":
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    asyncio.run(main())
+    main()
