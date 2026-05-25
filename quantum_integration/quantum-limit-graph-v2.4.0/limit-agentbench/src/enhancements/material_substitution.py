@@ -16,24 +16,23 @@ PRODUCTION ENHANCEMENTS OVER v5.2:
 10. ADDED: Material substitution audit trail
 
 V6.0 NEW ENHANCEMENTS:
-11. ADDED: Advanced machine learning property prediction
-12. ADDED: Circular economy and recyclability scoring
-13. ADDED: Supply chain resilience analysis
-14. ADDED: Multi-generational material planning
-15. ADDED: Real-time market price integration
-16. ADDED: Environmental impact beyond carbon (water, land use, toxicity)
-17. ADDED: Material compatibility and joining assessment
-18. ADDED: Manufacturing process energy analysis
-19. ADDED: Regulatory compliance and certification tracking
-20. ADDED: Digital twin integration for performance validation
+11. ADDED: Multi-objective Pareto optimization for material selection
+12. ADDED: Machine learning property prediction with uncertainty
+13. ADDED: Supply chain resilience analysis for materials
+14. ADDED: Circular economy scoring and recyclability assessment
+15. ADDED: Digital twin integration for performance validation
+16. ADDED: Blockchain-verified material provenance tracking
+17. ADDED: Real-time market price integration
+18. ADDED: Federated material data sharing across organizations
+19. ADDED: Natural language query interface for material search
+20. ADDED: API-first architecture with GraphQL endpoints
 
 Reference:
 - "CALPHAD Modeling of Aluminum Alloys" (Acta Materialia, 2023)
 - "Material Substitution for Sustainable Electronics" (Nature Materials, 2024)
-- "Ashby Method for Green Material Selection" (Materials Today, 2024)
 - "Machine Learning for Materials Discovery" (Nature Reviews Materials, 2025)
 - "Circular Economy Indicators" (Ellen MacArthur Foundation, 2024)
-- "Supply Chain Resilience Framework" (MIT Sustainable Supply Chains, 2024)
+- "Blockchain for Supply Chain Transparency" (IEEE Blockchain, 2025)
 """
 
 from dataclasses import dataclass, field
@@ -60,6 +59,7 @@ import copy
 from functools import lru_cache
 from abc import ABC, abstractmethod
 import warnings
+import random
 
 # Production dependencies
 from pydantic import BaseModel, Field, validator, root_validator
@@ -80,6 +80,19 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# Try optional imports
+try:
+    import networkx as nx
+    NETWORKX_AVAILABLE = True
+except ImportError:
+    NETWORKX_AVAILABLE = False
+
+try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+
 # Configure structured logging
 structlog.configure(
     processors=[
@@ -99,16 +112,132 @@ ANALYSIS_RUNS = Counter('substitution_analysis_total', 'Total analyses', ['statu
 ANALYSIS_DURATION = Histogram('substitution_analysis_duration_seconds', 'Analysis duration', registry=REGISTRY)
 CARBON_SAVINGS = Gauge('material_substitution_carbon_savings_kg', 'Carbon savings', ['material'], registry=REGISTRY)
 PHASE_STABILITY = Gauge('phase_stability_score', 'Phase stability', ['material'], registry=REGISTRY)
-PROPERTY_PREDICTION_ACCURACY = Gauge('ml_property_prediction_accuracy', 'ML prediction accuracy', 
-                                     ['property'], registry=REGISTRY)
+
+# V6.0 new metrics
+ML_PREDICTION_ACCURACY = Gauge('ml_material_prediction_accuracy', 'ML prediction accuracy', 
+                               ['property'], registry=REGISTRY)
 CIRCULARITY_SCORE = Gauge('material_circularity_score', 'Circular economy score', 
                          ['material'], registry=REGISTRY)
 SUPPLY_CHAIN_RISK = Gauge('supply_chain_risk_score', 'Supply chain risk', 
                          ['material', 'region'], registry=REGISTRY)
+BLOCKCHAIN_RECORDS = Counter('material_blockchain_records_total', 'Blockchain provenance records',
+                            ['material'], registry=REGISTRY)
 
 
 # ============================================================
-# ENHANCEMENT 11: ADVANCED ML PROPERTY PREDICTION
+# ENHANCEMENT 11: MULTI-OBJECTIVE PARETO OPTIMIZATION
+# ============================================================
+
+class MultiObjectiveMaterialOptimizer:
+    """
+    Multi-objective Pareto optimization for material selection.
+    
+    Features:
+    - Cost-performance-carbon trade-off analysis
+    - Pareto frontier discovery
+    - Constraint handling
+    - Solution diversity preservation
+    """
+    
+    def __init__(self):
+        self.population_size = 50
+        self.generations = 30
+        self.pareto_frontier = []
+        
+    def optimize_material_selection(self, candidates: List['MaterialProperties'],
+                                  objectives: List[str] = None) -> List[Dict]:
+        """Discover Pareto-optimal material solutions"""
+        
+        if objectives is None:
+            objectives = ['minimize_cost', 'maximize_performance', 'minimize_carbon']
+        
+        # Generate candidate solutions
+        solutions = []
+        for material in candidates:
+            solution = {
+                'material': material,
+                'cost': material.cost_per_kg_usd,
+                'performance': self._calculate_performance_score(material),
+                'carbon': material.carbon_footprint_kg_co2_per_kg,
+                'density': material.density_kg_m3,
+                'strength': material.yield_strength_mpa
+            }
+            solutions.append(solution)
+        
+        # Find Pareto-optimal solutions
+        pareto_optimal = self._non_dominated_sorting(solutions, objectives)
+        self.pareto_frontier = pareto_optimal
+        
+        return pareto_optimal
+    
+    def _calculate_performance_score(self, material: 'MaterialProperties') -> float:
+        """Calculate composite performance score"""
+        # Normalize properties to 0-1 scale
+        thermal_score = material.thermal_conductivity_w_mk / 500
+        strength_score = material.yield_strength_mpa / 500
+        stiffness_score = material.elastic_modulus_gpa / 200
+        
+        # Weighted performance index
+        performance = (thermal_score * 0.3 + strength_score * 0.4 + stiffness_score * 0.3)
+        
+        return performance
+    
+    def _non_dominated_sorting(self, solutions: List[Dict], 
+                              objectives: List[str]) -> List[Dict]:
+        """Identify non-dominated solutions"""
+        n = len(solutions)
+        dominated = np.zeros(n, dtype=bool)
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    # Check if j dominates i
+                    dominates = True
+                    
+                    # For cost and carbon: lower is better
+                    if solutions[j]['cost'] > solutions[i]['cost']:
+                        dominates = False
+                    if solutions[j]['carbon'] > solutions[i]['carbon']:
+                        dominates = False
+                    
+                    # For performance: higher is better
+                    if solutions[j]['performance'] < solutions[i]['performance']:
+                        dominates = False
+                    
+                    if dominates:
+                        dominated[i] = True
+                        break
+        
+        return [solutions[i] for i in range(n) if not dominated[i]]
+    
+    def get_optimal_tradeoff(self, cost_weight: float = 0.33,
+                           performance_weight: float = 0.33,
+                           carbon_weight: float = 0.34) -> Dict:
+        """Get optimal solution for given trade-off preferences"""
+        
+        if not self.pareto_frontier:
+            return {'error': 'No Pareto frontier computed'}
+        
+        # Normalize objectives
+        costs = [s['cost'] for s in self.pareto_frontier]
+        performances = [s['performance'] for s in self.pareto_frontier]
+        carbons = [s['carbon'] for s in self.pareto_frontier]
+        
+        max_cost = max(costs) if costs else 1
+        max_perf = max(performances) if performances else 1
+        max_carbon = max(carbons) if carbons else 1
+        
+        # Weighted sum selection
+        best_solution = min(self.pareto_frontier,
+                          key=lambda x: cost_weight * x['cost'] / max_cost - 
+                                      performance_weight * x['performance'] / max_perf +
+                                      carbon_weight * x['carbon'] / max_carbon)
+        
+        return best_solution
+
+
+# ============================================================
+# ENHANCEMENT 12: ML PROPERTY PREDICTION
 # ============================================================
 
 class MaterialPropertyPredictor:
@@ -118,7 +247,7 @@ class MaterialPropertyPredictor:
     Features:
     - Composition-to-property mapping
     - Uncertainty quantification
-    - Transfer learning from similar material families
+    - Transfer learning from similar materials
     - Feature importance analysis
     """
     
@@ -135,7 +264,26 @@ class MaterialPropertyPredictor:
             return {}
         
         # Extract features from compositions
-        X, y_dict = self._prepare_training_data(materials)
+        X = []
+        y_dict = defaultdict(list)
+        
+        for name, material in materials.items():
+            feature_vector = [
+                material.density_kg_m3 / 10000,
+                material.cost_per_kg_usd / 100,
+                material.recycling_rate_pct / 100,
+                material.supply_risk_hhi,
+                material.formation_enthalpy_kj_per_mol / 100,
+                material.formation_entropy_j_per_mol_k / 100,
+            ]
+            
+            X.append(feature_vector)
+            
+            y_dict['thermal_conductivity'].append(material.thermal_conductivity_w_mk / 500)
+            y_dict['yield_strength'].append(material.yield_strength_mpa / 500)
+            y_dict['elastic_modulus'].append(material.elastic_modulus_gpa / 200)
+        
+        X = np.array(X)
         
         if len(X) < 10:
             logger.warning("Insufficient data for ML training")
@@ -144,40 +292,37 @@ class MaterialPropertyPredictor:
         training_results = {}
         
         for property_name, y_values in y_dict.items():
-            # Create and train model
-            model = Pipeline([
-                ('poly', PolynomialFeatures(degree=2, include_bias=False)),
-                ('scaler', StandardScaler()),
-                ('regressor', GradientBoostingRegressor(
-                    n_estimators=100, 
-                    learning_rate=0.1,
-                    max_depth=3,
-                    random_state=42
-                ))
-            ])
+            y_values = np.array(y_values)
+            
+            # Train ensemble models
+            model_rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+            model_gb = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
             
             # Cross-validation
-            scores = cross_val_score(model, X, y_values, cv=min(5, len(X)//3), 
-                                    scoring='neg_mean_absolute_error')
+            cv_scores_rf = cross_val_score(model_rf, X, y_values, cv=min(5, len(X)//3), 
+                                          scoring='neg_mean_absolute_error')
+            cv_scores_gb = cross_val_score(model_gb, X, y_values, cv=min(5, len(X)//3),
+                                          scoring='neg_mean_absolute_error')
             
-            # Train final model
-            model.fit(X, y_values)
+            # Train final models
+            model_rf.fit(X, y_values)
+            model_gb.fit(X, y_values)
             
-            self.models[property_name] = model
-            
-            # Store feature importance
-            if hasattr(model[-1], 'feature_importances_'):
-                self.feature_importance[property_name] = model[-1].feature_importances_
+            self.models[f"{property_name}_rf"] = model_rf
+            self.models[f"{property_name}_gb"] = model_gb
+            self.feature_importance[property_name] = model_rf.feature_importances_
             
             training_results[property_name] = {
-                'cv_score': -scores.mean(),
-                'cv_std': scores.std(),
+                'rf_cv_score': -cv_scores_rf.mean(),
+                'gb_cv_score': -cv_scores_gb.mean(),
                 'n_samples': len(X)
             }
             
-            PREDICTION_ACCURACY.labels(property=property_name).set(-scores.mean())
+            ML_PREDICTION_ACCURACY.labels(property=property_name).set(
+                1 - cv_scores_rf.mean()
+            )
             
-            logger.info(f"Trained ML model for {property_name}: MAE={-scores.mean():.3f}")
+            logger.info(f"Trained ML model for {property_name}: MAE={-cv_scores_rf.mean():.3f}")
         
         self.training_history.append({
             'timestamp': datetime.now(),
@@ -187,77 +332,141 @@ class MaterialPropertyPredictor:
         
         return training_results
     
-    def _prepare_training_data(self, materials: Dict[str, 'MaterialProperties']) -> Tuple[np.ndarray, Dict]:
-        """Prepare training data from material database"""
-        features = []
-        target_dict = defaultdict(list)
-        
-        for name, material in materials.items():
-            # Feature engineering from material properties
-            feature_vector = [
-                material.density_kg_m3,
-                material.cost_per_kg_usd,
-                material.recycling_rate_pct,
-                material.supply_risk_hhi,
-                material.formation_enthalpy_kj_per_mol,
-                material.formation_entropy_j_per_mol_k,
-                material.interaction_parameters[0] if material.interaction_parameters else 0,
-                material.interaction_parameters[1] if len(material.interaction_parameters) > 1 else 0,
-                material.interaction_parameters[2] if len(material.interaction_parameters) > 2 else 0,
-            ]
-            
-            features.append(feature_vector)
-            
-            # Target properties to predict
-            target_dict['thermal_conductivity'].append(material.thermal_conductivity_w_mk)
-            target_dict['yield_strength'].append(material.yield_strength_mpa)
-            target_dict['elastic_modulus'].append(material.elastic_modulus_gpa)
-        
-        return np.array(features), dict(target_dict)
-    
     def predict_properties(self, composition_features: np.ndarray) -> Dict[str, Tuple[float, float]]:
         """Predict properties with uncertainty estimation"""
+        
         predictions = {}
         
-        for property_name, model in self.models.items():
-            if hasattr(model, 'estimators_'):
-                # Ensemble prediction with uncertainty
-                individual_preds = []
-                for estimator in model[-1].estimators_:
-                    pred = estimator.predict(model[:-1].transform(composition_features))
-                    individual_preds.append(pred[0] if len(pred.shape) > 1 else pred)
+        for property_name in ['thermal_conductivity', 'yield_strength', 'elastic_modulus']:
+            rf_key = f"{property_name}_rf"
+            gb_key = f"{property_name}_gb"
+            
+            if rf_key in self.models and gb_key in self.models:
+                rf_pred = self.models[rf_key].predict(composition_features.reshape(1, -1))[0]
+                gb_pred = self.models[gb_key].predict(composition_features.reshape(1, -1))[0]
                 
-                mean_pred = np.mean(individual_preds)
-                std_pred = np.std(individual_preds)
-                predictions[property_name] = (mean_pred, std_pred)
-            else:
-                pred = model.predict(composition_features)
-                predictions[property_name] = (pred[0], 0.0)
+                mean_pred = (rf_pred + gb_pred) / 2
+                std_pred = abs(rf_pred - gb_pred) / 2
+                
+                predictions[property_name] = (float(mean_pred), float(std_pred))
         
         return predictions
-    
-    def get_feature_importance_report(self) -> Dict:
-        """Get feature importance analysis"""
-        report = {}
-        feature_names = [
-            'density', 'cost', 'recycling_rate', 'supply_risk',
-            'enthalpy', 'entropy', 'interaction_0', 'interaction_1', 'interaction_2'
-        ]
-        
-        for prop, importance in self.feature_importance.items():
-            sorted_idx = np.argsort(importance)[::-1]
-            report[prop] = {
-                'top_features': [
-                    {'feature': feature_names[i], 'importance': importance[i]}
-                    for i in sorted_idx[:3]
-                ]
-            }
-        
-        return report
 
 
 # ============================================================
-# ENHANCEMENT 12: CIRCULAR ECONOMY SCORING
+# ENHANCEMENT 13: SUPPLY CHAIN RESILIENCE ANALYSIS
+# ============================================================
+
+class SupplyChainResilienceAnalyzer:
+    """
+    Supply chain resilience analysis for materials.
+    
+    Features:
+    - Geopolitical risk assessment
+    - Supplier diversification scoring
+    - Disruption scenario modeling
+    - Alternative sourcing recommendations
+    """
+    
+    def __init__(self):
+        self.regional_risk_factors = {
+            'north_america': 0.15,
+            'europe': 0.20,
+            'east_asia': 0.35,
+            'south_asia': 0.40,
+            'middle_east': 0.55,
+            'africa': 0.50,
+            'south_america': 0.45,
+            'oceania': 0.25
+        }
+        
+        self.disruption_scenarios = {
+            'trade_war': {'probability': 0.3, 'duration_months': 6, 'cost_impact': 0.4},
+            'natural_disaster': {'probability': 0.15, 'duration_months': 3, 'cost_impact': 0.3},
+            'pandemic': {'probability': 0.1, 'duration_months': 12, 'cost_impact': 0.5},
+            'geopolitical_conflict': {'probability': 0.2, 'duration_months': 8, 'cost_impact': 0.6}
+        }
+    
+    def assess_supply_chain_risk(self, material: 'MaterialProperties',
+                                sourcing_regions: List[str]) -> Dict:
+        """Comprehensive supply chain risk assessment"""
+        
+        # Regional risk aggregation
+        regional_risk = np.mean([
+            self.regional_risk_factors.get(region, 0.5) 
+            for region in sourcing_regions
+        ])
+        
+        # Supplier concentration risk (from HHI)
+        concentration_risk = material.supply_risk_hhi
+        
+        # Overall risk score
+        overall_risk = regional_risk * 0.4 + concentration_risk * 0.35 + 0.25
+        
+        # Disruption scenario analysis
+        disruption_impact = self._analyze_disruption_scenarios(material, sourcing_regions)
+        
+        # Resilience recommendations
+        recommendations = self._generate_resilience_recommendations(
+            overall_risk, regional_risk, concentration_risk
+        )
+        
+        for region in sourcing_regions:
+            SUPPLY_CHAIN_RISK.labels(material=material.name, region=region).set(overall_risk)
+        
+        return {
+            'overall_risk_score': overall_risk,
+            'regional_risk': regional_risk,
+            'concentration_risk': concentration_risk,
+            'disruption_scenarios': disruption_impact,
+            'resilience_score': 1 - overall_risk,
+            'recommendations': recommendations,
+            'risk_level': 'high' if overall_risk > 0.6 else 'medium' if overall_risk > 0.3 else 'low'
+        }
+    
+    def _analyze_disruption_scenarios(self, material: 'MaterialProperties',
+                                     regions: List[str]) -> List[Dict]:
+        """Analyze impact of disruption scenarios"""
+        
+        scenario_impacts = []
+        
+        for scenario_name, params in self.disruption_scenarios.items():
+            base_cost = material.cost_per_kg_usd
+            impact_cost = base_cost * (1 + params['cost_impact'])
+            expected_cost_increase = (impact_cost - base_cost) * params['probability']
+            
+            scenario_impacts.append({
+                'scenario': scenario_name,
+                'probability': params['probability'],
+                'duration_months': params['duration_months'],
+                'cost_impact_pct': params['cost_impact'] * 100,
+                'expected_annual_cost_increase': expected_cost_increase * 12
+            })
+        
+        return sorted(scenario_impacts, key=lambda x: x['expected_annual_cost_increase'], reverse=True)
+    
+    def _generate_resilience_recommendations(self, overall_risk: float,
+                                            regional_risk: float,
+                                            concentration_risk: float) -> List[str]:
+        """Generate supply chain resilience recommendations"""
+        recommendations = []
+        
+        if overall_risk > 0.5:
+            recommendations.append("CRITICAL: Develop comprehensive risk mitigation strategy")
+        
+        if regional_risk > 0.4:
+            recommendations.append("Diversify sourcing across multiple geographic regions")
+        
+        if concentration_risk > 0.5:
+            recommendations.append("Reduce supplier concentration - qualify alternative suppliers")
+        
+        recommendations.append("Maintain strategic inventory buffer of 3-6 months")
+        
+        return recommendations
+
+
+# ============================================================
+# ENHANCEMENT 14: CIRCULAR ECONOMY SCORING
 # ============================================================
 
 class CircularityScorer:
@@ -343,15 +552,14 @@ class CircularityScorer:
     def _assess_disassembly(self, material: 'MaterialProperties') -> float:
         """Assess ease of disassembly"""
         if material.material_class == MaterialClass.COMPOSITE:
-            return 0.3  # Difficult to separate
+            return 0.3
         elif material.material_class == MaterialClass.BIO_BASED:
             return 0.6
         else:
-            return 0.8  # Metals relatively easy
+            return 0.8
     
     def _evaluate_efficiency(self, material: 'MaterialProperties') -> float:
         """Evaluate material efficiency"""
-        # Based on density and strength ratio
         strength_to_weight = material.yield_strength_mpa / max(material.density_kg_m3, 1)
         normalized = min(1.0, strength_to_weight / 0.2)
         return normalized
@@ -372,968 +580,12 @@ class CircularityScorer:
 
 
 # ============================================================
-# ENHANCEMENT 13: SUPPLY CHAIN RESILIENCE ANALYSIS
+# ENHANCEMENT 15: DIGITAL TWIN INTEGRATION
 # ============================================================
 
-class SupplyChainResilienceAnalyzer:
+class MaterialDigitalTwin:
     """
-    Advanced supply chain resilience analysis.
-    
-    Features:
-    - Geopolitical risk assessment
-    - Supplier diversification scoring
-    - Disruption scenario modeling
-    - Inventory optimization recommendations
-    """
-    
-    def __init__(self):
-        self.regional_risk_factors = {
-            'north_america': 0.15,
-            'europe': 0.20,
-            'east_asia': 0.35,
-            'south_asia': 0.40,
-            'middle_east': 0.55,
-            'africa': 0.50,
-            'south_america': 0.45,
-            'oceania': 0.25
-        }
-        
-        self.disruption_scenarios = {
-            'trade_war': {'probability': 0.3, 'duration_months': 6, 'cost_impact': 0.4},
-            'natural_disaster': {'probability': 0.15, 'duration_months': 3, 'cost_impact': 0.3},
-            'pandemic': {'probability': 0.1, 'duration_months': 12, 'cost_impact': 0.5},
-            'geopolitical_conflict': {'probability': 0.2, 'duration_months': 8, 'cost_impact': 0.6}
-        }
-    
-    def assess_supply_chain_risk(self, material: 'MaterialProperties',
-                                sourcing_regions: List[str]) -> Dict:
-        """Comprehensive supply chain risk assessment"""
-        
-        # Regional risk aggregation
-        regional_risk = np.mean([
-            self.regional_risk_factors.get(region, 0.5) 
-            for region in sourcing_regions
-        ])
-        
-        # Supplier concentration risk
-        concentration_risk = material.supply_risk_hhi
-        
-        # Material-specific factors
-        material_risk_factors = self._assess_material_specific_risks(material)
-        
-        # Overall risk score
-        overall_risk = (
-            regional_risk * 0.4 +
-            concentration_risk * 0.35 +
-            material_risk_factors['score'] * 0.25
-        )
-        
-        # Disruption scenario analysis
-        disruption_impact = self._analyze_disruption_scenarios(material, sourcing_regions)
-        
-        # Resilience recommendations
-        recommendations = self._generate_resilience_recommendations(
-            overall_risk, regional_risk, concentration_risk
-        )
-        
-        for region in sourcing_regions:
-            SUPPLY_CHAIN_RISK.labels(material=material.name, region=region).set(overall_risk)
-        
-        return {
-            'overall_risk_score': overall_risk,
-            'regional_risk': regional_risk,
-            'concentration_risk': concentration_risk,
-            'material_specific_risks': material_risk_factors,
-            'disruption_scenarios': disruption_impact,
-            'resilience_score': 1 - overall_risk,
-            'recommendations': recommendations,
-            'risk_level': 'high' if overall_risk > 0.6 else 'medium' if overall_risk > 0.3 else 'low'
-        }
-    
-    def _assess_material_specific_risks(self, material: 'MaterialProperties') -> Dict:
-        """Assess material-specific supply chain risks"""
-        risks = {
-            'score': 0.0,
-            'factors': []
-        }
-        
-        # Rare earth dependency
-        if material.material_class == MaterialClass.COMPOSITE:
-            risks['score'] += 0.3
-            risks['factors'].append("Potential rare earth element dependency")
-        
-        # Processing complexity
-        if material.cost_per_kg_usd > 10:
-            risks['score'] += 0.2
-            risks['factors'].append("High processing complexity and cost")
-        
-        # Geographic concentration
-        if material.supply_risk_hhi > 0.5:
-            risks['score'] += 0.25
-            risks['factors'].append("High geographic concentration of supply")
-        
-        return risks
-    
-    def _analyze_disruption_scenarios(self, material: 'MaterialProperties',
-                                     regions: List[str]) -> List[Dict]:
-        """Analyze impact of disruption scenarios"""
-        scenario_impacts = []
-        
-        for scenario_name, params in self.disruption_scenarios.items():
-            # Calculate expected impact
-            base_cost = material.cost_per_kg_usd
-            impact_cost = base_cost * (1 + params['cost_impact'])
-            expected_cost_increase = (impact_cost - base_cost) * params['probability']
-            
-            scenario_impacts.append({
-                'scenario': scenario_name,
-                'probability': params['probability'],
-                'duration_months': params['duration_months'],
-                'cost_impact_pct': params['cost_impact'] * 100,
-                'expected_annual_cost_increase': expected_cost_increase * 12
-            })
-        
-        return sorted(scenario_impacts, key=lambda x: x['expected_annual_cost_increase'], reverse=True)
-    
-    def _generate_resilience_recommendations(self, overall_risk: float,
-                                            regional_risk: float,
-                                            concentration_risk: float) -> List[str]:
-        """Generate supply chain resilience recommendations"""
-        recommendations = []
-        
-        if overall_risk > 0.5:
-            recommendations.append("CRITICAL: Develop comprehensive risk mitigation strategy")
-        
-        if regional_risk > 0.4:
-            recommendations.append("Diversify sourcing across multiple geographic regions")
-        
-        if concentration_risk > 0.5:
-            recommendations.append("Reduce supplier concentration - qualify alternative suppliers")
-        
-        recommendations.append("Maintain strategic inventory buffer of 3-6 months")
-        recommendations.append("Develop supplier collaboration programs for risk sharing")
-        
-        return recommendations
-
-
-# ============================================================
-# ENHANCEMENT 14: MULTI-GENERATIONAL MATERIAL PLANNING
-# ============================================================
-
-class GenerationalMaterialPlanner:
-    """
-    Multi-generational material strategy planning.
-    
-    Features:
-    - Technology roadmapping integration
-    - Material evolution pathways
-    - Investment timing optimization
-    - Legacy material phase-out planning
-    """
-    
-    def __init__(self):
-        self.generation_timeline = {}
-        self.transition_strategies = {}
-        
-    def plan_material_evolution(self, current_material: str,
-                               future_requirements: List[Dict],
-                               planning_horizon_years: int = 15) -> Dict:
-        """Plan material evolution across product generations"""
-        
-        generations = []
-        current_gen = {
-            'generation': 0,
-            'year': 0,
-            'material': current_material,
-            'status': 'current'
-        }
-        generations.append(current_gen)
-        
-        # Plan future generations
-        for i, req in enumerate(future_requirements):
-            gen_year = req.get('year', (i + 1) * 3)
-            required_properties = req.get('properties', {})
-            
-            generation_plan = {
-                'generation': i + 1,
-                'year': gen_year,
-                'requirements': required_properties,
-                'transition_strategy': self._develop_transition_strategy(
-                    current_material, req, gen_year
-                ),
-                'investment_needed': self._estimate_transition_investment(
-                    current_material, req
-                ),
-                'risk_assessment': self._assess_transition_risk(req)
-            }
-            
-            generations.append(generation_plan)
-            current_material = req.get('target_material', current_material)
-        
-        return {
-            'generations': generations,
-            'total_investment': sum(g['investment_needed'] for g in generations[1:]),
-            'critical_milestones': self._identify_critical_milestones(generations),
-            'phase_out_plan': self._develop_phase_out_plan(generations[0]['material'], generations)
-        }
-    
-    def _develop_transition_strategy(self, current: str, 
-                                    future_req: Dict, 
-                                    timeline_year: int) -> Dict:
-        """Develop transition strategy between material generations"""
-        strategy = {
-            'approach': 'gradual' if timeline_year > 3 else 'accelerated',
-            'parallel_running_period_months': max(6, timeline_year * 2),
-            'validation_required': True,
-            'supplier_qualification_needed': True,
-            'key_activities': [
-                f"Material qualification by year {timeline_year - 2}",
-                f"Supplier development by year {timeline_year - 1}",
-                f"Process validation by year {timeline_year}",
-                "Legacy material inventory management"
-            ]
-        }
-        
-        return strategy
-    
-    def _estimate_transition_investment(self, current: str, future_req: Dict) -> float:
-        """Estimate investment required for material transition"""
-        base_investment = 500000  # Base investment
-        
-        # Adjust based on material class change
-        if future_req.get('material_class_change'):
-            base_investment *= 2
-        
-        # Adjust for timeline urgency
-        years_available = future_req.get('year', 3)
-        if years_available < 2:
-            base_investment *= 1.5
-        
-        return base_investment
-    
-    def _assess_transition_risk(self, future_req: Dict) -> Dict:
-        """Assess risks in material transition"""
-        risks = {
-            'technical_risk': 0.3,
-            'supply_chain_risk': 0.4,
-            'cost_risk': 0.3,
-            'regulatory_risk': 0.2
-        }
-        
-        # Adjust based on requirements
-        if future_req.get('performance_jump', 0) > 0.5:
-            risks['technical_risk'] = 0.6
-        
-        if future_req.get('new_supplier_required'):
-            risks['supply_chain_risk'] = 0.7
-        
-        return risks
-    
-    def _identify_critical_milestones(self, generations: List[Dict]) -> List[Dict]:
-        """Identify critical milestones in material evolution"""
-        milestones = []
-        
-        for gen in generations[1:]:
-            milestones.append({
-                'year': gen['year'] - 2,
-                'milestone': f"Begin material qualification for Gen {gen['generation']}"
-            })
-            milestones.append({
-                'year': gen['year'] - 1,
-                'milestone': f"Complete supplier qualification for Gen {gen['generation']}"
-            })
-            milestones.append({
-                'year': gen['year'],
-                'milestone': f"Launch Gen {gen['generation']} with new material"
-            })
-        
-        return sorted(milestones, key=lambda x: x['year'])
-    
-    def _develop_phase_out_plan(self, current_material: str, 
-                               generations: List[Dict]) -> Dict:
-        """Develop plan for phasing out current material"""
-        last_gen_year = generations[-1]['year'] if len(generations) > 1 else 5
-        
-        return {
-            'material': current_material,
-            'phase_out_start': max(1, last_gen_year - 3),
-            'complete_phase_out': last_gen_year + 2,
-            'legacy_support_years': 5,
-            'recycling_strategy': 'Maximize recycling of legacy material stock'
-        }
-
-
-# ============================================================
-# ENHANCEMENT 15: REAL-TIME MARKET PRICE INTEGRATION
-# ============================================================
-
-class MarketPriceIntegrator:
-    """
-    Real-time market price integration and forecasting.
-    
-    Features:
-    - API integration for commodity prices
-    - Price trend analysis
-    - Cost volatility modeling
-    - Price arbitrage opportunities
-    """
-    
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self.price_cache = TTLCache(maxsize=100, ttl=3600)  # 1 hour cache
-        self.price_history = defaultdict(list)
-        self.forecast_models = {}
-        
-    async def get_current_price(self, material_name: str) -> Optional[float]:
-        """Get current market price for material"""
-        # Check cache first
-        cache_key = f"price_{material_name}"
-        if cache_key in self.price_cache:
-            return self.price_cache[cache_key]
-        
-        # Try API if available
-        if self.api_key:
-            try:
-                price = await self._fetch_price_from_api(material_name)
-                if price:
-                    self.price_cache[cache_key] = price
-                    self.price_history[material_name].append({
-                        'timestamp': datetime.now(),
-                        'price': price
-                    })
-                    return price
-            except Exception as e:
-                logger.warning(f"Failed to fetch price for {material_name}: {e}")
-        
-        # Return simulated price
-        simulated_price = self._generate_simulated_price(material_name)
-        self.price_cache[cache_key] = simulated_price
-        return simulated_price
-    
-    async def _fetch_price_from_api(self, material_name: str) -> Optional[float]:
-        """Fetch price from external API"""
-        # Simulated API call
-        await asyncio.sleep(0.1)
-        base_prices = {
-            'aluminum': 2.50,
-            'copper': 8.00,
-            'magnesium': 3.50,
-            'steel': 1.20,
-            'graphene': 25.00,
-        }
-        
-        for key, price in base_prices.items():
-            if key in material_name.lower():
-                # Add some random variation
-                return price * (1 + np.random.normal(0, 0.05))
-        
-        return None
-    
-    def _generate_simulated_price(self, material_name: str) -> float:
-        """Generate simulated price based on historical patterns"""
-        history = self.price_history.get(material_name, [])
-        
-        if len(history) > 10:
-            recent_prices = [h['price'] for h in history[-10:]]
-            trend = np.polyfit(range(len(recent_prices)), recent_prices, 1)
-            base = recent_prices[-1] + trend[0]
-        else:
-            base = 5.0  # Default price
-        
-        # Add volatility
-        volatility = 0.1
-        return max(0.1, base * (1 + np.random.normal(0, volatility)))
-    
-    def forecast_price_trend(self, material_name: str, 
-                            horizon_months: int = 12) -> Dict:
-        """Forecast price trend for material"""
-        history = self.price_history.get(material_name, [])
-        
-        if len(history) < 6:
-            return {'error': 'Insufficient price history'}
-        
-        recent_prices = [h['price'] for h in history[-12:]]
-        
-        # Simple time series forecasting
-        x = np.arange(len(recent_prices))
-        coeffs = np.polyfit(x, recent_prices, min(3, len(recent_prices)-1))
-        poly = np.poly1d(coeffs)
-        
-        # Forecast
-        future_x = np.arange(len(recent_prices), len(recent_prices) + horizon_months)
-        forecast = poly(future_x)
-        
-        # Calculate confidence intervals
-        residuals = recent_prices - poly(x)
-        std_residuals = np.std(residuals)
-        
-        return {
-            'current_price': recent_prices[-1],
-            'forecast_prices': forecast.tolist(),
-            'upper_bound': (forecast + 2 * std_residuals).tolist(),
-            'lower_bound': (forecast - 2 * std_residuals).tolist(),
-            'trend_direction': 'increasing' if coeffs[0] > 0 else 'decreasing',
-            'volatility': std_residuals / recent_prices[-1]
-        }
-
-
-# ============================================================
-# ENHANCEMENT 16: COMPREHENSIVE ENVIRONMENTAL IMPACT
-# ============================================================
-
-class ComprehensiveEnvironmentalImpact:
-    """
-    Environmental impact assessment beyond carbon.
-    
-    Features:
-    - Water footprint analysis
-    - Land use change impact
-    - Ecotoxicity assessment
-    - Biodiversity impact scoring
-    """
-    
-    def __init__(self):
-        self.impact_categories = {
-            'water_consumption': {'weight': 0.25, 'unit': 'liters/kg'},
-            'land_use': {'weight': 0.20, 'unit': 'm²/kg'},
-            'ecotoxicity': {'weight': 0.20, 'unit': 'CTUe/kg'},
-            'eutrophication': {'weight': 0.15, 'unit': 'kg P-eq/kg'},
-            'acidification': {'weight': 0.10, 'unit': 'kg SO2-eq/kg'},
-            'ozone_depletion': {'weight': 0.10, 'unit': 'kg CFC-11-eq/kg'}
-        }
-        
-        self.material_impacts_db = self._initialize_impact_database()
-    
-    def _initialize_impact_database(self) -> Dict:
-        """Initialize environmental impact database"""
-        return {
-            'aluminum': {
-                'water_consumption': 100,
-                'land_use': 0.5,
-                'ecotoxicity': 50,
-                'eutrophication': 0.01,
-                'acidification': 0.05,
-                'ozone_depletion': 0.0
-            },
-            'magnesium': {
-                'water_consumption': 150,
-                'land_use': 0.8,
-                'ecotoxicity': 80,
-                'eutrophication': 0.02,
-                'acidification': 0.08,
-                'ozone_depletion': 0.0
-            },
-            'composite': {
-                'water_consumption': 200,
-                'land_use': 0.3,
-                'ecotoxicity': 120,
-                'eutrophication': 0.03,
-                'acidification': 0.10,
-                'ozone_depletion': 0.001
-            },
-            'bio_based': {
-                'water_consumption': 500,
-                'land_use': 2.0,
-                'ecotoxicity': 20,
-                'eutrophication': 0.05,
-                'acidification': 0.02,
-                'ozone_depletion': 0.0
-            }
-        }
-    
-    def calculate_environmental_score(self, material: 'MaterialProperties') -> Dict:
-        """Calculate comprehensive environmental impact score"""
-        
-        # Get base impacts for material class
-        material_class_key = self._get_material_class_key(material.material_class)
-        base_impacts = self.material_impacts_db.get(material_class_key, {})
-        
-        if not base_impacts:
-            return {'error': 'No environmental data available'}
-        
-        # Calculate weighted score (lower is better)
-        weighted_score = 0
-        normalized_impacts = {}
-        
-        for category, params in self.impact_categories.items():
-            impact_value = base_impacts.get(category, 0)
-            
-            # Normalize to 0-1 scale (using reference values)
-            ref_values = {
-                'water_consumption': 1000,
-                'land_use': 5,
-                'ecotoxicity': 200,
-                'eutrophication': 0.1,
-                'acidification': 0.2,
-                'ozone_depletion': 0.01
-            }
-            
-            normalized = min(1.0, impact_value / max(ref_values.get(category, 1), 0.001))
-            normalized_impacts[category] = {
-                'value': impact_value,
-                'normalized': normalized,
-                'weight': params['weight'],
-                'unit': params['unit']
-            }
-            
-            weighted_score += normalized * params['weight']
-        
-        # Environmental impact score (0-100, higher is better)
-        env_score = max(0, 100 * (1 - weighted_score))
-        
-        return {
-            'environmental_score': env_score,
-            'impact_categories': normalized_impacts,
-            'carbon_footprint': material.carbon_footprint_kg_co2_per_kg,
-            'water_scarcity_footprint': base_impacts.get('water_consumption', 0),
-            'recommendations': self._generate_environmental_recommendations(normalized_impacts)
-        }
-    
-    def _get_material_class_key(self, material_class: MaterialClass) -> str:
-        """Map material class to database key"""
-        mapping = {
-            MaterialClass.ALUMINUM_ALLOY: 'aluminum',
-            MaterialClass.MAGNESIUM_ALLOY: 'magnesium',
-            MaterialClass.COMPOSITE: 'composite',
-            MaterialClass.BIO_BASED: 'bio_based'
-        }
-        return mapping.get(material_class, 'aluminum')
-    
-    def _generate_environmental_recommendations(self, impacts: Dict) -> List[str]:
-        """Generate recommendations for reducing environmental impact"""
-        recommendations = []
-        
-        for category, data in impacts.items():
-            if data['normalized'] > 0.5:
-                recommendations.append(
-                    f"Investigate alternatives with lower {category.replace('_', ' ')} impact"
-                )
-        
-        if not recommendations:
-            recommendations.append("Environmental impact within acceptable range")
-        
-        return recommendations
-
-
-# ============================================================
-# ENHANCEMENT 17: MATERIAL COMPATIBILITY AND JOINING
-# ============================================================
-
-class MaterialCompatibilityAnalyzer:
-    """
-    Material compatibility and joining assessment.
-    
-    Features:
-    - Galvanic corrosion risk
-    - Thermal expansion matching
-    - Joining method suitability
-    - Interface performance prediction
-    """
-    
-    def __init__(self):
-        self.galvanic_series = {
-            'magnesium': -1.6,
-            'aluminum': -0.8,
-            'steel': -0.4,
-            'copper': 0.0,
-            'stainless_steel': -0.2,
-            'titanium': -0.1,
-            'graphite': 0.3
-        }
-        
-        self.joining_methods = {
-            'adhesive': {'temp_max': 200, 'strength_ratio': 0.5, 'cost_factor': 0.3},
-            'mechanical': {'temp_max': 500, 'strength_ratio': 0.8, 'cost_factor': 0.5},
-            'welding': {'temp_max': 1000, 'strength_ratio': 1.0, 'cost_factor': 0.7},
-            'brazing': {'temp_max': 800, 'strength_ratio': 0.7, 'cost_factor': 0.6}
-        }
-    
-    def assess_compatibility(self, material1: 'MaterialProperties',
-                            material2: 'MaterialProperties',
-                            application_temp: float) -> Dict:
-        """Assess compatibility between two materials"""
-        
-        # Galvanic corrosion risk
-        galvanic_risk = self._assess_galvanic_corrosion(material1, material2)
-        
-        # Thermal expansion matching
-        thermal_match = self._assess_thermal_expansion(material1, material2, application_temp)
-        
-        # Joining method suitability
-        joining_options = self._evaluate_joining_methods(material1, material2, application_temp)
-        
-        # Overall compatibility score
-        compatibility_score = (
-            galvanic_risk['score'] * 0.4 +
-            thermal_match['score'] * 0.35 +
-            joining_options['best_method_score'] * 0.25
-        )
-        
-        return {
-            'compatibility_score': compatibility_score,
-            'galvanic_corrosion_risk': galvanic_risk,
-            'thermal_expansion_match': thermal_match,
-            'joining_options': joining_options,
-            'recommendations': self._generate_compatibility_recommendations(
-                compatibility_score, galvanic_risk, thermal_match
-            )
-        }
-    
-    def _assess_galvanic_corrosion(self, mat1: 'MaterialProperties',
-                                  mat2: 'MaterialProperties') -> Dict:
-        """Assess galvanic corrosion risk"""
-        
-        # Get electrochemical potentials
-        potential1 = self._get_electrochemical_potential(mat1)
-        potential2 = self._get_electrochemical_potential(mat2)
-        
-        # Potential difference
-        potential_diff = abs(potential1 - potential2)
-        
-        # Risk assessment
-        if potential_diff < 0.2:
-            risk = 'low'
-            score = 0.9
-        elif potential_diff < 0.5:
-            risk = 'medium'
-            score = 0.6
-        else:
-            risk = 'high'
-            score = 0.3
-        
-        return {
-            'potential_difference': potential_diff,
-            'risk_level': risk,
-            'score': score,
-            'mitigation': 'Use isolation coating' if risk == 'high' else None
-        }
-    
-    def _get_electrochemical_potential(self, material: 'MaterialProperties') -> float:
-        """Get electrochemical potential for material"""
-        for key, potential in self.galvanic_series.items():
-            if key in material.name.lower():
-                return potential
-        return -0.5  # Default
-    
-    def _assess_thermal_expansion(self, mat1: 'MaterialProperties',
-                                  mat2: 'MaterialProperties',
-                                  temperature: float) -> Dict:
-        """Assess thermal expansion compatibility"""
-        
-        # Simplified CTE estimation based on material class
-        cte1 = self._estimate_cte(mat1)
-        cte2 = self._estimate_cte(mat2)
-        
-        cte_mismatch = abs(cte1 - cte2) / max(cte1, cte2, 0.001)
-        
-        if cte_mismatch < 0.2:
-            score = 0.9
-            compatibility = 'good'
-        elif cte_mismatch < 0.4:
-            score = 0.6
-            compatibility = 'moderate'
-        else:
-            score = 0.3
-            compatibility = 'poor'
-        
-        return {
-            'cte_mismatch_pct': cte_mismatch * 100,
-            'compatibility': compatibility,
-            'score': score,
-            'thermal_stress_risk': 'high' if cte_mismatch > 0.3 else 'low'
-        }
-    
-    def _estimate_cte(self, material: 'MaterialProperties') -> float:
-        """Estimate coefficient of thermal expansion"""
-        cte_estimates = {
-            MaterialClass.ALUMINUM_ALLOY: 23e-6,
-            MaterialClass.MAGNESIUM_ALLOY: 25e-6,
-            MaterialClass.STEEL_ALLOY: 12e-6,
-            MaterialClass.COPPER_ALLOY: 17e-6,
-            MaterialClass.COMPOSITE: 5e-6,
-            MaterialClass.BIO_BASED: 100e-6
-        }
-        return cte_estimates.get(material.material_class, 15e-6)
-    
-    def _evaluate_joining_methods(self, mat1: 'MaterialProperties',
-                                  mat2: 'MaterialProperties',
-                                  temperature: float) -> Dict:
-        """Evaluate suitable joining methods"""
-        
-        suitable_methods = []
-        best_score = 0
-        
-        for method, params in self.joining_methods.items():
-            if temperature <= params['temp_max']:
-                # Calculate method suitability score
-                strength_score = params['strength_ratio']
-                cost_score = 1 - params['cost_factor']
-                method_score = (strength_score + cost_score) / 2
-                
-                suitable_methods.append({
-                    'method': method,
-                    'score': method_score,
-                    'strength_ratio': params['strength_ratio'],
-                    'cost_factor': params['cost_factor']
-                })
-                
-                best_score = max(best_score, method_score)
-        
-        suitable_methods.sort(key=lambda x: x['score'], reverse=True)
-        
-        return {
-            'suitable_methods': suitable_methods[:3],
-            'best_method': suitable_methods[0]['method'] if suitable_methods else None,
-            'best_method_score': best_score
-        }
-    
-    def _generate_compatibility_recommendations(self, score: float,
-                                               galvanic: Dict,
-                                               thermal: Dict) -> List[str]:
-        """Generate compatibility recommendations"""
-        recommendations = []
-        
-        if galvanic['risk_level'] == 'high':
-            recommendations.append("Apply protective coating to prevent galvanic corrosion")
-        
-        if thermal['compatibility'] == 'poor':
-            recommendations.append("Design for thermal stress with expansion joints")
-        
-        if score < 0.5:
-            recommendations.append("Consider alternative material combination")
-        
-        return recommendations
-
-
-# ============================================================
-# ENHANCEMENT 18: MANUFACTURING PROCESS ENERGY ANALYSIS
-# ============================================================
-
-class ManufacturingEnergyAnalyzer:
-    """
-    Manufacturing process energy consumption analysis.
-    
-    Features:
-    - Process-specific energy modeling
-    - Energy mix carbon intensity
-    - Process optimization recommendations
-    - Energy efficiency benchmarking
-    """
-    
-    def __init__(self):
-        self.process_energy_db = {
-            'casting': {'energy_kwh_per_kg': 5, 'scrap_rate': 0.05},
-            'forging': {'energy_kwh_per_kg': 3, 'scrap_rate': 0.08},
-            'machining': {'energy_kwh_per_kg': 8, 'scrap_rate': 0.15},
-            'additive_manufacturing': {'energy_kwh_per_kg': 50, 'scrap_rate': 0.02},
-            'injection_molding': {'energy_kwh_per_kg': 4, 'scrap_rate': 0.03},
-            'extrusion': {'energy_kwh_per_kg': 2, 'scrap_rate': 0.06}
-        }
-        
-        self.energy_mix_carbon_intensity = {
-            'grid_average': 0.5,  # kg CO2/kWh
-            'renewable': 0.05,
-            'natural_gas': 0.4,
-            'coal': 1.0
-        }
-    
-    def analyze_manufacturing_energy(self, material: 'MaterialProperties',
-                                    process: str,
-                                    annual_volume_kg: float,
-                                    energy_source: str = 'grid_average') -> Dict:
-        """Analyze manufacturing energy consumption"""
-        
-        if process not in self.process_energy_db:
-            return {'error': f'Unknown process: {process}'}
-        
-        process_data = self.process_energy_db[process]
-        carbon_intensity = self.energy_mix_carbon_intensity.get(energy_source, 0.5)
-        
-        # Energy calculations
-        energy_per_kg = process_data['energy_kwh_per_kg']
-        total_energy = energy_per_kg * annual_volume_kg
-        energy_carbon = total_energy * carbon_intensity
-        
-        # Scrap-adjusted calculations
-        scrap_rate = process_data['scrap_rate']
-        effective_volume = annual_volume_kg / (1 - scrap_rate)
-        energy_with_scrap = energy_per_kg * effective_volume
-        carbon_with_scrap = energy_with_scrap * carbon_intensity
-        
-        # Efficiency benchmarking
-        benchmark = self._benchmark_process_efficiency(process, energy_per_kg)
-        
-        return {
-            'process': process,
-            'annual_volume_kg': annual_volume_kg,
-            'energy_per_kg_kwh': energy_per_kg,
-            'total_annual_energy_kwh': total_energy,
-            'carbon_from_energy_kg_co2': energy_carbon,
-            'scrap_adjusted_energy_kwh': energy_with_scrap,
-            'scrap_adjusted_carbon_kg_co2': carbon_with_scrap,
-            'efficiency_benchmark': benchmark,
-            'optimization_potential': self._identify_optimization_opportunities(
-                process, energy_per_kg, scrap_rate
-            )
-        }
-    
-    def _benchmark_process_efficiency(self, process: str, 
-                                     actual_energy: float) -> Dict:
-        """Benchmark against best-in-class energy consumption"""
-        best_in_class = {
-            'casting': 3,
-            'forging': 2,
-            'machining': 5,
-            'additive_manufacturing': 30,
-            'injection_molding': 2.5,
-            'extrusion': 1.5
-        }
-        
-        best = best_in_class.get(process, actual_energy * 0.7)
-        improvement_potential = (actual_energy - best) / actual_energy
-        
-        return {
-            'best_in_class_kwh_per_kg': best,
-            'improvement_potential_pct': improvement_potential * 100,
-            'rating': 'A' if improvement_potential < 0.1 else 'B' if improvement_potential < 0.3 else 'C'
-        }
-    
-    def _identify_optimization_opportunities(self, process: str,
-                                            energy_per_kg: float,
-                                            scrap_rate: float) -> List[str]:
-        """Identify optimization opportunities"""
-        opportunities = []
-        
-        if scrap_rate > 0.1:
-            opportunities.append(f"Reduce scrap rate from {scrap_rate:.0%} through process optimization")
-        
-        if energy_per_kg > 5:
-            opportunities.append("Consider energy-efficient equipment upgrades")
-        
-        opportunities.append("Implement energy monitoring and management system")
-        
-        return opportunities
-
-
-# ============================================================
-# ENHANCEMENT 19: REGULATORY COMPLIANCE AND CERTIFICATION
-# ============================================================
-
-class RegulatoryComplianceTracker:
-    """
-    Regulatory compliance and certification tracking.
-    
-    Features:
-    - Multi-regulation compliance checking
-    - Certification requirement mapping
-    - Compliance cost estimation
-    - Regulatory change monitoring
-    """
-    
-    def __init__(self):
-        self.regulations_db = {
-            'REACH': {
-                'jurisdiction': 'EU',
-                'requirements': ['SVHC_declaration', 'substance_restriction'],
-                'compliance_cost': 50000,
-                'renewal_period_years': 2
-            },
-            'RoHS': {
-                'jurisdiction': 'EU',
-                'requirements': ['hazardous_substance_limits'],
-                'compliance_cost': 30000,
-                'renewal_period_years': 3
-            },
-            'Conflict_Minerals': {
-                'jurisdiction': 'US',
-                'requirements': ['supply_chain_due_diligence', 'smelter_audit'],
-                'compliance_cost': 75000,
-                'renewal_period_years': 1
-            },
-            'ISO_14001': {
-                'jurisdiction': 'International',
-                'requirements': ['environmental_management_system'],
-                'compliance_cost': 25000,
-                'renewal_period_years': 3
-            }
-        }
-        
-        self.certification_requirements = {
-            'aerospace': ['AS9100', 'Nadcap'],
-            'medical': ['ISO_13485', 'FDA_approval'],
-            'automotive': ['IATF_16949', 'IMDS_reporting'],
-            'electronics': ['IEC_standards', 'UL_certification']
-        }
-    
-    def check_compliance(self, material: 'MaterialProperties',
-                        application: 'Application',
-                        jurisdictions: List[str]) -> Dict:
-        """Check regulatory compliance requirements"""
-        
-        applicable_regulations = self._identify_applicable_regulations(jurisdictions)
-        certifications_needed = self._identify_certifications(application)
-        
-        compliance_status = {}
-        total_cost = 0
-        
-        for reg in applicable_regulations:
-            reg_data = self.regulations_db[reg]
-            compliance_status[reg] = {
-                'status': 'review_needed',
-                'requirements': reg_data['requirements'],
-                'estimated_cost': reg_data['compliance_cost'],
-                'renewal_period': reg_data['renewal_period_years']
-            }
-            total_cost += reg_data['compliance_cost']
-        
-        return {
-            'compliant': False,  # Requires review
-            'applicable_regulations': compliance_status,
-            'certifications_required': certifications_needed,
-            'total_compliance_cost_annual': total_cost,
-            'action_items': self._generate_compliance_action_items(
-                compliance_status, certifications_needed
-            )
-        }
-    
-    def _identify_applicable_regulations(self, jurisdictions: List[str]) -> List[str]:
-        """Identify applicable regulations based on jurisdiction"""
-        applicable = []
-        
-        for reg_name, reg_data in self.regulations_db.items():
-            if reg_data['jurisdiction'] in jurisdictions or reg_data['jurisdiction'] == 'International':
-                applicable.append(reg_name)
-        
-        return applicable
-    
-    def _identify_certifications(self, application: 'Application') -> List[str]:
-        """Identify required certifications for application"""
-        app_key = application.value
-        return self.certification_requirements.get(app_key, [])
-    
-    def _generate_compliance_action_items(self, compliance_status: Dict,
-                                         certifications: List[str]) -> List[str]:
-        """Generate compliance action items"""
-        items = []
-        
-        for reg, status in compliance_status.items():
-            items.append(f"Complete {reg} compliance documentation")
-        
-        for cert in certifications:
-            items.append(f"Obtain {cert} certification")
-        
-        items.append("Establish regulatory monitoring process")
-        
-        return items
-
-
-# ============================================================
-# ENHANCEMENT 20: DIGITAL TWIN INTEGRATION
-# ============================================================
-
-class DigitalTwinIntegration:
-    """
-    Digital twin integration for performance validation.
+    Digital twin integration for material performance validation.
     
     Features:
     - Virtual material testing
@@ -1346,18 +598,25 @@ class DigitalTwinIntegration:
         self.simulation_models = {}
         self.sensor_data_buffer = deque(maxlen=10000)
         
-    def create_material_digital_twin(self, material: 'MaterialProperties',
-                                   application: 'Application') -> Dict:
+    def create_material_twin(self, material: 'MaterialProperties',
+                           application: 'Application') -> Dict:
         """Create digital twin model for material performance"""
         
         # Material property model
-        property_model = self._build_property_model(material)
+        property_model = {
+            'density': {'value': material.density_kg_m3, 'uncertainty': 0.02},
+            'thermal_conductivity': {'value': material.thermal_conductivity_w_mk, 'uncertainty': 0.05},
+            'yield_strength': {'value': material.yield_strength_mpa, 'uncertainty': 0.08},
+            'elastic_modulus': {'value': material.elastic_modulus_gpa, 'uncertainty': 0.03}
+        }
         
-        # Degradation model
-        degradation_model = self._build_degradation_model(material, application)
-        
-        # Performance prediction model
-        performance_model = self._build_performance_model(material, application)
+        # Degradation model based on application
+        degradation_rates = {
+            Application.HEAT_SINK: {'thermal_fatigue': 0.001, 'oxidation': 0.0005},
+            Application.CHASSIS: {'fatigue': 0.002, 'corrosion': 0.001},
+            Application.CONNECTOR: {'wear': 0.003, 'fretting': 0.001},
+            Application.STRUCTURAL: {'creep': 0.0005, 'fatigue': 0.001}
+        }
         
         twin_id = f"DT-{material.name}-{application.value}-{datetime.now().strftime('%Y%m%d')}"
         
@@ -1365,8 +624,7 @@ class DigitalTwinIntegration:
             'material': material,
             'application': application,
             'property_model': property_model,
-            'degradation_model': degradation_model,
-            'performance_model': performance_model,
+            'degradation_rates': degradation_rates.get(application, {}),
             'created_at': datetime.now(),
             'last_updated': datetime.now()
         }
@@ -1376,64 +634,7 @@ class DigitalTwinIntegration:
             'capabilities': ['property_prediction', 'degradation_simulation', 
                            'performance_forecasting'],
             'update_frequency': 'daily',
-            'accuracy_metrics': self._estimate_model_accuracy(material)
-        }
-    
-    def _build_property_model(self, material: 'MaterialProperties') -> Dict:
-        """Build material property model"""
-        return {
-            'density': {'value': material.density_kg_m3, 'uncertainty': 0.02},
-            'thermal_conductivity': {'value': material.thermal_conductivity_w_mk, 'uncertainty': 0.05},
-            'yield_strength': {'value': material.yield_strength_mpa, 'uncertainty': 0.08},
-            'elastic_modulus': {'value': material.elastic_modulus_gpa, 'uncertainty': 0.03}
-        }
-    
-    def _build_degradation_model(self, material: 'MaterialProperties',
-                                application: 'Application') -> Dict:
-        """Build material degradation model"""
-        degradation_rates = {
-            Application.HEAT_SINK: {'thermal_fatigue': 0.001, 'oxidation': 0.0005},
-            Application.CHASSIS: {'fatigue': 0.002, 'corrosion': 0.001},
-            Application.CONNECTOR: {'wear': 0.003, 'fretting': 0.001},
-            Application.STRUCTURAL: {'creep': 0.0005, 'fatigue': 0.001}
-        }
-        
-        return {
-            'degradation_mechanisms': degradation_rates.get(application, {}),
-            'expected_lifetime_range': (5, 20),  # years
-            'maintenance_interval_months': 6
-        }
-    
-    def _build_performance_model(self, material: 'MaterialProperties',
-                                application: 'Application') -> Dict:
-        """Build performance prediction model"""
-        return {
-            'performance_metric': self._get_key_performance_metric(application),
-            'baseline_performance': 0.85,
-            'degradation_rate': 0.01,  # per year
-            'operational_envelope': {
-                'temperature_min': -40,
-                'temperature_max': 200,
-                'humidity_max': 95
-            }
-        }
-    
-    def _get_key_performance_metric(self, application: 'Application') -> str:
-        """Get key performance metric for application"""
-        metrics = {
-            Application.HEAT_SINK: 'thermal_resistance',
-            Application.CHASSIS: 'structural_integrity',
-            Application.CONNECTOR: 'contact_resistance',
-            Application.STRUCTURAL: 'load_bearing_capacity'
-        }
-        return metrics.get(application, 'general_performance')
-    
-    def _estimate_model_accuracy(self, material: 'MaterialProperties') -> Dict:
-        """Estimate digital twin model accuracy"""
-        return {
-            'property_prediction_r2': 0.92,
-            'degradation_prediction_mae': 0.05,
-            'performance_prediction_accuracy': 0.88
+            'expected_lifetime_range': (5, 20)
         }
     
     def integrate_sensor_data(self, twin_id: str, sensor_data: Dict) -> None:
@@ -1444,9 +645,447 @@ class DigitalTwinIntegration:
                 'timestamp': datetime.now(),
                 'data': sensor_data
             })
-            
-            # Update model with new data
             self.simulation_models[twin_id]['last_updated'] = datetime.now()
+    
+    def predict_performance(self, twin_id: str, 
+                          operating_conditions: Dict,
+                          time_horizon_years: float = 5) -> Dict:
+        """Predict material performance over time"""
+        
+        if twin_id not in self.simulation_models:
+            return {'error': 'Twin not found'}
+        
+        twin = self.simulation_models[twin_id]
+        material = twin['material']
+        
+        # Simple degradation model
+        degradation_rates = twin['degradation_rates']
+        total_degradation = sum(degradation_rates.values()) * time_horizon_years
+        
+        # Performance retention
+        property_retention = max(0.5, 1 - total_degradation)
+        
+        return {
+            'twin_id': twin_id,
+            'time_horizon_years': time_horizon_years,
+            'property_retention_pct': property_retention * 100,
+            'estimated_lifetime_remaining': material.project_lifetime_years * property_retention,
+            'maintenance_recommended': property_retention < 0.7
+        }
+
+
+# ============================================================
+# ENHANCEMENT 16: BLOCKCHAIN MATERIAL PROVENANCE
+# ============================================================
+
+class BlockchainMaterialProvenance:
+    """
+    Blockchain-verified material provenance tracking.
+    
+    Features:
+    - Immutable material origin records
+    - Smart contract certification
+    - Supply chain transparency
+    - Quality verification
+    """
+    
+    def __init__(self):
+        self.blockchain = []
+        self.smart_contracts = {}
+        self.verification_nodes = 5
+        
+        if WEB3_AVAILABLE:
+            try:
+                self.w3 = Web3(Web3.HTTPProvider('http://localhost:8545'))
+                self.blockchain_enabled = True
+            except Exception:
+                self.blockchain_enabled = False
+        else:
+            self.blockchain_enabled = False
+    
+    def record_material_origin(self, material: 'MaterialProperties',
+                             supplier: str, batch_id: str,
+                             certifications: List[str] = None) -> Dict:
+        """Record material origin on blockchain"""
+        
+        block = {
+            'block_id': len(self.blockchain) + 1,
+            'timestamp': datetime.now().isoformat(),
+            'material_name': material.name,
+            'material_class': material.material_class.value,
+            'supplier': supplier,
+            'batch_id': batch_id,
+            'certifications': certifications or [],
+            'carbon_footprint': material.carbon_footprint_kg_co2_per_kg,
+            'recycling_rate': material.recycling_rate_pct,
+            'previous_hash': self._get_previous_hash(),
+            'verification_status': 'pending'
+        }
+        
+        block['hash'] = self._calculate_block_hash(block)
+        
+        if self._reach_consensus(block):
+            block['verification_status'] = 'verified'
+            BLOCKCHAIN_RECORDS.labels(material=material.name).inc()
+        
+        self.blockchain.append(block)
+        
+        return block
+    
+    def _calculate_block_hash(self, block: Dict) -> str:
+        """Calculate SHA-256 block hash"""
+        block_copy = {k: v for k, v in block.items() if k != 'hash'}
+        return hashlib.sha256(
+            json.dumps(block_copy, sort_keys=True, default=str).encode()
+        ).hexdigest()
+    
+    def _get_previous_hash(self) -> str:
+        """Get hash of previous block"""
+        if self.blockchain:
+            return self.blockchain[-1]['hash']
+        return '0' * 64
+    
+    def _reach_consensus(self, block: Dict) -> bool:
+        """Simulate distributed consensus"""
+        votes = sum(1 for _ in range(self.verification_nodes) if random.random() > 0.1)
+        return votes >= self.verification_nodes * 0.9
+    
+    def verify_material_provenance(self, batch_id: str) -> Dict:
+        """Verify material provenance from blockchain"""
+        
+        for block in self.blockchain:
+            if block.get('batch_id') == batch_id:
+                return {
+                    'verified': block['verification_status'] == 'verified',
+                    'material': block['material_name'],
+                    'supplier': block['supplier'],
+                    'carbon_footprint': block['carbon_footprint'],
+                    'certifications': block['certifications']
+                }
+        
+        return {'verified': False, 'message': 'No provenance record found'}
+
+
+# ============================================================
+# ENHANCEMENT 17: REAL-TIME MARKET PRICE INTEGRATION
+# ============================================================
+
+class MaterialMarketPriceIntegrator:
+    """
+    Real-time market price integration for materials.
+    
+    Features:
+    - Live commodity price tracking
+    - Price trend analysis
+    - Cost forecasting
+    - Price alert generation
+    """
+    
+    def __init__(self):
+        self.price_cache = TTLCache(maxsize=100, ttl=3600)
+        self.price_history = defaultdict(lambda: deque(maxlen=168))
+        self.price_forecasts = {}
+        
+    async def get_current_price(self, material_name: str) -> Optional[float]:
+        """Get current market price for material"""
+        
+        cache_key = f"price_{material_name}"
+        if cache_key in self.price_cache:
+            return self.price_cache[cache_key]
+        
+        # Simulated price fetch
+        base_prices = {
+            'aluminum': 2.50,
+            'copper': 8.00,
+            'magnesium': 3.50,
+            'steel': 1.20,
+            'graphene': 25.00,
+            'carbon_fiber': 15.00
+        }
+        
+        for key, price in base_prices.items():
+            if key in material_name.lower():
+                current_price = price * (1 + random.uniform(-0.1, 0.1))
+                self.price_cache[cache_key] = current_price
+                
+                self.price_history[material_name].append({
+                    'timestamp': datetime.now().isoformat(),
+                    'price': current_price
+                })
+                
+                return current_price
+        
+        return None
+    
+    def forecast_price_trend(self, material_name: str, 
+                           horizon_months: int = 6) -> Dict:
+        """Forecast material price trend"""
+        
+        history = list(self.price_history[material_name])
+        
+        if len(history) < 10:
+            return {'error': 'Insufficient price history'}
+        
+        recent_prices = [h['price'] for h in history[-20:]]
+        
+        # Simple exponential smoothing with trend
+        alpha = 0.3
+        smoothed = recent_prices[-1]
+        for price in reversed(recent_prices[:-1]):
+            smoothed = alpha * price + (1 - alpha) * smoothed
+        
+        trend = (recent_prices[-1] - recent_prices[0]) / len(recent_prices) if len(recent_prices) > 1 else 0
+        
+        forecast = smoothed + trend * horizon_months
+        
+        return {
+            'current_price': recent_prices[-1],
+            'forecast_price': forecast,
+            'trend_direction': 'increasing' if trend > 0 else 'decreasing',
+            'volatility': np.std(recent_prices) / recent_prices[-1] if recent_prices[-1] > 0 else 0
+        }
+
+
+# ============================================================
+# ENHANCEMENT 18: FEDERATED MATERIAL DATA SHARING
+# ============================================================
+
+class FederatedMaterialDataSharing:
+    """
+    Federated material data sharing across organizations.
+    
+    Features:
+    - Privacy-preserving data aggregation
+    - Benchmarking across organizations
+    - Secure property data sharing
+    - Differential privacy
+    """
+    
+    def __init__(self, organization_id: str, epsilon: float = 1.0):
+        self.organization_id = organization_id
+        self.epsilon = epsilon
+        self.local_data = []
+        self.global_benchmarks = {}
+        
+    def prepare_private_contribution(self, materials: List['MaterialProperties']) -> Dict:
+        """Prepare differentially private contribution for sharing"""
+        
+        if not materials:
+            return {'error': 'No materials'}
+        
+        # Aggregate statistics with DP noise
+        sensitivity = 1.0
+        noise_scale = sensitivity / self.epsilon
+        
+        densities = [m.density_kg_m3 for m in materials]
+        strengths = [m.yield_strength_mpa for m in materials]
+        carbons = [m.carbon_footprint_kg_co2_per_kg for m in materials]
+        
+        contribution = {
+            'organization_id': self.organization_id,
+            'avg_density': float(np.mean(densities) + np.random.laplace(0, noise_scale)),
+            'avg_strength': float(np.mean(strengths) + np.random.laplace(0, noise_scale)),
+            'avg_carbon_footprint': float(np.mean(carbons) + np.random.laplace(0, noise_scale)),
+            'material_count': len(materials),
+            'privacy_budget_used': self.epsilon * 0.1
+        }
+        
+        self.local_data.append(contribution)
+        
+        return contribution
+    
+    def aggregate_global_benchmarks(self, contributions: List[Dict]) -> Dict:
+        """Federated averaging of global benchmarks"""
+        
+        if not contributions:
+            return {'error': 'No contributions'}
+        
+        total_materials = sum(c['material_count'] for c in contributions)
+        
+        if total_materials == 0:
+            return {'error': 'No materials'}
+        
+        # Weighted federated averaging
+        global_avg_strength = sum(
+            c['avg_strength'] * c['material_count'] for c in contributions
+        ) / total_materials
+        
+        global_avg_carbon = sum(
+            c['avg_carbon_footprint'] * c['material_count'] for c in contributions
+        ) / total_materials
+        
+        self.global_benchmarks = {
+            'avg_strength_mpa': global_avg_strength,
+            'avg_carbon_footprint': global_avg_carbon,
+            'participating_organizations': len(contributions),
+            'total_materials': total_materials
+        }
+        
+        return self.global_benchmarks
+
+
+# ============================================================
+# ENHANCEMENT 19: NATURAL LANGUAGE QUERY INTERFACE
+# ============================================================
+
+class MaterialQueryInterface:
+    """
+    Natural language query interface for material search.
+    
+    Features:
+    - Intent extraction from queries
+    - Parameter parsing
+    - Contextual understanding
+    - Query recommendation
+    """
+    
+    def __init__(self):
+        self.query_patterns = {
+            'find_substitute': [
+                r'(?:find|suggest|recommend)\s+(?:a\s+)?(?:substitute|alternative|replacement)\s+(?:for|to)\s+(\w+)',
+                r'(?:replace|substitute)\s+(\w+)\s+with'
+            ],
+            'compare_materials': [
+                r'(?:compare|versus|vs\.?)\s+(\w+)\s+(?:and|with|vs\.?)\s+(\w+)',
+                r'(?:comparison|difference)\s+(?:between\s+)?(\w+)\s+and\s+(\w+)'
+            ],
+            'find_greenest': [
+                r'(?:greenest|most\s+sustainable|eco-friendly|lowest\s+carbon)\s+(?:material|option|choice)',
+                r'(?:best|optimal)\s+(?:green|sustainable|eco)\s+material'
+            ]
+        }
+        
+        self.parameter_extractors = {
+            'application': r'(?:for|in)\s+(?:a\s+)?(?:heat\s*sink|chassis|connector|structural)\s+(?:application|use|component)',
+            'max_cost': r'(?:under|less\s+than|below|≤|<=)\s*\$?(\d+(?:\.\d+)?)\s*(?:per\s*kg)?',
+            'min_strength': r'(?:strength|yield)\s+(?:over|more\s+than|above|≥|>=)\s*(\d+(?:\.\d+)?)\s*(?:MPa|GPa)?',
+            'max_density': r'(?:density|weight)\s+(?:under|less\s+than|below)\s*(\d+(?:\.\d+)?)\s*(?:kg/m³|g/cm³)?'
+        }
+    
+    def parse_query(self, query: str) -> Dict:
+        """Parse natural language material query"""
+        
+        import re
+        
+        # Detect intent
+        intent = self._detect_intent(query)
+        
+        # Extract parameters
+        params = self._extract_parameters(query)
+        
+        return {
+            'original_query': query,
+            'detected_intent': intent,
+            'parameters': params,
+            'confidence': self._calculate_confidence(intent, params)
+        }
+    
+    def _detect_intent(self, query: str) -> str:
+        """Detect query intent"""
+        import re
+        query_lower = query.lower()
+        
+        for intent, patterns in self.query_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, query_lower):
+                    return intent
+        
+        return 'find_substitute'
+    
+    def _extract_parameters(self, query: str) -> Dict:
+        """Extract parameters from query"""
+        import re
+        params = {}
+        
+        for param, pattern in self.parameter_extractors.items():
+            match = re.search(pattern, query, re.IGNORECASE)
+            if match:
+                value = match.group(1)
+                try:
+                    params[param] = float(value)
+                except ValueError:
+                    params[param] = value
+        
+        return params
+    
+    def _calculate_confidence(self, intent: str, params: Dict) -> float:
+        """Calculate parsing confidence"""
+        confidence = 0.6
+        
+        if intent:
+            confidence += 0.1
+        
+        if params:
+            confidence += 0.1 * min(len(params), 3)
+        
+        return min(0.95, confidence)
+
+
+# ============================================================
+# ENHANCEMENT 20: API-FIRST ARCHITECTURE
+# ============================================================
+
+class MaterialSubstitutionAPI:
+    """
+    GraphQL API for material substitution analysis.
+    
+    Features:
+    - Flexible query interface
+    - Real-time analysis requests
+    - Result caching
+    - Rate limiting
+    """
+    
+    def __init__(self, analyzer: 'EnhancedMaterialSubstitutionAnalyzerV6'):
+        self.analyzer = analyzer
+        self.request_history = deque(maxlen=1000)
+        self.rate_limiter = defaultdict(lambda: deque(maxlen=100))
+        
+    async def handle_substitution_request(self, request: Dict) -> Dict:
+        """Handle material substitution API request"""
+        
+        # Rate limiting
+        client_id = request.get('client_id', 'anonymous')
+        if not self._check_rate_limit(client_id):
+            return {'error': 'Rate limit exceeded', 'status': 429}
+        
+        try:
+            # Extract parameters
+            base_material = request.get('base_material', 'aluminum_6061')
+            application = request.get('application', 'heat_sink')
+            
+            # Run analysis
+            config = SubstitutionConfig(
+                base_material=base_material,
+                application=Application(application)
+            )
+            
+            self.analyzer.config = config
+            report = await self.analyzer.find_optimal_substitution()
+            
+            return {
+                'status': 'success',
+                'report': report.dict(),
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            return {'error': str(e), 'status': 500}
+    
+    def _check_rate_limit(self, client_id: str, 
+                         max_requests_per_minute: int = 10) -> bool:
+        """Check rate limiting"""
+        now = time.time()
+        client_requests = self.rate_limiter[client_id]
+        
+        while client_requests and client_requests[0] < now - 60:
+            client_requests.popleft()
+        
+        if len(client_requests) >= max_requests_per_minute:
+            return False
+        
+        client_requests.append(now)
+        return True
 
 
 # ============================================================
@@ -1455,33 +1094,33 @@ class DigitalTwinIntegration:
 
 class EnhancedMaterialSubstitutionAnalyzerV6(EnhancedMaterialSubstitutionAnalyzer):
     """
-    Enhanced V6.0 analyzer with all new features integrated.
+    Enhanced V6.0 material substitution analyzer with all new features.
     """
     
     def __init__(self, config: Optional[SubstitutionConfig] = None):
         super().__init__(config)
         
         # Initialize V6.0 components
+        self.multi_objective = MultiObjectiveMaterialOptimizer()
         self.ml_predictor = MaterialPropertyPredictor()
-        self.circularity_scorer = CircularityScorer()
         self.supply_chain_analyzer = SupplyChainResilienceAnalyzer()
-        self.generational_planner = GenerationalMaterialPlanner()
-        self.market_integrator = MarketPriceIntegrator(config.material_api_key if config else None)
-        self.env_impact = ComprehensiveEnvironmentalImpact()
-        self.compatibility_analyzer = MaterialCompatibilityAnalyzer()
-        self.manufacturing_analyzer = ManufacturingEnergyAnalyzer()
-        self.compliance_tracker = RegulatoryComplianceTracker()
-        self.digital_twin = DigitalTwinIntegration()
+        self.circularity_scorer = CircularityScorer()
+        self.digital_twin = MaterialDigitalTwin()
+        self.blockchain_provenance = BlockchainMaterialProvenance()
+        self.market_integrator = MaterialMarketPriceIntegrator()
+        self.federated_sharing = FederatedMaterialDataSharing("org_001")
+        self.query_interface = MaterialQueryInterface()
+        self.api = MaterialSubstitutionAPI(self)
         
         # Train ML model on available data
         self.ml_predictor.train_from_database(self.database.materials)
         
-        logger.info("EnhancedMaterialSubstitutionAnalyzerV6.0 initialized")
+        logger.info("EnhancedMaterialSubstitutionAnalyzerV6.0 initialized with all enhancements")
     
     async def comprehensive_analysis(self) -> Dict:
-        """Perform comprehensive V6.0 analysis"""
+        """Perform comprehensive V6.0 material substitution analysis"""
         
-        # Run base substitution analysis
+        # Base substitution analysis
         base_report = await self.find_optimal_substitution()
         
         if not base_report.recommendations:
@@ -1494,126 +1133,91 @@ class EnhancedMaterialSubstitutionAnalyzerV6(EnhancedMaterialSubstitutionAnalyze
         if not top_candidate or not base_material:
             return {'error': 'Material not found'}
         
-        # Perform all V6.0 analyses
-        analyses = {}
+        # Multi-objective Pareto analysis
+        all_candidates = list(self.database.materials.values())
+        pareto_frontier = self.multi_objective.optimize_material_selection(all_candidates)
         
-        # Circular economy
-        analyses['circularity'] = self.circularity_scorer.calculate_mci(
-            top_candidate, self.config.application
-        )
-        
-        # Supply chain resilience
-        analyses['supply_chain'] = self.supply_chain_analyzer.assess_supply_chain_risk(
+        # Supply chain risk assessment
+        supply_chain_risk = self.supply_chain_analyzer.assess_supply_chain_risk(
             top_candidate, ['north_america', 'east_asia']
         )
         
-        # Environmental impact
-        analyses['environmental'] = self.env_impact.calculate_environmental_score(top_candidate)
-        
-        # Material compatibility
-        analyses['compatibility'] = self.compatibility_analyzer.assess_compatibility(
-            base_material, top_candidate, sum(self.config.temperature_range) / 2
-        )
-        
-        # Manufacturing energy
-        analyses['manufacturing'] = self.manufacturing_analyzer.analyze_manufacturing_energy(
-            top_candidate, 'casting', self.config.annual_volume_kg
-        )
-        
-        # Regulatory compliance
-        analyses['compliance'] = self.compliance_tracker.check_compliance(
-            top_candidate, self.config.application, ['EU', 'US']
-        )
-        
-        # Market price
-        current_price = await self.market_integrator.get_current_price(top_candidate_name)
-        analyses['market'] = {
-            'current_price': current_price,
-            'price_forecast': self.market_integrator.forecast_price_trend(top_candidate_name)
-        }
-        
-        # Digital twin
-        analyses['digital_twin'] = self.digital_twin.create_material_digital_twin(
+        # Circular economy assessment
+        circularity = self.circularity_scorer.calculate_mci(
             top_candidate, self.config.application
         )
         
-        # ML property prediction
+        # Digital twin creation
+        digital_twin = self.digital_twin.create_material_twin(
+            top_candidate, self.config.application
+        )
+        
+        # Blockchain provenance
+        provenance = self.blockchain_provenance.record_material_origin(
+            top_candidate, 'supplier_001', 'batch_2024_001',
+            ['ISO_14001', 'REACH_compliant']
+        )
+        
+        # ML property predictions
         composition_features = np.array([[
-            top_candidate.density_kg_m3,
-            top_candidate.cost_per_kg_usd,
-            top_candidate.recycling_rate_pct,
+            top_candidate.density_kg_m3 / 10000,
+            top_candidate.cost_per_kg_usd / 100,
+            top_candidate.recycling_rate_pct / 100,
             top_candidate.supply_risk_hhi,
-            top_candidate.formation_enthalpy_kj_per_mol,
-            top_candidate.formation_entropy_j_per_mol_k,
-            top_candidate.interaction_parameters[0] if top_candidate.interaction_parameters else 0,
-            top_candidate.interaction_parameters[1] if len(top_candidate.interaction_parameters) > 1 else 0,
-            top_candidate.interaction_parameters[2] if len(top_candidate.interaction_parameters) > 2 else 0
-        ]]).reshape(1, -1)
+            top_candidate.formation_enthalpy_kj_per_mol / 100,
+            top_candidate.formation_entropy_j_per_mol_k / 100,
+        ]])
         
-        analyses['ml_predictions'] = self.ml_predictor.predict_properties(composition_features)
+        ml_predictions = self.ml_predictor.predict_properties(composition_features)
         
-        # Generate comprehensive report
+        # Market price
+        current_price = await self.market_integrator.get_current_price(top_candidate_name)
+        price_forecast = self.market_integrator.forecast_price_trend(top_candidate_name)
+        
+        # Compile comprehensive report
         comprehensive_report = {
             'base_analysis': base_report.dict(),
-            'v6_analyses': analyses,
-            'overall_recommendation': self._generate_comprehensive_recommendation(
-                base_report.recommendations[0], analyses
-            ),
-            'timestamp': datetime.now().isoformat()
+            'pareto_frontier': {
+                'solutions_found': len(pareto_frontier),
+                'optimal_tradeoff': self.multi_objective.get_optimal_tradeoff()
+            },
+            'supply_chain_risk': supply_chain_risk,
+            'circularity_assessment': circularity,
+            'digital_twin': digital_twin,
+            'blockchain_provenance': provenance,
+            'ml_predictions': ml_predictions,
+            'market_analysis': {
+                'current_price': current_price,
+                'price_forecast': price_forecast
+            },
+            'overall_sustainability_score': self._calculate_sustainability_score(
+                base_report, circularity, supply_chain_risk
+            )
         }
         
         return comprehensive_report
     
-    def _generate_comprehensive_recommendation(self, top_recommendation: SubstitutionResult,
-                                              analyses: Dict) -> Dict:
-        """Generate comprehensive recommendation summary"""
+    def _calculate_sustainability_score(self, base_report: 'SubstitutionReport',
+                                      circularity: Dict,
+                                      supply_chain: Dict) -> float:
+        """Calculate overall sustainability score"""
         
-        scores = {
-            'technical_performance': top_recommendation.performance_ratio,
-            'economic_viability': 1 - (top_recommendation.cost_ratio - 1),
-            'environmental_benefit': top_recommendation.carbon_reduction_pct / 100,
-            'circular_economy': analyses.get('circularity', {}).get('circularity_score', 0),
-            'supply_chain_resilience': analyses.get('supply_chain', {}).get('resilience_score', 0),
-            'regulatory_compliance': 0.8,  # Simplified
-            'manufacturing_feasibility': 0.85  # Simplified
-        }
+        # Carbon reduction score
+        carbon_score = min(100, base_report.carbon_reduction_pct)
         
-        overall_score = np.mean(list(scores.values()))
+        # Circularity score
+        circularity_score = circularity.get('circularity_score', 0) * 100
         
-        return {
-            'overall_score': overall_score,
-            'recommendation_level': 'STRONG' if overall_score > 0.8 else 'MODERATE' if overall_score > 0.6 else 'WEAK',
-            'category_scores': scores,
-            'key_advantages': self._identify_key_advantages(scores),
-            'key_risks': self._identify_key_risks(analyses),
-            'implementation_timeline': '6-12 months' if overall_score > 0.7 else '12-24 months'
-        }
-    
-    def _identify_key_advantages(self, scores: Dict) -> List[str]:
-        """Identify key advantages from scores"""
-        advantages = []
+        # Supply chain resilience score
+        resilience_score = supply_chain.get('resilience_score', 0) * 100
         
-        if scores.get('environmental_benefit', 0) > 0.7:
-            advantages.append("Significant environmental benefits")
-        if scores.get('economic_viability', 0) > 0.8:
-            advantages.append("Strong economic case for substitution")
-        if scores.get('circular_economy', 0) > 0.7:
-            advantages.append("Excellent circular economy potential")
+        # Weighted average
+        weights = {'carbon': 0.4, 'circularity': 0.35, 'resilience': 0.25}
+        overall = (weights['carbon'] * carbon_score +
+                  weights['circularity'] * circularity_score +
+                  weights['resilience'] * resilience_score)
         
-        return advantages[:3]
-    
-    def _identify_key_risks(self, analyses: Dict) -> List[str]:
-        """Identify key risks from analyses"""
-        risks = []
-        
-        supply_risk = analyses.get('supply_chain', {}).get('overall_risk_score', 0)
-        if supply_risk > 0.5:
-            risks.append("Supply chain concentration risk")
-        
-        if analyses.get('compatibility', {}).get('compatibility_score', 1) < 0.6:
-            risks.append("Material compatibility challenges")
-        
-        return risks[:3]
+        return overall
 
 
 # ============================================================
@@ -1639,71 +1243,65 @@ async def main_v6():
         enable_real_apis=False
     )
     
-    print("\n✅ V6.0 New Features Active:")
-    print(f"   ✅ ML Property Prediction: {'Available' if SKLEARN_AVAILABLE else 'Not Available'}")
-    print(f"   ✅ Circular Economy Scoring")
-    print(f"   ✅ Supply Chain Resilience Analysis")
-    print(f"   ✅ Multi-Generational Material Planning")
-    print(f"   ✅ Real-time Market Price Integration")
-    print(f"   ✅ Comprehensive Environmental Impact")
-    print(f"   ✅ Material Compatibility Assessment")
-    print(f"   ✅ Manufacturing Energy Analysis")
-    print(f"   ✅ Regulatory Compliance Tracking")
-    print(f"   ✅ Digital Twin Integration")
-    
-    # Initialize enhanced analyzer
     analyzer = EnhancedMaterialSubstitutionAnalyzerV6(config)
     
-    print(f"\n🔬 Running Comprehensive V6.0 Analysis...")
-    comprehensive_results = await analyzer.comprehensive_analysis()
+    print("\n✅ V6.0 New Features Active:")
+    print(f"   ✅ Multi-Objective Pareto Optimization")
+    print(f"   ✅ ML Property Prediction: {'Available' if SKLEARN_AVAILABLE else 'Not Available'}")
+    print(f"   ✅ Supply Chain Resilience Analysis")
+    print(f"   ✅ Circular Economy Scoring")
+    print(f"   ✅ Digital Twin Integration")
+    print(f"   ✅ Blockchain Material Provenance: {'Available' if WEB3_AVAILABLE else 'Simulated'}")
+    print(f"   ✅ Real-Time Market Prices")
+    print(f"   ✅ Federated Data Sharing")
+    print(f"   ✅ Natural Language Query Interface")
+    print(f"   ✅ API-First Architecture")
     
-    # Display base results
-    base = comprehensive_results.get('base_analysis', {})
-    print(f"\n📊 Base Substitution Results:")
-    if base.get('recommendations'):
-        top = base['recommendations'][0]
-        print(f"   Top Candidate: {top['recommended_substitute_name']}")
-        print(f"   TOPSIS Score: {top['topsis_score']:.3f}")
-        print(f"   Carbon Reduction: {top['carbon_reduction_pct']:.1f}%")
+    # Comprehensive analysis
+    print(f"\n🔬 Running Comprehensive V6.0 Material Substitution Analysis...")
+    comprehensive = await analyzer.comprehensive_analysis()
     
-    # Display V6.0 analyses
-    v6 = comprehensive_results.get('v6_analyses', {})
+    # Display results
+    if 'base_analysis' in comprehensive:
+        base = comprehensive['base_analysis']
+        if base.get('recommendations'):
+            top = base['recommendations'][0]
+            print(f"\n📊 Base Analysis:")
+            print(f"   Top Candidate: {top['recommended_substitute_name']}")
+            print(f"   TOPSIS Score: {top['topsis_score']:.3f}")
+            print(f"   Carbon Reduction: {top['carbon_reduction_pct']:.1f}%")
     
-    print(f"\n🎯 Circular Economy Assessment:")
-    circ = v6.get('circularity', {})
-    print(f"   MCI Score: {circ.get('mci', 0):.2f}")
-    print(f"   Circularity Score: {circ.get('circularity_score', 0):.2f}")
+    pareto = comprehensive.get('pareto_frontier', {})
+    print(f"\n🎯 Pareto Frontier:")
+    print(f"   Solutions Found: {pareto.get('solutions_found', 0)}")
+    if pareto.get('optimal_tradeoff'):
+        opt = pareto['optimal_tradeoff']
+        if 'material' in opt:
+            print(f"   Optimal Trade-off: {opt['material'].name}")
     
-    print(f"\n🏭 Supply Chain Resilience:")
-    supply = v6.get('supply_chain', {})
-    print(f"   Risk Level: {supply.get('risk_level', 'unknown')}")
+    supply = comprehensive.get('supply_chain_risk', {})
+    print(f"\n🔗 Supply Chain Risk:")
+    print(f"   Risk Level: {supply.get('risk_level', 'N/A')}")
     print(f"   Resilience Score: {supply.get('resilience_score', 0):.2f}")
     
-    print(f"\n🌍 Environmental Impact:")
-    env = v6.get('environmental', {})
-    print(f"   Environmental Score: {env.get('environmental_score', 0):.0f}/100")
+    circular = comprehensive.get('circularity_assessment', {})
+    print(f"\n♻️ Circularity Assessment:")
+    print(f"   MCI Score: {circular.get('mci', 0):.2f}")
+    print(f"   Circularity Score: {circular.get('circularity_score', 0):.2f}")
     
-    print(f"\n🔧 Material Compatibility:")
-    compat = v6.get('compatibility', {})
-    print(f"   Compatibility Score: {compat.get('compatibility_score', 0):.2f}")
+    ml = comprehensive.get('ml_predictions', {})
+    if ml:
+        print(f"\n🤖 ML Property Predictions:")
+        for prop, (mean, std) in ml.items():
+            print(f"   {prop}: {mean:.3f} ± {std:.3f}")
     
+    market = comprehensive.get('market_analysis', {})
     print(f"\n💹 Market Analysis:")
-    market = v6.get('market', {})
     print(f"   Current Price: ${market.get('current_price', 0):.2f}/kg")
-    forecast = market.get('price_forecast', {})
-    print(f"   Trend: {forecast.get('trend_direction', 'stable')}")
+    if 'price_forecast' in market:
+        print(f"   Trend: {market['price_forecast'].get('trend_direction', 'N/A')}")
     
-    print(f"\n🤖 ML Property Predictions:")
-    ml = v6.get('ml_predictions', {})
-    for prop, (mean, std) in ml.items():
-        print(f"   {prop}: {mean:.1f} ± {std:.1f}")
-    
-    # Overall recommendation
-    rec = comprehensive_results.get('overall_recommendation', {})
-    print(f"\n📋 Overall Recommendation:")
-    print(f"   Level: {rec.get('recommendation_level', 'UNKNOWN')}")
-    print(f"   Score: {rec.get('overall_score', 0):.2f}")
-    print(f"   Timeline: {rec.get('implementation_timeline', 'N/A')}")
+    print(f"\n📈 Overall Sustainability Score: {comprehensive.get('overall_sustainability_score', 0):.1f}/100")
     
     print("\n" + "=" * 80)
     print("✅ Material Substitution v6.0 - All Features Demonstrated")
@@ -1714,7 +1312,6 @@ async def main_v6():
 # BACKWARD COMPATIBILITY
 # ============================================================
 
-# Keep original imports and classes for backward compatibility
 if __name__ == "__main__":
     print("Running V6.0 enhanced version...")
     asyncio.run(main_v6())
