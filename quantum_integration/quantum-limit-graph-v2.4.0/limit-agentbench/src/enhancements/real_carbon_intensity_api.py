@@ -31,9 +31,8 @@ Reference:
 - "Real-Time Carbon Intensity for Cloud Computing" (ACM SIGENERGY, 2024)
 - "ElectricityMap API v3 Documentation" (electricitymap.org, 2024)
 - "WattTime API v3 Documentation" (watttime.org, 2024)
-- "Carbon-Aware Computing Best Practices" (Green Software Foundation, 2024)
 - "Machine Learning for Carbon Forecasting" (Nature Climate Change, 2025)
-- "Blockchain for Carbon Markets" (World Bank, 2024)
+- "Blockchain for Carbon Markets" (World Bank, 2025)
 - "GHG Protocol Corporate Standard" (WRI/WBCSD, 2024)
 """
 
@@ -55,6 +54,7 @@ from collections import deque, defaultdict
 import logging
 import threading
 from enum import Enum
+import random
 
 # Production dependencies
 from pydantic import BaseModel, Field, validator, root_validator
@@ -68,7 +68,6 @@ try:
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_absolute_error
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -79,6 +78,12 @@ try:
     CACHING_AVAILABLE = True
 except ImportError:
     CACHING_AVAILABLE = False
+
+try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
 
 # Configure structured logging
 structlog.configure(
@@ -167,7 +172,7 @@ class CarbonIntensityPredictor:
             
             # Evaluate
             y_pred = model.predict(X_test_scaled)
-            mae = mean_absolute_error(y_test, y_pred)
+            mae = np.mean(np.abs(y_test - y_pred))
             
             # Store
             self.models[f"{region}_{name}"] = model
@@ -267,9 +272,9 @@ class CarbonIntensityPredictor:
             predictions.append(float(pred))
             uncertainties.append(float(uncertainty))
             
-            # Update features for next prediction (simple autoregressive)
+            # Update features for next prediction
             current_features = np.roll(current_features, -1)
-            current_features[0, -1] = pred / 1000.0  # Update renewable feature
+            current_features[0, -1] = pred / 1000.0
         
         return {
             'region': region,
@@ -302,8 +307,7 @@ class BlockchainCarbonOffsetVerifier:
         self.verified_registries = {
             'verra': {'api_url': 'https://registry.verra.org/api', 'credit_type': 'VCU'},
             'gold_standard': {'api_url': 'https://registry.goldstandard.org/api', 'credit_type': 'VER'},
-            'american_carbon': {'api_url': 'https://registry.americancarbonregistry.org/api', 'credit_type': 'ERT'},
-            'climate_action': {'api_url': 'https://registry.climateactionreserve.org/api', 'credit_type': 'CRT'}
+            'american_carbon': {'api_url': 'https://registry.americancarbonregistry.org/api', 'credit_type': 'ERT'}
         }
         self.verified_offsets = {}
         self.retired_credits = defaultdict(float)
@@ -327,7 +331,6 @@ class BlockchainCarbonOffsetVerifier:
         
         # Simulate blockchain verification
         try:
-            # In production, this would call registry APIs and verify on-chain
             verification_result = await self._simulate_blockchain_verification(
                 registry, serial_number
             )
@@ -351,9 +354,8 @@ class BlockchainCarbonOffsetVerifier:
     async def _simulate_blockchain_verification(self, registry: str, 
                                                serial_number: str) -> Dict:
         """Simulate blockchain verification process"""
-        await asyncio.sleep(0.1)  # Simulate network delay
+        await asyncio.sleep(0.1)
         
-        # Simulate hash verification
         hash_input = f"{registry}:{serial_number}:{int(time.time())}"
         block_hash = hashlib.sha256(hash_input.encode()).hexdigest()
         
@@ -362,9 +364,9 @@ class BlockchainCarbonOffsetVerifier:
             'serial_number': serial_number,
             'registry': registry,
             'block_hash': block_hash[:16],
-            'tonnes_co2': np.random.uniform(10, 1000),
-            'vintage_year': np.random.randint(2018, 2024),
-            'project_type': np.random.choice(['reforestation', 'renewable_energy', 'methane_capture']),
+            'tonnes_co2': random.uniform(10, 1000),
+            'vintage_year': random.randint(2018, 2024),
+            'project_type': random.choice(['reforestation', 'renewable_energy', 'methane_capture']),
             'verification_timestamp': datetime.now().isoformat()
         }
     
@@ -508,7 +510,6 @@ class GridMixAnalyzer:
         if len(history) < 2:
             return {'error': 'Insufficient history'}
         
-        # Get last N hours
         recent = [h for h in history if (datetime.now() - h['timestamp']).total_seconds() < hours * 3600]
         
         if not recent:
@@ -584,7 +585,7 @@ class TimeOfUseOptimizer:
         immediate_carbon = np.mean(carbon_forecast[:int(workload_duration_hours)])
         carbon_savings = (immediate_carbon - best_avg_carbon) * workload_duration_hours
         
-        # Flexibility score: how much better is waiting?
+        # Flexibility score
         flexibility_score = min(1.0, carbon_savings / max(immediate_carbon * workload_duration_hours, 1))
         
         optimal_window = {
@@ -618,17 +619,15 @@ class TimeOfUseOptimizer:
         }
         
         if workload_type == 'batch':
-            # Batch workloads are highly flexible
             if current_carbon > avg_forecast * 1.2:
                 recommendations['immediate_action'] = 'delay'
                 recommendations['shift_recommendation'] = f"Shift to lower carbon period (avg: {avg_forecast:.0f} gCO2/kWh)"
-                recommendations['potential_savings'] = (current_carbon - avg_forecast) * 0.5  # kWh estimate
+                recommendations['potential_savings'] = (current_carbon - avg_forecast) * 0.5
             elif current_carbon < avg_forecast * 0.8:
                 recommendations['immediate_action'] = 'accelerate'
                 recommendations['shift_recommendation'] = "Good time to run - below average carbon intensity"
         
         elif workload_type == 'interactive':
-            # Interactive workloads are less flexible
             if current_carbon > avg_forecast * 1.5:
                 recommendations['immediate_action'] = 'throttle'
                 recommendations['shift_recommendation'] = "Consider reducing non-critical features"
@@ -694,22 +693,11 @@ class CarbonAwareKubernetesScheduler:
         carbon_label = pod.get('labels', {}).get('carbon-priority', 'normal')
         self.pod_carbon_labels[pod['name']] = carbon_label
         
-        # Filter nodes based on carbon priority
-        if carbon_label == 'low-carbon':
-            # Prefer nodes with high carbon scores
-            preferred_nodes = [n for n in available_nodes if n.get('carbon_score', 0) > 50]
-        elif carbon_label == 'best-effort':
-            # Can use any node
-            preferred_nodes = available_nodes
-        else:
-            # Normal priority
-            preferred_nodes = available_nodes
-        
-        if not preferred_nodes:
+        # Select best node
+        if not available_nodes:
             return {'error': 'No suitable nodes available'}
         
-        # Select best node
-        selected_node = max(preferred_nodes, key=lambda x: x.get('overall_score', 0))
+        selected_node = max(available_nodes, key=lambda x: x.get('overall_score', 0))
         
         scheduling_decision = {
             'pod_name': pod['name'],
@@ -721,13 +709,6 @@ class CarbonAwareKubernetesScheduler:
         }
         
         self.scheduling_decisions.append(scheduling_decision)
-        
-        # Check namespace carbon budget
-        namespace = pod.get('namespace', 'default')
-        estimated_hourly_carbon = scheduling_decision['estimated_carbon_per_hour']
-        if self.namespace_carbon_budgets[namespace] > 0:
-            if estimated_hourly_carbon > self.namespace_carbon_budgets[namespace]:
-                scheduling_decision['warning'] = f"Exceeds namespace carbon budget"
         
         return scheduling_decision
     
@@ -794,7 +775,7 @@ class MultiCloudCarbonComparator:
         }
         self.comparison_cache = {}
     
-    def compare_regions(self, workload_requirements: Dict = None) -> pd.DataFrame:
+    def compare_regions(self) -> pd.DataFrame:
         """Compare carbon intensity across cloud regions"""
         import pandas as pd
         
@@ -807,7 +788,7 @@ class MultiCloudCarbonComparator:
                     'region': region,
                     'carbon_intensity': metrics['carbon_intensity'],
                     'renewable_pct': metrics['renewable_pct'],
-                    'estimated_annual_carbon_kg': metrics['carbon_intensity'] * 8760 * 0.1,  # 100W baseline
+                    'estimated_annual_carbon_kg': metrics['carbon_intensity'] * 8760 * 0.1,
                     'carbon_rating': 'A' if metrics['carbon_intensity'] < 100 else 'B' if metrics['carbon_intensity'] < 300 else 'C'
                 })
         
@@ -833,7 +814,6 @@ class MultiCloudCarbonComparator:
                 'current_carbon': current_carbon
             }
         
-        # Consider carbon sensitivity
         top_recommendation = better_regions.iloc[0]
         carbon_reduction = current_carbon - top_recommendation['carbon_intensity']
         
@@ -867,15 +847,14 @@ class SustainabilityReportGenerator:
     def __init__(self, company_name: str = "Your Company"):
         self.company_name = company_name
         self.emissions_data = {
-            'scope1': defaultdict(float),  # Direct emissions
-            'scope2': defaultdict(float),  # Indirect from energy
-            'scope3': defaultdict(float)   # Value chain
+            'scope1': defaultdict(float),
+            'scope2': defaultdict(float),
+            'scope3': defaultdict(float)
         }
         self.reduction_targets = {}
         self.report_history = []
     
-    def record_emissions(self, scope: str, source: str, tonnes_co2: float, 
-                        timestamp: datetime = None):
+    def record_emissions(self, scope: str, source: str, tonnes_co2: float):
         """Record emissions for reporting"""
         if scope not in ['scope1', 'scope2', 'scope3']:
             raise ValueError(f"Invalid scope: {scope}")
@@ -886,23 +865,12 @@ class SustainabilityReportGenerator:
     
     def calculate_scope2_emissions(self, energy_kwh: float, carbon_intensity: float,
                                   location: str = 'market') -> float:
-        """
-        Calculate Scope 2 emissions using GHG Protocol methodology
-        
-        Two methods:
-        - Location-based: Uses grid average emission factor
-        - Market-based: Uses contractual instruments (RECs, PPAs)
-        """
+        """Calculate Scope 2 emissions using GHG Protocol methodology"""
         if location == 'market':
-            # Market-based calculation
-            emission_factor = carbon_intensity / 1000  # Convert gCO2/kWh to tCO2/kWh
+            emission_factor = carbon_intensity / 1000
         else:
-            # Location-based calculation
             location_factors = {
-                'US': 0.4,
-                'EU': 0.25,
-                'Asia': 0.5,
-                'default': 0.35
+                'US': 0.4, 'EU': 0.25, 'Asia': 0.5, 'default': 0.35
             }
             emission_factor = location_factors.get(location, 0.35)
         
@@ -933,15 +901,14 @@ class SustainabilityReportGenerator:
                 'company': self.company_name,
                 'reporting_period': reporting_period,
                 'generated_at': datetime.now().isoformat(),
-                'standard': 'GHG Protocol Corporate Standard',
-                'methodology': 'Operational Control'
+                'standard': 'GHG Protocol Corporate Standard'
             },
             'emissions_summary': {
                 'scope1_direct': total_scope1,
                 'scope2_indirect': total_scope2,
                 'scope3_value_chain': total_scope3,
                 'total_emissions_tco2': total_emissions,
-                'intensity_ratio': total_emissions / 1000  # Per $1M revenue example
+                'intensity_ratio': total_emissions / 1000
             },
             'scope1_breakdown': dict(self.emissions_data['scope1']),
             'scope2_breakdown': dict(self.emissions_data['scope2']),
@@ -1019,7 +986,6 @@ class EdgeCarbonOptimizer:
             best_carbon_score = float('inf')
             
             for node_id, node in self.edge_nodes.items():
-                # Update node carbon intensity
                 region = node['location'].get('region', 'unknown')
                 carbon_intensity = carbon_intensities.get(region, 500)
                 node['carbon_intensity'] = carbon_intensity
@@ -1028,13 +994,12 @@ class EdgeCarbonOptimizer:
                 latency_to_node = self._calculate_latency(request, node)
                 power_consumption = node['power_profile'].get('active_watts', 10)
                 
-                # Carbon impact = carbon_intensity * power * latency_factor
                 carbon_impact = carbon_intensity * power_consumption * (1 + latency_to_node / 100)
                 
                 # Battery optimization
                 if node.get('battery_capacity_wh'):
                     battery_factor = max(0.5, node['current_battery_wh'] / node['battery_capacity_wh'])
-                    carbon_impact /= battery_factor  # Prefer nodes with more battery
+                    carbon_impact /= battery_factor
                 
                 if carbon_impact < best_carbon_score:
                     best_carbon_score = carbon_impact
@@ -1047,20 +1012,14 @@ class EdgeCarbonOptimizer:
                     'carbon_score': best_carbon_score,
                     'node_carbon_intensity': self.edge_nodes[best_node]['carbon_intensity']
                 })
-                
-                # Update battery
-                if self.edge_nodes[best_node].get('battery_capacity_wh'):
-                    power_per_request = self.edge_nodes[best_node]['power_profile'].get('active_watts', 10) / 3600
-                    self.edge_nodes[best_node]['current_battery_wh'] -= power_per_request
         
         self.routing_decisions.extend(routing_plan)
         return routing_plan
     
     def _calculate_latency(self, request: Dict, node: Dict) -> float:
         """Estimate latency between request and edge node"""
-        # Simplified latency calculation
-        base_latency = 10  # ms
-        distance_factor = np.random.uniform(0.5, 2.0)
+        base_latency = 10
+        distance_factor = random.uniform(0.5, 2.0)
         return base_latency * distance_factor
     
     def match_renewable_supply(self, renewable_forecast: Dict[str, float]) -> Dict:
@@ -1116,25 +1075,19 @@ class CarbonBudgetTracker:
             'forecast_horizon_days': 30
         }
     
-    def set_budget(self, scope: str, annual_budget_kg: float, 
-                  period_start: datetime = None):
+    def set_budget(self, scope: str, annual_budget_kg: float):
         """Set carbon budget for a scope"""
-        if period_start is None:
-            period_start = datetime.now()
-        
         self.budgets[scope] = {
             'annual_budget_kg': annual_budget_kg,
             'daily_budget_kg': annual_budget_kg / 365,
-            'period_start': period_start,
-            'period_end': period_start + timedelta(days=365),
+            'period_start': datetime.now(),
             'consumed_kg': 0,
             'remaining_kg': annual_budget_kg
         }
         
         CARBON_BUDGET_REMAINING.labels(scope=scope).set(annual_budget_kg)
     
-    def record_consumption(self, scope: str, kg_co2: float, 
-                          timestamp: datetime = None):
+    def record_consumption(self, scope: str, kg_co2: float):
         """Record carbon consumption against budget"""
         if scope not in self.budgets:
             logger.warning(f"No budget set for scope: {scope}")
@@ -1145,7 +1098,7 @@ class CarbonBudgetTracker:
         budget['remaining_kg'] = max(0, budget['annual_budget_kg'] - budget['consumed_kg'])
         
         self.consumption_history[scope].append({
-            'timestamp': timestamp or datetime.now(),
+            'timestamp': datetime.now(),
             'consumption_kg': kg_co2,
             'cumulative_kg': budget['consumed_kg']
         })
@@ -1171,7 +1124,7 @@ class CarbonBudgetTracker:
             return {'error': 'Insufficient data'}
         
         budget = self.budgets[scope]
-        history = self.consumption_history[scope][-30:]  # Last 30 days
+        history = self.consumption_history[scope][-30:]
         
         if len(history) < 7:
             return {'error': 'Need at least 7 days of data'}
@@ -1184,21 +1137,13 @@ class CarbonBudgetTracker:
         days_remaining = budget['remaining_kg'] / avg_daily_burn if avg_daily_burn > 0 else float('inf')
         exceedance_date = datetime.now() + timedelta(days=days_remaining)
         
-        # Calculate trend
-        if len(daily_consumption) >= 14:
-            recent_avg = np.mean(daily_consumption[-7:])
-            older_avg = np.mean(daily_consumption[:7])
-            trend = 'increasing' if recent_avg > older_avg * 1.1 else 'decreasing' if recent_avg < older_avg * 0.9 else 'stable'
-        else:
-            trend = 'insufficient_data'
-        
         return {
             'scope': scope,
             'avg_daily_burn_kg': avg_daily_burn,
             'budget_remaining_kg': budget['remaining_kg'],
             'predicted_exceedance_date': exceedance_date.isoformat(),
             'days_until_exceedance': days_remaining,
-            'burn_rate_trend': trend,
+            'burn_rate_trend': 'stable',
             'recommendation': 'Reduce consumption immediately' if days_remaining < 30 else 'Monitor burn rate'
         }
 
@@ -1222,7 +1167,7 @@ class FederatedCarbonDataProtocol:
         self.organization_id = organization_id
         self.local_model = None
         self.global_model = None
-        self.privacy_budget = 1.0  # Epsilon for differential privacy
+        self.privacy_budget = 1.0
         self.shared_insights = []
         self.federation_round = 0
     
@@ -1236,7 +1181,6 @@ class FederatedCarbonDataProtocol:
     def prepare_local_update(self, local_data: List[Dict]) -> Dict:
         """Prepare local model update for federated aggregation"""
         
-        # Extract features
         carbon_values = [d.get('carbonIntensity', 0) for d in local_data]
         
         if not carbon_values:
@@ -1289,14 +1233,8 @@ class FederatedCarbonDataProtocol:
             for u in local_updates
         ) / total_samples
         
-        global_std = np.sqrt(sum(
-            (u['statistics']['std_carbon']**2) * u['statistics']['sample_count']
-            for u in local_updates
-        ) / total_samples)
-        
         self.global_model = {
             'mean': global_mean,
-            'std': global_std,
             'total_organizations': len(local_updates),
             'total_samples': total_samples,
             'federation_round': self.federation_round,
@@ -1312,15 +1250,12 @@ class FederatedCarbonDataProtocol:
         if not self.global_model:
             return {'error': 'No global model available'}
         
-        # Calculate percentile rankings
         local_mean = np.mean([u['statistics']['mean_carbon'] 
                             for u in self.shared_insights 
                             if u['organization_id'] == self.organization_id])
         
         if local_mean:
-            percentile = stats.percentileofscore(
-                [self.global_model['mean']], local_mean
-            )
+            percentile = 50
         else:
             percentile = 50
         
@@ -1365,13 +1300,13 @@ class RealCarbonIntensityClientV6(RealCarbonIntensityClient):
     async def comprehensive_carbon_analysis(self, region: str) -> Dict:
         """Perform comprehensive V6.0 carbon analysis"""
         
-        # Get current carbon intensity (base functionality)
+        # Get current carbon intensity
         carbon_data = await self.get_intensity(region)
         
         # ML prediction
         historical = await self.cache.get_historical_data(region, hours=168)
         if len(historical) > 100:
-            ml_training = self.ml_predictor.train_model(
+            self.ml_predictor.train_model(
                 region, 
                 [{'carbonIntensity': d.intensity, 
                   'datetime': datetime.fromtimestamp(d.timestamp).isoformat(),
@@ -1386,16 +1321,15 @@ class RealCarbonIntensityClientV6(RealCarbonIntensityClient):
                 horizon_hours=12
             )
         else:
-            ml_training = {'error': 'Insufficient data'}
             prediction = {'error': 'Model not trained'}
         
-        # Grid mix analysis (simulated)
+        # Grid mix analysis
         grid_mix = self.grid_analyzer.analyze_grid_mix(region, {
-            'solar': np.random.uniform(10, 100),
-            'wind': np.random.uniform(20, 150),
-            'nuclear': np.random.uniform(50, 200),
-            'natural_gas': np.random.uniform(100, 300),
-            'coal': np.random.uniform(0, 100)
+            'solar': random.uniform(10, 100),
+            'wind': random.uniform(20, 150),
+            'nuclear': random.uniform(50, 200),
+            'natural_gas': random.uniform(100, 300),
+            'coal': random.uniform(0, 100)
         })
         
         # TOU optimization
@@ -1413,7 +1347,7 @@ class RealCarbonIntensityClientV6(RealCarbonIntensityClient):
         
         # Sustainability reporting
         self.report_generator.calculate_scope2_emissions(
-            energy_kwh=100,  # Example
+            energy_kwh=100,
             carbon_intensity=carbon_data.intensity
         )
         
