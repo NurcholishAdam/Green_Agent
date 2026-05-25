@@ -55,6 +55,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import copy
 import warnings
+import random
 
 # Production dependencies
 from pydantic import BaseModel, Field, validator, root_validator
@@ -73,6 +74,13 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
+
+# Try optional imports
+try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -97,6 +105,16 @@ ESG_RISK_SCORE = Gauge('sustainability_esg_risk_score',
                       'ESG risk assessment score', ['risk_type'], registry=REGISTRY)
 ANOMALY_DETECTED = Counter('sustainability_anomalies_detected_total', 
                           'Anomalies detected', ['signal_type'], registry=REGISTRY)
+
+# V6.0 new metrics
+ML_PREDICTION_ACCURACY = Gauge('sustainability_ml_prediction_accuracy', 'ML prediction accuracy',
+                               ['metric'], registry=REGISTRY)
+STAKEHOLDER_IMPACT = Gauge('sustainability_stakeholder_impact', 'Stakeholder impact score',
+                          ['stakeholder_group'], registry=REGISTRY)
+CIRCULARITY_METRIC = Gauge('sustainability_circularity_metric', 'Circular economy metric',
+                          ['metric_type'], registry=REGISTRY)
+BLOCKCHAIN_RECORDS = Counter('sustainability_blockchain_records_total', 'Blockchain sustainability records',
+                            ['type'], registry=REGISTRY)
 
 
 # ============================================================
@@ -176,6 +194,10 @@ class SustainabilityTrendPredictor:
                     'rmse': np.sqrt(np.mean((y_test - y_pred)**2)),
                     'r2_score': model.score(X_test_scaled, y_test)
                 }
+            
+            ML_PREDICTION_ACCURACY.labels(metric=signal_name).set(
+                results.get('rf', {}).get('r2_score', 0)
+            )
             
             logger.info(f"Trained trend models for {signal_name}")
             
@@ -482,6 +504,7 @@ class StakeholderImpactFramework:
             }
             
             total_impact += stakeholder_total
+            STAKEHOLDER_IMPACT.labels(stakeholder_group=stakeholder).set(stakeholder_total)
         
         # Calculate SROI
         sroi = self._calculate_sroi(impact_data)
@@ -644,6 +667,9 @@ class CircularEconomyMetrics:
             'improvement_potential': 1 - mci
         }
         
+        CIRCULARITY_METRIC.labels(metric_type='MCI').set(mci)
+        CIRCULARITY_METRIC.labels(metric_type='recycled_content').set(metrics['recycled_content_pct'])
+        
         self.circularity_metrics[datetime.now().isoformat()] = metrics
         
         return metrics
@@ -794,12 +820,12 @@ class SupplyChainSustainabilityMapper:
     def _calculate_social_score(self, data: Dict) -> float:
         """Calculate social sustainability score"""
         # Simplified scoring
-        return np.random.uniform(0.5, 0.9)  # Would use real data in production
+        return random.uniform(0.5, 0.9)
     
     def _calculate_governance_score(self, data: Dict) -> float:
         """Calculate governance score"""
         # Simplified scoring
-        return np.random.uniform(0.4, 0.85)  # Would use real data in production
+        return random.uniform(0.4, 0.85)
     
     def _assess_supplier_risk(self, data: Dict) -> Dict:
         """Assess supplier-related risks"""
@@ -821,16 +847,15 @@ class SupplyChainSustainabilityMapper:
     
     def _assess_geographic_risk(self, location: Dict) -> float:
         """Assess geographic risk"""
-        # Simplified risk assessment
-        return np.random.uniform(0.1, 0.6)
+        return random.uniform(0.1, 0.6)
     
     def _assess_financial_risk(self, data: Dict) -> float:
         """Assess financial stability risk"""
-        return np.random.uniform(0.1, 0.5)
+        return random.uniform(0.1, 0.5)
     
     def _assess_compliance_risk(self, data: Dict) -> float:
         """Assess regulatory compliance risk"""
-        return np.random.uniform(0.1, 0.7)
+        return random.uniform(0.1, 0.7)
     
     def _assess_dependency_risk(self, data: Dict) -> float:
         """Assess supply dependency risk"""
@@ -1012,7 +1037,6 @@ class ClimateScenarioAnalyzer:
     
     def _identify_planning_scenario(self, results: Dict) -> str:
         """Identify recommended planning scenario"""
-        # Typically use the most impactful plausible scenario
         max_impact = max(results.items(), key=lambda x: x[1]['total_impact_usd'])
         return max_impact[0]
     
@@ -1175,7 +1199,7 @@ class BiodiversityImpactAssessor:
         
         return {
             'net_gain_ratio': net_gain_ratio,
-            'achieved_net_gain': net_gain_ratio > 0.1,  # 10% net gain target
+            'achieved_net_gain': net_gain_ratio > 0.1,
             'restoration_required': max(0, impacted_area * 1.1 - restoration_area)
         }
     
@@ -1305,7 +1329,7 @@ class SocialValueMeasurement:
         """Calculate health and wellbeing value"""
         
         health_improvements = data.get('health_improvements', 0)  # QALYs
-        value_per_qaly = 50000  # Standard value per Quality-Adjusted Life Year
+        value_per_qaly = 50000
         
         return health_improvements * value_per_qaly
     
@@ -1327,7 +1351,7 @@ class SocialValueMeasurement:
         volunteer_hours = data.get('volunteer_hours', 0)
         
         # Value of volunteer time
-        volunteer_value = volunteer_hours * 25  # Standard rate
+        volunteer_value = volunteer_hours * 25
         
         return community_investment + volunteer_value
     
@@ -1417,7 +1441,7 @@ class IntegratedReportingAutomation:
             'framework': framework,
             'generated_at': datetime.now().isoformat(),
             'reporting_period': 'FY2024',
-            'preparation_basis': 'In accordance with {framework} Standards'
+            'preparation_basis': f'In accordance with {framework} Standards'
         }
         
         self.report_history.append({
@@ -1465,7 +1489,6 @@ class IntegratedReportingAutomation:
     def _generate_sasb_report(self, sustainability: Dict, financial: Dict) -> Dict:
         """Generate SASB-aligned report"""
         
-        # Identify industry-specific SASB metrics
         industry = sustainability.get('industry', 'Technology & Communications')
         
         report = {
@@ -1556,7 +1579,6 @@ class IntegratedReportingAutomation:
     
     def _identify_material_topics(self, data: Dict) -> List[Dict]:
         """Identify material sustainability topics"""
-        # Simplified materiality assessment
         topics = [
             {'topic': 'Climate Change', 'materiality': 'high', 'boundary': 'internal_external'},
             {'topic': 'Energy Management', 'materiality': 'high', 'boundary': 'internal'},
@@ -1572,7 +1594,6 @@ class IntegratedReportingAutomation:
     
     def _get_sasb_disclosure_topics(self, industry: str) -> List[str]:
         """Get SASB disclosure topics for industry"""
-        # Simplified mapping
         topics_map = {
             'Technology & Communications': [
                 'Energy Management',
@@ -1678,6 +1699,8 @@ class BlockchainSustainabilityTracker:
             'timestamp': record['timestamp']
         })
         
+        BLOCKCHAIN_RECORDS.labels(type=data_type).inc()
+        
         return record
     
     def _generate_record_id(self) -> str:
@@ -1690,11 +1713,10 @@ class BlockchainSustainabilityTracker:
         """Get hash of previous block"""
         if self.blockchain_records:
             return self.blockchain_records[-1]['hash']
-        return '0' * 64  # Genesis block
+        return '0' * 64
     
     def _calculate_hash(self, record: Dict) -> str:
         """Calculate SHA-256 hash of record"""
-        # Remove hash field for calculation
         record_copy = {k: v for k, v in record.items() if k != 'hash'}
         record_string = json.dumps(record_copy, sort_keys=True, default=str)
         return hashlib.sha256(record_string.encode()).hexdigest()
@@ -1702,13 +1724,11 @@ class BlockchainSustainabilityTracker:
     def _verify_record(self, record: Dict) -> Dict:
         """Simulate distributed consensus verification"""
         
-        # Simulate multiple verification nodes
         n_nodes = 5
         consensus_threshold = 0.6
         
         verifications = []
         for i in range(n_nodes):
-            # Each node verifies independently
             verification = {
                 'node_id': f'node_{i+1}',
                 'verified': self._node_verification(record, i),
@@ -1716,7 +1736,6 @@ class BlockchainSustainabilityTracker:
             }
             verifications.append(verification)
         
-        # Consensus mechanism
         verified_count = sum(1 for v in verifications if v['verified'])
         consensus_reached = (verified_count / n_nodes) >= consensus_threshold
         
@@ -1729,7 +1748,6 @@ class BlockchainSustainabilityTracker:
     
     def _node_verification(self, record: Dict, node_id: int) -> bool:
         """Individual node verification logic"""
-        # Simplified: verify data integrity and consistency
         data_valid = len(record.get('data', {})) > 0
         hash_valid = len(record.get('hash', '')) == 64
         timestamp_valid = record.get('timestamp') is not None
@@ -1793,7 +1811,6 @@ class BlockchainSustainabilityTracker:
     
     def _check_conditions(self, conditions: Dict, data: Dict) -> bool:
         """Check if smart contract conditions are met"""
-        # Simplified condition checking
         for key, threshold in conditions.items():
             if key in data:
                 if data[key] < threshold:
@@ -1803,7 +1820,6 @@ class BlockchainSustainabilityTracker:
     
     def _execute_action(self, action: Dict, data: Dict) -> Dict:
         """Execute smart contract action"""
-        # Simplified action execution
         return {
             'action_type': action.get('type', 'unknown'),
             'status': 'completed',
@@ -1855,7 +1871,7 @@ class BlockchainSustainabilityTracker:
 
 
 # ============================================================
-# ENHANCED V6.0 MAIN SUSTAINABILITY SIGNALS SYSTEM
+# ENHANCED V6.0 SUSTAINABILITY SIGNALS SYSTEM
 # ============================================================
 
 class SustainabilitySignalsSystemV6:
