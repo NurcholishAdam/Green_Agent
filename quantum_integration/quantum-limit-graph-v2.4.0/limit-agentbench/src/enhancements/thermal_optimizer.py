@@ -75,6 +75,14 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# Try optional imports
+try:
+    import pennylane as qml
+    from pennylane import numpy as pnp
+    PENNYLANE_AVAILABLE = True
+except ImportError:
+    PENNYLANE_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -1461,7 +1469,7 @@ def main_v6():
     print(f"   ✅ Renewable Energy-Aware Management")
     print(f"   ✅ Digital Twin Synchronization")
     print(f"   ✅ Federated Learning Across DCs")
-    print(f"   ✅ Quantum-Inspired Optimization")
+    print(f"   ✅ Quantum-Inspired Optimization: {'Available' if PENNYLANE_AVAILABLE else 'Classical'}")
     print(f"   ✅ Edge Computing Thermal Management")
     print(f"   ✅ Circular Economy Cooling")
     print(f"   ✅ Autonomous Calibration")
