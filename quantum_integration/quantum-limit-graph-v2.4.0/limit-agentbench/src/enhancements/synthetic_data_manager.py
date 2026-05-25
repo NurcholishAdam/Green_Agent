@@ -895,7 +895,7 @@ class CausalDiscoveryEngine:
         return causal_graph
     
     def _test_causal_direction(self, x: pd.Series, y: pd.Series) -> bool:
-        """Simple test for causal direction (simplified)"""
+        """Simple test for causal direction"""
         # Use time precedence if available, else correlation strength
         if len(x) > 10:
             # Test if x causes y by checking if x predicts y better than y predicts x
