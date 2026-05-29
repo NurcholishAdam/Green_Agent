@@ -27,12 +27,24 @@ V6.0 NEW ENHANCEMENTS:
 19. ADDED: Natural language query interface for material search
 20. ADDED: API-first architecture with GraphQL endpoints
 
+V6.0 ENHANCED MODULES:
+21. ADDED: Generative design for material discovery
+22. ADDED: Multi-scale modeling from atom to application
+23. ADDED: Fatigue and creep life prediction
+24. ADDED: Corrosion resistance modeling
+25. ADDED: Electromagnetic compatibility assessment
+26. ADDED: Additive manufacturing suitability scoring
+27. ADDED: Surface treatment optimization
+28. ADDED: Joining and welding compatibility
+29. ADDED: Thermal management optimization
+30. ADDED: Acoustic and vibration damping properties
+
 Reference:
 - "CALPHAD Modeling of Aluminum Alloys" (Acta Materialia, 2023)
 - "Material Substitution for Sustainable Electronics" (Nature Materials, 2024)
-- "Machine Learning for Materials Discovery" (Nature Reviews Materials, 2025)
-- "Circular Economy Indicators" (Ellen MacArthur Foundation, 2024)
-- "Blockchain for Supply Chain Transparency" (IEEE Blockchain, 2025)
+- "Generative Design for Materials" (Advanced Materials, 2025)
+- "Multi-Scale Materials Modeling" (Progress in Materials Science, 2025)
+- "Additive Manufacturing Material Selection" (Additive Manufacturing, 2025)
 """
 
 from dataclasses import dataclass, field
@@ -114,1120 +126,1371 @@ CARBON_SAVINGS = Gauge('material_substitution_carbon_savings_kg', 'Carbon saving
 PHASE_STABILITY = Gauge('phase_stability_score', 'Phase stability', ['material'], registry=REGISTRY)
 
 # V6.0 new metrics
-ML_PREDICTION_ACCURACY = Gauge('ml_material_prediction_accuracy', 'ML prediction accuracy', 
-                               ['property'], registry=REGISTRY)
-CIRCULARITY_SCORE = Gauge('material_circularity_score', 'Circular economy score', 
-                         ['material'], registry=REGISTRY)
-SUPPLY_CHAIN_RISK = Gauge('supply_chain_risk_score', 'Supply chain risk', 
-                         ['material', 'region'], registry=REGISTRY)
-BLOCKCHAIN_RECORDS = Counter('material_blockchain_records_total', 'Blockchain provenance records',
-                            ['material'], registry=REGISTRY)
+FATIGUE_LIFE = Gauge('material_fatigue_life_cycles', 'Fatigue life prediction', 
+                    ['material'], registry=REGISTRY)
+CORROSION_RESISTANCE = Gauge('material_corrosion_resistance', 'Corrosion resistance score',
+                           ['material', 'environment'], registry=REGISTRY)
+ADDITIVE_MANUFACTURING = Gauge('material_am_suitability', 'Additive manufacturing suitability',
+                              ['material', 'process'], registry=REGISTRY)
+JOINING_COMPATIBILITY = Gauge('material_joining_compatibility', 'Joining compatibility score',
+                             ['material_pair'], registry=REGISTRY)
 
 
 # ============================================================
-# ENHANCEMENT 11: MULTI-OBJECTIVE PARETO OPTIMIZATION
+# ENHANCEMENT 21: GENERATIVE DESIGN FOR MATERIAL DISCOVERY
 # ============================================================
 
-class MultiObjectiveMaterialOptimizer:
+class GenerativeMaterialDesigner:
     """
-    Multi-objective Pareto optimization for material selection.
+    Generative design for novel material discovery.
     
     Features:
-    - Cost-performance-carbon trade-off analysis
+    - Composition optimization
+    - Property prediction
+    - Constraint satisfaction
     - Pareto frontier discovery
-    - Constraint handling
-    - Solution diversity preservation
     """
     
     def __init__(self):
-        self.population_size = 50
-        self.generations = 30
-        self.pareto_frontier = []
+        self.property_models = {}
+        self.design_constraints = {}
+        self.generated_materials = []
         
-    def optimize_material_selection(self, candidates: List['MaterialProperties'],
-                                  objectives: List[str] = None) -> List[Dict]:
-        """Discover Pareto-optimal material solutions"""
+    def define_design_space(self, elements: List[str],
+                          composition_ranges: Dict[str, Tuple[float, float]],
+                          target_properties: Dict[str, Tuple[float, float]]):
+        """Define material design space and targets"""
         
-        if objectives is None:
-            objectives = ['minimize_cost', 'maximize_performance', 'minimize_carbon']
-        
-        # Generate candidate solutions
-        solutions = []
-        for material in candidates:
-            solution = {
-                'material': material,
-                'cost': material.cost_per_kg_usd,
-                'performance': self._calculate_performance_score(material),
-                'carbon': material.carbon_footprint_kg_co2_per_kg,
-                'density': material.density_kg_m3,
-                'strength': material.yield_strength_mpa
-            }
-            solutions.append(solution)
-        
-        # Find Pareto-optimal solutions
-        pareto_optimal = self._non_dominated_sorting(solutions, objectives)
-        self.pareto_frontier = pareto_optimal
-        
-        return pareto_optimal
-    
-    def _calculate_performance_score(self, material: 'MaterialProperties') -> float:
-        """Calculate composite performance score"""
-        # Normalize properties to 0-1 scale
-        thermal_score = material.thermal_conductivity_w_mk / 500
-        strength_score = material.yield_strength_mpa / 500
-        stiffness_score = material.elastic_modulus_gpa / 200
-        
-        # Weighted performance index
-        performance = (thermal_score * 0.3 + strength_score * 0.4 + stiffness_score * 0.3)
-        
-        return performance
-    
-    def _non_dominated_sorting(self, solutions: List[Dict], 
-                              objectives: List[str]) -> List[Dict]:
-        """Identify non-dominated solutions"""
-        n = len(solutions)
-        dominated = np.zeros(n, dtype=bool)
-        
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    # Check if j dominates i
-                    dominates = True
-                    
-                    # For cost and carbon: lower is better
-                    if solutions[j]['cost'] > solutions[i]['cost']:
-                        dominates = False
-                    if solutions[j]['carbon'] > solutions[i]['carbon']:
-                        dominates = False
-                    
-                    # For performance: higher is better
-                    if solutions[j]['performance'] < solutions[i]['performance']:
-                        dominates = False
-                    
-                    if dominates:
-                        dominated[i] = True
-                        break
-        
-        return [solutions[i] for i in range(n) if not dominated[i]]
-    
-    def get_optimal_tradeoff(self, cost_weight: float = 0.33,
-                           performance_weight: float = 0.33,
-                           carbon_weight: float = 0.34) -> Dict:
-        """Get optimal solution for given trade-off preferences"""
-        
-        if not self.pareto_frontier:
-            return {'error': 'No Pareto frontier computed'}
-        
-        # Normalize objectives
-        costs = [s['cost'] for s in self.pareto_frontier]
-        performances = [s['performance'] for s in self.pareto_frontier]
-        carbons = [s['carbon'] for s in self.pareto_frontier]
-        
-        max_cost = max(costs) if costs else 1
-        max_perf = max(performances) if performances else 1
-        max_carbon = max(carbons) if carbons else 1
-        
-        # Weighted sum selection
-        best_solution = min(self.pareto_frontier,
-                          key=lambda x: cost_weight * x['cost'] / max_cost - 
-                                      performance_weight * x['performance'] / max_perf +
-                                      carbon_weight * x['carbon'] / max_carbon)
-        
-        return best_solution
-
-
-# ============================================================
-# ENHANCEMENT 12: ML PROPERTY PREDICTION
-# ============================================================
-
-class MaterialPropertyPredictor:
-    """
-    Machine learning-based material property prediction.
-    
-    Features:
-    - Composition-to-property mapping
-    - Uncertainty quantification
-    - Transfer learning from similar materials
-    - Feature importance analysis
-    """
-    
-    def __init__(self):
-        self.models = {}
-        self.scalers = {}
-        self.feature_importance = {}
-        self.training_history = []
-        
-    def train_from_database(self, materials: Dict[str, 'MaterialProperties']) -> Dict:
-        """Train ML models on existing material database"""
-        if not SKLEARN_AVAILABLE:
-            logger.warning("scikit-learn not available for ML prediction")
-            return {}
-        
-        # Extract features from compositions
-        X = []
-        y_dict = defaultdict(list)
-        
-        for name, material in materials.items():
-            feature_vector = [
-                material.density_kg_m3 / 10000,
-                material.cost_per_kg_usd / 100,
-                material.recycling_rate_pct / 100,
-                material.supply_risk_hhi,
-                material.formation_enthalpy_kj_per_mol / 100,
-                material.formation_entropy_j_per_mol_k / 100,
-            ]
-            
-            X.append(feature_vector)
-            
-            y_dict['thermal_conductivity'].append(material.thermal_conductivity_w_mk / 500)
-            y_dict['yield_strength'].append(material.yield_strength_mpa / 500)
-            y_dict['elastic_modulus'].append(material.elastic_modulus_gpa / 200)
-        
-        X = np.array(X)
-        
-        if len(X) < 10:
-            logger.warning("Insufficient data for ML training")
-            return {}
-        
-        training_results = {}
-        
-        for property_name, y_values in y_dict.items():
-            y_values = np.array(y_values)
-            
-            # Train ensemble models
-            model_rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-            model_gb = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
-            
-            # Cross-validation
-            cv_scores_rf = cross_val_score(model_rf, X, y_values, cv=min(5, len(X)//3), 
-                                          scoring='neg_mean_absolute_error')
-            cv_scores_gb = cross_val_score(model_gb, X, y_values, cv=min(5, len(X)//3),
-                                          scoring='neg_mean_absolute_error')
-            
-            # Train final models
-            model_rf.fit(X, y_values)
-            model_gb.fit(X, y_values)
-            
-            self.models[f"{property_name}_rf"] = model_rf
-            self.models[f"{property_name}_gb"] = model_gb
-            self.feature_importance[property_name] = model_rf.feature_importances_
-            
-            training_results[property_name] = {
-                'rf_cv_score': -cv_scores_rf.mean(),
-                'gb_cv_score': -cv_scores_gb.mean(),
-                'n_samples': len(X)
-            }
-            
-            ML_PREDICTION_ACCURACY.labels(property=property_name).set(
-                1 - cv_scores_rf.mean()
-            )
-            
-            logger.info(f"Trained ML model for {property_name}: MAE={-cv_scores_rf.mean():.3f}")
-        
-        self.training_history.append({
-            'timestamp': datetime.now(),
-            'n_materials': len(materials),
-            'properties_trained': list(training_results.keys())
-        })
-        
-        return training_results
-    
-    def predict_properties(self, composition_features: np.ndarray) -> Dict[str, Tuple[float, float]]:
-        """Predict properties with uncertainty estimation"""
-        
-        predictions = {}
-        
-        for property_name in ['thermal_conductivity', 'yield_strength', 'elastic_modulus']:
-            rf_key = f"{property_name}_rf"
-            gb_key = f"{property_name}_gb"
-            
-            if rf_key in self.models and gb_key in self.models:
-                rf_pred = self.models[rf_key].predict(composition_features.reshape(1, -1))[0]
-                gb_pred = self.models[gb_key].predict(composition_features.reshape(1, -1))[0]
-                
-                mean_pred = (rf_pred + gb_pred) / 2
-                std_pred = abs(rf_pred - gb_pred) / 2
-                
-                predictions[property_name] = (float(mean_pred), float(std_pred))
-        
-        return predictions
-
-
-# ============================================================
-# ENHANCEMENT 13: SUPPLY CHAIN RESILIENCE ANALYSIS
-# ============================================================
-
-class SupplyChainResilienceAnalyzer:
-    """
-    Supply chain resilience analysis for materials.
-    
-    Features:
-    - Geopolitical risk assessment
-    - Supplier diversification scoring
-    - Disruption scenario modeling
-    - Alternative sourcing recommendations
-    """
-    
-    def __init__(self):
-        self.regional_risk_factors = {
-            'north_america': 0.15,
-            'europe': 0.20,
-            'east_asia': 0.35,
-            'south_asia': 0.40,
-            'middle_east': 0.55,
-            'africa': 0.50,
-            'south_america': 0.45,
-            'oceania': 0.25
-        }
-        
-        self.disruption_scenarios = {
-            'trade_war': {'probability': 0.3, 'duration_months': 6, 'cost_impact': 0.4},
-            'natural_disaster': {'probability': 0.15, 'duration_months': 3, 'cost_impact': 0.3},
-            'pandemic': {'probability': 0.1, 'duration_months': 12, 'cost_impact': 0.5},
-            'geopolitical_conflict': {'probability': 0.2, 'duration_months': 8, 'cost_impact': 0.6}
+        self.design_constraints = {
+            'elements': elements,
+            'composition_ranges': composition_ranges,
+            'target_properties': target_properties
         }
     
-    def assess_supply_chain_risk(self, material: 'MaterialProperties',
-                                sourcing_regions: List[str]) -> Dict:
-        """Comprehensive supply chain risk assessment"""
+    def generate_candidates(self, n_candidates: int = 100) -> List[Dict]:
+        """Generate candidate material compositions"""
         
-        # Regional risk aggregation
-        regional_risk = np.mean([
-            self.regional_risk_factors.get(region, 0.5) 
-            for region in sourcing_regions
-        ])
+        candidates = []
+        elements = self.design_constraints['elements']
+        ranges = self.design_constraints['composition_ranges']
         
-        # Supplier concentration risk (from HHI)
-        concentration_risk = material.supply_risk_hhi
-        
-        # Overall risk score
-        overall_risk = regional_risk * 0.4 + concentration_risk * 0.35 + 0.25
-        
-        # Disruption scenario analysis
-        disruption_impact = self._analyze_disruption_scenarios(material, sourcing_regions)
-        
-        # Resilience recommendations
-        recommendations = self._generate_resilience_recommendations(
-            overall_risk, regional_risk, concentration_risk
-        )
-        
-        for region in sourcing_regions:
-            SUPPLY_CHAIN_RISK.labels(material=material.name, region=region).set(overall_risk)
-        
-        return {
-            'overall_risk_score': overall_risk,
-            'regional_risk': regional_risk,
-            'concentration_risk': concentration_risk,
-            'disruption_scenarios': disruption_impact,
-            'resilience_score': 1 - overall_risk,
-            'recommendations': recommendations,
-            'risk_level': 'high' if overall_risk > 0.6 else 'medium' if overall_risk > 0.3 else 'low'
-        }
-    
-    def _analyze_disruption_scenarios(self, material: 'MaterialProperties',
-                                     regions: List[str]) -> List[Dict]:
-        """Analyze impact of disruption scenarios"""
-        
-        scenario_impacts = []
-        
-        for scenario_name, params in self.disruption_scenarios.items():
-            base_cost = material.cost_per_kg_usd
-            impact_cost = base_cost * (1 + params['cost_impact'])
-            expected_cost_increase = (impact_cost - base_cost) * params['probability']
+        for _ in range(n_candidates):
+            # Generate random composition
+            composition = {}
+            remaining = 1.0
             
-            scenario_impacts.append({
-                'scenario': scenario_name,
-                'probability': params['probability'],
-                'duration_months': params['duration_months'],
-                'cost_impact_pct': params['cost_impact'] * 100,
-                'expected_annual_cost_increase': expected_cost_increase * 12
+            for element in elements[:-1]:
+                min_val, max_val = ranges.get(element, (0, 0.5))
+                value = random.uniform(min_val, min(max_val, remaining))
+                composition[element] = value
+                remaining -= value
+            
+            # Last element gets remainder
+            composition[elements[-1]] = max(0, remaining)
+            
+            # Normalize
+            total = sum(composition.values())
+            if total > 0:
+                composition = {k: v/total for k, v in composition.items()}
+            
+            # Predict properties
+            properties = self._predict_properties(composition)
+            
+            candidates.append({
+                'composition': composition,
+                'properties': properties
             })
         
-        return sorted(scenario_impacts, key=lambda x: x['expected_annual_cost_increase'], reverse=True)
+        self.generated_materials.extend(candidates)
+        
+        return candidates
     
-    def _generate_resilience_recommendations(self, overall_risk: float,
-                                            regional_risk: float,
-                                            concentration_risk: float) -> List[str]:
-        """Generate supply chain resilience recommendations"""
+    def _predict_properties(self, composition: Dict[str, float]) -> Dict:
+        """Predict material properties from composition"""
+        
+        # Rule of mixtures for simple properties
+        density = sum(composition.get(el, 0) * self._get_element_density(el) 
+                    for el in composition)
+        
+        # Vegard's law for lattice parameter
+        lattice_param = sum(composition.get(el, 0) * self._get_element_radius(el) * 2 
+                          for el in composition)
+        
+        # Simple strength model
+        strength = 200 + 500 * sum(composition.get(el, 0) * self._get_element_strength_factor(el)
+                                 for el in composition)
+        
+        return {
+            'density_kg_m3': density,
+            'lattice_parameter_angstrom': lattice_param,
+            'yield_strength_mpa': strength,
+            'elastic_modulus_gpa': strength * 0.3,
+            'thermal_conductivity_w_mk': 100 + 200 * random.random()
+        }
+    
+    def _get_element_density(self, element: str) -> float:
+        """Get element density"""
+        densities = {
+            'Al': 2.7, 'Mg': 1.74, 'Cu': 8.96, 'Zn': 7.14,
+            'Fe': 7.87, 'Ti': 4.51, 'Ni': 8.91, 'Cr': 7.19
+        }
+        return densities.get(element, 5.0)
+    
+    def _get_element_radius(self, element: str) -> float:
+        """Get atomic radius"""
+        radii = {
+            'Al': 1.43, 'Mg': 1.60, 'Cu': 1.28, 'Zn': 1.34,
+            'Fe': 1.26, 'Ti': 1.47, 'Ni': 1.25, 'Cr': 1.28
+        }
+        return radii.get(element, 1.4)
+    
+    def _get_element_strength_factor(self, element: str) -> float:
+        """Get strengthening factor"""
+        factors = {
+            'Al': 0.3, 'Mg': 0.5, 'Cu': 0.6, 'Zn': 0.2,
+            'Fe': 0.8, 'Ti': 0.9, 'Ni': 0.7, 'Cr': 0.6
+        }
+        return factors.get(element, 0.3)
+    
+    def optimize_composition(self, objective_weights: Dict[str, float]) -> Dict:
+        """Optimize composition for target properties"""
+        
+        if not self.generated_materials:
+            self.generate_candidates()
+        
+        best_candidate = None
+        best_score = float('-inf')
+        
+        targets = self.design_constraints['target_properties']
+        
+        for candidate in self.generated_materials:
+            score = 0
+            
+            for prop, (target_min, target_max) in targets.items():
+                actual = candidate['properties'].get(prop, 0)
+                
+                if target_min <= actual <= target_max:
+                    # Within target range
+                    score += objective_weights.get(prop, 0.1)
+                else:
+                    # Penalize being outside range
+                    distance = min(abs(actual - target_min), abs(actual - target_max))
+                    score -= distance * objective_weights.get(prop, 0.1)
+            
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+        
+        return best_candidate
+
+
+# ============================================================
+# ENHANCEMENT 22: MULTI-SCALE MODELING
+# ============================================================
+
+class MultiScaleMaterialModeler:
+    """
+    Multi-scale modeling from atom to application.
+    
+    Features:
+    - Density functional theory (DFT) surrogates
+    - Molecular dynamics approximations
+    - Crystal plasticity models
+    - Continuum mechanics integration
+    """
+    
+    def __init__(self):
+        self.scale_models = {
+            'atomic': self._atomic_scale_model,
+            'nano': self._nanoscale_model,
+            'micro': self._microscale_model,
+            'macro': self._macroscale_model
+        }
+        
+    def predict_properties_multiscale(self, material: 'MaterialProperties',
+                                    scale: str = 'macro') -> Dict:
+        """Predict material properties at different scales"""
+        
+        if scale not in self.scale_models:
+            return {'error': f'Unknown scale: {scale}'}
+        
+        # Start from atomic scale and propagate up
+        results = {}
+        
+        for current_scale in ['atomic', 'nano', 'micro', 'macro']:
+            model = self.scale_models[current_scale]
+            results[current_scale] = model(material, results)
+            
+            if current_scale == scale:
+                break
+        
+        return results.get(scale, {})
+    
+    def _atomic_scale_model(self, material: 'MaterialProperties',
+                          lower_results: Dict) -> Dict:
+        """Atomic scale DFT surrogate"""
+        
+        # Cohesive energy
+        cohesive_energy = material.formation_enthalpy_kj_per_mol
+        
+        # Elastic constants from interatomic potentials
+        C11 = 100 + cohesive_energy * 2
+        C12 = 50 + cohesive_energy
+        C44 = 30 + cohesive_energy * 0.5
+        
+        return {
+            'cohesive_energy_kj_per_mol': cohesive_energy,
+            'C11_GPa': C11,
+            'C12_GPa': C12,
+            'C44_GPa': C44,
+            'bulk_modulus_GPa': (C11 + 2*C12) / 3,
+            'shear_modulus_GPa': C44
+        }
+    
+    def _nanoscale_model(self, material: 'MaterialProperties',
+                       lower_results: Dict) -> Dict:
+        """Nanoscale molecular dynamics surrogate"""
+        
+        atomic = lower_results.get('atomic', {})
+        
+        # Hall-Petch strengthening
+        grain_size_nm = 100  # Typical grain size
+        hall_petch_coefficient = 0.5  # MPa·m^0.5
+        
+        yield_strength = material.yield_strength_mpa + \
+                       hall_petch_coefficient / np.sqrt(grain_size_nm * 1e-9)
+        
+        # Dislocation density
+        dislocation_density = 1e14  # m^-2
+        
+        return {
+            'grain_size_nm': grain_size_nm,
+            'hall_petch_strengthening_mpa': hall_petch_coefficient / np.sqrt(grain_size_nm * 1e-9),
+            'yield_strength_nano_mpa': yield_strength,
+            'dislocation_density_m2': dislocation_density
+        }
+    
+    def _microscale_model(self, material: 'MaterialProperties',
+                        lower_results: Dict) -> Dict:
+        """Microscale crystal plasticity"""
+        
+        nano = lower_results.get('nano', {})
+        
+        # Taylor factor
+        taylor_factor = 3.06  # For FCC materials
+        
+        # Critical resolved shear stress
+        crss = nano.get('yield_strength_nano_mpa', material.yield_strength_mpa) / taylor_factor
+        
+        # Strain hardening
+        strain_hardening_rate = material.elastic_modulus_gpa / 20
+        
+        return {
+            'taylor_factor': taylor_factor,
+            'crss_mpa': crss,
+            'strain_hardening_rate_mpa': strain_hardening_rate,
+            'flow_stress_mpa': crss * taylor_factor + strain_hardening_rate * 0.2
+        }
+    
+    def _macroscale_model(self, material: 'MaterialProperties',
+                        lower_results: Dict) -> Dict:
+        """Macroscale continuum mechanics"""
+        
+        micro = lower_results.get('micro', {})
+        
+        # Effective properties
+        yield_strength = micro.get('flow_stress_mpa', material.yield_strength_mpa)
+        
+        # Anisotropy
+        r_value = 1.0  # Lankford coefficient (isotropic = 1.0)
+        
+        # Formability
+        forming_limit = yield_strength * 0.3 / material.elastic_modulus_gpa
+        
+        return {
+            'yield_strength_macro_mpa': yield_strength,
+            'tensile_strength_mpa': yield_strength * 1.3,
+            'elongation_pct': 20 * (material.elastic_modulus_gpa / 200),
+            'r_value': r_value,
+            'forming_limit_strain': forming_limit
+        }
+
+
+# ============================================================
+# ENHANCEMENT 23: FATIGUE AND CREEP LIFE PREDICTION
+# ============================================================
+
+class FatigueCreepPredictor:
+    """
+    Fatigue and creep life prediction for materials.
+    
+    Features:
+    - S-N curve generation
+    - Creep rupture life estimation
+    - Thermomechanical fatigue
+    - Damage accumulation models
+    """
+    
+    def __init__(self):
+        self.fatigue_models = {}
+        self.creep_models = {}
+        
+    def predict_fatigue_life(self, material: 'MaterialProperties',
+                           stress_amplitude_mpa: float,
+                           stress_ratio: float = -1,
+                           temperature_c: float = 25) -> Dict:
+        """Predict fatigue life using Basquin's law"""
+        
+        # Fatigue strength coefficient
+        sigma_f = material.yield_strength_mpa * 1.5
+        
+        # Fatigue strength exponent (Basquin's exponent)
+        b = -0.08  # Typical for metals
+        
+        # Fatigue ductility coefficient
+        epsilon_f = 0.5  # True fracture ductility
+        
+        # Fatigue ductility exponent
+        c = -0.6  # Typical for metals
+        
+        # Mean stress correction (Goodman)
+        mean_stress = stress_amplitude_mpa * (1 + stress_ratio) / (1 - stress_ratio) if stress_ratio != 1 else 0
+        sigma_a_effective = stress_amplitude_mpa / (1 - mean_stress / material.yield_strength_mpa)
+        
+        # Basquin's law: σa = σf' * (2Nf)^b
+        Nf = 0.5 * (sigma_a_effective / sigma_f) ** (1/b)
+        
+        # Temperature derating
+        if temperature_c > 100:
+            temp_factor = 1 - 0.005 * (temperature_c - 100)
+            Nf *= max(0.1, temp_factor)
+        
+        FATIGUE_LIFE.labels(material=material.name).set(Nf)
+        
+        return {
+            'fatigue_life_cycles': Nf,
+            'stress_amplitude_mpa': stress_amplitude_mpa,
+            'mean_stress_mpa': mean_stress,
+            'fatigue_strength_coefficient_mpa': sigma_f,
+            'basquin_exponent': b,
+            'temperature_derating': temp_factor if temperature_c > 100 else 1.0,
+            'fatigue_limit_mpa': sigma_f * (2e6) ** b  # Fatigue limit at 2M cycles
+        }
+    
+    def predict_creep_life(self, material: 'MaterialProperties',
+                         stress_mpa: float,
+                         temperature_k: float) -> Dict:
+        """Predict creep rupture life using Larson-Miller parameter"""
+        
+        # Larson-Miller parameter
+        C = 20  # Material constant
+        
+        # Activation energy for creep (approximate)
+        Q_creep = 0.6 * material.formation_enthalpy_kj_per_mol * 1000  # J/mol
+        
+        R = 8.314  # Gas constant
+        
+        # Minimum creep rate (Norton's law)
+        n = 5  # Stress exponent
+        A = 1e-10
+        
+        min_creep_rate = A * stress_mpa ** n * np.exp(-Q_creep / (R * temperature_k))
+        
+        # Rupture life (Monkman-Grant relationship)
+        epsilon_f = 0.3  # Creep ductility
+        rupture_life = epsilon_f / min_creep_rate
+        
+        # Larson-Miller parameter
+        LMP = temperature_k * (C + np.log10(rupture_life / 3600)) / 1000
+        
+        return {
+            'rupture_life_hours': rupture_life / 3600,
+            'minimum_creep_rate_s': min_creep_rate,
+            'larson_miller_parameter': LMP,
+            'stress_exponent': n,
+            'activation_energy_j_per_mol': Q_creep,
+            'temperature_k': temperature_k,
+            'creep_regime': 'diffusion' if stress_mpa < material.yield_strength_mpa * 0.3 else 'power_law'
+        }
+
+
+# ============================================================
+# ENHANCEMENT 24: CORROSION RESISTANCE MODELING
+# ============================================================
+
+class CorrosionResistanceModeler:
+    """
+    Corrosion resistance modeling for material selection.
+    
+    Features:
+    - Pitting resistance equivalent (PREN)
+    - Galvanic corrosion prediction
+    - Environmental severity assessment
+    - Protection strategy recommendation
+    """
+    
+    def __init__(self):
+        self.corrosion_environments = {
+            'atmospheric': {'severity': 0.3, 'chloride_ppm': 10},
+            'marine': {'severity': 0.8, 'chloride_ppm': 20000},
+            'industrial': {'severity': 0.6, 'chloride_ppm': 100},
+            'chemical': {'severity': 0.9, 'chloride_ppm': 1000}
+        }
+        
+    def calculate_pitting_resistance(self, material: 'MaterialProperties',
+                                   composition: Dict[str, float] = None) -> Dict:
+        """Calculate Pitting Resistance Equivalent Number (PREN)"""
+        
+        # PREN = %Cr + 3.3%Mo + 16%N
+        cr_content = (composition or {}).get('Cr', 0) * 100
+        mo_content = (composition or {}).get('Mo', 0) * 100
+        n_content = (composition or {}).get('N', 0) * 100
+        
+        pren = cr_content + 3.3 * mo_content + 16 * n_content
+        
+        # Corrosion resistance classification
+        if pren > 40:
+            resistance = 'super_austenitic'
+        elif pren > 32:
+            resistance = 'super_duplex'
+        elif pren > 25:
+            resistance = 'duplex'
+        elif pren > 18:
+            resistance = 'austenitic'
+        else:
+            resistance = 'ferritic'
+        
+        return {
+            'pren': pren,
+            'resistance_class': resistance,
+            'suitable_for_marine': pren > 32,
+            'critical_pitting_temperature_c': 10 + pren * 1.5,
+            'crevice_corrosion_risk': 'high' if pren < 25 else 'medium' if pren < 35 else 'low'
+        }
+    
+    def assess_galvanic_corrosion(self, material1: 'MaterialProperties',
+                                material2: 'MaterialProperties',
+                                environment: str = 'marine') -> Dict:
+        """Assess galvanic corrosion risk between two materials"""
+        
+        # Galvanic series potentials (simplified)
+        potentials = {
+            'magnesium': -1.6, 'aluminum': -0.8, 'steel': -0.4,
+            'copper': 0.0, 'stainless_steel': -0.2, 'titanium': -0.1,
+            'graphite': 0.3, 'gold': 0.5
+        }
+        
+        # Determine potentials
+        potential1 = self._get_material_potential(material1)
+        potential2 = self._get_material_potential(material2)
+        
+        potential_diff = abs(potential1 - potential2)
+        
+        # Environment severity
+        env = self.corrosion_environments.get(environment, {})
+        severity = env.get('severity', 0.5)
+        
+        # Galvanic corrosion risk
+        if potential_diff < 0.2:
+            risk = 'low'
+        elif potential_diff < 0.5:
+            risk = 'medium'
+        else:
+            risk = 'high'
+        
+        # Risk increased by environment severity
+        if severity > 0.7 and risk == 'medium':
+            risk = 'high'
+        
+        CORROSION_RESISTANCE.labels(material=material1.name, environment=environment).set(
+            1 - min(1, potential_diff)
+        )
+        
+        return {
+            'potential_difference_v': potential_diff,
+            'galvanic_risk': risk,
+            'environment_severity': severity,
+            'corrosion_rate_mm_per_year': potential_diff * severity * 0.5,
+            'protection_required': risk in ['medium', 'high'],
+            'recommended_protection': self._recommend_protection(risk, severity)
+        }
+    
+    def _get_material_potential(self, material: 'MaterialProperties') -> float:
+        """Get electrochemical potential for material"""
+        
+        for key, potential in {
+            'magnesium': -1.6, 'aluminum': -0.8, 'steel': -0.4,
+            'copper': 0.0, 'titanium': -0.1
+        }.items():
+            if key in material.name.lower():
+                return potential
+        
+        return -0.5  # Default
+    
+    def _recommend_protection(self, risk: str, severity: float) -> List[str]:
+        """Recommend corrosion protection measures"""
+        
         recommendations = []
         
-        if overall_risk > 0.5:
-            recommendations.append("CRITICAL: Develop comprehensive risk mitigation strategy")
+        if risk == 'high':
+            recommendations.append("Apply cathodic protection system")
+            recommendations.append("Use insulating gaskets between dissimilar metals")
+            recommendations.append("Apply protective coating (epoxy or polyurethane)")
+        elif risk == 'medium':
+            recommendations.append("Apply conversion coating")
+            recommendations.append("Consider sacrificial anode protection")
+        else:
+            recommendations.append("Standard surface treatment sufficient")
         
-        if regional_risk > 0.4:
-            recommendations.append("Diversify sourcing across multiple geographic regions")
-        
-        if concentration_risk > 0.5:
-            recommendations.append("Reduce supplier concentration - qualify alternative suppliers")
-        
-        recommendations.append("Maintain strategic inventory buffer of 3-6 months")
+        if severity > 0.7:
+            recommendations.append("Increase inspection frequency to monthly")
         
         return recommendations
 
 
 # ============================================================
-# ENHANCEMENT 14: CIRCULAR ECONOMY SCORING
+# ENHANCEMENT 25: ELECTROMAGNETIC COMPATIBILITY
 # ============================================================
 
-class CircularityScorer:
+class ElectromagneticCompatibility:
     """
-    Comprehensive circular economy assessment.
+    Electromagnetic compatibility assessment for materials.
     
     Features:
-    - Material circularity indicator (MCI)
-    - Recycled content valuation
-    - End-of-life recovery rate estimation
-    - Design for disassembly scoring
+    - Shielding effectiveness calculation
+    - Conductivity assessment
+    - Magnetic permeability evaluation
+    - EMI/EMC compliance checking
     """
     
     def __init__(self):
-        self.circularity_weights = {
-            'recycled_content': 0.3,
-            'recycling_rate': 0.25,
-            'design_for_disassembly': 0.20,
-            'material_efficiency': 0.15,
-            'biological_cycle': 0.10
-        }
-        
-    def calculate_mci(self, material: 'MaterialProperties', 
-                     application: 'Application') -> Dict:
-        """
-        Material Circularity Indicator calculation
-        Based on Ellen MacArthur Foundation methodology
-        """
-        # Virgin material fraction
-        virgin_fraction = 1 - (material.recycling_rate_pct / 100)
-        
-        # Utility factor based on application
-        utility_factors = {
-            Application.HEAT_SINK: 0.8,
-            Application.CHASSIS: 0.9,
-            Application.CONNECTOR: 0.7,
-            Application.STRUCTURAL: 1.0
-        }
-        utility = utility_factors.get(application, 0.8)
-        
-        # Linear flow index
-        lfi = virgin_fraction * (1 / utility)
-        
-        # MCI calculation
-        mci = max(0, min(1, 1 - lfi * 0.9))
-        
-        # Sub-scores
-        scores = {
-            'recycled_content': material.recycling_rate_pct / 100,
-            'recycling_rate': self._estimate_eol_recovery(material),
-            'design_for_disassembly': self._assess_disassembly(material),
-            'material_efficiency': self._evaluate_efficiency(material),
-            'biological_cycle': 0.1 if material.material_class == MaterialClass.BIO_BASED else 0
-        }
-        
-        # Weighted total
-        weighted_score = sum(
-            scores[key] * self.circularity_weights[key] 
-            for key in self.circularity_weights
-        )
-        
-        CIRCULARITY_SCORE.labels(material=material.name).set(weighted_score)
-        
-        return {
-            'mci': mci,
-            'circularity_score': weighted_score,
-            'sub_scores': scores,
-            'improvement_potential': 1 - weighted_score,
-            'recommendations': self._generate_circularity_recommendations(material, scores)
+        self.emi_standards = {
+            'FCC_Part_15': {'frequency_range': (30e6, 40e9), 'emission_limit_dBuV': 40},
+            'CISPR_22': {'frequency_range': (150e3, 30e6), 'emission_limit_dBuV': 30},
+            'MIL_STD_461': {'frequency_range': (10e3, 40e9), 'emission_limit_dBuV': 24}
         }
     
-    def _estimate_eol_recovery(self, material: 'MaterialProperties') -> float:
-        """Estimate end-of-life recovery rate"""
-        if material.material_class == MaterialClass.RECYCLED_METAL:
-            return 0.95
-        elif material.material_class in [MaterialClass.ALUMINUM_ALLOY, MaterialClass.COPPER_ALLOY]:
-            return 0.85
-        elif material.material_class == MaterialClass.COMPOSITE:
-            return 0.3
+    def calculate_shielding_effectiveness(self, material: 'MaterialProperties',
+                                        thickness_mm: float,
+                                        frequency_hz: float) -> Dict:
+        """Calculate electromagnetic shielding effectiveness"""
+        
+        # Electrical conductivity
+        sigma = 1 / (material.electrical_conductivity_pct_iacs * 0.58e7) if material.electrical_conductivity_pct_iacs > 0 else 1e6
+        
+        # Magnetic permeability (relative)
+        mu_r = 1.0  # Assume non-magnetic unless specified
+        
+        # Skin depth
+        omega = 2 * np.pi * frequency_hz
+        skin_depth = np.sqrt(2 / (omega * mu_r * 4e-7 * np.pi * sigma))
+        
+        # Absorption loss
+        A = 8.686 * thickness_mm * 1e-3 / skin_depth
+        
+        # Reflection loss
+        K = 1.0  # Constant for plane wave
+        R = 168 + 10 * np.log10(sigma / (mu_r * frequency_hz))
+        
+        # Multiple reflection correction
+        if A < 10:
+            M = 20 * np.log10(1 - np.exp(-2 * thickness_mm * 1e-3 / skin_depth))
         else:
-            return material.recycling_rate_pct / 100
-    
-    def _assess_disassembly(self, material: 'MaterialProperties') -> float:
-        """Assess ease of disassembly"""
-        if material.material_class == MaterialClass.COMPOSITE:
-            return 0.3
-        elif material.material_class == MaterialClass.BIO_BASED:
-            return 0.6
-        else:
-            return 0.8
-    
-    def _evaluate_efficiency(self, material: 'MaterialProperties') -> float:
-        """Evaluate material efficiency"""
-        strength_to_weight = material.yield_strength_mpa / max(material.density_kg_m3, 1)
-        normalized = min(1.0, strength_to_weight / 0.2)
-        return normalized
-    
-    def _generate_circularity_recommendations(self, material: 'MaterialProperties', 
-                                            scores: Dict) -> List[str]:
-        """Generate recommendations for improving circularity"""
-        recommendations = []
+            M = 0
         
-        if scores['recycled_content'] < 0.5:
-            recommendations.append("Increase recycled content in material composition")
-        if scores['recycling_rate'] < 0.7:
-            recommendations.append("Improve end-of-life collection and recycling infrastructure")
-        if scores['design_for_disassembly'] < 0.6:
-            recommendations.append("Redesign for easier disassembly and material separation")
-        
-        return recommendations
-
-
-# ============================================================
-# ENHANCEMENT 15: DIGITAL TWIN INTEGRATION
-# ============================================================
-
-class MaterialDigitalTwin:
-    """
-    Digital twin integration for material performance validation.
-    
-    Features:
-    - Virtual material testing
-    - Performance prediction under real conditions
-    - Sensor data integration
-    - Predictive maintenance scheduling
-    """
-    
-    def __init__(self):
-        self.simulation_models = {}
-        self.sensor_data_buffer = deque(maxlen=10000)
-        
-    def create_material_twin(self, material: 'MaterialProperties',
-                           application: 'Application') -> Dict:
-        """Create digital twin model for material performance"""
-        
-        # Material property model
-        property_model = {
-            'density': {'value': material.density_kg_m3, 'uncertainty': 0.02},
-            'thermal_conductivity': {'value': material.thermal_conductivity_w_mk, 'uncertainty': 0.05},
-            'yield_strength': {'value': material.yield_strength_mpa, 'uncertainty': 0.08},
-            'elastic_modulus': {'value': material.elastic_modulus_gpa, 'uncertainty': 0.03}
-        }
-        
-        # Degradation model based on application
-        degradation_rates = {
-            Application.HEAT_SINK: {'thermal_fatigue': 0.001, 'oxidation': 0.0005},
-            Application.CHASSIS: {'fatigue': 0.002, 'corrosion': 0.001},
-            Application.CONNECTOR: {'wear': 0.003, 'fretting': 0.001},
-            Application.STRUCTURAL: {'creep': 0.0005, 'fatigue': 0.001}
-        }
-        
-        twin_id = f"DT-{material.name}-{application.value}-{datetime.now().strftime('%Y%m%d')}"
-        
-        self.simulation_models[twin_id] = {
-            'material': material,
-            'application': application,
-            'property_model': property_model,
-            'degradation_rates': degradation_rates.get(application, {}),
-            'created_at': datetime.now(),
-            'last_updated': datetime.now()
-        }
+        # Total shielding effectiveness
+        SE = A + R + M
         
         return {
-            'twin_id': twin_id,
-            'capabilities': ['property_prediction', 'degradation_simulation', 
-                           'performance_forecasting'],
-            'update_frequency': 'daily',
-            'expected_lifetime_range': (5, 20)
+            'shielding_effectiveness_db': max(0, SE),
+            'absorption_loss_db': A,
+            'reflection_loss_db': R,
+            'skin_depth_mm': skin_depth * 1000,
+            'frequency_hz': frequency_hz,
+            'shielding_class': 'excellent' if SE > 100 else 'good' if SE > 60 else 'moderate' if SE > 20 else 'poor'
         }
     
-    def integrate_sensor_data(self, twin_id: str, sensor_data: Dict) -> None:
-        """Integrate real-time sensor data into digital twin"""
-        if twin_id in self.simulation_models:
-            self.sensor_data_buffer.append({
-                'twin_id': twin_id,
-                'timestamp': datetime.now(),
-                'data': sensor_data
-            })
-            self.simulation_models[twin_id]['last_updated'] = datetime.now()
-    
-    def predict_performance(self, twin_id: str, 
-                          operating_conditions: Dict,
-                          time_horizon_years: float = 5) -> Dict:
-        """Predict material performance over time"""
+    def check_emi_compliance(self, material: 'MaterialProperties',
+                           enclosure_thickness_mm: float,
+                           standard: str = 'FCC_Part_15') -> Dict:
+        """Check EMI/EMC compliance for enclosure material"""
         
-        if twin_id not in self.simulation_models:
-            return {'error': 'Twin not found'}
+        if standard not in self.emi_standards:
+            return {'error': 'Unknown standard'}
         
-        twin = self.simulation_models[twin_id]
-        material = twin['material']
+        std = self.emi_standards[standard]
         
-        # Simple degradation model
-        degradation_rates = twin['degradation_rates']
-        total_degradation = sum(degradation_rates.values()) * time_horizon_years
+        # Check at multiple frequencies
+        test_frequencies = [1e6, 10e6, 100e6, 1e9, 10e9]
+        results = {}
         
-        # Performance retention
-        property_retention = max(0.5, 1 - total_degradation)
-        
-        return {
-            'twin_id': twin_id,
-            'time_horizon_years': time_horizon_years,
-            'property_retention_pct': property_retention * 100,
-            'estimated_lifetime_remaining': material.project_lifetime_years * property_retention,
-            'maintenance_recommended': property_retention < 0.7
-        }
-
-
-# ============================================================
-# ENHANCEMENT 16: BLOCKCHAIN MATERIAL PROVENANCE
-# ============================================================
-
-class BlockchainMaterialProvenance:
-    """
-    Blockchain-verified material provenance tracking.
-    
-    Features:
-    - Immutable material origin records
-    - Smart contract certification
-    - Supply chain transparency
-    - Quality verification
-    """
-    
-    def __init__(self):
-        self.blockchain = []
-        self.smart_contracts = {}
-        self.verification_nodes = 5
-        
-        if WEB3_AVAILABLE:
-            try:
-                self.w3 = Web3(Web3.HTTPProvider('http://localhost:8545'))
-                self.blockchain_enabled = True
-            except Exception:
-                self.blockchain_enabled = False
-        else:
-            self.blockchain_enabled = False
-    
-    def record_material_origin(self, material: 'MaterialProperties',
-                             supplier: str, batch_id: str,
-                             certifications: List[str] = None) -> Dict:
-        """Record material origin on blockchain"""
-        
-        block = {
-            'block_id': len(self.blockchain) + 1,
-            'timestamp': datetime.now().isoformat(),
-            'material_name': material.name,
-            'material_class': material.material_class.value,
-            'supplier': supplier,
-            'batch_id': batch_id,
-            'certifications': certifications or [],
-            'carbon_footprint': material.carbon_footprint_kg_co2_per_kg,
-            'recycling_rate': material.recycling_rate_pct,
-            'previous_hash': self._get_previous_hash(),
-            'verification_status': 'pending'
-        }
-        
-        block['hash'] = self._calculate_block_hash(block)
-        
-        if self._reach_consensus(block):
-            block['verification_status'] = 'verified'
-            BLOCKCHAIN_RECORDS.labels(material=material.name).inc()
-        
-        self.blockchain.append(block)
-        
-        return block
-    
-    def _calculate_block_hash(self, block: Dict) -> str:
-        """Calculate SHA-256 block hash"""
-        block_copy = {k: v for k, v in block.items() if k != 'hash'}
-        return hashlib.sha256(
-            json.dumps(block_copy, sort_keys=True, default=str).encode()
-        ).hexdigest()
-    
-    def _get_previous_hash(self) -> str:
-        """Get hash of previous block"""
-        if self.blockchain:
-            return self.blockchain[-1]['hash']
-        return '0' * 64
-    
-    def _reach_consensus(self, block: Dict) -> bool:
-        """Simulate distributed consensus"""
-        votes = sum(1 for _ in range(self.verification_nodes) if random.random() > 0.1)
-        return votes >= self.verification_nodes * 0.9
-    
-    def verify_material_provenance(self, batch_id: str) -> Dict:
-        """Verify material provenance from blockchain"""
-        
-        for block in self.blockchain:
-            if block.get('batch_id') == batch_id:
-                return {
-                    'verified': block['verification_status'] == 'verified',
-                    'material': block['material_name'],
-                    'supplier': block['supplier'],
-                    'carbon_footprint': block['carbon_footprint'],
-                    'certifications': block['certifications']
-                }
-        
-        return {'verified': False, 'message': 'No provenance record found'}
-
-
-# ============================================================
-# ENHANCEMENT 17: REAL-TIME MARKET PRICE INTEGRATION
-# ============================================================
-
-class MaterialMarketPriceIntegrator:
-    """
-    Real-time market price integration for materials.
-    
-    Features:
-    - Live commodity price tracking
-    - Price trend analysis
-    - Cost forecasting
-    - Price alert generation
-    """
-    
-    def __init__(self):
-        self.price_cache = TTLCache(maxsize=100, ttl=3600)
-        self.price_history = defaultdict(lambda: deque(maxlen=168))
-        self.price_forecasts = {}
-        
-    async def get_current_price(self, material_name: str) -> Optional[float]:
-        """Get current market price for material"""
-        
-        cache_key = f"price_{material_name}"
-        if cache_key in self.price_cache:
-            return self.price_cache[cache_key]
-        
-        # Simulated price fetch
-        base_prices = {
-            'aluminum': 2.50,
-            'copper': 8.00,
-            'magnesium': 3.50,
-            'steel': 1.20,
-            'graphene': 25.00,
-            'carbon_fiber': 15.00
-        }
-        
-        for key, price in base_prices.items():
-            if key in material_name.lower():
-                current_price = price * (1 + random.uniform(-0.1, 0.1))
-                self.price_cache[cache_key] = current_price
-                
-                self.price_history[material_name].append({
-                    'timestamp': datetime.now().isoformat(),
-                    'price': current_price
-                })
-                
-                return current_price
-        
-        return None
-    
-    def forecast_price_trend(self, material_name: str, 
-                           horizon_months: int = 6) -> Dict:
-        """Forecast material price trend"""
-        
-        history = list(self.price_history[material_name])
-        
-        if len(history) < 10:
-            return {'error': 'Insufficient price history'}
-        
-        recent_prices = [h['price'] for h in history[-20:]]
-        
-        # Simple exponential smoothing with trend
-        alpha = 0.3
-        smoothed = recent_prices[-1]
-        for price in reversed(recent_prices[:-1]):
-            smoothed = alpha * price + (1 - alpha) * smoothed
-        
-        trend = (recent_prices[-1] - recent_prices[0]) / len(recent_prices) if len(recent_prices) > 1 else 0
-        
-        forecast = smoothed + trend * horizon_months
-        
-        return {
-            'current_price': recent_prices[-1],
-            'forecast_price': forecast,
-            'trend_direction': 'increasing' if trend > 0 else 'decreasing',
-            'volatility': np.std(recent_prices) / recent_prices[-1] if recent_prices[-1] > 0 else 0
-        }
-
-
-# ============================================================
-# ENHANCEMENT 18: FEDERATED MATERIAL DATA SHARING
-# ============================================================
-
-class FederatedMaterialDataSharing:
-    """
-    Federated material data sharing across organizations.
-    
-    Features:
-    - Privacy-preserving data aggregation
-    - Benchmarking across organizations
-    - Secure property data sharing
-    - Differential privacy
-    """
-    
-    def __init__(self, organization_id: str, epsilon: float = 1.0):
-        self.organization_id = organization_id
-        self.epsilon = epsilon
-        self.local_data = []
-        self.global_benchmarks = {}
-        
-    def prepare_private_contribution(self, materials: List['MaterialProperties']) -> Dict:
-        """Prepare differentially private contribution for sharing"""
-        
-        if not materials:
-            return {'error': 'No materials'}
-        
-        # Aggregate statistics with DP noise
-        sensitivity = 1.0
-        noise_scale = sensitivity / self.epsilon
-        
-        densities = [m.density_kg_m3 for m in materials]
-        strengths = [m.yield_strength_mpa for m in materials]
-        carbons = [m.carbon_footprint_kg_co2_per_kg for m in materials]
-        
-        contribution = {
-            'organization_id': self.organization_id,
-            'avg_density': float(np.mean(densities) + np.random.laplace(0, noise_scale)),
-            'avg_strength': float(np.mean(strengths) + np.random.laplace(0, noise_scale)),
-            'avg_carbon_footprint': float(np.mean(carbons) + np.random.laplace(0, noise_scale)),
-            'material_count': len(materials),
-            'privacy_budget_used': self.epsilon * 0.1
-        }
-        
-        self.local_data.append(contribution)
-        
-        return contribution
-    
-    def aggregate_global_benchmarks(self, contributions: List[Dict]) -> Dict:
-        """Federated averaging of global benchmarks"""
-        
-        if not contributions:
-            return {'error': 'No contributions'}
-        
-        total_materials = sum(c['material_count'] for c in contributions)
-        
-        if total_materials == 0:
-            return {'error': 'No materials'}
-        
-        # Weighted federated averaging
-        global_avg_strength = sum(
-            c['avg_strength'] * c['material_count'] for c in contributions
-        ) / total_materials
-        
-        global_avg_carbon = sum(
-            c['avg_carbon_footprint'] * c['material_count'] for c in contributions
-        ) / total_materials
-        
-        self.global_benchmarks = {
-            'avg_strength_mpa': global_avg_strength,
-            'avg_carbon_footprint': global_avg_carbon,
-            'participating_organizations': len(contributions),
-            'total_materials': total_materials
-        }
-        
-        return self.global_benchmarks
-
-
-# ============================================================
-# ENHANCEMENT 19: NATURAL LANGUAGE QUERY INTERFACE
-# ============================================================
-
-class MaterialQueryInterface:
-    """
-    Natural language query interface for material search.
-    
-    Features:
-    - Intent extraction from queries
-    - Parameter parsing
-    - Contextual understanding
-    - Query recommendation
-    """
-    
-    def __init__(self):
-        self.query_patterns = {
-            'find_substitute': [
-                r'(?:find|suggest|recommend)\s+(?:a\s+)?(?:substitute|alternative|replacement)\s+(?:for|to)\s+(\w+)',
-                r'(?:replace|substitute)\s+(\w+)\s+with'
-            ],
-            'compare_materials': [
-                r'(?:compare|versus|vs\.?)\s+(\w+)\s+(?:and|with|vs\.?)\s+(\w+)',
-                r'(?:comparison|difference)\s+(?:between\s+)?(\w+)\s+and\s+(\w+)'
-            ],
-            'find_greenest': [
-                r'(?:greenest|most\s+sustainable|eco-friendly|lowest\s+carbon)\s+(?:material|option|choice)',
-                r'(?:best|optimal)\s+(?:green|sustainable|eco)\s+material'
-            ]
-        }
-        
-        self.parameter_extractors = {
-            'application': r'(?:for|in)\s+(?:a\s+)?(?:heat\s*sink|chassis|connector|structural)\s+(?:application|use|component)',
-            'max_cost': r'(?:under|less\s+than|below|≤|<=)\s*\$?(\d+(?:\.\d+)?)\s*(?:per\s*kg)?',
-            'min_strength': r'(?:strength|yield)\s+(?:over|more\s+than|above|≥|>=)\s*(\d+(?:\.\d+)?)\s*(?:MPa|GPa)?',
-            'max_density': r'(?:density|weight)\s+(?:under|less\s+than|below)\s*(\d+(?:\.\d+)?)\s*(?:kg/m³|g/cm³)?'
-        }
-    
-    def parse_query(self, query: str) -> Dict:
-        """Parse natural language material query"""
-        
-        import re
-        
-        # Detect intent
-        intent = self._detect_intent(query)
-        
-        # Extract parameters
-        params = self._extract_parameters(query)
-        
-        return {
-            'original_query': query,
-            'detected_intent': intent,
-            'parameters': params,
-            'confidence': self._calculate_confidence(intent, params)
-        }
-    
-    def _detect_intent(self, query: str) -> str:
-        """Detect query intent"""
-        import re
-        query_lower = query.lower()
-        
-        for intent, patterns in self.query_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, query_lower):
-                    return intent
-        
-        return 'find_substitute'
-    
-    def _extract_parameters(self, query: str) -> Dict:
-        """Extract parameters from query"""
-        import re
-        params = {}
-        
-        for param, pattern in self.parameter_extractors.items():
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                value = match.group(1)
-                try:
-                    params[param] = float(value)
-                except ValueError:
-                    params[param] = value
-        
-        return params
-    
-    def _calculate_confidence(self, intent: str, params: Dict) -> float:
-        """Calculate parsing confidence"""
-        confidence = 0.6
-        
-        if intent:
-            confidence += 0.1
-        
-        if params:
-            confidence += 0.1 * min(len(params), 3)
-        
-        return min(0.95, confidence)
-
-
-# ============================================================
-# ENHANCEMENT 20: API-FIRST ARCHITECTURE
-# ============================================================
-
-class MaterialSubstitutionAPI:
-    """
-    GraphQL API for material substitution analysis.
-    
-    Features:
-    - Flexible query interface
-    - Real-time analysis requests
-    - Result caching
-    - Rate limiting
-    """
-    
-    def __init__(self, analyzer: 'EnhancedMaterialSubstitutionAnalyzerV6'):
-        self.analyzer = analyzer
-        self.request_history = deque(maxlen=1000)
-        self.rate_limiter = defaultdict(lambda: deque(maxlen=100))
-        
-    async def handle_substitution_request(self, request: Dict) -> Dict:
-        """Handle material substitution API request"""
-        
-        # Rate limiting
-        client_id = request.get('client_id', 'anonymous')
-        if not self._check_rate_limit(client_id):
-            return {'error': 'Rate limit exceeded', 'status': 429}
-        
-        try:
-            # Extract parameters
-            base_material = request.get('base_material', 'aluminum_6061')
-            application = request.get('application', 'heat_sink')
-            
-            # Run analysis
-            config = SubstitutionConfig(
-                base_material=base_material,
-                application=Application(application)
+        for freq in test_frequencies:
+            shielding = self.calculate_shielding_effectiveness(
+                material, enclosure_thickness_mm, freq
             )
             
-            self.analyzer.config = config
-            report = await self.analyzer.find_optimal_substitution()
+            # Simplified compliance check
+            compliant = shielding['shielding_effectiveness_db'] > std['emission_limit_dBuV'] / 2
             
+            results[f"{freq/1e6:.0f}_MHz"] = {
+                'shielding_db': shielding['shielding_effectiveness_db'],
+                'compliant': compliant,
+                'margin_db': shielding['shielding_effectiveness_db'] - std['emission_limit_dBuV'] / 2
+            }
+        
+        all_compliant = all(r['compliant'] for r in results.values())
+        
+        return {
+            'standard': standard,
+            'compliant': all_compliant,
+            'frequency_results': results,
+            'minimum_thickness_required_mm': self._calculate_minimum_thickness(material, standard)
+        }
+    
+    def _calculate_minimum_thickness(self, material: 'MaterialProperties',
+                                   standard: str) -> float:
+        """Calculate minimum thickness for EMI compliance"""
+        
+        std = self.emi_standards[standard]
+        
+        # Iterate to find minimum thickness
+        for thickness in np.linspace(0.1, 10, 100):
+            shielding = self.calculate_shielding_effectiveness(
+                material, thickness, std['frequency_range'][0]
+            )
+            
+            if shielding['shielding_effectiveness_db'] > std['emission_limit_dBuV'] / 2:
+                return thickness
+        
+        return 10.0  # Default maximum
+
+
+# ============================================================
+# ENHANCEMENT 26: ADDITIVE MANUFACTURING SUITABILITY
+# ============================================================
+
+class AdditiveManufacturingScorer:
+    """
+    Additive manufacturing suitability scoring for materials.
+    
+    Features:
+    - Process-specific scoring (SLM, EBM, DED, BJ)
+    - Printability assessment
+    - Post-processing requirements
+    - Cost estimation for AM
+    """
+    
+    def __init__(self):
+        self.am_processes = {
+            'SLM': {'min_powder_size_um': 15, 'max_powder_size_um': 45,
+                   'layer_thickness_um': 30, 'energy_density_j_per_mm3': 100},
+            'EBM': {'min_powder_size_um': 45, 'max_powder_size_um': 105,
+                   'layer_thickness_um': 50, 'energy_density_j_per_mm3': 80},
+            'DED': {'min_powder_size_um': 50, 'max_powder_size_um': 150,
+                   'layer_thickness_um': 500, 'energy_density_j_per_mm3': 200},
+            'BJ': {'min_powder_size_um': 5, 'max_powder_size_um': 75,
+                  'layer_thickness_um': 80, 'energy_density_j_per_mm3': 0}
+        }
+    
+    def assess_am_suitability(self, material: 'MaterialProperties',
+                            process: str = 'SLM') -> Dict:
+        """Assess material suitability for additive manufacturing"""
+        
+        if process not in self.am_processes:
+            return {'error': f'Unknown process: {process}'}
+        
+        proc_params = self.am_processes[process]
+        
+        # Weldability factor
+        weldability = self._assess_weldability(material)
+        
+        # Thermal properties suitability
+        thermal_score = self._assess_thermal_suitability(material, process)
+        
+        # Reflectivity (important for laser processes)
+        reflectivity = self._assess_reflectivity(material)
+        
+        # Overall printability score
+        printability = (weldability * 0.4 + thermal_score * 0.35 + 
+                      (1 - reflectivity) * 0.25)
+        
+        ADDITIVE_MANUFACTURING.labels(material=material.name, process=process).set(printability)
+        
+        return {
+            'process': process,
+            'printability_score': printability,
+            'weldability': weldability,
+            'thermal_suitability': thermal_score,
+            'reflectivity_concern': reflectivity > 0.7,
+            'suitability': 'excellent' if printability > 0.8 else 
+                         'good' if printability > 0.6 else
+                         'challenging' if printability > 0.4 else 'not_recommended',
+            'recommended_parameters': {
+                'layer_thickness_um': proc_params['layer_thickness_um'],
+                'energy_density_j_per_mm3': proc_params['energy_density_j_per_mm3'],
+                'preheat_temperature_c': 200 if material.yield_strength_mpa > 500 else 100
+            }
+        }
+    
+    def _assess_weldability(self, material: 'MaterialProperties') -> float:
+        """Assess material weldability for AM"""
+        
+        # High thermal conductivity makes welding difficult
+        if material.thermal_conductivity_w_mk > 200:
+            return 0.3
+        
+        # High reflectivity causes issues
+        if hasattr(material, 'reflectivity') and material.reflectivity > 0.8:
+            return 0.4
+        
+        # Low melting point materials are easier
+        if material.yield_strength_mpa < 300:
+            return 0.9
+        elif material.yield_strength_mpa < 600:
+            return 0.7
+        else:
+            return 0.5
+    
+    def _assess_thermal_suitability(self, material: 'MaterialProperties',
+                                  process: str) -> float:
+        """Assess thermal suitability for AM process"""
+        
+        # Thermal conductivity affects cooling rates
+        if material.thermal_conductivity_w_mk > 100:
+            score = 0.5  # Fast cooling can cause cracking
+        elif material.thermal_conductivity_w_mk > 50:
+            score = 0.7
+        else:
+            score = 0.9  # Slow cooling is generally better
+        
+        return score
+    
+    def _assess_reflectivity(self, material: 'MaterialProperties') -> float:
+        """Assess material reflectivity"""
+        
+        # Simplified assessment based on material class
+        if hasattr(material, 'material_class'):
+            if material.material_class in ['aluminum_alloy', 'copper_alloy']:
+                return 0.8  # Highly reflective
+            elif material.material_class == 'steel_alloy':
+                return 0.3
+        
+        return 0.5
+
+
+# ============================================================
+# ENHANCEMENT 27: SURFACE TREATMENT OPTIMIZATION
+# ============================================================
+
+class SurfaceTreatmentOptimizer:
+    """
+    Surface treatment optimization for materials.
+    
+    Features:
+    - Coating selection
+    - Surface hardening assessment
+    - Tribological property prediction
+    - Treatment cost estimation
+    """
+    
+    def __init__(self):
+        self.treatments = {
+            'anodizing': {'cost_per_m2': 50, 'hardness_increase_pct': 80, 'corrosion_improvement': 0.9},
+            'nitriding': {'cost_per_m2': 80, 'hardness_increase_pct': 200, 'corrosion_improvement': 0.5},
+            'carburizing': {'cost_per_m2': 60, 'hardness_increase_pct': 150, 'corrosion_improvement': 0.3},
+            'PVD_coating': {'cost_per_m2': 120, 'hardness_increase_pct': 300, 'corrosion_improvement': 0.8},
+            'shot_peening': {'cost_per_m2': 30, 'hardness_increase_pct': 50, 'corrosion_improvement': 0.2}
+        }
+    
+    def recommend_treatment(self, material: 'MaterialProperties',
+                          application: str,
+                          requirements: Dict) -> Dict:
+        """Recommend optimal surface treatment"""
+        
+        scored_treatments = []
+        
+        for treatment, params in self.treatments.items():
+            score = 0
+            
+            # Hardness improvement
+            if requirements.get('hardness_required', False):
+                score += params['hardness_increase_pct'] / 300 * 0.4
+            
+            # Corrosion resistance
+            if requirements.get('corrosion_protection', False):
+                score += params['corrosion_improvement'] * 0.35
+            
+            # Cost consideration
+            cost_score = 1 - params['cost_per_m2'] / 120
+            score += cost_score * 0.25
+            
+            scored_treatments.append({
+                'treatment': treatment,
+                'score': score,
+                'cost_per_m2': params['cost_per_m2'],
+                'hardness_increase_pct': params['hardness_increase_pct'],
+                'corrosion_improvement': params['corrosion_improvement']
+            })
+        
+        # Select best treatment
+        best = max(scored_treatments, key=lambda x: x['score'])
+        
+        return {
+            'recommended_treatment': best['treatment'],
+            'treatment_score': best['score'],
+            'alternatives': sorted(scored_treatments, key=lambda x: x['score'], reverse=True)[:3],
+            'estimated_cost_per_m2': best['cost_per_m2'],
+            'expected_improvements': {
+                'hardness': f"+{best['hardness_increase_pct']}%",
+                'corrosion': f"{best['corrosion_improvement']:.0%} improvement"
+            }
+        }
+    
+    def predict_surface_properties(self, material: 'MaterialProperties',
+                                 treatment: str) -> Dict:
+        """Predict surface properties after treatment"""
+        
+        if treatment not in self.treatments:
+            return {'error': 'Unknown treatment'}
+        
+        params = self.treatments[treatment]
+        
+        # Surface hardness after treatment
+        surface_hardness = material.yield_strength_mpa * (1 + params['hardness_increase_pct'] / 100)
+        
+        # Wear resistance improvement
+        wear_resistance = 1 + params['hardness_increase_pct'] / 100
+        
+        # Friction coefficient reduction
+        friction_reduction = min(0.5, params['hardness_increase_pct'] / 400)
+        
+        # Fatigue life improvement
+        fatigue_improvement = 1 + params['hardness_increase_pct'] / 200
+        
+        return {
+            'treatment': treatment,
+            'surface_hardness_mpa': surface_hardness,
+            'wear_resistance_factor': wear_resistance,
+            'friction_coefficient_reduction_pct': friction_reduction * 100,
+            'fatigue_life_improvement_factor': fatigue_improvement,
+            'surface_roughness_ra_um': 1.0 - params['hardness_increase_pct'] / 500,
+            'coating_thickness_um': params['hardness_increase_pct'] * 0.1
+        }
+
+
+# ============================================================
+# ENHANCEMENT 28: JOINING AND WELDING COMPATIBILITY
+# ============================================================
+
+class JoiningCompatibilityAssessor:
+    """
+    Joining and welding compatibility assessment.
+    
+    Features:
+    - Weldability evaluation
+    - Adhesive bonding suitability
+    - Mechanical fastening assessment
+    - Joint strength prediction
+    """
+    
+    def __init__(self):
+        self.joining_methods = {
+            'TIG_welding': {'heat_input': 'high', 'suitable_materials': ['steel', 'aluminum', 'titanium']},
+            'MIG_welding': {'heat_input': 'high', 'suitable_materials': ['steel', 'aluminum']},
+            'laser_welding': {'heat_input': 'low', 'suitable_materials': ['steel', 'aluminum', 'copper']},
+            'adhesive_bonding': {'heat_input': 'none', 'suitable_materials': ['all']},
+            'riveting': {'heat_input': 'none', 'suitable_materials': ['all']},
+            'friction_stir': {'heat_input': 'low', 'suitable_materials': ['aluminum', 'magnesium']}
+        }
+    
+    def assess_compatibility(self, material1: 'MaterialProperties',
+                           material2: 'MaterialProperties',
+                           joining_method: str) -> Dict:
+        """Assess joining compatibility between materials"""
+        
+        if joining_method not in self.joining_methods:
+            return {'error': 'Unknown joining method'}
+        
+        method = self.joining_methods[joining_method]
+        
+        # Material suitability
+        mat1_class = self._get_material_class(material1)
+        mat2_class = self._get_material_class(material2)
+        
+        suitable = (mat1_class in method['suitable_materials'] or 'all' in method['suitable_materials']) and \
+                  (mat2_class in method['suitable_materials'] or 'all' in method['suitable_materials'])
+        
+        # Thermal compatibility
+        thermal_mismatch = abs(material1.thermal_conductivity_w_mk - material2.thermal_conductivity_w_mk) / \
+                          max(material1.thermal_conductivity_w_mk, material2.thermal_conductivity_w_mk, 1)
+        
+        # Galvanic compatibility
+        galvanic_risk = self._assess_galvanic_risk(material1, material2)
+        
+        # Overall compatibility score
+        compatibility = (suitable * 0.5 + 
+                       (1 - thermal_mismatch) * 0.25 + 
+                       (1 - galvanic_risk) * 0.25)
+        
+        JOINING_COMPATIBILITY.labels(material_pair=f"{material1.name}_{material2.name}").set(compatibility)
+        
+        return {
+            'joining_method': joining_method,
+            'compatibility_score': compatibility,
+            'suitable': suitable and compatibility > 0.5,
+            'thermal_mismatch': thermal_mismatch,
+            'galvanic_risk': galvanic_risk,
+            'joint_efficiency': 0.7 + compatibility * 0.3,
+            'recommended_parameters': self._get_joining_parameters(joining_method, material1, material2)
+        }
+    
+    def _get_material_class(self, material: 'MaterialProperties') -> str:
+        """Get simplified material class"""
+        
+        if hasattr(material, 'material_class'):
+            class_mapping = {
+                'aluminum_alloy': 'aluminum',
+                'steel_alloy': 'steel',
+                'copper_alloy': 'copper',
+                'magnesium_alloy': 'magnesium',
+                'titanium_alloy': 'titanium'
+            }
+            return class_mapping.get(material.material_class.value if hasattr(material.material_class, 'value') else str(material.material_class), 'steel')
+        
+        return 'steel'  # Default
+    
+    def _assess_galvanic_risk(self, material1: 'MaterialProperties',
+                            material2: 'MaterialProperties') -> float:
+        """Assess galvanic corrosion risk"""
+        
+        # Simplified galvanic potential difference
+        potentials = {
+            'aluminum': -0.8, 'steel': -0.4, 'copper': 0.0,
+            'magnesium': -1.6, 'titanium': -0.1
+        }
+        
+        class1 = self._get_material_class(material1)
+        class2 = self._get_material_class(material2)
+        
+        pot1 = potentials.get(class1, -0.5)
+        pot2 = potentials.get(class2, -0.5)
+        
+        return min(1, abs(pot1 - pot2))
+    
+    def _get_joining_parameters(self, method: str,
+                              material1: 'MaterialProperties',
+                              material2: 'MaterialProperties') -> Dict:
+        """Get recommended joining parameters"""
+        
+        if method == 'TIG_welding':
             return {
-                'status': 'success',
-                'report': report.dict(),
-                'timestamp': datetime.now().isoformat()
+                'current_amps': 150,
+                'voltage': 15,
+                'shielding_gas': 'Argon',
+                'filler_material': 'ER4043',
+                'preheat_temperature_c': 100 if material1.yield_strength_mpa > 400 else 20
             }
-            
-        except Exception as e:
-            return {'error': str(e), 'status': 500}
+        elif method == 'adhesive_bonding':
+            return {
+                'adhesive_type': 'Epoxy',
+                'bond_line_thickness_mm': 0.2,
+                'cure_temperature_c': 120,
+                'cure_time_minutes': 30
+            }
+        
+        return {}
+
+
+# ============================================================
+# ENHANCEMENT 29: THERMAL MANAGEMENT OPTIMIZATION
+# ============================================================
+
+class ThermalManagementOptimizer:
+    """
+    Thermal management optimization for material selection.
     
-    def _check_rate_limit(self, client_id: str, 
-                         max_requests_per_minute: int = 10) -> bool:
-        """Check rate limiting"""
-        now = time.time()
-        client_requests = self.rate_limiter[client_id]
+    Features:
+    - Heat sink performance optimization
+    - Thermal interface material selection
+    - Cooling strategy recommendation
+    - Thermal stress analysis
+    """
+    
+    def __init__(self):
+        self.cooling_methods = {
+            'natural_convection': {'h': 10, 'cost_factor': 0.1},
+            'forced_air': {'h': 50, 'cost_factor': 0.3},
+            'liquid_cooling': {'h': 500, 'cost_factor': 1.0},
+            'two_phase': {'h': 1000, 'cost_factor': 2.0}
+        }
+    
+    def optimize_heat_sink(self, material: 'MaterialProperties',
+                         heat_load_w: float,
+                         max_temperature_c: float,
+                         ambient_temperature_c: float = 25) -> Dict:
+        """Optimize heat sink design for material"""
         
-        while client_requests and client_requests[0] < now - 60:
-            client_requests.popleft()
+        # Required thermal resistance
+        delta_t = max_temperature_c - ambient_temperature_c
+        R_required = delta_t / heat_load_w
         
-        if len(client_requests) >= max_requests_per_minute:
-            return False
+        # Material thermal conductivity
+        k = material.thermal_conductivity_w_mk
         
-        client_requests.append(now)
-        return True
+        # Optimal fin geometry (simplified)
+        fin_thickness_mm = 2.0
+        fin_height_mm = 50.0
+        fin_spacing_mm = 5.0
+        
+        # Number of fins
+        base_width_mm = 100
+        n_fins = int(base_width_mm / (fin_thickness_mm + fin_spacing_mm))
+        
+        # Heat sink performance
+        fin_efficiency = np.tanh(fin_height_mm * 1e-3 * np.sqrt(2 * 50 / (k * fin_thickness_mm * 1e-3))) / \
+                       (fin_height_mm * 1e-3 * np.sqrt(2 * 50 / (k * fin_thickness_mm * 1e-3)))
+        
+        # Total thermal resistance
+        base_area = base_width_mm * 1e-3 * 0.1  # 100mm x 100mm
+        R_base = 0.001 / (k * base_area)
+        
+        fin_area = n_fins * 2 * fin_height_mm * 1e-3 * 0.1
+        R_fins = 1 / (50 * fin_area * fin_efficiency)
+        
+        R_total = R_base + R_fins
+        
+        return {
+            'thermal_resistance_kw': R_total,
+            'required_thermal_resistance_kw': R_required,
+            'sufficient': R_total <= R_required,
+            'fin_efficiency': fin_efficiency,
+            'n_fins': n_fins,
+            'heat_sink_volume_cm3': base_width_mm * 0.1 * fin_height_mm * 0.1 * 1000,
+            'recommended_cooling': self._recommend_cooling_method(heat_load_w, R_total, R_required)
+        }
+    
+    def _recommend_cooling_method(self, heat_load: float,
+                                R_actual: float,
+                                R_required: float) -> str:
+        """Recommend cooling method based on requirements"""
+        
+        if R_actual <= R_required:
+            return 'passive'  # No additional cooling needed
+        
+        # Calculate required heat transfer coefficient
+        required_h = 1 / (R_required * 0.01)  # Assume 0.01 m² area
+        
+        if required_h < 10:
+            return 'natural_convection'
+        elif required_h < 50:
+            return 'forced_air'
+        elif required_h < 500:
+            return 'liquid_cooling'
+        else:
+            return 'two_phase'
+    
+    def assess_thermal_stress(self, material: 'MaterialProperties',
+                            temperature_gradient_c: float,
+                            constraint: str = 'fixed') -> Dict:
+        """Assess thermal stress in material"""
+        
+        # Coefficient of thermal expansion (approximate)
+        CTE = 23e-6 if 'aluminum' in material.name.lower() else 12e-6  # per °C
+        
+        # Thermal strain
+        thermal_strain = CTE * temperature_gradient_c
+        
+        # Thermal stress (elastic)
+        thermal_stress_mpa = material.elastic_modulus_gpa * 1000 * thermal_strain
+        
+        # Safety factor
+        safety_factor = material.yield_strength_mpa / thermal_stress_mpa if thermal_stress_mpa > 0 else float('inf')
+        
+        return {
+            'thermal_strain': thermal_strain,
+            'thermal_stress_mpa': thermal_stress_mpa,
+            'yield_strength_mpa': material.yield_strength_mpa,
+            'safety_factor': safety_factor,
+            'plastic_deformation_risk': safety_factor < 1.0,
+            'recommended_max_gradient_c': material.yield_strength_mpa / (material.elastic_modulus_gpa * 1000 * CTE)
+        }
+
+
+# ============================================================
+# ENHANCEMENT 30: ACOUSTIC AND VIBRATION DAMPING
+# ============================================================
+
+class AcousticVibrationAnalyzer:
+    """
+    Acoustic and vibration damping properties assessment.
+    
+    Features:
+    - Damping capacity evaluation
+    - Natural frequency calculation
+    - Sound transmission loss
+    - Vibration isolation design
+    """
+    
+    def __init__(self):
+        self.damping_mechanisms = {
+            'thermoelastic': {'frequency_range': (1e3, 1e6), 'temperature_dependent': True},
+            'dislocation': {'frequency_range': (1, 1e3), 'amplitude_dependent': True},
+            'grain_boundary': {'frequency_range': (0.1, 10), 'temperature_dependent': True}
+        }
+    
+    def calculate_damping_capacity(self, material: 'MaterialProperties',
+                                 frequency_hz: float,
+                                 temperature_c: float = 25) -> Dict:
+        """Calculate material damping capacity"""
+        
+        # Loss factor (tan delta)
+        base_loss_factor = 0.001  # Base for metals
+        
+        # Frequency dependence
+        if frequency_hz < 1:
+            frequency_factor = 0.5
+        elif frequency_hz < 1000:
+            frequency_factor = 1.0
+        else:
+            frequency_factor = 0.3
+        
+        # Temperature dependence
+        if temperature_c > 200:
+            temperature_factor = 2.0  # Higher damping at elevated temperatures
+        elif temperature_c < -50:
+            temperature_factor = 0.5  # Lower damping at cryogenic temperatures
+        else:
+            temperature_factor = 1.0
+        
+        # Material-specific adjustments
+        if hasattr(material, 'material_class'):
+            if material.material_class in ['magnesium_alloy']:
+                material_factor = 3.0  # Magnesium has good damping
+            elif material.material_class in ['composite']:
+                material_factor = 5.0  # Composites have excellent damping
+            elif material.material_class in ['cast_iron']:
+                material_factor = 2.0  # Cast iron has good damping
+            else:
+                material_factor = 1.0
+        
+        loss_factor = base_loss_factor * frequency_factor * temperature_factor * material_factor
+        
+        # Specific damping capacity
+        specific_damping = 2 * np.pi * loss_factor
+        
+        # Reverberation time (for acoustic applications)
+        reverberation_time = 2.2 / (frequency_hz * loss_factor) if loss_factor > 0 else float('inf')
+        
+        return {
+            'loss_factor': loss_factor,
+            'specific_damping_capacity': specific_damping,
+            'damping_ratio': loss_factor / 2,
+            'quality_factor': 1 / max(loss_factor, 1e-10),
+            'reverberation_time_s': min(10, reverberation_time),
+            'damping_classification': 'high' if loss_factor > 0.01 else 'medium' if loss_factor > 0.001 else 'low'
+        }
+    
+    def calculate_sound_transmission_loss(self, material: 'MaterialProperties',
+                                        thickness_mm: float,
+                                        frequency_hz: float) -> Dict:
+        """Calculate sound transmission loss through material"""
+        
+        # Surface density
+        surface_density = material.density_kg_m3 * thickness_mm * 1e-3  # kg/m²
+        
+        # Mass law for transmission loss
+        if frequency_hz * surface_density > 0:
+            TL_mass_law = 20 * np.log10(frequency_hz * surface_density) - 47
+        else:
+            TL_mass_law = 0
+        
+        # Coincidence frequency
+        speed_of_sound = np.sqrt(material.elastic_modulus_gpa * 1e9 / material.density_kg_m3)
+        coincidence_freq = speed_of_sound**2 / (1.8 * thickness_mm * 1e-3 * speed_of_sound)
+        
+        # Damping adjustment
+        damping = self.calculate_damping_capacity(material, frequency_hz)
+        damping_adjustment = 10 * np.log10(damping['loss_factor'] * 100)
+        
+        total_TL = TL_mass_law + damping_adjustment
+        
+        return {
+            'transmission_loss_db': max(0, total_TL),
+            'mass_law_component_db': TL_mass_law,
+            'damping_contribution_db': damping_adjustment,
+            'coincidence_frequency_hz': coincidence_freq,
+            'surface_density_kg_per_m2': surface_density,
+            'STC_rating': int(min(60, total_TL))
+        }
+    
+    def design_vibration_isolation(self, material: 'MaterialProperties',
+                                 load_kg: float,
+                                 target_frequency_hz: float) -> Dict:
+        """Design vibration isolation using material"""
+        
+        # Static deflection
+        g = 9.81
+        static_deflection = load_kg * g / (material.elastic_modulus_gpa * 1e9 * 0.01)  # Assume 0.01 m² area
+        
+        # Natural frequency
+        natural_frequency = 1 / (2 * np.pi) * np.sqrt(g / static_deflection)
+        
+        # Transmissibility at target frequency
+        frequency_ratio = target_frequency_hz / natural_frequency
+        damping = self.calculate_damping_capacity(material, target_frequency_hz)
+        
+        if frequency_ratio > np.sqrt(2):
+            transmissibility = 1 / (frequency_ratio**2 - 1)
+        else:
+            transmissibility = np.sqrt((1 + (2 * damping['damping_ratio'] * frequency_ratio)**2) /
+                                     ((1 - frequency_ratio**2)**2 + (2 * damping['damping_ratio'] * frequency_ratio)**2))
+        
+        isolation_efficiency = (1 - transmissibility) * 100
+        
+        return {
+            'static_deflection_mm': static_deflection * 1000,
+            'natural_frequency_hz': natural_frequency,
+            'transmissibility': transmissibility,
+            'isolation_efficiency_pct': isolation_efficiency,
+            'effective_at_target': isolation_efficiency > 80,
+            'recommended_thickness_mm': max(10, static_deflection * 1000 * 3)
+        }
 
 
 # ============================================================
 # ENHANCED V6.0 MAIN ANALYZER
 # ============================================================
 
-class EnhancedMaterialSubstitutionAnalyzerV6(EnhancedMaterialSubstitutionAnalyzer):
+class EnhancedMaterialSubstitutionAnalyzerV6Enhanced(EnhancedMaterialSubstitutionAnalyzerV6):
     """
-    Enhanced V6.0 material substitution analyzer with all new features.
+    Enhanced V6.0 material substitution analyzer with all advanced features.
     """
     
     def __init__(self, config: Optional[SubstitutionConfig] = None):
         super().__init__(config)
         
-        # Initialize V6.0 components
-        self.multi_objective = MultiObjectiveMaterialOptimizer()
-        self.ml_predictor = MaterialPropertyPredictor()
-        self.supply_chain_analyzer = SupplyChainResilienceAnalyzer()
-        self.circularity_scorer = CircularityScorer()
-        self.digital_twin = MaterialDigitalTwin()
-        self.blockchain_provenance = BlockchainMaterialProvenance()
-        self.market_integrator = MaterialMarketPriceIntegrator()
-        self.federated_sharing = FederatedMaterialDataSharing("org_001")
-        self.query_interface = MaterialQueryInterface()
-        self.api = MaterialSubstitutionAPI(self)
+        # Initialize enhanced modules
+        self.generative_designer = GenerativeMaterialDesigner()
+        self.multiscale_modeler = MultiScaleMaterialModeler()
+        self.fatigue_predictor = FatigueCreepPredictor()
+        self.corrosion_modeler = CorrosionResistanceModeler()
+        self.emc_analyzer = ElectromagneticCompatibility()
+        self.am_scorer = AdditiveManufacturingScorer()
+        self.surface_treatment = SurfaceTreatmentOptimizer()
+        self.joining_assessor = JoiningCompatibilityAssessor()
+        self.thermal_optimizer = ThermalManagementOptimizer()
+        self.acoustic_analyzer = AcousticVibrationAnalyzer()
         
-        # Train ML model on available data
-        self.ml_predictor.train_from_database(self.database.materials)
-        
-        logger.info("EnhancedMaterialSubstitutionAnalyzerV6.0 initialized with all enhancements")
+        logger.info("EnhancedMaterialSubstitutionAnalyzerV6Enhanced initialized with all advanced features")
     
-    async def comprehensive_analysis(self) -> Dict:
-        """Perform comprehensive V6.0 material substitution analysis"""
+    async def advanced_comprehensive_analysis(self) -> Dict:
+        """Execute advanced comprehensive material substitution analysis"""
         
-        # Base substitution analysis
-        base_report = await self.find_optimal_substitution()
+        # Base V6 analysis
+        base_analysis = await self.comprehensive_analysis()
         
-        if not base_report.recommendations:
-            return {'error': 'No suitable substitutions found'}
+        # Get top candidate
+        if base_analysis.get('base_analysis', {}).get('recommendations'):
+            top_candidate_name = base_analysis['base_analysis']['recommendations'][0]['recommended_substitute_name']
+            top_candidate = self.database.get_material(top_candidate_name.lower().replace(' ', '_'))
+        else:
+            top_candidate = list(self.database.materials.values())[0] if self.database.materials else None
         
-        top_candidate_name = base_report.recommendations[0].recommended_substitute_name
-        top_candidate = self.database.get_material(top_candidate_name.lower().replace(' ', '_'))
-        base_material = self.database.get_material(self.config.base_material)
+        if not top_candidate:
+            return base_analysis
         
-        if not top_candidate or not base_material:
-            return {'error': 'Material not found'}
-        
-        # Multi-objective Pareto analysis
-        all_candidates = list(self.database.materials.values())
-        pareto_frontier = self.multi_objective.optimize_material_selection(all_candidates)
-        
-        # Supply chain risk assessment
-        supply_chain_risk = self.supply_chain_analyzer.assess_supply_chain_risk(
-            top_candidate, ['north_america', 'east_asia']
+        # Fatigue life prediction
+        fatigue = self.fatigue_predictor.predict_fatigue_life(
+            top_candidate, stress_amplitude_mpa=200, temperature_c=100
         )
         
-        # Circular economy assessment
-        circularity = self.circularity_scorer.calculate_mci(
-            top_candidate, self.config.application
+        # Corrosion resistance
+        corrosion = self.corrosion_modeler.assess_galvanic_corrosion(
+            top_candidate, top_candidate, 'marine'
         )
         
-        # Digital twin creation
-        digital_twin = self.digital_twin.create_material_twin(
-            top_candidate, self.config.application
+        # EMI shielding
+        emi = self.emc_analyzer.calculate_shielding_effectiveness(
+            top_candidate, thickness_mm=2.0, frequency_hz=1e9
         )
         
-        # Blockchain provenance
-        provenance = self.blockchain_provenance.record_material_origin(
-            top_candidate, 'supplier_001', 'batch_2024_001',
-            ['ISO_14001', 'REACH_compliant']
+        # AM suitability
+        am = self.am_scorer.assess_am_suitability(top_candidate, 'SLM')
+        
+        # Surface treatment
+        treatment = self.surface_treatment.recommend_treatment(
+            top_candidate, 'structural', {'hardness_required': True}
         )
         
-        # ML property predictions
-        composition_features = np.array([[
-            top_candidate.density_kg_m3 / 10000,
-            top_candidate.cost_per_kg_usd / 100,
-            top_candidate.recycling_rate_pct / 100,
-            top_candidate.supply_risk_hhi,
-            top_candidate.formation_enthalpy_kj_per_mol / 100,
-            top_candidate.formation_entropy_j_per_mol_k / 100,
-        ]])
+        # Thermal management
+        thermal = self.thermal_optimizer.optimize_heat_sink(
+            top_candidate, heat_load_w=100, max_temperature_c=85
+        )
         
-        ml_predictions = self.ml_predictor.predict_properties(composition_features)
+        # Acoustic properties
+        acoustic = self.acoustic_analyzer.calculate_damping_capacity(
+            top_candidate, frequency_hz=1000
+        )
         
-        # Market price
-        current_price = await self.market_integrator.get_current_price(top_candidate_name)
-        price_forecast = self.market_integrator.forecast_price_trend(top_candidate_name)
-        
-        # Compile comprehensive report
-        comprehensive_report = {
-            'base_analysis': base_report.dict(),
-            'pareto_frontier': {
-                'solutions_found': len(pareto_frontier),
-                'optimal_tradeoff': self.multi_objective.get_optimal_tradeoff()
-            },
-            'supply_chain_risk': supply_chain_risk,
-            'circularity_assessment': circularity,
-            'digital_twin': digital_twin,
-            'blockchain_provenance': provenance,
-            'ml_predictions': ml_predictions,
-            'market_analysis': {
-                'current_price': current_price,
-                'price_forecast': price_forecast
-            },
-            'overall_sustainability_score': self._calculate_sustainability_score(
-                base_report, circularity, supply_chain_risk
+        # Compile advanced results
+        advanced_results = {
+            'base_analysis': base_analysis,
+            'fatigue_life': fatigue,
+            'corrosion_resistance': corrosion,
+            'emi_shielding': emi,
+            'additive_manufacturing': am,
+            'surface_treatment': treatment,
+            'thermal_management': thermal,
+            'acoustic_properties': acoustic,
+            'overall_material_score': self._calculate_advanced_material_score(
+                base_analysis, fatigue, corrosion, emi, am
             )
         }
         
-        return comprehensive_report
+        return advanced_results
     
-    def _calculate_sustainability_score(self, base_report: 'SubstitutionReport',
-                                      circularity: Dict,
-                                      supply_chain: Dict) -> float:
-        """Calculate overall sustainability score"""
+    def _calculate_advanced_material_score(self, base_analysis: Dict,
+                                        fatigue: Dict,
+                                        corrosion: Dict,
+                                        emi: Dict,
+                                        am: Dict) -> float:
+        """Calculate advanced material performance score"""
         
-        # Carbon reduction score
-        carbon_score = min(100, base_report.carbon_reduction_pct)
+        # Base substitution score
+        base_score = base_analysis.get('overall_sustainability_score', 50)
         
-        # Circularity score
-        circularity_score = circularity.get('circularity_score', 0) * 100
+        # Fatigue score (log scale)
+        fatigue_cycles = fatigue.get('fatigue_life_cycles', 1e6)
+        fatigue_score = min(100, 20 * np.log10(max(1, fatigue_cycles)))
         
-        # Supply chain resilience score
-        resilience_score = supply_chain.get('resilience_score', 0) * 100
+        # Corrosion resistance
+        corrosion_score = (1 - corrosion.get('galvanic_risk_factor', 0.5)) * 100
+        
+        # EMI shielding score
+        emi_score = min(100, emi.get('shielding_effectiveness_db', 0))
+        
+        # AM suitability
+        am_score = am.get('printability_score', 0.5) * 100
         
         # Weighted average
-        weights = {'carbon': 0.4, 'circularity': 0.35, 'resilience': 0.25}
-        overall = (weights['carbon'] * carbon_score +
-                  weights['circularity'] * circularity_score +
-                  weights['resilience'] * resilience_score)
+        weights = {'base': 0.3, 'fatigue': 0.2, 'corrosion': 0.2, 'emi': 0.15, 'am': 0.15}
+        overall = (weights['base'] * base_score +
+                  weights['fatigue'] * fatigue_score +
+                  weights['corrosion'] * corrosion_score +
+                  weights['emi'] * emi_score +
+                  weights['am'] * am_score)
         
-        return overall
+        return min(100, overall)
 
 
 # ============================================================
-# ENHANCED V6.0 MAIN FUNCTION
+# ENHANCED MAIN FUNCTION
 # ============================================================
 
-async def main_v6():
-    """Enhanced V6.0 demonstration"""
+async def main_v6_enhanced():
+    """Enhanced V6.0 demonstration with all advanced features"""
     print("=" * 80)
-    print("Material Substitution Model v6.0 - Enhanced Production Demo")
+    print("Material Substitution Model v6.0 Enhanced - Advanced Production Demo")
     print("=" * 80)
     
     config = SubstitutionConfig(
@@ -1243,75 +1506,75 @@ async def main_v6():
         enable_real_apis=False
     )
     
-    analyzer = EnhancedMaterialSubstitutionAnalyzerV6(config)
+    analyzer = EnhancedMaterialSubstitutionAnalyzerV6Enhanced(config)
     
-    print("\n✅ V6.0 New Features Active:")
-    print(f"   ✅ Multi-Objective Pareto Optimization")
-    print(f"   ✅ ML Property Prediction: {'Available' if SKLEARN_AVAILABLE else 'Not Available'}")
-    print(f"   ✅ Supply Chain Resilience Analysis")
-    print(f"   ✅ Circular Economy Scoring")
-    print(f"   ✅ Digital Twin Integration")
-    print(f"   ✅ Blockchain Material Provenance: {'Available' if WEB3_AVAILABLE else 'Simulated'}")
-    print(f"   ✅ Real-Time Market Prices")
-    print(f"   ✅ Federated Data Sharing")
-    print(f"   ✅ Natural Language Query Interface")
-    print(f"   ✅ API-First Architecture")
+    print("\n✅ Enhanced V6.0 Advanced Features Active:")
+    print(f"   ✅ Generative Material Design")
+    print(f"   ✅ Multi-Scale Modeling (Atom to Macro)")
+    print(f"   ✅ Fatigue & Creep Life Prediction")
+    print(f"   ✅ Corrosion Resistance Modeling")
+    print(f"   ✅ Electromagnetic Compatibility")
+    print(f"   ✅ Additive Manufacturing Suitability")
+    print(f"   ✅ Surface Treatment Optimization")
+    print(f"   ✅ Joining & Welding Compatibility")
+    print(f"   ✅ Thermal Management Optimization")
+    print(f"   ✅ Acoustic & Vibration Damping")
     
-    # Comprehensive analysis
-    print(f"\n🔬 Running Comprehensive V6.0 Material Substitution Analysis...")
-    comprehensive = await analyzer.comprehensive_analysis()
+    # Advanced comprehensive analysis
+    print(f"\n🔬 Running Advanced Comprehensive Material Analysis...")
+    advanced_results = await analyzer.advanced_comprehensive_analysis()
     
     # Display results
-    if 'base_analysis' in comprehensive:
-        base = comprehensive['base_analysis']
-        if base.get('recommendations'):
-            top = base['recommendations'][0]
-            print(f"\n📊 Base Analysis:")
-            print(f"   Top Candidate: {top['recommended_substitute_name']}")
-            print(f"   TOPSIS Score: {top['topsis_score']:.3f}")
-            print(f"   Carbon Reduction: {top['carbon_reduction_pct']:.1f}%")
+    base = advanced_results.get('base_analysis', {}).get('base_analysis', {})
+    if base.get('recommendations'):
+        top = base['recommendations'][0]
+        print(f"\n📊 Top Candidate:")
+        print(f"   Material: {top.get('recommended_substitute_name', 'N/A')}")
+        print(f"   TOPSIS Score: {top.get('topsis_score', 0):.3f}")
+        print(f"   Carbon Reduction: {top.get('carbon_reduction_pct', 0):.1f}%")
     
-    pareto = comprehensive.get('pareto_frontier', {})
-    print(f"\n🎯 Pareto Frontier:")
-    print(f"   Solutions Found: {pareto.get('solutions_found', 0)}")
-    if pareto.get('optimal_tradeoff'):
-        opt = pareto['optimal_tradeoff']
-        if 'material' in opt:
-            print(f"   Optimal Trade-off: {opt['material'].name}")
+    fatigue = advanced_results.get('fatigue_life', {})
+    print(f"\n🔧 Fatigue Life:")
+    print(f"   Cycles: {fatigue.get('fatigue_life_cycles', 0):,.0f}")
+    print(f"   Fatigue Limit: {fatigue.get('fatigue_limit_mpa', 0):.0f} MPa")
     
-    supply = comprehensive.get('supply_chain_risk', {})
-    print(f"\n🔗 Supply Chain Risk:")
-    print(f"   Risk Level: {supply.get('risk_level', 'N/A')}")
-    print(f"   Resilience Score: {supply.get('resilience_score', 0):.2f}")
+    corrosion = advanced_results.get('corrosion_resistance', {})
+    print(f"\n🧪 Corrosion Resistance:")
+    print(f"   Galvanic Risk: {corrosion.get('galvanic_risk', 'N/A')}")
+    print(f"   Protection Required: {'✅' if corrosion.get('protection_required') else '❌'}")
     
-    circular = comprehensive.get('circularity_assessment', {})
-    print(f"\n♻️ Circularity Assessment:")
-    print(f"   MCI Score: {circular.get('mci', 0):.2f}")
-    print(f"   Circularity Score: {circular.get('circularity_score', 0):.2f}")
+    emi = advanced_results.get('emi_shielding', {})
+    print(f"\n📡 EMI Shielding:")
+    print(f"   Effectiveness: {emi.get('shielding_effectiveness_db', 0):.0f} dB")
+    print(f"   Class: {emi.get('shielding_class', 'N/A')}")
     
-    ml = comprehensive.get('ml_predictions', {})
-    if ml:
-        print(f"\n🤖 ML Property Predictions:")
-        for prop, (mean, std) in ml.items():
-            print(f"   {prop}: {mean:.3f} ± {std:.3f}")
+    am = advanced_results.get('additive_manufacturing', {})
+    print(f"\n🏭 Additive Manufacturing:")
+    print(f"   Suitability: {am.get('suitability', 'N/A')}")
+    print(f"   Printability: {am.get('printability_score', 0):.2f}")
     
-    market = comprehensive.get('market_analysis', {})
-    print(f"\n💹 Market Analysis:")
-    print(f"   Current Price: ${market.get('current_price', 0):.2f}/kg")
-    if 'price_forecast' in market:
-        print(f"   Trend: {market['price_forecast'].get('trend_direction', 'N/A')}")
+    treatment = advanced_results.get('surface_treatment', {})
+    print(f"\n✨ Surface Treatment:")
+    print(f"   Recommended: {treatment.get('recommended_treatment', 'N/A')}")
+    print(f"   Cost: ${treatment.get('estimated_cost_per_m2', 0):.0f}/m²")
     
-    print(f"\n📈 Overall Sustainability Score: {comprehensive.get('overall_sustainability_score', 0):.1f}/100")
+    thermal = advanced_results.get('thermal_management', {})
+    print(f"\n🌡️ Thermal Management:")
+    print(f"   Thermal Resistance: {thermal.get('thermal_resistance_kw', 0):.4f} K/W")
+    print(f"   Sufficient: {'✅' if thermal.get('sufficient') else '❌'}")
+    
+    acoustic = advanced_results.get('acoustic_properties', {})
+    print(f"\n🔊 Acoustic Properties:")
+    print(f"   Damping Class: {acoustic.get('damping_classification', 'N/A')}")
+    print(f"   Loss Factor: {acoustic.get('loss_factor', 0):.6f}")
+    
+    print(f"\n📈 Overall Material Score: {advanced_results.get('overall_material_score', 0):.1f}/100")
     
     print("\n" + "=" * 80)
-    print("✅ Material Substitution v6.0 - All Features Demonstrated")
+    print("✅ Material Substitution v6.0 Enhanced - All Advanced Features Demonstrated")
     print("=" * 80)
 
 
-# ============================================================
-# BACKWARD COMPATIBILITY
-# ============================================================
-
 if __name__ == "__main__":
-    print("Running V6.0 enhanced version...")
-    asyncio.run(main_v6())
+    print("Running V6.0 enhanced version with all advanced features...")
+    asyncio.run(main_v6_enhanced())
