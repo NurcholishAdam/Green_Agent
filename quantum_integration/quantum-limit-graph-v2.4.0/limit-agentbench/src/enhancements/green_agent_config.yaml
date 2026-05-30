@@ -1,0 +1,294 @@
+# File: src/enhancements/green_agent_config.yaml
+
+# ============================================================
+# Green Agent Unified Configuration v6.1
+# ============================================================
+
+# System Configuration
+system:
+  name: "Green Agent"
+  version: "6.1.0"
+  environment: "production"  # development, staging, production
+  log_level: "INFO"
+  correlation_id_enabled: true
+  
+# Paths
+paths:
+  data_dir: "src/enhancements/data"
+  output_dir: "output"
+  log_dir: "logs"
+  model_dir: "models"
+  blockchain_dir: "blockchain"
+
+# ============================================================
+# Helium Data Configuration
+# ============================================================
+
+helium:
+  data_collector:
+    csv_path: "src/enhancements/data/helium_timeseries.csv"
+    use_synthetic_fallback: true
+    cache_ttl_seconds: 3600
+    update_frequency_hours: 24
+    
+  elasticity:
+    base_price_elasticity: -0.4
+    scarcity_elasticity_factor: 0.8
+    cross_elasticity_factor: 0.3
+    thermal_elasticity_factor: 0.5
+    migration_threshold_high: 0.7
+    migration_threshold_medium: 0.5
+    efficiency_improvement_target: 0.15
+    
+  circularity:
+    recovery_method: "hybrid"  # membrane_separation, pressure_swing_adsorption, cryogenic_distillation, hybrid
+    collection_efficiency: 0.95
+    compression_efficiency: 0.90
+    purification_efficiency: 0.85
+    liquefaction_efficiency: 0.80
+    platinum_recovery_rate: 0.95
+    gold_recovery_rate: 0.85
+    silver_recovery_rate: 0.70
+    bronze_recovery_rate: 0.50
+
+# ============================================================
+# Quantum Computing Configuration
+# ============================================================
+
+quantum:
+  provider: "pennylane"  # pennylane, qiskit, cirq, braket
+  backend: "default.qubit"  # default.qubit, lightning.qubit, real hardware
+  n_qubits: 12
+  shots: 1000
+  optimization_method: "quantum_approximate_optimization"  # QAOA, VQE, quantum_annealing
+  error_mitigation: true
+  
+  qaoa:
+    n_layers: 3
+    optimizer: "COBYLA"
+    max_iterations: 200
+    
+  vqe:
+    ansatz: "hardware_efficient"
+    optimizer: "SPSA"
+    max_iterations: 300
+    
+  quantum_annealing:
+    n_iterations: 2000
+    initial_temperature: 100.0
+    cooling_rate: 0.95
+    chain_strength: 1.5
+
+# ============================================================
+# Blockchain Configuration
+# ============================================================
+
+blockchain:
+  provider: "ethereum"  # ethereum, polygon, hyperledger, simulated
+  network: "sepolia"  # mainnet, goerli, sepolia, local
+  rpc_url: "${BLOCKCHAIN_RPC_URL}"  # From environment variable
+  chain_id: 11155111  # Sepolia testnet
+  
+  wallet:
+    private_key_env: "BLOCKCHAIN_PRIVATE_KEY"
+    address_env: "BLOCKCHAIN_ADDRESS"
+    
+  smart_contracts:
+    sustainability_verification:
+      address: "${SUSTAINABILITY_CONTRACT_ADDRESS}"
+      abi_path: "abi/sustainability_verification.json"
+    carbon_credits:
+      address: "${CARBON_CREDITS_CONTRACT_ADDRESS}"
+      abi_path: "abi/carbon_credits.json"
+    helium_provenance:
+      address: "${HELIUM_PROVENANCE_CONTRACT_ADDRESS}"
+      abi_path: "abi/helium_provenance.json"
+      
+  gas:
+    max_fee_per_gas_gwei: 100
+    max_priority_fee_per_gas_gwei: 2
+    gas_limit: 300000
+
+# ============================================================
+# Regret Optimizer Configuration
+# ============================================================
+
+regret_optimizer:
+  n_scenarios: 1000
+  confidence_level: 0.95
+  optimization_method: "minimax"  # minimax, cvar, robust
+  parallel_workers: 4
+  
+  scenario_generation:
+    carbon_price_mean: 75.0
+    carbon_price_std: 25.0
+    energy_cost_mean: 0.08
+    energy_cost_std: 0.02
+    extreme_event_probability: 0.05
+    
+  project_evaluation:
+    discount_rate: 0.05
+    min_project_lifetime: 5
+    max_project_lifetime: 40
+    synergy_threshold: 0.1
+
+# ============================================================
+# Sustainability Signals Configuration
+# ============================================================
+
+sustainability:
+  sector: "technology"  # technology, energy, financials, manufacturing
+  reporting_framework: "GRI"  # GRI, SASB, TCFD, IR
+  
+  esg_weights:
+    environmental: 0.40
+    social: 0.35
+    governance: 0.25
+    
+  risk_thresholds:
+    high_risk: 0.7
+    critical_risk: 0.85
+    anomaly_sensitivity: 0.05
+    
+  circular_economy:
+    target_circularity: 0.7
+    target_recycled_content: 30.0
+    target_waste_reduction: 50.0
+    
+  climate:
+    scenarios:
+      - "orderly_transition"
+      - "disorderly_transition"
+      - "hot_house_world"
+      - "net_zero_2050"
+    time_horizon_years: 30
+
+# ============================================================
+# Thermal Optimizer Configuration
+# ============================================================
+
+thermal:
+  data_center:
+    name: "Default_DC"
+    chiller_cop: 4.5
+    pump_power_kw: 15.0
+    fan_power_per_server_w: 10.0
+    ambient_temp_c: 25.0
+    safety_margin_c: 5.0
+    
+  optimization:
+    objective: "minimize_carbon"  # minimize_energy, minimize_temperature, minimize_carbon, balanced
+    rl_enabled: true
+    liquid_cooling_enabled: true
+    free_cooling_enabled: true
+    
+  servers:
+    compute:
+      cpu_tdp_watts: 200
+      max_temp_c: 85
+      airflow_required_cfm: 100
+    gpu:
+      cpu_tdp_watts: 400
+      gpu_tdp_watts: 300
+      max_temp_c: 80
+      airflow_required_cfm: 150
+    storage:
+      cpu_tdp_watts: 100
+      max_temp_c: 90
+      airflow_required_cfm: 80
+
+# ============================================================
+# Synthetic Data Manager Configuration
+# ============================================================
+
+synthetic_data:
+  seed: 42
+  n_samples_default: 1000
+  parallel_workers: 4
+  
+  generation:
+    enable_correlations: true
+    enable_temporal: true
+    enable_privacy: false
+    privacy_epsilon: 1.0
+    quality_threshold: 0.7
+    
+  domains:
+    esg_metrics:
+      n_samples: 500
+      sectors: ["Technology", "Energy", "Financials", "Manufacturing"]
+    carbon_scenarios:
+      n_scenarios: 1000
+      scenario_types: ["orderly_transition", "disorderly_transition", "hot_house_world", "net_zero_2050"]
+    supply_chain:
+      n_suppliers: 100
+      countries: ["US", "CN", "IN", "DE", "BR", "GB", "JP"]
+    project_decisions:
+      n_projects: 50
+
+# ============================================================
+# Carbon Pricing Configuration
+# ============================================================
+
+carbon:
+  price_usd_per_tonne: 75.0
+  grid_carbon_intensity: 0.5  # kg CO2/kWh
+  renewable_energy_pct: 30.0
+  carbon_tax_enabled: true
+  
+  markets:
+    eu_ets:
+      enabled: true
+      price_source: "api"
+    voluntary:
+      enabled: true
+      price_source: "market"
+
+# ============================================================
+# API Configuration
+# ============================================================
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  rate_limit_per_minute: 60
+  
+  endpoints:
+    regret_optimizer: "/api/v1/regret/optimize"
+    sustainability: "/api/v1/sustainability/assess"
+    thermal: "/api/v1/thermal/optimize"
+    helium: "/api/v1/helium/analyze"
+    quantum: "/api/v1/quantum/optimize"
+    
+  authentication:
+    enabled: true
+    api_key_header: "X-API-Key"
+    jwt_enabled: false
+
+# ============================================================
+# Monitoring Configuration
+# ============================================================
+
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+    metrics_path: "/metrics"
+    
+  logging:
+    level: "INFO"
+    format: "structured"  # structured, simple
+    output: ["file", "console"]
+    file_path: "logs/green_agent.log"
+    max_file_size_mb: 100
+    backup_count: 5
+    
+  alerts:
+    email_enabled: false
+    slack_enabled: false
+    pagerduty_enabled: false
+    critical_thresholds:
+      helium_scarcity: 0.8
+      carbon_price: 200
+      max_temperature_c: 45
