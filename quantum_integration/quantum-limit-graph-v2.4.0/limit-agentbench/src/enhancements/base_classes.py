@@ -736,6 +736,45 @@ class ModuleRegistry:
             cls._modules.clear()
             logging.getLogger(__name__).info("All modules unregistered")
 
+# Add to src/enhancements/base_classes.py (GPU-aware base class)
+
+class GPUBaseCalculator(BaseCalculator):
+    """Base calculator with GPU acceleration support"""
+    
+    def __init__(self, config=None):
+        super().__init__(config)
+        self._gpu_accelerator = None
+        self._init_gpu()
+    
+    def _init_gpu(self):
+        """Initialize GPU acceleration"""
+        try:
+            from .gpu_acceleration import get_gpu_accelerator
+            self._gpu_accelerator = get_gpu_accelerator()
+            if self._gpu_accelerator.cuda_available:
+                logger.info(f"{self.__class__.__name__} GPU-ready: "
+                           f"{self._gpu_accelerator.device_name}")
+        except ImportError:
+            self._gpu_accelerator = None
+    
+    def to_gpu(self, data):
+        """Move data to GPU if available"""
+        if self._gpu_accelerator:
+            return self._gpu_accelerator.to_gpu(data)
+        return data
+    
+    def to_cpu(self, data):
+        """Move data back to CPU"""
+        if self._gpu_accelerator:
+            return self._gpu_accelerator.to_cpu(data)
+        return data
+    
+    def get_gpu_memory_info(self):
+        """Get GPU memory information"""
+        if self._gpu_accelerator:
+            return self._gpu_accelerator.get_memory_info()
+        return {'cuda_available': False}
+
 # ============================================================
 # CONVENIENCE IMPORTS
 # ============================================================
