@@ -81,6 +81,46 @@ try:
 except ImportError:
     PENNYLANE_AVAILABLE = False
 
+# Add to src/enhancements/regret_optimizer.py (GPU enhancement at top of file after imports)
+
+# GPU Acceleration integration
+try:
+    from .gpu_acceleration import get_gpu_accelerator, gpu_accelerated
+    GPU_ACCELERATOR = get_gpu_accelerator()
+    GPU_AVAILABLE = GPU_ACCELERATOR.cuda_available
+except ImportError:
+    GPU_ACCELERATOR = None
+    GPU_AVAILABLE = False
+    def gpu_accelerated(func):
+        return func
+
+# In StandardRegretCalculator._build_payoff_matrix, add GPU acceleration:
+def _build_payoff_matrix(self, decisions, scenarios):
+    """Build payoff matrix with GPU acceleration"""
+    n_decisions = len(decisions)
+    n_scenarios = len(scenarios)
+    
+    # Use GPU for large matrices
+    if GPU_AVAILABLE and n_decisions * n_scenarios > 10000:
+        payoff_matrix = np.zeros((n_decisions, n_scenarios))
+        for i, decision in enumerate(decisions):
+            for j, scenario in enumerate(scenarios):
+                payoff_matrix[i, j] = self.payoff_calculator.calculate_payoff(decision, scenario)
+        
+        # GPU-accelerated regret calculation
+        best_per_scenario = np.max(payoff_matrix, axis=0)
+        regret_matrix = best_per_scenario[np.newaxis, :] - payoff_matrix
+        return regret_matrix, best_per_scenario
+    
+    # CPU fallback for small matrices
+    payoff_matrix = np.zeros((n_decisions, n_scenarios))
+    for i, decision in enumerate(decisions):
+        for j, scenario in enumerate(scenarios):
+            payoff_matrix[i, j] = self.payoff_calculator.calculate_payoff(decision, scenario)
+    
+    best_per_scenario = np.max(payoff_matrix, axis=0)
+    regret_matrix = best_per_scenario[np.newaxis, :] - payoff_matrix
+    return regret_matrix, best_per_scenario
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -137,6 +177,48 @@ except ImportError:
 # ============================================================
 // ... (content truncated) ...
 ===========================================
+
+# Add to src/enhancements/regret_optimizer.py (GPU enhancement at top of file after imports)
+
+# GPU Acceleration integration
+try:
+    from .gpu_acceleration import get_gpu_accelerator, gpu_accelerated
+    GPU_ACCELERATOR = get_gpu_accelerator()
+    GPU_AVAILABLE = GPU_ACCELERATOR.cuda_available
+except ImportError:
+    GPU_ACCELERATOR = None
+    GPU_AVAILABLE = False
+    def gpu_accelerated(func):
+        return func
+
+# In StandardRegretCalculator._build_payoff_matrix, add GPU acceleration:
+def _build_payoff_matrix(self, decisions, scenarios):
+    """Build payoff matrix with GPU acceleration"""
+    n_decisions = len(decisions)
+    n_scenarios = len(scenarios)
+    
+    # Use GPU for large matrices
+    if GPU_AVAILABLE and n_decisions * n_scenarios > 10000:
+        payoff_matrix = np.zeros((n_decisions, n_scenarios))
+        for i, decision in enumerate(decisions):
+            for j, scenario in enumerate(scenarios):
+                payoff_matrix[i, j] = self.payoff_calculator.calculate_payoff(decision, scenario)
+        
+        # GPU-accelerated regret calculation
+        best_per_scenario = np.max(payoff_matrix, axis=0)
+        regret_matrix = best_per_scenario[np.newaxis, :] - payoff_matrix
+        return regret_matrix, best_per_scenario
+    
+    # CPU fallback for small matrices
+    payoff_matrix = np.zeros((n_decisions, n_scenarios))
+    for i, decision in enumerate(decisions):
+        for j, scenario in enumerate(scenarios):
+            payoff_matrix[i, j] = self.payoff_calculator.calculate_payoff(decision, scenario)
+    
+    best_per_scenario = np.max(payoff_matrix, axis=0)
+    regret_matrix = best_per_scenario[np.newaxis, :] - payoff_matrix
+    return regret_matrix, best_per_scenario
+
 
 class EnhancedRegretCalculatorV6(StandardRegretCalculator):
     """
