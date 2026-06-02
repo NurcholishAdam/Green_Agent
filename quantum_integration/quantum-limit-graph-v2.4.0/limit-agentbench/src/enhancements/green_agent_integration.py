@@ -149,7 +149,29 @@ class GreenAgentIntegrator(BaseIntegrator):
     Phase 6: MONITORING & HEALTH
     - Health checks, metrics aggregation, status reporting
     """
+    # Add to src/enhancements/green_agent_integration.py (GPU monitoring)
+
+# In GreenAgentIntegrator, add GPU monitoring:
+def get_gpu_status(self) -> Dict:
+    """Get GPU acceleration status across all modules"""
+    try:
+        from .gpu_acceleration import get_gpu_accelerator
+        gpu = get_gpu_accelerator()
+        return gpu.get_memory_info()
+    except ImportError:
+        return {'cuda_available': False, 'message': 'GPU acceleration not available'}
+
+# Add to integrate() method:
+def integrate(self, source_data=None, target_module="all"):
+    """Enhanced integration with GPU acceleration"""
     
+    # Check GPU availability
+    gpu_status = self.get_gpu_status()
+    if gpu_status.get('cuda_available'):
+        logger.info(f"GPU acceleration available: {gpu_status.get('device_name', 'Unknown')}")
+    
+    # ... rest of integration code ...
+
     def __init__(self, config: Dict = None):
         super().__init__(config)
         
