@@ -133,6 +133,35 @@ class EnhancedSyntheticDataManager:
     - Differential privacy with budget tracking
     - Multi-format export
     """
+
+    # Add to src/enhancements/synthetic_data_manager.py (GPU enhancement)
+
+# In EnhancedSyntheticGAN class, add GPU optimization:
+class EnhancedSyntheticGAN:
+    def __init__(self, input_dim, hidden_dim=128, latent_dim=64):
+        # ... existing code ...
+        
+        # GPU optimization
+        try:
+            from .gpu_acceleration import get_gpu_accelerator
+            self.gpu_acc = get_gpu_accelerator()
+            if self.gpu_acc.cuda_available and TORCH_AVAILABLE:
+                self.generator = self.generator.cuda()
+                self.discriminator = self.discriminator.cuda()
+                self.device = torch.device('cuda')
+                logger.info(f"GAN models on GPU: {self.gpu_acc.device_name}")
+        except ImportError:
+            self.gpu_acc = None
+    
+    def train(self, real_data, n_epochs=100, batch_size=64, early_stopping=True):
+        """Train with GPU-accelerated batch processing"""
+        
+        # Use larger batch size on GPU
+        if self.gpu_acc and self.gpu_acc.cuda_available:
+            batch_size = min(256, batch_size * 4)
+            logger.info(f"GPU batch size: {batch_size}")
+        
+        # ... rest of training code ...
     
     def __init__(self, config: Dict = None):
         self.config = GenerationConfig(**(config or {}))
