@@ -132,6 +132,36 @@ except ImportError:
 // ... (content truncated) ...
 ===========================================
 
+# Add to src/enhancements/helium_forecaster.py (GPU enhancement)
+
+# GPU Acceleration
+try:
+    from .gpu_acceleration import get_gpu_accelerator
+    GPU_ACC = get_gpu_accelerator()
+    GPU_AVAILABLE = GPU_ACC.cuda_available
+except ImportError:
+    GPU_ACC = None
+    GPU_AVAILABLE = False
+
+# In HeliumForecaster.train() method, add:
+def train(self, historical_data, epochs=100, validation_split=0.2, early_stopping=True):
+    """Train with GPU acceleration"""
+    if not TORCH_AVAILABLE:
+        return {'error': 'PyTorch required for training'}
+    
+    # Move models to GPU if available
+    if GPU_AVAILABLE:
+        self.lstm_model = self.lstm_model.cuda()
+        self.transformer_model = self.transformer_model.cuda()
+        logger.info(f"Models moved to GPU: {GPU_ACC.device_name}")
+    
+    # ... rest of training code ...
+    
+    # Clear GPU cache after training
+    if GPU_AVAILABLE:
+        GPU_ACC.clear_cache()
+
+
 class HeliumLSTMForecaster(nn.Module):
     """LSTM-based helium market forecaster with attention and MC Dropout"""
     
