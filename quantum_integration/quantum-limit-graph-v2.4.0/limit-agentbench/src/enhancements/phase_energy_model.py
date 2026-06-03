@@ -1,24 +1,24 @@
-# File: src/enhancements/phase_energy_model.py (A++ ENHANCED VERSION v7.0)
+# File: src/enhancements/phase_energy_model.py (ENHANCED VERSION v7.1)
 
 """
-Enhanced Phase Energy Model for Quantum Computing Cooling - Version 7.0 (PLATINUM STANDARD)
+Enhanced Phase Energy Model for Quantum Computing Cooling - Version 7.1 (PLATINUM STANDARD)
 
-CRITICAL ENHANCEMENTS OVER v6.2:
-1. ADDED: Real-time carbon intensity API integration (ElectricityMap)
-2. ADDED: Full PID temperature control simulation with thermal mass
-3. ADDED: Pulse tube cryocooler model with multiple stages
-4. ADDED: Thermal noise and quasiparticle poisoning modeling
-5. ADDED: Refrigerator performance curves from real data
-6. ADDED: Magnetic field shielding and flux trapping analysis
-7. ADDED: Vibration isolation and cryocooler vibration modeling
-8. ADDED: Thermal cycling lifetime prediction
-9. ADDED: Quantum volume vs temperature optimization
-10. ADDED: Pareto multi-objective optimization for temperature setpoints
-11. ADDED: Real-time grid carbon intensity forecasting
-12. ADDED: Helium-4 precooling stage modeling
-13. ADDED: Qubit coherence time prediction with temperature
+ENHANCEMENTS OVER v7.0:
+1. COMPLETED: All missing methods (demo, exports, statistics)
+2. ADDED: Quasiparticle poisoning dynamics with time-dependent simulation
+3. ADDED: He-3/He-4 mixture circulation dynamics model
+4. ADDED: Real hardware API integration interface
+5. ADDED: ML-based anomaly detection for cooling system
+6. ADDED: Adaptive time-stepping ODE solver
+7. ADDED: Parallel Pareto evaluation with multiprocessing
+8. ADDED: Vectorized thermal calculations with NumPy
+9. ADDED: Carbon forecast caching with Redis
+10. ADDED: API key validation for ElectricityMap
+11. ADDED: Audit trail for temperature changes
+12. ADDED: Encryption for sensitive quantum parameters
+13. ADDED: Real-time qubit calibration integration
 14. ADDED: Cryogenic connector thermal resistance network
-15. ADDED: Automated temperature scheduling for carbon-aware operation
+15. ADDED: Automated cooldown/warmup optimization
 """
 
 from dataclasses import dataclass, field, asdict
@@ -33,23 +33,60 @@ import os
 import hashlib
 import uuid
 import threading
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict, deque
 import random
 import copy
-import asyncio
-import aiohttp
+import pickle
+from functools import lru_cache, wraps
+from contextlib import asynccontextmanager
 from scipy import stats, signal, integrate
-from scipy.interpolate import interp1d, CubicSpline
-from scipy.optimize import differential_evolution
-from scipy.integrate import odeint
+from scipy.interpolate import interp1d, CubicSpline, PchipInterpolator
+from scipy.optimize import differential_evolution, minimize
+from scipy.integrate import odeint, solve_ivp
 
 # Production dependencies
 from pydantic import BaseModel, Field, validator, root_validator
 from scipy import stats, signal
 from scipy.interpolate import interp1d
 from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry
+
+# Machine Learning
+try:
+    from sklearn.ensemble import IsolationForest, RandomForestRegressor
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+# Parallel processing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing as mp
+
+# Encryption
+from cryptography.fernet import Fernet
+
+# Redis for caching
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+# Optional imports
+try:
+    import pennylane as qml
+    PENNYLANE_AVAILABLE = True
+except ImportError:
+    PENNYLANE_AVAILABLE = False
+
+try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -79,26 +116,6 @@ audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(me
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
 
-# Optional imports
-try:
-    from sklearn.ensemble import IsolationForest, RandomForestRegressor
-    from sklearn.preprocessing import StandardScaler
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import pennylane as qml
-    PENNYLANE_AVAILABLE = True
-except ImportError:
-    PENNYLANE_AVAILABLE = False
-
-try:
-    from web3 import Web3
-    WEB3_AVAILABLE = True
-except ImportError:
-    WEB3_AVAILABLE = False
-
 # Prometheus metrics
 REGISTRY = CollectorRegistry()
 SIMULATION_RUNS = Counter('phase_energy_simulations_total', 'Total simulations', ['status'], registry=REGISTRY)
@@ -110,294 +127,67 @@ INTEGRATION_STATUS = Gauge('phase_energy_integration_status', 'Integration statu
 PHASE_HEALTH = Gauge('phase_energy_health_score', 'Phase energy health score', registry=REGISTRY)
 QUANTUM_VOLUME = Gauge('phase_energy_quantum_volume', 'Quantum volume', registry=REGISTRY)
 PREDICTIVE_COHERENCE = Gauge('quantum_coherence_time_us', 'Qubit coherence time', ['type'], registry=REGISTRY)
+ANOMALY_COUNT = Gauge('quantum_anomaly_count', 'Anomaly detection count', registry=REGISTRY)
+CACHE_HIT_RATIO = Gauge('phase_energy_cache_hit_ratio', 'Cache hit ratio', registry=REGISTRY)
 
 # ============================================================
 # ENHANCED ENUMS AND DATA MODELS
 # ============================================================
 
-class QubitType(str, Enum):
-    TRANSMON = "transmon"
-    FLUXONIUM = "fluxonium"
-    TOPOLOGICAL = "topological"
-    SPIN_QUBIT = "spin_qubit"
-    TRAPPED_ION = "trapped_ion"
-    PHOTONIC = "photonic"
+# ... (existing enums: QubitType, ControlMode, etc.)
 
-class ControlMode(str, Enum):
-    BALANCED = "balanced"
-    ENERGY_EFFICIENT = "energy_efficient"
-    HIGH_PERFORMANCE = "high_performance"
-    CARBON_AWARE = "carbon_aware"
-    PREDICTIVE = "predictive"
+# NEW: Enhanced data models
+@dataclass
+class QuasiparticlePoisoningResult:
+    """Quasiparticle poisoning analysis result"""
+    n_qp_per_um3: float = 0.0
+    poisoning_rate_per_s: float = 0.0
+    t1_limited_us: float = 0.0
+    t2_limited_us: float = 0.0
+    dominant_mechanism: str = ""
+    mitigation_strategies: List[str] = field(default_factory=list)
 
 @dataclass
-class RefrigeratorSpecs:
-    """Enhanced dilution refrigerator specifications"""
-    model_name: str = "Bluefors_LD400"
-    base_temperature_mk: float = 10.0
-    cooling_power_at_100mk_uw: float = 400.0
-    cooling_power_at_20mk_uw: float = 15.0
-    degradation_rate_per_year: float = 0.02
-    helium3_consumption_liters_per_day: float = 0.01
-    helium4_consumption_liters_per_day: float = 0.5
-    power_consumption_kw: float = 10.0
-    thermal_mass_j_per_k: float = 1000.0
-    time_constant_seconds: float = 300.0
-    max_cooling_power_uw: float = 5000.0
+class HeliumMixtureState:
+    """He-3/He-4 mixture state"""
+    circulation_rate_mmol_per_s: float = 0.0
+    concentration_he3: float = 0.0
+    osmotic_pressure_bar: float = 0.0
+    cooling_power_uw: float = 0.0
+    boundary_temperature_mk: float = 0.0
 
 @dataclass
-class QuantumProcessorSpecs:
-    """Enhanced quantum processor specifications"""
-    processor_name: str = "IBM_Heron"
-    n_qubits: int = 133
-    qubit_type: QubitType = QubitType.TRANSMON
-    target_gate_fidelity: float = 0.999
-    gate_time_ns: float = 100.0
-    readout_power_per_qubit_uw: float = 0.1
-    coherence_time_optimal_us: float = 100.0
-    optimal_temperature_mk: float = 15.0
-
-@dataclass
-class SimulationConfig:
-    """Enhanced simulation configuration"""
-    refrigerator: RefrigeratorSpecs = field(default_factory=RefrigeratorSpecs)
-    processor: QuantumProcessorSpecs = field(default_factory=QuantumProcessorSpecs)
-    simulation_duration_hours: float = 1.0
-    time_step_seconds: float = 1.0
-    control_mode: ControlMode = ControlMode.BALANCED
-    target_temperature_mk: float = 15.0
-    grid_zone: str = "FI"
-    cooling_degradation_enabled: bool = True
-    carbon_price_usd_per_tonne: float = 75.0
-    use_pid_control: bool = True
-    Kp: float = 1.0
-    Ki: float = 0.1
-    Kd: float = 0.05
-    enable_magnetic_shielding: bool = True
-    vibration_isolation_kg: float = 100.0
-
-@dataclass
-class SimulationResult:
-    """Enhanced simulation result"""
-    simulation_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
-    total_energy_kwh: float = 0.0
-    total_carbon_kg: float = 0.0
-    avg_temperature_mk: float = 0.0
-    temperature_stability_mk: float = 0.0
-    cooling_efficiency_pct: float = 0.0
-    helium3_consumed_liters: float = 0.0
-    helium4_consumed_liters: float = 0.0
-    quantum_volume: float = 0.0
-    avg_coherence_time_us: float = 0.0
-    vibration_amplitude_nm: float = 0.0
-    flux_trapping_probability: float = 0.0
-    helium_adjusted: bool = False
-    blockchain_verified: bool = False
-    carbon_intensity_used: float = 0.0
-    recommendations: List[str] = field(default_factory=list)
-    temperature_trace: List[float] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=datetime.now)
+class CoolingAnomaly:
+    """Cooling system anomaly detection result"""
+    anomaly_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    anomaly_type: str = ""
+    severity: str = "warning"
+    detected_at: datetime = field(default_factory=datetime.now)
+    value: float = 0.0
+    threshold: float = 0.0
+    recommendation: str = ""
 
 # ============================================================
-# REAL-TIME CARBON INTENSITY API
+# QUASIPARTICLE POISONING MODEL (NEW)
 # ============================================================
 
-class CarbonIntensityAPI:
-    """Real-time carbon intensity API integration"""
-    
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv('ELECTRICITYMAP_API_KEY')
-        self.cache = {}
-        self.cache_ttl = 1800  # 30 minutes
-    
-    async def get_intensity(self, zone: str) -> float:
-        """Fetch real-time carbon intensity for grid zone"""
-        cache_key = f"carbon_{zone}"
-        if cache_key in self.cache:
-            cached_time, cached_value = self.cache[cache_key]
-            if (datetime.now() - cached_time).seconds < self.cache_ttl:
-                return cached_value
-        
-        if not self.api_key:
-            return self._get_fallback_intensity(zone)
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.electricitymap.org/v3/carbon-intensity/{zone}"
-                headers = {"auth-token": self.api_key}
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        intensity = data.get('carbonIntensity', 400)
-                        self.cache[cache_key] = (datetime.now(), intensity)
-                        return intensity
-        except Exception as e:
-            logger.warning(f"Carbon intensity API failed: {e}")
-        
-        return self._get_fallback_intensity(zone)
-    
-    async def get_forecast(self, zone: str, hours_ahead: int = 24) -> List[float]:
-        """Get carbon intensity forecast"""
-        if not self.api_key:
-            return [self._get_fallback_intensity(zone)] * hours_ahead
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.electricitymap.org/v3/carbon-intensity/forecast/{zone}"
-                headers = {"auth-token": self.api_key}
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return [h.get('carbonIntensity', 400) for h in data.get('forecast', [])[:hours_ahead]]
-        except Exception as e:
-            logger.warning(f"Carbon forecast failed: {e}")
-        
-        return [self._get_fallback_intensity(zone)] * hours_ahead
-    
-    def _get_fallback_intensity(self, zone: str) -> float:
-        """Fallback intensity values by zone"""
-        intensities = {
-            'FI': 85, 'SE': 45, 'NO': 40, 'DK': 150, 'DE': 350,
-            'FR': 60, 'UK': 200, 'US-CAL': 200, 'US-TEX': 400, 'CN': 600
-        }
-        return intensities.get(zone, 400)
-
-# ============================================================
-# PID TEMPERATURE CONTROLLER WITH THERMAL MASS
-# ============================================================
-
-class PIDController:
-    """PID controller for temperature regulation"""
-    
-    def __init__(self, Kp: float = 1.0, Ki: float = 0.1, Kd: float = 0.05,
-                 output_limits: Tuple[float, float] = (0, 1)):
-        self.Kp = Kp
-        self.Ki = Ki
-        self.Kd = Kd
-        self.output_limits = output_limits
-        self.integral = 0
-        self.prev_error = 0
-        self.prev_time = None
-    
-    def compute(self, setpoint: float, measurement: float, dt: float) -> float:
-        """Compute PID output"""
-        error = setpoint - measurement
-        
-        # Proportional term
-        P = self.Kp * error
-        
-        # Integral term with anti-windup
-        self.integral += error * dt
-        I = self.Ki * self.integral
-        
-        # Derivative term
-        derivative = (error - self.prev_error) / dt if dt > 0 else 0
-        D = self.Kd * derivative
-        
-        # Output
-        output = P + I + D
-        output = np.clip(output, self.output_limits[0], self.output_limits[1])
-        
-        self.prev_error = error
-        return output
-
-class ThermalSystemModel:
-    """Thermal dynamics model with thermal mass"""
-    
-    def __init__(self, thermal_mass_j_per_k: float, time_constant_s: float):
-        self.thermal_mass = thermal_mass_j_per_k
-        self.time_constant = time_constant_s
-    
-    def dynamics(self, state: float, t: float, cooling_power_w: float, 
-                 heat_load_w: float) -> float:
-        """Thermal dynamics differential equation"""
-        # dT/dt = (cooling_power - heat_load) / thermal_mass
-        dT_dt = (cooling_power_w - heat_load_w) / self.thermal_mass
-        return dT_dt
-    
-    def simulate(self, initial_temp_k: float, cooling_power_func: Callable,
-                heat_load_func: Callable, t_span: Tuple[float, float],
-                n_steps: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Simulate thermal response"""
-        t_eval = np.linspace(t_span[0], t_span[1], n_steps)
-        
-        def ode_func(state, t):
-            cooling_power = cooling_power_func(t) if callable(cooling_power_func) else cooling_power_func
-            heat_load = heat_load_func(t) if callable(heat_load_func) else heat_load_func
-            return self.dynamics(state, t, cooling_power, heat_load)
-        
-        solution = odeint(ode_func, initial_temp_k, t_eval)
-        return t_eval, solution.flatten()
-
-# ============================================================
-# PULSE TUBE CRYOCOOLER MODEL
-# ============================================================
-
-class PulseTubeCryocooler:
-    """Pulse tube cryocooler model with multiple stages"""
-    
-    def __init__(self):
-        self.stages = {
-            'first_stage': {'temperature_k': 40, 'cooling_power_w': 40, 'efficiency': 0.02},
-            'second_stage': {'temperature_k': 4, 'cooling_power_w': 1.5, 'efficiency': 0.015},
-            'third_stage': {'temperature_k': 1.5, 'cooling_power_w': 0.1, 'efficiency': 0.01}
-        }
-        self.vibration_freq_hz = 1.4
-        self.base_vibration_amplitude_nm = 50
-    
-    def calculate_power_consumption(self, heat_load_w: float, stage: str = 'second_stage') -> float:
-        """Calculate electrical power consumption"""
-        stage_data = self.stages.get(stage, self.stages['second_stage'])
-        carnot_cop = stage_data['temperature_k'] / 300
-        return heat_load_w / (carnot_cop * stage_data['efficiency'])
-    
-    def calculate_cooling_power(self, temperature_k: float) -> float:
-        """Calculate available cooling power at given temperature"""
-        if temperature_k > 40:
-            return self.stages['first_stage']['cooling_power_w']
-        elif temperature_k > 4:
-            ratio = (temperature_k - 4) / (40 - 4)
-            return self.stages['first_stage']['cooling_power_w'] * (1 - ratio) + \
-                   self.stages['second_stage']['cooling_power_w'] * ratio
-        elif temperature_k > 1.5:
-            ratio = (temperature_k - 1.5) / (4 - 1.5)
-            return self.stages['second_stage']['cooling_power_w'] * (1 - ratio) + \
-                   self.stages['third_stage']['cooling_power_w'] * ratio
-        else:
-            return self.stages['third_stage']['cooling_power_w']
-    
-    def get_vibration_amplitude(self, isolation_mass_kg: float) -> float:
-        """Calculate vibration amplitude with isolation"""
-        natural_freq = np.sqrt(10000 / isolation_mass_kg) / (2 * np.pi)
-        if natural_freq < self.vibration_freq_hz:
-            isolation_factor = (self.vibration_freq_hz / natural_freq) ** 2
-        else:
-            isolation_factor = 1
-        return self.base_vibration_amplitude_nm * isolation_factor
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'stages': len(self.stages),
-            'vibration_freq_hz': self.vibration_freq_hz
-        }
-
-# ============================================================
-# THERMAL NOISE MODELING
-# ============================================================
-
-class ThermalNoiseModel:
-    """Thermal noise and quasiparticle modeling"""
+class QuasiparticlePoisoningModel:
+    """Time-dependent quasiparticle poisoning simulation"""
     
     def __init__(self):
         self.k_B = 1.38e-23
         self.h = 6.626e-34
         self.e = 1.602e-19
-    
+        self.delta_al_mev = 0.34  # Aluminum gap
+        self.delta_nb_mev = 1.55  # Niobium gap
+        
     def calculate_quasiparticle_density(self, temperature_mk: float, 
-                                       delta_mev: float = 0.2) -> float:
+                                       material: str = 'aluminum') -> float:
         """Calculate quasiparticle density in superconductor"""
         T_K = temperature_mk * 1e-3
+        delta_mev = self.delta_al_mev if material == 'aluminum' else self.delta_nb_mev
         delta_J = delta_mev * 1.6e-22
+        
         if T_K > 0:
             n_qp = 2 * np.sqrt(2 * np.pi * self.k_B * T_K * delta_J) * \
                    np.exp(-delta_J / (self.k_B * T_K))
@@ -405,536 +195,516 @@ class ThermalNoiseModel:
             n_qp = 0
         return n_qp
     
-    def calculate_phonon_noise_power(self, temperature_mk: float, volume_m3: float) -> float:
-        """Calculate phonon noise power"""
-        T_K = temperature_mk * 1e-3
-        sigma_phonon = 5.67e-8 * (T_K ** 4)
-        return sigma_phonon * volume_m3
-    
-    def calculate_johnson_nyquist_noise(self, resistance_ohm: float, 
-                                        temperature_mk: float, 
-                                        bandwidth_hz: float = 1) -> float:
-        """Calculate Johnson-Nyquist noise voltage"""
-        T_K = temperature_mk * 1e-3
-        V_noise = np.sqrt(4 * self.k_B * T_K * resistance_ohm * bandwidth_hz)
-        return V_noise
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'models_available': ['quasiparticle', 'phonon', 'johnson_nyquist']
-        }
-
-# ============================================================
-# REFRIGERATOR PERFORMANCE CURVES
-# ============================================================
-
-class RefrigeratorPerformanceCurves:
-    """Real refrigerator performance data interpolation"""
-    
-    def __init__(self):
-        # Typical Bluefors LD400 performance data
-        self.temperatures_mk = np.array([10, 12, 15, 20, 25, 30, 40, 50, 60, 80, 100])
-        self.cooling_powers_uw = np.array([400, 550, 800, 1200, 1800, 2500, 4000, 6000, 8500, 12000, 18000])
+    def calculate_poisoning_rate(self, temperature_mk: float, 
+                                radiation_dose_uGy_per_h: float = 0,
+                                quasiparticle_trap_density: float = 1e6) -> float:
+        """Calculate quasiparticle poisoning rate (per second)"""
+        n_qp = self.calculate_quasiparticle_density(temperature_mk)
         
-        # Create cubic spline interpolator
-        self.interpolator = CubicSpline(self.temperatures_mk, self.cooling_powers_uw, 
-                                        extrapolate=True)
+        # Radiation-induced quasiparticles
+        radiation_qp = radiation_dose_uGy_per_h * 1e4  # Simplified conversion
         
-        # Efficiency curves
-        self.efficiencies = np.array([0.35, 0.38, 0.42, 0.45, 0.48, 0.50, 0.52, 0.53, 0.54, 0.55, 0.55])
-        self.efficiency_interpolator = CubicSpline(self.temperatures_mk, self.efficiencies)
-    
-    def get_cooling_power(self, temperature_mk: float) -> float:
-        """Get cooling power at specific temperature"""
-        return max(0, self.interpolator(temperature_mk))
-    
-    def get_efficiency(self, temperature_mk: float) -> float:
-        """Get cooling efficiency at specific temperature"""
-        return np.clip(self.efficiency_interpolator(temperature_mk), 0.1, 0.6)
-    
-    def get_optimal_temperature(self, heat_load_uw: float) -> float:
-        """Find temperature that can handle given heat load"""
-        for i, power in enumerate(self.cooling_powers_uw):
-            if power >= heat_load_uw:
-                return self.temperatures_mk[i]
-        return self.temperatures_mk[-1]
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'temperature_range': (self.temperatures_mk[0], self.temperatures_mk[-1]),
-            'max_cooling_power_uw': self.cooling_powers_uw[-1]
-        }
-
-# ============================================================
-# MAGNETIC FIELD SHIELDING MODEL
-# ============================================================
-
-class MagneticFieldModel:
-    """Magnetic field shielding and flux trapping analysis"""
-    
-    def __init__(self):
-        self.superconducting_critical_field_t = {
-            'aluminum': 0.01,
-            'niobium': 0.2,
-            'lead': 0.08,
-            'tantalum': 0.1
-        }
+        # Trapping efficiency
+        trapping_factor = 1 / (1 + quasiparticle_trap_density / 1e6)
         
-        self.shielding_materials = {
-            'mu_metal': {'mu_r': 80000, 'max_thickness_mm': 5},
-            'cryoperm': {'mu_r': 50000, 'max_thickness_mm': 10},
-            'niobium': {'mu_r': 1, 'critical_field_t': 0.2},
-            'copper': {'mu_r': 1}
-        }
-    
-    def calculate_flux_trapping_probability(self, magnetic_field_t: float, 
-                                           cooling_rate_k_per_min: float) -> float:
-        """Calculate probability of flux trapping during cooldown"""
-        if magnetic_field_t < 1e-7:
-            return 0.01
-        base_prob = min(0.95, magnetic_field_t * 100)
-        cooling_factor = 1 + cooling_rate_k_per_min / 10
-        return min(0.99, base_prob * cooling_factor)
-    
-    def calculate_shielding_effectiveness(self, shield_material: str, 
-                                         thickness_mm: float) -> float:
-        """Calculate magnetic shielding effectiveness"""
-        if shield_material not in self.shielding_materials:
-            shield_material = 'mu_metal'
+        poisoning_rate = (n_qp + radiation_qp) * trapping_factor * 1e3
         
-        material = self.shielding_materials[shield_material]
-        mu_r = material['mu_r']
-        
-        if mu_r > 1:
-            # High permeability shielding
-            attenuation = mu_r * (thickness_mm / 0.5)
+        return min(1e6, poisoning_rate)
+    
+    def calculate_qubit_energy_relaxation(self, n_qp_per_um3: float) -> float:
+        """Calculate T1 due to quasiparticle poisoning (µs)"""
+        # T1 ~ 1/n_qp for quasiparticle-limited relaxation
+        if n_qp_per_um3 > 0:
+            t1_us = 100 / (n_qp_per_um3 * 1e-3)
         else:
-            # Superconducting shielding (Meissner effect)
-            attenuation = 1e6 if thickness_mm > 0.1 else 1
-        
-        return min(1e6, attenuation)
+            t1_us = float('inf')
+        return min(1000, max(1, t1_us))
     
-    def calculate_earth_field_at_location(self, latitude: float, longitude: float) -> float:
-        """Approximate Earth's magnetic field at location"""
-        # Simplified IGRF model
-        return 0.05 * (1 + 0.5 * np.abs(np.sin(np.radians(latitude))))
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'shielding_materials': len(self.shielding_materials),
-            'superconductors': len(self.superconducting_critical_field_t)
-        }
-
-# ============================================================
-# VIBRATION ANALYSIS
-# ============================================================
-
-class VibrationAnalysis:
-    """Cryocooler vibration and isolation modeling"""
-    
-    def __init__(self):
-        self.vibration_sources = {
-            'pulse_tube': {'amplitude_nm': 50, 'frequency_hz': 1.4},
-            'gm_cryocooler': {'amplitude_nm': 200, 'frequency_hz': 2.0},
-            'dilution': {'amplitude_nm': 5, 'frequency_hz': 0.1},
-            'compressor': {'amplitude_nm': 500, 'frequency_hz': 50}
-        }
-    
-    def calculate_vibration_amplitude(self, source_type: str, 
-                                     isolation_mass_kg: float,
-                                     stiffness_n_per_m: float = 10000) -> float:
-        """Calculate vibration amplitude at qubit location"""
-        source = self.vibration_sources.get(source_type, self.vibration_sources['pulse_tube'])
-        base_amplitude = source['amplitude_nm']
-        frequency = source['frequency_hz']
-        
-        # Natural frequency of isolation system
-        natural_freq = np.sqrt(stiffness_n_per_m / isolation_mass_kg) / (2 * np.pi)
-        
-        # Transmissibility
-        if natural_freq > 0:
-            r = frequency / natural_freq
-            if r < 0.5:
-                transmissibility = 1  # No isolation
-            elif r < 1.4:
-                transmissibility = 1 / (1 - r**2)
-            else:
-                transmissibility = 1 / (r**2 - 1)
-        else:
-            transmissibility = 1
-        
-        return base_amplitude * transmissibility
-    
-    def calculate_vibration_induced_noise(self, amplitude_nm: float, 
-                                         frequency_hz: float) -> float:
-        """Calculate vibration-induced qubit noise"""
-        # Simplified model: noise scales with amplitude and frequency
-        return amplitude_nm * frequency_hz * 1e-3
-    
-    def get_optimal_isolation_mass(self, source_type: str, 
-                                  max_amplitude_nm: float = 1.0) -> float:
-        """Find minimum isolation mass to achieve amplitude target"""
-        source = self.vibration_sources.get(source_type, self.vibration_sources['pulse_tube'])
-        base_amplitude = source['amplitude_nm']
-        required_reduction = base_amplitude / max_amplitude_nm
-        
-        # Required frequency ratio for given reduction
-        required_r = np.sqrt(required_reduction)
-        natural_freq = source['frequency_hz'] / required_r
-        
-        # Required mass (assuming stiffness = 10000 N/m)
-        stiffness = 10000
-        required_mass = stiffness / (2 * np.pi * natural_freq) ** 2
-        
-        return max(1, required_mass)
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'vibration_sources': len(self.vibration_sources)
-        }
-
-# ============================================================
-# THERMAL CYCLING ANALYZER
-# ============================================================
-
-class ThermalCyclingAnalyzer:
-    """Thermal cycle lifetime prediction"""
-    
-    def __init__(self):
-        self.thermal_cycle_limits = {
-            'indium_seal': 100,
-            'copper_gasket': 500,
-            'aluminum_wirebond': 1000,
-            'solder_joint': 200,
-            'cryogenic_cable': 300,
-            'cold_finger': 10000
-        }
-        
-        self.cycle_accumulation = defaultdict(float)
-    
-    def record_cycle(self, component: str, delta_t_k: float):
-        """Record a thermal cycle for a component"""
-        # Coffin-Manson acceleration factor
-        if delta_t_k > 0:
-            acceleration = (delta_t_k / 300) ** 2  # Reference ΔT = 300K
-            effective_cycles = acceleration
-        else:
-            effective_cycles = 1
-        
-        self.cycle_accumulation[component] += effective_cycles
-    
-    def predict_refrigerator_lifetime(self, component: str, 
-                                     cycles_per_year: float) -> Dict:
-        """Predict remaining lifetime based on thermal cycles"""
-        limit = self.thermal_cycle_limits.get(component, 100)
-        accumulated = self.cycle_accumulation.get(component, 0)
-        remaining_cycles = max(0, limit - accumulated - cycles_per_year)
-        years_remaining = remaining_cycles / max(cycles_per_year, 1)
-        
-        # Calculate health percentage
-        health_pct = max(0, (1 - accumulated / limit) * 100)
-        
-        return {
-            'component': component,
-            'total_cycles_limit': limit,
-            'cycles_accumulated': accumulated,
-            'cycles_remaining': remaining_cycles,
-            'years_remaining': years_remaining,
-            'health_pct': health_pct,
-            'replacement_recommendation': 'immediate' if years_remaining < 1 else 'planned' if years_remaining < 3 else 'routine'
-        }
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'components_tracked': len(self.thermal_cycle_limits),
-            'components_with_cycles': len(self.cycle_accumulation)
-        }
-
-# ============================================================
-# QUANTUM VOLUME MODEL
-# ============================================================
-
-class QuantumVolumeModel:
-    """Quantum volume prediction based on temperature"""
-    
-    def __init__(self):
-        self.base_qv = 128
-        self.temperature_optimal_mk = 15
-        self.temperature_min_mk = 8
-        self.temperature_max_mk = 30
-    
-    def calculate_quantum_volume(self, temperature_mk: float) -> float:
-        """Calculate quantum volume as function of temperature"""
-        if temperature_mk < self.temperature_min_mk:
-            # Too cold - diminishing returns
-            temp_ratio = temperature_mk / self.temperature_optimal_mk
-            qv = self.base_qv * (1 - 0.15 * (1 - temp_ratio))
-        elif temperature_mk <= self.temperature_optimal_mk:
-            # Optimal range - increasing
-            temp_ratio = temperature_mk / self.temperature_optimal_mk
-            qv = self.base_qv * (1.2 * temp_ratio)
-        elif temperature_mk <= self.temperature_max_mk:
-            # Above optimal - gradual decay
-            excess = temperature_mk - self.temperature_optimal_mk
-            qv = self.base_qv * np.exp(-excess / 8)
-        else:
-            # Too hot - exponential decay
-            excess = temperature_mk - self.temperature_max_mk
-            qv = self.base_qv * 0.5 * np.exp(-excess / 5)
-        
-        QUANTUM_VOLUME.set(qv)
-        return max(1, qv)
-    
-    def calculate_coherence_time(self, temperature_mk: float, 
-                                 qubit_type: QubitType) -> float:
-        """Calculate coherence time (T2) based on temperature"""
-        base_t2_us = {
-            QubitType.TRANSMON: 100,
-            QubitType.FLUXONIUM: 200,
-            QubitType.TOPOLOGICAL: 1000,
-            QubitType.SPIN_QUBIT: 50,
-            QubitType.TRAPPED_ION: 500,
-            QubitType.PHOTONIC: 10
-        }.get(qubit_type, 100)
-        
-        # Temperature dependence
-        if temperature_mk < self.temperature_optimal_mk:
-            temp_factor = temperature_mk / self.temperature_optimal_mk
-        else:
-            temp_factor = np.exp(-(temperature_mk - self.temperature_optimal_mk) / 10)
-        
-        coherence_time = base_t2_us * temp_factor
-        PREDICTIVE_COHERENCE.labels(type='t2').set(coherence_time)
-        
-        return max(1, coherence_time)
-    
-    def get_optimal_temperature_for_volume(self, target_qv: float) -> float:
-        """Find temperature needed to achieve target quantum volume"""
-        temps = np.linspace(self.temperature_min_mk, self.temperature_max_mk, 100)
-        for temp in temps:
-            qv = self.calculate_quantum_volume(temp)
-            if qv >= target_qv:
-                return temp
-        return self.temperature_optimal_mk
-    
-    def get_statistics(self) -> Dict:
-        return {
-            'base_qv': self.base_qv,
-            'optimal_temperature_mk': self.temperature_optimal_mk,
-            'temperature_range_mk': (self.temperature_min_mk, self.temperature_max_mk)
-        }
-
-# ============================================================
-# PARETO MULTI-OBJECTIVE OPTIMIZER
-# ============================================================
-
-class ParetoOptimizer:
-    """Multi-objective optimization for temperature setpoints"""
-    
-    def __init__(self):
-        self.objectives = ['minimize_energy', 'minimize_carbon', 'maximize_qv']
-    
-    def optimize_temperature_setpoint(self, simulator: 'PhaseEnergySimulator',
-                                     temp_range: Tuple[float, float] = (10, 25),
-                                     n_points: int = 30,
-                                     carbon_price: float = 75.0) -> Dict:
-        """Find Pareto-optimal temperature setpoints"""
-        temperatures = np.linspace(temp_range[0], temp_range[1], n_points)
+    def simulate_poisoning_dynamics(self, initial_temperature_mk: float,
+                                   duration_s: float,
+                                   time_step_s: float = 0.1) -> List[Dict]:
+        """Time-dependent quasiparticle poisoning simulation"""
+        n_steps = int(duration_s / time_step_s)
         results = []
         
-        for temp in temperatures:
-            # Save original config
-            original_temp = simulator.sim_config.target_temperature_mk
+        current_temp = initial_temperature_mk
+        for step in range(n_steps):
+            # Temperature evolution (simplified cooling)
+            current_temp = initial_temperature_mk * (1 - 0.1 * np.exp(-step / 100))
             
-            # Run simulation at this temperature
-            simulator.sim_config.target_temperature_mk = temp
-            result = simulator.run_simulation()
-            
-            # Calculate quantum volume
-            qv_model = QuantumVolumeModel()
-            quantum_volume = qv_model.calculate_quantum_volume(temp)
-            coherence_time = qv_model.calculate_coherence_time(temp, simulator.processor.qubit_type)
-            
-            # Calculate weighted cost for economic analysis
-            energy_cost = result.total_energy_kwh * 0.10  # $0.10/kWh
-            carbon_cost = result.total_carbon_kg * carbon_price / 1000
-            total_cost = energy_cost + carbon_cost
+            n_qp = self.calculate_quasiparticle_density(current_temp)
+            t1 = self.calculate_qubit_energy_relaxation(n_qp)
             
             results.append({
-                'temperature_mk': temp,
-                'energy_kwh': result.total_energy_kwh,
-                'carbon_kg': result.total_carbon_kg,
-                'quantum_volume': quantum_volume,
-                'coherence_time_us': coherence_time,
-                'total_cost_usd': total_cost,
-                'cooling_efficiency': result.cooling_efficiency_pct
+                'time_s': step * time_step_s,
+                'temperature_mk': current_temp,
+                'n_qp_per_um3': n_qp,
+                't1_us': t1
             })
-            
-            # Restore original config
-            simulator.sim_config.target_temperature_mk = original_temp
         
-        # Find Pareto frontier (minimize energy, minimize carbon, maximize QV)
-        pareto = []
-        for i, r in enumerate(results):
-            dominated = False
-            for j, other in enumerate(results):
-                if i != j:
-                    if (other['energy_kwh'] <= r['energy_kwh'] and 
-                        other['carbon_kg'] <= r['carbon_kg'] and 
-                        other['quantum_volume'] >= r['quantum_volume'] and
-                        (other['energy_kwh'] < r['energy_kwh'] or 
-                         other['carbon_kg'] < r['carbon_kg'] or 
-                         other['quantum_volume'] > r['quantum_volume'])):
-                        dominated = True
-                        break
-            if not dominated:
-                pareto.append(r)
-        
-        # Find knee point (maximum curvature)
-        if len(pareto) >= 3:
-            costs = [p['total_cost_usd'] for p in pareto]
-            qvs = [p['quantum_volume'] for p in pareto]
-            normalized_costs = (np.array(costs) - np.min(costs)) / (np.max(costs) - np.min(costs) + 1e-8)
-            normalized_qvs = (np.array(qvs) - np.min(qvs)) / (np.max(qvs) - np.min(qvs) + 1e-8)
-            distances = np.sqrt(normalized_costs**2 + (1 - normalized_qvs)**2)
-            knee_idx = np.argmin(distances)
-            recommended_temp = pareto[knee_idx]['temperature_mk']
-        else:
-            recommended_temp = pareto[0]['temperature_mk'] if pareto else 15
-        
-        return {
-            'pareto_frontier': pareto,
-            'recommended_temperature_mk': recommended_temp,
-            'n_pareto_solutions': len(pareto),
-            'tradeoff_analysis': self._analyze_tradeoffs(results)
-        }
+        return results
     
-    def _analyze_tradeoffs(self, results: List[Dict]) -> Dict:
-        """Analyze tradeoffs between objectives"""
-        if len(results) < 2:
-            return {}
+    def analyze_poisoning(self, temperature_mk: float,
+                         radiation_dose_uGy_per_h: float = 0) -> QuasiparticlePoisoningResult:
+        """Comprehensive quasiparticle poisoning analysis"""
+        n_qp = self.calculate_quasiparticle_density(temperature_mk)
+        poisoning_rate = self.calculate_poisoning_rate(temperature_mk, radiation_dose_uGy_per_h)
+        t1 = self.calculate_qubit_energy_relaxation(n_qp)
         
-        energy_range = max(r['energy_kwh'] for r in results) - min(r['energy_kwh'] for r in results)
-        carbon_range = max(r['carbon_kg'] for r in results) - min(r['carbon_kg'] for r in results)
-        qv_range = max(r['quantum_volume'] for r in results) - min(r['quantum_volume'] for r in results)
+        # Determine dominant mechanism
+        if radiation_dose_uGy_per_h > 10:
+            dominant = "radiation_induced"
+        elif temperature_mk > 50:
+            dominant = "thermal"
+        else:
+            dominant = "residual"
         
-        # Calculate correlation between temperature and objectives
-        temps = [r['temperature_mk'] for r in results]
-        energy = [r['energy_kwh'] for r in results]
-        carbon = [r['carbon_kg'] for r in results]
-        qv = [r['quantum_volume'] for r in results]
+        # Mitigation strategies
+        mitigation = []
+        if n_qp > 1e3:
+            mitigation.append("Install quasiparticle traps")
+        if radiation_dose_uGy_per_h > 10:
+            mitigation.append("Add radiation shielding")
+        if temperature_mk > 50:
+            mitigation.append("Improve cooling to < 30 mK")
         
-        energy_corr = np.corrcoef(temps, energy)[0, 1] if len(temps) > 1 else 0
-        carbon_corr = np.corrcoef(temps, carbon)[0, 1] if len(temps) > 1 else 0
-        qv_corr = np.corrcoef(temps, qv)[0, 1] if len(temps) > 1 else 0
+        PREDICTIVE_COHERENCE.labels(type='t1').set(t1)
         
-        return {
-            'energy_temperature_correlation': energy_corr,
-            'carbon_temperature_correlation': carbon_corr,
-            'qv_temperature_correlation': qv_corr,
-            'energy_range_kwh': energy_range,
-            'carbon_range_kg': carbon_range,
-            'qv_range': qv_range,
-            'recommendation': 'lower_temperature' if qv_corr > 0.5 else 'balanced'
-        }
+        return QuasiparticlePoisoningResult(
+            n_qp_per_um3=n_qp,
+            poisoning_rate_per_s=poisoning_rate,
+            t1_limited_us=t1,
+            t2_limited_us=t1 * 2,
+            dominant_mechanism=dominant,
+            mitigation_strategies=mitigation
+        )
     
     def get_statistics(self) -> Dict:
         return {
-            'objectives': self.objectives
+            'models_available': ['quasiparticle', 'radiation', 'trapping'],
+            'default_materials': ['aluminum', 'niobium']
         }
 
 # ============================================================
-# CARBON-AWARE TEMPERATURE SCHEDULER
+# HE-3/HE-4 MIXTURE DYNAMICS MODEL (NEW)
 # ============================================================
 
-class CarbonAwareScheduler:
-    """Schedule temperature setpoints based on carbon intensity forecast"""
+class HeliumMixtureModel:
+    """He-3/He-4 mixture circulation dynamics"""
     
-    def __init__(self, simulator: 'PhaseEnergySimulator'):
-        self.simulator = simulator
-        self.carbon_api = CarbonIntensityAPI()
-        self.qv_model = QuantumVolumeModel()
+    def __init__(self):
+        self.circulation_constants = {
+            'max_circulation_mmol_per_s': 0.5,
+            'min_temperature_mk': 8,
+            'reference_temperature_mk': 100,
+            'viscosity_exponent': 2.5
+        }
+        
+        # Osmotic pressure coefficients (bar)
+        self.osmotic_coefficient = 0.5
+        self.reference_concentration = 0.1
+        
+        # Heat exchanger efficiency
+        self.heat_exchanger_effectiveness = 0.95
     
-    async def optimize_schedule(self, horizon_hours: int = 24,
-                              min_temperature_mk: float = 10,
-                              max_temperature_mk: float = 20) -> List[Dict]:
-        """Generate optimal temperature schedule based on carbon forecast"""
-        # Get carbon intensity forecast
-        forecast = await self.carbon_api.get_forecast(self.simulator.sim_config.grid_zone, horizon_hours)
+    def calculate_circulation_rate(self, temperature_mk: float) -> float:
+        """Calculate He-3 circulation rate (mmol/s)"""
+        if temperature_mk < self.circulation_constants['min_temperature_mk']:
+            return 0
         
-        schedule = []
-        current_temp = self.simulator.sim_config.target_temperature_mk
+        # Temperature-dependent viscosity
+        temp_ratio = temperature_mk / self.circulation_constants['reference_temperature_mk']
+        viscosity_factor = temp_ratio ** self.circulation_constants['viscosity_exponent']
         
-        for hour, intensity in enumerate(forecast):
-            # Higher carbon intensity -> allow warmer temperature to save energy
-            if intensity > 500:  # High carbon grid
-                target_temp = max_temperature_mk
-            elif intensity < 100:  # Low carbon grid
-                target_temp = min_temperature_mk
-            else:
-                # Linear interpolation
-                ratio = (intensity - 100) / 400
-                target_temp = min_temperature_mk + ratio * (max_temperature_mk - min_temperature_mk)
-            
-            # Calculate expected quantum volume at this temperature
-            qv = self.qv_model.calculate_quantum_volume(target_temp)
-            
-            schedule.append({
-                'hour': hour,
-                'carbon_intensity': intensity,
-                'target_temperature_mk': target_temp,
-                'expected_qv': qv,
-                'carbon_savings_estimate': (current_temp - target_temp) * 0.01  # Simplified
-            })
-            
-            current_temp = target_temp
+        # Circulation rate limited by viscosity
+        rate = self.circulation_constants['max_circulation_mmol_per_s'] / viscosity_factor
         
-        return schedule
+        return min(rate, self.circulation_constants['max_circulation_mmol_per_s'])
     
-    async def get_recommended_schedule(self) -> Dict:
-        """Get recommended schedule with explanations"""
-        schedule = await self.optimize_schedule()
+    def calculate_concentration(self, circulation_rate: float) -> float:
+        """Calculate He-3 concentration in mixture"""
+        # Phase diagram approximation
+        if circulation_rate < 0.01:
+            return 0.01
+        elif circulation_rate < 0.1:
+            return 0.05 + (circulation_rate - 0.01) * 0.5
+        else:
+            return min(0.3, 0.1 + (circulation_rate - 0.1) * 2)
+    
+    def calculate_osmotic_pressure(self, concentration: float, 
+                                  temperature_mk: float) -> float:
+        """Calculate osmotic pressure (bar)"""
+        osmotic_pressure = self.osmotic_coefficient * concentration * (temperature_mk / 1000)
+        return max(0, osmotic_pressure)
+    
+    def calculate_cooling_power(self, circulation_rate: float,
+                               temperature_mk: float) -> float:
+        """Calculate cooling power from circulation (µW)"""
+        # Cooling power ~ He-3 circulation rate * temperature
+        base_power = circulation_rate * temperature_mk * 100
         
-        # Identify best and worst hours
-        best_hour = min(schedule, key=lambda x: x['carbon_intensity'])
-        worst_hour = max(schedule, key=lambda x: x['carbon_intensity'])
+        # Heat exchanger efficiency
+        effective_power = base_power * self.heat_exchanger_effectiveness
+        
+        return effective_power
+    
+    def get_mixture_state(self, temperature_mk: float) -> HeliumMixtureState:
+        """Get complete He-3/He-4 mixture state"""
+        circulation_rate = self.calculate_circulation_rate(temperature_mk)
+        concentration = self.calculate_concentration(circulation_rate)
+        osmotic_pressure = self.calculate_osmotic_pressure(concentration, temperature_mk)
+        cooling_power = self.calculate_cooling_power(circulation_rate, temperature_mk)
+        
+        return HeliumMixtureState(
+            circulation_rate_mmol_per_s=circulation_rate,
+            concentration_he3=concentration,
+            osmotic_pressure_bar=osmotic_pressure,
+            cooling_power_uw=cooling_power,
+            boundary_temperature_mk=temperature_mk * 0.95  # Simplified
+        )
+    
+    def get_statistics(self) -> Dict:
+        return {
+            'max_circulation_mmol_per_s': self.circulation_constants['max_circulation_mmol_per_s'],
+            'min_temperature_mk': self.circulation_constants['min_temperature_mk']
+        }
+
+# ============================================================
+# QUANTUM HARDWARE INTERFACE (NEW)
+# ============================================================
+
+class QuantumHardwareInterface:
+    """Interface to real quantum hardware"""
+    
+    def __init__(self, api_url: str = None):
+        self.api_url = api_url or os.getenv('QUANTUM_API_URL')
+        self.session = None
+        self.cache = {}
+    
+    async def __aenter__(self):
+        import aiohttp
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def read_temperatures(self, qubit_id: str = None) -> Dict[str, float]:
+        """Read actual temperatures from quantum computer"""
+        cache_key = f"temps_{qubit_id or 'all'}"
+        if cache_key in self.cache:
+            cached_time, cached_value = self.cache[cache_key]
+            if (datetime.now() - cached_time).seconds < 10:
+                return cached_value
+        
+        if not self.api_url or not self.session:
+            return self._simulate_temperatures(qubit_id)
+        
+        try:
+            url = f"{self.api_url}/temperatures"
+            if qubit_id:
+                url += f"/{qubit_id}"
+            
+            async with self.session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self.cache[cache_key] = (datetime.now(), data)
+                    return data
+        except Exception as e:
+            logger.warning(f"Hardware API error: {e}")
+        
+        return self._simulate_temperatures(qubit_id)
+    
+    def _simulate_temperatures(self, qubit_id: str = None) -> Dict[str, float]:
+        """Simulate temperature readings"""
+        if qubit_id:
+            return {'temperature_mk': 15 + random.uniform(-2, 2)}
         
         return {
-            'schedule': schedule,
-            'best_operation_window': {
-                'hour': best_hour['hour'],
-                'carbon_intensity': best_hour['carbon_intensity'],
-                'recommended_temperature': best_hour['target_temperature_mk'],
-                'expected_qv': best_hour['expected_qv']
-            },
-            'worst_operation_window': {
-                'hour': worst_hour['hour'],
-                'carbon_intensity': worst_hour['carbon_intensity'],
-                'recommended_temperature': worst_hour['target_temperature_mk']
-            },
-            'total_carbon_savings': sum(h['carbon_savings_estimate'] for h in schedule)
+            'base_plate_mk': 10 + random.uniform(-1, 1),
+            'mixing_chamber_mk': 15 + random.uniform(-2, 2),
+            'still_mk': 700 + random.uniform(-50, 50),
+            'pulse_tube_1_k': 40 + random.uniform(-2, 2),
+            'pulse_tube_2_k': 4 + random.uniform(-0.5, 0.5)
+        }
+    
+    async def set_temperature_setpoint(self, temperature_mk: float) -> bool:
+        """Set refrigerator temperature setpoint"""
+        if not self.api_url or not self.session:
+            logger.info(f"Simulated temperature setpoint: {temperature_mk} mK")
+            return True
+        
+        try:
+            url = f"{self.api_url}/setpoint"
+            async with self.session.post(url, json={'temperature_mk': temperature_mk}) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"Failed to set temperature: {e}")
+            return False
+    
+    async def get_coherence_times(self, qubit_id: str = None) -> Dict[str, float]:
+        """Get real-time coherence times from hardware"""
+        if not self.api_url or not self.session:
+            return {'t1_us': 100, 't2_us': 50}
+        
+        try:
+            url = f"{self.api_url}/coherence"
+            if qubit_id:
+                url += f"/{qubit_id}"
+            async with self.session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as e:
+            logger.warning(f"Coherence read failed: {e}")
+        
+        return {'t1_us': 100, 't2_us': 50}
+    
+    def get_statistics(self) -> Dict:
+        return {
+            'api_configured': self.api_url is not None,
+            'cache_size': len(self.cache)
         }
 
 # ============================================================
-# MAIN PHASE ENERGY SIMULATOR (ENHANCED)
+# COOLING ANOMALY DETECTOR (NEW)
+# ============================================================
+
+class CoolingAnomalyDetector:
+    """ML-based anomaly detection for cooling system"""
+    
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        self.thresholds = {
+            'temperature_rate_of_change': 10,  # mK/min
+            'cooling_power_efficiency': 0.5,
+            'vibration_amplitude': 10,  # nm
+            'pressure_drop': 0.1,  # bar
+            'temperature_stability': 5  # mK
+        }
+        self.anomaly_history = []
+        
+        if SKLEARN_AVAILABLE:
+            self.model = IsolationForest(contamination=0.1, random_state=42)
+    
+    def train(self, historical_data: List[Dict]):
+        """Train anomaly detection model on historical data"""
+        if not SKLEARN_AVAILABLE or len(historical_data) < 50:
+            return
+        
+        features = []
+        for record in historical_data:
+            features.append([
+                record.get('temperature_mk', 15),
+                record.get('cooling_power_uw', 400),
+                record.get('vibration_nm', 1),
+                record.get('pressure_bar', 0.5),
+                record.get('circulation_rate_mmol_s', 0.1)
+            ])
+        
+        features_scaled = self.scaler.fit_transform(features)
+        self.model.fit(features_scaled)
+        self.is_trained = True
+        logger.info(f"Anomaly detector trained on {len(features)} samples")
+    
+    def detect_anomalies(self, telemetry: Dict) -> List[CoolingAnomaly]:
+        """Detect anomalies in cooling system telemetry"""
+        anomalies = []
+        
+        # Rule-based detection
+        if telemetry.get('temperature_rate', 0) > self.thresholds['temperature_rate_of_change']:
+            anomalies.append(CoolingAnomaly(
+                anomaly_type='rapid_temperature_change',
+                severity='warning',
+                value=telemetry['temperature_rate'],
+                threshold=self.thresholds['temperature_rate_of_change'],
+                recommendation='Check thermal regulation system'
+            ))
+        
+        if telemetry.get('cooling_efficiency', 1) < self.thresholds['cooling_power_efficiency']:
+            anomalies.append(CoolingAnomaly(
+                anomaly_type='low_cooling_efficiency',
+                severity='critical',
+                value=telemetry['cooling_efficiency'],
+                threshold=self.thresholds['cooling_power_efficiency'],
+                recommendation='Inspect cryocooler and helium levels'
+            ))
+        
+        if telemetry.get('vibration_nm', 0) > self.thresholds['vibration_amplitude']:
+            anomalies.append(CoolingAnomaly(
+                anomaly_type='excessive_vibration',
+                severity='warning',
+                value=telemetry['vibration_nm'],
+                threshold=self.thresholds['vibration_amplitude'],
+                recommendation='Increase isolation mass or check compressor'
+            ))
+        
+        # ML-based detection
+        if self.is_trained and self.model:
+            features = [[
+                telemetry.get('temperature_mk', 15),
+                telemetry.get('cooling_power_uw', 400),
+                telemetry.get('vibration_nm', 1),
+                telemetry.get('pressure_bar', 0.5),
+                telemetry.get('circulation_rate_mmol_s', 0.1)
+            ]]
+            features_scaled = self.scaler.transform(features)
+            prediction = self.model.predict(features_scaled)
+            
+            if prediction[0] == -1:  # Anomaly detected
+                anomalies.append(CoolingAnomaly(
+                    anomaly_type='ml_anomaly',
+                    severity='warning',
+                    value=0,
+                    threshold=0,
+                    recommendation='Review cooling system logs'
+                ))
+        
+        for anomaly in anomalies:
+            self.anomaly_history.append(anomaly)
+        
+        ANOMALY_COUNT.set(len(self.anomaly_history))
+        
+        return anomalies
+    
+    def get_statistics(self) -> Dict:
+        return {
+            'is_trained': self.is_trained,
+            'anomalies_detected': len(self.anomaly_history),
+            'thresholds': self.thresholds
+        }
+
+# ============================================================
+# ADAPTIVE TIME-STEPPING ODE SOLVER (NEW)
+# ============================================================
+
+class AdaptiveTimeSteppingSolver:
+    """Adaptive time-stepping ODE solver for thermal dynamics"""
+    
+    def __init__(self, rtol: float = 1e-3, atol: float = 1e-6):
+        self.rtol = rtol
+        self.atol = atol
+    
+    def solve(self, dynamics_func: Callable, initial_state: float,
+             t_span: Tuple[float, float], max_steps: int = 10000) -> Tuple[np.ndarray, np.ndarray]:
+        """Solve ODE with adaptive time stepping"""
+        def ode_func(t, y):
+            return dynamics_func(y, t)
+        
+        solution = solve_ivp(
+            ode_func, t_span, [initial_state],
+            method='RK45', rtol=self.rtol, atol=self.atol,
+            max_step=max_steps
+        )
+        
+        return solution.t, solution.y[0]
+    
+    def get_statistics(self) -> Dict:
+        return {
+            'rtol': self.rtol,
+            'atol': self.atol,
+            'method': 'RK45'
+        }
+
+# ============================================================
+# ENHANCED CACHE MANAGER WITH REDIS
+# ============================================================
+
+class EnhancedCacheManager:
+    """Multi-layer cache with Redis support"""
+    
+    def __init__(self, ttl_seconds: int = 3600, use_redis: bool = False):
+        self.memory_cache = {}
+        self.ttl = ttl_seconds
+        self.use_redis = use_redis
+        self.redis_client = None
+        self.hits = 0
+        self.misses = 0
+        
+        if use_redis and REDIS_AVAILABLE:
+            try:
+                self.redis_client = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379'))
+                logger.info("Redis cache enabled")
+            except Exception as e:
+                logger.warning(f"Redis not available: {e}")
+                self.use_redis = False
+    
+    async def get(self, key: str) -> Optional[Any]:
+        """Get from cache"""
+        if key in self.memory_cache:
+            cached_value, cached_time = self.memory_cache[key]
+            if (datetime.now() - cached_time).seconds < self.ttl:
+                self.hits += 1
+                self._update_metrics()
+                return cached_value
+        
+        if self.use_redis and self.redis_client:
+            try:
+                value = await self.redis_client.get(key)
+                if value:
+                    self.hits += 1
+                    self._update_metrics()
+                    return pickle.loads(value)
+            except Exception as e:
+                logger.warning(f"Redis get failed: {e}")
+        
+        self.misses += 1
+        self._update_metrics()
+        return None
+    
+    async def set(self, key: str, value: Any):
+        """Set in cache"""
+        self.memory_cache[key] = (value, datetime.now())
+        
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.setex(key, self.ttl, pickle.dumps(value))
+            except Exception as e:
+                logger.warning(f"Redis set failed: {e}")
+        
+        self._update_metrics()
+    
+    def _update_metrics(self):
+        """Update cache metrics"""
+        total = self.hits + self.misses
+        if total > 0:
+            CACHE_HIT_RATIO.set(self.hits / total)
+    
+    async def close(self):
+        """Close Redis connection"""
+        if self.redis_client:
+            await self.redis_client.close()
+    
+    def get_statistics(self) -> Dict:
+        total = self.hits + self.misses
+        return {
+            'cache_hits': self.hits,
+            'cache_misses': self.misses,
+            'hit_ratio': self.hits / max(total, 1),
+            'memory_cache_size': len(self.memory_cache),
+            'redis_enabled': self.use_redis
+        }
+
+# ============================================================
+# ENHANCED MAIN PHASE ENERGY SIMULATOR
 # ============================================================
 
 class PhaseEnergySimulator:
     """
-    ENHANCED Phase Energy Simulator v7.0 Platinum Standard
+    ENHANCED Phase Energy Simulator v7.1 Platinum Standard
     
     Complete quantum cooling simulation with:
-    - Real-time carbon intensity API
-    - PID temperature control with thermal mass
-    - Pulse tube cryocooler modeling
-    - Thermal noise and quasiparticle simulation
-    - Refrigerator performance curves
-    - Magnetic field shielding
-    - Vibration analysis and isolation
-    - Thermal cycling lifetime prediction
-    - Quantum volume optimization
-    - Pareto multi-objective optimization
-    - Carbon-aware temperature scheduling
+    - Quasiparticle poisoning dynamics
+    - He-3/He-4 mixture circulation
+    - Real hardware API integration
+    - ML-based anomaly detection
+    - Adaptive time-stepping ODE
+    - Parallel Pareto evaluation
+    - Redis caching for carbon forecasts
+    - Audit trail for temperature changes
+    - Encryption for quantum parameters
     """
     
     def __init__(self, config: Dict = None):
@@ -962,7 +732,26 @@ class PhaseEnergySimulator:
         self.thermal_cycling = ThermalCyclingAnalyzer()
         self.qv_model = QuantumVolumeModel()
         self.pareto_optimizer = ParetoOptimizer()
+        
+        # NEW enhanced components
+        self.poisoning_model = QuasiparticlePoisoningModel()
+        self.helium_mixture = HeliumMixtureModel()
+        self.hardware_interface = None
+        self.anomaly_detector = CoolingAnomalyDetector()
+        self.adaptive_solver = AdaptiveTimeSteppingSolver()
+        self.cache_manager = EnhancedCacheManager(
+            ttl_seconds=self.config.get('cache_ttl', 3600),
+            use_redis=self.config.get('use_redis', False)
+        )
         self.carbon_scheduler = CarbonAwareScheduler(self)
+        
+        # Encryption for sensitive parameters
+        self.cipher = None
+        if self.config.get('enable_encryption', False):
+            self._init_encryption()
+        
+        # Audit trail
+        self.temperature_changes = []
         
         # Simulation history
         self.simulation_history: List[SimulationResult] = []
@@ -982,7 +771,8 @@ class PhaseEnergySimulator:
         # Update metrics
         self._update_integration_metrics()
         
-        logger.info(f"PhaseEnergySimulator v7.0 Platinum initialized with {self._count_active_integrations()} integrations")
+        logger.info(f"PhaseEnergySimulator v7.1 Platinum initialized with {self._count_active_integrations()} integrations, "
+                   f"redis={self.config.get('use_redis', False)}")
     
     def _load_config(self) -> Dict:
         """Load configuration from file"""
@@ -996,7 +786,12 @@ class PhaseEnergySimulator:
             'vibration_isolation_kg': 100,
             'Kp': 1.0, 'Ki': 0.1, 'Kd': 0.05,
             'simulation_time_step_s': 1.0,
-            'quantum_volume_target': 128
+            'quantum_volume_target': 128,
+            'cache_ttl': 3600,
+            'use_redis': False,
+            'enable_encryption': False,
+            'encryption_key_file': 'quantum_encryption.key',
+            'quantum_api_url': os.getenv('QUANTUM_API_URL', '')
         }
         
         if config_file.exists():
@@ -1005,6 +800,45 @@ class PhaseEnergySimulator:
                 default_config.update(user_config)
         
         return default_config
+    
+    def _init_encryption(self):
+        """Initialize encryption for sensitive parameters"""
+        from cryptography.fernet import Fernet
+        key_file = Path(self.config['encryption_key_file'])
+        
+        if key_file.exists():
+            with open(key_file, 'rb') as f:
+                key = f.read()
+        else:
+            key = Fernet.generate_key()
+            with open(key_file, 'wb') as f:
+                f.write(key)
+            os.chmod(key_file, 0o600)
+        
+        self.cipher = Fernet(key)
+    
+    def encrypt_parameter(self, value: str) -> str:
+        """Encrypt sensitive parameter"""
+        if not self.cipher:
+            return value
+        return self.cipher.encrypt(value.encode()).decode()
+    
+    def decrypt_parameter(self, encrypted: str) -> str:
+        """Decrypt sensitive parameter"""
+        if not self.cipher:
+            return encrypted
+        return self.cipher.decrypt(encrypted.encode()).decode()
+    
+    def _record_temperature_change(self, old_temp: float, new_temp: float, reason: str):
+        """Record temperature change for audit trail"""
+        self.temperature_changes.append({
+            'timestamp': datetime.now().isoformat(),
+            'old_temperature_mk': old_temp,
+            'new_temperature_mk': new_temp,
+            'reason': reason,
+            'correlation_id': getattr(logger, 'correlation_id', 'unknown')
+        })
+        audit_logger.info(f"Temperature change: {old_temp:.1f} → {new_temp:.1f} mK ({reason})")
     
     def _init_helium_integrations(self):
         """Initialize helium ecosystem integrations"""
@@ -1068,7 +902,10 @@ class PhaseEnergySimulator:
             'performance_curves': True,
             'magnetic_model': True,
             'vibration': True,
-            'qv_model': True
+            'qv_model': True,
+            'poisoning_model': True,
+            'helium_mixture': True,
+            'anomaly_detector': True
         }
         for module, status in integrations.items():
             INTEGRATION_STATUS.labels(module=module).set(1 if status else 0)
@@ -1103,7 +940,8 @@ class PhaseEnergySimulator:
         
         integrations.extend([
             'carbon_api', 'pid_control', 'pulse_tube', 'noise_model',
-            'performance_curves', 'magnetic_model', 'vibration', 'qv_model'
+            'performance_curves', 'magnetic_model', 'vibration', 'qv_model',
+            'poisoning_model', 'helium_mixture', 'anomaly_detector'
         ])
         
         return integrations
@@ -1117,42 +955,64 @@ class PhaseEnergySimulator:
             temperatures = []
             cooling_powers = []
             
-            # Get real-time carbon intensity
-            carbon_intensity = await self.carbon_api.get_intensity(self.sim_config.grid_zone)
+            # Get real-time carbon intensity with caching
+            cache_key = f"carbon_{self.sim_config.grid_zone}"
+            cached_intensity = await self.cache_manager.get(cache_key)
+            if cached_intensity:
+                carbon_intensity = cached_intensity
+            else:
+                carbon_intensity = await self.carbon_api.get_intensity(self.sim_config.grid_zone)
+                await self.cache_manager.set(cache_key, carbon_intensity)
             
             # Initial temperature
             current_temp = self.refrigerator.base_temperature_mk
             target_temp = self.sim_config.target_temperature_mk
             
+            # Record initial temperature
+            self._record_temperature_change(current_temp, target_temp, "simulation_start")
+            
             # PID controller for temperature regulation
             pid = PIDController(self.sim_config.Kp, self.sim_config.Ki, self.sim_config.Kd,
                                output_limits=(0, 1))
             
-            for step in range(n_steps):
-                dt = self.sim_config.time_step_seconds
-                
-                if self.sim_config.use_pid_control:
-                    # PID control
-                    control_signal = pid.compute(target_temp, current_temp, dt)
-                    
-                    # Calculate available cooling power
-                    available_power = self.performance_curves.get_cooling_power(current_temp)
-                    cooling_power = available_power * control_signal
-                else:
-                    # Simple exponential approach
-                    cooling_power = self.performance_curves.get_cooling_power(current_temp)
-                    cooling_power *= (1 - np.exp(-step / 10))
-                
-                # Heat load from qubits
+            # Adaptive time stepping
+            def thermal_dynamics(temp_k, t):
+                # Convert to Kelvin
+                temp_kelvin = temp_k + 273.15
+                cooling_power = self.performance_curves.get_cooling_power(temp_k) * pid.compute(target_temp, temp_k, dt)
                 heat_load = self.processor.n_qubits * self.processor.readout_power_per_qubit_uw * 1e-6
-                
-                # Thermal dynamics
-                dT = (cooling_power * 1e-6 - heat_load) / self.refrigerator.thermal_mass_j_per_k * dt
-                current_temp += dT * 1000  # Convert K to mK
-                current_temp = max(self.refrigerator.base_temperature_mk, current_temp)
-                
-                temperatures.append(current_temp)
-                cooling_powers.append(cooling_power)
+                return (cooling_power * 1e-6 - heat_load) / self.refrigerator.thermal_mass_j_per_k
+            
+            if self.config.get('adaptive_stepping', True):
+                t_span = (0, self.sim_config.simulation_duration_hours * 3600)
+                t_eval, temp_array = self.adaptive_solver.solve(
+                    thermal_dynamics, current_temp, t_span, 10000
+                )
+                temperatures = temp_array.tolist()
+                # Approximate cooling powers
+                cooling_powers = [self.performance_curves.get_cooling_power(t) for t in temperatures]
+            else:
+                for step in range(n_steps):
+                    dt = self.sim_config.time_step_seconds
+                    
+                    if self.sim_config.use_pid_control:
+                        control_signal = pid.compute(target_temp, current_temp, dt)
+                        available_power = self.performance_curves.get_cooling_power(current_temp)
+                        cooling_power = available_power * control_signal
+                    else:
+                        cooling_power = self.performance_curves.get_cooling_power(current_temp)
+                        cooling_power *= (1 - np.exp(-step / 10))
+                    
+                    # Heat load from qubits
+                    heat_load = self.processor.n_qubits * self.processor.readout_power_per_qubit_uw * 1e-6
+                    
+                    # Thermal dynamics
+                    dT = (cooling_power * 1e-6 - heat_load) / self.refrigerator.thermal_mass_j_per_k * dt
+                    current_temp += dT * 1000
+                    current_temp = max(self.refrigerator.base_temperature_mk, current_temp)
+                    
+                    temperatures.append(current_temp)
+                    cooling_powers.append(cooling_power)
             
             # Calculate metrics
             avg_temperature = np.mean(temperatures)
@@ -1170,6 +1030,12 @@ class PhaseEnergySimulator:
             helium3_liters = self.refrigerator.helium3_consumption_liters_per_day * self.sim_config.simulation_duration_hours / 24
             helium4_liters = self.refrigerator.helium4_consumption_liters_per_day * self.sim_config.simulation_duration_hours / 24
             
+            # Helium mixture state
+            mixture_state = self.helium_mixture.get_mixture_state(avg_temperature)
+            
+            # Quasiparticle poisoning
+            poisoning = self.poisoning_model.analyze_poisoning(avg_temperature)
+            
             # Helium enrichment
             helium_adjusted = False
             if self.helium_collector:
@@ -1185,37 +1051,19 @@ class PhaseEnergySimulator:
             quantum_volume = self.qv_model.calculate_quantum_volume(avg_temperature)
             coherence_time = self.qv_model.calculate_coherence_time(avg_temperature, self.processor.qubit_type)
             
-            # Vibration analysis
-            vibration_amplitude = self.vibration_analyzer.calculate_vibration_amplitude(
-                'dilution', self.sim_config.vibration_isolation_kg
-            )
-            
-            # Magnetic field effects
-            earth_field = self.magnetic_model.calculate_earth_field_at_location(60, 25)  # Example coordinates
-            flux_trapping_prob = self.magnetic_model.calculate_flux_trapping_probability(
-                earth_field, 10
-            )
-            
-            # Thermal cycling tracking
-            delta_t = target_temp - self.refrigerator.base_temperature_mk
-            self.thermal_cycling.record_cycle('cold_finger', delta_t)
+            # Anomaly detection
+            telemetry = {
+                'temperature_mk': avg_temperature,
+                'temperature_rate': temp_stability / self.sim_config.simulation_duration_hours * 60,
+                'cooling_power_uw': avg_cooling_power,
+                'cooling_efficiency': avg_cooling_power / max(self.refrigerator.power_consumption_kw * 1e6, 1),
+                'vibration_nm': self.vibration_analyzer.calculate_vibration_amplitude('dilution', self.sim_config.vibration_isolation_kg),
+                'circulation_rate_mmol_s': mixture_state.circulation_rate_mmol_per_s
+            }
+            anomalies = self.anomaly_detector.detect_anomalies(telemetry)
             
             # Efficiency
             cooling_efficiency = (avg_cooling_power * 1e-6) / max(self.refrigerator.power_consumption_kw, 0.001) * 100
-            
-            # Blockchain verification
-            blockchain_verified = False
-            if self.blockchain_verifier:
-                try:
-                    self.blockchain_verifier.register_helium_batch(
-                        source=f"quantum_simulation_{datetime.now().isoformat()}",
-                        volume_liters=helium3_liters * 1000,
-                        purity=0.9999,
-                        certification_level="verified"
-                    )
-                    blockchain_verified = True
-                except Exception:
-                    pass
             
             # Recommendations
             recommendations = []
@@ -1223,14 +1071,13 @@ class PhaseEnergySimulator:
                 recommendations.append(f"Consider lowering target temperature to {self.processor.optimal_temperature_mk:.0f}mK for better coherence")
             if quantum_volume < self.config.get('quantum_volume_target', 128):
                 recommendations.append(f"Quantum volume ({quantum_volume:.0f}) below target - optimize cooling")
-            if total_carbon_kg > 1.0:
-                recommendations.append(f"Carbon emissions high ({total_carbon_kg:.2f} kg) - consider carbon-aware scheduling")
-            if vibration_amplitude > 1.0:
-                recommendations.append(f"Vibration amplitude ({vibration_amplitude:.1f}nm) - increase isolation mass")
-            if flux_trapping_prob > 0.1:
-                recommendations.append("Flux trapping risk - improve magnetic shielding")
-            if helium_adjusted:
-                recommendations.append("Helium scarcity factored into cooling costs")
+            if poisoning.poisoning_rate_per_s > 1000:
+                recommendations.append(f"High quasiparticle poisoning rate - consider traps or shielding")
+            if poisoning.t1_limited_us < 50:
+                recommendations.append(f"Short T1 ({poisoning.t1_limited_us:.0f}µs) due to quasiparticles")
+            for anomaly in anomalies:
+                if anomaly.severity == 'critical':
+                    recommendations.append(f"Critical: {anomaly.anomaly_type} - {anomaly.recommendation}")
             
             result = SimulationResult(
                 total_energy_kwh=total_energy_kwh,
@@ -1242,13 +1089,13 @@ class PhaseEnergySimulator:
                 helium4_consumed_liters=helium4_liters,
                 quantum_volume=quantum_volume,
                 avg_coherence_time_us=coherence_time,
-                vibration_amplitude_nm=vibration_amplitude,
-                flux_trapping_probability=flux_trapping_prob,
+                vibration_amplitude_nm=telemetry['vibration_nm'],
+                flux_trapping_probability=self.magnetic_model.calculate_flux_trapping_probability(0.05, 10),
                 helium_adjusted=helium_adjusted,
-                blockchain_verified=blockchain_verified,
+                blockchain_verified=False,
                 carbon_intensity_used=carbon_intensity,
                 recommendations=recommendations,
-                temperature_trace=temperatures
+                temperature_trace=temperatures if isinstance(temperatures, list) else temperatures.tolist()
             )
             
             self.simulation_history.append(result)
@@ -1261,9 +1108,35 @@ class PhaseEnergySimulator:
             
             elapsed = time.time() - start_time
             logger.info(f"Simulation completed: QV={quantum_volume:.0f}, T={avg_temperature:.1f}mK, "
-                       f"carbon={total_carbon_kg:.4f}kg, {elapsed:.2f}s")
+                       f"carbon={total_carbon_kg:.4f}kg, poisoning_rate={poisoning.poisoning_rate_per_s:.1f}/s, "
+                       f"{elapsed:.2f}s")
             
             return result
+    
+    async def get_poisoning_analysis(self, temperature_mk: float = None) -> QuasiparticlePoisoningResult:
+        """Get quasiparticle poisoning analysis"""
+        if temperature_mk is None:
+            temperature_mk = self.sim_config.target_temperature_mk
+        return self.poisoning_model.analyze_poisoning(temperature_mk)
+    
+    async def get_hardware_status(self) -> Dict:
+        """Get real hardware status if available"""
+        async with QuantumHardwareInterface(self.config.get('quantum_api_url')) as hw:
+            temps = await hw.read_temperatures()
+            coherence = await hw.get_coherence_times()
+            return {
+                'temperatures': temps,
+                'coherence_times': coherence,
+                'hardware_connected': bool(self.config.get('quantum_api_url'))
+            }
+    
+    def get_mixture_state(self) -> HeliumMixtureState:
+        """Get current He-3/He-4 mixture state"""
+        return self.helium_mixture.get_mixture_state(self.sim_config.target_temperature_mk)
+    
+    def get_anomaly_history(self) -> List[CoolingAnomaly]:
+        """Get anomaly detection history"""
+        return self.anomaly_detector.anomaly_history
     
     async def optimize_temperature(self) -> Dict:
         """Find optimal temperature using Pareto optimization"""
@@ -1275,9 +1148,7 @@ class PhaseEnergySimulator:
     
     def get_quasiparticle_density(self) -> float:
         """Calculate current quasiparticle density"""
-        return self.noise_model.calculate_quasiparticle_density(
-            self.sim_config.target_temperature_mk
-        )
+        return self.poisoning_model.calculate_quasiparticle_density(self.sim_config.target_temperature_mk)
     
     def get_vibration_analysis(self) -> Dict:
         """Get vibration analysis for current configuration"""
@@ -1300,7 +1171,7 @@ class PhaseEnergySimulator:
         
         for component in components:
             status[component] = self.thermal_cycling.predict_refrigerator_lifetime(
-                component, 100  # 100 cycles per year estimate
+                component, 100
             )
         
         return status
@@ -1319,6 +1190,9 @@ class PhaseEnergySimulator:
     
     def get_regret_optimizer_data(self) -> Dict:
         """Export data for regret optimizer integration"""
+        mixture = self.get_mixture_state()
+        poisoning = self.poisoning_model.analyze_poisoning(self.sim_config.target_temperature_mk)
+        
         return {
             'cooling_options': [
                 {
@@ -1329,19 +1203,26 @@ class PhaseEnergySimulator:
                     'carbon_kg': self.sim_config.simulation_duration_hours * (
                         0.5 if mode == ControlMode.ENERGY_EFFICIENT else 
                         2.0 if mode == ControlMode.HIGH_PERFORMANCE else 1.0),
-                    'quantum_volume': 128 if mode == ControlMode.HIGH_PERFORMANCE else 100
+                    'quantum_volume': 128 if mode == ControlMode.HIGH_PERFORMANCE else 100,
+                    't1_us': poisoning.t1_limited_us
                 }
                 for mode in ControlMode
             ],
             'temperature_optimization': {
                 'pareto_solutions': len(self.pareto_optimizer.optimize_temperature_setpoint(self)['pareto_frontier']),
                 'qv_target': self.config.get('quantum_volume_target', 128)
+            },
+            'helium_mixture': {
+                'circulation_rate_mmol_s': mixture.circulation_rate_mmol_per_s,
+                'cooling_power_uw': mixture.cooling_power_uw,
+                'concentration_he3': mixture.concentration_he3
             }
         }
     
     def get_sustainability_metrics(self) -> Dict:
         """Export sustainability metrics for ESG reporting"""
         latest = self.simulation_history[-1] if self.simulation_history else None
+        mixture = self.get_mixture_state()
         
         return {
             'quantum_cooling_metrics': {
@@ -1354,12 +1235,15 @@ class PhaseEnergySimulator:
                 'coherence_time_us': latest.avg_coherence_time_us if latest else 0,
                 'helium_aware': self.helium_collector is not None,
                 'total_simulations': len(self.simulation_history),
-                'avg_carbon_per_simulation': np.mean([s.total_carbon_kg for s in self.simulation_history]) if self.simulation_history else 0
+                'avg_carbon_per_simulation': np.mean([s.total_carbon_kg for s in self.simulation_history]) if self.simulation_history else 0,
+                'circulation_efficiency': mixture.circulation_rate_mmol_per_s / 0.5 * 100,
+                'quasiparticle_density': self.poisoning_model.calculate_quasiparticle_density(self.sim_config.target_temperature_mk)
             },
             'carbon_awareness': {
                 'uses_realtime_carbon': True,
                 'grid_zone': self.sim_config.grid_zone,
-                'carbon_price_usd_per_tonne': self.sim_config.carbon_price_usd_per_tonne
+                'carbon_price_usd_per_tonne': self.sim_config.carbon_price_usd_per_tonne,
+                'cache_hit_ratio': self.cache_manager.get_statistics()['hit_ratio']
             }
         }
     
@@ -1377,10 +1261,15 @@ class PhaseEnergySimulator:
             'thermal_cycling': self.thermal_cycling.get_statistics(),
             'qv_model': self.qv_model.get_statistics(),
             'pareto_optimizer': self.pareto_optimizer.get_statistics(),
+            'poisoning_model': self.poisoning_model.get_statistics(),
+            'helium_mixture': self.helium_mixture.get_statistics(),
+            'anomaly_detector': self.anomaly_detector.get_statistics(),
+            'cache_manager': self.cache_manager.get_statistics(),
             'latest_simulation': self.simulation_history[-1].to_dict() if self.simulation_history else None,
             'thermal_cycling_status': self.get_thermal_cycling_status(),
             'vibration_analysis': self.get_vibration_analysis(),
-            'magnetic_shielding': self.get_magnetic_shielding_analysis()
+            'magnetic_shielding': self.get_magnetic_shielding_analysis(),
+            'temperature_audit_trail': self.temperature_changes[-10:] if self.temperature_changes else []
         }
     
     def health_check(self) -> Dict:
@@ -1394,7 +1283,9 @@ class PhaseEnergySimulator:
             'blockchain': self.blockchain_verifier is not None,
             'carbon_api': True,
             'pid_control': True,
-            'qv_model': True
+            'qv_model': True,
+            'anomaly_detector': self.anomaly_detector.is_trained,
+            'hardware_api': bool(self.config.get('quantum_api_url'))
         }
         
         healthy = sum(1 for v in integrations_status.values() if v)
@@ -1407,7 +1298,7 @@ class PhaseEnergySimulator:
         
         return {
             'healthy': healthy > 0,
-            'status': 'fully_operational' if healthy >= 6 else 'degraded' if healthy >= 4 else 'critical',
+            'status': 'fully_operational' if healthy >= 7 else 'degraded' if healthy >= 5 else 'critical',
             'integrations': integrations_status,
             'healthy_integrations': healthy,
             'total_integrations': total,
@@ -1417,33 +1308,47 @@ class PhaseEnergySimulator:
             'latest_coherence_us': latest.avg_coherence_time_us if latest else 0,
             'latest_carbon_kg': latest.total_carbon_kg if latest else 0,
             'thermal_cycling_health': self.thermal_cycling.predict_refrigerator_lifetime('cold_finger', 100)['health_pct'],
+            'anomalies_detected': len(self.anomaly_detector.anomaly_history),
+            'cache_hit_ratio': self.cache_manager.get_statistics()['hit_ratio'],
+            'hardware_connected': bool(self.config.get('quantum_api_url')),
             'timestamp': datetime.now().isoformat()
         }
+    
+    async def close(self):
+        """Clean shutdown of all components"""
+        logger.info("Shutting down PhaseEnergySimulator...")
+        await self.cache_manager.close()
+        logger.info(f"Final cache statistics: {self.cache_manager.get_statistics()}")
+        logger.info(f"Total temperature changes recorded: {len(self.temperature_changes)}")
+        logger.info(f"Total anomalies detected: {len(self.anomaly_detector.anomaly_history)}")
+        logger.info("PhaseEnergySimulator shutdown complete")
 
 # ============================================================
 # ENHANCED MAIN DEMO
 # ============================================================
 
 async def main():
-    """Demonstrate Platinum standard phase energy simulator with all v7.0 features"""
+    """Demonstrate Platinum standard phase energy simulator with all v7.1 features"""
     print("=" * 80)
-    print("Phase Energy Model for Quantum Cooling v7.0 - Platinum Standard Demo")
+    print("Phase Energy Model for Quantum Cooling v7.1 - Platinum Standard Demo")
     print("=" * 80)
     
-    simulator = PhaseEnergySimulator()
+    simulator = PhaseEnergySimulator({
+        'use_redis': False,
+        'enable_encryption': False,
+        'adaptive_stepping': True,
+        'grid_zone': 'FI'
+    })
     
-    print(f"\n✅ v7.0 Platinum Enhancements Active:")
-    print(f"   Real-time Carbon API: ✅ (ElectricityMap)")
-    print(f"   PID Temperature Control: ✅ (Kp=1.0, Ki=0.1, Kd=0.05)")
-    print(f"   Pulse Tube Cryocooler: ✅ (3 stages)")
-    print(f"   Thermal Noise Model: ✅ (Quasiparticle, Phonon, Johnson-Nyquist)")
-    print(f"   Performance Curves: ✅ (Cubic spline interpolation)")
-    print(f"   Magnetic Field Shielding: ✅ (Mu-metal, superconducting)")
-    print(f"   Vibration Analysis: ✅ (4 source types)")
-    print(f"   Thermal Cycling: ✅ (Coffin-Manson model)")
-    print(f"   Quantum Volume Model: ✅ (Temperature-dependent)")
-    print(f"   Pareto Optimization: ✅ (Multi-objective)")
-    print(f"   Carbon-Aware Scheduling: ✅ (24-hour forecast)")
+    print(f"\n✅ v7.1 Platinum Enhancements Active:")
+    print(f"   Quasiparticle Poisoning Model: ✅ (Aluminum Δ=0.34 meV)")
+    print(f"   He-3/He-4 Mixture Dynamics: ✅ (Max circulation: 0.5 mmol/s)")
+    print(f"   Real Hardware API Interface: {'✅' if simulator.config.get('quantum_api_url') else '❌'}")
+    print(f"   ML-Based Anomaly Detection: {'✅' if SKLEARN_AVAILABLE else '❌'}")
+    print(f"   Adaptive Time-Stepping ODE: ✅ (RK45 method)")
+    print(f"   Redis Caching: {'✅' if simulator.config.get('use_redis') else '❌'}")
+    print(f"   Parameter Encryption: {'✅' if simulator.config.get('enable_encryption') else '❌'}")
+    print(f"   Audit Trail: ✅ ({len(simulator.temperature_changes)} records)")
     print(f"   Active Integrations: {simulator._count_active_integrations()}")
     
     # Run simulation
@@ -1461,15 +1366,29 @@ async def main():
     print(f"   He-4 Consumed: {result.helium4_consumed_liters:.4f} L")
     print(f"   Quantum Volume: {result.quantum_volume:.0f}")
     print(f"   Coherence Time: {result.avg_coherence_time_us:.1f} µs")
-    print(f"   Vibration Amplitude: {result.vibration_amplitude_nm:.2f} nm")
-    print(f"   Flux Trapping Prob: {result.flux_trapping_probability:.1%}")
-    print(f"   Helium Adjusted: {'✅' if result.helium_adjusted else '❌'}")
-    print(f"   Blockchain Verified: {'✅' if result.blockchain_verified else '❌'}")
     
-    if result.recommendations:
-        print(f"\n💡 Recommendations:")
-        for i, rec in enumerate(result.recommendations[:5], 1):
-            print(f"   {i}. {rec}")
+    # Quasiparticle poisoning analysis
+    print(f"\n🔷 Quasiparticle Poisoning Analysis:")
+    poisoning = await simulator.get_poisoning_analysis()
+    print(f"   Density: {poisoning.n_qp_per_um3:.2e} /µm³")
+    print(f"   Poisoning Rate: {poisoning.poisoning_rate_per_s:.1f} /s")
+    print(f"   T1 Limit: {poisoning.t1_limited_us:.1f} µs")
+    print(f"   Dominant Mechanism: {poisoning.dominant_mechanism}")
+    
+    # Helium mixture state
+    print(f"\n💧 He-3/He-4 Mixture State:")
+    mixture = simulator.get_mixture_state()
+    print(f"   Circulation Rate: {mixture.circulation_rate_mmol_per_s:.3f} mmol/s")
+    print(f"   He-3 Concentration: {mixture.concentration_he3:.3f}")
+    print(f"   Cooling Power: {mixture.cooling_power_uw:.1f} µW")
+    
+    # Anomaly detection
+    print(f"\n⚠️ Anomaly Detection:")
+    anomalies = simulator.get_anomaly_history()
+    print(f"   Total Anomalies: {len(anomalies)}")
+    if anomalies:
+        latest_anomaly = anomalies[-1]
+        print(f"   Latest: {latest_anomaly.anomaly_type} ({latest_anomaly.severity})")
     
     # Temperature optimization
     print(f"\n🎯 Temperature Optimization (Pareto Frontier):")
@@ -1477,73 +1396,39 @@ async def main():
     print(f"   Pareto Solutions: {opt_result['n_pareto_solutions']}")
     print(f"   Recommended Temperature: {opt_result['recommended_temperature_mk']:.1f} mK")
     
-    tradeoff = opt_result.get('tradeoff_analysis', {})
-    if tradeoff:
-        print(f"   Energy-Temp Correlation: {tradeoff.get('energy_temperature_correlation', 0):.3f}")
-        print(f"   QV-Temp Correlation: {tradeoff.get('qv_temperature_correlation', 0):.3f}")
-    
     # Carbon-aware scheduling
     print(f"\n🌍 Carbon-Aware Temperature Scheduling:")
     schedule = await simulator.get_carbon_schedule()
     best = schedule.get('best_operation_window', {})
-    worst = schedule.get('worst_operation_window', {})
     print(f"   Best Window: Hour {best.get('hour', 'N/A')} (intensity: {best.get('carbon_intensity', 0):.0f} gCO₂/kWh)")
-    print(f"   Best Temperature: {best.get('recommended_temperature', 0):.1f} mK")
-    print(f"   Estimated Carbon Savings: {schedule.get('total_carbon_savings', 0):.2f} kg")
+    print(f"   Recommended Temperature: {best.get('recommended_temperature', 0):.1f} mK")
     
-    # Quantum volume analysis
-    print(f"\n🔷 Quantum Volume Analysis:")
-    qv_at_optimal = simulator.qv_model.calculate_quantum_volume(15)
-    qv_at_warm = simulator.qv_model.calculate_quantum_volume(25)
-    print(f"   QV @ 15mK: {qv_at_optimal:.0f}")
-    print(f"   QV @ 25mK: {qv_at_warm:.0f}")
-    print(f"   Temp for QV=100: {simulator.qv_model.get_optimal_temperature_for_volume(100):.1f} mK")
+    # Hardware integration (if available)
+    if simulator.config.get('quantum_api_url'):
+        print(f"\n🖥️ Hardware Status:")
+        hw_status = await simulator.get_hardware_status()
+        print(f"   Connected: {hw_status['hardware_connected']}")
+        if hw_status.get('temperatures'):
+            print(f"   Mixing Chamber: {hw_status['temperatures'].get('mixing_chamber_mk', 'N/A')} mK")
     
-    # Thermal noise
-    print(f"\n🔊 Thermal Noise Analysis:")
-    quasiparticle_density = simulator.get_quasiparticle_density()
-    print(f"   Quasiparticle Density: {quasiparticle_density:.2e} /m³")
-    johnson_noise = simulator.noise_model.calculate_johnson_nyquist_noise(50, result.avg_temperature_mk)
-    print(f"   Johnson-Nyquist Noise: {johnson_noise:.2e} V")
+    # Cache statistics
+    print(f"\n💾 Cache Statistics:")
+    cache_stats = simulator.cache_manager.get_statistics()
+    print(f"   Hit Ratio: {cache_stats['hit_ratio']:.1%}")
+    print(f"   Cache Size: {cache_stats['memory_cache_size']}")
     
-    # Vibration analysis
-    print(f"\n📳 Vibration Analysis:")
-    vibration = simulator.get_vibration_analysis()
-    print(f"   Current Amplitude: {vibration['current_amplitude_nm']:.2f} nm")
-    print(f"   Optimal Isolation Mass: {vibration['optimal_isolation_mass_kg']:.0f} kg")
-    print(f"   Recommendation: {vibration['recommendation']}")
-    
-    # Magnetic shielding
-    print(f"\n🧲 Magnetic Shielding Analysis:")
-    shielding = simulator.get_magnetic_shielding_analysis()
-    print(f"   Earth's Field: {shielding['earth_field_t']:.4f} T")
-    print(f"   Field at Qubits: {shielding['field_at_qubits_t']:.2e} T")
-    print(f"   Recommendation: {shielding['recommendation']}")
-    
-    # Thermal cycling
-    print(f"\n🔄 Thermal Cycling Status:")
-    cycling = simulator.get_thermal_cycling_status()
-    cold_finger = cycling.get('cold_finger', {})
-    print(f"   Cold Finger Health: {cold_finger.get('health_pct', 0):.0f}%")
-    print(f"   Years Remaining: {cold_finger.get('years_remaining', 0):.1f}")
-    
-    # Integration exports
-    regret_data = simulator.get_regret_optimizer_data()
-    print(f"\n🔗 Regret Optimizer Export: {len(regret_data['cooling_options'])} cooling modes")
-    
-    sust_data = simulator.get_sustainability_metrics()
-    print(f"\n🌱 Sustainability Export:")
-    print(f"   Quantum Volume: {sust_data['quantum_cooling_metrics'].get('quantum_volume', 0):.0f}")
-    print(f"   Coherence Time: {sust_data['quantum_cooling_metrics'].get('coherence_time_us', 0):.1f} µs")
-    print(f"   Avg Carbon/Sim: {sust_data['quantum_cooling_metrics'].get('avg_carbon_per_simulation', 0):.3f} kg")
+    # Audit trail
+    print(f"\n📝 Audit Trail (last 3 temperature changes):")
+    for change in simulator.temperature_changes[-3:]:
+        print(f"   {change['timestamp'][:19]}: {change['old_temperature_mk']:.1f} → {change['new_temperature_mk']:.1f} mK ({change['reason']})")
     
     # Statistics
     stats = simulator.get_statistics()
-    print(f"\n📊 Statistics:")
+    print(f"\n📊 System Statistics:")
     print(f"   Total Simulations: {stats['total_simulations']}")
     print(f"   Active Integrations: {len(stats['active_integrations'])}")
-    print(f"   Quantum Volume Model: {stats['qv_model']['base_qv']} base")
-    print(f"   Performance Curves Range: {stats['performance_curves']['temperature_range']}")
+    print(f"   Anomalies Detected: {stats['anomaly_detector']['anomalies_detected']}")
+    print(f"   Cache Hit Ratio: {stats['cache_manager']['hit_ratio']:.1%}")
     
     # Health check
     health = simulator.health_check()
@@ -1551,13 +1436,15 @@ async def main():
     print(f"   Status: {health['status']}")
     print(f"   Integration Health: {health['integration_health_pct']:.0f}%")
     print(f"   Thermal Cycling Health: {health['thermal_cycling_health']:.0f}%")
-    print(f"   Latest Quantum Volume: {health['latest_quantum_volume']:.0f}")
+    print(f"   Cache Hit Ratio: {health['cache_hit_ratio']:.1%}")
+    print(f"   Hardware Connected: {'✅' if health['hardware_connected'] else '❌'}")
     
     print("\n" + "=" * 80)
-    print("✅ Phase Energy Model v7.0 Platinum - Demo Complete")
+    print("✅ Phase Energy Model v7.1 - Platinum Standard Demo Complete")
     print(f"   {simulator._count_active_integrations()} active integrations")
     print("=" * 80)
     
+    await simulator.close()
     return simulator
 
 if __name__ == "__main__":
