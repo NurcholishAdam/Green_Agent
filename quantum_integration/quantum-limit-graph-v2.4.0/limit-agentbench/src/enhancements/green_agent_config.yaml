@@ -1,16 +1,29 @@
-# File: src/enhancements/green_agent_config.yaml
+# File: src/enhancements/green_agent_config.yaml (ENHANCED VERSION)
 
 # ============================================================
-# Green Agent Unified Configuration v6.1
+# Green Agent Unified Configuration v7.0
+# ============================================================
+# ENHANCEMENTS:
+# - Added GPU acceleration configuration
+# - Added Federated Learning configuration
+# - Added Fallback Manager configuration
+# - Added Export Engine configuration
+# - Added Perplexity API configuration
+# - Added validation constraints
+# - Added secrets management
+# - Added audit configuration
+# - Added performance optimization settings
+# - Added environment-specific overrides
 # ============================================================
 
 # System Configuration
 system:
   name: "Green Agent"
-  version: "6.1.0"
+  version: "7.0.0"
   environment: "production"  # development, staging, production
   log_level: "INFO"
   correlation_id_enabled: true
+  timezone: "UTC"
   
 # Paths
 paths:
@@ -19,9 +32,207 @@ paths:
   log_dir: "logs"
   model_dir: "models"
   blockchain_dir: "blockchain"
+  temp_dir: "/tmp/green_agent"
+  cache_dir: "./cache"
+  backup_dir: "./backups"
 
 # ============================================================
-# Helium Data Configuration
+# GPU Acceleration Configuration (NEW)
+# ============================================================
+
+gpu:
+  enabled: true
+  device_ids: [0]  # Multiple GPUs: [0, 1, 2, 3]
+  memory_fraction: 0.8  # Use 80% of GPU memory (0.1-0.95)
+  mixed_precision: true
+  stream_pool_size: 4
+  fallback_to_cpu: true
+  operation_timeout_seconds: 300
+  
+  operations:
+    matrix_multiply: true
+    convolution: true
+    batch_processing: true
+    elementwise_ops: true
+    reduce_ops: true
+    
+  monitoring:
+    track_temperature: true
+    track_utilization: true
+    track_memory: true
+
+# ============================================================
+# Federated Learning Configuration (NEW)
+# ============================================================
+
+federated_learning:
+  enabled: true
+  n_clients: 50
+  clients_per_round: 10
+  local_epochs: 5
+  batch_size: 32
+  learning_rate: 0.01
+  
+  aggregation:
+    method: "fed_avg"  # fed_avg, fed_prox, fed_adam, attention
+    fedprox_mu: 0.01  # Range: 0.001-0.1
+    
+  privacy:
+    differential_privacy: true
+    epsilon: 1.0  # Range: 0.1-10.0
+    delta: 1e-5
+    clip_norm: 1.0  # Range: 0.1-10.0
+    
+  communication:
+    compression_ratio: 0.1  # Range: 0.01-0.5
+    quantization: false
+    staleness_bound: 5
+    adaptive_weighting: true
+    
+  selection:
+    strategy: "carbon_aware"  # carbon_aware, helium_aware, compute_aware, network_aware
+    epsilon_greedy: 0.1
+    
+  checkpointing:
+    enabled: true
+    keep_last_n: 10
+    encrypt_checkpoints: false
+
+# ============================================================
+# Fallback Manager Configuration (NEW)
+# ============================================================
+
+fallback_manager:
+  enabled: true
+  max_retries: 3  # Range: 1-10
+  base_retry_delay: 1.0  # Seconds
+  use_jitter: true
+  max_delay: 30.0  # Seconds
+  
+  circuit_breaker:
+    failure_threshold: 5  # Range: 2-20
+    recovery_timeout: 60  # Seconds
+    half_open_max_requests: 3
+    enable_gradual_recovery: true
+    
+  load_shedding:
+    max_concurrent_requests: 1000
+    max_queue_size: 100
+    priority_levels: ["critical", "high", "normal", "low"]
+    
+  sla_manager:
+    enabled: true
+    tiers:
+      platinum:
+        max_latency_ms: 100
+        min_availability: 0.999
+        cost_multiplier: 2.0
+        allowed_degradation: "none"
+      gold:
+        max_latency_ms: 500
+        min_availability: 0.99
+        cost_multiplier: 1.5
+        allowed_degradation: "minor"
+      silver:
+        max_latency_ms: 2000
+        min_availability: 0.95
+        cost_multiplier: 1.0
+        allowed_degradation: "major"
+      bronze:
+        max_latency_ms: 5000
+        min_availability: 0.90
+        cost_multiplier: 0.5
+        allowed_degradation: "critical"
+        
+  webhooks:
+    enabled: false
+    endpoints: []
+    
+  persistence:
+    storage_type: "sqlite"  # sqlite, redis
+    redis_url: "${REDIS_URL}"
+
+# ============================================================
+# Export Engine Configuration (NEW)
+# ============================================================
+
+export_engine:
+  default_format: "parquet"  # csv, json, parquet, excel, html, pdf
+  output_dir: "./exports"
+  compression_enabled: true
+  encryption_enabled: false
+  encryption_key_file: "export_key.key"
+  
+  incremental_export:
+    enabled: true
+    state_file: "export_state.json"
+    retention_days: 30
+    key_column: "last_modified"
+    
+  streaming:
+    enabled: true
+    chunk_size: 10000  # Rows per chunk
+    
+  destinations:
+    local:
+      enabled: true
+    s3:
+      enabled: false
+      bucket: "green-agent-exports"
+      region: "us-east-1"
+      access_key_env: "AWS_ACCESS_KEY"
+      secret_key_env: "AWS_SECRET_KEY"
+    gcs:
+      enabled: false
+      bucket: "green-agent-exports"
+      credentials_file: "gcs_credentials.json"
+    azure:
+      enabled: false
+      container: "green-agent-exports"
+      connection_string_env: "AZURE_CONNECTION_STRING"
+      
+  quality:
+    validation_enabled: true
+    imputation_strategy: "ml"  # ml, median, mean, forward
+    anomaly_detection: true
+    min_quality_score: 0.7
+
+# ============================================================
+# Perplexity API Configuration (NEW)
+# ============================================================
+
+perplexity:
+  api_key: "${PERPLEXITY_API_KEY}"
+  model: "sonar-pro"  # sonar-pro, sonar-small
+  max_results_per_query: 100
+  cache_ttl_hours: 24
+  
+  extraction:
+    confidence_threshold: 0.7  # Range: 0.5-0.95
+    duplicate_threshold: 0.85  # Range: 0.7-0.95
+    source_reliability:
+      perplexity_api: 0.90
+      web_scrape: 0.55
+      user_provided: 0.45
+      
+  knowledge_graph:
+    storage_path: "./kg_storage"
+    versioning_enabled: true
+    max_versions: 10
+    memory_efficient: true
+    
+  temporal_analytics:
+    enabled: true
+    half_life_days: 180
+    forecast_horizon_years: 2
+    
+  web_scraping_fallback:
+    enabled: true
+    rate_limit_requests: 10
+    rate_limit_period_seconds: 60
+
+# ============================================================
+# Helium Data Configuration (Existing - Enhanced)
 # ============================================================
 
 helium:
@@ -30,9 +241,13 @@ helium:
     use_synthetic_fallback: true
     cache_ttl_seconds: 3600
     update_frequency_hours: 24
+    validation:
+      enabled: true
+      min_purity: 0.95
+      max_scarcity: 1.0
     
   elasticity:
-    base_price_elasticity: -0.4
+    base_price_elasticity: -0.4  # Range: -1.0 to -0.1
     scarcity_elasticity_factor: 0.8
     cross_elasticity_factor: 0.3
     thermal_elasticity_factor: 0.5
@@ -42,7 +257,7 @@ helium:
     
   circularity:
     recovery_method: "hybrid"  # membrane_separation, pressure_swing_adsorption, cryogenic_distillation, hybrid
-    collection_efficiency: 0.95
+    collection_efficiency: 0.95  # Range: 0.8-0.99
     compression_efficiency: 0.90
     purification_efficiency: 0.85
     liquefaction_efficiency: 0.80
@@ -52,26 +267,29 @@ helium:
     bronze_recovery_rate: 0.50
 
 # ============================================================
-# Quantum Computing Configuration
+# Quantum Computing Configuration (Existing - Enhanced)
 # ============================================================
 
 quantum:
   provider: "pennylane"  # pennylane, qiskit, cirq, braket
   backend: "default.qubit"  # default.qubit, lightning.qubit, real hardware
-  n_qubits: 12
-  shots: 1000
+  n_qubits: 12  # Range: 1-30 for simulators, 1-433 for real hardware
+  shots: 1000  # Range: 100-1000000
   optimization_method: "quantum_approximate_optimization"  # QAOA, VQE, quantum_annealing
   error_mitigation: true
+  timeout_seconds: 300
   
   qaoa:
-    n_layers: 3
-    optimizer: "COBYLA"
+    n_layers: 3  # Range: 1-20
+    optimizer: "COBYLA"  # COBYLA, SPSA, ADAM
     max_iterations: 200
+    learning_rate: 0.01
     
   vqe:
-    ansatz: "hardware_efficient"
-    optimizer: "SPSA"
+    ansatz: "hardware_efficient"  # hardware_efficient, UCCSD, RyRz
+    optimizer: "SPSA"  # SPSA, COBYLA, LBFGS
     max_iterations: 300
+    initial_parameters: "random"
     
   quantum_annealing:
     n_iterations: 2000
@@ -80,13 +298,13 @@ quantum:
     chain_strength: 1.5
 
 # ============================================================
-# Blockchain Configuration
+# Blockchain Configuration (Existing - Enhanced)
 # ============================================================
 
 blockchain:
   provider: "ethereum"  # ethereum, polygon, hyperledger, simulated
   network: "sepolia"  # mainnet, goerli, sepolia, local
-  rpc_url: "${BLOCKCHAIN_RPC_URL}"  # From environment variable
+  rpc_url: "${BLOCKCHAIN_RPC_URL}"
   chain_id: 11155111  # Sepolia testnet
   
   wallet:
@@ -108,14 +326,18 @@ blockchain:
     max_fee_per_gas_gwei: 100
     max_priority_fee_per_gas_gwei: 2
     gas_limit: 300000
+    
+  monitoring:
+    confirmations_required: 3
+    transaction_timeout_seconds: 120
 
 # ============================================================
-# Regret Optimizer Configuration
+# Regret Optimizer Configuration (Existing - Enhanced)
 # ============================================================
 
 regret_optimizer:
-  n_scenarios: 1000
-  confidence_level: 0.95
+  n_scenarios: 1000  # Range: 100-10000
+  confidence_level: 0.95  # Range: 0.8-0.999
   optimization_method: "minimax"  # minimax, cvar, robust
   parallel_workers: 4
   
@@ -131,9 +353,14 @@ regret_optimizer:
     min_project_lifetime: 5
     max_project_lifetime: 40
     synergy_threshold: 0.1
+    
+  constraints:
+    max_carbon_budget_tons: 1000000
+    min_roi_percent: 10.0
+    max_payback_years: 15
 
 # ============================================================
-# Sustainability Signals Configuration
+# Sustainability Signals Configuration (Existing - Enhanced)
 # ============================================================
 
 sustainability:
@@ -146,6 +373,8 @@ sustainability:
     governance: 0.25
     
   risk_thresholds:
+    low_risk: 0.3
+    medium_risk: 0.5
     high_risk: 0.7
     critical_risk: 0.85
     anomaly_sensitivity: 0.05
@@ -162,9 +391,10 @@ sustainability:
       - "hot_house_world"
       - "net_zero_2050"
     time_horizon_years: 30
+    scenario_weights: [0.3, 0.3, 0.2, 0.2]  # Must sum to 1.0
 
 # ============================================================
-# Thermal Optimizer Configuration
+# Thermal Optimizer Configuration (Existing - Fixed)
 # ============================================================
 
 thermal:
@@ -181,6 +411,7 @@ thermal:
     rl_enabled: true
     liquid_cooling_enabled: true
     free_cooling_enabled: true
+    update_frequency_seconds: 60
     
   servers:
     compute:
@@ -188,8 +419,8 @@ thermal:
       max_temp_c: 85
       airflow_required_cfm: 100
     gpu:
-      cpu_tdp_watts: 400
-      gpu_tdp_watts: 300
+      gpu_tdp_watts: 300  # FIXED: was cpu_tdp_watts
+      cpu_tdp_watts: 200
       max_temp_c: 80
       airflow_required_cfm: 150
     storage:
@@ -198,7 +429,7 @@ thermal:
       airflow_required_cfm: 80
 
 # ============================================================
-# Synthetic Data Manager Configuration
+# Synthetic Data Manager Configuration (Existing - Enhanced)
 # ============================================================
 
 synthetic_data:
@@ -227,25 +458,31 @@ synthetic_data:
       n_projects: 50
 
 # ============================================================
-# Carbon Pricing Configuration
+# Carbon Pricing Configuration (Existing - Enhanced)
 # ============================================================
 
 carbon:
-  price_usd_per_tonne: 75.0
-  grid_carbon_intensity: 0.5  # kg CO2/kWh
-  renewable_energy_pct: 30.0
+  price_usd_per_tonne: 75.0  # Range: 0-500
+  grid_carbon_intensity: 0.5  # kg CO2/kWh, Range: 0.1-1.0
+  renewable_energy_pct: 30.0  # Range: 0-100
   carbon_tax_enabled: true
   
   markets:
     eu_ets:
       enabled: true
-      price_source: "api"
+      price_source: "api"  # api, static, historical
+      api_url: "https://api.ember-climate.org/v1/eu-ets-price"
     voluntary:
       enabled: true
       price_source: "market"
+      
+  offsets:
+    enabled: true
+    max_offset_percentage: 0.2  # Can offset up to 20% of emissions
+    certified_only: true
 
 # ============================================================
-# API Configuration
+# API Configuration (Existing - Enhanced)
 # ============================================================
 
 api:
@@ -260,14 +497,23 @@ api:
     thermal: "/api/v1/thermal/optimize"
     helium: "/api/v1/helium/analyze"
     quantum: "/api/v1/quantum/optimize"
+    federated_learning: "/api/v1/federated/train"
+    export: "/api/v1/export/data"
     
   authentication:
     enabled: true
     api_key_header: "X-API-Key"
     jwt_enabled: false
+    jwt_secret_env: "JWT_SECRET"
+    
+  cors:
+    enabled: false
+    allowed_origins: []
+    allowed_methods: ["GET", "POST", "PUT", "DELETE"]
+    allowed_headers: ["Content-Type", "Authorization"]
 
 # ============================================================
-# Monitoring Configuration
+# Monitoring Configuration (Existing - Enhanced)
 # ============================================================
 
 monitoring:
@@ -286,9 +532,151 @@ monitoring:
     
   alerts:
     email_enabled: false
+    smtp_server: "${SMTP_SERVER}"
+    smtp_port: 587
+    alert_email: "alerts@green-agent.com"
     slack_enabled: false
+    slack_webhook: "${SLACK_WEBHOOK}"
     pagerduty_enabled: false
+    pagerduty_key: "${PAGERDUTY_KEY}"
+    
     critical_thresholds:
       helium_scarcity: 0.8
       carbon_price: 200
       max_temperature_c: 45
+      model_accuracy_drop: 0.15
+      circuit_breaker_open: 1
+
+# ============================================================
+# Performance Optimization (NEW)
+# ============================================================
+
+performance:
+  cache:
+    enabled: true
+    backend: "redis"  # redis, memcached, local
+    ttl_seconds: 3600
+    max_size_mb: 1024
+    redis_url: "${REDIS_URL}"
+    
+  database:
+    pool_size: 10
+    max_overflow: 20
+    pool_pre_ping: true
+    echo: false
+    
+  async:
+    max_workers: 4
+    task_timeout_seconds: 300
+    graceful_shutdown_timeout: 30
+
+# ============================================================
+# Secrets Management (NEW)
+# ============================================================
+
+secrets:
+  provider: "env_only"  # vault, aws_secrets, env_only
+  vault:
+    address: "${VAULT_ADDRESS}"
+    token: "${VAULT_TOKEN}"
+    mount_path: "secret/green_agent"
+    
+  aws_secrets:
+    region: "us-east-1"
+    secret_name: "green_agent/secrets"
+    
+  encryption:
+    master_key_env: "ENCRYPTION_MASTER_KEY"
+    key_rotation_days: 90
+
+# ============================================================
+# Audit Configuration (NEW)
+# ============================================================
+
+audit:
+  enabled: true
+  log_level: "INFO"
+  retention_days: 365
+  sensitive_fields:
+    - "api_key"
+    - "private_key"
+    - "password"
+    - "secret_key"
+  redact_patterns:
+    - ".*_KEY$"
+    - ".*_SECRET$"
+    - ".*_TOKEN$"
+    - ".*_PASSWORD$"
+    
+  events:
+    - "user_login"
+    - "config_change"
+    - "model_training"
+    - "data_export"
+    - "circuit_breaker_change"
+    - "blockchain_transaction"
+
+# ============================================================
+# Environment Overrides (NEW)
+# ============================================================
+
+environments:
+  development:
+    system:
+      log_level: "DEBUG"
+      environment: "development"
+    synthetic_data:
+      n_samples_default: 100
+    monitoring:
+      prometheus:
+        enabled: false
+    export_engine:
+      encryption_enabled: false
+    blockchain:
+      network: "local"
+      
+  staging:
+    system:
+      log_level: "INFO"
+      environment: "staging"
+    blockchain:
+      network: "sepolia"
+    monitoring:
+      alerts:
+        email_enabled: true
+        slack_enabled: true
+        pagerduty_enabled: false
+        
+  production:
+    system:
+      log_level: "WARNING"
+      environment: "production"
+    blockchain:
+      network: "mainnet"
+    monitoring:
+      alerts:
+        email_enabled: true
+        slack_enabled: true
+        pagerduty_enabled: true
+    audit:
+      enabled: true
+    export_engine:
+      encryption_enabled: true
+
+# ============================================================
+# Validation Constraints (Documentation)
+# ============================================================
+# 
+# Configuration Validation Rules:
+# - quantum.n_qubits: 1-30 for simulators, 1-433 for real hardware
+# - federated_learning.aggregation.fedprox_mu: 0.001-0.1
+# - federated_learning.privacy.epsilon: 0.1-10.0
+# - fallback_manager.max_retries: 1-10
+# - fallback_manager.circuit_breaker.failure_threshold: 2-20
+# - export_engine.streaming.chunk_size: 1000-100000
+# - perplexity.extraction.confidence_threshold: 0.5-0.95
+# - carbon.price_usd_per_tonne: 0-500
+# - carbon.grid_carbon_intensity: 0.1-1.0
+# - thermal.servers.gpu.gpu_tdp_watts: 100-1000
+# - sustainability.risk_thresholds: Must be increasing (low < medium < high < critical)
+# - climate.scenario_weights: Must sum to 1.0
