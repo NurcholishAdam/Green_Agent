@@ -1,0 +1,15 @@
+date,global_production_tonnes,global_demand_tonnes,demand_supply_ratio,price_index,shortage_severity_0_1,supply_risk_score_0_1,scarcity_index,recycling_rate_0_1,substitution_feasibility_0_1,circularity_potential,cooling_load_sensitivity,thermal_impact_factor,geopolitical_risk_index,logistics_disruption_index,scenario
+2026-07-01,29200,30300,1.038,148,0.72,0.72,0.70,0.23,0.21,0.220,1.12,0.806,0.59,0.49,"base"
+2027-01-01,29500,30800,1.044,152,0.75,0.75,0.73,0.24,0.22,0.230,1.14,0.855,0.61,0.51,"base"
+2027-07-01,29800,31300,1.050,155,0.78,0.77,0.76,0.25,0.23,0.240,1.16,0.905,0.63,0.53,"base"
+2028-01-01,30200,32000,1.060,160,0.80,0.80,0.79,0.27,0.25,0.260,1.18,0.944,0.65,0.55,"base"
+2028-07-01,30600,32700,1.069,165,0.82,0.82,0.81,0.29,0.27,0.280,1.20,0.984,0.67,0.57,"base"
+2029-01-01,31000,33500,1.081,170,0.84,0.84,0.84,0.31,0.29,0.300,1.22,1.025,0.69,0.59,"base"
+2029-07-01,31400,34300,1.092,175,0.86,0.86,0.86,0.33,0.31,0.320,1.24,1.066,0.71,0.61,"base"
+2030-01-01,31800,35000,1.101,180,0.88,0.88,0.88,0.35,0.33,0.340,1.26,1.109,0.73,0.63,"base"
+
+# Optimistic scenario (high recycling, substitution breakthroughs)
+2030-01-01,33000,34000,1.030,140,0.60,0.60,0.62,0.50,0.50,0.500,1.15,0.690,0.50,0.40,"optimistic"
+
+# Pessimistic scenario (supply shocks, demand surge)
+2030-01-01,30500,37000,1.213,220,0.95,0.95,0.95,0.20,0.15,0.175,1.30,1.235,0.85,0.75,"pessimistic"
