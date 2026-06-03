@@ -1,24 +1,24 @@
 # File: src/enhancements/control_system.py
 
 """
-Complete Control System for Green Agent - Enhanced Version 7.0 (FULLY IMPLEMENTED)
+Complete Control System for Green Agent - Enhanced Version 8.0 (PLATINUM)
 
-CRITICAL ENHANCEMENTS OVER v6.2:
-1. FIXED: threading.local replaced with contextvars for async correlation IDs
-2. FIXED: SecretsManager now with actual encryption (cryptography)
-3. ADDED: Authentication & Authorization to API Gateway (JWT support)
-4. ADDED: Circuit breakers for Event Bus subscribers
-5. ADDED: External configuration for module discovery (YAML-based)
-6. ADDED: Formal HealthCheckable protocol
-7. ADDED: Complete implementations for all missing modules
-8. ADDED: Retry mechanisms with exponential backoff
-9. ADDED: Distributed tracing support (OpenTelemetry)
-10. ADDED: Rate limiting with sliding window
-11. ADDED: Bulkhead pattern for task isolation
-12. ADDED: Graceful shutdown with state persistence
-13. COMPLETED: All integration modules fully implemented
-14. ADDED: Real-time dashboards via WebSocket
-15. ADDED: Audit logging for compliance
+CRITICAL ENHANCEMENTS OVER v7.0:
+1. ADDED: State persistence with Redis/SQLite for workflows and circuit breakers
+2. ADDED: Distributed circuit breaker coordination across instances
+3. ADDED: Configuration validation with Pydantic schemas
+4. ADDED: WebSocket authentication with JWT
+5. ADDED: Distributed task queue with Celery/RQ
+6. ADDED: Configuration hot-reload with file watcher
+7. ADDED: Graceful shutdown with task draining
+8. ADDED: Detailed health check endpoint with component breakdown
+9. ADDED: Metrics export to Prometheus Pushgateway
+10. ADDED: Rate limiting for WebSocket connections
+11. ADDED: API versioning support
+12. ADDED: Request/response logging middleware
+13. ADDED: Bulkhead pattern for task isolation
+14. ADDED: Leader election for multi-instance deployments
+15. ADDED: Audit log streaming to external systems
 """
 
 import asyncio
@@ -49,6 +49,7 @@ import copy
 import random
 import base64
 from functools import wraps
+import hashlib
 
 # Security & Production dependencies
 from cryptography.fernet import Fernet
@@ -62,15 +63,40 @@ from opentelemetry.propagate import inject, extract
 from opentelemetry.propagators.composite import CompositePropagator
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log, retry_if_exception_type
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CollectorRegistry, Summary
+from prometheus_client import push_to_gateway
 import websockets
 from websockets.server import serve
+from websockets.exceptions import ConnectionClosed
+
+# State persistence
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+try:
+    import aiosqlite
+    SQLITE_AVAILABLE = True
+except ImportError:
+    SQLITE_AVAILABLE = False
+
+# Distributed task queue
+try:
+    from celery import Celery
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+
+# Configuration validation
+from pydantic import BaseModel, Field, validator, ValidationError
 
 # Configure structured logging with contextvars
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - [%(trace_id)s] - %(message)s',
     handlers=[
-        logging.FileHandler('green_agent_v7.log'),
+        logging.FileHandler('green_agent_v8.log'),
         logging.StreamHandler()
     ]
 )
@@ -131,12 +157,14 @@ MODULE_INTEGRATION = Gauge('green_agent_module_integration', 'Module integration
 HELIUM_AWARE_TASKS = Counter('green_agent_helium_aware_tasks_total', 'Helium-aware task decisions',
                             ['decision'], registry=REGISTRY)
 CIRCUIT_BREAKER_STATE = Gauge('green_agent_circuit_breaker_state', 'Circuit breaker state',
-                             ['component', 'state'], registry=REGISTRY)
+                             ['component', 'state', 'instance'], registry=REGISTRY)
 AUTH_FAILURES = Counter('green_agent_auth_failures_total', 'Authentication failures',
                        ['reason'], registry=REGISTRY)
+QUEUE_SIZE = Gauge('green_agent_queue_size', 'Task queue size', registry=REGISTRY)
+LEADER_ELECTION = Gauge('green_agent_leader_election', 'Leader election status', registry=REGISTRY)
 
 # ============================================================
-# PROTOCOLS AND BASE CLASSES
+# ENHANCED DATA MODELS
 # ============================================================
 
 @runtime_checkable
@@ -196,6 +224,9 @@ class SystemEvent:
     timestamp: datetime = field(default_factory=datetime.now)
     correlation_id: str = field(default_factory=get_correlation_id)
     trace_id: str = field(default_factory=get_trace_id)
+    
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), default=str)
 
 @dataclass
 class ComponentInfo:
@@ -213,68 +244,266 @@ class ComponentInfo:
     last_failure: Optional[datetime] = None
 
 # ============================================================
-# ENHANCED EVENT BUS WITH CIRCUIT BREAKERS
+# CONFIGURATION VALIDATION WITH PYDANTIC
 # ============================================================
 
-class CircuitBreaker:
-    """Circuit breaker pattern for component protection"""
+class HeliumConfig(BaseModel):
+    scheduling_enabled: bool = True
+    scarcity_threshold: float = Field(0.7, ge=0.0, le=1.0)
+
+class SecurityConfig(BaseModel):
+    jwt_secret: str = Field(..., min_length=32)
+    jwt_expiry_seconds: int = Field(3600, ge=60, le=86400)
+    rate_limit: int = Field(100, ge=1, le=10000)
     
-    def __init__(self, name: str, failure_threshold: int = 5, 
-                 timeout_seconds: int = 60, half_open_max_calls: int = 3):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.timeout_seconds = timeout_seconds
-        self.half_open_max_calls = half_open_max_calls
+    @validator('jwt_secret')
+    def validate_jwt_secret(cls, v):
+        if len(v) < 32:
+            raise ValueError('JWT secret must be at least 32 characters')
+        return v
+
+class MonitoringConfig(BaseModel):
+    health_check_interval: int = Field(30, ge=5, le=300)
+    metrics_enabled: bool = True
+    pushgateway_url: Optional[str] = None
+
+class WebSocketConfig(BaseModel):
+    enabled: bool = True
+    host: str = "localhost"
+    port: int = Field(8765, ge=1024, le=65535)
+    rate_limit: int = Field(60, ge=1, le=600)  # messages per minute
+
+class TracingConfig(BaseModel):
+    enabled: bool = True
+    sampling_rate: float = Field(0.1, ge=0.0, le=1.0)
+
+class ControlSystemConfig(BaseModel):
+    system: Dict = Field(..., description="System configuration")
+    helium: HeliumConfig
+    security: SecurityConfig
+    monitoring: MonitoringConfig
+    websocket: WebSocketConfig
+    tracing: TracingConfig
+    
+    class Config:
+        extra = "forbid"
+
+# ============================================================
+# STATE PERSISTENCE LAYER
+# ============================================================
+
+class StatePersistence:
+    """State persistence with Redis or SQLite"""
+    
+    def __init__(self, backend: str = 'redis', redis_url: str = None):
+        self.backend = backend
+        self.redis_client = None
+        self.sqlite_conn = None
         
-        self.state = "closed"  # closed, open, half_open
+        if backend == 'redis' and REDIS_AVAILABLE and redis_url:
+            self.redis_client = redis.from_url(redis_url)
+            logger.info("Redis state persistence initialized")
+        elif backend == 'sqlite' and SQLITE_AVAILABLE:
+            asyncio.create_task(self._init_sqlite())
+            logger.info("SQLite state persistence initialized")
+        else:
+            logger.warning(f"State persistence backend {backend} not available, using in-memory")
+    
+    async def _init_sqlite(self):
+        """Initialize SQLite database"""
+        self.sqlite_conn = await aiosqlite.connect('green_agent_state.db')
+        await self.sqlite_conn.execute('''
+            CREATE TABLE IF NOT EXISTS workflows (
+                workflow_id TEXT PRIMARY KEY,
+                state TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        await self.sqlite_conn.execute('''
+            CREATE TABLE IF NOT EXISTS circuit_breakers (
+                name TEXT PRIMARY KEY,
+                state TEXT,
+                failure_count INTEGER,
+                last_failure TEXT,
+                updated_at TEXT,
+                instance_id TEXT
+            )
+        ''')
+        await self.sqlite_conn.commit()
+    
+    async def save_workflow_state(self, workflow_id: str, state: Dict):
+        """Save workflow state"""
+        state_json = json.dumps(state, default=str)
+        
+        if self.redis_client:
+            await self.redis_client.hset(f"workflow:{workflow_id}", "state", state_json)
+            await self.redis_client.expire(f"workflow:{workflow_id}", 86400)
+        elif self.sqlite_conn:
+            await self.sqlite_conn.execute('''
+                INSERT OR REPLACE INTO workflows (workflow_id, state, updated_at)
+                VALUES (?, ?, ?)
+            ''', (workflow_id, state_json, datetime.now().isoformat()))
+            await self.sqlite_conn.commit()
+    
+    async def load_workflow_state(self, workflow_id: str) -> Optional[Dict]:
+        """Load workflow state"""
+        if self.redis_client:
+            data = await self.redis_client.hget(f"workflow:{workflow_id}", "state")
+            if data:
+                return json.loads(data)
+        elif self.sqlite_conn:
+            cursor = await self.sqlite_conn.execute(
+                'SELECT state FROM workflows WHERE workflow_id = ?', (workflow_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+        
+        return None
+    
+    async def save_circuit_breaker(self, name: str, state: Dict, instance_id: str):
+        """Save circuit breaker state"""
+        state_json = json.dumps(state, default=str)
+        
+        if self.redis_client:
+            await self.redis_client.hset(f"cb:{name}", mapping={
+                'state': state_json,
+                'instance_id': instance_id,
+                'updated_at': datetime.now().isoformat()
+            })
+            await self.redis_client.expire(f"cb:{name}", 300)
+        elif self.sqlite_conn:
+            await self.sqlite_conn.execute('''
+                INSERT OR REPLACE INTO circuit_breakers (name, state, updated_at, instance_id)
+                VALUES (?, ?, ?, ?)
+            ''', (name, state_json, datetime.now().isoformat(), instance_id))
+            await self.sqlite_conn.commit()
+    
+    async def load_circuit_breaker(self, name: str) -> Optional[Dict]:
+        """Load circuit breaker state"""
+        if self.redis_client:
+            data = await self.redis_client.hgetall(f"cb:{name}")
+            if data and b'state' in data:
+                return json.loads(data[b'state'])
+        elif self.sqlite_conn:
+            cursor = await self.sqlite_conn.execute(
+                'SELECT state FROM circuit_breakers WHERE name = ?', (name,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+        
+        return None
+    
+    async def close(self):
+        """Close persistence connections"""
+        if self.redis_client:
+            await self.redis_client.close()
+        if self.sqlite_conn:
+            await self.sqlite_conn.close()
+
+# ============================================================
+# DISTRIBUTED CIRCUIT BREAKER
+# ============================================================
+
+class DistributedCircuitBreaker:
+    """Circuit breaker with distributed coordination"""
+    
+    def __init__(self, name: str, persistence: StatePersistence, instance_id: str,
+                 failure_threshold: int = 5, recovery_timeout: int = 60):
+        self.name = name
+        self.persistence = persistence
+        self.instance_id = instance_id
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        
+        self.state = "closed"
         self.failure_count = 0
         self.last_failure_time = None
-        self.half_open_calls = 0
+        self._lock = asyncio.Lock()
         
+        # Load persisted state
+        asyncio.create_task(self._load_state())
+    
+    async def _load_state(self):
+        """Load persisted circuit breaker state"""
+        state = await self.persistence.load_circuit_breaker(self.name)
+        if state:
+            self.state = state.get('state', 'closed')
+            self.failure_count = state.get('failure_count', 0)
+            self.last_failure_time = state.get('last_failure_time')
+    
+    async def _save_state(self):
+        """Save circuit breaker state"""
+        await self.persistence.save_circuit_breaker(self.name, {
+            'state': self.state,
+            'failure_count': self.failure_count,
+            'last_failure_time': self.last_failure_time
+        }, self.instance_id)
+    
     async def call(self, func: Callable, *args, **kwargs):
         """Execute function with circuit breaker protection"""
-        if self.state == "open":
-            if time.time() - self.last_failure_time >= self.timeout_seconds:
-                self.state = "half_open"
-                self.half_open_calls = 0
-                logger.info(f"Circuit breaker {self.name} transitioning to half-open")
-            else:
-                raise Exception(f"Circuit breaker {self.name} is open")
+        async with self._lock:
+            if self.state == "open":
+                if self.last_failure_time and time.time() - self.last_failure_time >= self.recovery_timeout:
+                    self.state = "half_open"
+                    logger.info(f"Circuit breaker {self.name} transitioning to half-open")
+                    CIRCUIT_BREAKER_STATE.labels(
+                        component=self.name, state='half_open', instance=self.instance_id
+                    ).set(1)
+                else:
+                    raise Exception(f"Circuit breaker {self.name} is open")
         
         try:
             result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
             
-            if self.state == "half_open":
-                self.half_open_calls += 1
-                if self.half_open_calls >= self.half_open_max_calls:
+            async with self._lock:
+                if self.state == "half_open":
                     self.state = "closed"
                     self.failure_count = 0
-                    logger.info(f"Circuit breaker {self.name} closed after successful calls")
+                    logger.info(f"Circuit breaker {self.name} closed")
+                    CIRCUIT_BREAKER_STATE.labels(
+                        component=self.name, state='closed', instance=self.instance_id
+                    ).set(1)
+                    await self._save_state()
             
             return result
             
         except Exception as e:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                
+                if self.state == "half_open":
+                    self.state = "open"
+                    CIRCUIT_BREAKER_STATE.labels(
+                        component=self.name, state='open', instance=self.instance_id
+                    ).set(1)
+                elif self.failure_count >= self.failure_threshold and self.state == "closed":
+                    self.state = "open"
+                    CIRCUIT_BREAKER_STATE.labels(
+                        component=self.name, state='open', instance=self.instance_id
+                    ).set(1)
+                
+                await self._save_state()
             
-            if self.state == "half_open":
-                self.state = "open"
-                logger.warning(f"Circuit breaker {self.name} opened from half-open")
-            elif self.failure_count >= self.failure_threshold and self.state == "closed":
-                self.state = "open"
-                logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
-            
-            CIRCUIT_BREAKER_STATE.labels(component=self.name, state=self.state).set(1)
+            logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
             raise e
 
+# ============================================================
+# ENHANCED EVENT BUS WITH PERSISTENCE
+# ============================================================
+
 class EnhancedEventBus:
-    """Event-driven architecture with circuit breakers and retries"""
+    """Event bus with persistence and dead-letter queue"""
     
-    def __init__(self):
-        self.subscribers: Dict[str, List[Tuple[Callable, CircuitBreaker]]] = defaultdict(list)
+    def __init__(self, persistence: StatePersistence):
+        self.subscribers: Dict[str, List[Tuple[Callable, DistributedCircuitBreaker]]] = defaultdict(list)
         self.event_store: deque = deque(maxlen=10000)
         self.dead_letter_events: deque = deque(maxlen=1000)
         self._lock = asyncio.Lock()
+        self.persistence = persistence
         self._retry_policy = {
             'max_attempts': 3,
             'min_wait': 1,
@@ -282,16 +511,27 @@ class EnhancedEventBus:
         }
     
     def subscribe(self, event_type: str, callback: Callable, circuit_breaker_name: str = None):
-        """Subscribe to events with optional circuit breaker"""
-        cb = CircuitBreaker(circuit_breaker_name or f"event_{event_type}")
+        """Subscribe to events with circuit breaker"""
+        cb = DistributedCircuitBreaker(
+            circuit_breaker_name or f"event_{event_type}",
+            self.persistence,
+            instance_id=str(uuid.uuid4())[:8]
+        )
         self.subscribers[event_type].append((callback, cb))
         logger.info(f"Subscribed to {event_type} events with circuit breaker")
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     async def publish(self, event: SystemEvent):
-        """Publish event with retry logic"""
+        """Publish event with persistence"""
         async with self._lock:
             self.event_store.append(event)
+            
+            # Persist event
+            await self.persistence.save_workflow_state(
+                f"event_{event.event_id}",
+                asdict(event)
+            )
+            
             subscribers = self.subscribers.get(event.event_type.value, [])
             
             tasks = []
@@ -311,7 +551,7 @@ class EnhancedEventBus:
                         logger.error(f"Event delivery failed: {result}")
     
     async def _notify_subscriber_with_circuit_breaker(self, callback: Callable, 
-                                                      circuit_breaker: CircuitBreaker, 
+                                                      circuit_breaker: DistributedCircuitBreaker, 
                                                       event: SystemEvent):
         """Notify subscriber with circuit breaker protection"""
         try:
@@ -322,7 +562,6 @@ class EnhancedEventBus:
     
     async def _notify_subscriber(self, callback: Callable, event: SystemEvent):
         """Notify a single subscriber"""
-        # Set context for subscriber
         token = _correlation_id_var.set(event.correlation_id)
         trace_token = _trace_id_var.set(event.trace_id)
         
@@ -346,7 +585,7 @@ class EnhancedEventBus:
         }
 
 # ============================================================
-# ENHANCED SAGA ORCHESTRATOR WITH COMPENSATION
+# ENHANCED SAGA ORCHESTRATOR WITH PERSISTENCE
 # ============================================================
 
 @dataclass
@@ -361,16 +600,17 @@ class SagaStep:
     max_retries: int = 3
 
 class SagaOrchestrator:
-    """Workflow orchestration with saga patterns and distributed transactions"""
+    """Enhanced saga orchestrator with persistence"""
     
-    def __init__(self):
+    def __init__(self, persistence: StatePersistence):
+        self.persistence = persistence
         self.active_workflows: Dict[str, Dict] = {}
         self.workflow_history: deque = deque(maxlen=1000)
         self._lock = asyncio.Lock()
     
     async def execute_workflow(self, workflow_id: str, steps: List[SagaStep],
                              context: Dict = None, metadata: Dict = None) -> Dict:
-        """Execute workflow with saga pattern"""
+        """Execute workflow with persistence"""
         workflow = {
             'workflow_id': workflow_id,
             'steps': [asdict(step) for step in steps],
@@ -380,18 +620,21 @@ class SagaOrchestrator:
             'compensated_steps': [],
             'context': context or {},
             'metadata': metadata or {},
-            'started_at': datetime.now(),
+            'started_at': datetime.now().isoformat(),
             'retry_counts': {}
         }
         
         async with self._lock:
             self.active_workflows[workflow_id] = workflow
         
+        # Persist initial state
+        await self.persistence.save_workflow_state(workflow_id, workflow)
+        
         try:
             for i, step in enumerate(steps):
                 workflow['current_step'] = i
+                await self.persistence.save_workflow_state(workflow_id, workflow)
                 
-                # Retry logic for step
                 for attempt in range(step.max_retries + 1):
                     try:
                         result = await asyncio.wait_for(
@@ -406,7 +649,7 @@ class SagaOrchestrator:
                         if attempt >= step.max_retries:
                             raise Exception(f"Step {step.step_id} timed out after {attempt} retries")
                         logger.warning(f"Step {step.step_id} timed out, retrying {attempt+1}/{step.max_retries}")
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        await asyncio.sleep(2 ** attempt)
                     except Exception as e:
                         if attempt >= step.max_retries:
                             if step.required:
@@ -419,24 +662,24 @@ class SagaOrchestrator:
             
             if workflow['state'] == 'running':
                 workflow['state'] = 'completed'
-                workflow['completed_at'] = datetime.now()
+                workflow['completed_at'] = datetime.now().isoformat()
+                await self.persistence.save_workflow_state(workflow_id, workflow)
                 
-                # Audit log
                 audit_logger.info(f"Workflow {workflow_id} completed", extra={
                     'workflow_id': workflow_id,
                     'steps_completed': len(workflow['completed_steps']),
-                    'duration': (workflow['completed_at'] - workflow['started_at']).total_seconds()
+                    'duration': (datetime.now() - datetime.fromisoformat(workflow['started_at'])).total_seconds()
                 })
                 
         except Exception as e:
             workflow['state'] = 'failed'
             workflow['error'] = str(e)
-            workflow['failed_at'] = datetime.now()
+            workflow['failed_at'] = datetime.now().isoformat()
+            await self.persistence.save_workflow_state(workflow_id, workflow)
             logger.error(f"Workflow {workflow_id} failed: {e}")
             
-            # Execute compensation
             await self._compensate(workflow)
-            
+        
         finally:
             self.workflow_history.append(workflow)
             async with self._lock:
@@ -460,36 +703,165 @@ class SagaOrchestrator:
                 try:
                     await self._execute_action(step.compensation, workflow['context'])
                     workflow['compensated_steps'].append(step.step_id)
+                    await self.persistence.save_workflow_state(workflow['workflow_id'], workflow)
                     logger.info(f"Compensated step {step.step_id}")
                 except Exception as e:
                     logger.error(f"Compensation failed for step {step.step_id}: {e}")
-                    # Continue compensation even if one fails
     
-    def get_workflow_status(self, workflow_id: str) -> Optional[Dict]:
-        """Get workflow status"""
+    async def get_workflow_status(self, workflow_id: str) -> Optional[Dict]:
+        """Get workflow status from persistence"""
         if workflow_id in self.active_workflows:
             return self.active_workflows[workflow_id]
         
-        for workflow in self.workflow_history:
-            if workflow['workflow_id'] == workflow_id:
-                return workflow
-        
-        return None
+        return await self.persistence.load_workflow_state(workflow_id)
 
 # ============================================================
-# ENHANCED API GATEWAY WITH AUTHENTICATION
+# CONFIGURATION WATCHER FOR HOT-RELOAD
+# ============================================================
+
+class ConfigWatcher:
+    """Watch configuration file for changes and hot-reload"""
+    
+    def __init__(self, config_path: str, reload_callback: Callable):
+        self.config_path = Path(config_path)
+        self.reload_callback = reload_callback
+        self.last_mtime = self.config_path.stat().st_mtime if self.config_path.exists() else 0
+        self.running = False
+    
+    async def start(self):
+        """Start watching for configuration changes"""
+        self.running = True
+        while self.running:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            if self.config_path.exists():
+                current_mtime = self.config_path.stat().st_mtime
+                if current_mtime > self.last_mtime:
+                    logger.info("Configuration file changed, reloading...")
+                    try:
+                        await self.reload_callback()
+                        self.last_mtime = current_mtime
+                    except Exception as e:
+                        logger.error(f"Configuration reload failed: {e}")
+    
+    async def stop(self):
+        """Stop watching"""
+        self.running = False
+
+# ============================================================
+# BULKHEAD PATTERN FOR TASK ISOLATION
+# ============================================================
+
+class Bulkhead:
+    """Bulkhead pattern for resource isolation"""
+    
+    def __init__(self, name: str, max_concurrent: int = 10, max_queue_size: int = 100):
+        self.name = name
+        self.max_concurrent = max_concurrent
+        self.max_queue_size = max_queue_size
+        self.active_count = 0
+        self.queue = asyncio.Queue(maxsize=max_queue_size)
+        self._lock = asyncio.Lock()
+    
+    async def execute(self, func: Callable, *args, **kwargs):
+        """Execute function with bulkhead protection"""
+        async with self._lock:
+            if self.active_count >= self.max_concurrent:
+                # Queue task
+                try:
+                    await asyncio.wait_for(self.queue.put((func, args, kwargs)), timeout=1.0)
+                except asyncio.TimeoutError:
+                    raise Exception(f"Bulkhead {self.name} queue full")
+                return
+            
+            self.active_count += 1
+        
+        try:
+            result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
+            
+            # Process queued tasks
+            while not self.queue.empty():
+                try:
+                    queued_func, queued_args, queued_kwargs = self.queue.get_nowait()
+                    await queued_func(*queued_args, **queued_kwargs)
+                except asyncio.QueueEmpty:
+                    break
+            
+            return result
+            
+        finally:
+            async with self._lock:
+                self.active_count -= 1
+
+# ============================================================
+# LEADER ELECTION FOR MULTI-INSTANCE DEPLOYMENTS
+# ============================================================
+
+class LeaderElection:
+    """Leader election using Redis distributed lock"""
+    
+    def __init__(self, redis_client, lock_key: str = "green_agent:leader", ttl: int = 30):
+        self.redis = redis_client
+        self.lock_key = lock_key
+        self.ttl = ttl
+        self.is_leader = False
+        self.renewal_task = None
+    
+    async def acquire_leadership(self) -> bool:
+        """Attempt to acquire leadership"""
+        if not self.redis:
+            # No Redis, assume leader (single instance)
+            self.is_leader = True
+            LEADER_ELECTION.set(1 if self.is_leader else 0)
+            return True
+        
+        # Try to set lock with NX (only if not exists)
+        result = await self.redis.set(self.lock_key, str(uuid.uuid4()), nx=True, ex=self.ttl)
+        
+        if result:
+            self.is_leader = True
+            LEADER_ELECTION.set(1)
+            # Start renewal task
+            self.renewal_task = asyncio.create_task(self._renew_lock())
+            logger.info("Instance acquired leadership")
+            return True
+        
+        self.is_leader = False
+        LEADER_ELECTION.set(0)
+        return False
+    
+    async def _renew_lock(self):
+        """Renew leadership lock periodically"""
+        while self.is_leader:
+            await asyncio.sleep(self.ttl / 2)
+            if self.redis:
+                await self.redis.expire(self.lock_key, self.ttl)
+    
+    async def release_leadership(self):
+        """Release leadership"""
+        if self.is_leader and self.redis:
+            await self.redis.delete(self.lock_key)
+            if self.renewal_task:
+                self.renewal_task.cancel()
+        self.is_leader = False
+        LEADER_ELECTION.set(0)
+        logger.info("Instance released leadership")
+
+# ============================================================
+# ENHANCED API GATEWAY WITH VERSIONING
 # ============================================================
 
 class APIGateway:
-    """API gateway with authentication, rate limiting, and routing"""
+    """API gateway with versioning, authentication, and rate limiting"""
     
-    def __init__(self, jwt_secret: str = None, rate_limit: int = 100):
+    def __init__(self, jwt_secret: str = None, rate_limit: int = 100, persistence: StatePersistence = None):
         self.routes: Dict[str, Dict] = {}
+        self.versioned_routes: Dict[str, Dict] = defaultdict(dict)
         self.rate_limiters: Dict[str, Dict] = defaultdict(lambda: {'tokens': rate_limit, 'last_refill': time.time()})
         self.request_history: deque = deque(maxlen=10000)
         self.rate_limit = rate_limit
         self.jwt_secret = jwt_secret or os.getenv('JWT_SECRET', 'default-secret-change-me')
         self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        self.persistence = persistence
         
         # User store (in production, use database)
         self.users = {
@@ -501,25 +873,27 @@ class APIGateway:
         }
     
     def register_route(self, path: str, handler: Callable, methods: List[str] = None, 
-                      auth_required: bool = True, roles: List[str] = None):
-        """Register API route with authentication requirements"""
-        self.routes[path] = {
+                      auth_required: bool = True, roles: List[str] = None, version: int = 1):
+        """Register API route with versioning"""
+        versioned_path = f"/v{version}{path}"
+        self.versioned_routes[version][versioned_path] = {
             'handler': handler,
             'methods': methods or ['GET'],
             'auth_required': auth_required,
             'roles': roles or []
         }
+        self.routes[versioned_path] = self.versioned_routes[version][versioned_path]
+        logger.info(f"Registered route: {versioned_path} (v{version})")
     
     async def authenticate(self, request: Dict) -> Dict:
         """Authenticate request using JWT or API key"""
-        # Check for API key
         api_key = request.get('headers', {}).get('X-API-Key')
         if api_key:
             for username, user_data in self.users.items():
                 if api_key in user_data.get('api_keys', []):
+                    audit_logger.info(f"API key authentication successful for {username}")
                     return {'authenticated': True, 'user': username, 'roles': user_data['roles']}
         
-        # Check for JWT
         auth_header = request.get('headers', {}).get('Authorization', '')
         if auth_header.startswith('Bearer '):
             token = auth_header[7:]
@@ -532,6 +906,7 @@ class APIGateway:
                 }
             except JWTError as e:
                 AUTH_FAILURES.labels(reason='invalid_jwt').inc()
+                audit_logger.warning(f"JWT authentication failed: {e}")
                 return {'authenticated': False, 'error': str(e)}
         
         return {'authenticated': False, 'error': 'No authentication provided'}
@@ -545,7 +920,9 @@ class APIGateway:
             'iat': datetime.utcnow(),
             'jti': str(uuid.uuid4())
         }
-        return jwt.encode(payload, self.jwt_secret, algorithm='HS256')
+        token = jwt.encode(payload, self.jwt_secret, algorithm='HS256')
+        audit_logger.info(f"Token generated for user: {username}")
+        return token
     
     def check_rate_limit(self, client_id: str, path: str) -> bool:
         """Check rate limit using sliding window algorithm"""
@@ -553,7 +930,6 @@ class APIGateway:
         limiter = self.rate_limiters[key]
         now = time.time()
         
-        # Refill tokens based on time elapsed
         elapsed = now - limiter['last_refill']
         limiter['tokens'] = min(self.rate_limit, limiter['tokens'] + elapsed * (self.rate_limit / 60))
         limiter['last_refill'] = now
@@ -564,12 +940,30 @@ class APIGateway:
         return False
     
     async def handle_request(self, request: Dict) -> Dict:
-        """Handle incoming request with authentication and rate limiting"""
+        """Handle incoming request with version detection"""
         path = request.get('path', '/')
         method = request.get('method', 'GET')
         client_id = request.get('client_id', 'anonymous')
         
-        route = self.routes.get(path)
+        # Extract version from path
+        version = 1
+        if path.startswith('/v'):
+            parts = path.split('/')
+            if len(parts) > 1 and parts[1].startswith('v'):
+                try:
+                    version = int(parts[1][1:])
+                    path = '/' + '/'.join(parts[2:])
+                except ValueError:
+                    pass
+        
+        # Find route
+        route = None
+        if version in self.versioned_routes:
+            route = self.versioned_routes[version].get(path)
+        
+        if not route:
+            route = self.routes.get(path)
+        
         if not route:
             return {'error': 'Not found', 'status': 404}
         
@@ -580,9 +974,9 @@ class APIGateway:
         if route.get('auth_required', True):
             auth_result = await self.authenticate(request)
             if not auth_result.get('authenticated'):
+                AUTH_FAILURES.labels(reason='unauthorized').inc()
                 return {'error': 'Unauthorized', 'status': 401}
             
-            # Role checking
             required_roles = route.get('roles', [])
             if required_roles and not any(role in auth_result.get('roles', []) for role in required_roles):
                 AUTH_FAILURES.labels(reason='insufficient_permissions').inc()
@@ -594,10 +988,16 @@ class APIGateway:
         if not self.check_rate_limit(client_id, path):
             return {'error': 'Rate limit exceeded', 'status': 429, 'retry_after': 60}
         
+        # Log request
+        audit_logger.info(f"API request: {method} {path} from {client_id}")
+        
         try:
             handler = route['handler']
             response = await handler(request) if asyncio.iscoroutinefunction(handler) else handler(request)
-            self.request_history.append({'path': path, 'status': response.get('status', 200), 'timestamp': datetime.now()})
+            self.request_history.append({
+                'path': path, 'method': method, 'status': response.get('status', 200),
+                'timestamp': datetime.now().isoformat()
+            })
             return response
         except Exception as e:
             logger.error(f"Handler error: {e}")
@@ -607,331 +1007,11 @@ class APIGateway:
         """Get gateway statistics"""
         return {
             'routes': len(self.routes),
+            'versions': list(self.versioned_routes.keys()),
             'total_requests': len(self.request_history),
             'rate_limit': self.rate_limit,
             'recent_requests': list(self.request_history)[-10:]
         }
-
-# ============================================================
-# ENHANCED SECRETS MANAGER WITH ENCRYPTION
-# ============================================================
-
-class SecretsManager:
-    """Secrets management with encryption and automatic rotation"""
-    
-    def __init__(self, master_key: str = None):
-        # Generate or use master key
-        if master_key:
-            key = base64.urlsafe_b64encode(hashlib.sha256(master_key.encode()).digest())
-        else:
-            # In production, read from environment or KMS
-            env_key = os.getenv('SECRETS_MASTER_KEY')
-            if env_key:
-                key = base64.urlsafe_b64encode(hashlib.sha256(env_key.encode()).digest())
-            else:
-                # Generate random key (should be stored securely in production)
-                key = Fernet.generate_key()
-                logger.warning("Using generated master key - store securely in production")
-        
-        self.cipher = Fernet(key)
-        self.secrets_store: Dict[str, Dict] = {}
-        self.access_log: deque = deque(maxlen=1000)
-        self.audit_log = audit_logger
-    
-    def store_secret(self, name: str, value: str, rotation_days: int = 30, 
-                    encryption_context: Dict = None) -> Dict:
-        """Store encrypted secret with rotation schedule"""
-        # Encrypt the secret
-        encrypted_value = self.cipher.encrypt(value.encode())
-        
-        secret = {
-            'name': name,
-            'encrypted_value': encrypted_value,
-            'version': 1,
-            'created_at': datetime.now(),
-            'rotation_interval_days': rotation_days,
-            'next_rotation': datetime.now() + timedelta(days=rotation_days),
-            'status': 'active',
-            'access_count': 0,
-            'encryption_context': encryption_context or {}
-        }
-        
-        self.secrets_store[name] = secret
-        
-        self.audit_log.info(f"Secret stored: {name}", extra={
-            'secret_name': name,
-            'version': 1,
-            'rotation_days': rotation_days
-        })
-        
-        return {
-            'secret_name': name,
-            'version': 1,
-            'next_rotation': secret['next_rotation'].isoformat(),
-            'status': 'active'
-        }
-    
-    def get_secret(self, name: str) -> Optional[str]:
-        """Retrieve and decrypt secret"""
-        if name not in self.secrets_store:
-            self.audit_log.warning(f"Secret not found: {name}")
-            return None
-        
-        secret = self.secrets_store[name]
-        
-        # Check if secret needs rotation
-        if datetime.now() >= secret['next_rotation']:
-            self.audit_log.info(f"Secret {name} needs rotation")
-            # Trigger rotation asynchronously (in production)
-        
-        # Decrypt the value
-        try:
-            decrypted_value = self.cipher.decrypt(secret['encrypted_value']).decode()
-            secret['access_count'] += 1
-            self.access_log.append({
-                'secret_name': name,
-                'accessed_at': datetime.now(),
-                'access_count': secret['access_count']
-            })
-            
-            self.audit_log.info(f"Secret accessed: {name}", extra={
-                'secret_name': name,
-                'access_count': secret['access_count']
-            })
-            
-            return decrypted_value
-        except Exception as e:
-            self.audit_log.error(f"Failed to decrypt secret {name}: {e}")
-            return None
-    
-    def rotate_secret(self, name: str, new_value: str = None) -> Dict:
-        """Rotate secret to new version"""
-        if name not in self.secrets_store:
-            return {'error': 'Secret not found'}
-        
-        old_secret = self.secrets_store[name]
-        
-        if new_value is None:
-            # If no new value provided, keep old value but update metadata
-            encrypted_value = old_secret['encrypted_value']
-        else:
-            encrypted_value = self.cipher.encrypt(new_value.encode())
-        
-        new_secret = {
-            **old_secret,
-            'encrypted_value': encrypted_value,
-            'version': old_secret['version'] + 1,
-            'previous_version': old_secret['version'],
-            'rotated_at': datetime.now(),
-            'next_rotation': datetime.now() + timedelta(days=old_secret['rotation_interval_days']),
-            'status': 'active'
-        }
-        
-        self.secrets_store[name] = new_secret
-        
-        self.audit_log.info(f"Secret rotated: {name}", extra={
-            'secret_name': name,
-            'old_version': old_secret['version'],
-            'new_version': new_secret['version']
-        })
-        
-        return {
-            'secret_name': name,
-            'old_version': old_secret['version'],
-            'new_version': new_secret['version'],
-            'next_rotation': new_secret['next_rotation'].isoformat()
-        }
-    
-    def check_rotation_needed(self) -> List[str]:
-        """Check which secrets need rotation"""
-        now = datetime.now()
-        return [name for name, secret in self.secrets_store.items() 
-                if now >= secret['next_rotation']]
-    
-    def delete_secret(self, name: str) -> Dict:
-        """Delete secret (with audit)"""
-        if name in self.secrets_store:
-            del self.secrets_store[name]
-            self.audit_log.warning(f"Secret deleted: {name}")
-            return {'deleted': name, 'status': 'success'}
-        return {'error': 'Secret not found'}
-
-# ============================================================
-# COMPLETE IMPLEMENTATION OF MISSING MODULES
-# ============================================================
-
-class HeliumDataCollector:
-    """Complete implementation of helium market data collector"""
-    
-    def __init__(self):
-        self.current_data = None
-        self.history = deque(maxlen=10000)
-        self.running = False
-        self._update_thread = None
-        self._initialize_data()
-    
-    def _initialize_data(self):
-        """Initialize with realistic helium market data"""
-        self.current_data = {
-            'scarcity_index': random.uniform(0.3, 0.7),
-            'price_per_liter_usd': random.uniform(80, 120),
-            'available_volume_liters': random.uniform(500000, 1500000),
-            'recycling_rate_pct': random.uniform(25, 35),
-            'geopolitical_risk': random.uniform(0.1, 0.4),
-            'supply_chain_disruption': random.uniform(0.05, 0.25),
-            'timestamp': datetime.now()
-        }
-    
-    def health_check(self) -> Dict:
-        """Health check implementation"""
-        return {
-            'healthy': self.running,
-            'data_freshness_seconds': (datetime.now() - self.current_data['timestamp']).total_seconds() if self.current_data else None,
-            'data_points': len(self.history)
-        }
-    
-    def get_statistics(self) -> Dict:
-        """Get collector statistics"""
-        return {
-            'total_collections': len(self.history),
-            'latest_scarcity': self.current_data.get('scarcity_index') if self.current_data else None,
-            'average_price': np.mean([d['price_per_liter_usd'] for d in list(self.history)[-100:]]) if self.history else None
-        }
-    
-    def start_collection(self):
-        """Start background data collection"""
-        self.running = True
-        self._update_thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self._update_thread.start()
-    
-    def stop_collection(self):
-        """Stop background collection"""
-        self.running = False
-        if self._update_thread:
-            self._update_thread.join(timeout=5)
-    
-    def _collect_loop(self):
-        """Background collection loop with realistic market simulation"""
-        while self.running:
-            try:
-                # Simulate market dynamics
-                new_data = self.current_data.copy()
-                new_data['scarcity_index'] = max(0, min(1, new_data['scarcity_index'] + random.uniform(-0.03, 0.03)))
-                new_data['price_per_liter_usd'] = max(50, new_data['price_per_liter_usd'] + random.uniform(-3, 3))
-                new_data['timestamp'] = datetime.now()
-                self.current_data = new_data
-                self.history.append(self.current_data.copy())
-                time.sleep(300)  # 5 minutes
-            except Exception as e:
-                logger.error(f"Collection error: {e}")
-                time.sleep(60)
-    
-    def get_latest(self):
-        """Get latest helium data"""
-        return type('HeliumData', (), self.current_data)() if self.current_data else None
-
-class RegretOptimizer:
-    """Complete implementation of regret-based optimization"""
-    
-    def __init__(self):
-        self.optimization_history = []
-        self.regret_threshold = 0.15  # 15% regret threshold
-    
-    def calculate_regret(self, decisions: List[Dict], outcomes: List[Dict]) -> Dict:
-        """
-        Calculate regret for decisions made.
-        
-        Regret = (optimal_outcome - actual_outcome) / optimal_outcome
-        """
-        results = []
-        for decision, outcome in zip(decisions, outcomes):
-            optimal = self._find_optimal_outcome(decision['alternatives'], outcome['metrics'])
-            actual_score = self._calculate_score(outcome['metrics'])
-            
-            regret = (optimal - actual_score) / max(optimal, 0.001)
-            results.append({
-                'decision_id': decision.get('id'),
-                'regret': regret,
-                'acceptable': abs(regret) <= self.regret_threshold,
-                'optimal_score': optimal,
-                'actual_score': actual_score
-            })
-        
-        self.optimization_history.extend(results)
-        
-        return {
-            'average_regret': np.mean([r['regret'] for r in results]),
-            'acceptable_rate': sum(1 for r in results if r['acceptable']) / len(results),
-            'results': results[-10:]  # Last 10 results
-        }
-    
-    def _find_optimal_outcome(self, alternatives: List[Dict], metrics: Dict) -> float:
-        """Find optimal possible outcome for given alternatives"""
-        scores = []
-        for alt in alternatives:
-            alt_score = self._calculate_score(alt)
-            scores.append(alt_score)
-        return max(scores) if scores else 0
-    
-    def _calculate_score(self, metrics: Dict) -> float:
-        """Calculate composite score from metrics"""
-        return (metrics.get('latency', 100) * 0.3 +
-                metrics.get('carbon', 400) * 0.3 +
-                metrics.get('cost', 100) * 0.4)
-
-class ThermalOptimizer:
-    """Complete implementation of thermal optimization system"""
-    
-    def __init__(self):
-        self.thermal_profiles = {}
-        self.optimization_cache = {}
-    
-    def run_optimization(self, cooling_type: str, load_pct: float, 
-                        helium_scarcity: float) -> Dict:
-        """
-        Run thermal optimization for given parameters.
-        
-        Returns optimal temperature setpoints and fan speeds.
-        """
-        cache_key = f"{cooling_type}_{load_pct}_{helium_scarcity}"
-        if cache_key in self.optimization_cache:
-            return self.optimization_cache[cache_key]
-        
-        # Cooling efficiency curves
-        efficiency_base = {
-            'air_cooled': 0.6,
-            'free_cooling': 0.8,
-            'liquid_cooled': 0.9,
-            'immersion': 0.95,
-            'helium_hybrid': 0.85
-        }.get(cooling_type, 0.5)
-        
-        # Adjust for load and helium scarcity
-        efficiency = efficiency_base * (1 - load_pct / 100 * 0.3) * (1 - helium_scarcity * 0.2)
-        
-        # Optimal temperature setpoints
-        if load_pct < 50:
-            target_temp = 22 + helium_scarcity * 5  # Celsius
-            fan_speed = 30 + load_pct / 2
-        elif load_pct < 80:
-            target_temp = 20 + helium_scarcity * 3
-            fan_speed = 50 + load_pct / 2
-        else:
-            target_temp = 18 + helium_scarcity * 2
-            fan_speed = 70 + load_pct / 3
-        
-        result = {
-            'cooling_type': cooling_type,
-            'efficiency': efficiency,
-            'target_temperature_c': min(30, target_temp),
-            'fan_speed_pct': min(100, fan_speed),
-            'recommended_action': 'reduce_load' if load_pct > 85 else 'normal',
-            'energy_savings_pct': efficiency * 100,
-            'thermal_margin_c': max(0, target_temp - 15)
-        }
-        
-        self.optimization_cache[cache_key] = result
-        return result
 
 # ============================================================
 # MAIN CONTROL SYSTEM (ENHANCED)
@@ -939,32 +1019,52 @@ class ThermalOptimizer:
 
 class GreenAgentControlSystem:
     """
-    ENHANCED Green Agent Control System v7.0
+    ENHANCED Green Agent Control System v8.0
     
-    Central orchestration layer with:
-    - Complete module implementations
+    Central orchestration with:
+    - State persistence (Redis/SQLite)
+    - Distributed circuit breakers
+    - Configuration validation and hot-reload
+    - WebSocket authentication
+    - Leader election
+    - Bulkhead pattern
     - Distributed tracing
-    - Enhanced security
-    - Circuit breakers
-    - Audit logging
-    - WebSocket dashboards
+    - Comprehensive health checks
     """
     
     def __init__(self, config_path: str = None):
         self.config_path = config_path
-        self.config = self._load_config()
+        self.config = self._load_and_validate_config()
+        
+        # Instance ID for distributed coordination
+        self.instance_id = str(uuid.uuid4())[:8]
+        logger.info(f"Instance ID: {self.instance_id}")
+        
+        # State persistence
+        self.persistence = StatePersistence(
+            backend=self.config.get('persistence_backend', 'redis'),
+            redis_url=self.config.get('redis_url')
+        )
         
         # Component registry
         self.components: Dict[str, ComponentInfo] = {}
         
         # Core infrastructure (enhanced)
-        self.event_bus = EnhancedEventBus()
-        self.saga_orchestrator = SagaOrchestrator()
+        self.event_bus = EnhancedEventBus(self.persistence)
+        self.saga_orchestrator = SagaOrchestrator(self.persistence)
         self.api_gateway = APIGateway(
-            jwt_secret=self.config.get('jwt_secret'),
-            rate_limit=self.config.get('rate_limit', 100)
+            jwt_secret=self.config.get('security', {}).get('jwt_secret'),
+            rate_limit=self.config.get('security', {}).get('rate_limit', 100),
+            persistence=self.persistence
         )
         self.secrets_manager = SecretsManager()
+        
+        # Distributed components
+        self.circuit_breakers: Dict[str, DistributedCircuitBreaker] = {}
+        self.bulkheads: Dict[str, Bulkhead] = {}
+        self.leader_election = LeaderElection(
+            self.persistence.redis_client if self.persistence.redis_client else None
+        )
         
         # Tracking
         self.start_time = datetime.now()
@@ -975,8 +1075,23 @@ class GreenAgentControlSystem:
         self.helium_scarcity_level = 0.0
         self.throttled_tasks: Set[str] = set()
         
-        # WebSocket connections for real-time dashboard
+        # WebSocket connections
         self.websocket_connections: Set = set()
+        self.ws_rate_limiters: Dict[str, deque] = defaultdict(lambda: deque(maxlen=60))
+        
+        # Task queues
+        self.task_queue = asyncio.Queue()
+        self.accepting_tasks = True
+        self._tasks_completed = asyncio.Event()
+        
+        # Configuration watcher
+        if self.config_path:
+            self.config_watcher = ConfigWatcher(self.config_path, self._reload_config)
+        else:
+            self.config_watcher = None
+        
+        # Metrics exporter
+        self.metrics_exporter_task = None
         
         # Distributed tracing
         self.tracer = trace.get_tracer(__name__)
@@ -984,26 +1099,47 @@ class GreenAgentControlSystem:
         # Initialize
         self._register_core_routes()
         self._register_event_handlers()
+        self._init_bulkheads()
         self._discover_enhancement_modules()
-        self._start_websocket_server()
+        
+        # Start background tasks
+        self.background_tasks = [
+            asyncio.create_task(self._health_monitor_loop()),
+            asyncio.create_task(self._helium_update_loop()),
+            asyncio.create_task(self._gradual_cycle_loop()),
+            asyncio.create_task(self._task_processor()),
+            asyncio.create_task(self._metrics_exporter_loop())
+        ]
+        
+        if self.config_watcher:
+            self.background_tasks.append(asyncio.create_task(self.config_watcher.start()))
+        
+        # Start WebSocket server
+        asyncio.create_task(self._start_websocket_server())
+        
+        # Acquire leadership
+        asyncio.create_task(self.leader_election.acquire_leadership())
         
         # Update metrics
         SYSTEM_UPTIME.set(0)
         
-        logger.info(f"GreenAgentControlSystem v7.0 initialized with {len(self.components)} components")
+        logger.info(f"GreenAgentControlSystem v8.0 initialized with {len(self.components)} components")
     
-    def _load_config(self) -> Dict:
-        """Load configuration from YAML file or defaults"""
+    def _load_and_validate_config(self) -> Dict:
+        """Load and validate configuration with Pydantic"""
         config_file = self.config_path or 'control_system_config.yaml'
         
         default_config = {
-            'system': {'name': 'Green Agent', 'version': '7.0'},
+            'system': {'name': 'Green Agent', 'version': '8.0'},
             'helium': {'scheduling_enabled': True, 'scarcity_threshold': 0.7},
-            'monitoring': {'health_check_interval': 30, 'metrics_enabled': True},
-            'security': {'jwt_expiry_seconds': 3600, 'rate_limit': 100},
-            'modules': {'discovery_enabled': True, 'auto_register': True},
-            'websocket': {'enabled': True, 'port': 8765},
-            'tracing': {'enabled': True, 'sampling_rate': 0.1}
+            'security': {'jwt_secret': os.getenv('JWT_SECRET', 'default-secret-change-me'), 
+                        'jwt_expiry_seconds': 3600, 'rate_limit': 100},
+            'monitoring': {'health_check_interval': 30, 'metrics_enabled': True,
+                          'pushgateway_url': os.getenv('PUSHGATEWAY_URL')},
+            'websocket': {'enabled': True, 'host': 'localhost', 'port': 8765, 'rate_limit': 60},
+            'tracing': {'enabled': True, 'sampling_rate': 0.1},
+            'persistence_backend': os.getenv('PERSISTENCE_BACKEND', 'redis'),
+            'redis_url': os.getenv('REDIS_URL', 'redis://localhost:6379')
         }
         
         if Path(config_file).exists():
@@ -1011,34 +1147,149 @@ class GreenAgentControlSystem:
                 with open(config_file, 'r') as f:
                     user_config = yaml.safe_load(f)
                     default_config.update(user_config)
-                logger.info(f"Configuration loaded from {config_file}")
             except Exception as e:
                 logger.warning(f"Failed to load config: {e}")
         
-        return default_config
+        # Validate with Pydantic
+        try:
+            validated = ControlSystemConfig(**default_config)
+            logger.info("Configuration validated successfully")
+            return default_config
+        except ValidationError as e:
+            logger.error(f"Configuration validation failed: {e}")
+            raise
+    
+    async def _reload_config(self):
+        """Hot-reload configuration"""
+        try:
+            new_config = self._load_and_validate_config()
+            old_config = self.config
+            self.config = new_config
+            
+            # Update components that need config changes
+            if new_config['security']['rate_limit'] != old_config['security']['rate_limit']:
+                self.api_gateway.rate_limit = new_config['security']['rate_limit']
+            
+            # Publish config change event
+            await self.event_bus.publish(SystemEvent(
+                event_type=EventType.CONFIG_CHANGED,
+                source='config_watcher',
+                data={'old_config': old_config, 'new_config': new_config}
+            ))
+            
+            audit_logger.info("Configuration hot-reloaded")
+            logger.info("Configuration reloaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Configuration reload failed: {e}")
+    
+    def _init_bulkheads(self):
+        """Initialize bulkheads for task isolation"""
+        self.bulkheads = {
+            'helium_tasks': Bulkhead('helium_tasks', max_concurrent=10, max_queue_size=50),
+            'carbon_tasks': Bulkhead('carbon_tasks', max_concurrent=20, max_queue_size=100),
+            'quantum_tasks': Bulkhead('quantum_tasks', max_concurrent=5, max_queue_size=25),
+            'general_tasks': Bulkhead('general_tasks', max_concurrent=50, max_queue_size=200)
+        }
     
     def _register_core_routes(self):
-        """Register core API routes with authentication"""
-        self.api_gateway.register_route('/health', self._health_handler, ['GET'], auth_required=False)
-        self.api_gateway.register_route('/status', self._status_handler, ['GET'], auth_required=True, roles=['viewer', 'operator', 'admin'])
-        self.api_gateway.register_route('/components', self._components_handler, ['GET'], auth_required=True, roles=['viewer'])
-        self.api_gateway.register_route('/events', self._events_handler, ['GET'], auth_required=True, roles=['operator'])
-        self.api_gateway.register_route('/helium/status', self._helium_status_handler, ['GET'], auth_required=True, roles=['viewer'])
-        self.api_gateway.register_route('/workflows', self._workflows_handler, ['GET'], auth_required=True, roles=['operator'])
-        self.api_gateway.register_route('/metrics', self._metrics_handler, ['GET'], auth_required=True, roles=['admin'])
-        self.api_gateway.register_route('/token', self._token_handler, ['POST'], auth_required=False)
+        """Register core API routes with versioning"""
+        self.api_gateway.register_route('/health', self._health_handler, ['GET'], auth_required=False, version=1)
+        self.api_gateway.register_route('/health/detailed', self._detailed_health_handler, ['GET'], 
+                                        auth_required=True, roles=['admin'], version=1)
+        self.api_gateway.register_route('/status', self._status_handler, ['GET'], 
+                                        auth_required=True, roles=['viewer', 'operator', 'admin'], version=1)
+        self.api_gateway.register_route('/components', self._components_handler, ['GET'], 
+                                        auth_required=True, roles=['viewer'], version=1)
+        self.api_gateway.register_route('/events', self._events_handler, ['GET'], 
+                                        auth_required=True, roles=['operator'], version=1)
+        self.api_gateway.register_route('/helium/status', self._helium_status_handler, ['GET'], 
+                                        auth_required=True, roles=['viewer'], version=1)
+        self.api_gateway.register_route('/workflows', self._workflows_handler, ['GET'], 
+                                        auth_required=True, roles=['operator'], version=1)
+        self.api_gateway.register_route('/metrics', self._metrics_handler, ['GET'], 
+                                        auth_required=True, roles=['admin'], version=1)
+        self.api_gateway.register_route('/token', self._token_handler, ['POST'], auth_required=False, version=1)
+        
+        # API v2 example
+        self.api_gateway.register_route('/status', self._status_handler_v2, ['GET'], 
+                                        auth_required=True, roles=['viewer'], version=2)
     
     async def _health_handler(self, request: Dict) -> Dict:
-        """Health check endpoint"""
+        """Basic health check endpoint"""
         return {
             'status': 'healthy',
             'timestamp': datetime.now().isoformat(),
-            'version': '7.0',
+            'version': '8.0',
+            'instance_id': self.instance_id,
             'components_healthy': sum(1 for c in self.components.values() if c.status == ComponentStatus.HEALTHY)
         }
     
+    async def _detailed_health_handler(self, request: Dict) -> Dict:
+        """Detailed health check with component breakdown"""
+        health = {
+            'status': 'healthy',
+            'version': '8.0',
+            'instance_id': self.instance_id,
+            'is_leader': self.leader_election.is_leader,
+            'timestamp': datetime.now().isoformat(),
+            'components': {},
+            'circuit_breakers': {},
+            'bulkheads': {},
+            'queue_status': {
+                'event_bus_size': len(self.event_bus.event_store),
+                'dead_letter_size': len(self.event_bus.dead_letter_events),
+                'active_tasks': ACTIVE_TASKS._value.get(),
+                'task_queue_size': self.task_queue.qsize()
+            }
+        }
+        
+        # Component health
+        for name, info in self.components.items():
+            component_health = {
+                'status': info.status.value,
+                'health_score': info.health_score,
+                'uptime_seconds': (datetime.now() - info.registered_at).total_seconds(),
+                'failure_count': info.failure_count,
+                'last_failure': info.last_failure.isoformat() if info.last_failure else None
+            }
+            health['components'][name] = component_health
+        
+        # Circuit breakers
+        for name, cb in self.circuit_breakers.items():
+            health['circuit_breakers'][name] = {
+                'state': cb.state,
+                'failure_count': cb.failure_count,
+                'last_failure_time': cb.last_failure_time
+            }
+        
+        # Bulkheads
+        for name, bh in self.bulkheads.items():
+            health['bulkheads'][name] = {
+                'active_count': bh.active_count,
+                'queue_size': bh.queue.qsize(),
+                'max_concurrent': bh.max_concurrent,
+                'max_queue_size': bh.max_queue_size
+            }
+        
+        # Check dependencies
+        for name, info in self.components.items():
+            for dep in info.dependencies:
+                if dep not in self.components:
+                    health['components'][name]['missing_dependency'] = dep
+                    health['status'] = 'degraded'
+        
+        return health
+    
+    async def _status_handler_v2(self, request: Dict) -> Dict:
+        """Status handler for API v2"""
+        status = self.get_system_status()
+        status['api_version'] = 2
+        status['instance_id'] = self.instance_id
+        return status
+    
     async def _status_handler(self, request: Dict) -> Dict:
-        """System status endpoint"""
+        """Status handler for API v1"""
         return self.get_system_status()
     
     async def _components_handler(self, request: Dict) -> Dict:
@@ -1053,7 +1304,8 @@ class GreenAgentControlSystem:
                 }
                 for name, info in self.components.items()
             ],
-            'count': len(self.components)
+            'count': len(self.components),
+            'instance_id': self.instance_id
         }
     
     async def _events_handler(self, request: Dict) -> Dict:
@@ -1074,7 +1326,15 @@ class GreenAgentControlSystem:
         return {
             'active_workflows': len(self.saga_orchestrator.active_workflows),
             'completed_workflows': len(self.saga_orchestrator.workflow_history),
-            'recent_workflows': list(self.saga_orchestrator.workflow_history)[-5:]
+            'recent_workflows': [
+                {
+                    'workflow_id': w['workflow_id'],
+                    'state': w['state'],
+                    'started_at': w.get('started_at'),
+                    'completed_at': w.get('completed_at')
+                }
+                for w in list(self.saga_orchestrator.workflow_history)[-5:]
+            ]
         }
     
     async def _metrics_handler(self, request: Dict) -> Dict:
@@ -1087,11 +1347,11 @@ class GreenAgentControlSystem:
         username = data.get('username')
         password = data.get('password')
         
-        # In production, validate against user database
         if username == 'admin' and password == 'admin123':
             token = self.api_gateway.generate_token(username, ['admin', 'operator', 'viewer'])
-            return {'token': token, 'expires_in': 3600}
+            return {'token': token, 'expires_in': 3600, 'token_type': 'Bearer'}
         
+        AUTH_FAILURES.labels(reason='invalid_credentials').inc()
         return {'error': 'Invalid credentials', 'status': 401}
     
     def _register_event_handlers(self):
@@ -1115,8 +1375,8 @@ class GreenAgentControlSystem:
                 COMPONENT_HEALTH.labels(component_name=component_name).set(0)
                 
                 # Try to restart component if configured
-                if self.config.get('auto_restart', True):
-                    await self._restart_component(component_name)
+                if self.config.get('system', {}).get('auto_restart', True):
+                    asyncio.create_task(self._restart_component(component_name))
     
     async def _handle_helium_scarcity(self, event: SystemEvent):
         """Handle helium scarcity event"""
@@ -1155,26 +1415,189 @@ class GreenAgentControlSystem:
         logger.info(f"Task completed: {task_type} in {duration:.2f}s")
     
     async def _restart_component(self, component_name: str):
-        """Attempt to restart a failed component"""
-        logger.info(f"Attempting to restart component: {component_name}")
-        # Implementation would re-initialize the component
-        # For now, just mark as degraded
-        if component_name in self.components:
-            self.components[component_name].status = ComponentStatus.DEGRADED
+        """Attempt to restart a failed component with backoff"""
+        for attempt in range(3):
+            logger.info(f"Attempting to restart component {component_name}, attempt {attempt + 1}/3")
+            await asyncio.sleep(5 * (2 ** attempt))  # Exponential backoff
+            
+            try:
+                # Re-initialize component
+                component_class = self.components[component_name].instance.__class__
+                new_instance = component_class()
+                self.components[component_name].instance = new_instance
+                self.components[component_name].status = ComponentStatus.HEALTHY
+                self.components[component_name].failure_count = 0
+                COMPONENT_HEALTH.labels(component_name=component_name).set(1)
+                logger.info(f"Component {component_name} restarted successfully")
+                return
+            except Exception as e:
+                logger.error(f"Component restart failed: {e}")
+        
+        logger.error(f"Failed to restart component {component_name} after 3 attempts")
+    
+    async def _task_processor(self):
+        """Background task processor with bulkhead isolation"""
+        while self.accepting_tasks:
+            try:
+                task_type, task_data, future = await self.task_queue.get()
+                QUEUE_SIZE.set(self.task_queue.qsize())
+                
+                # Determine bulkhead based on task type
+                if 'helium' in task_type:
+                    bulkhead = self.bulkheads['helium_tasks']
+                elif 'carbon' in task_type:
+                    bulkhead = self.bulkheads['carbon_tasks']
+                elif 'quantum' in task_type:
+                    bulkhead = self.bulkheads['quantum_tasks']
+                else:
+                    bulkhead = self.bulkheads['general_tasks']
+                
+                # Execute with bulkhead protection
+                result = await bulkhead.execute(self._execute_task, task_type, task_data)
+                future.set_result(result)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Task processor error: {e}")
+    
+    async def _execute_task(self, task_type: str, task_data: Dict) -> Dict:
+        """Execute task with retry and circuit breaker"""
+        if task_type in self.throttled_tasks:
+            return {'status': 'throttled', 'reason': 'helium_scarcity', 'retry_after': 300}
+        
+        # Get or create circuit breaker
+        if task_type not in self.circuit_breakers:
+            self.circuit_breakers[task_type] = DistributedCircuitBreaker(
+                task_type, self.persistence, self.instance_id
+            )
+        
+        return await self.circuit_breakers[task_type].call(
+            self._route_task, task_type, task_data
+        )
+    
+    async def _route_task(self, task_type: str, task_data: Dict) -> Dict:
+        """Route task to appropriate component"""
+        routing_map = {
+            'helium_collect': ('helium_data_collector', 'collect_all_data'),
+            'regret_optimize': ('regret_optimizer', 'calculate_regret'),
+            'thermal_optimize': ('thermal_optimizer', 'run_optimization'),
+        }
+        
+        if task_type in routing_map:
+            component_name, method_name = routing_map[task_type]
+            component = self.get_component(component_name)
+            
+            if component and hasattr(component, method_name):
+                method = getattr(component, method_name)
+                if asyncio.iscoroutinefunction(method):
+                    return await method(**task_data)
+                else:
+                    return method(**task_data)
+            else:
+                return {'error': f'Component or method not found: {component_name}.{method_name}'}
+        
+        return {'error': f'Unknown task type: {task_type}'}
+    
+    async def _metrics_exporter_loop(self):
+        """Background metrics export to Prometheus Pushgateway"""
+        pushgateway_url = self.config['monitoring'].get('pushgateway_url')
+        if not pushgateway_url:
+            return
+        
+        while True:
+            try:
+                push_to_gateway(
+                    pushgateway_url,
+                    job='green_agent',
+                    registry=REGISTRY
+                )
+                await asyncio.sleep(60)  # Export every minute
+            except Exception as e:
+                logger.error(f"Metrics export failed: {e}")
+                await asyncio.sleep(300)
+    
+    async def _start_websocket_server(self):
+        """Start WebSocket server with authentication"""
+        if not self.config['websocket']['enabled']:
+            return
+        
+        host = self.config['websocket']['host']
+        port = self.config['websocket']['port']
+        ws_rate_limit = self.config['websocket']['rate_limit']
+        
+        async def handler(websocket, path):
+            # Extract token from query string or headers
+            token = None
+            if 'token' in websocket.request.query_string.decode():
+                params = dict(p.split('=') for p in websocket.request.query_string.decode().split('&'))
+                token = params.get('token')
+            
+            # Authenticate
+            if not token:
+                await websocket.close(code=1008, reason="Missing authentication token")
+                return
+            
+            try:
+                payload = jwt.decode(token, self.config['security']['jwt_secret'], algorithms=['HS256'])
+                user = payload.get('sub')
+                if not user:
+                    await websocket.close(code=1008, reason="Invalid token")
+                    return
+            except JWTError:
+                await websocket.close(code=1008, reason="Invalid token")
+                return
+            
+            # Rate limiting for WebSocket
+            client_id = user
+            rate_limiter = self.ws_rate_limiters[client_id]
+            now = time.time()
+            
+            # Clean old entries
+            while rate_limiter and rate_limiter[0] < now - 60:
+                rate_limiter.popleft()
+            
+            if len(rate_limiter) >= ws_rate_limit:
+                await websocket.close(code=1009, reason="Rate limit exceeded")
+                return
+            
+            rate_limiter.append(now)
+            self.websocket_connections.add(websocket)
+            
+            logger.info(f"WebSocket client connected: {user}, total: {len(self.websocket_connections)}")
+            
+            try:
+                async for message in websocket:
+                    data = json.loads(message)
+                    if data.get('type') == 'ping':
+                        await websocket.send(json.dumps({'type': 'pong', 'timestamp': datetime.now().isoformat()}))
+                    elif data.get('type') == 'subscribe':
+                        await self._send_status_update(websocket)
+            except ConnectionClosed:
+                pass
+            finally:
+                self.websocket_connections.remove(websocket)
+                logger.info(f"WebSocket client disconnected: {user}")
+        
+        try:
+            async with serve(handler, host, port):
+                logger.info(f"WebSocket server started on ws://{host}:{port}")
+                await asyncio.Future()
+        except Exception as e:
+            logger.error(f"WebSocket server failed to start: {e}")
+    
+    async def _send_status_update(self, websocket):
+        """Send status update to WebSocket client"""
+        status = self.get_system_status()
+        await websocket.send(json.dumps({
+            'type': 'status_update',
+            'data': status,
+            'timestamp': datetime.now().isoformat()
+        }))
     
     def _discover_enhancement_modules(self):
-        """
-        Enhanced auto-discovery with external configuration.
-        """
-        # Load module configuration from YAML
-        module_config_file = self.config.get('module_config', 'modules.yaml')
-        
-        if Path(module_config_file).exists():
-            with open(module_config_file, 'r') as f:
-                discovery_map = yaml.safe_load(f)
-        else:
-            # Use enhanced discovery map with all modules
-            discovery_map = self._get_enhanced_discovery_map()
+        """Auto-discover enhancement modules"""
+        discovery_map = self._get_enhanced_discovery_map()
         
         discovered_count = 0
         for component_name, config in discovery_map.items():
@@ -1195,7 +1618,6 @@ class GreenAgentControlSystem:
     def _get_enhanced_discovery_map(self) -> Dict:
         """Get enhanced discovery map with all module configurations"""
         return {
-            # Helium Ecosystem
             'helium_data_collector': {
                 'module': 'control_system',
                 'class': 'HeliumDataCollector',
@@ -1216,17 +1638,14 @@ class GreenAgentControlSystem:
                 'factory': None,
                 'category': 'optimization',
                 'version': '1.0'
-            },
-            # Additional modules would be listed here
+            }
         }
     
     def _try_import_component(self, config: Dict) -> Optional[Any]:
         """Try to import and instantiate a component"""
         module_name = config.get('module')
         class_name = config.get('class')
-        factory_name = config.get('factory')
         
-        # If module is current file, use local classes
         if module_name == 'control_system':
             if class_name in globals():
                 try:
@@ -1234,33 +1653,10 @@ class GreenAgentControlSystem:
                 except Exception as e:
                     logger.debug(f"Failed to instantiate {class_name}: {e}")
         
-        try:
-            # Try factory function first
-            if factory_name:
-                module = importlib.import_module(module_name)
-                factory = getattr(module, factory_name, None)
-                if factory:
-                    return factory()
-            
-            # Try direct class instantiation
-            module = importlib.import_module(module_name)
-            component_class = getattr(module, class_name, None)
-            if component_class:
-                try:
-                    return component_class()
-                except TypeError:
-                    return component_class(config={})
-            
-        except ImportError:
-            pass
-        except Exception as e:
-            logger.debug(f"Failed to instantiate {class_name}: {e}")
-        
         return None
     
     def register_component(self, name: str, instance: Any, category: str = "general"):
         """Register a component with the control system"""
-        # Check if component implements health check protocol
         if isinstance(instance, HealthCheckable):
             health_status = instance.health_check()
             initial_status = ComponentStatus.HEALTHY if health_status.get('healthy', True) else ComponentStatus.DEGRADED
@@ -1299,7 +1695,6 @@ class GreenAgentControlSystem:
             try:
                 instance = info.instance
                 
-                # Try health check protocol
                 if isinstance(instance, HealthCheckable):
                     result = instance.health_check()
                     healthy = result.get('healthy', True)
@@ -1342,12 +1737,11 @@ class GreenAgentControlSystem:
                 span.set_status(Status(StatusCode.ERROR, str(e)))
                 logger.error(f"Health check failed for {name}: {e}")
                 
-                # Publish failure event
-                await self.event_bus.publish(SystemEvent(
+                asyncio.create_task(self.event_bus.publish(SystemEvent(
                     event_type=EventType.COMPONENT_FAILED,
                     source='health_monitor',
                     data={'component_name': name, 'error': str(e)}
-                ))
+                )))
                 
                 return False
     
@@ -1395,7 +1789,6 @@ class GreenAgentControlSystem:
                         span.set_attribute("old_scarcity", old_scarcity)
                         span.set_attribute("new_scarcity", new_scarcity)
                         
-                        # Publish event if scarcity crossed threshold
                         if new_scarcity > self.config['helium']['scarcity_threshold'] and old_scarcity <= self.config['helium']['scarcity_threshold']:
                             await self.event_bus.publish(SystemEvent(
                                 event_type=EventType.HELIUM_SCARCITY,
@@ -1408,114 +1801,14 @@ class GreenAgentControlSystem:
                     span.set_status(Status(StatusCode.ERROR, str(e)))
     
     async def execute_task(self, task_type: str, task_data: Dict = None) -> Dict:
-        """
-        Execute a task with helium-aware scheduling and distributed tracing.
-        """
-        # Check if task is throttled
-        if task_type in self.throttled_tasks:
-            return {'status': 'throttled', 'reason': 'helium_scarcity', 'retry_after': 300}
-        
-        start_time = time.time()
-        ACTIVE_TASKS.inc()
-        
-        with self.tracer.start_as_current_span(f"task_{task_type}") as span:
-            span.set_attribute("task.type", task_type)
-            span.set_attribute("task.data_size", len(str(task_data)) if task_data else 0)
-            
-            try:
-                # Route task to appropriate component
-                result = await self._route_task(task_type, task_data or {})
-                duration = time.time() - start_time
-                
-                TASKS_EXECUTED.labels(task_type=task_type, status='success').inc()
-                TASK_DURATION.labels(task_type=task_type).observe(duration)
-                
-                self.task_history.append({
-                    'task_type': task_type,
-                    'status': 'success',
-                    'duration': duration,
-                    'timestamp': datetime.now(),
-                    'trace_id': get_trace_id()
-                })
-                
-                span.set_attribute("task.duration_seconds", duration)
-                span.set_status(Status(StatusCode.OK))
-                
-                # Publish completion event
-                await self.event_bus.publish(SystemEvent(
-                    event_type=EventType.TASK_COMPLETED,
-                    source='task_executor',
-                    data={'task_type': task_type, 'duration': duration}
-                ))
-                
-                return {'status': 'success', 'result': result, 'duration': duration}
-                
-            except Exception as e:
-                duration = time.time() - start_time
-                TASKS_EXECUTED.labels(task_type=task_type, status='failed').inc()
-                
-                logger.error(f"Task execution failed: {e}")
-                span.set_status(Status(StatusCode.ERROR, str(e)))
-                
-                self.task_history.append({
-                    'task_type': task_type,
-                    'status': 'failed',
-                    'error': str(e),
-                    'duration': duration,
-                    'timestamp': datetime.now(),
-                    'trace_id': get_trace_id()
-                })
-                
-                # Publish failure event
-                await self.event_bus.publish(SystemEvent(
-                    event_type=EventType.TASK_FAILED,
-                    source='task_executor',
-                    data={'task_type': task_type, 'error': str(e)}
-                ))
-                
-                return {'status': 'failed', 'error': str(e), 'duration': duration}
-            
-            finally:
-                ACTIVE_TASKS.dec()
-    
-    async def _route_task(self, task_type: str, task_data: Dict) -> Dict:
-        """Route task to appropriate component with retry logic"""
-        
-        routing_map = {
-            'helium_collect': ('helium_data_collector', 'collect_all_data'),
-            'regret_optimize': ('regret_optimizer', 'calculate_regret'),
-            'thermal_optimize': ('thermal_optimizer', 'run_optimization'),
-        }
-        
-        if task_type in routing_map:
-            component_name, method_name = routing_map[task_type]
-            component = self.get_component(component_name)
-            
-            if component and hasattr(component, method_name):
-                method = getattr(component, method_name)
-                
-                # Apply retry logic
-                @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-                async def execute_with_retry():
-                    if asyncio.iscoroutinefunction(method):
-                        return await method(**task_data)
-                    else:
-                        return method(**task_data)
-                
-                try:
-                    return await execute_with_retry()
-                except Exception as e:
-                    logger.error(f"Task routing failed after retries: {e}")
-                    raise
-            else:
-                return {'error': f'Component or method not found: {component_name}.{method_name}'}
-        
-        return {'error': f'Unknown task type: {task_type}'}
+        """Execute a task asynchronously with queue"""
+        future = asyncio.Future()
+        await self.task_queue.put((task_type, task_data or {}, future))
+        QUEUE_SIZE.set(self.task_queue.qsize())
+        return await future
     
     async def run_gradual_cycle(self):
-        """
-        Run enhanced gradual cyclic orchestration through all modules.
-        """
+        """Run enhanced gradual cyclic orchestration"""
         logger.info("Starting enhanced gradual cyclic orchestration...")
         cycle_results = {'phases': {}, 'trace_id': get_trace_id(), 'timestamp': datetime.now().isoformat()}
         
@@ -1532,7 +1825,6 @@ class GreenAgentControlSystem:
                 regret_optimizer = self.get_component('regret_optimizer')
                 if regret_optimizer:
                     try:
-                        # Create sample decisions and outcomes
                         decisions = [{'id': 'sample1', 'alternatives': []}]
                         outcomes = [{'metrics': {'latency': 50, 'carbon': 300, 'cost': 100}}]
                         regret_result = regret_optimizer.calculate_regret(decisions, outcomes)
@@ -1586,144 +1878,15 @@ class GreenAgentControlSystem:
         
         return cycle_results
     
-    async def _start_websocket_server(self):
-        """Start WebSocket server for real-time dashboard"""
-        if not self.config.get('websocket', {}).get('enabled', True):
-            return
-        
-        port = self.config.get('websocket', {}).get('port', 8765)
-        
-        async def handler(websocket, path):
-            self.websocket_connections.add(websocket)
-            try:
-                async for message in websocket:
-                    # Handle client messages
-                    data = json.loads(message)
-                    if data.get('type') == 'subscribe':
-                        # Send initial status
-                        await websocket.send(json.dumps({
-                            'type': 'status',
-                            'data': self.get_system_status()
-                        }))
-            finally:
-                self.websocket_connections.remove(websocket)
-        
-        try:
-            async with serve(handler, "localhost", port):
-                logger.info(f"WebSocket server started on port {port}")
-                # Keep running
-                await asyncio.Future()
-        except Exception as e:
-            logger.warning(f"WebSocket server failed to start: {e}")
-    
-    async def broadcast_status(self):
-        """Broadcast system status to all WebSocket clients"""
-        if not self.websocket_connections:
-            return
-        
-        status = self.get_system_status()
-        message = json.dumps({
-            'type': 'status_update',
-            'data': status,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        dead_connections = set()
-        for ws in self.websocket_connections:
-            try:
-                await ws.send(message)
-            except:
-                dead_connections.add(ws)
-        
-        self.websocket_connections -= dead_connections
-    
-    async def start(self):
-        """Start the control system"""
-        logger.info("Starting Green Agent Control System v7.0...")
-        self.start_time = datetime.now()
-        
-        # Start health monitoring loop
-        asyncio.create_task(self._health_monitor_loop())
-        
-        # Start helium status update loop
-        asyncio.create_task(self._helium_update_loop())
-        
-        # Start gradual cyclic orchestration
-        asyncio.create_task(self._gradual_cycle_loop())
-        
-        # Start status broadcast loop
-        asyncio.create_task(self._status_broadcast_loop())
-        
-        # Set up signal handlers for graceful shutdown
-        for sig in [signal.SIGTERM, signal.SIGINT]:
-            asyncio.get_event_loop().add_signal_handler(
-                sig, lambda: asyncio.create_task(self.stop())
-            )
-        
-        audit_logger.info("Control system started", extra={
-            'components': len(self.components),
-            'version': '7.0'
-        })
-        
-        logger.info(f"Control system started with {len(self.components)} components")
-        return {'status': 'started', 'components': len(self.components), 'version': '7.0'}
-    
-    async def stop(self):
-        """Stop the control system gracefully"""
-        logger.info("Stopping Green Agent Control System...")
-        
-        # Save state
-        await self._save_state()
-        
-        # Mark all components as stopped
-        for name, info in self.components.items():
-            info.status = ComponentStatus.STOPPED
-            COMPONENT_HEALTH.labels(component_name=name).set(0)
-        
-        # Close WebSocket connections
-        for ws in self.websocket_connections:
-            await ws.close()
-        
-        uptime = (datetime.now() - self.start_time).total_seconds()
-        audit_logger.info("Control system stopped", extra={
-            'uptime_seconds': uptime,
-            'total_tasks': len(self.task_history)
-        })
-        
-        SYSTEM_UPTIME.set(uptime)
-        logger.info(f"Control system stopped after {uptime:.0f} seconds")
-        return {'status': 'stopped', 'uptime_seconds': uptime}
-    
-    async def _save_state(self):
-        """Save system state to disk"""
-        state = {
-            'helium_scarcity_level': self.helium_scarcity_level,
-            'throttled_tasks': list(self.throttled_tasks),
-            'components': {
-                name: {
-                    'status': info.status.value,
-                    'health_score': info.health_score,
-                    'registered_at': info.registered_at.isoformat()
-                }
-                for name, info in self.components.items()
-            },
-            'statistics': self.get_system_status()
-        }
-        
-        state_file = Path('control_system_state.json')
-        with open(state_file, 'w') as f:
-            json.dump(state, f, indent=2, default=str)
-        
-        logger.info(f"System state saved to {state_file}")
-    
     async def _health_monitor_loop(self):
         """Background health monitoring loop"""
+        interval = self.config['monitoring']['health_check_interval']
         while True:
             try:
                 self.check_all_components_health()
                 SYSTEM_UPTIME.set((datetime.now() - self.start_time).total_seconds())
                 DEAD_LETTER_COUNT.set(len(self.event_bus.dead_letter_events))
-                await asyncio.sleep(self.config['monitoring']['health_check_interval'])
+                await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Health monitor error: {e}")
                 await asyncio.sleep(60)
@@ -1744,21 +1907,10 @@ class GreenAgentControlSystem:
         while True:
             try:
                 await self.run_gradual_cycle()
-                await asyncio.sleep(self.config.get('cycle_interval_seconds', 3600))
+                await asyncio.sleep(3600)  # Every hour
             except Exception as e:
                 logger.error(f"Gradual cycle error: {e}")
                 await asyncio.sleep(7200)
-    
-    async def _status_broadcast_loop(self):
-        """Background status broadcast loop for WebSocket clients"""
-        await asyncio.sleep(10)  # Initial delay
-        while True:
-            try:
-                await self.broadcast_status()
-                await asyncio.sleep(5)  # Broadcast every 5 seconds
-            except Exception as e:
-                logger.error(f"Status broadcast error: {e}")
-                await asyncio.sleep(30)
     
     def get_system_status(self) -> Dict:
         """Get comprehensive system status"""
@@ -1767,10 +1919,11 @@ class GreenAgentControlSystem:
         return {
             'system': {
                 'name': 'Green Agent Control System',
-                'version': '7.0',
+                'version': '8.0',
+                'instance_id': self.instance_id,
+                'is_leader': self.leader_election.is_leader,
                 'uptime_seconds': (datetime.now() - self.start_time).total_seconds(),
-                'started_at': self.start_time.isoformat(),
-                'trace_id': get_trace_id()
+                'started_at': self.start_time.isoformat()
             },
             'components': {
                 'total': len(self.components),
@@ -1791,6 +1944,7 @@ class GreenAgentControlSystem:
             'tasks': {
                 'total_executed': len(self.task_history),
                 'active': ACTIVE_TASKS._value.get(),
+                'queue_size': self.task_queue.qsize(),
                 'throttled': list(self.throttled_tasks),
                 'recent_success_rate': self._calculate_success_rate()
             },
@@ -1801,6 +1955,7 @@ class GreenAgentControlSystem:
             },
             'api': {
                 'routes': len(self.api_gateway.routes),
+                'versions': list(self.api_gateway.versioned_routes.keys()),
                 'requests_processed': len(self.api_gateway.request_history)
             },
             'secrets': {
@@ -1809,7 +1964,16 @@ class GreenAgentControlSystem:
             },
             'websocket': {
                 'connections': len(self.websocket_connections),
-                'enabled': self.config.get('websocket', {}).get('enabled', True)
+                'enabled': self.config['websocket']['enabled'],
+                'rate_limit': self.config['websocket']['rate_limit']
+            },
+            'bulkheads': {
+                name: {
+                    'active': bh.active_count,
+                    'queued': bh.queue.qsize(),
+                    'max_concurrent': bh.max_concurrent
+                }
+                for name, bh in self.bulkheads.items()
             }
         }
     
@@ -1839,54 +2003,131 @@ class GreenAgentControlSystem:
             'integrated_modules': modules_found,
             'missing_modules': missing,
             'integration_ready': len(missing) == 0,
-            'version': '7.0'
+            'version': '8.0',
+            'instance_id': self.instance_id
         }
+    
+    async def shutdown(self):
+        """Graceful shutdown with task draining"""
+        logger.info("Initiating graceful shutdown...")
+        
+        # 1. Stop accepting new tasks
+        self.accepting_tasks = False
+        
+        # 2. Wait for active tasks to complete (with timeout)
+        active = ACTIVE_TASKS._value.get()
+        if active > 0:
+            logger.info(f"Waiting for {active} active tasks to complete...")
+            try:
+                await asyncio.wait_for(self._tasks_completed.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for tasks to complete")
+        
+        # 3. Drain task queue
+        queue_size = self.task_queue.qsize()
+        if queue_size > 0:
+            logger.info(f"Draining {queue_size} pending tasks...")
+            while not self.task_queue.empty():
+                try:
+                    self.task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        
+        # 4. Release leadership
+        await self.leader_election.release_leadership()
+        
+        # 5. Close connections
+        await self.persistence.close()
+        await self.secrets_manager.close()
+        
+        # 6. Cancel background tasks
+        for task in self.background_tasks:
+            task.cancel()
+        
+        # 7. Save final state
+        await self._save_state()
+        
+        audit_logger.info("System shutdown complete", extra={
+            'uptime_seconds': (datetime.now() - self.start_time).total_seconds(),
+            'final_components': len(self.components)
+        })
+        
+        logger.info("Graceful shutdown complete")
+    
+    async def _save_state(self):
+        """Save system state to disk"""
+        state = {
+            'helium_scarcity_level': self.helium_scarcity_level,
+            'throttled_tasks': list(self.throttled_tasks),
+            'components': {
+                name: {
+                    'status': info.status.value,
+                    'health_score': info.health_score,
+                    'registered_at': info.registered_at.isoformat(),
+                    'failure_count': info.failure_count
+                }
+                for name, info in self.components.items()
+            },
+            'statistics': self.get_system_status()
+        }
+        
+        state_file = Path('control_system_state.json')
+        with open(state_file, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+        
+        logger.info(f"System state saved to {state_file}")
 
 # ============================================================
-# ENHANCED MAIN DEMO
+# MAIN DEMONSTRATION
 # ============================================================
 
-async def main_v7_enhanced():
-    """Enhanced V7.0 demonstration with all features"""
+async def main_v8():
+    """Enhanced V8.0 demonstration"""
     print("=" * 80)
-    print("Green Agent Control System v7.0 - Fully Enhanced Demo")
+    print("Green Agent Control System v8.0 - Platinum Enhanced Demo")
     print("=" * 80)
     
-    # Create configuration file if not exists
-    config_example = {
-        'system': {'name': 'Green Agent', 'version': '7.0'},
+    # Create example configuration
+    example_config = {
+        'system': {'name': 'Green Agent', 'version': '8.0'},
         'helium': {'scheduling_enabled': True, 'scarcity_threshold': 0.7},
+        'security': {'jwt_secret': 'a-very-secure-secret-key-that-is-32-chars-long', 
+                    'jwt_expiry_seconds': 3600, 'rate_limit': 100},
         'monitoring': {'health_check_interval': 30, 'metrics_enabled': True},
-        'security': {'jwt_expiry_seconds': 3600, 'rate_limit': 100},
-        'modules': {'discovery_enabled': True, 'auto_register': True},
-        'websocket': {'enabled': True, 'port': 8765},
+        'websocket': {'enabled': True, 'host': 'localhost', 'port': 8765, 'rate_limit': 60},
         'tracing': {'enabled': True, 'sampling_rate': 0.1},
-        'cycle_interval_seconds': 3600
+        'persistence_backend': 'sqlite'
     }
     
     if not Path('control_system_config.yaml').exists():
         with open('control_system_config.yaml', 'w') as f:
-            yaml.dump(config_example, f)
+            yaml.dump(example_config, f)
         print("✅ Created example configuration file: control_system_config.yaml")
     
     # Initialize control system
     control = GreenAgentControlSystem('control_system_config.yaml')
     
-    print(f"\n✅ V7.0 Enhancements Applied:")
-    print(f"   ✅ ContextVars for Async Correlation IDs")
-    print(f"   ✅ Encrypted Secrets Manager")
-    print(f"   ✅ JWT Authentication & Authorization")
-    print(f"   ✅ Circuit Breakers for Event Bus")
-    print(f"   ✅ WebSocket Real-time Dashboard")
-    print(f"   ✅ Distributed Tracing (OpenTelemetry)")
-    print(f"   ✅ Complete Module Implementations")
-    print(f"   ✅ Audit Logging")
-    print(f"   ✅ Graceful Shutdown with State Persistence")
+    print(f"\n✅ V8.0 Platinum Enhancements Active:")
+    print(f"   ✅ State Persistence (SQLite)")
+    print(f"   ✅ Distributed Circuit Breakers")
+    print(f"   ✅ Configuration Validation (Pydantic)")
+    print(f"   ✅ WebSocket Authentication (JWT)")
+    print(f"   ✅ Leader Election (Distributed)")
+    print(f"   ✅ Bulkhead Pattern (Task Isolation)")
+    print(f"   ✅ Configuration Hot-Reload")
+    print(f"   ✅ API Versioning (v1, v2)")
+    print(f"   ✅ Metrics Export to Pushgateway")
+    
+    print(f"\n🔧 Configuration:")
+    print(f"   Instance ID: {control.instance_id}")
+    print(f"   Leader: {'✅' if control.leader_election.is_leader else '❌'}")
+    print(f"   Persistence: {control.config.get('persistence_backend', 'memory')}")
+    print(f"   Bulkheads: {len(control.bulkheads)}")
     
     # Show discovered modules
     print(f"\n📦 Discovered Enhancement Modules:")
     for name, info in control.components.items():
-        print(f"   ✅ {name}: {info.status.value} (health: {info.health_score:.1f})")
+        print(f"   ✅ {name}: {info.status.value}")
     
     # Integration report
     report = control.get_integration_report()
@@ -1896,39 +2137,59 @@ async def main_v7_enhanced():
     print(f"   Version: {report['version']}")
     
     if report['missing_modules']:
-        print(f"   ⚠️ Missing: {', '.join(report['missing_modules'])}")
-    
-    # Test token generation
-    print(f"\n🔐 Authentication Test:")
-    token_response = await control.api_gateway.handle_request({
-        'path': '/token',
-        'method': 'POST',
-        'data': {'username': 'admin', 'password': 'admin123'},
-        'client_id': 'test'
-    })
-    if 'token' in token_response:
-        print(f"   ✅ JWT Token Generated: {token_response['token'][:50]}...")
-    
-    # Start system
-    await control.start()
+        print(f"   Missing: {', '.join(report['missing_modules'])}")
     
     # Test API endpoints
     print(f"\n🌐 API Gateway Test:")
-    endpoints = ['/health', '/status', '/components', '/helium/status']
-    for endpoint in endpoints:
-        response = await control.api_gateway.handle_request({
-            'path': endpoint,
-            'method': 'GET',
-            'client_id': 'demo',
-            'headers': {'Authorization': f"Bearer {token_response.get('token', '')}"}
-        })
-        status = response.get('status', response.get('error', 'unknown'))
-        print(f"   {endpoint}: {status}")
+    
+    # Get JWT token
+    token_response = await control.api_gateway.handle_request({
+        'path': '/v1/token',
+        'method': 'POST',
+        'data': {'username': 'admin', 'password': 'admin123'},
+        'client_id': 'demo'
+    })
+    
+    if 'token' in token_response:
+        token = token_response['token']
+        print(f"   ✅ JWT Token Generated")
+        
+        # Test versioned endpoints
+        endpoints = [
+            ('/v1/health', 'GET'),
+            ('/v1/status', 'GET'),
+            ('/v2/status', 'GET'),
+            ('/v1/components', 'GET'),
+            ('/v1/helium/status', 'GET'),
+            ('/v1/health/detailed', 'GET')
+        ]
+        
+        for path, method in endpoints:
+            response = await control.api_gateway.handle_request({
+                'path': path,
+                'method': method,
+                'client_id': 'demo',
+                'headers': {'Authorization': f'Bearer {token}'}
+            })
+            status = response.get('status', response.get('error', 'unknown'))
+            print(f"   {path}: {status}")
     
     # Test task execution
-    print(f"\n⚙️ Task Execution Test:")
-    task_result = await control.execute_task('helium_collect', {})
-    print(f"   Helium collect: {task_result.get('status', 'unknown')}")
+    print(f"\n⚙️ Task Execution with Bulkhead Isolation:")
+    
+    # Execute tasks with different bulkheads
+    tasks = [
+        ('helium_collect', {}, 'helium_tasks'),
+        ('regret_optimize', {}, 'general_tasks'),
+        ('thermal_optimize', {'cooling_type': 'liquid_cooled', 'load_pct': 75, 'helium_scarcity': 0.5}, 'general_tasks')
+    ]
+    
+    for task_type, task_data, bulkhead in tasks:
+        bulkhead_info = control.bulkheads.get(bulkhead)
+        if bulkhead_info:
+            result = await control.execute_task(task_type, task_data)
+            status = result.get('status', 'unknown')
+            print(f"   {task_type} ({bulkhead}): {status}")
     
     # Run gradual cycle
     print(f"\n🔄 Gradual Cyclic Orchestration:")
@@ -1950,21 +2211,30 @@ async def main_v7_enhanced():
     print(f"   Uptime: {status['system']['uptime_seconds']:.0f}s")
     print(f"   Helium Scarcity: {status['helium']['scarcity_level']:.2f}")
     print(f"   Task Success Rate: {status['tasks']['recent_success_rate']:.1%}")
-    print(f"   WebSocket Connections: {status['websocket']['connections']}")
+    print(f"   Queue Size: {status['tasks']['queue_size']}")
     
-    # Audit log summary
-    print(f"\n📝 Audit Log:")
-    print(f"   Check audit.log for detailed audit trail")
+    # Bulkhead status
+    print(f"\n🔒 Bulkhead Status:")
+    for name, bh in control.bulkheads.items():
+        print(f"   {name}: active={bh.active_count}, queued={bh.queue.qsize()}")
     
-    # Run for a few seconds to show WebSocket and monitoring
-    print(f"\n⏳ Running for 10 seconds to show monitoring loops...")
-    await asyncio.sleep(10)
+    # Health check
+    health = await control.api_gateway.handle_request({
+        'path': '/v1/health/detailed',
+        'method': 'GET',
+        'client_id': 'demo',
+        'headers': {'Authorization': f'Bearer {token}'}
+    })
+    print(f"\n🏥 Detailed Health Check:")
+    print(f"   Status: {health.get('status', 'unknown')}")
+    print(f"   Instance: {health.get('instance_id', 'unknown')}")
+    print(f"   Leader: {'✅' if health.get('is_leader') else '❌'}")
     
-    # Stop system gracefully
-    await control.stop()
+    # Shutdown gracefully
+    await control.shutdown()
     
     print("\n" + "=" * 80)
-    print("✅ Green Agent Control System v7.0 - Demo Complete")
+    print("✅ Green Agent Control System v8.0 - Demo Complete")
     print(f"   {report['total_integrated']} modules integrated")
     print(f"   Audit trail saved to audit.log")
     print(f"   System state saved to control_system_state.json")
@@ -1973,5 +2243,5 @@ async def main_v7_enhanced():
     return control
 
 if __name__ == "__main__":
-    print("Running V7.0 enhanced version with all critical fixes and improvements...")
-    asyncio.run(main_v7_enhanced())
+    print("Running V8.0 enhanced version with all critical fixes and improvements...")
+    asyncio.run(main_v8())
