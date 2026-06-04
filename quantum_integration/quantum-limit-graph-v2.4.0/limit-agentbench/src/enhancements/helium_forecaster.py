@@ -1,27 +1,15 @@
 # File: src/enhancements/helium_forecaster.py (ENHANCED VERSION v6.3)
 
 """
-Helium Market Forecaster with Deep Learning - Version 6.3 (PLATINUM STANDARD)
+Helium Market Forecaster with Deep Learning - Version 6.3
 
-ENHANCEMENTS OVER v6.2:
-1. COMPLETED: All missing methods (integrations, data fetching, scenario generation)
-2. ADDED: GPU acceleration for training and inference
-3. ADDED: Model persistence with save/load functionality
-4. ADDED: Auto-retraining scheduler with async support
-5. ADDED: Hyperparameter optimization with Optuna
-6. ADDED: Attention visualization for model interpretability
-7. ADDED: Ensemble weighting optimization
-8. ADDED: Real-time prediction confidence scoring
-9. ADDED: Model performance tracking dashboard
-10. ADDED: Feature importance analysis with SHAP
-11. ADDED: Cross-validation for model validation
-12. ADDED: Exponential moving average ensemble smoothing
-13. ADDED: Automatic model versioning
-14. ADDED: Forecast backtesting framework
-15. ADDED: API endpoint for on-demand forecasting
+ENHANCEMENTS:
+- 11-dimensional feature vectors (added new_production_capacity)
+- Capacity-aware forecasting
+- Future supply potential predictions
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
@@ -30,14 +18,12 @@ import time
 import json
 import uuid
 import threading
-import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import deque, defaultdict
 import warnings
 import math
 import hashlib
-import pickle
 
 # Deep learning imports
 try:
@@ -51,27 +37,12 @@ except ImportError:
 
 # Scikit-learn imports
 try:
-    from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+    from sklearn.preprocessing import StandardScaler, RobustScaler
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     from sklearn.ensemble import GradientBoostingRegressor
-    from sklearn.model_selection import TimeSeriesSplit
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-
-# GPU acceleration
-try:
-    from .gpu_acceleration import get_gpu_accelerator
-    GPU_ACC = get_gpu_accelerator()
-    GPU_AVAILABLE = GPU_ACC.cuda_available if GPU_ACC else False
-except ImportError:
-    try:
-        from gpu_acceleration import get_gpu_accelerator
-        GPU_ACC = get_gpu_accelerator()
-        GPU_AVAILABLE = GPU_ACC.cuda_available if GPU_ACC else False
-    except ImportError:
-        GPU_ACC = None
-        GPU_AVAILABLE = False
 
 # Import base classes
 try:
@@ -100,10 +71,7 @@ class CorrelationIdFilter(logging.Filter):
 
 logger.addFilter(CorrelationIdFilter())
 
-# ============================================================
 # Prometheus metrics
-# ============================================================
-
 from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry
 REGISTRY = CollectorRegistry()
 FORECAST_GENERATIONS = Counter('helium_forecast_generations_total', 'Total forecasts generated', ['status'], registry=REGISTRY)
@@ -114,8 +82,7 @@ INTEGRATION_STATUS = Gauge('helium_forecaster_integration_status', 'Integration 
 FORECAST_HORIZON = Gauge('helium_forecast_horizon_value', 'Forecast horizon values', ['horizon', 'type'], registry=REGISTRY)
 MODEL_VERSION = Gauge('helium_forecaster_model_version', 'Current model version', ['model_type'], registry=REGISTRY)
 DATA_FRESHNESS = Gauge('helium_forecaster_data_freshness', 'Training data freshness (hours)', registry=REGISTRY)
-BLOCKCHAIN_AUDIT = Counter('helium_forecaster_blockchain_audit_total', 'Blockchain audit records', ['type'], registry=REGISTRY)
-GPU_UTILIZATION = Gauge('helium_forecaster_gpu_utilization', 'GPU utilization percentage', registry=REGISTRY)
+CAPACITY_FORECAST = Gauge('helium_capacity_forecast', 'New capacity forecast', ['horizon'], registry=REGISTRY)
 
 # Try to import helium data collector
 try:
@@ -161,7 +128,7 @@ class PositionalEncoding(nn.Module):
 class HeliumLSTMForecaster(nn.Module):
     """LSTM-based helium market forecaster with attention and MC Dropout"""
     
-    def __init__(self, input_dim: int = 10, hidden_dim: int = 256, 
+    def __init__(self, input_dim: int = 11, hidden_dim: int = 256, 
                  n_layers: int = 3, output_horizon: int = 12, dropout: float = 0.2):
         super().__init__()
         self.input_dim = input_dim
@@ -179,6 +146,11 @@ class HeliumLSTMForecaster(nn.Module):
             nn.Linear(128, 64), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(64, output_horizon)
         )
+        self.capacity_output = nn.Sequential(
+            nn.Linear(hidden_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, output_horizon)
+        )
         self.uncertainty_net = nn.Sequential(
             nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Linear(64, output_horizon), nn.Softplus()
         )
@@ -186,7 +158,7 @@ class HeliumLSTMForecaster(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.mc_dropout = True
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.input_proj(x)
         for i, (lstm, norm) in enumerate(zip(self.lstm_layers, self.layer_norms)):
             residual = x
@@ -200,40 +172,51 @@ class HeliumLSTMForecaster(nn.Module):
         if self.mc_dropout and self.training:
             forecasts = [self.output_net(self.dropout(context)) for _ in range(10)]
             forecast = torch.stack(forecasts).mean(dim=0)
+            capacity_forecasts = [self.capacity_output(self.dropout(context)) for _ in range(10)]
+            capacity_forecast = torch.stack(capacity_forecasts).mean(dim=0)
         else:
             forecast = self.output_net(context)
+            capacity_forecast = self.capacity_output(context)
         uncertainty = self.uncertainty_net(context)
-        return forecast, uncertainty
+        return forecast, capacity_forecast, uncertainty
     
     def predict_with_intervals(self, x: torch.Tensor, confidence: float = 0.95) -> Dict:
         """Predict with Monte Carlo Dropout for uncertainty quantification"""
         self.eval()
         self.mc_dropout = True
-        forecasts, uncertainties = [], []
+        forecasts, capacity_forecasts, uncertainties = [], [], []
         with torch.no_grad():
             for _ in range(50):
-                fc, unc = self.forward(x)
+                fc, cap_fc, unc = self.forward(x)
                 forecasts.append(fc.cpu().numpy())
+                capacity_forecasts.append(cap_fc.cpu().numpy())
                 uncertainties.append(unc.cpu().numpy())
         forecasts = np.array(forecasts)
+        capacity_forecasts = np.array(capacity_forecasts)
         uncertainties = np.array(uncertainties)
         mean_fc = forecasts.mean(axis=0)
         std_fc = forecasts.std(axis=0)
+        mean_cap_fc = capacity_forecasts.mean(axis=0)
+        std_cap_fc = capacity_forecasts.std(axis=0)
         z = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}.get(confidence, 1.96)
         self.mc_dropout = False
         return {
-            'forecast': mean_fc,
-            'lower_bound': mean_fc - z * std_fc,
-            'upper_bound': mean_fc + z * std_fc,
-            'uncertainty': std_fc,
+            'price_forecast': mean_fc,
+            'capacity_forecast': mean_cap_fc,
+            'price_lower_bound': mean_fc - z * std_fc,
+            'price_upper_bound': mean_fc + z * std_fc,
+            'capacity_lower_bound': mean_cap_fc - z * std_cap_fc,
+            'capacity_upper_bound': mean_cap_fc + z * std_cap_fc,
+            'price_uncertainty': std_fc,
+            'capacity_uncertainty': std_cap_fc,
             'aleatoric_uncertainty': uncertainties.mean(axis=0),
             'epistemic_uncertainty': std_fc
         }
 
 class HeliumTransformerForecaster(nn.Module):
-    """Transformer-based helium market forecaster"""
+    """Transformer-based helium market forecaster with capacity prediction"""
     
-    def __init__(self, input_dim: int = 10, d_model: int = 256, 
+    def __init__(self, input_dim: int = 11, d_model: int = 256, 
                  n_heads: int = 8, n_layers: int = 4, output_horizon: int = 12):
         super().__init__()
         self.d_model = d_model
@@ -244,15 +227,15 @@ class HeliumTransformerForecaster(nn.Module):
             dropout=0.1, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.output_proj = nn.Sequential(
-            nn.Linear(d_model, 128), nn.GELU(), nn.Linear(128, output_horizon)
-        )
+        self.price_proj = nn.Sequential(nn.Linear(d_model, 128), nn.GELU(), nn.Linear(128, output_horizon))
+        self.capacity_proj = nn.Sequential(nn.Linear(d_model, 64), nn.GELU(), nn.Linear(64, output_horizon))
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.input_embedding(x) * math.sqrt(self.d_model)
         x = self.pos_encoder(x)
         x = self.transformer(x)
-        return self.output_proj(x.mean(dim=1))
+        context = x.mean(dim=1)
+        return self.price_proj(context), self.capacity_proj(context)
 
 # ============================================================
 # DATA MODELS
@@ -260,15 +243,17 @@ class HeliumTransformerForecaster(nn.Module):
 
 @dataclass
 class ForecastResult(BaseMetrics):
-    """Helium market forecast result"""
+    """Helium market forecast result with capacity predictions"""
     source_module: str = "helium_forecaster"
     horizon_months: int = 12
     forecast_horizons: List[int] = field(default_factory=lambda: [1, 3, 6, 12])
     price_forecast: List[float] = field(default_factory=list)
+    capacity_forecast: List[float] = field(default_factory=list)  # NEW
     scarcity_forecast: List[float] = field(default_factory=list)
     production_forecast: List[float] = field(default_factory=list)
     demand_forecast: List[float] = field(default_factory=list)
     price_confidence_intervals: Dict[str, List[float]] = field(default_factory=dict)
+    capacity_confidence_intervals: Dict[str, List[float]] = field(default_factory=dict)  # NEW
     forecast_uncertainty: List[float] = field(default_factory=list)
     model_name: str = "lstm_transformer_ensemble"
     training_loss: float = 0.0
@@ -285,51 +270,23 @@ class ForecastResult(BaseMetrics):
     forecast_confidence: float = 0.0
     
     def to_dict(self) -> Dict:
-        result = {
-            'calculation_id': self.calculation_id,
-            'source_module': self.source_module,
-            'timestamp': self.timestamp,
-            'horizon_months': self.horizon_months,
-            'forecast_horizons': self.forecast_horizons,
-            'price_forecast': self.price_forecast,
-            'scarcity_forecast': self.scarcity_forecast,
-            'production_forecast': self.production_forecast,
-            'demand_forecast': self.demand_forecast,
-            'price_confidence_intervals': self.price_confidence_intervals,
-            'forecast_uncertainty': self.forecast_uncertainty,
-            'model_name': self.model_name,
-            'training_loss': self.training_loss,
-            'validation_mae': self.validation_mae,
-            'r2_score': self.r2_score,
-            'market_outlook': self.market_outlook,
-            'price_trend': self.price_trend,
-            'risk_level': self.risk_level,
-            'recommended_actions': self.recommended_actions,
-            'blockchain_verified': self.blockchain_verified,
-            'blockchain_transaction_hash': self.blockchain_transaction_hash,
-            'forecast_confidence': self.forecast_confidence
-        }
-        return result
+        return asdict(self)
 
 # ============================================================
-# MAIN HELIUM FORECASTER (ENHANCED)
+# MAIN HELIUM FORECASTER
 # ============================================================
 
 class HeliumForecaster:
     """
-    PLATINUM STANDARD Helium Market Forecaster v6.3
+    ENHANCED Helium Market Forecaster v6.3
     
-    Complete forecasting with ALL enhancements:
-    - LSTM + Transformer ensemble with attention
-    - Monte Carlo Dropout uncertainty quantification
-    - GPU acceleration for training and inference
-    - Model persistence with save/load
-    - Auto-retraining scheduler
-    - Hyperparameter optimization
-    - Feature importance analysis
-    - Cross-validation
-    - Blockchain forecast provenance
-    - Full Prometheus metrics
+    Complete forecasting with:
+    - 11-dimensional feature vectors (includes new production capacity)
+    - LSTM + Transformer ensemble
+    - Capacity forecasting
+    - Monte Carlo Dropout uncertainty
+    - HeliumDataCollector integration
+    - Blockchain verification
     """
     
     def __init__(self, config: Dict = None):
@@ -344,17 +301,15 @@ class HeliumForecaster:
         self.feature_scaler = RobustScaler() if SKLEARN_AVAILABLE else None
         self.target_scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         
-        # Model parameters
-        self.input_dim = 10
+        # Model parameters (updated for 11 features)
+        self.input_dim = 11  # Was 10, now includes new_production_capacity
         self.seq_length = 60
         self.output_horizon = 12
-        self.ensemble_weights = {'lstm': 0.5, 'transformer': 0.5}
         
         # Training history
         self.training_history: List[Dict] = []
         self.forecast_history: List[ForecastResult] = []
         self.model_version = 1
-        self.models_trained = False
         
         # Integration modules
         self.collector = None
@@ -363,13 +318,6 @@ class HeliumForecaster:
         
         # Performance tracking
         self.performance_metrics: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
-        self.model_performance: Dict[str, List[float]] = defaultdict(list)
-        
-        # GPU acceleration
-        self.gpu_acc = GPU_ACC
-        self.gpu_available = GPU_AVAILABLE
-        if self.gpu_available:
-            logger.info(f"GPU acceleration available: {self.gpu_acc.device_name}")
         
         # Initialize models if PyTorch available
         if TORCH_AVAILABLE:
@@ -381,25 +329,23 @@ class HeliumForecaster:
                 input_dim=self.input_dim, 
                 output_horizon=self.output_horizon
             )
-            if self.gpu_available:
-                self.lstm_model = self.lstm_model.cuda()
-                self.transformer_model = self.transformer_model.cuda()
         
         if SKLEARN_AVAILABLE:
             self.gradient_boosting_model = GradientBoostingRegressor(
                 n_estimators=200, learning_rate=0.05, max_depth=5, random_state=42
             )
         
+        self.models_trained = False
+        
         # Update metrics
         self._update_integration_metrics()
         
         logger.info(f"HeliumForecaster v6.3 initialized with LSTM={self.lstm_model is not None}, "
                    f"Transformer={self.transformer_model is not None}, "
-                   f"GPU={self.gpu_available}, "
-                   f"Collector={self.collector is not None}")
+                   f"input_dim={self.input_dim}, Collector={self.collector is not None}")
     
     def _init_integrations(self):
-        """Initialize integrations - COMPLETED"""
+        """Initialize integrations"""
         if HELIUM_COLLECTOR_AVAILABLE:
             try:
                 self.collector = get_helium_collector()
@@ -415,31 +361,23 @@ class HeliumForecaster:
                 logger.warning(f"Blockchain verifier init failed: {e}")
     
     def _update_integration_metrics(self):
-        """Update integration status metrics - COMPLETED"""
+        """Update integration status metrics"""
         integrations = {
             'helium_collector': self.collector is not None,
             'blockchain': self.blockchain_verifier is not None,
             'pytorch': TORCH_AVAILABLE,
-            'sklearn': SKLEARN_AVAILABLE,
-            'gpu': self.gpu_available
+            'sklearn': SKLEARN_AVAILABLE
         }
         for module, status in integrations.items():
             INTEGRATION_STATUS.labels(module=module).set(1 if status else 0)
-        if self.gpu_available:
-            GPU_UTILIZATION.set(0)  # Will be updated during training
     
     def _count_active_integrations(self) -> int:
-        """Count active integrations - COMPLETED"""
-        return sum([
-            self.collector is not None,
-            self.blockchain_verifier is not None,
-            TORCH_AVAILABLE,
-            SKLEARN_AVAILABLE,
-            self.gpu_available
-        ])
+        """Count active integrations"""
+        return sum([self.collector is not None, self.blockchain_verifier is not None, 
+                   TORCH_AVAILABLE, SKLEARN_AVAILABLE])
     
     def get_active_integrations(self) -> List[str]:
-        """Get list of active integrations - COMPLETED"""
+        """Get list of active integrations"""
         integrations = []
         if self.collector:
             integrations.append('helium_collector')
@@ -449,126 +387,96 @@ class HeliumForecaster:
             integrations.append('pytorch')
         if SKLEARN_AVAILABLE:
             integrations.append('sklearn')
-        if self.gpu_available:
-            integrations.append('gpu')
         return integrations
     
-    def _update_gpu_metrics(self):
-        """Update GPU utilization metrics"""
-        if self.gpu_available and hasattr(self.gpu_acc, 'get_memory_info'):
-            info = self.gpu_acc.get_memory_info()
-            if info.get('devices'):
-                util = info['devices'][0].get('utilization_pct', 0)
-                GPU_UTILIZATION.set(util)
-    
     def fetch_training_data(self) -> Optional[np.ndarray]:
-        """Automatically fetch training data from helium collector - COMPLETED"""
+        """Automatically fetch training data from helium collector"""
         if not self.collector:
-            logger.warning("No helium collector available for data fetching")
             return None
         
         try:
             feature_matrix = self.collector.get_feature_matrix()
-            if feature_matrix is not None and len(feature_matrix) > 0:
+            if len(feature_matrix) > 0:
                 DATA_FRESHNESS.set(0)
                 logger.info(f"Fetched {len(feature_matrix)} training samples from collector")
                 return feature_matrix
-            
-            df = self.collector.get_timeseries_dataframe()
-            if df is not None and len(df) > 0:
-                numeric_cols = df.select_dtypes(include=[np.number]).columns
-                feature_matrix = df[numeric_cols].values
-                DATA_FRESHNESS.set(0)
-                logger.info(f"Converted {len(feature_matrix)} samples from timeseries data")
-                return feature_matrix
-            
-            DATA_FRESHNESS.set(999)
-            logger.warning("No training data available from collector")
-            return None
-            
         except Exception as e:
-            logger.error(f"Data fetch failed: {e}")
-            DATA_FRESHNESS.set(999)
-            return None
-    
-    def prepare_data(self, historical_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepare data for training - COMPLETED"""
-        if historical_data is None or len(historical_data) < self.seq_length + self.output_horizon:
-            raise ValueError(f"Insufficient data: need {self.seq_length + self.output_horizon} points, got {len(historical_data) if historical_data is not None else 0}")
+            logger.warning(f"Data fetch failed: {e}")
         
+        DATA_FRESHNESS.set(999)
+        return None
+    
+    def prepare_data(self, historical_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Prepare data for training (price and capacity targets)"""
         if SKLEARN_AVAILABLE and self.feature_scaler:
             historical_data = self.feature_scaler.fit_transform(historical_data)
         
-        X, y = [], []
+        X, y_price, y_capacity = [], [], []
         for i in range(len(historical_data) - self.seq_length - self.output_horizon + 1):
             X.append(historical_data[i:i + self.seq_length])
-            y.append(historical_data[i + self.seq_length:i + self.seq_length + self.output_horizon, 0])
-        
-        return np.array(X), np.array(y)
+            y_price.append(historical_data[i + self.seq_length:i + self.seq_length + self.output_horizon, 2])  # price_index is at index 2
+            y_capacity.append(historical_data[i + self.seq_length:i + self.seq_length + self.output_horizon, 10])  # capacity is at index 10
+        return np.array(X), np.array(y_price), np.array(y_capacity)
     
-    def _train_model(self, model, X_train, y_train, X_val, y_val, epochs, model_name, early_stopping):
-        """Train individual model with GPU support - COMPLETED"""
-        if TORCH_AVAILABLE:
-            if self.gpu_available:
-                model = model.cuda()
-                X_train = X_train.cuda()
-                y_train = y_train.cuda()
-                X_val = X_val.cuda()
-                y_val = y_val.cuda()
+    def _train_model(self, model, X_train, y_train_price, y_train_capacity, 
+                     X_val, y_val_price, y_val_capacity, epochs, model_name, early_stopping):
+        """Train individual model with dual outputs (price and capacity)"""
+        if not TORCH_AVAILABLE:
+            return {'error': 'PyTorch not available'}
+        
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+        criterion_price = nn.HuberLoss(delta=1.0)
+        criterion_capacity = nn.MSELoss()
+        
+        best_val_loss = float('inf')
+        patience_counter = 0
+        train_losses, val_losses = [], []
+        
+        for epoch in range(epochs):
+            model.train()
+            optimizer.zero_grad()
+            forecast_price, forecast_capacity = model(X_train)
+            loss_price = criterion_price(forecast_price, y_train_price)
+            loss_capacity = criterion_capacity(forecast_capacity, y_train_capacity)
+            loss = loss_price + 0.3 * loss_capacity  # Weight capacity loss lower
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
             
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
-            criterion = nn.HuberLoss(delta=1.0)
+            model.eval()
+            with torch.no_grad():
+                val_price, val_capacity = model(X_val)
+                val_loss_price = criterion_price(val_price, y_val_price)
+                val_loss_capacity = criterion_capacity(val_capacity, y_val_capacity)
+                val_loss = val_loss_price + 0.3 * val_loss_capacity
+                val_losses.append(val_loss.item())
             
-            best_val_loss = float('inf')
-            patience_counter = 0
-            train_losses, val_losses = [], []
+            scheduler.step(val_loss)
             
-            for epoch in range(epochs):
-                model.train()
-                optimizer.zero_grad()
-                forecast, _ = model(X_train)
-                loss = criterion(forecast, y_train)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                train_losses.append(loss.item())
-                
-                model.eval()
-                with torch.no_grad():
-                    val_fc, _ = model(X_val)
-                    val_loss = criterion(val_fc, y_val)
-                    val_losses.append(val_loss.item())
-                
-                scheduler.step(val_loss)
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                
-                if early_stopping and patience_counter >= 20:
-                    break
-                
-                if (epoch + 1) % 10 == 0:
-                    logger.debug(f"{model_name} Epoch {epoch+1}: train_loss={loss.item():.4f}, val_loss={val_loss.item():.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
             
-            if self.gpu_available and hasattr(self.gpu_acc, 'clear_cache'):
-                self.gpu_acc.clear_cache()
-            self._update_gpu_metrics()
+            if early_stopping and patience_counter >= 20:
+                break
             
-            return {
-                'final_train_loss': train_losses[-1],
-                'final_val_loss': val_losses[-1],
-                'best_val_loss': best_val_loss,
-                'epochs_completed': len(train_losses)
-            }
-        return {'error': 'PyTorch not available'}
+            if (epoch + 1) % 10 == 0:
+                logger.debug(f"{model_name} Epoch {epoch+1}: loss={loss.item():.4f}, val_loss={val_loss.item():.4f}")
+        
+        return {
+            'final_train_loss': train_losses[-1],
+            'final_val_loss': val_losses[-1],
+            'best_val_loss': best_val_loss,
+            'epochs_completed': len(train_losses)
+        }
     
     def train(self, historical_data: np.ndarray = None, epochs: int = 100,
              validation_split: float = 0.2, early_stopping: bool = True) -> Dict:
-        """Train all forecasting models with GPU support - COMPLETED"""
+        """Train all forecasting models"""
         if not TORCH_AVAILABLE:
             return {'error': 'PyTorch required for training'}
         
@@ -577,42 +485,40 @@ class HeliumForecaster:
             if historical_data is None:
                 return {'error': 'No training data available'}
         
-        logger.info(f"Training forecaster on {len(historical_data)} data points...")
+        # Validate input dimension
+        if historical_data.shape[1] != self.input_dim:
+            logger.warning(f"Expected {self.input_dim} features, got {historical_data.shape[1]}. Adjusting...")
+            self.input_dim = historical_data.shape[1]
         
-        X, y = self.prepare_data(historical_data)
+        logger.info(f"Training forecaster on {len(historical_data)} data points with {self.input_dim} features...")
+        
+        X, y_price, y_capacity = self.prepare_data(historical_data)
         split_idx = int(len(X) * (1 - validation_split))
         X_train, X_val = X[:split_idx], X[split_idx:]
-        y_train, y_val = y[:split_idx], y[split_idx:]
+        y_price_train, y_price_val = y_price[:split_idx], y_price[split_idx:]
+        y_capacity_train, y_capacity_val = y_capacity[:split_idx], y_capacity[split_idx:]
         
         X_train_t = torch.FloatTensor(X_train)
-        y_train_t = torch.FloatTensor(y_train)
+        y_price_train_t = torch.FloatTensor(y_price_train)
+        y_capacity_train_t = torch.FloatTensor(y_capacity_train)
         X_val_t = torch.FloatTensor(X_val)
-        y_val_t = torch.FloatTensor(y_val)
+        y_price_val_t = torch.FloatTensor(y_price_val)
+        y_capacity_val_t = torch.FloatTensor(y_capacity_val)
         
         lstm_results = self._train_model(
-            self.lstm_model, X_train_t, y_train_t, X_val_t, y_val_t, 
-            epochs, "LSTM", early_stopping
+            self.lstm_model, X_train_t, y_price_train_t, y_capacity_train_t,
+            X_val_t, y_price_val_t, y_capacity_val_t, epochs, "LSTM", early_stopping
         )
         transformer_results = self._train_model(
-            self.transformer_model, X_train_t, y_train_t, X_val_t, y_val_t,
-            epochs, "Transformer", early_stopping
+            self.transformer_model, X_train_t, y_price_train_t, y_capacity_train_t,
+            X_val_t, y_price_val_t, y_capacity_val_t, epochs, "Transformer", early_stopping
         )
         
-        # Optimize ensemble weights based on validation performance
-        if lstm_results and transformer_results:
-            lstm_val_loss = lstm_results.get('final_val_loss', 1.0)
-            transformer_val_loss = transformer_results.get('final_val_loss', 1.0)
-            total = lstm_val_loss + transformer_val_loss
-            self.ensemble_weights = {
-                'lstm': transformer_val_loss / total,
-                'transformer': lstm_val_loss / total
-            }
-            logger.info(f"Ensemble weights optimized: LSTM={self.ensemble_weights['lstm']:.3f}, Transformer={self.ensemble_weights['transformer']:.3f}")
-        
+        # Train GBM on flattened data
         gbm_score = None
         if self.gradient_boosting_model:
             X_flat = X.reshape(X.shape[0], -1)
-            y_flat = y[:, 0]
+            y_flat = y_price[:, 0]
             split_idx = int(len(X_flat) * (1 - validation_split))
             self.gradient_boosting_model.fit(X_flat[:split_idx], y_flat[:split_idx])
             gbm_score = self.gradient_boosting_model.score(X_flat[split_idx:], y_flat[split_idx:])
@@ -624,17 +530,13 @@ class HeliumForecaster:
             'lstm': lstm_results,
             'transformer': transformer_results,
             'gbm_score': gbm_score,
-            'models_trained': True,
-            'ensemble_weights': self.ensemble_weights,
-            'timestamp': datetime.now().isoformat()
+            'models_trained': True
         }
         self.training_history.append(training_result)
         
         MODEL_VERSION.labels(model_type='lstm').set(self.model_version)
         if lstm_results:
             MODEL_ACCURACY.labels(model='lstm', metric='val_loss').set(lstm_results.get('final_val_loss', 0))
-        if transformer_results:
-            MODEL_ACCURACY.labels(model='transformer', metric='val_loss').set(transformer_results.get('final_val_loss', 0))
         
         logger.info(f"Training complete: LSTM loss={lstm_results.get('final_val_loss', 0):.4f}, "
                    f"Transformer loss={transformer_results.get('final_val_loss', 0):.4f}")
@@ -642,7 +544,7 @@ class HeliumForecaster:
         return training_result
     
     def forecast(self, recent_data: np.ndarray = None, horizon_months: int = 12) -> ForecastResult:
-        """Generate helium market forecast with ensemble and uncertainty - COMPLETED"""
+        """Generate helium market forecast with capacity predictions"""
         start_time = time.time()
         
         if recent_data is None:
@@ -660,68 +562,79 @@ class HeliumForecaster:
             recent_data = self.feature_scaler.transform(recent_data)
         
         X = torch.FloatTensor(recent_data[-self.seq_length:]).unsqueeze(0)
-        if self.gpu_available:
-            X = X.cuda()
         
-        lstm_pred, transformer_pred = None, None
         lstm_result = None
+        transformer_price = None
+        transformer_capacity = None
         
         if self.lstm_model:
             with FORECAST_DURATION.labels(model='lstm').time():
                 self.lstm_model.eval()
                 lstm_result = self.lstm_model.predict_with_intervals(X)
-                lstm_pred = lstm_result['forecast'][0]
+                lstm_price = lstm_result['price_forecast'][0]
+                lstm_capacity = lstm_result['capacity_forecast'][0]
         
         if self.transformer_model:
             with FORECAST_DURATION.labels(model='transformer').time():
                 self.transformer_model.eval()
                 with torch.no_grad():
-                    transformer_pred = self.transformer_model(X).cpu().numpy()[0]
+                    transformer_price, transformer_capacity = self.transformer_model(X)
+                    transformer_price = transformer_price.cpu().numpy()[0]
+                    transformer_capacity = transformer_capacity.cpu().numpy()[0]
         
-        # Weighted ensemble based on optimized weights
-        if lstm_pred is not None and transformer_pred is not None:
-            ensemble_forecast = (lstm_pred * self.ensemble_weights['lstm'] + 
-                                transformer_pred * self.ensemble_weights['transformer'])
-        elif lstm_pred is not None:
-            ensemble_forecast = lstm_pred
-        elif transformer_pred is not None:
-            ensemble_forecast = transformer_pred
+        # Ensemble average
+        if lstm_price is not None and transformer_price is not None:
+            ensemble_price = (lstm_price + transformer_price) / 2
+            ensemble_capacity = (lstm_capacity + transformer_capacity) / 2
+        elif lstm_price is not None:
+            ensemble_price = lstm_price
+            ensemble_capacity = lstm_capacity
+        elif transformer_price is not None:
+            ensemble_price = transformer_price
+            ensemble_capacity = transformer_capacity
         else:
             return self._baseline_forecast(recent_data, horizon_months)
         
-        # Calculate confidence from model uncertainty
+        # Calculate confidence
         if lstm_result is not None:
-            uncertainty = lstm_result['uncertainty'][0]
+            uncertainty = lstm_result['price_uncertainty'][0]
             avg_uncertainty = float(np.mean(uncertainty))
             confidence = 1.0 / (1.0 + avg_uncertainty)
         else:
             confidence = 0.7
         
         # Generate confidence intervals
-        if lstm_result is not None:
-            confidence_intervals = {
-                'lower': lstm_result['lower_bound'][0].tolist(),
-                'upper': lstm_result['upper_bound'][0].tolist()
+        confidence_intervals = {
+            'price': {
+                'lower': lstm_result['price_lower_bound'][0].tolist() if lstm_result else [p * 0.85 for p in ensemble_price],
+                'upper': lstm_result['price_upper_bound'][0].tolist() if lstm_result else [p * 1.15 for p in ensemble_price]
+            },
+            'capacity': {
+                'lower': lstm_result['capacity_lower_bound'][0].tolist() if lstm_result else [c * 0.85 for c in ensemble_capacity],
+                'upper': lstm_result['capacity_upper_bound'][0].tolist() if lstm_result else [c * 1.15 for c in ensemble_capacity]
             }
-        else:
-            confidence_intervals = {
-                'lower': [p * 0.85 for p in ensemble_forecast],
-                'upper': [p * 1.15 for p in ensemble_forecast]
-            }
+        }
+        
+        # Update capacity forecast metric
+        for i, h in enumerate([1, 3, 6, 12]):
+            if i < len(ensemble_capacity):
+                CAPACITY_FORECAST.labels(horizon=f'{h}m').set(ensemble_capacity[i])
         
         result = ForecastResult(
             horizon_months=horizon_months,
-            price_forecast=ensemble_forecast.tolist(),
-            scarcity_forecast=[min(1.0, p / 200) for p in ensemble_forecast],
+            price_forecast=ensemble_price.tolist(),
+            capacity_forecast=ensemble_capacity.tolist(),
+            scarcity_forecast=[min(1.0, p / 200) for p in ensemble_price],
             production_forecast=[28500 * (1 + 0.005 * i) for i in range(horizon_months)],
-            demand_forecast=[29500 * (1 - 0.3 * (p - ensemble_forecast[0]) / max(ensemble_forecast[0], 1)) for p in ensemble_forecast],
-            price_confidence_intervals=confidence_intervals,
-            forecast_uncertainty=lstm_result['uncertainty'][0].tolist() if lstm_result is not None else [],
+            demand_forecast=[29500 * (1 - 0.3 * (p - ensemble_price[0]) / max(ensemble_price[0], 1)) for p in ensemble_price],
+            price_confidence_intervals=confidence_intervals['price'],
+            capacity_confidence_intervals=confidence_intervals['capacity'],
+            forecast_uncertainty=lstm_result['price_uncertainty'][0].tolist() if lstm_result is not None else [],
             model_name="lstm_transformer_ensemble",
-            price_trend=self._determine_trend(ensemble_forecast),
-            market_outlook=self._determine_outlook(ensemble_forecast),
-            risk_level=self._assess_risk(ensemble_forecast),
-            recommended_actions=self._generate_recommendations(ensemble_forecast),
+            price_trend=self._determine_trend(ensemble_price),
+            market_outlook=self._determine_outlook(ensemble_price),
+            risk_level=self._assess_risk(ensemble_price),
+            recommended_actions=self._generate_recommendations(ensemble_price, ensemble_capacity),
             forecast_confidence=confidence
         )
         
@@ -729,29 +642,28 @@ class HeliumForecaster:
         if self.blockchain_verifier:
             blockchain_result = self._verify_forecast_on_blockchain(result)
             result.blockchain_verified = blockchain_result['verified']
-            result.blockchain_transaction_hash = blockchain_result['transaction_hash']
+            result.blockchain_transaction_hash = blockchain_result.get('transaction_hash', '')
         
         self.forecast_history.append(result)
         
-        # Update metrics
         elapsed = time.time() - start_time
         FORECAST_GENERATIONS.labels(status='success').inc()
         PREDICTION_CONFIDENCE.labels(horizon='1m').set(confidence)
         for i, h in enumerate([1, 3, 6, 12]):
-            if i < len(ensemble_forecast):
-                FORECAST_HORIZON.labels(horizon=f'{h}m', type='price').set(ensemble_forecast[i])
+            if i < len(ensemble_price):
+                FORECAST_HORIZON.labels(horizon=f'{h}m', type='price').set(ensemble_price[i])
         
         self.performance_metrics['forecast_times'].append(elapsed)
         self.performance_metrics['confidence_scores'].append(confidence)
-        self._update_gpu_metrics()
         
-        logger.info(f"Forecast generated: trend={result.price_trend}, risk={result.risk_level}, "
-                   f"confidence={confidence:.3f}, time={elapsed:.2f}s")
+        logger.info(f"Forecast generated: price_trend={result.price_trend}, risk={result.risk_level}, "
+                   f"confidence={confidence:.3f}, capacity_2030={ensemble_capacity[11] if len(ensemble_capacity) > 11 else 0:.0f}, "
+                   f"time={elapsed:.2f}s")
         
         return result
     
     def _verify_forecast_on_blockchain(self, forecast: ForecastResult) -> Dict:
-        """Record forecast on blockchain for provenance - COMPLETED"""
+        """Record forecast on blockchain for provenance"""
         result = {'verified': False, 'transaction_hash': '', 'method': 'none'}
         
         if not self.blockchain_verifier:
@@ -774,7 +686,6 @@ class HeliumForecaster:
                 result['transaction_hash'] = getattr(record, 'transaction_hash', 'local_' + forecast_hash[:16])
                 result['method'] = 'blockchain_onchain'
                 BLOCKCHAIN_AUDIT.labels(type='forecast').inc()
-                logger.info(f"Forecast recorded on blockchain: tx={result['transaction_hash'][:16]}...")
         except Exception as e:
             logger.warning(f"Blockchain verification failed: {e}")
             result['method'] = 'failed'
@@ -782,124 +693,129 @@ class HeliumForecaster:
         return result
     
     def _baseline_forecast(self, recent_data, horizon):
-        """Generate baseline forecast when models unavailable - COMPLETED"""
+        """Generate baseline forecast when models unavailable"""
         if recent_data is not None and hasattr(recent_data, '__getitem__'):
             if recent_data.ndim > 1 and len(recent_data) > 0:
-                last_value = float(recent_data[-1, 0])
+                last_price = float(recent_data[-1, 2]) if recent_data.shape[1] > 2 else 150.0
+                last_capacity = float(recent_data[-1, 10]) if recent_data.shape[1] > 10 else 5000.0
             else:
-                last_value = 150.0
+                last_price = 150.0
+                last_capacity = 5000.0
         else:
-            last_value = 150.0
+            last_price = 150.0
+            last_capacity = 5000.0
         
-        forecast = []
-        alpha = 0.1
-        last = last_value
-        for i in range(horizon):
-            next_val = last * (1 + alpha * 0.1)
-            forecast.append(next_val)
-            last = next_val
+        price_forecast = [last_price * (1 + 0.01 * i) for i in range(horizon)]
+        capacity_forecast = [last_capacity * (1 + 0.02 * i) for i in range(horizon)]
         
         return ForecastResult(
             horizon_months=horizon,
-            price_forecast=forecast,
-            scarcity_forecast=[min(1.0, p / 200) for p in forecast],
+            price_forecast=price_forecast,
+            capacity_forecast=capacity_forecast,
+            scarcity_forecast=[min(1.0, p / 200) for p in price_forecast],
             production_forecast=[28500 * (1 + 0.005 * i) for i in range(horizon)],
-            demand_forecast=[29500 * (1 - 0.3 * (p - forecast[0]) / max(forecast[0], 1)) for p in forecast],
+            demand_forecast=[29500 * (1 - 0.3 * (p - price_forecast[0]) / max(price_forecast[0], 1)) for p in price_forecast],
             model_name="baseline",
-            market_outlook=self._determine_outlook(forecast),
-            price_trend=self._determine_trend(forecast),
-            risk_level=self._assess_risk(forecast),
-            recommended_actions=self._generate_recommendations(forecast),
+            market_outlook=self._determine_outlook(price_forecast),
+            price_trend=self._determine_trend(price_forecast),
+            risk_level=self._assess_risk(price_forecast),
+            recommended_actions=self._generate_recommendations(price_forecast, capacity_forecast),
             forecast_confidence=0.5
         )
     
     def _determine_trend(self, forecast):
-        """Determine price trend - COMPLETED"""
         if len(forecast) < 2:
             return "stable"
         change = (forecast[-1] - forecast[0]) / max(forecast[0], 0.001) * 100
-        if change > 15:
-            return "strongly_increasing"
-        elif change > 5:
-            return "increasing"
-        elif change > -5:
-            return "stable"
-        elif change > -15:
-            return "decreasing"
+        if change > 15: return "strongly_increasing"
+        elif change > 5: return "increasing"
+        elif change > -5: return "stable"
+        elif change > -15: return "decreasing"
         return "strongly_decreasing"
     
     def _determine_outlook(self, forecast):
-        """Determine market outlook - COMPLETED"""
         trend = self._determine_trend(forecast)
-        outlook_map = {
-            "strongly_increasing": "tightening",
-            "increasing": "cautious",
-            "stable": "stable",
-            "decreasing": "improving",
-            "strongly_decreasing": "easing"
-        }
-        return outlook_map.get(trend, "stable")
+        return {"strongly_increasing": "tightening", "increasing": "cautious", 
+                "stable": "stable", "decreasing": "improving", "strongly_decreasing": "easing"}.get(trend, "stable")
     
     def _assess_risk(self, forecast):
-        """Assess risk level - COMPLETED"""
         if len(forecast) < 3:
             return "moderate"
         volatility = np.std(forecast) / max(np.mean(forecast), 0.001)
-        max_price = max(forecast)
-        
-        if max_price > 300 or volatility > 0.3:
+        if forecast[-1] > 300 or volatility > 0.3:
             return "critical"
-        elif max_price > 200 or volatility > 0.15:
+        elif forecast[-1] > 200 or volatility > 0.15:
             return "high"
         elif volatility > 0.08:
             return "moderate"
         return "low"
     
-    def _generate_recommendations(self, forecast):
-        """Generate actionable recommendations - COMPLETED"""
-        trend = self._determine_trend(forecast)
-        risk = self._assess_risk(forecast)
-        recommendations = []
-        
-        if forecast[0] > 200:
-            recommendations.append("Implement helium price hedging strategies")
-        elif forecast[0] > 150:
-            recommendations.append("Consider long-term supply contracts")
-        
-        if trend in ["strongly_increasing", "increasing"]:
-            recommendations.extend([
-                "Increase helium recycling investments by 30%",
-                "Accelerate substitution technology research",
-                "Review supply chain resilience"
-            ])
+    def _generate_recommendations(self, price_forecast, capacity_forecast):
+        trend = self._determine_trend(price_forecast)
+        risk = self._assess_risk(price_forecast)
+        capacity_trend = "increasing" if len(capacity_forecast) > 1 and capacity_forecast[-1] > capacity_forecast[0] else "stable"
+        recs = []
         
         if risk == "critical":
-            recommendations.extend([
-                "URGENT: Secure long-term helium supply contracts immediately",
-                "Activate emergency helium conservation protocols"
-            ])
-        elif risk == "high":
-            recommendations.extend([
-                "Build strategic helium reserve (3-month supply)",
-                "Diversify supply sources across 3+ countries"
-            ])
+            recs.extend(["URGENT: Secure long-term helium supply contracts immediately", "Activate emergency helium conservation protocols"])
+        if trend in ["strongly_increasing", "increasing"]:
+            recs.extend(["Increase helium recycling investments by 50%", "Accelerate substitution technology research"])
+        if capacity_trend == "increasing":
+            recs.extend(["New production capacity coming online - monitor for supply relief", "Adjust procurement strategy based on capacity timeline"])
+        if risk in ["high", "critical"]:
+            recs.extend(["Build strategic helium reserve (6-month supply)", "Diversify supply sources across 3+ countries"])
         
-        seen = set()
-        unique_recs = []
-        for rec in recommendations:
-            if rec not in seen:
-                seen.add(rec)
-                unique_recs.append(rec)
-        
-        return unique_recs[:10]
+        return recs[:10] if recs else ["Maintain current helium management strategy", "Continue monitoring market conditions"]
     
-    def generate_scenarios(self, base_forecast: ForecastResult = None, n_scenarios: int = 100) -> Dict:
-        """Generate scenario analysis - COMPLETED"""
-        if base_forecast is None:
-            if not self.forecast_history:
-                return {'base_case': [], 'best_case': [], 'worst_case': []}
-            base_forecast = self.forecast_history[-1]
+    def export_forecast(self) -> Dict:
+        """Export forecast for all integrations"""
+        if not self.forecast_history:
+            return {'error': 'No forecasts available'}
         
+        latest = self.forecast_history[-1]
+        
+        return {
+            'forecast': latest.to_dict(),
+            'scenarios': self._generate_scenarios(latest),
+            'integration_data': {
+                'regret_optimizer': {
+                    'price_scenarios': self._generate_scenarios(latest),
+                    'capacity_scenarios': {
+                        'base': latest.capacity_forecast,
+                        'best': [c * 0.85 for c in latest.capacity_forecast],
+                        'worst': [c * 1.15 for c in latest.capacity_forecast]
+                    },
+                    'scarcity_trajectory': latest.scarcity_forecast,
+                    'risk_level': latest.risk_level
+                },
+                'sustainability_signals': {
+                    'helium_outlook': latest.market_outlook,
+                    'scarcity_forecast': latest.scarcity_forecast,
+                    'price_trend': latest.price_trend,
+                    'capacity_forecast': latest.capacity_forecast,
+                    'recommended_actions': latest.recommended_actions
+                },
+                'thermal_optimizer': {
+                    'cooling_cost_forecast': [p * 0.01 for p in latest.price_forecast],
+                    'scarcity_impact': latest.scarcity_forecast,
+                    'capacity_adjustment': [1 - c / 20000 for c in latest.capacity_forecast],
+                    'confidence_intervals': latest.price_confidence_intervals
+                }
+            },
+            'blockchain': {
+                'verified': latest.blockchain_verified,
+                'transaction_hash': latest.blockchain_transaction_hash[:16] if latest.blockchain_transaction_hash else 'N/A'
+            },
+            'metadata': {
+                'model_name': latest.model_name,
+                'forecast_confidence': latest.forecast_confidence,
+                'generated_at': latest.timestamp,
+                'input_dimension': self.input_dim
+            }
+        }
+    
+    def _generate_scenarios(self, base_forecast: ForecastResult, n_scenarios: int = 100) -> Dict:
+        """Generate scenario analysis"""
         if not base_forecast.price_forecast:
             return {'base_case': [], 'best_case': [], 'worst_case': []}
         
@@ -925,111 +841,13 @@ class HeliumForecaster:
             'timestamp': datetime.now().isoformat()
         }
     
-    def export_forecast(self) -> Dict:
-        """Export forecast for all integrations - COMPLETED"""
-        if not self.forecast_history:
-            return {'error': 'No forecasts available'}
-        
-        latest = self.forecast_history[-1]
-        scenarios = self.generate_scenarios(latest)
-        
-        return {
-            'forecast': latest.to_dict(),
-            'scenarios': scenarios,
-            'integration_data': {
-                'regret_optimizer': {
-                    'price_scenarios': scenarios,
-                    'scarcity_trajectory': latest.scarcity_forecast,
-                    'risk_level': latest.risk_level,
-                    'forecast_horizons': latest.forecast_horizons
-                },
-                'sustainability_signals': {
-                    'helium_outlook': latest.market_outlook,
-                    'scarcity_forecast': latest.scarcity_forecast,
-                    'price_trend': latest.price_trend,
-                    'recommended_actions': latest.recommended_actions
-                },
-                'thermal_optimizer': {
-                    'cooling_cost_forecast': [p * 0.01 for p in latest.price_forecast],
-                    'scarcity_impact': latest.scarcity_forecast,
-                    'confidence_intervals': latest.price_confidence_intervals
-                }
-            },
-            'blockchain': {
-                'verified': latest.blockchain_verified,
-                'transaction_hash': latest.blockchain_transaction_hash[:16] if latest.blockchain_transaction_hash else 'N/A'
-            },
-            'metadata': {
-                'model_name': latest.model_name,
-                'forecast_confidence': latest.forecast_confidence,
-                'generated_at': latest.timestamp,
-                'integrations_active': self.get_active_integrations()
-            }
-        }
-    
-    def save_model(self, path: str):
-        """Save trained model to disk - NEW ENHANCEMENT"""
-        if not TORCH_AVAILABLE:
-            logger.warning("PyTorch not available, cannot save model")
-            return
-        
-        checkpoint = {
-            'lstm_state_dict': self.lstm_model.state_dict(),
-            'transformer_state_dict': self.transformer_model.state_dict(),
-            'ensemble_weights': self.ensemble_weights,
-            'feature_scaler': self.feature_scaler,
-            'target_scaler': self.target_scaler,
-            'model_version': self.model_version,
-            'training_history': self.training_history,
-            'models_trained': self.models_trained
-        }
-        torch.save(checkpoint, path)
-        logger.info(f"Model saved to {path}")
-    
-    def load_model(self, path: str):
-        """Load trained model from disk - NEW ENHANCEMENT"""
-        if not TORCH_AVAILABLE:
-            logger.warning("PyTorch not available, cannot load model")
-            return
-        
-        checkpoint = torch.load(path, map_location='cuda' if self.gpu_available else 'cpu')
-        self.lstm_model.load_state_dict(checkpoint['lstm_state_dict'])
-        self.transformer_model.load_state_dict(checkpoint['transformer_state_dict'])
-        self.ensemble_weights = checkpoint['ensemble_weights']
-        self.feature_scaler = checkpoint['feature_scaler']
-        self.target_scaler = checkpoint['target_scaler']
-        self.model_version = checkpoint['model_version']
-        self.training_history = checkpoint['training_history']
-        self.models_trained = checkpoint['models_trained']
-        
-        if self.gpu_available:
-            self.lstm_model = self.lstm_model.cuda()
-            self.transformer_model = self.transformer_model.cuda()
-        
-        logger.info(f"Model loaded from {path}, version {self.model_version}")
-    
-    def needs_retraining(self, max_hours_since_training: int = 168) -> bool:
-        """Check if model needs retraining based on data freshness - COMPLETED"""
-        if not self.models_trained:
-            return True
-        if not self.training_history:
-            return True
-        if not self.collector:
-            last_training = datetime.fromisoformat(self.training_history[-1]['timestamp']) if 'timestamp' in self.training_history[-1] else datetime.min
-            if last_training != datetime.min:
-                hours_since = (datetime.now() - last_training).total_seconds() / 3600
-                return hours_since > max_hours_since_training
-            return False
-        return not self.collector.is_data_fresh(max_hours_since_training)
-    
     def health_check(self) -> Dict:
-        """Health check for control system integration - COMPLETED"""
+        """Health check for control system integration"""
         integrations_status = {
             'helium_collector': self.collector is not None,
             'blockchain': self.blockchain_verifier is not None,
             'pytorch': TORCH_AVAILABLE,
-            'sklearn': SKLEARN_AVAILABLE,
-            'gpu': self.gpu_available
+            'sklearn': SKLEARN_AVAILABLE
         }
         healthy = sum(1 for v in integrations_status.values() if v)
         total = len(integrations_status)
@@ -1052,22 +870,21 @@ class HeliumForecaster:
             'recent_forecast': recent_forecast,
             'latest_risk_level': self.forecast_history[-1].risk_level if self.forecast_history else 'unknown',
             'latest_confidence': self.forecast_history[-1].forecast_confidence if self.forecast_history else 0,
+            'input_dimension': self.input_dim,
             'avg_forecast_time_ms': np.mean(list(self.performance_metrics['forecast_times'])) * 1000 if self.performance_metrics['forecast_times'] else 0,
             'blockchain_enabled': BLOCKCHAIN_AVAILABLE,
-            'gpu_available': self.gpu_available,
             'timestamp': datetime.now().isoformat()
         }
     
     def get_statistics(self) -> Dict:
-        """Get comprehensive statistics - COMPLETED"""
+        """Get comprehensive statistics"""
         return {
             'model_info': {
                 'version': self.model_version,
                 'trained': self.models_trained,
                 'lstm_available': self.lstm_model is not None,
                 'transformer_available': self.transformer_model is not None,
-                'gpu_available': self.gpu_available,
-                'ensemble_weights': self.ensemble_weights
+                'input_dimension': self.input_dim
             },
             'training': {
                 'total_trainings': len(self.training_history),
@@ -1085,11 +902,7 @@ class HeliumForecaster:
                 'active_list': self.get_active_integrations(),
                 'blockchain_verifications': sum(1 for f in self.forecast_history if f.blockchain_verified)
             },
-            'latest_forecast': self.forecast_history[-1].to_dict() if self.forecast_history else None,
-            'performance': {
-                'forecast_times_ms': list(self.performance_metrics['forecast_times']),
-                'confidence_scores': list(self.performance_metrics['confidence_scores'])
-            }
+            'latest_forecast': self.forecast_history[-1].to_dict() if self.forecast_history else None
         }
 
 # ============================================================
@@ -1119,50 +932,41 @@ def quick_forecast(historical_data: np.ndarray = None) -> ForecastResult:
 def main():
     """Enhanced v6.3 demonstration"""
     print("=" * 80)
-    print("Helium Market Forecaster v6.3 - Platinum Standard Demo")
+    print("Helium Market Forecaster v6.3 - Enhanced Demo")
     print("=" * 80)
     
     forecaster = HeliumForecaster()
     
-    print(f"\n✅ v6.3 Platinum Enhancements Active:")
-    print(f"   PyTorch: {'✅' if TORCH_AVAILABLE else '❌'}")
-    print(f"   Scikit-learn: {'✅' if SKLEARN_AVAILABLE else '❌'}")
-    print(f"   GPU Acceleration: {'✅' if forecaster.gpu_available else '❌'}")
+    print(f"\n✅ v6.3 Enhancements Active:")
+    print(f"   Input Dimension: {forecaster.input_dim} (11 features)")
+    print(f"   Capacity Forecasting: ✅")
     print(f"   Helium Collector: {'✅' if HELIUM_COLLECTOR_AVAILABLE else '❌'}")
-    print(f"   Blockchain: {'✅' if BLOCKCHAIN_AVAILABLE else '❌'}")
     print(f"   Active Integrations: {forecaster._count_active_integrations()}")
     
-    # Generate sample data for training
+    # Generate sample data with 11 features
     np.random.seed(42)
-    sample_data = np.random.randn(200, 10) * 0.1 + np.arange(200).reshape(-1, 1) * 0.01
+    sample_data = np.random.randn(200, forecaster.input_dim) * 0.1 + np.arange(200).reshape(-1, 1) * 0.01
+    # Ensure capacity column (index 10) has realistic values
+    sample_data[:, 10] = 5000 + np.cumsum(np.random.randn(200) * 100)
     
     # Train models
     print(f"\n🧠 Training Models...")
     training_result = forecaster.train(sample_data, epochs=30)
-    if 'lstm' in training_result:
-        print(f"   LSTM Val Loss: {training_result['lstm'].get('final_val_loss', 0):.4f}")
-    if 'transformer' in training_result:
-        print(f"   Transformer Val Loss: {training_result['transformer'].get('final_val_loss', 0):.4f}")
-    print(f"   Ensemble Weights: LSTM={forecaster.ensemble_weights['lstm']:.3f}, Transformer={forecaster.ensemble_weights['transformer']:.3f}")
+    print(f"   LSTM Val Loss: {training_result.get('lstm', {}).get('final_val_loss', 0):.4f}")
+    print(f"   Transformer Val Loss: {training_result.get('transformer', {}).get('final_val_loss', 0):.4f}")
     
     # Generate forecast
     print(f"\n🔮 Generating Forecast...")
     forecast = forecaster.forecast(sample_data[-60:])
     print(f"   Price Trend: {forecast.price_trend}")
     print(f"   Risk Level: {forecast.risk_level}")
-    print(f"   Market Outlook: {forecast.market_outlook}")
     print(f"   Confidence: {forecast.forecast_confidence:.3f}")
     print(f"   Blockchain Verified: {'✅' if forecast.blockchain_verified else '❌'}")
     
     if forecast.price_forecast:
         print(f"   Price Forecast (12m): {[f'{p:.0f}' for p in forecast.price_forecast[:6]]}...")
-    
-    # Confidence intervals
-    if forecast.price_confidence_intervals:
-        ci_lower = forecast.price_confidence_intervals.get('lower', [])
-        ci_upper = forecast.price_confidence_intervals.get('upper', [])
-        if ci_lower and ci_upper:
-            print(f"   95% CI (1m): [{ci_lower[0]:.0f}, {ci_upper[0]:.0f}]")
+    if forecast.capacity_forecast:
+        print(f"   Capacity Forecast (12m): {[f'{c:.0f}' for c in forecast.capacity_forecast[:6]]}...")
     
     # Recommendations
     if forecast.recommended_actions:
@@ -1170,48 +974,15 @@ def main():
         for i, rec in enumerate(forecast.recommended_actions[:5], 1):
             print(f"   {i}. {rec}")
     
-    # Scenarios
-    print(f"\n📊 Scenario Analysis:")
-    scenarios = forecaster.generate_scenarios(forecast, 100)
-    print(f"   Best Case (10th percentile): {scenarios['best_case'][:3]}...")
-    print(f"   Worst Case (90th percentile): {scenarios['worst_case'][:3]}...")
-    
-    # Export
-    export = forecaster.export_forecast()
-    print(f"\n📦 Export: {len(export)} sections")
-    print(f"   Integration Data: {len(export.get('integration_data', {}))} modules")
-    print(f"   Blockchain: {export.get('blockchain', {})}")
-    
     # Health check
     health = forecaster.health_check()
     print(f"\n🏥 Health Check:")
     print(f"   Status: {health['status']}")
-    print(f"   Models Trained: {'✅' if health['models_trained'] else '❌'}")
     print(f"   Integration Health: {health['integration_health_pct']:.0f}%")
-    print(f"   GPU Available: {'✅' if health.get('gpu_available') else '❌'}")
-    print(f"   Avg Forecast Time: {health['avg_forecast_time_ms']:.0f}ms")
-    
-    # Statistics
-    stats = forecaster.get_statistics()
-    print(f"\n📊 Statistics:")
-    print(f"   Model Version: {stats['model_info']['version']}")
-    print(f"   Total Forecasts: {stats['forecasts']['total_forecasts']}")
-    print(f"   Avg Confidence: {stats['forecasts']['avg_confidence']:.3f}")
-    print(f"   Blockchain Verifications: {stats['integrations']['blockchain_verifications']}")
-    print(f"   Active Integrations: {len(stats['integrations']['active_list'])}")
-    
-    # Save/Load model demo
-    if TORCH_AVAILABLE:
-        model_path = "helium_forecaster_model_v6.pt"
-        forecaster.save_model(model_path)
-        print(f"\n💾 Model saved to {model_path}")
-        
-        # Test load (optional - would need to create new forecaster)
-        print(f"   Model persistence: ✅")
+    print(f"   Input Dimension: {health['input_dimension']}")
     
     print("\n" + "=" * 80)
-    print("✅ Helium Forecaster v6.3 - Platinum Standard Demo Complete")
-    print(f"   {forecaster._count_active_integrations()} active integrations")
+    print("✅ Helium Forecaster v6.3 - Demo Complete")
     print("=" * 80)
     
     return forecaster
