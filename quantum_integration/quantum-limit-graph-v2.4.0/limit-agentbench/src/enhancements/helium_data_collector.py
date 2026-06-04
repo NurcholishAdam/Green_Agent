@@ -1487,5 +1487,89 @@ class HeliumRecord:
             self.new_production_capacity_tonnes / 10000  # NEW normalized
         ])
 
+def _generate_enhanced_synthetic_data(self) -> HeliumDataset:
+    """Generate enhanced synthetic data with new production capacity"""
+    np.random.seed(42)
+    start_date = dt.date(2020, 1, 1)
+    n_periods = 48  # 4 years monthly
+    
+    records = []
+    
+    # Generate realistic price path with seasonality
+    dt_days = 1/12  # monthly
+    mu = 0.05  # drift
+    sigma = 0.15  # volatility
+    
+    price_path = [100]
+    for i in range(n_periods):
+        shock = np.random.normal(0, sigma * np.sqrt(dt_days))
+        price_path.append(price_path[-1] * np.exp((mu - 0.5 * sigma**2) * dt_days + shock))
+    price_path = price_path[1:]  # Remove initial
+    
+    # Add seasonal component
+    seasonality = 1 + 0.1 * np.sin(2 * np.pi * np.arange(n_periods) / 12)
+    price_path = price_path * seasonality
+    
+    # Generate new production capacity (increasing over time)
+    base_capacity = 2000
+    capacity_growth_rate = 0.02  # 2% per month growth
+    
+    for i in range(n_periods):
+        date = start_date + dt.timedelta(days=30 * i)
+        
+        # Production (slightly decreasing)
+        production = 28000 + i * (-50) + np.random.normal(0, 300)
+        production = max(20000, min(35000, production))
+        
+        # Demand (increasing)
+        demand = 27000 + i * 100 + np.random.normal(0, 400)
+        demand = max(25000, min(40000, demand))
+        
+        # NEW: Production capacity (ramping up over time)
+        new_capacity = base_capacity * (1 + capacity_growth_rate) ** i + np.random.normal(0, 200)
+        new_capacity = max(500, min(15000, new_capacity))
+        
+        # Shortage severity (increasing with demand/supply, mitigated by new capacity)
+        effective_supply = production + new_capacity * 0.3  # 30% of new capacity online
+        demand_supply = demand / max(effective_supply, 1)
+        shortage = min(1.0, max(0.05, (demand_supply - 0.95) * 3))
+        
+        # Supply risk (increasing over time, but reduced by new capacity)
+        supply_risk = min(0.8, 0.2 + i * 0.015 - (new_capacity / 20000) + np.random.uniform(-0.05, 0.05))
+        supply_risk = max(0.1, min(0.9, supply_risk))
+        
+        # Recycling rate (slowly increasing)
+        recycling = min(0.30, 0.10 + i * 0.006 + np.random.uniform(-0.01, 0.01))
+        
+        # Substitution feasibility (increasing)
+        substitution = min(0.35, 0.08 + i * 0.008 + np.random.uniform(-0.01, 0.01))
+        
+        # Cooling sensitivity (slightly increasing)
+        cooling = 0.85 + i * 0.008 + np.random.uniform(-0.02, 0.02)
+        
+        records.append(HeliumRecord(
+            date=date,
+            global_production_tonnes=production,
+            global_demand_tonnes=demand,
+            price_index=price_path[i],
+            shortage_severity_0_1=np.clip(shortage, 0, 1),
+            supply_risk_score_0_1=np.clip(supply_risk, 0, 1),
+            recycling_rate_0_1=np.clip(recycling, 0, 1),
+            substitution_feasibility_0_1=np.clip(substitution, 0, 1),
+            cooling_load_sensitivity=cooling,
+            geopolitical_risk_index=np.clip(0.3 + i * 0.005, 0, 1),
+            logistics_disruption_index=np.clip(0.2 + i * 0.004, 0, 1),
+            new_production_capacity_tonnes=new_capacity  # NEW
+        ))
+    
+    return HeliumDataset(
+        records=records,
+        metadata={
+            'source': 'enhanced_synthetic_with_capacity',
+            'generated_at': dt.datetime.now().isoformat(),
+            'model': 'geometric_brownian_motion_with_seasonality_and_capacity'
+        }
+    )
+
 if __name__ == "__main__":
     asyncio.run(main_v2_enhanced())
