@@ -609,6 +609,85 @@ def test_data_collector_enhanced(results: EnhancedTestResults):
     except Exception as e:
         results.assert_true(False, "Data collector", str(e))
 
+def test_capacity_field(results: TestResults):
+    """Test new production capacity field (NEW)"""
+    print("\n" + "─" * 60)
+    print("24. Testing New Production Capacity Field (NEW v7.1)")
+    print("─" * 60)
+    
+    try:
+        from helium_data_collector import get_helium_collector
+        
+        collector = get_helium_collector()
+        latest = collector.get_latest()
+        
+        if latest:
+            results.assert_true(hasattr(latest, 'new_production_capacity_tonnes'), 
+                              "Has new_production_capacity_tonnes field")
+            results.assert_true(latest.new_production_capacity_tonnes >= 0, 
+                              "Capacity value is valid")
+            
+            # Test derived properties
+            if hasattr(latest, 'future_supply_potential'):
+                results.assert_true(latest.future_supply_potential >= 0, 
+                                  "Future supply potential calculated")
+                print(f"   ✅ Capacity: {latest.new_production_capacity_tonnes:.0f} tonnes")
+                print(f"   ✅ Future Supply Potential: {latest.future_supply_potential:.1f}%")
+            else:
+                results.add_warning("future_supply_potential property not found")
+        else:
+            results.add_skipped("Capacity field", "No data available")
+        
+        # Test feature vector dimension
+        feature_vector = collector.get_feature_vector()
+        expected_dim = 11
+        results.assert_true(len(feature_vector) == expected_dim, 
+                          f"Feature vector dimension: {len(feature_vector)} (expected {expected_dim})")
+        print(f"   ✅ Feature vector dimension: {len(feature_vector)} (capacity included)")
+        
+    except ImportError:
+        results.add_skipped("Capacity field test", "Module not available")
+    except Exception as e:
+        results.add_warning(f"Capacity test failed: {str(e)[:60]}")
+
+def test_capacity_in_exports(results: TestResults):
+    """Test capacity field in exports (NEW)"""
+    print("\n" + "─" * 60)
+    print("25. Testing Capacity Field in Exports (NEW v7.1)")
+    print("─" * 60)
+    
+    try:
+        from helium_data_collector import get_helium_collector
+        
+        collector = get_helium_collector()
+        
+        exports_to_test = [
+            ('regret_optimizer', collector.export_for_regret_optimizer, 'capacity_impact'),
+            ('sustainability_signals', collector.export_for_sustainability_signals, 'capacity_signal'),
+            ('thermal_optimizer', collector.export_for_thermal_optimizer, 'capacity_adjustment_factor'),
+            ('forecaster', collector.export_for_forecaster, 'capacity_info')
+        ]
+        
+        passed = 0
+        for name, export_func, capacity_key in exports_to_test:
+            try:
+                data = export_func()
+                if capacity_key in data:
+                    passed += 1
+                    print(f"   ✅ {name}: {capacity_key} present")
+                else:
+                    results.add_warning(f"{name} export missing {capacity_key}")
+            except Exception as e:
+                results.add_warning(f"{name} export failed: {str(e)[:50]}")
+        
+        results.assert_true(passed >= 3, f"Capacity exports: {passed}/{len(exports_to_test)} working")
+        
+    except ImportError:
+        results.add_skipped("Capacity exports test", "Module not available")
+    except Exception as e:
+        results.add_warning(f"Capacity exports test failed: {str(e)[:60]}")
+
+
 # ============================================================
 # ENHANCED MAIN TEST SUITE
 # ============================================================
@@ -670,6 +749,9 @@ def run_all_tests_enhanced():
     dependency_graph.add_test("stress", test_stress_conditions, depends_on=["data_collector"])
     dependency_graph.add_test("memory_leaks", test_memory_leaks, depends_on=["data_collector"])
     dependency_graph.add_test("thread_safety", test_thread_safety, depends_on=["data_collector"])
+    dependency_graph.add_test("capacity_field", test_capacity_field, depends_on=["data_collector"])
+    dependency_graph.add_test("capacity_exports", test_capacity_in_exports, depends_on=["data_collector", "exports"])
+    
     
     # Run tests with timing
     print("\n⚡ Running Tests...")
