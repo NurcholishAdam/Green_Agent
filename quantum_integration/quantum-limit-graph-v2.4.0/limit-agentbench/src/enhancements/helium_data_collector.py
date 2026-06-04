@@ -1418,5 +1418,74 @@ async def main_v2_enhanced():
     
     return collector
 
+@dataclass
+class HeliumRecord:
+    """Enhanced helium record with additional fields"""
+    date: dt.date
+    global_production_tonnes: float
+    global_demand_tonnes: float
+    price_index: float
+    shortage_severity_0_1: float
+    supply_risk_score_0_1: float
+    recycling_rate_0_1: float
+    substitution_feasibility_0_1: float
+    cooling_load_sensitivity: float
+    geopolitical_risk_index: float = 0.5
+    logistics_disruption_index: float = 0.3
+    new_production_capacity_tonnes: float = 0.0  # NEW FIELD
+    
+    # ... existing properties ...
+    
+    @property
+    def future_supply_potential(self) -> float:
+        """Calculate future supply potential based on new capacity"""
+        # Ratio of new capacity to current production (as percentage)
+        return (self.new_production_capacity_tonnes / max(self.global_production_tonnes, 1)) * 100
+    
+    @property
+    def supply_demand_gap_projection(self) -> float:
+        """Projected supply-demand gap considering new capacity"""
+        projected_supply = self.global_production_tonnes + self.new_production_capacity_tonnes * 0.5
+        return self.global_demand_tonnes - projected_supply
+    
+    def to_dict(self) -> Dict:
+        return {
+            'date': self.date.isoformat(),
+            'global_production_tonnes': self.global_production_tonnes,
+            'global_demand_tonnes': self.global_demand_tonnes,
+            'price_index': self.price_index,
+            'shortage_severity_0_1': self.shortage_severity_0_1,
+            'supply_risk_score_0_1': self.supply_risk_score_0_1,
+            'recycling_rate_0_1': self.recycling_rate_0_1,
+            'substitution_feasibility_0_1': self.substitution_feasibility_0_1,
+            'cooling_load_sensitivity': self.cooling_load_sensitivity,
+            'demand_supply_ratio': self.demand_supply_ratio,
+            'scarcity_index': self.scarcity_index,
+            'circularity_potential': self.circularity_potential,
+            'thermal_impact_factor': self.thermal_impact_factor,
+            'price_volatility': self.price_volatility,
+            'market_regime': self.market_regime,
+            'is_anomaly': self.is_anomaly,
+            'new_production_capacity_tonnes': self.new_production_capacity_tonnes,  # NEW
+            'future_supply_potential': self.future_supply_potential,  # NEW derived
+            'supply_demand_gap_projection': self.supply_demand_gap_projection  # NEW derived
+        }
+    
+    def to_feature_vector(self) -> np.ndarray:
+        """Enhanced feature vector with new capacity field"""
+        return np.array([
+            self.global_production_tonnes / 30000,
+            self.demand_supply_ratio,
+            self.price_index / 200,
+            self.shortage_severity_0_1,
+            self.supply_risk_score_0_1,
+            self.recycling_rate_0_1,
+            self.substitution_feasibility_0_1,
+            self.cooling_load_sensitivity,
+            self.geopolitical_risk_index,
+            self.logistics_disruption_index,
+            self.new_production_capacity_tonnes / 10000  # NEW normalized
+        ])
+
 if __name__ == "__main__":
     asyncio.run(main_v2_enhanced())
