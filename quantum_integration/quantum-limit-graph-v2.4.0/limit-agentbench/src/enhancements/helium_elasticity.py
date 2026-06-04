@@ -755,6 +755,32 @@ class HeliumElasticityCalculator:
                    f"regime={market_regime}, rec={migration_rec}")
         
         return metrics
+
+    def calculate_scarcity_elasticity(self, helium_data: Dict = None) -> float:
+    """Calculate scarcity elasticity with new capacity consideration"""
+    if helium_data is None:
+        helium_data = self.get_current_helium_data()
+    
+    new_capacity = helium_data.get('new_production_capacity_tonnes', 0)
+    production = helium_data.get('global_production_tonnes', 28000)
+    
+    # Future supply potential reduces current scarcity
+    future_supply_factor = max(0, 1 - (new_capacity / max(production, 1)) * 0.5)
+    
+    scarcity_score = (
+        helium_data.get('shortage_severity_0_1', 0.5) * 0.30 +
+        helium_data.get('supply_risk_score_0_1', 0.5) * 0.25 +
+        max(0, helium_data.get('demand_supply_ratio', 1.0) - 1) * 0.20 +
+        helium_data.get('geopolitical_risk_index', 0.5) * 0.15 +
+        helium_data.get('logistics_disruption_index', 0.3) * 0.10
+    ) * future_supply_factor
+    
+    elasticity = np.clip(scarcity_score * self.config.scarcity_elasticity_factor, 0, 1)
+    
+    SCARCITY_INDEX.set(scarcity_score)
+    ELASTICITY_CALCULATIONS.labels(type='scarcity').inc()
+    
+    return elasticity
     
     def get_elasticity_trend_analysis(self) -> Dict:
         """Get trend analysis for all elasticity types - COMPLETED"""
