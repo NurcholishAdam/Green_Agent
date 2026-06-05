@@ -1,0 +1,49 @@
+# Core
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.3.0
+aiohttp>=3.8.0
+pyyaml>=6.0
+pydantic>=2.0
+cryptography>=41.0
+python-jose>=3.3
+passlib>=1.7
+bcrypt>=4.0
+
+# ML
+torch>=2.0.0 (optional, with CUDA support)
+scikit-learn>=1.0.0
+
+# Visualization
+plotly>=5.0.0
+
+# WebSocket
+websockets>=10.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# Monitoring
+prometheus-client>=0.14.0
+
+# Cloud SDKs (optional)
+boto3>=1.26.0  # AWS
+azure-mgmt-compute>=30.0.0  # Azure
+google-cloud-compute>=1.14.0  # GCP
+
+# Async
+websockets>=12.0
+aiohttp>=3.8
+aiosqlite>=0.19
+
+# Observability
+opentelemetry-api>=1.20
+opentelemetry-sdk>=1.20
+opentelemetry-exporter-jaeger>=1.20
+prometheus-client>=0.17
+
+# Resilience
+tenacity>=8.2
+
+# Distributed (optional)
+redis>=5.0
+celery>=5.3
