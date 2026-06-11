@@ -1,0 +1,55 @@
+# File: moe_config.json
+{
+    "enable_quantum": true,
+    "max_carbon_budget_kg": 0.1,
+    "max_helium_budget": 0.05,
+    "max_latency_ms": 1000,
+    "reflection_enabled": true,
+    "monitoring_enabled": true,
+    "pipeline_default": "standard",
+    
+    "expert_configuration": {
+        "energy_expert": {
+            "enabled": true,
+            "quantization_levels": ["fp32", "fp16", "int8", "int4"],
+            "default_quantization": "int8"
+        },
+        "data_expert": {
+            "enabled": true,
+            "compression_algorithms": ["none", "gzip", "lz4", "zstd"],
+            "default_compression": "lz4"
+        },
+        "iot_expert": {
+            "enabled": true,
+            "edge_optimization": true
+        },
+        "helium_expert": {
+            "enabled": true,
+            "scarcity_threshold": 0.3
+        },
+        "quantum_expert": {
+            "enabled": true,
+            "backend_type": "simulator",
+            "max_qubits": 20
+        }
+    },
+    
+    "gating_network": {
+        "top_k": 2,
+        "capacity_factor": 1.25,
+        "noise_std": 0.1,
+        "load_balance_weight": 0.01
+    },
+    
+    "monitoring": {
+        "prometheus_enabled": true,
+        "grafana_dashboard_enabled": true,
+        "metrics_retention_days": 30
+    },
+    
+    "planetary_boundaries": {
+        "carbon_emissions_limit_ppm": 350,
+        "helium_scarcity_limit": 0.8,
+        "energy_capacity_limit": 0.9
+    }
+}
