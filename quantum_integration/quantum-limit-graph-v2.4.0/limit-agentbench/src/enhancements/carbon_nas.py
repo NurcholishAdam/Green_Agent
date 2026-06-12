@@ -1,408 +1,500 @@
-# src/enhancements/carbon_nas.py
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/carbon_nas.py
+# Enhanced with expert_registry.py auto-registration
 
 """
-Carbon-Aware Neural Architecture Search (NAS) for Green Agent
-Scientific basis: Energy consumption of training is proportional to parameters × steps
+Enhanced Carbon-Aware Neural Architecture Search
+Version: 2.0.0
 
-Reference: "Carbon-Aware Neural Architecture Search" (NeurIPS, 2023)
+Now integrates with expert_registry.py for:
+- Automatic registration of discovered architectures
+- Version lineage tracking
+- Certification of NAS-discovered experts
+- Carbon-efficient architecture deployment
 """
 
-import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
-import itertools
+import asyncio
 import logging
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+import numpy as np
+import copy
+import hashlib
+import json
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Registry Bridge for Auto-Registration
+# ============================================================================
 
-class OperationType(Enum):
-    """Neural network operation types"""
-    CONV3x3 = "conv3x3"
-    CONV5x5 = "conv5x5"
-    CONV7x7 = "conv7x7"
-    MAXPOOL = "maxpool"
-    AVGPOOL = "avgpool"
-    IDENTITY = "identity"
-    SKIP_CONNECT = "skip_connect"
-    LINEAR = "linear"
-    ATTENTION = "attention"
-    MLP = "mlp"
-
-
-@dataclass
-class ArchitectureConfig:
-    """Configuration for a neural architecture"""
-    num_layers: int
-    hidden_size: int
-    num_heads: int
-    operations: List[OperationType]
-    quantization: str  # 'FP32', 'FP16', 'INT8', 'INT4'
-    parallelism: int
-
-
-@dataclass
-class ArchitectureMetrics:
-    """Metrics for an architecture"""
-    accuracy: float
-    latency_ms: float
-    training_energy_joules: float
-    inference_energy_joules: float
-    total_carbon_kg: float
-    params_millions: float
-    flops_billions: float
-    helium_footprint: float
-
-
-@dataclass
-class ParetoPoint:
-    """Point on Pareto frontier"""
-    config: ArchitectureConfig
-    metrics: ArchitectureMetrics
-    dominates: List[int] = field(default_factory=list)
-    dominated_by: List[int] = field(default_factory=list)
-
-
-class CarbonAwareNAS:
+class RegistryBridge:
     """
-    Carbon-Aware Neural Architecture Search.
+    Bridge between Carbon NAS and Expert Registry.
     
-    Search for architectures that minimize:
-    C_total = C_train + Σ(C_inference_i * n_i)
-    
-    Where C = Energy * Carbon_Intensity * (1 + Helium_Weight)
+    Enables automatic registration of NAS-discovered architectures.
     """
     
-    # Energy per operation (Joules per FLOP)
-    ENERGY_PER_OP = {
-        OperationType.CONV3x3: 2.0e-11,
-        OperationType.CONV5x5: 5.0e-11,
-        OperationType.CONV7x7: 1.0e-10,
-        OperationType.MAXPOOL: 1.0e-12,
-        OperationType.AVGPOOL: 1.0e-12,
-        OperationType.IDENTITY: 0,
-        OperationType.SKIP_CONNECT: 1.0e-13,
-        OperationType.LINEAR: 1.0e-11,
-        OperationType.ATTENTION: 5.0e-11,
-        OperationType.MLP: 2.0e-11
-    }
+    def __init__(self):
+        self.registry = None  # Will be injected
+        self.registered_architectures: Dict[str, str] = {}  # arch_hash -> expert_id
+        self.registration_history: List[Dict] = []
+        
+        logger.info("RegistryBridge initialized for NAS-Registry integration")
     
-    # Search space bounds
-    SEARCH_SPACE = {
-        'num_layers': [6, 12, 24, 48],
-        'hidden_size': [128, 256, 512, 1024],
-        'num_heads': [4, 8, 12, 16],
-        'operations': list(OperationType),
-        'quantization': ['FP32', 'FP16', 'INT8', 'INT4'],
-        'parallelism': [1, 2, 4, 8]
-    }
+    def inject_registry(self, registry: Any):
+        """Inject expert registry"""
+        self.registry = registry
+        logger.info("Expert registry injected into NAS bridge")
     
-    # Carbon intensity by region (gCO2/kWh)
-    CARBON_INTENSITY = {
-        'us-east': 380,
-        'us-west': 250,
-        'eu-north': 80,
-        'asia-pacific': 550
-    }
-    
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.region = self.config.get('region', 'us-east')
-        self.expected_inferences = self.config.get('expected_inferences', 1_000_000)
-        self.carbon_intensity = self.CARBON_INTENSITY.get(self.region, 400)
-        self.helium_weight = self.config.get('helium_weight', 0.3)
-        
-        # Storage for searched architectures
-        self.explored_architectures: List[Tuple[ArchitectureConfig, ArchitectureMetrics]] = []
-        self.pareto_frontier: List[ParetoPoint] = []
-        
-    def estimate_training_flops(self, config: ArchitectureConfig) -> float:
-        """Estimate training FLOPs for an architecture"""
-        # Simplified model: FLOPs = hidden^2 * layers * 3 (forward+backward+update)
-        flops_per_forward = config.hidden_size ** 2 * config.num_layers
-        training_flops = flops_per_forward * 1000  # Assume 1000 training steps
-        
-        # Adjust for operations
-        for op in config.operations:
-            if op in [OperationType.ATTENTION]:
-                training_flops *= 1.5
-            elif op in [OperationType.MLP]:
-                training_flops *= 1.2
-        
-        return training_flops
-    
-    def estimate_inference_flops(self, config: ArchitectureConfig) -> float:
-        """Estimate inference FLOPs for an architecture"""
-        flops_per_forward = config.hidden_size ** 2 * config.num_layers
-        
-        # Quantization reduces compute
-        quantization_factors = {
-            'FP32': 1.0,
-            'FP16': 0.8,
-            'INT8': 0.4,
-            'INT4': 0.2
-        }
-        quant_factor = quantization_factors.get(config.quantization, 1.0)
-        
-        total_flops = flops_per_forward * quant_factor * self.expected_inferences
-        
-        return total_flops
-    
-    def calculate_training_energy(self, flops: float, config: ArchitectureConfig) -> float:
-        """Calculate training energy in Joules"""
-        # Average energy per FLOP based on operations
-        avg_energy_per_flop = np.mean([self.ENERGY_PER_OP.get(op, 1e-11) 
-                                        for op in config.operations])
-        
-        # Parallelism reduces per-device load but adds communication
-        energy = flops * avg_energy_per_flop / config.parallelism
-        
-        # Quantization reduces energy
-        quantization_factors = {
-            'FP32': 1.0,
-            'FP16': 0.6,
-            'INT8': 0.25,
-            'INT4': 0.15
-        }
-        energy *= quantization_factors.get(config.quantization, 1.0)
-        
-        return energy
-    
-    def calculate_inference_energy(self, flops: float, config: ArchitectureConfig) -> float:
-        """Calculate inference energy in Joules"""
-        avg_energy_per_flop = np.mean([self.ENERGY_PER_OP.get(op, 1e-11) 
-                                        for op in config.operations])
-        
-        energy = flops * avg_energy_per_flop / config.parallelism
-        
-        # Amortized over expected inferences
-        return energy
-    
-    def estimate_carbon(self, energy_joules: float) -> float:
-        """Estimate carbon emissions in kg CO2"""
-        energy_kwh = energy_joules / 3.6e6
-        carbon_kg = energy_kwh * self.carbon_intensity / 1000
-        return carbon_kg
-    
-    def estimate_helium_footprint(self, config: ArchitectureConfig) -> float:
-        """Estimate helium footprint based on hardware parallelism and quantization"""
-        base_footprint = config.parallelism * 0.1
-        
-        # Quantization reduces helium needs
-        quantization_factors = {
-            'FP32': 1.0,
-            'FP16': 0.9,
-            'INT8': 0.7,
-            'INT4': 0.5
-        }
-        footprint = base_footprint * quantization_factors.get(config.quantization, 1.0)
-        
-        # Larger models need more helium
-        footprint *= np.log2(config.hidden_size) / 10
-        
-        return min(1.0, footprint)
-    
-    def evaluate_architecture(self, config: ArchitectureConfig) -> ArchitectureMetrics:
+    def register_architecture(
+        self,
+        architecture: Dict[str, Any],
+        performance_metrics: Dict[str, Any],
+        carbon_footprint_kg: float,
+        version: str = "1.0.0"
+    ) -> Optional[str]:
         """
-        Evaluate an architecture configuration.
+        Register discovered architecture as expert.
         
-        Returns metrics including carbon footprint.
+        Returns expert_id if successful, None otherwise.
         """
-        # Estimate FLOPs
-        train_flops = self.estimate_training_flops(config)
-        inference_flops = self.estimate_inference_flops(config)
-        
-        # Estimate energy
-        train_energy = self.calculate_training_energy(train_flops, config)
-        inference_energy = self.calculate_inference_energy(inference_flops, config)
-        
-        # Estimate carbon (training + inference)
-        train_carbon = self.estimate_carbon(train_energy)
-        inference_carbon = self.estimate_carbon(inference_energy)
-        total_carbon = train_carbon + inference_carbon
-        
-        # Estimate accuracy (simplified model)
-        accuracy = 0.7 + 0.3 * (1 - 1 / np.log2(config.hidden_size + 1))
-        # Quantization reduces accuracy
-        quantization_impacts = {
-            'FP32': 0,
-            'FP16': 0.01,
-            'INT8': 0.03,
-            'INT4': 0.08
-        }
-        accuracy -= quantization_impacts.get(config.quantization, 0)
-        accuracy = max(0.6, min(0.95, accuracy))
-        
-        # Estimate latency
-        latency_base = config.num_layers * config.hidden_size / 1e6
-        latency_ms = latency_base * 1000 / config.parallelism
-        
-        # Estimated parameters
-        params_millions = config.hidden_size ** 2 * config.num_layers / 1e6
-        
-        # Helium footprint
-        helium_footprint = self.estimate_helium_footprint(config)
-        
-        # FLOPs (billions)
-        flops_billions = (train_flops + inference_flops) / 1e9
-        
-        return ArchitectureMetrics(
-            accuracy=accuracy,
-            latency_ms=latency_ms,
-            training_energy_joules=train_energy,
-            inference_energy_joules=inference_energy,
-            total_carbon_kg=total_carbon,
-            params_millions=params_millions,
-            flops_billions=flops_billions,
-            helium_footprint=helium_footprint
-        )
-    
-    def search_pareto_frontier(self, max_architectures: int = 100) -> List[ParetoPoint]:
-        """
-        Search for Pareto-optimal architectures.
-        
-        Objectives (minimize):
-        1. Carbon emissions
-        2. Latency
-        3. Helium footprint
-        
-        Maximize:
-        1. Accuracy
-        """
-        # Generate random samples (simplified)
-        import random
-        
-        self.explored_architectures = []
-        
-        for _ in range(max_architectures):
-            config = ArchitectureConfig(
-                num_layers=random.choice(self.SEARCH_SPACE['num_layers']),
-                hidden_size=random.choice(self.SEARCH_SPACE['hidden_size']),
-                num_heads=random.choice(self.SEARCH_SPACE['num_heads']),
-                operations=random.sample(self.SEARCH_SPACE['operations'], 3),
-                quantization=random.choice(self.SEARCH_SPACE['quantization']),
-                parallelism=random.choice(self.SEARCH_SPACE['parallelism'])
-            )
-            
-            metrics = self.evaluate_architecture(config)
-            self.explored_architectures.append((config, metrics))
-        
-        # Compute Pareto frontier
-        self.pareto_frontier = self._compute_pareto_frontier()
-        
-        return self.pareto_frontier
-    
-    def _compute_pareto_frontier(self) -> List[ParetoPoint]:
-        """
-        Compute Pareto frontier for 4 objectives:
-        Maximize accuracy, minimize carbon, latency, helium
-        """
-        points = []
-        
-        for i, (config, metrics) in enumerate(self.explored_architectures):
-            points.append(ParetoPoint(config=config, metrics=metrics))
-        
-        # Check dominance
-        for i, point in enumerate(points):
-            for j, other in enumerate(points):
-                if i != j:
-                    # Check if point dominates other
-                    if (point.metrics.accuracy >= other.metrics.accuracy and
-                        point.metrics.total_carbon_kg <= other.metrics.total_carbon_kg and
-                        point.metrics.latency_ms <= other.metrics.latency_ms and
-                        point.metrics.helium_footprint <= other.metrics.helium_footprint and
-                        (point.metrics.accuracy > other.metrics.accuracy or
-                         point.metrics.total_carbon_kg < other.metrics.total_carbon_kg or
-                         point.metrics.latency_ms < other.metrics.latency_ms or
-                         point.metrics.helium_footprint < other.metrics.helium_footprint)):
-                        point.dominates.append(j)
-                    
-                    # Check if dominated by other
-                    if (other.metrics.accuracy >= point.metrics.accuracy and
-                        other.metrics.total_carbon_kg <= point.metrics.total_carbon_kg and
-                        other.metrics.latency_ms <= point.metrics.latency_ms and
-                        other.metrics.helium_footprint <= point.metrics.helium_footprint and
-                        (other.metrics.accuracy > point.metrics.accuracy or
-                         other.metrics.total_carbon_kg < point.metrics.total_carbon_kg or
-                         other.metrics.latency_ms < point.metrics.latency_ms or
-                         other.metrics.helium_footprint < point.metrics.helium_footprint)):
-                        point.dominated_by.append(j)
-        
-        # Pareto optimal = points with no dominating points
-        pareto_optimal = [p for p in points if len(p.dominated_by) == 0]
-        
-        logger.info(f"Found {len(pareto_optimal)} Pareto-optimal architectures out of {len(points)}")
-        
-        return pareto_optimal
-    
-    def select_optimal_architecture(self, carbon_budget_kg: float = float('inf'),
-                                   latency_budget_ms: float = float('inf'),
-                                   helium_budget: float = 1.0,
-                                   min_accuracy: float = 0.7) -> Optional[ArchitectureConfig]:
-        """
-        Select optimal architecture given constraints.
-        
-        Uses weighted scoring when multiple Pareto-optimal options exist.
-        """
-        if not self.pareto_frontier:
-            self.search_pareto_frontier()
-        
-        # Filter by constraints
-        feasible = []
-        for point in self.pareto_frontier:
-            m = point.metrics
-            if (m.total_carbon_kg <= carbon_budget and
-                m.latency_ms <= latency_budget_ms and
-                m.helium_footprint <= helium_budget and
-                m.accuracy >= min_accuracy):
-                feasible.append(point)
-        
-        if not feasible:
-            logger.warning("No feasible architectures found with given constraints")
+        if not self.registry:
+            logger.warning("No registry available for architecture registration")
             return None
         
-        # Score feasible architectures
-        for point in feasible:
-            m = point.metrics
+        # Generate unique architecture hash
+        arch_hash = self._compute_architecture_hash(architecture)
+        
+        # Check if already registered
+        if arch_hash in self.registered_architectures:
+            existing_id = self.registered_architectures[arch_hash]
+            logger.info(f"Architecture already registered as {existing_id}")
+            return existing_id
+        
+        try:
+            # Create expert profile
+            from enhancements.moe_expert_system.expert_registry import (
+                ExpertProfile, ExpertDomain, ExpertLifecycleState,
+                ExpertVersion, ExpertLineage, HardwareProfile
+            )
             
-            # Normalize metrics (0-1 scale)
-            carbon_score = 1 - (m.total_carbon_kg / carbon_budget) if carbon_budget > 0 else 1
-            latency_score = 1 - (m.latency_ms / latency_budget_ms) if latency_budget_ms > 0 else 1
-            helium_score = 1 - m.helium_footprint / helium_budget if helium_budget > 0 else 1
-            accuracy_score = m.accuracy
+            expert_id = f"nas_expert_{arch_hash[:12]}"
             
-            # Weighted sum
-            point.score = (0.3 * carbon_score + 
-                          0.2 * latency_score + 
-                          0.2 * helium_score + 
-                          0.3 * accuracy_score)
-        
-        # Select best
-        best = max(feasible, key=lambda x: x.score)
-        
-        logger.info(f"Selected architecture: {best.config.num_layers} layers, "
-                   f"{best.config.hidden_size} hidden, {best.config.quantization}")
-        logger.info(f"  Carbon: {best.metrics.total_carbon_kg:.2f}kg, "
-                   f"Latency: {best.metrics.latency_ms:.1f}ms, "
-                   f"Accuracy: {best.metrics.accuracy:.2%}")
-        
-        return best.config
+            profile = ExpertProfile(
+                expert_id=expert_id,
+                expert_name=f"NAS-Discovered-{architecture.get('type', 'unknown')}",
+                version=ExpertVersion.from_string(version),
+                domain=ExpertDomain.GENERAL,
+                hardware_profile=HardwareProfile.HYBRID,
+                lifecycle_state=ExpertLifecycleState.REGISTERED,
+                
+                # Resource metrics from NAS evaluation
+                carbon_per_inference=performance_metrics.get('carbon_kg', 0.0001),
+                energy_per_inference=performance_metrics.get('energy_kwh', 0.001),
+                avg_latency_ms=performance_metrics.get('latency_ms', 50.0),
+                
+                # Performance scores
+                accuracy_score=performance_metrics.get('accuracy', 0.9),
+                efficiency_score=performance_metrics.get('efficiency', 0.9),
+                reliability_score=0.95,
+                
+                # NAS-specific metadata
+                tags=['nas_discovered', architecture.get('type', 'unknown')],
+                capabilities=['auto_discovered', 'carbon_optimized'],
+                
+                # Lineage tracking
+                lineage=ExpertLineage(
+                    lineage_id=f"nas_{arch_hash[:16]}",
+                    created_from='nas',
+                    training_carbon_kg=carbon_footprint_kg,
+                    model_architecture=json.dumps(architecture),
+                    hyperparameters=architecture.get('hyperparameters', {})
+                )
+            )
+            
+            # Register with registry
+            success, message = self.registry.register_expert(
+                profile, validate=True, auto_certify=True
+            )
+            
+            if success:
+                # Activate the expert
+                self.registry.activate_expert(expert_id)
+                
+                # Track registration
+                self.registered_architectures[arch_hash] = expert_id
+                self.registration_history.append({
+                    'architecture_hash': arch_hash,
+                    'expert_id': expert_id,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'carbon_footprint_kg': carbon_footprint_kg,
+                    'accuracy': performance_metrics.get('accuracy', 0)
+                })
+                
+                logger.info(
+                    f"Architecture registered as expert {expert_id}: "
+                    f"accuracy={performance_metrics.get('accuracy', 0):.3f}, "
+                    f"carbon={carbon_footprint_kg:.6f}kg"
+                )
+                
+                return expert_id
+            else:
+                logger.warning(f"Failed to register architecture: {message}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Architecture registration error: {str(e)}")
+            return None
     
-    def get_carbon_optimal_architecture(self, task_constraints: Dict) -> ArchitectureConfig:
-        """
-        Main interface for Layer 0/4 integration.
+    def update_architecture_version(
+        self,
+        expert_id: str,
+        improved_architecture: Dict[str, Any],
+        performance_metrics: Dict[str, Any],
+        new_version: str
+    ) -> bool:
+        """Register improved version of existing architecture"""
+        if not self.registry:
+            return False
         
-        Returns carbon-optimal architecture for given task.
-        """
-        carbon_budget = task_constraints.get('carbon_budget_kg', 100.0)
-        latency_budget = task_constraints.get('latency_budget_ms', 100.0)
-        helium_budget = task_constraints.get('helium_budget', 1.0)
-        min_accuracy = task_constraints.get('min_accuracy', 0.7)
+        try:
+            # Get existing expert
+            existing = self.registry.get_expert(expert_id)
+            if not existing:
+                return False
+            
+            # Create new version
+            from enhancements.moe_expert_system.expert_registry import (
+                ExpertProfile, ExpertVersion
+            )
+            
+            new_profile = copy.deepcopy(existing)
+            new_profile.version = ExpertVersion.from_string(new_version)
+            new_profile.accuracy_score = performance_metrics.get('accuracy', existing.accuracy_score)
+            new_profile.carbon_per_inference = performance_metrics.get('carbon_kg', existing.carbon_per_inference)
+            new_profile.replaces_expert = expert_id
+            
+            # Register new version
+            success, _ = self.registry.register_expert(new_profile, validate=True)
+            
+            if success:
+                # Deprecate old version
+                self.registry.deprecate_expert(expert_id, replacement_id=new_profile.expert_id)
+                
+                logger.info(
+                    f"Updated {expert_id} to v{new_version}: "
+                    f"accuracy={performance_metrics.get('accuracy', 0):.3f}"
+                )
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Version update error: {str(e)}")
+            return False
+    
+    def _compute_architecture_hash(self, architecture: Dict[str, Any]) -> str:
+        """Compute unique hash for architecture"""
+        arch_str = json.dumps(architecture, sort_keys=True)
+        return hashlib.sha256(arch_str.encode()).hexdigest()
+    
+    def get_registered_architectures(self) -> List[Dict]:
+        """Get all NAS-registered architectures"""
+        return self.registration_history.copy()
+    
+    def get_architecture_expert_id(self, architecture: Dict[str, Any]) -> Optional[str]:
+        """Get expert ID for a given architecture"""
+        arch_hash = self._compute_architecture_hash(architecture)
+        return self.registered_architectures.get(arch_hash)
+
+
+# ============================================================================
+# Enhanced Carbon NAS
+# ============================================================================
+
+@dataclass
+class ArchitectureGene:
+    """Enhanced architecture gene with registry awareness"""
+    architecture: Dict[str, Any]
+    fitness: float = 0.0
+    carbon_cost_kg: float = 0.0
+    accuracy: float = 0.0
+    registered_expert_id: Optional[str] = None
+    version: str = "1.0.0"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'architecture': self.architecture,
+            'fitness': self.fitness,
+            'carbon_cost_kg': self.carbon_cost_kg,
+            'accuracy': self.accuracy,
+            'registered_expert_id': self.registered_expert_id,
+            'version': self.version
+        }
+
+class EnhancedCarbonNAS:
+    """
+    Enhanced Carbon-Aware Neural Architecture Search.
+    
+    Features:
+    - Automatic expert registration of discovered architectures
+    - Version lineage tracking
+    - Carbon-budget-aware search
+    - Registry-aware fitness evaluation
+    - Incremental architecture improvement
+    """
+    
+    def __init__(
+        self,
+        expert_registry: Optional[Any] = None,
+        population_size: int = 20,
+        mutation_rate: float = 0.1,
+        carbon_budget_kg: float = 1.0,
+        auto_register: bool = True,
+        min_accuracy_threshold: float = 0.85
+    ):
+        self.population_size = population_size
+        self.mutation_rate = mutation_rate
+        self.carbon_budget_kg = carbon_budget_kg
+        self.auto_register = auto_register
+        self.min_accuracy_threshold = min_accuracy_threshold
         
-        return self.select_optimal_architecture(
-            carbon_budget_kg=carbon_budget,
-            latency_budget_ms=latency_budget,
-            helium_budget=helium_budget,
-            min_accuracy=min_accuracy
+        # Registry bridge for auto-registration
+        self.registry_bridge = RegistryBridge()
+        if expert_registry:
+            self.registry_bridge.inject_registry(expert_registry)
+        
+        # Population
+        self.population: List[ArchitectureGene] = []
+        self.generation = 0
+        
+        # Evolution history
+        self.evolution_history: List[Dict] = []
+        
+        # Carbon tracking        self.total_carbon_spent_kg = 0.0
+        
+        # Initialize population
+        self._initialize_population()
+        
+        logger.info(
+            f"Enhanced Carbon NAS initialized: "
+            f"population={population_size}, auto_register={auto_register}"
         )
+    
+    def _initialize_population(self):
+        """Initialize population with diverse architectures"""
+        architectures = [
+            {'type': 'transformer', 'layers': 6, 'hidden': 512, 'heads': 8},
+            {'type': 'transformer', 'layers': 4, 'hidden': 384, 'heads': 6},
+            {'type': 'transformer', 'layers': 8, 'hidden': 640, 'heads': 10},
+            {'type': 'cnn', 'layers': 12, 'filters': [64, 128, 256]},
+            {'type': 'cnn', 'layers': 8, 'filters': [32, 64, 128]},
+            {'type': 'mlp', 'layers': 5, 'hidden': [512, 256, 128]},
+            {'type': 'mlp', 'layers': 3, 'hidden': [256, 128]},
+            {'type': 'hybrid', 'cnn_layers': 4, 'transformer_layers': 3},
+            {'type': 'efficient', 'layers': 6, 'hidden': 256, 'pruned': True},
+            {'type': 'efficient', 'layers': 4, 'hidden': 192, 'quantized': True},
+        ]
+        
+        for arch in architectures[:self.population_size]:
+            gene = ArchitectureGene(architecture=arch)
+            self.population.append(gene)
+        
+        # Fill remaining with mutations
+        while len(self.population) < self.population_size:
+            base = np.random.choice(architectures)
+            mutated = self._mutate_architecture(base)
+            gene = ArchitectureGene(architecture=mutated)
+            self.population.append(gene)
+        
+        logger.info(f"Initialized population of {len(self.population)} architectures")
+    
+    def _mutate_architecture(self, architecture: Dict[str, Any]) -> Dict[str, Any]:
+        """Mutate architecture parameters"""
+        mutated = copy.deepcopy(architecture)
+        
+        if 'layers' in mutated and np.random.random() < self.mutation_rate:
+            mutated['layers'] = max(1, mutated['layers'] + np.random.randint(-2, 3))
+        
+        if 'hidden' in mutated and np.random.random() < self.mutation_rate:
+            mutated['hidden'] = mutated['hidden'] + np.random.choice([-128, -64, 64, 128])
+            mutated['hidden'] = max(64, min(1024, mutated['hidden']))
+        
+        if 'heads' in mutated and np.random.random() < self.mutation_rate:
+            mutated['heads'] = max(2, mutated['heads'] + np.random.choice([-2, 2, 4]))
+        
+        return mutated
+    
+    async def evolve_generation(
+        self,
+        fitness_function: Callable,
+        auto_register_best: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Evolve one generation and auto-register best architectures.
+        
+        Args:
+            fitness_function: Function to evaluate architecture fitness
+            auto_register_best: Automatically register best architecture
+            
+        Returns:
+            Generation metrics
+        """
+        self.generation += 1
+        
+        # Evaluate fitness
+        for gene in self.population:
+            try:
+                fitness_result = await fitness_function(gene.architecture)
+                gene.fitness = fitness_result.get('fitness', 0.0)
+                gene.carbon_cost_kg = fitness_result.get('carbon_kg', 0.001)
+                gene.accuracy = fitness_result.get('accuracy', 0.5)
+                
+                # Track carbon
+                self.total_carbon_spent_kg += gene.carbon_cost_kg
+                
+            except Exception as e:
+                logger.error(f"Fitness evaluation error: {str(e)}")
+                gene.fitness = 0.0
+        
+        # Sort by fitness
+        self.population.sort(key=lambda g: g.fitness, reverse=True)
+        
+        # Auto-register best architecture
+        best_gene = self.population[0]
+        
+        if (
+            self.auto_register and
+            auto_register_best and
+            best_gene.accuracy >= self.min_accuracy_threshold and
+            best_gene.fitness > 0
+        ):
+            # Check if already registered
+            if not best_gene.registered_expert_id:
+                performance_metrics = {
+                    'accuracy': best_gene.accuracy,
+                    'carbon_kg': best_gene.carbon_cost_kg,
+                    'energy_kwh': best_gene.carbon_cost_kg * 2.5,
+                    'latency_ms': 100.0 / best_gene.accuracy,
+                    'efficiency': best_gene.fitness
+                }
+                
+                expert_id = self.registry_bridge.register_architecture(
+                    architecture=best_gene.architecture,
+                    performance_metrics=performance_metrics,
+                    carbon_footprint_kg=best_gene.carbon_cost_kg,
+                    version=f"1.{self.generation}.0"
+                )
+                
+                if expert_id:
+                    best_gene.registered_expert_id = expert_id
+                    logger.info(
+                        f"Auto-registered best architecture as expert {expert_id}"
+                    )
+        
+        # Evolution metrics
+        fitnesses = [g.fitness for g in self.population]
+        metrics = {
+            'generation': self.generation,
+            'best_fitness': max(fitnesses),
+            'average_fitness': np.mean(fitnesses),
+            'best_accuracy': best_gene.accuracy,
+            'best_carbon_kg': best_gene.carbon_cost_kg,
+            'registered_expert_id': best_gene.registered_expert_id,
+            'population_diversity': len(set(
+                self.registry_bridge._compute_architecture_hash(g.architecture)
+                for g in self.population
+            )),
+            'total_carbon_spent_kg': self.total_carbon_spent_kg,
+            'carbon_budget_remaining': max(0, self.carbon_budget_kg - self.total_carbon_spent_kg)
+        }
+        
+        self.evolution_history.append(metrics)
+        
+        # Selection and reproduction
+        self._evolve_population()
+        
+        logger.info(
+            f"Generation {self.generation}: "
+            f"best_fitness={metrics['best_fitness']:.4f}, "
+            f"accuracy={metrics['best_accuracy']:.3f}, "
+            f"registered={best_gene.registered_expert_id or 'none'}"
+        )
+        
+        return metrics
+    
+    def _evolve_population(self):
+        """Evolve population through selection, crossover, mutation"""
+        # Keep elite (top 20%)
+        elite_size = max(1, self.population_size // 5)
+        elite = self.population[:elite_size]
+        
+        new_population = elite.copy()
+        
+        # Fill rest through crossover and mutation
+        while len(new_population) < self.population_size:
+            if np.random.random() < 0.7:  # Crossover
+                parent1, parent2 = np.random.choice(elite, 2, replace=False)
+                child_arch = self._crossover_architectures(
+                    parent1.architecture, parent2.architecture
+                )
+            else:  # Mutation
+                parent = np.random.choice(elite)
+                child_arch = self._mutate_architecture(parent.architecture)
+            
+            child = ArchitectureGene(architecture=child_arch)
+            new_population.append(child)
+        
+        self.population = new_population
+    
+    def _crossover_architectures(
+        self,
+        arch1: Dict[str, Any],
+        arch2: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Crossover two architectures"""
+        child = {}
+        
+        all_keys = set(arch1.keys()) | set(arch2.keys())
+        for key in all_keys:
+            if key in arch1 and key in arch2:
+                # Randomly inherit from either parent
+                child[key] = arch1[key] if np.random.random() < 0.5 else arch2[key]
+            elif key in arch1:
+                child[key] = arch1[key]
+            else:
+                child[key] = arch2[key]
+        
+        return child
+    
+    def get_best_architecture(self) -> Optional[ArchitectureGene]:
+        """Get best architecture from population"""
+        if not self.population:
+            return None
+        
+        return self.population[0]
+    
+    def get_registered_experts(self) -> List[str]:
+        """Get list of NAS-registered expert IDs"""
+        return [
+            g.registered_expert_id
+            for g in self.population
+            if g.registered_expert_id
+        ]
+    
+    def get_evolution_summary(self) -> Dict[str, Any]:
+        """Get evolution summary"""
+        return {
+            'generations': self.generation,
+            'total_carbon_spent_kg': self.total_carbon_spent_kg,
+            'registered_architectures': len(self.registry_bridge.registered_architectures),
+            'best_accuracy': self.population[0].accuracy if self.population else 0,
+            'evolution_history': self.evolution_history[-10:],
+            'registered_experts': self.get_registered_experts()
+        }
+    
+    def inject_registry(self, registry: Any):
+        """Inject expert registry for auto-registration"""
+        self.registry_bridge.inject_registry(registry)
