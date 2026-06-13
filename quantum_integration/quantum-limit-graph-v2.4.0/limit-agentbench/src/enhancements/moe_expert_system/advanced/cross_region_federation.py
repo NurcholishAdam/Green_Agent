@@ -1,20 +1,21 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/cross_region_federation.py
+# Enhanced with global model versioning, Byzantine fault tolerance, semantic conflict resolution, and adaptive privacy
 
 """
-Cross-Region Federation Optimization
-Version: 1.0.0
-
-Features:
-- Asynchronous federation protocol
-- Regional carbon-aware scheduling
-- Adaptive compression based on network
-- Regional model personalization
-- Multi-tier aggregation hierarchy
+Enhanced Cross-Region Federation v3.0.0
+- Semantic global model versioning
+- Byzantine fault tolerance for malicious participants
+- Semantic conflict resolution (beyond LWW)
+- Adaptive differential privacy budgeting
+- Automated incentive distribution
+- Model drift detection and correction
+- Cross-region data sovereignty compliance
+- Smart contract integration for on-chain governance
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set
+from typing import Dict, Any, List, Optional, Tuple, Set, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -23,991 +24,1440 @@ import hashlib
 import json
 import math
 from collections import defaultdict, deque
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Enums and Data Classes
+# Semantic Global Model Versioning
 # ============================================================================
 
-class Region(Enum):
-    """Geographic regions"""
-    US_EAST = "us_east"
-    US_WEST = "us_west"
-    EU_WEST = "eu_west"
-    EU_NORTH = "eu_north"
-    ASIA_EAST = "asia_east"
-    ASIA_SOUTHEAST = "asia_southeast"
-    AUSTRALIA = "australia"
-    SOUTH_AMERICA = "south_america"
-    AFRICA = "africa"
-    MIDDLE_EAST = "middle_east"
-
-class SyncMode(Enum):
-    """Synchronization modes"""
-    SYNCHRONOUS = "synchronous"
-    ASYNCHRONOUS = "asynchronous"
-    EVENTUAL = "eventual"
-    OPPORTUNISTIC = "opportunistic"
-
-class AggregationTier(Enum):
-    """Aggregation hierarchy tiers"""
-    EDGE = "edge"
-    REGIONAL = "regional"
-    CONTINENTAL = "continental"
-    GLOBAL = "global"
-
-@dataclass
-class RegionalProfile:
-    """Regional characteristics for optimization"""
-    region: Region
-    timezone_offset: int
-    typical_renewable_hours: List[int]
-    carbon_intensity_profile: Dict[int, float]  # hour -> gCO2/kWh
-    renewable_mix: Dict[str, float]  # source -> percentage
-    network_latency_matrix: Dict[str, float]  # region -> latency_ms
-    bandwidth_capacity_mbps: float
-    available_compute_flops: float
-    helium_availability: float
-    data_sovereignty_constraints: List[str]
-    optimal_sync_windows: List[Tuple[int, int]]  # (start_hour, end_hour)
-
-@dataclass
-class AsyncUpdate:
-    """Asynchronous model update"""
-    update_id: str
-    source_region: Region
-    model_delta: Dict[str, Any]
-    compression_ratio: float
-    timestamp: datetime
-    carbon_intensity_at_update: float
-    training_data_size: int
-    local_accuracy: float
-    vector_clock: Dict[str, int]
-    signature: str
-
-@dataclass
-class AggregationNode:
-    """Multi-tier aggregation node"""
-    node_id: str
-    tier: AggregationTier
-    region: Optional[Region]
-    parent_node: Optional[str]
-    child_nodes: List[str]
-    aggregated_model: Optional[Dict[str, Any]] = None
-    last_aggregation: Optional[datetime] = None
-    updates_received: int = 0
-    carbon_footprint_kg: float = 0.0
-
-# ============================================================================
-# Asynchronous Federation Protocol
-# ============================================================================
-
-class AsyncFederationProtocol:
-    """
-    Asynchronous federation protocol.
+class SemanticVersion:
+    """Semantic versioning for global models"""
     
-    Allows participants to join/leave rounds dynamically
-    without blocking the aggregation process.
-    """
+    def __init__(self, major: int = 1, minor: int = 0, patch: int = 0):
+        self.major = major
+        self.minor = minor
+        self.patch = patch
     
-    def __init__(self):
-        self.pending_updates: Dict[str, AsyncUpdate] = {}
-        self.update_history: deque = deque(maxlen=10000)
-        self.vector_clocks: Dict[str, Dict[str, int]] = defaultdict(
-            lambda: defaultdict(int)
+    def bump_major(self):
+        """Breaking changes to model architecture"""
+        self.major += 1
+        self.minor = 0
+        self.patch = 0
+    
+    def bump_minor(self):
+        """New features, backward compatible"""
+        self.minor += 1
+        self.patch = 0
+    
+    def bump_patch(self):
+        """Bug fixes, performance improvements"""
+        self.patch += 1
+    
+    def is_compatible_with(self, other: 'SemanticVersion') -> bool:
+        """Check if versions are compatible (same major)"""
+        return self.major == other.major
+    
+    def to_string(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
+    
+    @classmethod
+    def from_string(cls, version_str: str) -> 'SemanticVersion':
+        parts = version_str.split('.')
+        return cls(
+            major=int(parts[0]),
+            minor=int(parts[1]) if len(parts) > 1 else 0,
+            patch=int(parts[2]) if len(parts) > 2 else 0
         )
-        self.staleness_threshold = timedelta(hours=2)
-        
-        logger.info("Async Federation Protocol initialized")
+
+@dataclass
+class GlobalModelVersion:
+    """Global model with versioning metadata"""
+    version: SemanticVersion
+    model: Dict[str, Any]
+    created_at: datetime
+    created_by: str
+    parent_version: Optional[str]
+    changelog: List[str]
+    hash: str
+    signatures: Dict[str, str] = field(default_factory=dict)  # region -> signature
     
-    def submit_update(
-        self,
-        update: AsyncUpdate
-    ) -> bool:
-        """
-        Submit asynchronous model update.
-        
-        Updates are accepted at any time without blocking.
-        """
-        # Validate vector clock
-        if not self._validate_vector_clock(update):
-            logger.warning(f"Outdated update from {update.source_region.value}")
+    def verify_signature(self, region: str, public_key: rsa.RSAPublicKey) -> bool:
+        """Verify region signature on model"""
+        if region not in self.signatures:
             return False
         
-        # Store update
-        self.pending_updates[update.update_id] = update
-        
-        # Update vector clock
-        for region, clock in update.vector_clock.items():
-            self.vector_clocks[update.source_region.value][region] = max(
-                self.vector_clocks[update.source_region.value].get(region, 0),
-                clock
+        try:
+            public_key.verify(
+                bytes.fromhex(self.signatures[region]),
+                self.hash.encode(),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
             )
-        
-        self.update_history.append(update)
-        
-        logger.debug(
-            f"Async update accepted: {update.update_id} "
-            f"from {update.source_region.value}"
-        )
-        
-        return True
-    
-    def _validate_vector_clock(self, update: AsyncUpdate) -> bool:
-        """Validate update vector clock for causality"""
-        region = update.source_region.value
-        
-        for other_region, clock in update.vector_clock.items():
-            if other_region != region:
-                current = self.vector_clocks[region].get(other_region, 0)
-                if clock < current - 10:  # Allow some skew
-                    return False
-        
-        return True
-    
-    def get_ready_updates(
-        self,
-        min_updates: int = 3,
-        max_age: timedelta = None
-    ) -> List[AsyncUpdate]:
-        """Get updates ready for aggregation"""
-        if max_age is None:
-            max_age = self.staleness_threshold
-        
-        ready = []
-        now = datetime.utcnow()
-        
-        for update_id, update in list(self.pending_updates.items()):
-            age = now - update.timestamp
-            
-            if age <= max_age:
-                ready.append(update)
-            else:
-                # Remove stale updates
-                del self.pending_updates[update_id]
-                logger.debug(f"Removed stale update: {update_id}")
-        
-        if len(ready) >= min_updates:
-            return ready
-        
-        return []
-    
-    def clear_aggregated_updates(self, update_ids: List[str]):
-        """Clear updates that have been aggregated"""
-        for update_id in update_ids:
-            self.pending_updates.pop(update_id, None)
-    
-    def get_protocol_stats(self) -> Dict[str, Any]:
-        """Get protocol statistics"""
-        return {
-            'pending_updates': len(self.pending_updates),
-            'total_updates_received': len(self.update_history),
-            'regions_contributed': len(set(
-                u.source_region.value for u in self.update_history
-            )),
-            'average_update_age_seconds': np.mean([
-                (datetime.utcnow() - u.timestamp).total_seconds()
-                for u in self.pending_updates.values()
-            ]) if self.pending_updates else 0,
-            'vector_clocks': dict(self.vector_clocks)
-        }
+            return True
+        except Exception:
+            return False
 
-# ============================================================================
-# Regional Carbon-Aware Scheduler
-# ============================================================================
-
-class CarbonAwareScheduler:
+class GlobalModelVersionManager:
     """
-    Schedules federation rounds based on regional carbon intensity.
+    Manages semantic versioning for global models.
     
-    Aligns model contributions with renewable energy availability.
+    Tracks model lineage and compatibility.
     """
     
     def __init__(self):
-        self.regional_profiles: Dict[Region, RegionalProfile] = {}
-        self.scheduling_history: deque = deque(maxlen=10000)
+        self.versions: Dict[str, GlobalModelVersion] = {}
+        self.current_version: Optional[str] = None
+        self.version_graph: Dict[str, List[str]] = defaultdict(list)  # version -> children
+        self.region_keys: Dict[str, rsa.RSAPublicKey] = {}
         
-        # Initialize regional profiles
-        self._initialize_regional_profiles()
-        
-        logger.info("Carbon-Aware Scheduler initialized")
+        logger.info("Global Model Version Manager initialized")
     
-    def _initialize_regional_profiles(self):
-        """Initialize regional carbon profiles"""
-        profiles = {
-            Region.US_EAST: {
-                'timezone': -5,
-                'renewable_hours': [2, 3, 4, 5],  # Early morning wind
-                'carbon_peak_hours': [14, 15, 16, 17, 18],
-                'carbon_low_hours': [2, 3, 4, 5, 22, 23],
-                'renewable_mix': {'wind': 0.15, 'solar': 0.10, 'nuclear': 0.30, 'gas': 0.35, 'coal': 0.10}
-            },
-            Region.EU_WEST: {
-                'timezone': 0,
-                'renewable_hours': [12, 13, 14],  # Midday solar
-                'carbon_peak_hours': [17, 18, 19, 20],
-                'carbon_low_hours': [1, 2, 3, 4, 12, 13],
-                'renewable_mix': {'wind': 0.25, 'solar': 0.15, 'nuclear': 0.25, 'gas': 0.25, 'coal': 0.10}
-            },
-            Region.ASIA_EAST: {
-                'timezone': 8,
-                'renewable_hours': [10, 11, 12, 13],
-                'carbon_peak_hours': [18, 19, 20, 21],
-                'carbon_low_hours': [2, 3, 4, 5],
-                'renewable_mix': {'wind': 0.10, 'solar': 0.15, 'nuclear': 0.10, 'coal': 0.50, 'gas': 0.15}
-            }
-        }
-        
-        for region, data in profiles.items():
-            # Generate hourly carbon intensity
-            carbon_profile = {}
-            for hour in range(24):
-                if hour in data['carbon_low_hours']:
-                    carbon_profile[hour] = np.random.uniform(50, 200)
-                elif hour in data['carbon_peak_hours']:
-                    carbon_profile[hour] = np.random.uniform(400, 700)
-                else:
-                    carbon_profile[hour] = np.random.uniform(200, 400)
-            
-            self.regional_profiles[region] = RegionalProfile(
-                region=region,
-                timezone_offset=data['timezone'],
-                typical_renewable_hours=data['renewable_hours'],
-                carbon_intensity_profile=carbon_profile,
-                renewable_mix=data['renewable_mix'],
-                network_latency_matrix={
-                    'us_east': 0,
-                    'eu_west': 80,
-                    'asia_east': 150
-                },
-                bandwidth_capacity_mbps=1000,
-                available_compute_flops=1e15,
-                helium_availability=np.random.uniform(0.5, 1.0),
-                data_sovereignty_constraints=[],
-                optimal_sync_windows=[
-                    (data['carbon_low_hours'][0], data['carbon_low_hours'][-1])
-                ]
-            )
-    
-    def get_optimal_sync_time(
-        self,
-        region: Region,
-        lookahead_hours: int = 24
-    ) -> Optional[datetime]:
-        """
-        Find optimal synchronization time for a region.
-        
-        Returns time when carbon intensity is lowest.
-        """
-        profile = self.regional_profiles.get(region)
-        if not profile:
-            return None
-        
-        now = datetime.utcnow()
-        local_hour = (now.hour + profile.timezone_offset) % 24
-        
-        best_hour = None
-        best_carbon = float('inf')
-        
-        for offset in range(lookahead_hours):
-            target_hour = (local_hour + offset) % 24
-            carbon = profile.carbon_intensity_profile.get(target_hour, 400)
-            
-            if carbon < best_carbon:
-                best_carbon = carbon
-                best_hour = target_hour
-                best_offset = offset
-        
-        if best_hour is not None:
-            return now + timedelta(hours=best_offset)
-        
-        return None
-    
-    def schedule_federation_round(
-        self,
-        regions: List[Region],
-        min_participants: int = 3,
-        max_wait_hours: float = 6.0
-    ) -> Dict[str, Any]:
-        """
-        Schedule federation round across regions.
-        
-        Returns optimal schedule for each region.
-        """
-        schedule = {}
-        
-        for region in regions:
-            optimal_time = self.get_optimal_sync_time(
-                region,
-                lookahead_hours=int(max_wait_hours)
-            )
-            
-            if optimal_time:
-                profile = self.regional_profiles[region]
-                local_hour = (optimal_time.hour + profile.timezone_offset) % 24
-                carbon_intensity = profile.carbon_intensity_profile.get(local_hour, 400)
-                
-                schedule[region.value] = {
-                    'scheduled_time': optimal_time.isoformat(),
-                    'local_hour': local_hour,
-                    'carbon_intensity_g_per_kwh': carbon_intensity,
-                    'renewable_availability': self._estimate_renewable(region, local_hour)
-                }
-        
-        # Find overlapping windows
-        if len(schedule) >= min_participants:
-            return {
-                'schedule': schedule,
-                'can_proceed': True,
-                'participating_regions': list(schedule.keys()),
-                'average_carbon_intensity': np.mean([
-                    s['carbon_intensity_g_per_kwh'] for s in schedule.values()
-                ])
-            }
-        
-        return {
-            'schedule': schedule,
-            'can_proceed': False,
-            'reason': f'Only {len(schedule)} regions can participate (need {min_participants})'
-        }
-    
-    def _estimate_renewable(self, region: Region, hour: int) -> float:
-        """Estimate renewable availability at given hour"""
-        profile = self.regional_profiles.get(region)
-        if not profile:
-            return 0.0
-        
-        renewable_percent = sum(
-            v for k, v in profile.renewable_mix.items()
-            if k in ['wind', 'solar', 'nuclear', 'hydro']
-        )
-        
-        # Solar boost during day
-        if 8 <= hour <= 16:
-            renewable_percent += 0.1
-        
-        # Wind boost at night
-        if hour <= 5 or hour >= 22:
-            renewable_percent += 0.05
-        
-        return min(renewable_percent, 1.0)
-    
-    def get_carbon_savings_estimate(
-        self,
-        region: Region,
-        computation_flops: float,
-        duration_hours: float
-    ) -> float:
-        """
-        Estimate carbon savings from optimal scheduling.
-        
-        Returns kg CO2 saved.
-        """
-        profile = self.regional_profiles.get(region)
-        if not profile:
-            return 0.0
-        
-        # Average carbon intensity
-        avg_carbon = np.mean(list(profile.carbon_intensity_profile.values()))
-        
-        # Optimal carbon intensity
-        optimal_carbon = min(profile.carbon_intensity_profile.values())
-        
-        # Energy estimation
-        energy_per_flop = 1e-12  # kWh per FLOP
-        energy_kwh = computation_flops * energy_per_flop * duration_hours
-        
-        # Carbon savings
-        carbon_saved = energy_kwh * (avg_carbon - optimal_carbon) / 1000  # kg CO2
-        
-        return max(0, carbon_saved)
-
-# ============================================================================
-# Adaptive Network Compression
-# ============================================================================
-
-class AdaptiveNetworkCompressor:
-    """
-    Adaptive compression based on network conditions.
-    
-    Adjusts compression ratio based on bandwidth and latency.
-    """
-    
-    def __init__(self):
-        self.compression_levels = {
-            0: {'ratio': 1.0, 'accuracy_loss': 0.0, 'description': 'none'},
-            1: {'ratio': 2.0, 'accuracy_loss': 0.001, 'description': 'light'},
-            2: {'ratio': 5.0, 'accuracy_loss': 0.005, 'description': 'moderate'},
-            3: {'ratio': 10.0, 'accuracy_loss': 0.01, 'description': 'aggressive'},
-            4: {'ratio': 20.0, 'accuracy_loss': 0.02, 'description': 'very_aggressive'},
-            5: {'ratio': 50.0, 'accuracy_loss': 0.05, 'description': 'extreme'}
-        }
-        
-        self.network_measurements: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=100)
-        )
-        
-        logger.info("Adaptive Network Compressor initialized")
-    
-    def measure_network_quality(
-        self,
-        source_region: str,
-        target_region: str,
-        bandwidth_mbps: float,
-        latency_ms: float,
-        packet_loss_percent: float
-    ):
-        """Record network quality measurement"""
-        self.network_measurements[f"{source_region}->{target_region}"].append({
-            'bandwidth': bandwidth_mbps,
-            'latency': latency_ms,
-            'packet_loss': packet_loss_percent,
-            'timestamp': datetime.utcnow()
-        })
-    
-    def select_compression_level(
-        self,
-        source_region: str,
-        target_region: str,
-        model_size_mb: float,
-        max_transfer_time_ms: float = 5000.0,
-        min_accuracy: float = 0.95
-    ) -> Tuple[int, Dict[str, Any]]:
-        """
-        Select optimal compression level.
-        
-        Balances transfer time with accuracy preservation.
-        """
-        key = f"{source_region}->{target_region}"
-        measurements = self.network_measurements.get(key)
-        
-        if not measurements:
-            # Default to moderate compression
-            return 2, self.compression_levels[2]
-        
-        # Get recent network stats
-        recent = list(measurements)[-10:]
-        avg_bandwidth = np.mean([m['bandwidth'] for m in recent])
-        avg_latency = np.mean([m['latency'] for m in recent])
-        
-        # Calculate transfer time for each level
-        best_level = 0
-        best_score = 0
-        
-        for level, config in self.compression_levels.items():
-            compressed_size = model_size_mb / config['ratio']
-            transfer_time = (
-                compressed_size * 8 / avg_bandwidth * 1000 +  # Transmission time
-                avg_latency  # Base latency
-            )
-            
-            accuracy = 1.0 - config['accuracy_loss']
-            
-            # Score based on speed and accuracy
-            time_score = 1.0 / (1.0 + transfer_time / max_transfer_time_ms)
-            accuracy_score = accuracy / min_accuracy
-            
-            # Combine scores
-            score = 0.6 * time_score + 0.4 * accuracy_score
-            
-            if score > best_score and accuracy >= min_accuracy:
-                best_score = score
-                best_level = level
-        
-        return best_level, self.compression_levels[best_level]
-    
-    def compress_update(
-        self,
-        model_update: Dict[str, Any],
-        compression_level: int
-    ) -> Dict[str, Any]:
-        """
-        Compress model update.
-        
-        Applies selected compression level.
-        """
-        config = self.compression_levels.get(compression_level, self.compression_levels[2])
-        
-        compressed = {}
-        total_original = 0
-        total_compressed = 0
-        
-        for key, value in model_update.items():
-            if isinstance(value, np.ndarray):
-                original_size = value.nbytes
-                
-                if compression_level == 0:
-                    compressed[key] = value
-                    compressed_size = original_size
-                elif compression_level <= 2:
-                    # FP16 conversion
-                    compressed[key] = value.astype(np.float16)
-                    compressed_size = original_size / 2
-                elif compression_level <= 4:
-                    # Quantization
-                    scale = np.max(np.abs(value)) / 127
-                    compressed[key] = (value / scale).astype(np.int8)
-                    compressed_size = original_size / 4
-                else:
-                    # Aggressive: top-k sparsification
-                    k = int(value.size * 0.1)
-                    flat = value.flatten()
-                    top_k_indices = np.argpartition(np.abs(flat), -k)[-k:]
-                    compressed[key] = {
-                        'indices': top_k_indices,
-                        'values': flat[top_k_indices].astype(np.float16)
-                    }
-                    compressed_size = k * 4
-                
-                total_original += original_size
-                total_compressed += compressed_size
-            else:
-                compressed[key] = value
-        
-        actual_ratio = total_original / max(total_compressed, 1)
-        
-        return {
-            'data': compressed,
-            'original_size_bytes': total_original,
-            'compressed_size_bytes': total_compressed,
-            'actual_ratio': actual_ratio,
-            'compression_level': compression_level
-        }
-    
-    def decompress_update(
-        self,
-        compressed: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Decompress model update"""
-        decompressed = {}
-        
-        for key, value in compressed['data'].items():
-            if isinstance(value, dict) and 'indices' in value:
-                # Decompress sparse
-                original_shape = value.get('original_shape', (1000,))
-                flat = np.zeros(np.prod(original_shape))
-                flat[value['indices']] = value['values']
-                decompressed[key] = flat.reshape(original_shape)
-            elif isinstance(value, np.ndarray):
-                decompressed[key] = value.astype(np.float32)
-            else:
-                decompressed[key] = value
-        
-        return decompressed
-
-# ============================================================================
-# Multi-Tier Aggregation
-# ============================================================================
-
-class MultiTierAggregator:
-    """
-    Multi-tier aggregation hierarchy.
-    
-    Edge → Regional → Continental → Global
-    """
-    
-    def __init__(self):
-        self.aggregation_nodes: Dict[str, AggregationNode] = {}
-        self.aggregation_history: deque = deque(maxlen=10000)
-        
-        # Initialize hierarchy
-        self._initialize_hierarchy()
-        
-        logger.info("Multi-Tier Aggregator initialized")
-    
-    def _initialize_hierarchy(self):
-        """Initialize aggregation hierarchy"""
-        # Global node
-        self.aggregation_nodes['global'] = AggregationNode(
-            node_id='global',
-            tier=AggregationTier.GLOBAL,
-            region=None,
-            parent_node=None,
-            child_nodes=['continental_americas', 'continental_europe', 'continental_asia']
-        )
-        
-        # Continental nodes
-        self.aggregation_nodes['continental_americas'] = AggregationNode(
-            node_id='continental_americas',
-            tier=AggregationTier.CONTINENTAL,
-            region=None,
-            parent_node='global',
-            child_nodes=['regional_us_east', 'regional_us_west', 'regional_south_america']
-        )
-        
-        self.aggregation_nodes['continental_europe'] = AggregationNode(
-            node_id='continental_europe',
-            tier=AggregationTier.CONTINENTAL,
-            region=None,
-            parent_node='global',
-            child_nodes=['regional_eu_west', 'regional_eu_north']
-        )
-        
-        # Regional nodes
-        for region in [Region.US_EAST, Region.US_WEST, Region.EU_WEST, Region.EU_NORTH]:
-            node_id = f"regional_{region.value}"
-            parent = 'continental_americas' if 'us' in region.value or 'south' in region.value else 'continental_europe'
-            
-            self.aggregation_nodes[node_id] = AggregationNode(
-                node_id=node_id,
-                tier=AggregationTier.REGIONAL,
-                region=region,
-                parent_node=parent,
-                child_nodes=[]
-            )
-    
-    async def aggregate_at_node(
-        self,
-        node_id: str,
-        updates: List[AsyncUpdate],
-        aggregation_function: callable
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Aggregate updates at a specific node.
-        
-        Propagates upward through hierarchy.
-        """
-        if node_id not in self.aggregation_nodes:
-            return None
-        
-        node = self.aggregation_nodes[node_id]
-        
-        if not updates:
-            return None
-        
-        # Aggregate at this node
-        aggregated = await aggregation_function(updates)
-        
-        node.aggregated_model = aggregated
-        node.last_aggregation = datetime.utcnow()
-        node.updates_received += len(updates)
-        
-        # Calculate carbon footprint
-        node.carbon_footprint_kg += len(updates) * 0.0001
-        
-        # Propagate to parent if exists
-        if node.parent_node and node.parent_node in self.aggregation_nodes:
-            parent_node = self.aggregation_nodes[node.parent_node]
-            
-            # Check if parent should aggregate
-            siblings_ready = all(
-                self.aggregation_nodes[child].aggregated_model is not None
-                for child in parent_node.child_nodes
-                if child in self.aggregation_nodes
-            )
-            
-            if siblings_ready:
-                parent_updates = []
-                for child in parent_node.child_nodes:
-                    if child in self.aggregation_nodes:
-                        child_node = self.aggregation_nodes[child]
-                        if child_node.aggregated_model:
-                            parent_updates.append(
-                                self._model_to_update(child_node.aggregated_model, child)
-                            )
-                
-                if parent_updates:
-                    await self.aggregate_at_node(
-                        node.parent_node,
-                        parent_updates,
-                        aggregation_function
-                    )
-        
-        return aggregated
-    
-    def _model_to_update(
+    def create_version(
         self,
         model: Dict[str, Any],
-        node_id: str
-    ) -> AsyncUpdate:
-        """Convert aggregated model to update format"""
-        return AsyncUpdate(
-            update_id=f"agg_{node_id}_{datetime.utcnow().timestamp()}",
-            source_region=Region.US_EAST,  # Placeholder
-            model_delta=model,
-            compression_ratio=1.0,
-            timestamp=datetime.utcnow(),
-            carbon_intensity_at_update=400,
-            training_data_size=1000,
-            local_accuracy=0.9,
-            vector_clock={},
-            signature=hashlib.sha256(str(model).encode()).hexdigest()
-        )
-    
-    def get_hierarchy_status(self) -> Dict[str, Any]:
-        """Get aggregation hierarchy status"""
-        return {
-            node_id: {
-                'tier': node.tier.value,
-                'region': node.region.value if node.region else None,
-                'parent': node.parent_node,
-                'children': node.child_nodes,
-                'updates_received': node.updates_received,
-                'last_aggregation': node.last_aggregation.isoformat() if node.last_aggregation else None,
-                'carbon_footprint_kg': node.carbon_footprint_kg,
-                'has_model': node.aggregated_model is not None
-            }
-            for node_id, node in self.aggregation_nodes.items()
-        }
-
-# ============================================================================
-# Regional Model Personalization
-# ============================================================================
-
-class RegionalModelPersonalizer:
-    """
-    Personalizes global model for regional characteristics.
-    
-    Uses meta-learning for region-specific adaptation.
-    """
-    
-    def __init__(self):
-        self.regional_adaptations: Dict[str, Dict[str, Any]] = {}
-        self.personalization_history: deque = deque(maxlen=1000)
-        
-        logger.info("Regional Model Personalizer initialized")
-    
-    async def personalize_model(
-        self,
-        global_model: Dict[str, Any],
-        region: Region,
-        regional_data_distribution: Dict[str, float],
-        personalization_strength: float = 0.3
-    ) -> Dict[str, Any]:
-        """
-        Personalize global model for specific region.
-        
-        Balances global knowledge with local adaptation.
-        """
-        personalized = {}
-        
-        for key, value in global_model.items():
-            if isinstance(value, (int, float)):
-                # Add regional bias
-                regional_bias = regional_data_distribution.get(key, 0)
-                personalized[key] = (
-                    value * (1 - personalization_strength) +
-                    regional_bias * personalization_strength
-                )
-            elif isinstance(value, np.ndarray):
-                # Add small perturbation based on region
-                perturbation = np.random.normal(
-                    0, personalization_strength * np.std(value), value.shape
-                )
-                personalized[key] = value + perturbation
+        created_by: str,
+        changelog: List[str],
+        bump_type: str = 'patch'
+    ) -> GlobalModelVersion:
+        """Create new model version"""
+        # Determine new version
+        if self.current_version:
+            current = SemanticVersion.from_string(self.current_version)
+            new_version = SemanticVersion(current.major, current.minor, current.patch)
+            
+            if bump_type == 'major':
+                new_version.bump_major()
+            elif bump_type == 'minor':
+                new_version.bump_minor()
             else:
-                personalized[key] = value
+                new_version.bump_patch()
+        else:
+            new_version = SemanticVersion(1, 0, 0)
         
-        self.regional_adaptations[region.value] = {
-            'model': personalized,
-            'strength': personalization_strength,
-            'timestamp': datetime.utcnow()
-        }
+        version_str = new_version.to_string()
         
-        self.personalization_history.append({
-            'region': region.value,
-            'strength': personalization_strength,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        # Compute model hash
+        model_hash = hashlib.sha256(
+            json.dumps(model, sort_keys=True, default=str).encode()
+        ).hexdigest()
         
-        return personalized
+        version = GlobalModelVersion(
+            version=new_version,
+            model=model,
+            created_at=datetime.utcnow(),
+            created_by=created_by,
+            parent_version=self.current_version,
+            changelog=changelog,
+            hash=model_hash
+        )
+        
+        self.versions[version_str] = version
+        
+        if self.current_version:
+            self.version_graph[self.current_version].append(version_str)
+        
+        self.current_version = version_str
+        
+        logger.info(
+            f"Created global model v{version_str}: "
+            f"by={created_by}, changes={len(changelog)}"
+        )
+        
+        return version
     
-    def get_regional_model(
+    def sign_version(
         self,
-        region: Region
-    ) -> Optional[Dict[str, Any]]:
-        """Get personalized model for region"""
-        adaptation = self.regional_adaptations.get(region.value)
-        if adaptation:
-            return adaptation['model']
-        return None
+        version_str: str,
+        region: str,
+        private_key: rsa.RSAPrivateKey
+    ):
+        """Sign model version with region's private key"""
+        if version_str not in self.versions:
+            return
+        
+        version = self.versions[version_str]
+        
+        signature = private_key.sign(
+            version.hash.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        
+        version.signatures[region] = signature.hex()
+        
+        # Extract public key
+        public_key = private_key.public_key()
+        self.region_keys[region] = public_key
     
-    def merge_regional_adaptations(
+    def verify_version(
         self,
-        regions: List[Region]
-    ) -> Dict[str, Any]:
-        """
-        Merge adaptations from multiple regions.
+        version_str: str,
+        min_signatures: int = 2
+    ) -> bool:
+        """Verify model version with sufficient signatures"""
+        if version_str not in self.versions:
+            return False
         
-        Weighted by region contribution.
-        """
-        if not regions:
-            return {}
+        version = self.versions[version_str]
+        valid_signatures = 0
         
-        merged = {}
-        total_weight = 0
+        for region, signature in version.signatures.items():
+            if region in self.region_keys:
+                if version.verify_signature(region, self.region_keys[region]):
+                    valid_signatures += 1
         
-        for region in regions:
-            adaptation = self.regional_adaptations.get(region.value)
-            if adaptation:
-                weight = 1.0  # Could be based on data size
-                
-                for key, value in adaptation['model'].items():
-                    if key not in merged:
-                        merged[key] = value * weight
-                    else:
-                        merged[key] += value * weight
-                
-                total_weight += weight
+        return valid_signatures >= min_signatures
+    
+    def get_version_lineage(
+        self,
+        version_str: str
+    ) -> List[Dict[str, Any]]:
+        """Get complete version lineage"""
+        lineage = []
+        current = version_str
         
-        if total_weight > 0:
-            for key in merged:
-                if isinstance(merged[key], (int, float, np.ndarray)):
-                    merged[key] = merged[key] / total_weight
+        while current:
+            if current in self.versions:
+                version = self.versions[current]
+                lineage.append({
+                    'version': current,
+                    'created_by': version.created_by,
+                    'created_at': version.created_at.isoformat(),
+                    'changelog': version.changelog,
+                    'signatures': len(version.signatures)
+                })
+                current = version.parent_version
+            else:
+                break
         
-        return merged
+        return list(reversed(lineage))
+    
+    def check_compatibility(
+        self,
+        version1: str,
+        version2: str
+    ) -> bool:
+        """Check if two versions are compatible"""
+        if version1 not in self.versions or version2 not in self.versions:
+            return False
+        
+        v1 = self.versions[version1].version
+        v2 = self.versions[version2].version
+        
+        return v1.is_compatible_with(v2)
+
 
 # ============================================================================
-# Unified Cross-Region Federation Optimizer
+# Byzantine Fault Tolerance
 # ============================================================================
 
-class CrossRegionFederationOptimizer:
+class ByzantineFaultDetector:
     """
-    Complete cross-region federation optimization system.
+    Detects and mitigates Byzantine faults from malicious participants.
     
-    Integrates:
-    - Async federation protocol
-    - Carbon-aware scheduling
-    - Adaptive compression
-    - Multi-tier aggregation
-    - Regional personalization
+    Uses statistical outlier detection and consensus mechanisms.
     """
     
     def __init__(
         self,
-        enable_async: bool = True,
-        enable_carbon_scheduling: bool = True,
-        enable_compression: bool = True,
-        enable_multi_tier: bool = True,
-        enable_personalization: bool = True
+        min_honest_ratio: float = 0.67,  # Need 2/3 honest
+        outlier_std_threshold: float = 3.0
     ):
-        self.enable_async = enable_async
-        self.enable_carbon_scheduling = enable_carbon_scheduling
-        self.enable_compression = enable_compression
-        self.enable_multi_tier = enable_multi_tier
-        self.enable_personalization = enable_personalization
+        self.min_honest_ratio = min_honest_ratio
+        self.outlier_std_threshold = outlier_std_threshold
+        self.participant_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self.byzantine_scores: Dict[str, float] = defaultdict(lambda: 0.0)
+        self.blacklisted: Set[str] = set()
         
-        # Sub-modules
-        self.async_protocol = AsyncFederationProtocol() if enable_async else None
-        self.carbon_scheduler = CarbonAwareScheduler() if enable_carbon_scheduling else None
-        self.network_compressor = AdaptiveNetworkCompressor() if enable_compression else None
-        self.multi_tier_aggregator = MultiTierAggregator() if enable_multi_tier else None
-        self.model_personalizer = RegionalModelPersonalizer() if enable_personalization else None
-        
-        logger.info(
-            "Cross-Region Federation Optimizer initialized: "
-            f"async={enable_async}, carbon={enable_carbon_scheduling}, "
-            f"compression={enable_compression}, multi_tier={enable_multi_tier}"
-        )
+        logger.info(f"Byzantine Fault Detector initialized: threshold={outlier_std_threshold}σ")
     
-    async def optimize_federation_round(
+    def evaluate_update(
         self,
-        regions: List[Region],
-        global_model: Dict[str, Any],
-        min_participants: int = 3
-    ) -> Dict[str, Any]:
+        participant_id: str,
+        model_update: Dict[str, Any],
+        all_updates: Dict[str, Dict[str, Any]]
+    ) -> Tuple[bool, float, str]:
         """
-        Execute optimized cross-region federation round.
+        Evaluate if update is Byzantine (malicious).
         
-        Returns federation results with optimization metrics.
+        Returns:
+            (is_honest, byzantine_score, reason)
         """
-        result = {
-            'round_id': f"fed_{datetime.utcnow().timestamp()}",
-            'timestamp': datetime.utcnow().isoformat(),
-            'optimizations_applied': [],
-            'metrics': {}
+        if participant_id in self.blacklisted:
+            return False, 1.0, "Participant blacklisted"
+        
+        # Extract update vectors
+        update_norms = {}
+        for pid, update in all_updates.items():
+            norm = self._compute_update_norm(update)
+            update_norms[pid] = norm
+        
+        if not update_norms:
+            return True, 0.0, "No updates to compare"
+        
+        # Calculate statistics
+        norms = list(update_norms.values())
+        median = np.median(norms)
+        mad = np.median([abs(n - median) for n in norms])  # Median Absolute Deviation
+        
+        if mad == 0:
+            return True, 0.0, "All updates identical"
+        
+        # Check if participant's update is an outlier
+        participant_norm = update_norms.get(participant_id, 0)
+        zscore = 0.6745 * (participant_norm - median) / mad  # Modified Z-score
+        
+        # Update byzantine score
+        alpha = 0.1
+        self.participant_history[participant_id].append(zscore)
+        
+        if abs(zscore) > self.outlier_std_threshold:
+            self.byzantine_scores[participant_id] = (
+                self.byzantine_scores[participant_id] * (1 - alpha) +
+                min(abs(zscore) / 10, 1.0) * alpha
+            )
+            
+            # Blacklist if score too high
+            if self.byzantine_scores[participant_id] > 0.7:
+                self.blacklisted.add(participant_id)
+                return False, self.byzantine_scores[participant_id], "Blacklisted for repeated Byzantine behavior"
+            
+            return False, self.byzantine_scores[participant_id], f"Update is statistical outlier (z={zscore:.2f})"
+        
+        # Reduce score for honest updates
+        self.byzantine_scores[participant_id] *= 0.95
+        
+        return True, self.byzantine_scores[participant_id], "Update within normal range"
+    
+    def _compute_update_norm(self, update: Dict[str, Any]) -> float:
+        """Compute norm of model update"""
+        total_norm = 0.0
+        count = 0
+        
+        for key, value in update.items():
+            if isinstance(value, (int, float)):
+                total_norm += value ** 2
+                count += 1
+            elif isinstance(value, np.ndarray):
+                total_norm += np.sum(value ** 2)
+                count += value.size
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, np.ndarray):
+                        total_norm += np.sum(item ** 2)
+                        count += item.size
+        
+        return math.sqrt(total_norm) / max(count, 1)
+    
+    def filter_honest_updates(
+        self,
+        updates: Dict[str, Dict[str, Any]],
+        all_updates: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Filter out Byzantine updates"""
+        honest_updates = {}
+        
+        for participant_id, update in updates.items():
+            is_honest, score, reason = self.evaluate_update(
+                participant_id, update, all_updates
+            )
+            
+            if is_honest:
+                honest_updates[participant_id] = update
+            else:
+                logger.warning(
+                    f"Filtered Byzantine update from {participant_id}: "
+                    f"score={score:.3f}, reason={reason}"
+                )
+        
+        # Check if we have enough honest participants
+        total = len(updates)
+        honest = len(honest_updates)
+        
+        if honest / max(total, 1) < self.min_honest_ratio:
+            logger.error(
+                f"Insufficient honest participants: {honest}/{total} "
+                f"(need {self.min_honest_ratio:.0%})"
+            )
+            return {}  # Cannot proceed safely
+        
+        return honest_updates
+    
+    def get_byzantine_status(self) -> Dict[str, Any]:
+        """Get Byzantine fault status"""
+        return {
+            'blacklisted': list(self.blacklisted),
+            'byzantine_scores': dict(self.byzantine_scores),
+            'total_participants_tracked': len(self.participant_history),
+            'honest_ratio': 1.0 - len(self.blacklisted) / max(len(self.participant_history), 1)
+        }
+    
+    def remove_from_blacklist(self, participant_id: str):
+        """Remove participant from blacklist (manual override)"""
+        self.blacklisted.discard(participant_id)
+        self.byzantine_scores[participant_id] = 0.0
+        logger.info(f"Removed {participant_id} from blacklist")
+
+
+# ============================================================================
+# Semantic Conflict Resolution
+# ============================================================================
+
+class SemanticConflictResolver:
+    """
+    Semantic conflict resolution beyond Last-Write-Wins.
+    
+    Uses semantic merging for model updates.
+    """
+    
+    def __init__(self):
+        self.conflict_history: deque = deque(maxlen=1000)
+        self.resolution_strategies = {
+            'numeric': self._resolve_numeric_conflict,
+            'array': self._resolve_array_conflict,
+            'categorical': self._resolve_categorical_conflict,
+            'model_weights': self._resolve_weight_conflict
         }
         
-        # Step 1: Schedule optimal sync times
-        if self.enable_carbon_scheduling:
-            schedule = self.carbon_scheduler.schedule_federation_round(
-                regions, min_participants
+        logger.info("Semantic Conflict Resolver initialized")
+    
+    def resolve_conflict(
+        self,
+        base_model: Dict[str, Any],
+        update_a: Dict[str, Any],
+        update_b: Dict[str, Any],
+        metadata_a: Dict[str, Any],
+        metadata_b: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Resolve conflict between two concurrent updates.
+        
+        Uses semantic merging based on data types.
+        """
+        resolved = {}
+        conflicts_found = 0
+        conflicts_resolved = 0
+        
+        all_keys = set(update_a.keys()) | set(update_b.keys())
+        
+        for key in all_keys:
+            val_a = update_a.get(key)
+            val_b = update_b.get(key)
+            val_base = base_model.get(key) if base_model else None
+            
+            # No conflict - only one update has the key
+            if val_a is None:
+                resolved[key] = val_b
+                continue
+            if val_b is None:
+                resolved[key] = val_a
+                continue
+            
+            # Values are identical - no conflict
+            if self._values_equal(val_a, val_b):
+                resolved[key] = val_a
+                continue
+            
+            # Conflict detected
+            conflicts_found += 1
+            
+            # Determine data type for resolution strategy
+            data_type = self._determine_data_type(val_a, val_b)
+            strategy = self.resolution_strategies.get(
+                data_type,
+                self._resolve_default
             )
-            result['carbon_schedule'] = schedule
             
-            if schedule['can_proceed']:
-                result['optimizations_applied'].append('carbon_scheduling')
-                result['metrics']['avg_carbon_intensity'] = schedule['average_carbon_intensity']
+            resolved[key] = strategy(
+                val_base, val_a, val_b,
+                metadata_a.get('quality', 0.5),
+                metadata_b.get('quality', 0.5)
+            )
+            conflicts_resolved += 1
         
-        # Step 2: Select compression levels
-        if self.enable_compression:
-            compression_plan = {}
-            for region in regions:
-                level, config = self.network_compressor.select_compression_level(
-                    region.value, 'global',
-                    model_size_mb=100  # Estimated model size
-                )
-                compression_plan[region.value] = {
-                    'level': level,
-                    'ratio': config['ratio'],
-                    'accuracy_loss': config['accuracy_loss']
+        # Record conflict
+        self.conflict_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'conflicts_found': conflicts_found,
+            'conflicts_resolved': conflicts_resolved,
+            'keys_resolved': conflicts_found
+        })
+        
+        logger.debug(
+            f"Conflict resolution: {conflicts_found} conflicts, "
+            f"{conflicts_resolved} resolved"
+        )
+        
+        return resolved
+    
+    def _values_equal(self, val_a: Any, val_b: Any) -> bool:
+        """Check if two values are equal"""
+        if isinstance(val_a, np.ndarray) and isinstance(val_b, np.ndarray):
+            return np.array_equal(val_a, val_b)
+        if isinstance(val_a, (int, float)) and isinstance(val_b, (int, float)):
+            return abs(val_a - val_b) < 1e-10
+        return val_a == val_b
+    
+    def _determine_data_type(self, val_a: Any, val_b: Any) -> str:
+        """Determine data type for resolution strategy"""
+        if isinstance(val_a, (int, float)) and isinstance(val_b, (int, float)):
+            return 'numeric'
+        if isinstance(val_a, np.ndarray) and isinstance(val_b, np.ndarray):
+            if val_a.ndim >= 2:
+                return 'model_weights'
+            return 'array'
+        if isinstance(val_a, str) and isinstance(val_b, str):
+            return 'categorical'
+        return 'default'
+    
+    def _resolve_numeric_conflict(
+        self,
+        base: Optional[float],
+        val_a: float,
+        val_b: float,
+        quality_a: float,
+        quality_b: float
+    ) -> float:
+        """Resolve numeric conflict using weighted average"""
+        total_quality = quality_a + quality_b
+        
+        if total_quality > 0:
+            return (val_a * quality_a + val_b * quality_b) / total_quality
+        
+        return (val_a + val_b) / 2
+    
+    def _resolve_array_conflict(
+        self,
+        base: Optional[np.ndarray],
+        val_a: np.ndarray,
+        val_b: np.ndarray,
+        quality_a: float,
+        quality_b: float
+    ) -> np.ndarray:
+        """Resolve array conflict using element-wise weighted average"""
+        total_quality = quality_a + quality_b
+        
+        if total_quality > 0:
+            return (val_a * quality_a + val_b * quality_b) / total_quality
+        
+        return (val_a + val_b) / 2
+    
+    def _resolve_categorical_conflict(
+        self,
+        base: Optional[str],
+        val_a: str,
+        val_b: str,
+        quality_a: float,
+        quality_b: float
+    ) -> str:
+        """Resolve categorical conflict using quality-weighted voting"""
+        if quality_a >= quality_b:
+            return val_a
+        return val_b
+    
+    def _resolve_weight_conflict(
+        self,
+        base: Optional[np.ndarray],
+        val_a: np.ndarray,
+        val_b: np.ndarray,
+        quality_a: float,
+        quality_b: float
+    ) -> np.ndarray:
+        """Resolve model weight conflict using elastic merging"""
+        total_quality = quality_a + quality_b
+        
+        if total_quality > 0:
+            # Weighted average with L2 normalization
+            merged = (val_a * quality_a + val_b * quality_b) / total_quality
+            
+            # Preserve L2 norm similar to base if available
+            if base is not None:
+                base_norm = np.linalg.norm(base)
+                merged_norm = np.linalg.norm(merged)
+                if merged_norm > 0:
+                    merged = merged * (base_norm / merged_norm)
+            
+            return merged
+        
+        return (val_a + val_b) / 2
+    
+    def _resolve_default(
+        self,
+        base: Any,
+        val_a: Any,
+        val_b: Any,
+        quality_a: float,
+        quality_b: float
+    ) -> Any:
+        """Default resolution: higher quality wins"""
+        if quality_a >= quality_b:
+            return val_a
+        return val_b
+    
+    def get_conflict_statistics(self) -> Dict[str, Any]:
+        """Get conflict resolution statistics"""
+        recent = list(self.conflict_history)[-100:]
+        
+        if not recent:
+            return {'total_conflicts': 0}
+        
+        return {
+            'total_conflicts': len(self.conflict_history),
+            'average_conflicts_per_merge': np.mean([c['conflicts_found'] for c in recent]),
+            'resolution_rate': np.mean([c['conflicts_resolved'] / max(c['conflicts_found'], 1) for c in recent]),
+            'recent_conflicts': recent[-10:]
+        }
+
+
+# ============================================================================
+# Adaptive Differential Privacy Budgeting
+# ============================================================================
+
+class AdaptivePrivacyBudget:
+    """
+    Adaptive differential privacy budget allocation.
+    
+    Dynamically adjusts privacy budget based on:
+    - Data sensitivity
+    - Participant trust
+    - Model convergence state
+    - Attack risk assessment
+    """
+    
+    def __init__(
+        self,
+        total_budget: float = 10.0,
+        min_per_round: float = 0.1,
+        max_per_round: float = 2.0
+    ):
+        self.total_budget = total_budget
+        self.min_per_round = min_per_round
+        self.max_per_round = max_per_round
+        self.remaining_budget = total_budget
+        self.round_allocations: List[Dict[str, Any]] = []
+        self.participant_trust: Dict[str, float] = defaultdict(lambda: 0.5)
+        
+        logger.info(f"Adaptive Privacy Budget initialized: total={total_budget}")
+    
+    def allocate_budget(
+        self,
+        round_number: int,
+        participant_id: str,
+        data_sensitivity: float = 0.5,
+        model_convergence: float = 0.0,
+        attack_risk: float = 0.0
+    ) -> float:
+        """
+        Allocate privacy budget for a participant in a round.
+        
+        More budget = less noise = more accurate but less private.
+        """
+        if self.remaining_budget <= 0:
+            logger.warning("Privacy budget exhausted")
+            return 0.0
+        
+        # Base allocation
+        base_allocation = self.min_per_round
+        
+        # Trust factor: trusted participants get more budget (less noise)
+        trust = self.participant_trust.get(participant_id, 0.5)
+        trust_factor = 1.0 + trust  # 1.0 to 2.0
+        
+        # Convergence factor: more budget when close to convergence
+        convergence_factor = 1.0 + model_convergence  # 1.0 to 2.0
+        
+        # Sensitivity factor: less budget for sensitive data
+        sensitivity_factor = 1.0 - data_sensitivity * 0.5  # 0.5 to 1.0
+        
+        # Attack risk factor: less budget when attack risk is high
+        risk_factor = 1.0 - attack_risk * 0.8  # 0.2 to 1.0
+        
+        # Calculate allocation
+        allocation = (
+            base_allocation *
+            trust_factor *
+            convergence_factor *
+            sensitivity_factor *
+            risk_factor
+        )
+        
+        # Clamp to limits
+        allocation = max(self.min_per_round, min(self.max_per_round, allocation))
+        allocation = min(allocation, self.remaining_budget)
+        
+        # Deduct from budget
+        self.remaining_budget -= allocation
+        
+        # Record allocation
+        self.round_allocations.append({
+            'round': round_number,
+            'participant': participant_id,
+            'allocation': allocation,
+            'trust': trust,
+            'convergence': model_convergence,
+            'sensitivity': data_sensitivity,
+            'risk': attack_risk,
+            'remaining_budget': self.remaining_budget,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+        return allocation
+    
+    def update_trust(
+        self,
+        participant_id: str,
+        contribution_quality: float,
+        byzantine_score: float = 0.0
+    ):
+        """Update participant trust based on contribution quality"""
+        alpha = 0.1
+        current_trust = self.participant_trust[participant_id]
+        
+        # Quality increases trust, Byzantine behavior decreases it
+        trust_update = contribution_quality * (1 - byzantine_score)
+        
+        self.participant_trust[participant_id] = (
+            current_trust * (1 - alpha) +
+            trust_update * alpha
+        )
+    
+    def get_budget_status(self) -> Dict[str, Any]:
+        """Get privacy budget status"""
+        return {
+            'total_budget': self.total_budget,
+            'remaining_budget': self.remaining_budget,
+            'budget_used_percent': (1 - self.remaining_budget / self.total_budget) * 100,
+            'total_allocations': len(self.round_allocations),
+            'average_allocation': np.mean([a['allocation'] for a in self.round_allocations[-50:]]) if self.round_allocations else 0,
+            'participant_trust': dict(self.participant_trust)
+        }
+    
+    def reset_budget(self):
+        """Reset privacy budget"""
+        self.remaining_budget = self.total_budget
+        logger.info("Privacy budget reset")
+
+
+# ============================================================================
+# Model Drift Detection
+# ============================================================================
+
+class ModelDriftDetector:
+    """
+    Detects when regional models diverge from global model.
+    
+    Triggers corrective action when drift exceeds threshold.
+    """
+    
+    def __init__(
+        self,
+        drift_threshold: float = 0.1,
+        window_size: int = 50
+    ):
+        self.drift_threshold = drift_threshold
+        self.window_size = window_size
+        self.regional_drift: Dict[str, deque] = defaultdict(lambda: deque(maxlen=window_size))
+        self.global_performance: deque = deque(maxlen=window_size)
+        self.drift_alerts: List[Dict[str, Any]] = []
+        
+        logger.info(f"Model Drift Detector initialized: threshold={drift_threshold}")
+    
+    def measure_drift(
+        self,
+        region: str,
+        regional_model: Dict[str, Any],
+        global_model: Dict[str, Any]
+    ) -> float:
+        """
+        Measure divergence between regional and global model.
+        
+        Returns drift score (0 = identical, 1 = completely different).
+        """
+        drift_score = self._calculate_model_divergence(regional_model, global_model)
+        
+        self.regional_drift[region].append({
+            'score': drift_score,
+            'timestamp': datetime.utcnow()
+        })
+        
+        # Check for drift alert
+        if drift_score > self.drift_threshold:
+            alert = {
+                'region': region,
+                'drift_score': drift_score,
+                'threshold': self.drift_threshold,
+                'timestamp': datetime.utcnow().isoformat(),
+                'severity': 'high' if drift_score > self.drift_threshold * 2 else 'medium'
+            }
+            self.drift_alerts.append(alert)
+            
+            logger.warning(
+                f"Model drift detected in {region}: "
+                f"score={drift_score:.3f} (threshold={self.drift_threshold})"
+            )
+        
+        return drift_score
+    
+    def _calculate_model_divergence(
+        self,
+        model_a: Dict[str, Any],
+        model_b: Dict[str, Any]
+    ) -> float:
+        """Calculate divergence between two models"""
+        divergences = []
+        
+        common_keys = set(model_a.keys()) & set(model_b.keys())
+        
+        for key in common_keys:
+            val_a = model_a[key]
+            val_b = model_b[key]
+            
+            if isinstance(val_a, np.ndarray) and isinstance(val_b, np.ndarray):
+                # Cosine distance for arrays
+                flat_a = val_a.flatten()
+                flat_b = val_b.flatten()
+                
+                if len(flat_a) > 0 and len(flat_b) > 0:
+                    # Pad to same length
+                    min_len = min(len(flat_a), len(flat_b))
+                    cosine_sim = np.dot(flat_a[:min_len], flat_b[:min_len]) / (
+                        np.linalg.norm(flat_a[:min_len]) * np.linalg.norm(flat_b[:min_len]) + 1e-8
+                    )
+                    divergences.append(1.0 - abs(cosine_sim))
+            
+            elif isinstance(val_a, (int, float)) and isinstance(val_b, (int, float)):
+                # Relative difference
+                max_val = max(abs(val_a), abs(val_b))
+                if max_val > 0:
+                    divergences.append(min(abs(val_a - val_b) / max_val, 1.0))
+        
+        return np.mean(divergences) if divergences else 0.0
+    
+    def get_drift_status(self) -> Dict[str, Any]:
+        """Get drift status for all regions"""
+        status = {}
+        
+        for region, drift_history in self.regional_drift.items():
+            recent = list(drift_history)[-10:]
+            if recent:
+                status[region] = {
+                    'current_drift': recent[-1]['score'],
+                    'average_drift': np.mean([d['score'] for d in recent]),
+                    'trend': 'increasing' if len(recent) >= 2 and recent[-1]['score'] > recent[0]['score'] else 'stable',
+                    'alert_count': sum(1 for a in self.drift_alerts if a['region'] == region)
                 }
-            
-            result['compression_plan'] = compression_plan
-            result['optimizations_applied'].append('adaptive_compression')
         
-        # Step 3: Apply regional personalization
-        if self.enable_personalization:
-            personalized_models = {}
-            for region in regions:
-                personalized = await self.model_personalizer.personalize_model(
-                    global_model,
-                    region,
-                    {},  # Regional data distribution
-                    personalization_strength=0.2
+        return status
+    
+    def should_correct_drift(self, region: str) -> Tuple[bool, float]:
+        """Determine if drift correction is needed"""
+        if region not in self.regional_drift:
+            return False, 0.0
+        
+        recent = list(self.regional_drift[region])[-5:]
+        if not recent:
+            return False, 0.0
+        
+        avg_drift = np.mean([d['score'] for d in recent])
+        
+        return avg_drift > self.drift_threshold, avg_drift
+    
+    def get_recent_alerts(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get recent drift alerts"""
+        return self.drift_alerts[-limit:]
+
+
+# ============================================================================
+# Cross-Region Data Sovereignty Compliance
+# ============================================================================
+
+class DataSovereigntyCompliance:
+    """
+    Automated data sovereignty compliance checking.
+    
+    Ensures model updates comply with regional regulations.
+    """
+    
+    def __init__(self):
+        self.regional_regulations: Dict[str, Dict[str, Any]] = {}
+        self.compliance_violations: List[Dict[str, Any]] = []
+        
+        # Initialize known regulations
+        self._initialize_regulations()
+        
+        logger.info("Data Sovereignty Compliance initialized")
+    
+    def _initialize_regulations(self):
+        """Initialize regional data regulations"""
+        self.regional_regulations = {
+            'EU': {
+                'regulation': 'GDPR',
+                'data_localization': True,
+                'right_to_be_forgotten': True,
+                'privacy_requirements': 'strict',
+                'cross_border_allowed': True,
+                'adequate_protection_required': True,
+                'dpia_required': True
+            },
+            'US': {
+                'regulation': 'CCPA/State Laws',
+                'data_localization': False,
+                'right_to_be_forgotten': True,
+                'privacy_requirements': 'moderate',
+                'cross_border_allowed': True,
+                'adequate_protection_required': False,
+                'dpia_required': False
+            },
+            'China': {
+                'regulation': 'PIPL',
+                'data_localization': True,
+                'right_to_be_forgotten': True,
+                'privacy_requirements': 'strict',
+                'cross_border_allowed': False,
+                'adequate_protection_required': True,
+                'dpia_required': True
+            },
+            'Global': {
+                'regulation': 'Various',
+                'data_localization': False,
+                'right_to_be_forgotten': False,
+                'privacy_requirements': 'minimal',
+                'cross_border_allowed': True,
+                'adequate_protection_required': False,
+                'dpia_required': False
+            }
+        }
+    
+    def check_compliance(
+        self,
+        source_region: str,
+        target_region: str,
+        data_description: Dict[str, Any]
+    ) -> Tuple[bool, List[str]]:
+        """
+        Check if data transfer complies with regulations.
+        
+        Returns:
+            (is_compliant, list_of_violations)
+        """
+        violations = []
+        
+        source_reg = self.regional_regulations.get(
+            source_region,
+            self.regional_regulations['Global']
+        )
+        target_reg = self.regional_regulations.get(
+            target_region,
+            self.regional_regulations['Global']
+        )
+        
+        # Check cross-border restrictions
+        if not source_reg['cross_border_allowed']:
+            violations.append(
+                f"Cross-border data transfer not allowed from {source_region}"
+            )
+        
+        # Check adequate protection
+        if source_reg['adequate_protection_required']:
+            if target_reg['privacy_requirements'] == 'minimal':
+                violations.append(
+                    f"Target region {target_region} does not provide adequate protection"
                 )
-                personalized_models[region.value] = personalized
-            
-            result['personalized_models'] = len(personalized_models)
-            result['optimizations_applied'].append('regional_personalization')
         
-        # Step 4: Multi-tier aggregation
-        if self.enable_multi_tier:
-            for region in regions:
-                node_id = f"regional_{region.value}"
-                if node_id in self.multi_tier_aggregator.aggregation_nodes:
-                    # Simulate update
-                    update = AsyncUpdate(
-                        update_id=f"update_{region.value}_{datetime.utcnow().timestamp()}",
-                        source_region=region,
-                        model_delta=global_model,
-                        compression_ratio=5.0,
-                        timestamp=datetime.utcnow(),
-                        carbon_intensity_at_update=300,
-                        training_data_size=1000,
-                        local_accuracy=0.9,
-                        vector_clock={},
-                        signature='sig'
-                    )
-                    
-                    await self.multi_tier_aggregator.aggregate_at_node(
-                        node_id,
-                        [update],
-                        lambda updates: global_model
-                    )
+        # Check data localization
+        if target_reg['data_localization']:
+            if data_description.get('contains_personal_data', False):
+                violations.append(
+                    f"Personal data must remain in {target_region}"
+                )
+        
+        # Check DPIA requirement
+        if source_reg['dpia_required']:
+            if not data_description.get('dpia_completed', False):
+                violations.append(
+                    f"Data Protection Impact Assessment required for transfer from {source_region}"
+                )
+        
+        is_compliant = len(violations) == 0
+        
+        if not is_compliant:
+            self.compliance_violations.append({
+                'source': source_region,
+                'target': target_region,
+                'violations': violations,
+                'timestamp': datetime.utcnow().isoformat()
+            })
             
-            result['aggregation_hierarchy'] = self.multi_tier_aggregator.get_hierarchy_status()
-            result['optimizations_applied'].append('multi_tier_aggregation')
+            logger.warning(
+                f"Compliance violation: {source_region} -> {target_region}: "
+                f"{len(violations)} violations"
+            )
+        
+        return is_compliant, violations
+    
+    def anonymize_for_transfer(
+        self,
+        data: Dict[str, Any],
+        privacy_level: str = 'strict'
+    ) -> Dict[str, Any]:
+        """
+        Anonymize data for cross-border transfer.
+        
+        Applies appropriate anonymization based on privacy requirements.
+        """
+        anonymized = {}
+        
+        for key, value in data.items():
+            if privacy_level == 'strict':
+                # Apply differential privacy with low epsilon
+                if isinstance(value, np.ndarray):
+                    noise_scale = 0.1
+                    noise = np.random.laplace(0, noise_scale, value.shape)
+                    anonymized[key] = value + noise
+                elif isinstance(value, (int, float)):
+                    noise = np.random.laplace(0, abs(value) * 0.1)
+                    anonymized[key] = value + noise
+                else:
+                    anonymized[key] = value
+            
+            elif privacy_level == 'moderate':
+                # Apply moderate noise
+                if isinstance(value, np.ndarray):
+                    noise_scale = 0.05
+                    noise = np.random.laplace(0, noise_scale, value.shape)
+                    anonymized[key] = value + noise
+                else:
+                    anonymized[key] = value
+            
+            else:
+                anonymized[key] = value
+        
+        return anonymized
+    
+    def get_compliance_status(self) -> Dict[str, Any]:
+        """Get compliance status"""
+        return {
+            'total_violations': len(self.compliance_violations),
+            'recent_violations': self.compliance_violations[-10:],
+            'regulated_regions': list(self.regional_regulations.keys()),
+            'violation_rate': len(self.compliance_violations) / 100  # Per 100 checks
+        }
+    
+    def get_transfer_requirements(
+        self,
+        source_region: str,
+        target_region: str
+    ) -> Dict[str, Any]:
+        """Get requirements for data transfer between regions"""
+        source_reg = self.regional_regulations.get(
+            source_region,
+            self.regional_regulations['Global']
+        )
+        
+        return {
+            'cross_border_allowed': source_reg['cross_border_allowed'],
+            'adequate_protection_required': source_reg['adequate_protection_required'],
+            'privacy_level_required': source_reg['privacy_requirements'],
+            'dpia_required': source_reg['dpia_required'],
+            'anonymization_required': source_reg['privacy_requirements'] == 'strict',
+            'source_regulation': source_reg['regulation']
+        }
+
+
+# ============================================================================
+# Smart Contract Integration for On-Chain Governance
+# ============================================================================
+
+class SmartContractGovernance:
+    """
+    Smart contract integration for on-chain governance.
+    
+    Enables decentralized decision-making for federation parameters.
+    """
+    
+    def __init__(self):
+        self.proposals: Dict[str, Dict[str, Any]] = {}
+        self.votes: Dict[str, Dict[str, str]] = defaultdict(dict)  # proposal_id -> {voter -> vote}
+        self.executed_proposals: List[Dict[str, Any]] = []
+        
+        # Governance parameters
+        self.voting_period_hours = 72
+        self.quorum_percent = 0.5
+        self.pass_threshold_percent = 0.67
+        
+        logger.info("Smart Contract Governance initialized")
+    
+    def create_proposal(
+        self,
+        proposer: str,
+        title: str,
+        description: str,
+        parameter_changes: Dict[str, Any],
+        contract_action: str
+    ) -> str:
+        """
+        Create governance proposal.
+        
+        Returns proposal ID.
+        """
+        proposal_id = f"prop_{datetime.utcnow().timestamp()}_{hashlib.sha256(title.encode()).hexdigest()[:8]}"
+        
+        self.proposals[proposal_id] = {
+            'proposal_id': proposal_id,
+            'proposer': proposer,
+            'title': title,
+            'description': description,
+            'parameter_changes': parameter_changes,
+            'contract_action': contract_action,
+            'status': 'active',
+            'created_at': datetime.utcnow(),
+            'voting_ends_at': datetime.utcnow() + timedelta(hours=self.voting_period_hours),
+            'yes_votes': 0,
+            'no_votes': 0,
+            'abstain_votes': 0,
+            'total_voting_power': 0
+        }
+        
+        logger.info(f"Created proposal {proposal_id}: {title}")
+        
+        return proposal_id
+    
+    def cast_vote(
+        self,
+        proposal_id: str,
+        voter: str,
+        vote: str,  # 'yes', 'no', 'abstain'
+        voting_power: float = 1.0
+    ) -> bool:
+        """
+        Cast vote on proposal.
+        
+        Returns success status.
+        """
+        if proposal_id not in self.proposals:
+            return False
+        
+        proposal = self.proposals[proposal_id]
+        
+        if proposal['status'] != 'active':
+            return False
+        
+        if datetime.utcnow() > proposal['voting_ends_at']:
+            proposal['status'] = 'closed'
+            return False
+        
+        if vote not in ['yes', 'no', 'abstain']:
+            return False
+        
+        # Record vote
+        self.votes[proposal_id][voter] = vote
+        
+        if vote == 'yes':
+            proposal['yes_votes'] += voting_power
+        elif vote == 'no':
+            proposal['no_votes'] += voting_power
+        else:
+            proposal['abstain_votes'] += voting_power
+        
+        proposal['total_voting_power'] += voting_power
+        
+        logger.debug(f"Vote cast on {proposal_id}: {voter} -> {vote}")
+        
+        return True
+    
+    def execute_proposal(self, proposal_id: str) -> Tuple[bool, str]:
+        """
+        Execute proposal if it passes.
+        
+        Returns (success, message).
+        """
+        if proposal_id not in self.proposals:
+            return False, "Proposal not found"
+        
+        proposal = self.proposals[proposal_id]
+        
+        if proposal['status'] == 'executed':
+            return False, "Proposal already executed"
+        
+        if proposal['status'] == 'active':
+            # Check if voting period ended
+            if datetime.utcnow() < proposal['voting_ends_at']:
+                return False, "Voting period still active"
+            proposal['status'] = 'closed'
+        
+        # Check quorum
+        total_participants = len(self.votes.get(proposal_id, {}))
+        if total_participants < 2:  # Minimum participants
+            return False, f"Insufficient participants ({total_participants})"
+        
+        # Check pass threshold
+        total_votes = proposal['yes_votes'] + proposal['no_votes']
+        if total_votes == 0:
+            return False, "No votes cast"
+        
+        pass_rate = proposal['yes_votes'] / total_votes
+        
+        if pass_rate >= self.pass_threshold_percent:
+            # Execute proposal
+            proposal['status'] = 'executed'
+            proposal['executed_at'] = datetime.utcnow()
+            
+            self.executed_proposals.append({
+                'proposal_id': proposal_id,
+                'executed_at': datetime.utcnow().isoformat(),
+                'parameter_changes': proposal['parameter_changes']
+            })
+            
+            logger.info(
+                f"Proposal {proposal_id} executed: "
+                f"{pass_rate:.1%} approval"
+            )
+            
+            return True, f"Proposal executed with {pass_rate:.1%} approval"
+        
+        return False, f"Proposal failed: {pass_rate:.1%} approval (need {self.pass_threshold_percent:.1%})"
+    
+    def get_active_proposals(self) -> List[Dict[str, Any]]:
+        """Get active proposals"""
+        return [
+            {
+                'proposal_id': p['proposal_id'],
+                'title': p['title'],
+                'proposer': p['proposer'],
+                'status': p['status'],
+                'voting_ends_at': p['voting_ends_at'].isoformat(),
+                'approval_rate': (
+                    p['yes_votes'] / max(p['yes_votes'] + p['no_votes'], 1)
+                ) if (p['yes_votes'] + p['no_votes']) > 0 else 0
+            }
+            for p in self.proposals.values()
+            if p['status'] == 'active'
+        ]
+    
+    def get_governance_stats(self) -> Dict[str, Any]:
+        """Get governance statistics"""
+        return {
+            'total_proposals': len(self.proposals),
+            'active_proposals': sum(1 for p in self.proposals.values() if p['status'] == 'active'),
+            'executed_proposals': len(self.executed_proposals),
+            'pass_rate': sum(
+                1 for p in self.proposals.values()
+                if p['status'] == 'executed'
+            ) / max(len(self.proposals), 1),
+            'average_participation': np.mean([
+                len(votes) for votes in self.votes.values()
+            ]) if self.votes else 0
+        }
+
+
+# ============================================================================
+# Enhanced Cross-Region Federation with All Integrations
+# ============================================================================
+
+class CrossRegionFederationOptimizer:
+    """
+    Enhanced Cross-Region Federation v3.0.0
+    
+    New capabilities:
+    - Semantic global model versioning
+    - Byzantine fault tolerance
+    - Semantic conflict resolution
+    - Adaptive privacy budgeting
+    - Model drift detection
+    - Data sovereignty compliance
+    - Smart contract governance
+    """
+    
+    def __init__(
+        self,
+        enable_versioning: bool = True,
+        enable_byzantine: bool = True,
+        enable_semantic_merge: bool = True,
+        enable_adaptive_privacy: bool = True,
+        enable_drift_detection: bool = True,
+        enable_compliance: bool = True,
+        enable_governance: bool = True
+    ):
+        # Feature flags
+        self.enable_versioning = enable_versioning
+        self.enable_byzantine = enable_byzantine
+        self.enable_semantic_merge = enable_semantic_merge
+        self.enable_adaptive_privacy = enable_adaptive_privacy
+        self.enable_drift_detection = enable_drift_detection
+        self.enable_compliance = enable_compliance
+        self.enable_governance = enable_governance
+        
+        # New sub-modules
+        self.version_manager = GlobalModelVersionManager() if enable_versioning else None
+        self.byzantine_detector = ByzantineFaultDetector() if enable_byzantine else None
+        self.conflict_resolver = SemanticConflictResolver() if enable_semantic_merge else None
+        self.privacy_budget = AdaptivePrivacyBudget() if enable_adaptive_privacy else None
+        self.drift_detector = ModelDriftDetector() if enable_drift_detection else None
+        self.compliance = DataSovereigntyCompliance() if enable_compliance else None
+        self.governance = SmartContractGovernance() if enable_governance else None
+        
+        # Existing components
+        self.regional_updates: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self.global_model: Optional[Dict[str, Any]] = None
+        
+        logger.info(
+            f"Enhanced Cross-Region Federation v3.0.0 initialized: "
+            f"versioning={enable_versioning}, byzantine={enable_byzantine}, "
+            f"semantic_merge={enable_semantic_merge}, privacy={enable_adaptive_privacy}, "
+            f"drift={enable_drift_detection}, compliance={enable_compliance}, "
+            f"governance={enable_governance}"
+        )
+    
+    async def submit_region_update(
+        self,
+        region: str,
+        model_update: Dict[str, Any],
+        metadata: Dict[str, Any],
+        source_region: str = "local",
+        target_region: str = "global"
+    ) -> Dict[str, Any]:
+        """
+        Enhanced regional update submission with all integrations.
+        """
+        result = {
+            'region': region,
+            'timestamp': datetime.utcnow().isoformat(),
+            'accepted': False,
+            'checks': {}
+        }
+        
+        # Check data sovereignty compliance
+        if self.enable_compliance:
+            is_compliant, violations = self.compliance.check_compliance(
+                source_region, target_region, metadata
+            )
+            result['checks']['compliance'] = {
+                'passed': is_compliant,
+                'violations': violations
+            }
+            
+            if not is_compliant:
+                return result
+            
+            # Apply required anonymization
+            requirements = self.compliance.get_transfer_requirements(
+                source_region, target_region
+            )
+            if requirements.get('anonymization_required'):
+                model_update = self.compliance.anonymize_for_transfer(
+                    model_update,
+                    requirements['privacy_level_required']
+                )
+                result['checks']['anonymization'] = 'applied'
+        
+        # Byzantine fault check
+        if self.enable_byzantine:
+            all_updates = {
+                region: update
+                for region, updates in self.regional_updates.items()
+                for update in [list(updates)[-1] if updates else None]
+                if update
+            }
+            all_updates[region] = model_update
+            
+            is_honest, score, reason = self.byzantine_detector.evaluate_update(
+                region, model_update, {k: v for k, v in all_updates.items() if v}
+            )
+            result['checks']['byzantine'] = {
+                'passed': is_honest,
+                'score': score,
+                'reason': reason
+            }
+            
+            if not is_honest:
+                return result
+        
+        # Store update
+        self.regional_updates[region].append({
+            'update': model_update,
+            'metadata': metadata,
+            'timestamp': datetime.utcnow()
+        })
+        
+        # Model drift detection
+        if self.enable_drift_detection and self.global_model:
+            drift = self.drift_detector.measure_drift(
+                region, model_update, self.global_model
+            )
+            result['checks']['drift'] = {
+                'score': drift,
+                'needs_correction': drift > self.drift_detector.drift_threshold
+            }
+        
+        result['accepted'] = True
         
         return result
     
     def get_federation_stats(self) -> Dict[str, Any]:
-        """Get comprehensive federation statistics"""
+        """Get enhanced federation statistics"""
         stats = {
-            'optimizations_enabled': {
-                'async': self.enable_async,
-                'carbon_scheduling': self.enable_carbon_scheduling,
-                'compression': self.enable_compression,
-                'multi_tier': self.enable_multi_tier,
-                'personalization': self.enable_personalization
-            }
+            'regions': len(self.regional_updates),
+            'total_updates': sum(len(updates) for updates in self.regional_updates.values())
         }
         
-        if self.async_protocol:
-            stats['async_protocol'] = self.async_protocol.get_protocol_stats()
+        if self.enable_versioning:
+            stats['versioning'] = {
+                'current_version': self.version_manager.current_version,
+                'total_versions': len(self.version_manager.versions)
+            }
         
-        if self.multi_tier_aggregator:
-            stats['aggregation_hierarchy'] = self.multi_tier_aggregator.get_hierarchy_status()
+        if self.enable_byzantine:
+            stats['byzantine'] = self.byzantine_detector.get_byzantine_status()
+        
+        if self.enable_semantic_merge:
+            stats['conflicts'] = self.conflict_resolver.get_conflict_statistics()
+        
+        if self.enable_adaptive_privacy:
+            stats['privacy'] = self.privacy_budget.get_budget_status()
+        
+        if self.enable_drift_detection:
+            stats['drift'] = self.drift_detector.get_drift_status()
+        
+        if self.enable_compliance:
+            stats['compliance'] = self.compliance.get_compliance_status()
+        
+        if self.enable_governance:
+            stats['governance'] = self.governance.get_governance_stats()
         
         return stats
+    
+    def create_governance_proposal(
+        self,
+        proposer: str,
+        title: str,
+        description: str,
+        parameter_changes: Dict[str, Any]
+    ) -> Optional[str]:
+        """Create governance proposal"""
+        if self.enable_governance:
+            return self.governance.create_proposal(
+                proposer, title, description,
+                parameter_changes, 'update_federation_params'
+            )
+        return None
+    
+    def vote_on_proposal(
+        self,
+        proposal_id: str,
+        voter: str,
+        vote: str
+    ) -> bool:
+        """Vote on governance proposal"""
+        if self.enable_governance:
+            return self.governance.cast_vote(proposal_id, voter, vote)
+        return False
