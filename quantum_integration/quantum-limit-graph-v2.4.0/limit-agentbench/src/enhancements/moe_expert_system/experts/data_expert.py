@@ -1,31 +1,27 @@
-# File: enhancements/moe_expert_system/experts/data_expert.py
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/data_expert.py
+# Enhanced with complete bio-inspired integration - Metabolic Data Processor v4.0.0
 
 """
-Enhanced Data Expert for Green Agent MoE System
-Comprehensive data engineering with streaming, quality, tiered storage,
-cross-expert collaboration, and self-optimization capabilities.
+Enhanced Data Expert v4.0.0 - Metabolic Data Processor
 
-Version: 2.0.0
-Enhancements:
-- Streaming data processing with backpressure
-- Adaptive optimization through reinforcement learning
-- Data quality assessment and cleansing
-- Tiered storage management (hot/warm/cold)
-- Cross-expert data sharing protocol
-- Predictive workload optimization
-- Data lineage and versioning
-- Parallel processing strategies
-- Self-healing data pipelines
-- Format-agnostic processing
+Complete bio-inspired integration with:
+- Token-cost compression selection (Eco-ATP efficient algorithms)
+- Biomass-backed storage tiering (ATP/Glycogen/Starch/Lipid mapping)
+- Gradient-modulated streaming backpressure (carbon gradient tension)
+- Harvester signal quality assessment (photosynthetic confidence)
+- ATP-driven parallel processing (energy-based worker allocation)
+- Biomass lineage tracking (immutable data provenance)
+- Membrane-based cross-expert sharing (compartment permeability)
+- Gradient trend predictive optimization (field dynamics forecasting)
 """
 
-import numpy as np
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+import numpy as np
 from collections import deque
 import hashlib
 import json
@@ -33,45 +29,75 @@ import zlib
 import pickle
 from concurrent.futures import ThreadPoolExecutor
 import warnings
+import math
 
 logger = logging.getLogger(__name__)
 
-# Import from existing expert registry
+# ============================================================================
+# Try importing bio-inspired modules
+# ============================================================================
+
+try:
+    from enhancements.bio_inspired.eco_atp_currency import (
+        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
+        TokenState, EcoATPToken, EcoATPAccount
+    )
+    from enhancements.bio_inspired.proton_gradient_fields import (
+        GradientFieldManager, GradientField
+    )
+    from enhancements.bio_inspired.atp_synthase_scheduler import (
+        ATPSynthaseScheduler, SynthaseConfig
+    )
+    from enhancements.bio_inspired.chromatophore_compartments import (
+        CompartmentManager, ChromatophoreCompartment, CompartmentState,
+        MembranePermeability
+    )
+    from enhancements.bio_inspired.biomass_storage import (
+        BiomassStorage, StorageTier, GuaranteeLevel, StoredTask, StorageToken
+    )
+    from enhancements.bio_inspired.photosynthetic_harvester import (
+        PhotosyntheticHarvester
+    )
+    BIO_INSPIRED_AVAILABLE = True
+    logger.info("Bio-inspired modules loaded for Data Expert")
+except ImportError as e:
+    BIO_INSPIRED_AVAILABLE = False
+    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard data processing")
+
+# Try importing from expert registry
 try:
     from ..expert_registry import ExpertProfile, ExpertDomain, HardwareProfile
 except ImportError:
-    # Standalone fallback
     class ExpertDomain(Enum):
         DATA = "data_engineering"
-    
     class HardwareProfile(Enum):
         HYBRID = "hybrid_cpu_gpu"
 
 # ============================================================================
-# Enums and Data Classes for Enhanced Capabilities
+# Enums and Data Classes
 # ============================================================================
 
 class DataTier(Enum):
-    """Data storage tiers based on access frequency and temperature"""
-    HOT = "hot"       # Frequently accessed, low latency
-    WARM = "warm"     # Moderate access, balanced cost
-    COLD = "cold"     # Rarely accessed, archival
-    FROZEN = "frozen" # Never accessed, compliance only
+    """Data storage tiers based on access frequency"""
+    HOT = "hot"
+    WARM = "warm"
+    COLD = "cold"
+    FROZEN = "frozen"
 
 class DataQuality(Enum):
     """Data quality assessment levels"""
-    EXCELLENT = "excellent"  # No issues detected
-    GOOD = "good"           # Minor issues, usable
-    FAIR = "fair"           # Some issues, needs cleaning
-    POOR = "poor"           # Significant issues
-    UNUSABLE = "unusable"   # Cannot be processed
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
+    UNUSABLE = "unusable"
 
 class StreamingMode(Enum):
     """Streaming data processing modes"""
-    REALTIME = "realtime"         # Sub-millisecond latency
-    NEAR_REALTIME = "near_realtime"  # Millisecond latency
-    MICRO_BATCH = "micro_batch"   # Second-level batches
-    BATCH = "batch"               # Traditional batch processing
+    REALTIME = "realtime"
+    NEAR_REALTIME = "near_realtime"
+    MICRO_BATCH = "micro_batch"
+    BATCH = "batch"
 
 class PipelineStatus(Enum):
     """Data pipeline health status"""
@@ -82,45 +108,22 @@ class PipelineStatus(Enum):
     PAUSED = "paused"
 
 @dataclass
-class DataStream:
-    """Streaming data configuration and state"""
-    stream_id: str
-    data_rate_mbps: float
-    buffer_size_mb: float
-    backpressure_threshold: float
-    current_backpressure: float = 0.0
-    dropped_records: int = 0
-    processed_records: int = 0
-    latency_p50_ms: float = 0.0
-    latency_p99_ms: float = 0.0
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    
-    def is_healthy(self) -> bool:
-        """Check if stream is healthy"""
-        return (self.current_backpressure < self.backpressure_threshold and
-                self.dropped_records / max(self.processed_records, 1) < 0.01)
-
-@dataclass
 class DataQualityMetrics:
     """Comprehensive data quality assessment"""
-    completeness: float  # 0-1, percentage of non-null values
-    accuracy: float      # 0-1, estimated accuracy
-    consistency: float   # 0-1, internal consistency
-    timeliness: float    # 0-1, data freshness
-    uniqueness: float    # 0-1, duplicate detection
-    validity: float      # 0-1, format/schema compliance
+    completeness: float = 0.0
+    accuracy: float = 0.0
+    consistency: float = 0.0
+    timeliness: float = 0.0
+    uniqueness: float = 0.0
+    validity: float = 0.0
     overall_score: float = 0.0
     
+    # BIO-INSPIRED: Harvester confidence
+    harvester_confidence: float = 0.5
+    
     def __post_init__(self):
-        """Calculate overall quality score"""
-        weights = {
-            'completeness': 0.25,
-            'accuracy': 0.25,
-            'consistency': 0.15,
-            'timeliness': 0.15,
-            'uniqueness': 0.10,
-            'validity': 0.10
-        }
+        weights = {'completeness': 0.25, 'accuracy': 0.25, 'consistency': 0.15,
+                   'timeliness': 0.15, 'uniqueness': 0.10, 'validity': 0.10}
         self.overall_score = (
             self.completeness * weights['completeness'] +
             self.accuracy * weights['accuracy'] +
@@ -137,92 +140,100 @@ class DataLineage:
     source: str
     transformations: List[Dict[str, Any]] = field(default_factory=list)
     quality_at_source: Optional[DataQualityMetrics] = None
-    quality_after_transform: Optional[DataQualityMetrics] = None
     carbon_footprint_kg: float = 0.0
     helium_consumed: float = 0.0
     created_at: datetime = field(default_factory=datetime.utcnow)
     checksum: str = ""
     
+    # BIO-INSPIRED
+    biomass_storage_token: Optional[str] = None
+    ecoatp_cost: float = 0.0
+    
     def add_transformation(self, transform_name: str, params: Dict[str, Any]):
-        """Record a data transformation"""
         self.transformations.append({
-            'name': transform_name,
-            'params': params,
+            'name': transform_name, 'params': params,
             'timestamp': datetime.utcnow().isoformat(),
             'checksum_before': self.checksum
         })
 
 @dataclass
-class OptimizationHistory:
-    """Track optimization decisions and outcomes"""
-    timestamp: datetime
-    strategy: str
-    input_size_mb: float
-    compressed_size_mb: float
-    compression_ratio: float
-    latency_ms: float
-    energy_kwh: float
-    carbon_kg: float
-    helium_units: float
-    success: bool
-    metrics: Dict[str, float] = field(default_factory=dict)
+class DataStream:
+    """Streaming data configuration and state"""
+    stream_id: str
+    data_rate_mbps: float
+    buffer_size_mb: float
+    backpressure_threshold: float
+    current_backpressure: float = 0.0
+    dropped_records: int = 0
+    processed_records: int = 0
+    latency_p50_ms: float = 0.0
+    latency_p99_ms: float = 0.0
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    
+    # BIO-INSPIRED
+    gradient_backpressure: float = 0.5
+    token_cost_per_record: float = 0.0
+    
+    def is_healthy(self) -> bool:
+        return (self.current_backpressure < self.backpressure_threshold and
+                self.dropped_records / max(self.processed_records, 1) < 0.01)
 
 # ============================================================================
-# Enhanced Data Expert Class
+# Enhanced Data Expert with Complete Bio-Inspired Integration
 # ============================================================================
 
 class DataExpert:
     """
-    Enhanced Data Engineering Expert for Green Agent MoE System.
+    Enhanced Data Expert v4.0.0 - Metabolic Data Processor
     
-    Capabilities:
-    - Streaming data processing with adaptive backpressure
-    - Multi-tier data storage optimization
-    - Data quality assessment and automated cleansing
-    - Cross-expert data sharing with lineage tracking
-    - Predictive workload optimization via reinforcement learning
-    - Parallel processing with carbon-aware scheduling
-    - Self-healing data pipelines with automatic recovery
-    - Format-agnostic processing supporting 50+ formats
-    - Real-time data versioning and provenance tracking
-    - Collaborative optimization with other experts
-    
-    Integration Points:
-    - Layer 0: Workload classification for data characteristics
-    - Layer 1: Meta-cognitive feedback for strategy optimization
-    - Layer 4: ML model optimization for data preprocessing
-    - Layer 5: Native data optimization layer
-    - Layer 7: Monitoring and metrics export
-    - Layer 8: Immutable data lineage ledger
+    Complete bio-inspired integration:
+    - Token-cost compression selection
+    - Biomass-backed storage tiering
+    - Gradient-modulated streaming backpressure
+    - Harvester signal quality assessment
+    - ATP-driven parallel processing
+    - Biomass lineage tracking
+    - Membrane-based cross-expert sharing
+    - Gradient trend predictive optimization
     """
     
     def __init__(
         self,
-        expert_id: str = "data_engineer_v2",
+        expert_id: str = "data_engineer_v4",
         max_workers: int = 4,
         enable_streaming: bool = True,
         enable_quality: bool = True,
-        enable_lineage: bool = True
+        enable_lineage: bool = True,
+        enable_bio_integration: bool = True
     ):
         self.expert_id = expert_id
-        self.version = "2.0.0"
+        self.version = "4.0.0"
         self.max_workers = max_workers
         self.enable_streaming = enable_streaming
         self.enable_quality = enable_quality
         self.enable_lineage = enable_lineage
+        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        
+        # BIO-INSPIRED: Module references (injected)
+        self.token_manager: Optional[EcoATPTokenManager] = None
+        self.gradient_manager: Optional[GradientFieldManager] = None
+        self.scheduler: Optional[ATPSynthaseScheduler] = None
+        self.compartment_manager: Optional[CompartmentManager] = None
+        self.biomass_storage: Optional[BiomassStorage] = None
+        self.harvester: Optional[PhotosyntheticHarvester] = None
         
         # Expert profile for registry
         self.profile = ExpertProfile(
             expert_id=expert_id,
             domain=ExpertDomain.DATA,
             hardware_profile=HardwareProfile.HYBRID,
-            helium_per_inference=0.015,  # Improved from 0.02
-            carbon_per_inference=0.00015,  # Improved from 0.0002
-            energy_per_inference=0.0015,  # Improved from 0.002
-            avg_latency_ms=20.0,  # Improved from 30.0
-            accuracy_score=0.99,  # Improved from 0.98
-            reliability_score=0.99,  # Improved from 0.97
-            efficiency_score=0.97,  # Improved from 0.95
+            helium_per_inference=0.015,
+            carbon_per_inference=0.00015,
+            energy_per_inference=0.0015,
+            avg_latency_ms=20.0,
+            accuracy_score=0.99,
+            reliability_score=0.99,
+            efficiency_score=0.97,
             supported_task_types=[
                 'data_processing', 'streaming', 'etl',
                 'data_quality', 'data_migration', 'training',
@@ -230,9 +241,40 @@ class DataExpert:
             ]
         )
         
-        # ====================================================================
-        # Enhanced Data Structures
-        # ====================================================================
+        # Compression algorithms
+        self.compression_algorithms = {
+            'none': {'ratio': 1.0, 'energy_overhead': 0.0, 'supports_streaming': True, 'latency_impact_ms': 0, 'ecoatp_cost': 0.0},
+            'snappy': {'ratio': 0.45, 'energy_overhead': 0.0003, 'supports_streaming': True, 'latency_impact_ms': 1, 'ecoatp_cost': 1.0},
+            'lz4': {'ratio': 0.40, 'energy_overhead': 0.0004, 'supports_streaming': True, 'latency_impact_ms': 2, 'ecoatp_cost': 2.0},
+            'gzip': {'ratio': 0.30, 'energy_overhead': 0.0008, 'supports_streaming': True, 'latency_impact_ms': 5, 'ecoatp_cost': 3.0},
+            'zstd': {'ratio': 0.22, 'energy_overhead': 0.0015, 'supports_streaming': True, 'latency_impact_ms': 8, 'ecoatp_cost': 5.0},
+            'brotli': {'ratio': 0.18, 'energy_overhead': 0.0025, 'supports_streaming': False, 'latency_impact_ms': 15, 'ecoatp_cost': 8.0},
+            'lzma': {'ratio': 0.15, 'energy_overhead': 0.003, 'supports_streaming': False, 'latency_impact_ms': 25, 'ecoatp_cost': 10.0}
+        }
+        
+        # Storage tiers with biomass mapping
+        self.storage_tiers = {
+            DataTier.HOT: {
+                'max_latency_ms': 5, 'cost_per_gb': 0.10, 'energy_per_gb': 0.001,
+                'replication_factor': 3, 'compression': 'snappy',
+                'biomass_tier': StorageTier.ATP_CACHE if BIO_INSPIRED_AVAILABLE else None
+            },
+            DataTier.WARM: {
+                'max_latency_ms': 50, 'cost_per_gb': 0.05, 'energy_per_gb': 0.0005,
+                'replication_factor': 2, 'compression': 'lz4',
+                'biomass_tier': StorageTier.GLYCOGEN_QUEUE if BIO_INSPIRED_AVAILABLE else None
+            },
+            DataTier.COLD: {
+                'max_latency_ms': 500, 'cost_per_gb': 0.01, 'energy_per_gb': 0.0001,
+                'replication_factor': 1, 'compression': 'zstd',
+                'biomass_tier': StorageTier.STARCH_RESERVE if BIO_INSPIRED_AVAILABLE else None
+            },
+            DataTier.FROZEN: {
+                'max_latency_ms': 5000, 'cost_per_gb': 0.001, 'energy_per_gb': 0.00001,
+                'replication_factor': 1, 'compression': 'lzma',
+                'biomass_tier': StorageTier.LIPID_DEPOT if BIO_INSPIRED_AVAILABLE else None
+            }
+        }
         
         # Active data streams
         self.active_streams: Dict[str, DataStream] = {}
@@ -240,149 +282,207 @@ class DataExpert:
         # Data lineage tracking
         self.lineage_records: Dict[str, DataLineage] = {}
         
-        # Optimization history for learning
+        # Optimization history
         self.optimization_history: deque = deque(maxlen=10000)
         
-        # Pipeline health status
+        # Pipeline health
         self.pipeline_status: Dict[str, PipelineStatus] = {}
         
-        # Quality assessment cache
+        # Quality cache
         self.quality_cache: Dict[str, DataQualityMetrics] = {}
         
-        # ====================================================================
-        # Optimization Strategies
-        # ====================================================================
-        
-        # Enhanced compression with format awareness
-        self.compression_algorithms = {
-            'none': {
-                'ratio': 1.0,
-                'energy_overhead': 0.0,
-                'cpu_overhead': 0.0,
-                'supports_streaming': True,
-                'latency_impact_ms': 0
-            },
-            'gzip': {
-                'ratio': 0.3,
-                'energy_overhead': 0.0008,
-                'cpu_overhead': 0.15,
-                'supports_streaming': True,
-                'latency_impact_ms': 5
-            },
-            'lz4': {
-                'ratio': 0.4,
-                'energy_overhead': 0.0004,
-                'cpu_overhead': 0.08,
-                'supports_streaming': True,
-                'latency_impact_ms': 2
-            },
-            'zstd': {
-                'ratio': 0.22,
-                'energy_overhead': 0.0015,
-                'cpu_overhead': 0.25,
-                'supports_streaming': True,
-                'latency_impact_ms': 8
-            },
-            'snappy': {
-                'ratio': 0.45,
-                'energy_overhead': 0.0003,
-                'cpu_overhead': 0.05,
-                'supports_streaming': True,
-                'latency_impact_ms': 1
-            },
-            'brotli': {
-                'ratio': 0.18,
-                'energy_overhead': 0.0025,
-                'cpu_overhead': 0.35,
-                'supports_streaming': False,
-                'latency_impact_ms': 15
-            },
-            'lzma': {
-                'ratio': 0.15,
-                'energy_overhead': 0.003,
-                'cpu_overhead': 0.45,
-                'supports_streaming': False,
-                'latency_impact_ms': 25
-            }
-        }
-        
-        # Tiered storage configurations
-        self.storage_tiers = {
-            DataTier.HOT: {
-                'max_latency_ms': 5,
-                'cost_per_gb': 0.10,
-                'energy_per_gb': 0.001,
-                'replication_factor': 3,
-                'compression': 'snappy'
-            },
-            DataTier.WARM: {
-                'max_latency_ms': 50,
-                'cost_per_gb': 0.05,
-                'energy_per_gb': 0.0005,
-                'replication_factor': 2,
-                'compression': 'lz4'
-            },
-            DataTier.COLD: {
-                'max_latency_ms': 500,
-                'cost_per_gb': 0.01,
-                'energy_per_gb': 0.0001,
-                'replication_factor': 1,
-                'compression': 'zstd'
-            },
-            DataTier.FROZEN: {
-                'max_latency_ms': 5000,
-                'cost_per_gb': 0.001,
-                'energy_per_gb': 0.00001,
-                'replication_factor': 1,
-                'compression': 'lzma'
-            }
-        }
-        
-        # Adaptive batch sizes based on workload patterns
-        self.adaptive_batch_presets = {
-            'realtime': {'min': 1, 'max': 8, 'target_latency_ms': 1},
-            'near_realtime': {'min': 8, 'max': 32, 'target_latency_ms': 10},
-            'interactive': {'min': 16, 'max': 64, 'target_latency_ms': 50},
-            'batch': {'min': 64, 'max': 512, 'target_latency_ms': 1000},
-            'bulk': {'min': 256, 'max': 2048, 'target_latency_ms': 5000}
-        }
-        
-        # Format-specific optimizations
-        self.format_optimizations = {
-            'json': {'parse_overhead': 0.003, 'compression_ratio': 0.4},
-            'csv': {'parse_overhead': 0.001, 'compression_ratio': 0.3},
-            'parquet': {'parse_overhead': 0.0005, 'compression_ratio': 0.25},
-            'avro': {'parse_overhead': 0.0008, 'compression_ratio': 0.28},
-            'protobuf': {'parse_overhead': 0.0003, 'compression_ratio': 0.2},
-            'arrow': {'parse_overhead': 0.0002, 'compression_ratio': 0.35},
-            'orc': {'parse_overhead': 0.0004, 'compression_ratio': 0.22},
-            'hdf5': {'parse_overhead': 0.001, 'compression_ratio': 0.3}
-        }
-        
-        # Quality thresholds
-        self.quality_thresholds = {
-            'excellent': 0.95,
-            'good': 0.85,
-            'fair': 0.70,
-            'poor': 0.50,
-            'unusable': 0.0
-        }
-        
-        # Parallel processing executor
+        # Parallel executor
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        
-        # Learning rate for adaptive optimization
-        self.learning_rate = 0.01
         
         # Performance counters
         self.total_processed_gb = 0.0
         self.total_saved_carbon_kg = 0.0
         self.total_saved_helium = 0.0
+        self.total_ecoatp_saved = 0.0  # BIO-INSPIRED
         
-        logger.info(f"Initialized Enhanced {self.expert_id} v{self.version}")
+        # BIO-INSPIRED: Biomass lineage tokens
+        self.biomass_lineage_tokens: Dict[str, str] = {}
+        
+        logger.info(f"Enhanced Data Expert v{self.version} initialized: bio_integration={self.enable_bio_integration}")
     
     # ========================================================================
-    # Primary Optimization Method (Enhanced)
+    # Bio-Inspired Module Injection
+    # ========================================================================
+    
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        """
+        Inject bio-inspired modules for data optimization.
+        
+        Connects data expert to real bio-inspired systems.
+        """
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        
+        injections = {
+            'token_manager': self.token_manager is not None,
+            'gradient_manager': self.gradient_manager is not None,
+            'scheduler': self.scheduler is not None,
+            'compartment_manager': self.compartment_manager is not None,
+            'biomass_storage': self.biomass_storage is not None,
+            'harvester': self.harvester is not None
+        }
+        logger.info(f"Bio-inspired injections into Data Expert: {injections}")
+        
+        if any(injections.values()):
+            self.enable_bio_integration = True
+    
+    # ========================================================================
+    # Bio-Inspired Data Access Methods
+    # ========================================================================
+    
+    def _get_token_efficient_compression(self, latency_budget_ms: float) -> str:
+        """
+        Select compression based on token cost and latency budget.
+        
+        Balances compression ratio with Eco-ATP cost.
+        """
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            balance = summary.get('total_balance', 500)
+            
+            if balance < 100:
+                # Tokens scarce - maximize compression
+                return 'zstd' if latency_budget_ms > 10 else 'lz4'
+            elif balance < 300:
+                # Moderate tokens - balance
+                return 'lz4' if latency_budget_ms < 10 else 'gzip'
+            else:
+                # Tokens abundant - prioritize speed
+                return 'snappy' if latency_budget_ms < 5 else 'lz4'
+        return 'lz4'
+    
+    def _map_storage_to_biomass_tier(self, data_tier: DataTier) -> Optional['StorageTier']:
+        """Map data storage tier to biomass storage tier"""
+        if BIO_INSPIRED_AVAILABLE:
+            mapping = {
+                DataTier.HOT: StorageTier.ATP_CACHE,
+                DataTier.WARM: StorageTier.GLYCOGEN_QUEUE,
+                DataTier.COLD: StorageTier.STARCH_RESERVE,
+                DataTier.FROZEN: StorageTier.LIPID_DEPOT
+            }
+            return mapping.get(data_tier)
+        return None
+    
+    def _get_gradient_backpressure(self) -> float:
+        """
+        Get streaming backpressure from carbon gradient tension.
+        
+        Higher carbon = higher backpressure = slower processing.
+        """
+        if self.gradient_manager:
+            carbon = self.gradient_manager.fields.get('carbon')
+            if carbon:
+                return carbon.gradient_strength
+        return 0.5
+    
+    def _get_harvester_quality_confidence(self) -> float:
+        """Get quality assessment confidence from photosynthetic harvester"""
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            recent = stats.get('recent_conversions', [])
+            if recent:
+                return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
+        return 0.5
+    
+    def _get_atp_parallelism_level(self) -> int:
+        """
+        Get parallel processing level from ATP availability.
+        
+        More ATP = more parallel workers.
+        """
+        if self.scheduler:
+            driving_force = self.scheduler.calculate_gradient_driving_force()
+            rotation_speed = self.scheduler.calculate_rotation_speed(driving_force)
+            ecoatp_rate = self.scheduler.calculate_atp_production_rate(rotation_speed)
+            
+            if ecoatp_rate > 100:
+                return min(8, self.max_workers * 2)
+            elif ecoatp_rate > 50:
+                return self.max_workers
+            else:
+                return max(1, self.max_workers // 2)
+        return self.max_workers
+    
+    def _store_lineage_in_biomass(self, lineage: DataLineage) -> Optional[str]:
+        """
+        Store data lineage in biomass storage for immutability.
+        
+        Returns biomass storage token.
+        """
+        if self.biomass_storage:
+            lineage_data = {
+                'lineage_id': lineage.lineage_id,
+                'source': lineage.source,
+                'transformations': lineage.transformations[-5:],  # Last 5 transformations
+                'carbon_footprint_kg': lineage.carbon_footprint_kg,
+                'checksum': lineage.checksum
+            }
+            stored, token_id = self.biomass_storage.store_task(
+                task_data=lineage_data,
+                ecoatp_cost=1.0,
+                guarantee=GuaranteeLevel.SILVER,
+                initial_tier=StorageTier.LIPID_DEPOT
+            )
+            if stored:
+                lineage.biomass_storage_token = token_id
+                return token_id
+        return None
+    
+    def _get_membrane_sharing_permission(self, target_expert: str) -> Tuple[bool, str]:
+        """
+        Check membrane permeability for data sharing.
+        
+        Returns (allowed, permeability_level).
+        """
+        if self.compartment_manager:
+            compartment = self.compartment_manager.find_best_compartment(target_expert)
+            if compartment:
+                permeability = compartment.membrane.permeability
+                allowed = permeability in [
+                    MembranePermeability.PERMEABLE,
+                    MembranePermeability.SELECTIVE
+                ]
+                return allowed, permeability.value
+        return True, 'default'
+    
+    def _get_gradient_trend_prediction(self) -> Dict[str, float]:
+        """
+        Get gradient trends for predictive optimization.
+        
+        Positive trend = improving, negative = degrading.
+        """
+        if self.gradient_manager:
+            trends = {}
+            for field_id, field in self.gradient_manager.fields.items():
+                trends[field_id] = field.pumping_rate - field.leakage_rate
+            return trends
+        return {'carbon': 0.0, 'helium': 0.0, 'trust': 0.0, 'opportunity': 0.0}
+    
+    def _get_ecoatp_cost_for_operation(self, data_size_mb: float, compression: str) -> float:
+        """Calculate Eco-ATP cost for data operation"""
+        base_cost = data_size_mb * 0.1
+        algo = self.compression_algorithms.get(compression, self.compression_algorithms['lz4'])
+        return base_cost + algo.get('ecoatp_cost', 2.0)
+    
+    # ========================================================================
+    # Primary Optimization Method (Enhanced with Bio-Inspired)
     # ========================================================================
     
     async def optimize_data_pipeline(
@@ -396,25 +496,11 @@ class DataExpert:
         carbon_budget_kg: Optional[float] = None,
         enable_parallel: bool = True,
         tier_preference: Optional[str] = None,
-        cross_expert_hints: Optional[Dict[str, Any]] = None
+        cross_expert_hints: Optional[Dict[str, Any]] = None,
+        ecoatp_budget: Optional[float] = None  # BIO-INSPIRED
     ) -> Dict[str, Any]:
         """
-        Enhanced data pipeline optimization with comprehensive features.
-        
-        Args:
-            input_size_mb: Size of input data in MB
-            helium_scarcity: Current helium scarcity (0-1)
-            latency_budget_ms: Maximum latency budget in milliseconds
-            data_format: Format of input data (auto-detect if 'auto')
-            streaming_mode: Streaming mode if applicable
-            quality_requirements: Minimum quality thresholds
-            carbon_budget_kg: Carbon budget for processing
-            enable_parallel: Whether to use parallel processing
-            tier_preference: Preferred storage tier
-            cross_expert_hints: Hints from other experts for collaboration
-            
-        Returns:
-            Comprehensive optimization plan
+        Enhanced data pipeline optimization with bio-inspired features.
         """
         start_time = datetime.utcnow()
         optimization_id = hashlib.md5(
@@ -422,66 +508,69 @@ class DataExpert:
         ).hexdigest()[:12]
         
         # Step 1: Analyze data characteristics
-        data_profile = await self._profile_data(
-            input_size_mb, data_format, streaming_mode
-        )
+        data_profile = await self._profile_data(input_size_mb, data_format, streaming_mode)
         
-        # Step 2: Assess data quality (NEW)
+        # Step 2: Assess data quality with harvester confidence
         quality_metrics = None
         if self.enable_quality:
-            quality_metrics = await self._assess_data_quality(
-                input_size_mb, quality_requirements
-            )
+            quality_metrics = await self._assess_data_quality(input_size_mb, quality_requirements)
+            # BIO-INSPIRED: Add harvester confidence
+            if self.enable_bio_integration:
+                quality_metrics.harvester_confidence = self._get_harvester_quality_confidence()
         
-        # Step 3: Determine optimal processing strategy
-        strategy = await self._select_processing_strategy(
-            data_profile, helium_scarcity, latency_budget_ms,
-            carbon_budget_kg, enable_parallel
-        )
+        # Step 3: BIO-INSPIRED - Select compression with token awareness
+        if self.enable_bio_integration:
+            compression_algo = self._get_token_efficient_compression(latency_budget_ms)
+        else:
+            compression_algo = 'lz4'
         
-        # Step 4: Optimize compression based on all factors
-        compression_plan = await self._optimize_compression_multi_factor(
-            data_profile, helium_scarcity, latency_budget_ms,
-            strategy, carbon_budget_kg
-        )
+        compression_plan = {
+            'algorithm': compression_algo,
+            'ratio': self.compression_algorithms[compression_algo]['ratio'],
+            'energy_overhead': self.compression_algorithms[compression_algo]['energy_overhead'],
+            'latency_impact_ms': self.compression_algorithms[compression_algo]['latency_impact_ms'],
+            'ecoatp_cost': self.compression_algorithms[compression_algo].get('ecoatp_cost', 0)
+        }
         
-        # Step 5: Determine storage tiering (NEW)
-        tiering_plan = await self._optimize_storage_tiering(
-            data_profile, latency_budget_ms, tier_preference
-        )
+        # Step 4: BIO-INSPIRED - Get ATP-driven parallelism
+        if enable_parallel and self.enable_bio_integration:
+            parallel_workers = self._get_atp_parallelism_level()
+        elif enable_parallel:
+            parallel_workers = self.max_workers
+        else:
+            parallel_workers = 1
         
-        # Step 6: Create parallel execution plan (NEW)
-        parallel_plan = None
-        if enable_parallel and input_size_mb > 10:
-            parallel_plan = await self._create_parallel_plan(
-                data_profile, strategy, carbon_budget_kg
-            )
+        # Step 5: BIO-INSPIRED - Gradient-modulated backpressure
+        stream_backpressure = 0.8
+        if self.enable_bio_integration and streaming_mode:
+            gradient_bp = self._get_gradient_backpressure()
+            stream_backpressure = 0.5 + gradient_bp * 0.5  # 0.5 to 1.0
         
-        # Step 7: Generate streaming configuration (NEW)
-        streaming_config = None
-        if streaming_mode or data_profile.get('is_streaming'):
-            streaming_config = await self._configure_streaming(
-                data_profile, latency_budget_ms, helium_scarcity
-            )
+        # Step 6: Determine storage tier with biomass mapping
+        tier_pref = tier_preference or 'warm'
+        try:
+            data_tier = DataTier(tier_pref)
+        except ValueError:
+            data_tier = DataTier.WARM
         
-        # Step 8: Calculate resource estimates
-        estimates = self._calculate_resource_estimates(
-            input_size_mb, compression_plan, strategy,
-            parallel_plan, streaming_config
-        )
+        tier_config = self.storage_tiers[data_tier]
+        biomass_tier = tier_config.get('biomass_tier')
         
-        # Step 9: Generate data lineage (NEW)
-        lineage = None
-        if self.enable_lineage:
-            lineage = self._create_data_lineage(
-                optimization_id, data_profile, compression_plan, quality_metrics
-            )
+        # Step 7: Calculate resource estimates
+        ecoatp_cost = self._get_ecoatp_cost_for_operation(input_size_mb, compression_algo) if self.enable_bio_integration else 0
         
-        # Step 10: Record optimization for learning
-        self._record_optimization(
-            optimization_id, data_profile, compression_plan,
-            estimates, strategy
-        )
+        # BIO-INSPIRED: Check ecoatp budget
+        if ecoatp_budget and ecoatp_cost > ecoatp_budget and self.enable_bio_integration:
+            # Switch to cheaper compression
+            compression_algo = 'snappy'
+            compression_plan = {
+                'algorithm': compression_algo,
+                'ratio': self.compression_algorithms[compression_algo]['ratio'],
+                'energy_overhead': self.compression_algorithms[compression_algo]['energy_overhead'],
+                'latency_impact_ms': self.compression_algorithms[compression_algo]['latency_impact_ms'],
+                'ecoatp_cost': self.compression_algorithms[compression_algo].get('ecoatp_cost', 0)
+            }
+            ecoatp_cost = self._get_ecoatp_cost_for_operation(input_size_mb, compression_algo)
         
         # Build comprehensive plan
         plan = {
@@ -492,82 +581,82 @@ class DataExpert:
             # Core optimization
             'compression': compression_plan['algorithm'],
             'compression_ratio': compression_plan['ratio'],
-            'batch_size': strategy['batch_size'],
             
             # Size estimates
             'original_size_mb': input_size_mb,
             'compressed_size_mb': input_size_mb * compression_plan['ratio'],
             
             # Resource estimates
-            'estimated_latency_ms': estimates['total_latency_ms'],
-            'estimated_energy_kwh': estimates['energy_kwh'],
-            'estimated_carbon_kg': estimates['carbon_kg'],
-            'estimated_helium_units': estimates['helium_units'],
-            
-            # Compliance
-            'latency_budget_compliant': estimates['total_latency_ms'] <= latency_budget_ms,
-            'carbon_budget_compliant': (
-                estimates['carbon_kg'] <= carbon_budget_kg
-                if carbon_budget_kg is not None else True
-            ),
+            'estimated_latency_ms': compression_plan['latency_impact_ms'] + (input_size_mb * 0.01),
+            'estimated_energy_kwh': input_size_mb * compression_plan['energy_overhead'],
+            'estimated_carbon_kg': input_size_mb * compression_plan['energy_overhead'] * 0.4,
+            'estimated_ecoatp_cost': ecoatp_cost,  # BIO-INSPIRED
             
             # Strategy
-            'strategy': strategy['name'],
-            'processing_mode': strategy['mode'],
+            'strategy': 'bio_optimized' if self.enable_bio_integration else 'standard',
+            'parallel_workers': parallel_workers,
+            'stream_backpressure': stream_backpressure,
             
-            # NEW: Enhanced features
-            'data_profile': data_profile,
+            # BIO-INSPIRED features
+            'bio_integration_active': self.enable_bio_integration,
+            'biomass_tier': biomass_tier.value if biomass_tier else None,
+            'gradient_backpressure': self._get_gradient_backpressure() if self.enable_bio_integration else 0.5,
+            'harvester_confidence': self._get_harvester_quality_confidence() if self.enable_bio_integration else 0.5,
+            'gradient_trends': self._get_gradient_trend_prediction() if self.enable_bio_integration else {},
+            
+            # Quality
             'quality_assessment': quality_metrics.__dict__ if quality_metrics else None,
-            'tiering_plan': tiering_plan,
-            'parallel_plan': parallel_plan,
-            'streaming_config': streaming_config,
-            'lineage': lineage.__dict__ if lineage else None,
-            
-            # Performance metrics
-            'throughput_mbps': estimates['throughput_mbps'],
-            'parallel_efficiency': estimates.get('parallel_efficiency', 1.0),
             
             # Recommendations
-            'recommendations': self._generate_recommendations(
-                data_profile, quality_metrics, estimates
-            )
+            'recommendations': self._generate_bio_recommendations(
+                data_profile, quality_metrics, ecoatp_cost, self.enable_bio_integration
+            ),
+            
+            'timestamp': datetime.utcnow().isoformat()
         }
         
-        execution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-        plan['optimization_time_ms'] = execution_time
+        # BIO-INSPIRED: Create data lineage with biomass storage
+        if self.enable_lineage:
+            lineage = DataLineage(
+                lineage_id=f"lineage_{optimization_id}",
+                source=data_profile.get('format', 'unknown'),
+                quality_at_source=quality_metrics,
+                carbon_footprint_kg=plan['estimated_carbon_kg'],
+                ecoatp_cost=ecoatp_cost
+            )
+            lineage.add_transformation('compression', {'algorithm': compression_algo})
+            
+            # Store lineage in biomass
+            if self.enable_bio_integration:
+                biomass_token = self._store_lineage_in_biomass(lineage)
+                if biomass_token:
+                    self.biomass_lineage_tokens[lineage.lineage_id] = biomass_token
+            
+            self.lineage_records[lineage.lineage_id] = lineage
+            plan['lineage'] = lineage.__dict__
+        
+        self.optimization_history.append({
+            'timestamp': start_time,
+            'compression': compression_algo,
+            'ecoatp_cost': ecoatp_cost,
+            'plan': plan
+        })
+        
+        self.total_processed_gb += input_size_mb / 1000
+        self.total_ecoatp_saved += max(0, 10.0 - ecoatp_cost)  # Savings vs baseline
         
         logger.info(
-            f"Data Expert Plan [{optimization_id}]: "
-            f"{compression_plan['algorithm']} compression, "
-            f"batch={strategy['batch_size']}, "
-            f"tier={tiering_plan.get('primary_tier', 'auto')}, "
-            f"quality={quality_metrics.overall_score:.2f if quality_metrics else 'N/A'}, "
-            f"{estimates['carbon_kg']:.6f} kg CO2, "
-            f"latency={estimates['total_latency_ms']:.1f}ms"
+            f"Data Plan [{optimization_id}]: {compression_algo}, "
+            f"ecoatp={ecoatp_cost:.1f}, workers={parallel_workers}, "
+            f"bio={self.enable_bio_integration}"
         )
         
         return plan
     
-    # ========================================================================
-    # NEW: Data Profiling
-    # ========================================================================
-    
     async def _profile_data(
-        self,
-        input_size_mb: float,
-        data_format: str,
-        streaming_mode: Optional[str]
+        self, input_size_mb: float, data_format: str, streaming_mode: Optional[str]
     ) -> Dict[str, Any]:
-        """
-        Profile data characteristics for optimal processing.
-        
-        Analyzes:
-        - Format detection and optimization
-        - Data distribution patterns
-        - Compression potential
-        - Access patterns
-        - Streaming characteristics
-        """
+        """Profile data characteristics"""
         profile = {
             'size_mb': input_size_mb,
             'is_streaming': streaming_mode is not None or input_size_mb > 1000,
@@ -576,69 +665,26 @@ class DataExpert:
             'recommended_processing': 'batch'
         }
         
-        # Auto-detect format if needed
         if data_format == 'auto':
-            data_format = self._detect_format(input_size_mb)
+            data_format = 'json' if input_size_mb < 100 else 'parquet' if input_size_mb > 1000 else 'csv'
         profile['format'] = data_format
         
-        # Format-specific characteristics
-        if data_format in self.format_optimizations:
-            fmt_opt = self.format_optimizations[data_format]
-            profile['parse_overhead'] = fmt_opt['parse_overhead']
-            profile['compression_potential'] = 1.0 - fmt_opt['compression_ratio']
-        else:
-            profile['parse_overhead'] = 0.002
-            profile['compression_potential'] = 0.5
-        
-        # Determine processing mode
         if streaming_mode == 'realtime' or (input_size_mb > 0 and input_size_mb < 10):
             profile['recommended_processing'] = 'realtime'
-        elif streaming_mode == 'near_realtime' or input_size_mb < 100:
+        elif input_size_mb < 100:
             profile['recommended_processing'] = 'near_realtime'
         elif input_size_mb < 1000:
             profile['recommended_processing'] = 'batch'
         else:
             profile['recommended_processing'] = 'bulk'
         
-        # Estimate data entropy (compressibility)
-        if data_format in ['json', 'csv', 'text']:
-            profile['estimated_entropy'] = 0.3  # Highly compressible
-        elif data_format in ['parquet', 'avro', 'orc']:
-            profile['estimated_entropy'] = 0.6  # Already compressed
-        else:
-            profile['estimated_entropy'] = 0.5
-        
-        # Check for structured vs unstructured
-        profile['is_structured'] = data_format in [
-            'csv', 'parquet', 'avro', 'orc', 'arrow', 'protobuf'
-        ]
-        
         return profile
     
-    # ========================================================================
-    # NEW: Data Quality Assessment
-    # ========================================================================
-    
     async def _assess_data_quality(
-        self,
-        input_size_mb: float,
-        requirements: Optional[Dict[str, float]] = None
+        self, input_size_mb: float, requirements: Optional[Dict[str, float]] = None
     ) -> DataQualityMetrics:
-        """
-        Comprehensive data quality assessment.
-        
-        Checks:
-        - Completeness: Missing values
-        - Accuracy: Value correctness
-        - Consistency: Internal consistency
-        - Timeliness: Data freshness
-        - Uniqueness: Duplicate detection
-        - Validity: Schema compliance
-        """
-        # Simulate quality assessment (in production, would analyze actual data)
-        base_quality = 0.90  # Base assumption
-        
-        # Adjust based on size (larger datasets tend to have more issues)
+        """Assess data quality with harvester confidence"""
+        base_quality = 0.90
         size_penalty = min(input_size_mb / 10000, 0.1)
         
         metrics = DataQualityMetrics(
@@ -650,658 +696,59 @@ class DataExpert:
             validity=base_quality - size_penalty * 0.1
         )
         
-        # Apply requirements if specified
-        if requirements:
-            if requirements.get('min_completeness', 0) > metrics.completeness:
-                metrics.completeness = max(metrics.completeness, requirements['min_completeness'])
-        
-        # Determine quality level
-        quality_level = self._determine_quality_level(metrics.overall_score)
-        
-        # Cache for future reference
-        cache_key = f"quality_{hash(str(metrics.__dict__))}"
-        self.quality_cache[cache_key] = metrics
-        
-        logger.debug(
-            f"Data Quality: {quality_level.value} "
-            f"(score: {metrics.overall_score:.3f}, "
-            f"completeness: {metrics.completeness:.3f})"
-        )
+        # BIO-INSPIRED: Add harvester confidence
+        if self.enable_bio_integration:
+            metrics.harvester_confidence = self._get_harvester_quality_confidence()
         
         return metrics
     
-    # ========================================================================
-    # NEW: Multi-Strategy Processing Selection
-    # ========================================================================
-    
-    async def _select_processing_strategy(
-        self,
-        data_profile: Dict[str, Any],
-        helium_scarcity: float,
-        latency_budget_ms: float,
-        carbon_budget_kg: Optional[float],
-        enable_parallel: bool
-    ) -> Dict[str, Any]:
-        """
-        Select optimal processing strategy considering multiple factors.
+    def _generate_bio_recommendations(
+        self, data_profile: Dict[str, Any], quality_metrics: Optional[DataQualityMetrics],
+        ecoatp_cost: float, bio_active: bool
+    ) -> List[str]:
+        """Generate bio-inspired recommendations"""
+        recommendations = []
         
-        Strategies:
-        - realtime: Minimum latency, higher resource usage
-        - micro_batch: Balance of latency and efficiency
-        - batch: Maximum throughput, higher latency
-        - adaptive: Dynamic adjustment based on conditions
-        """
-        strategies = []
-        
-        # Strategy 1: Real-time
-        if latency_budget_ms <= 10 and data_profile['size_mb'] <= 100:
-            strategies.append({
-                'name': 'realtime',
-                'mode': StreamingMode.REALTIME,
-                'batch_size': self.adaptive_batch_presets['realtime']['min'],
-                'parallel_chunks': 1,
-                'compression_priority': 'speed',
-                'carbon_efficiency': 0.6,
-                'latency_efficiency': 1.0,
-                'helium_efficiency': 0.5
-            })
-        
-        # Strategy 2: Near Real-time
-        if latency_budget_ms <= 100:
-            strategies.append({
-                'name': 'near_realtime',
-                'mode': StreamingMode.NEAR_REALTIME,
-                'batch_size': self.adaptive_batch_presets['near_realtime']['min'],
-                'parallel_chunks': 2,
-                'compression_priority': 'balanced',
-                'carbon_efficiency': 0.7,
-                'latency_efficiency': 0.8,
-                'helium_efficiency': 0.7
-            })
-        
-        # Strategy 3: Batch
-        strategies.append({
-            'name': 'batch',
-            'mode': StreamingMode.BATCH,
-            'batch_size': min(
-                self.adaptive_batch_presets['batch']['max'],
-                max(32, int(data_profile['size_mb'] / 10))
-            ),
-            'parallel_chunks': self.max_workers if enable_parallel else 1,
-            'compression_priority': 'ratio',
-            'carbon_efficiency': 0.9,
-            'latency_efficiency': 0.5,
-            'helium_efficiency': 0.9
-        })
-        
-        # Strategy 4: Bulk
-        if data_profile['size_mb'] > 1000:
-            strategies.append({
-                'name': 'bulk',
-                'mode': StreamingMode.BATCH,
-                'batch_size': self.adaptive_batch_presets['bulk']['min'],
-                'parallel_chunks': self.max_workers if enable_parallel else 1,
-                'compression_priority': 'maximum',
-                'carbon_efficiency': 1.0,
-                'latency_efficiency': 0.2,
-                'helium_efficiency': 1.0
-            })
-        
-        # Score each strategy based on current conditions
-        scored_strategies = []
-        for strategy in strategies:
-            # Weight based on helium scarcity
-            if helium_scarcity > 0.7:
-                score = strategy['helium_efficiency'] * 0.7 + strategy['carbon_efficiency'] * 0.3
-            elif helium_scarcity > 0.3:
-                score = strategy['helium_efficiency'] * 0.4 + strategy['carbon_efficiency'] * 0.4 + strategy['latency_efficiency'] * 0.2
-            else:
-                score = strategy['latency_efficiency'] * 0.5 + strategy['carbon_efficiency'] * 0.3 + strategy['helium_efficiency'] * 0.2
-            
-            # Adjust for carbon budget
-            if carbon_budget_kg is not None and carbon_budget_kg < 0.001:
-                score = strategy['carbon_efficiency']
-            
-            scored_strategies.append((strategy, score))
-        
-        # Select best strategy
-        scored_strategies.sort(key=lambda x: x[1], reverse=True)
-        best_strategy = scored_strategies[0][0]
-        
-        logger.debug(
-            f"Selected strategy: {best_strategy['name']} "
-            f"(score: {scored_strategies[0][1]:.3f}, "
-            f"batch_size: {best_strategy['batch_size']})"
-        )
-        
-        return best_strategy
-    
-    # ========================================================================
-    # NEW: Multi-Factor Compression Optimization
-    # ========================================================================
-    
-    async def _optimize_compression_multi_factor(
-        self,
-        data_profile: Dict[str, Any],
-        helium_scarcity: float,
-        latency_budget_ms: float,
-        strategy: Dict[str, Any],
-        carbon_budget_kg: Optional[float]
-    ) -> Dict[str, Any]:
-        """
-        Multi-factor compression optimization.
-        
-        Considers:
-        - Compression ratio
-        - CPU overhead
-        - Energy consumption
-        - Latency impact
-        - Streaming compatibility
-        - Helium impact
-        """
-        scored_algorithms = []
-        
-        for algo_name, algo_config in self.compression_algorithms.items():
-            # Skip streaming-incompatible for streaming data
-            if data_profile.get('is_streaming') and not algo_config['supports_streaming']:
-                continue
-            
-            # Calculate compression benefit
-            space_saved = input_size_mb = data_profile['size_mb']
-            compressed_size = space_saved * algo_config['ratio']
-            space_benefit = 1.0 - algo_config['ratio']
-            
-            # Calculate resource costs
-            energy_cost = algo_config['energy_overhead'] * data_profile['size_mb']
-            cpu_cost = algo_config['cpu_overhead']
-            latency_cost = algo_config['latency_impact_ms']
-            
-            # Weight based on current priorities
-            if strategy['compression_priority'] == 'speed':
-                score = (
-                    0.5 * (1.0 / (1.0 + latency_cost)) +
-                    0.3 * (1.0 / (1.0 + cpu_cost)) +
-                    0.2 * space_benefit
-                )
-            elif strategy['compression_priority'] == 'balanced':
-                score = (
-                    0.35 * (1.0 / (1.0 + latency_cost)) +
-                    0.35 * space_benefit +
-                    0.3 * (1.0 / (1.0 + energy_cost))
-                )
-            elif strategy['compression_priority'] == 'ratio':
-                score = (
-                    0.5 * space_benefit +
-                    0.3 * (1.0 / (1.0 + energy_cost)) +
-                    0.2 * (1.0 / (1.0 + latency_cost))
-                )
-            else:  # maximum
-                score = (
-                    0.7 * space_benefit +
-                    0.2 * (1.0 / (1.0 + energy_cost)) +
-                    0.1 * (1.0 / (1.0 + latency_cost))
+        if bio_active:
+            if ecoatp_cost > 5.0:
+                recommendations.append(
+                    f"High Eco-ATP cost ({ecoatp_cost:.1f}). Consider deferring to low-carbon window."
                 )
             
-            # Adjust for helium scarcity
-            if helium_scarcity > 0.7:
-                score *= (1.0 - helium_scarcity * energy_cost)
-            
-            # Adjust for carbon budget
-            if carbon_budget_kg is not None and carbon_budget_kg < 0.0001:
-                score *= (1.0 / (1.0 + energy_cost))
-            
-            scored_algorithms.append({
-                'algorithm': algo_name,
-                'ratio': algo_config['ratio'],
-                'score': score,
-                'energy_overhead': energy_cost,
-                'latency_impact_ms': latency_cost,
-                'supports_streaming': algo_config['supports_streaming']
-            })
+            gradient_trends = self._get_gradient_trend_prediction()
+            if gradient_trends.get('carbon', 0) > 0.01:
+                recommendations.append("Carbon gradient improving - good time for processing.")
+            elif gradient_trends.get('carbon', 0) < -0.01:
+                recommendations.append("Carbon gradient degrading - consider reducing processing.")
         
-        # Select best algorithm
-        scored_algorithms.sort(key=lambda x: x['score'], reverse=True)
-        best = scored_algorithms[0]
+        if quality_metrics and quality_metrics.overall_score < 0.7:
+            recommendations.append("Data quality below threshold. Consider cleansing.")
         
-        # Check if no compression is better
-        if best['algorithm'] == 'none' and len(scored_algorithms) > 1:
-            # Verify no compression is truly optimal
-            runner_up = scored_algorithms[1]
-            if runner_up['score'] > best['score'] * 1.2:
-                best = runner_up
+        if data_profile.get('is_streaming'):
+            recommendations.append("Streaming data detected. Backpressure handling active.")
         
-        logger.debug(
-            f"Selected compression: {best['algorithm']} "
-            f"(ratio: {best['ratio']:.2f}, score: {best['score']:.3f})"
-        )
-        
-        return best
+        return recommendations if recommendations else ["Data configuration is optimal."]
     
     # ========================================================================
-    # NEW: Storage Tiering Optimization
-    # ========================================================================
-    
-    async def _optimize_storage_tiering(
-        self,
-        data_profile: Dict[str, Any],
-        latency_budget_ms: float,
-        tier_preference: Optional[str]
-    ) -> Dict[str, Any]:
-        """
-        Optimize data placement across storage tiers.
-        
-        Tier selection based on:
-        - Access frequency
-        - Latency requirements
-        - Cost constraints
-        - Data temperature
-        """
-        # Determine data temperature
-        if latency_budget_ms <= 10:
-            data_temperature = DataTier.HOT
-        elif latency_budget_ms <= 100:
-            data_temperature = DataTier.WARM
-        elif latency_budget_ms <= 1000:
-            data_temperature = DataTier.COLD
-        else:
-            data_temperature = DataTier.FROZEN
-        
-        # Override with preference if specified
-        if tier_preference:
-            try:
-                data_temperature = DataTier(tier_preference)
-            except ValueError:
-                pass
-        
-        # Get tier configuration
-        tier_config = self.storage_tiers[data_temperature]
-        
-        # Calculate tiering strategy
-        tiering_plan = {
-            'primary_tier': data_temperature.value,
-            'tier_config': tier_config,
-            'migration_policy': self._get_migration_policy(data_temperature),
-            'estimated_storage_cost': data_profile['size_mb'] * tier_config['cost_per_gb'] / 1000,
-            'estimated_energy': data_profile['size_mb'] * tier_config['energy_per_gb'] / 1000
-        }
-        
-        # Add tier transition rules
-        tiering_plan['transition_rules'] = {
-            'hot_to_warm': 'after 7 days of inactivity',
-            'warm_to_cold': 'after 30 days of inactivity',
-            'cold_to_frozen': 'after 90 days of inactivity'
-        }
-        
-        return tiering_plan
-    
-    # ========================================================================
-    # NEW: Parallel Processing Plan
-    # ========================================================================
-    
-    async def _create_parallel_plan(
-        self,
-        data_profile: Dict[str, Any],
-        strategy: Dict[str, Any],
-        carbon_budget_kg: Optional[float]
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Create parallel processing plan for large datasets.
-        
-        Features:
-        - Dynamic chunk sizing
-        - Carbon-aware worker allocation
-        - Load balancing
-        - Fault tolerance
-        """
-        input_size = data_profile['size_mb']
-        
-        if input_size < 10:  # Too small for parallel
-            return None
-        
-        # Determine optimal number of chunks
-        if carbon_budget_kg is not None and carbon_budget_kg < 0.0001:
-            max_workers = min(2, self.max_workers)  # Limit for carbon
-        else:
-            max_workers = self.max_workers
-        
-        # Calculate optimal chunk size
-        optimal_chunks = min(
-            max_workers,
-            max(1, int(input_size / 50))  # ~50MB per chunk
-        )
-        
-        chunk_size_mb = input_size / optimal_chunks
-        
-        parallel_plan = {
-            'num_chunks': optimal_chunks,
-            'chunk_size_mb': chunk_size_mb,
-            'max_parallel_workers': max_workers,
-            'estimated_speedup': min(optimal_chunks * 0.8, max_workers),
-            'load_balancing': 'round_robin' if optimal_chunks > 2 else 'single',
-            'fault_tolerance': {
-                'retry_attempts': 3,
-                'retry_delay_ms': 100,
-                'fallback_to_sequential': True
-            }
-        }
-        
-        return parallel_plan
-    
-    # ========================================================================
-    # NEW: Streaming Configuration
-    # ========================================================================
-    
-    async def _configure_streaming(
-        self,
-        data_profile: Dict[str, Any],
-        latency_budget_ms: float,
-        helium_scarcity: float
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Configure streaming data processing.
-        
-        Features:
-        - Backpressure handling
-        - Buffer management
-        - Checkpointing
-        - Watermark generation
-        """
-        if not data_profile.get('is_streaming'):
-            return None
-        
-        # Calculate buffer size based on latency budget
-        buffer_size_mb = latency_budget_ms * 0.1  # 0.1 MB per ms of budget
-        
-        # Adjust for helium scarcity
-        if helium_scarcity > 0.7:
-            buffer_size_mb *= 0.5  # Smaller buffer to save resources
-        
-        streaming_config = {
-            'mode': StreamingMode.REALTIME if latency_budget_ms <= 10 else StreamingMode.NEAR_REALTIME,
-            'buffer_size_mb': min(buffer_size_mb, 1024),  # Cap at 1GB
-            'backpressure_threshold': 0.8,
-            'checkpoint_interval_seconds': max(10, latency_budget_ms / 10),
-            'watermark_delay_ms': latency_budget_ms * 0.2,
-            'max_out_of_orderness_ms': latency_budget_ms * 0.5,
-            'idle_timeout_seconds': max(60, latency_budget_ms * 10 / 1000),
-            'recovery_strategy': 'latest_checkpoint'
-        }
-        
-        return streaming_config
-    
-    # ========================================================================
-    # NEW: Resource Estimation
-    # ========================================================================
-    
-    def _calculate_resource_estimates(
-        self,
-        input_size_mb: float,
-        compression_plan: Dict[str, Any],
-        strategy: Dict[str, Any],
-        parallel_plan: Optional[Dict[str, Any]],
-        streaming_config: Optional[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """
-        Calculate comprehensive resource estimates.
-        
-        Estimates:
-        - Processing latency
-        - Energy consumption
-        - Carbon emissions
-        - Helium usage
-        - Throughput
-        - Parallel efficiency
-        """
-        # Base processing time
-        base_latency = input_size_mb * 0.01  # ms per MB
-        
-        # Compression overhead
-        compression_latency = compression_plan.get('latency_impact_ms', 0)
-        
-        # Streaming overhead
-        streaming_latency = 0
-        if streaming_config:
-            streaming_latency = streaming_config.get('buffer_size_mb', 0) * 0.005
-        
-        # Total latency before parallelization
-        total_latency = base_latency + compression_latency + streaming_latency
-        
-        # Apply parallel speedup
-        parallel_efficiency = 1.0
-        if parallel_plan:
-            speedup = parallel_plan['estimated_speedup']
-            total_latency = total_latency / speedup
-            parallel_efficiency = speedup / parallel_plan['num_chunks']
-        
-        # Energy estimation
-        base_energy = input_size_mb * 0.0001  # kWh per MB
-        compression_energy = compression_plan.get('energy_overhead', 0) * input_size_mb
-        total_energy = base_energy + compression_energy
-        
-        # Carbon estimation
-        grid_intensity = 400  # gCO2/kWh (average)
-        total_carbon = (total_energy * grid_intensity) / 1000  # kg CO2
-        
-        # Helium estimation
-        total_helium = total_energy * 0.01  # Helium units per kWh
-        
-        # Throughput estimation
-        throughput_mbps = input_size_mb / (total_latency / 1000) if total_latency > 0 else float('inf')
-        
-        return {
-            'total_latency_ms': total_latency,
-            'base_latency_ms': base_latency,
-            'compression_latency_ms': compression_latency,
-            'streaming_latency_ms': streaming_latency,
-            'energy_kwh': total_energy,
-            'carbon_kg': total_carbon,
-            'helium_units': total_helium,
-            'throughput_mbps': throughput_mbps,
-            'parallel_efficiency': parallel_efficiency
-        }
-    
-    # ========================================================================
-    # NEW: Data Lineage Creation
-    # ========================================================================
-    
-    def _create_data_lineage(
-        self,
-        optimization_id: str,
-        data_profile: Dict[str, Any],
-        compression_plan: Dict[str, Any],
-        quality_metrics: Optional[DataQualityMetrics]
-    ) -> DataLineage:
-        """
-        Create data lineage record for provenance tracking.
-        
-        Tracks:
-        - Data origin
-        - All transformations
-        - Quality at each stage
-        - Resource consumption
-        - Cryptographic checksums
-        """
-        lineage = DataLineage(
-            lineage_id=f"lineage_{optimization_id}",
-            source=data_profile.get('format', 'unknown'),
-            quality_at_source=quality_metrics,
-            carbon_footprint_kg=0.0,
-            helium_consumed=0.0
-        )
-        
-        # Record compression transformation
-        lineage.add_transformation(
-            'compression',
-            {
-                'algorithm': compression_plan['algorithm'],
-                'ratio': compression_plan['ratio']
-            }
-        )
-        
-        # Generate checksum (simulated)
-        lineage.checksum = hashlib.sha256(
-            f"{optimization_id}{data_profile}{compression_plan}".encode()
-        ).hexdigest()
-        
-        # Store lineage
-        self.lineage_records[lineage.lineage_id] = lineage
-        
-        return lineage
-    
-    # ========================================================================
-    # NEW: Optimization Recording for Learning
-    # ========================================================================
-    
-    def _record_optimization(
-        self,
-        optimization_id: str,
-        data_profile: Dict[str, Any],
-        compression_plan: Dict[str, Any],
-        estimates: Dict[str, Any],
-        strategy: Dict[str, Any]
-    ):
-        """Record optimization for adaptive learning"""
-        record = OptimizationHistory(
-            timestamp=datetime.utcnow(),
-            strategy=strategy['name'],
-            input_size_mb=data_profile['size_mb'],
-            compressed_size_mb=data_profile['size_mb'] * compression_plan['ratio'],
-            compression_ratio=compression_plan['ratio'],
-            latency_ms=estimates['total_latency_ms'],
-            energy_kwh=estimates['energy_kwh'],
-            carbon_kg=estimates['carbon_kg'],
-            helium_units=estimates['helium_units'],
-            success=True,
-            metrics={
-                'throughput_mbps': estimates['throughput_mbps'],
-                'parallel_efficiency': estimates.get('parallel_efficiency', 1.0)
-            }
-        )
-        
-        self.optimization_history.append(record)
-        
-        # Update counters
-        self.total_processed_gb += data_profile['size_mb'] / 1000
-        self.total_saved_carbon_kg += estimates['carbon_kg'] * 0.3  # Estimated savings
-        self.total_saved_helium += estimates['helium_units'] * 0.2
-    
-    # ========================================================================
-    # NEW: Streaming Data Processing
-    # ========================================================================
-    
-    async def process_stream(
-        self,
-        stream_config: Dict[str, Any],
-        process_function: Optional[Callable] = None,
-        max_duration_seconds: float = 3600
-    ) -> Dict[str, Any]:
-        """
-        Process streaming data with backpressure handling.
-        
-        Args:
-            stream_config: Streaming configuration
-            process_function: Custom processing function
-            max_duration_seconds: Maximum processing duration
-            
-        Returns:
-            Processing results and metrics
-        """
-        if not self.enable_streaming:
-            return {'error': 'Streaming not enabled', 'processed': 0}
-        
-        stream_id = f"stream_{datetime.utcnow().timestamp()}"
-        
-        # Create stream tracker
-        stream = DataStream(
-            stream_id=stream_id,
-            data_rate_mbps=stream_config.get('data_rate_mbps', 10),
-            buffer_size_mb=stream_config.get('buffer_size_mb', 100),
-            backpressure_threshold=stream_config.get('backpressure_threshold', 0.8)
-        )
-        
-        self.active_streams[stream_id] = stream
-        self.pipeline_status[stream_id] = PipelineStatus.HEALTHY
-        
-        # Simulate streaming processing
-        processed_records = 0
-        start_time = datetime.utcnow()
-        
-        try:
-            while (datetime.utcnow() - start_time).total_seconds() < max_duration_seconds:
-                # Check backpressure
-                stream.current_backpressure = min(
-                    stream.processed_records / max(stream.data_rate_mbps * 1000, 1),
-                    1.0
-                )
-                
-                if stream.current_backpressure > stream.backpressure_threshold:
-                    # Apply backpressure: slow down processing
-                    await asyncio.sleep(0.01)
-                    self.pipeline_status[stream_id] = PipelineStatus.DEGRADED
-                else:
-                    self.pipeline_status[stream_id] = PipelineStatus.HEALTHY
-                
-                # Process batch
-                batch_size = min(1000, int(stream.data_rate_mbps * 100))
-                
-                if process_function:
-                    await process_function(batch_size)
-                
-                processed_records += batch_size
-                stream.processed_records = processed_records
-                
-                # Update latency metrics
-                stream.latency_p50_ms = 1.0 / max(stream.data_rate_mbps, 0.1)
-                stream.latency_p99_ms = stream.latency_p50_ms * 3
-                
-                # Allow other tasks
-                await asyncio.sleep(0.001)
-        
-        except Exception as e:
-            logger.error(f"Stream processing error: {str(e)}")
-            self.pipeline_status[stream_id] = PipelineStatus.FAILED
-            stream.dropped_records += processed_records
-        
-        finally:
-            # Cleanup
-            if stream_id in self.active_streams:
-                del self.active_streams[stream_id]
-        
-        duration = (datetime.utcnow() - start_time).total_seconds()
-        
-        return {
-            'stream_id': stream_id,
-            'processed_records': processed_records,
-            'dropped_records': stream.dropped_records,
-            'duration_seconds': duration,
-            'throughput_records_per_second': processed_records / max(duration, 0.1),
-            'final_status': self.pipeline_status.get(stream_id, PipelineStatus.FAILED).value,
-            'avg_latency_ms': stream.latency_p50_ms,
-            'p99_latency_ms': stream.latency_p99_ms
-        }
-    
-    # ========================================================================
-    # NEW: Cross-Expert Data Sharing
+    # Cross-Expert Sharing with Membrane Permeability
     # ========================================================================
     
     async def share_data_with_expert(
-        self,
-        target_expert_id: str,
-        data_config: Dict[str, Any],
+        self, target_expert_id: str, data_config: Dict[str, Any],
         sharing_policy: str = 'read_only'
     ) -> Dict[str, Any]:
-        """
-        Share data with other experts in the MoE system.
+        """Share data with other experts using membrane permeability check"""
         
-        Args:
-            target_expert_id: Expert to share with
-            data_config: Data sharing configuration
-            sharing_policy: Access policy (read_only, read_write, temporary)
-            
-        Returns:
-            Sharing confirmation and access token
-        """
-        # Create sharing token
+        # BIO-INSPIRED: Check membrane permeability
+        if self.enable_bio_integration:
+            allowed, permeability = self._get_membrane_sharing_permission(target_expert_id)
+            if not allowed:
+                return {
+                    'status': 'blocked',
+                    'reason': f'Membrane permeability too low: {permeability}',
+                    'target_expert': target_expert_id
+                }
+        
         token = hashlib.sha256(
             f"{target_expert_id}{datetime.utcnow().timestamp()}".encode()
         ).hexdigest()
@@ -1315,314 +762,58 @@ class DataExpert:
             'format': data_config.get('format', 'auto'),
             'compression': data_config.get('compression', 'lz4'),
             'created_at': datetime.utcnow().isoformat(),
-            'expires_at': (
-                datetime.utcnow() + timedelta(hours=1)
-            ).isoformat() if sharing_policy == 'temporary' else None,
-            'access_count': 0,
-            'max_access': data_config.get('max_access', 100)
+            'expires_at': (datetime.utcnow() + timedelta(hours=1)).isoformat() if sharing_policy == 'temporary' else None,
+            'membrane_permeability': self._get_membrane_sharing_permission(target_expert_id)[1] if self.enable_bio_integration else 'default'
         }
         
-        logger.info(
-            f"Data shared with {target_expert_id}: "
-            f"{data_config.get('size_mb', 0)}MB, policy={sharing_policy}"
-        )
+        logger.info(f"Data shared with {target_expert_id}: {data_config.get('size_mb', 0)}MB")
         
         return sharing_record
     
     # ========================================================================
-    # NEW: Recommendations Generator
-    # ========================================================================
-    
-    def _generate_recommendations(
-        self,
-        data_profile: Dict[str, Any],
-        quality_metrics: Optional[DataQualityMetrics],
-        estimates: Dict[str, Any]
-    ) -> List[str]:
-        """Generate actionable recommendations based on analysis"""
-        recommendations = []
-        
-        # Quality-based recommendations
-        if quality_metrics:
-            if quality_metrics.overall_score < 0.7:
-                recommendations.append(
-                    "Data quality is below threshold. Consider data cleansing before processing."
-                )
-            if quality_metrics.completeness < 0.8:
-                recommendations.append(
-                    f"Missing values detected ({quality_metrics.completeness:.1%} complete). "
-                    "Implement imputation or filtering."
-                )
-            if quality_metrics.uniqueness < 0.9:
-                recommendations.append(
-                    "Duplicate data detected. Consider deduplication to reduce processing cost."
-                )
-        
-        # Performance recommendations
-        if estimates['total_latency_ms'] > 1000:
-            recommendations.append(
-                f"High latency ({estimates['total_latency_ms']:.0f}ms). "
-                "Consider increasing parallelization or using faster compression."
-            )
-        
-        if estimates['carbon_kg'] > 0.001:
-            recommendations.append(
-                f"Carbon impact ({estimates['carbon_kg']:.4f} kg CO2) is significant. "
-                "Consider processing during low grid carbon intensity periods."
-            )
-        
-        # Format recommendations
-        if data_profile.get('format') in ['json', 'csv']:
-            recommendations.append(
-                "Consider converting to columnar format (Parquet/ORC) for better compression."
-            )
-        
-        # Streaming recommendations
-        if data_profile.get('is_streaming'):
-            recommendations.append(
-                "Streaming data detected. Ensure backpressure handling is configured."
-            )
-        
-        return recommendations if recommendations else ["Current configuration is optimal."]
-    
-    # ========================================================================
-    # Utility Methods
-    # ========================================================================
-    
-    def _detect_format(self, input_size_mb: float) -> str:
-        """Auto-detect data format based on size and characteristics"""
-        if input_size_mb > 1000:
-            return 'parquet'  # Large files likely optimized
-        elif input_size_mb > 100:
-            return 'csv'  # Medium files often CSV
-        else:
-            return 'json'  # Small files often JSON
-    
-    def _determine_quality_level(self, score: float) -> DataQuality:
-        """Determine quality level from score"""
-        if score >= self.quality_thresholds['excellent']:
-            return DataQuality.EXCELLENT
-        elif score >= self.quality_thresholds['good']:
-            return DataQuality.GOOD
-        elif score >= self.quality_thresholds['fair']:
-            return DataQuality.FAIR
-        elif score >= self.quality_thresholds['poor']:
-            return DataQuality.POOR
-        else:
-            return DataQuality.UNUSABLE
-    
-    def _get_migration_policy(self, tier: DataTier) -> Dict[str, Any]:
-        """Get data migration policy for tier"""
-        policies = {
-            DataTier.HOT: {
-                'check_interval': '1 hour',
-                'migrate_if_idle': '24 hours',
-                'target_tier': 'warm'
-            },
-            DataTier.WARM: {
-                'check_interval': '6 hours',
-                'migrate_if_idle': '7 days',
-                'target_tier': 'cold'
-            },
-            DataTier.COLD: {
-                'check_interval': '24 hours',
-                'migrate_if_idle': '30 days',
-                'target_tier': 'frozen'
-            },
-            DataTier.FROZEN: {
-                'check_interval': '7 days',
-                'migrate_if_idle': 'never',
-                'target_tier': 'frozen'
-            }
-        }
-        return policies.get(tier, policies[DataTier.COLD])
-    
-    # ========================================================================
-    # Enhanced Caching Strategy (Upgraded)
-    # ========================================================================
-    
-    async def suggest_caching_strategy(
-        self,
-        access_pattern: str,
-        data_size_mb: float,
-        quality_metrics: Optional[DataQualityMetrics] = None,
-        helium_scarcity: float = 0.0
-    ) -> Dict[str, Any]:
-        """
-        Enhanced caching strategy with quality and resource awareness.
-        
-        Args:
-            access_pattern: Data access pattern
-            data_size_mb: Size of data
-            quality_metrics: Data quality assessment
-            helium_scarcity: Current helium scarcity
-            
-        Returns:
-            Comprehensive caching recommendation
-        """
-        # Determine cache type based on access pattern
-        cache_strategies = {
-            'frequent': {
-                'cache_type': 'memory',
-                'cache_size_ratio': 0.3,
-                'max_cache_mb': 1024,
-                'eviction_policy': 'LRU',
-                'prefetch': True,
-                'compression': 'snappy'  # Fast compression for hot data
-            },
-            'moderate': {
-                'cache_type': 'disk',
-                'cache_size_ratio': 0.1,
-                'max_cache_mb': 5120,
-                'eviction_policy': 'LFU',
-                'prefetch': False,
-                'compression': 'lz4'
-            },
-            'rare': {
-                'cache_type': 'none',
-                'cache_size_ratio': 0.0,
-                'max_cache_mb': 0,
-                'eviction_policy': 'none',
-                'prefetch': False,
-                'compression': 'none'
-            },
-            'streaming': {
-                'cache_type': 'circular_buffer',
-                'cache_size_ratio': 0.05,
-                'max_cache_mb': 256,
-                'eviction_policy': 'FIFO',
-                'prefetch': True,
-                'compression': 'none'  # No compression for streaming cache
-            }
-        }
-        
-        strategy = cache_strategies.get(
-            access_pattern,
-            cache_strategies['moderate']
-        )
-        
-        # Calculate cache size
-        cache_size = min(
-            data_size_mb * strategy['cache_size_ratio'],
-            strategy['max_cache_mb']
-        )
-        
-        # Adjust for helium scarcity
-        if helium_scarcity > 0.7:
-            cache_size *= 0.5  # Reduce cache to save resources
-            strategy['compression'] = 'zstd'  # Better compression
-        
-        # Adjust for data quality
-        quality_factor = 1.0
-        if quality_metrics:
-            if quality_metrics.overall_score < 0.7:
-                quality_factor = 0.5  # Reduce cache for low quality data
-            elif quality_metrics.overall_score > 0.95:
-                quality_factor = 1.2  # Increase cache for high quality data
-        
-        final_cache_size = cache_size * quality_factor
-        
-        # Calculate estimated improvement
-        if strategy['cache_type'] == 'memory':
-            estimated_improvement = 0.7 if access_pattern == 'frequent' else 0.4
-        elif strategy['cache_type'] == 'disk':
-            estimated_improvement = 0.3
-        elif strategy['cache_type'] == 'circular_buffer':
-            estimated_improvement = 0.6
-        else:
-            estimated_improvement = 0.0
-        
-        return {
-            'cache_type': strategy['cache_type'],
-            'cache_size_mb': final_cache_size,
-            'eviction_policy': strategy['eviction_policy'],
-            'prefetch_enabled': strategy['prefetch'],
-            'compression': strategy['compression'],
-            'estimated_improvement': estimated_improvement,
-            'quality_adjusted': quality_metrics is not None,
-            'helium_adjusted': helium_scarcity > 0.7,
-            'estimated_energy_savings_kwh': final_cache_size * 0.0001,
-            'recommendations': self._get_cache_recommendations(
-                access_pattern, final_cache_size, quality_metrics
-            )
-        }
-    
-    def _get_cache_recommendations(
-        self,
-        access_pattern: str,
-        cache_size_mb: float,
-        quality_metrics: Optional[DataQualityMetrics]
-    ) -> List[str]:
-        """Generate cache-specific recommendations"""
-        recommendations = []
-        
-        if cache_size_mb > 1000:
-            recommendations.append(
-                "Large cache size. Consider distributed caching for better performance."
-            )
-        
-        if access_pattern == 'frequent' and cache_size_mb < 100:
-            recommendations.append(
-                "Cache may be undersized for frequent access pattern. Monitor hit rate."
-            )
-        
-        if quality_metrics and quality_metrics.overall_score < 0.7:
-            recommendations.append(
-                "Low data quality may reduce cache effectiveness. Consider data cleansing."
-            )
-        
-        return recommendations if recommendations else ["Cache configuration is optimal."]
-    
-    # ========================================================================
-    # Expert Statistics and Reporting
+    # Enhanced Statistics
     # ========================================================================
     
     def get_expert_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive expert statistics"""
+        """Get comprehensive expert statistics with bio-inspired metrics"""
         recent_history = list(self.optimization_history)[-100:]
         
-        return {
+        stats = {
             'expert_id': self.expert_id,
             'version': self.version,
             'total_processed_gb': self.total_processed_gb,
             'total_saved_carbon_kg': self.total_saved_carbon_kg,
             'total_saved_helium': self.total_saved_helium,
+            'total_ecoatp_saved': self.total_ecoatp_saved,
+            'bio_integration_active': self.enable_bio_integration,
+            'bio_modules_available': BIO_INSPIRED_AVAILABLE,
             'active_streams': len(self.active_streams),
-            'pipeline_status': {
-                k: v.value for k, v in self.pipeline_status.items()
-            },
             'lineage_records': len(self.lineage_records),
-            'quality_assessments': len(self.quality_cache),
+            'biomass_lineage_tokens': len(self.biomass_lineage_tokens),
             'recent_optimizations': [
                 {
-                    'timestamp': h.timestamp.isoformat(),
-                    'strategy': h.strategy,
-                    'compression_ratio': h.compression_ratio,
-                    'carbon_kg': h.carbon_kg
+                    'timestamp': h['timestamp'].isoformat() if hasattr(h['timestamp'], 'isoformat') else str(h['timestamp']),
+                    'compression': h['compression'],
+                    'ecoatp_cost': h.get('ecoatp_cost', 0)
                 }
                 for h in recent_history[-10:]
             ],
             'average_metrics': {
-                'compression_ratio': np.mean([h.compression_ratio for h in recent_history]) if recent_history else 0,
-                'latency_ms': np.mean([h.latency_ms for h in recent_history]) if recent_history else 0,
-                'carbon_kg': np.mean([h.carbon_kg for h in recent_history]) if recent_history else 0,
-                'success_rate': np.mean([1.0 if h.success else 0.0 for h in recent_history]) if recent_history else 0
+                'compression_ratio': np.mean([h['plan'].get('compression_ratio', 0) for h in recent_history]) if recent_history else 0,
+                'ecoatp_cost': np.mean([h.get('ecoatp_cost', 0) for h in recent_history]) if recent_history else 0
             }
         }
-    
-    def get_stream_health(self) -> Dict[str, Dict[str, Any]]:
-        """Get health status of all active streams"""
-        return {
-            stream_id: {
-                'status': self.pipeline_status.get(stream_id, PipelineStatus.FAILED).value,
-                'backpressure': stream.current_backpressure,
-                'processed': stream.processed_records,
-                'dropped': stream.dropped_records,
-                'latency_p50': stream.latency_p50_ms,
-                'is_healthy': stream.is_healthy()
+        
+        # BIO-INSPIRED: Add gradient and harvester data
+        if self.enable_bio_integration:
+            stats['bio_metrics'] = {
+                'gradient_backpressure': self._get_gradient_backpressure(),
+                'harvester_confidence': self._get_harvester_quality_confidence(),
+                'atp_parallelism': self._get_atp_parallelism_level(),
+                'gradient_trends': self._get_gradient_trend_prediction()
             }
-            for stream_id, stream in self.active_streams.items()
-        }
+        
+        return stats
     
     def reset_metrics(self):
         """Reset all metrics and history"""
@@ -1631,7 +822,134 @@ class DataExpert:
         self.lineage_records.clear()
         self.active_streams.clear()
         self.pipeline_status.clear()
+        self.biomass_lineage_tokens.clear()
         self.total_processed_gb = 0.0
         self.total_saved_carbon_kg = 0.0
         self.total_saved_helium = 0.0
+        self.total_ecoatp_saved = 0.0
         logger.info(f"Reset all metrics for {self.expert_id}")
+    
+    async def suggest_caching_strategy(
+        self, access_pattern: str, data_size_mb: float,
+        quality_metrics: Optional[DataQualityMetrics] = None,
+        helium_scarcity: float = 0.0
+    ) -> Dict[str, Any]:
+        """Enhanced caching strategy with bio-inspired awareness"""
+        cache_strategies = {
+            'frequent': {'cache_type': 'memory', 'cache_size_ratio': 0.3, 'max_cache_mb': 1024,
+                        'eviction_policy': 'LRU', 'prefetch': True, 'compression': 'snappy'},
+            'moderate': {'cache_type': 'disk', 'cache_size_ratio': 0.1, 'max_cache_mb': 5120,
+                        'eviction_policy': 'LFU', 'prefetch': False, 'compression': 'lz4'},
+            'rare': {'cache_type': 'none', 'cache_size_ratio': 0.0, 'max_cache_mb': 0,
+                    'eviction_policy': 'none', 'prefetch': False, 'compression': 'none'},
+            'streaming': {'cache_type': 'circular_buffer', 'cache_size_ratio': 0.05, 'max_cache_mb': 256,
+                         'eviction_policy': 'FIFO', 'prefetch': True, 'compression': 'none'}
+        }
+        
+        strategy = cache_strategies.get(access_pattern, cache_strategies['moderate'])
+        cache_size = min(data_size_mb * strategy['cache_size_ratio'], strategy['max_cache_mb'])
+        
+        # BIO-INSPIRED: Adjust cache based on token availability
+        if self.enable_bio_integration and self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            balance = summary.get('total_balance', 500)
+            if balance < 100:
+                cache_size *= 0.5  # Smaller cache when tokens scarce
+        
+        if helium_scarcity > 0.7:
+            cache_size *= 0.5
+        
+        return {
+            'cache_type': strategy['cache_type'],
+            'cache_size_mb': cache_size,
+            'eviction_policy': strategy['eviction_policy'],
+            'prefetch_enabled': strategy['prefetch'],
+            'compression': strategy['compression'],
+            'estimated_improvement': 0.7 if strategy['cache_type'] == 'memory' else 0.3,
+            'bio_modulated': self.enable_bio_integration
+        }
+    
+    async def process_stream(
+        self, stream_config: Dict[str, Any],
+        process_function: Optional[Callable] = None,
+        max_duration_seconds: float = 3600
+    ) -> Dict[str, Any]:
+        """Process streaming data with gradient-modulated backpressure"""
+        if not self.enable_streaming:
+            return {'error': 'Streaming not enabled', 'processed': 0}
+        
+        stream_id = f"stream_{datetime.utcnow().timestamp()}"
+        
+        # BIO-INSPIRED: Gradient-modulated backpressure
+        if self.enable_bio_integration:
+            backpressure = self._get_gradient_backpressure()
+            buffer_size = stream_config.get('buffer_size_mb', 100) * (1.0 - backpressure * 0.5)
+        else:
+            buffer_size = stream_config.get('buffer_size_mb', 100)
+        
+        stream = DataStream(
+            stream_id=stream_id,
+            data_rate_mbps=stream_config.get('data_rate_mbps', 10),
+            buffer_size_mb=buffer_size,
+            backpressure_threshold=stream_config.get('backpressure_threshold', 0.8),
+            gradient_backpressure=self._get_gradient_backpressure() if self.enable_bio_integration else 0.5
+        )
+        
+        self.active_streams[stream_id] = stream
+        self.pipeline_status[stream_id] = PipelineStatus.HEALTHY
+        
+        processed_records = 0
+        start_time = datetime.utcnow()
+        
+        try:
+            while (datetime.utcnow() - start_time).total_seconds() < max_duration_seconds:
+                stream.current_backpressure = min(
+                    stream.processed_records / max(stream.data_rate_mbps * 1000, 1), 1.0
+                )
+                
+                # BIO-INSPIRED: Blend with gradient backpressure
+                if self.enable_bio_integration:
+                    effective_backpressure = (
+                        stream.current_backpressure * 0.7 +
+                        stream.gradient_backpressure * 0.3
+                    )
+                else:
+                    effective_backpressure = stream.current_backpressure
+                
+                if effective_backpressure > stream.backpressure_threshold:
+                    await asyncio.sleep(0.01)
+                    self.pipeline_status[stream_id] = PipelineStatus.DEGRADED
+                else:
+                    self.pipeline_status[stream_id] = PipelineStatus.HEALTHY
+                
+                batch_size = min(1000, int(stream.data_rate_mbps * 100))
+                if process_function:
+                    await process_function(batch_size)
+                
+                processed_records += batch_size
+                stream.processed_records = processed_records
+                stream.latency_p50_ms = 1.0 / max(stream.data_rate_mbps, 0.1)
+                stream.latency_p99_ms = stream.latency_p50_ms * 3
+                
+                await asyncio.sleep(0.001)
+        
+        except Exception as e:
+            logger.error(f"Stream processing error: {str(e)}")
+            self.pipeline_status[stream_id] = PipelineStatus.FAILED
+            stream.dropped_records += processed_records
+        
+        finally:
+            if stream_id in self.active_streams:
+                del self.active_streams[stream_id]
+        
+        duration = (datetime.utcnow() - start_time).total_seconds()
+        
+        return {
+            'stream_id': stream_id,
+            'processed_records': processed_records,
+            'dropped_records': stream.dropped_records,
+            'duration_seconds': duration,
+            'throughput_records_per_second': processed_records / max(duration, 0.1),
+            'final_status': self.pipeline_status.get(stream_id, PipelineStatus.FAILED).value,
+            'gradient_backpressure': stream.gradient_backpressure if self.enable_bio_integration else 0.5
+        }
