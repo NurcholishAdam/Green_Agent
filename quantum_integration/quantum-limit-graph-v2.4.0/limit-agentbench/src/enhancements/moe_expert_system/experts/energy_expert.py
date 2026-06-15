@@ -1,661 +1,277 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/energy_expert.py
-# Enhanced with real-time grid API integration, ML-based renewable forecasting, and building management
+# Enhanced with complete bio-inspired integration - Metabolic Energy Producer v4.0.0
 
 """
-Enhanced Energy Expert v3.0.0
-- Real-time grid carbon intensity API integration
-- ML-based renewable energy forecasting
-- Building management system integration
-- Liquid cooling optimization for data centers
-- Dynamic energy storage arbitrage
+Enhanced Energy Expert v4.0.0 - Metabolic Energy Producer (Primary Producer/Autotroph)
+
+Complete bio-inspired integration with:
+- Gradient-based energy source selection (carbon gradient drives source priority)
+- ATP-driven DVFS power states (energy availability controls frequency)
+- Token-cost quantization selection (Eco-ATP efficient precision)
+- Compartment thermal state for cooling (health-based temperature)
+- Harvester-aligned workload shifting (photosynthetic opportunity timing)
+- Biomass-backed energy storage (storage tiers as energy reserves)
+- Harvester-based renewable forecasting (excitation as prediction)
+- Token-generating carbon offsets (Eco-ATP from carbon savings)
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 import numpy as np
 from collections import deque
-import aiohttp
+import math
+import hashlib
 import json
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Real-Time Grid API Integration
+# Try importing bio-inspired modules
 # ============================================================================
 
-class GridCarbonAPI:
-    """
-    Real-time grid carbon intensity API integration.
-    
-    Supports:
-    - ElectricityMap API
-    - WattTime API
-    - Local grid operator APIs
-    """
-    
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self.cache: Dict[str, Dict] = {}
-        self.cache_ttl = timedelta(minutes=5)
-        self.last_fetch: Dict[str, datetime] = {}
-        
-        # API endpoints
-        self.endpoints = {
-            'electricitymap': 'https://api.electricitymap.org/v3/carbon-intensity/latest',
-            'watttime': 'https://api.watttime.org/v2/index'
-        }
-        
-        # Fallback carbon intensities (gCO2/kWh)
-        self.fallback_intensities = {
-            'US_EAST': 450, 'US_WEST': 350, 'EU_WEST': 300,
-            'EU_NORTH': 200, 'ASIA_EAST': 550, 'ASIA_SOUTHEAST': 500,
-            'AUSTRALIA': 600, 'SOUTH_AMERICA': 250, 'AFRICA': 400
-        }
-        
-        logger.info("Grid Carbon API initialized")
-    
-    async def get_carbon_intensity(
-        self,
-        region: str,
-        use_cache: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Get real-time carbon intensity for a region.
-        
-        Returns:
-            {
-                'carbon_intensity_g_per_kwh': float,
-                'renewable_percentage': float,
-                'source': str,
-                'timestamp': str
-            }
-        """
-        # Check cache
-        if use_cache and region in self.cache:
-            cached = self.cache[region]
-            if datetime.utcnow() - cached['fetched_at'] < self.cache_ttl:
-                return cached['data']
-        
-        try:
-            # Try ElectricityMap API
-            data = await self._fetch_electricitymap(region)
-            if data:
-                self._update_cache(region, data)
-                return data
-            
-            # Try WattTime API
-            data = await self._fetch_watttime(region)
-            if data:
-                self._update_cache(region, data)
-                return data
-            
-            # Use fallback
-            data = self._get_fallback(region)
-            self._update_cache(region, data)
-            return data
-            
-        except Exception as e:
-            logger.warning(f"API fetch failed for {region}: {str(e)}")
-            return self._get_fallback(region)
-    
-    async def _fetch_electricitymap(self, region: str) -> Optional[Dict[str, Any]]:
-        """Fetch from ElectricityMap API"""
-        try:
-            # Simulated API call
-            await asyncio.sleep(0.01)
-            
-            base_intensity = self.fallback_intensities.get(region, 400)
-            # Add realistic variation
-            intensity = base_intensity * np.random.uniform(0.8, 1.2)
-            renewable = np.random.uniform(0.2, 0.6)
-            
-            return {
-                'carbon_intensity_g_per_kwh': round(intensity, 1),
-                'renewable_percentage': round(renewable * 100, 1),
-                'source': 'electricitymap',
-                'timestamp': datetime.utcnow().isoformat(),
-                'region': region
-            }
-        except Exception:
-            return None
-    
-    async def _fetch_watttime(self, region: str) -> Optional[Dict[str, Any]]:
-        """Fetch from WattTime API"""
-        try:
-            await asyncio.sleep(0.01)
-            
-            base_intensity = self.fallback_intensities.get(region, 400)
-            intensity = base_intensity * np.random.uniform(0.85, 1.15)
-            
-            return {
-                'carbon_intensity_g_per_kwh': round(intensity, 1),
-                'renewable_percentage': round(np.random.uniform(0.15, 0.55) * 100, 1),
-                'source': 'watttime',
-                'timestamp': datetime.utcnow().isoformat(),
-                'region': region
-            }
-        except Exception:
-            return None
-    
-    def _get_fallback(self, region: str) -> Dict[str, Any]:
-        """Get fallback carbon intensity"""
-        intensity = self.fallback_intensities.get(region, 400)
-        return {
-            'carbon_intensity_g_per_kwh': intensity,
-            'renewable_percentage': 25.0,
-            'source': 'fallback',
-            'timestamp': datetime.utcnow().isoformat(),
-            'region': region
-        }
-    
-    def _update_cache(self, region: str, data: Dict[str, Any]):
-        """Update local cache"""
-        self.cache[region] = {
-            'data': data,
-            'fetched_at': datetime.utcnow()
-        }
-    
-    async def get_forecast(
-        self,
-        region: str,
-        hours_ahead: int = 24
-    ) -> List[Dict[str, Any]]:
-        """Get carbon intensity forecast"""
-        forecast = []
-        current = await self.get_carbon_intensity(region)
-        base = current['carbon_intensity_g_per_kwh']
-        
-        for hour in range(hours_ahead):
-            # Add diurnal pattern
-            hour_of_day = (datetime.utcnow().hour + hour) % 24
-            
-            # Solar boost during day
-            if 10 <= hour_of_day <= 16:
-                factor = 0.7 + 0.3 * np.sin(np.pi * (hour_of_day - 10) / 6)
-            # Wind boost at night
-            elif hour_of_day <= 5 or hour_of_day >= 22:
-                factor = 0.8
-            else:
-                factor = 1.0
-            
-            forecast.append({
-                'hour': hour,
-                'timestamp': (datetime.utcnow() + timedelta(hours=hour)).isoformat(),
-                'carbon_intensity_g_per_kwh': round(base * factor * np.random.uniform(0.9, 1.1), 1),
-                'renewable_percentage': current['renewable_percentage'] * (1 / factor)
-            })
-        
-        return forecast
+try:
+    from enhancements.bio_inspired.eco_atp_currency import (
+        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
+        TokenState, EcoATPToken, EcoATPAccount
+    )
+    from enhancements.bio_inspired.proton_gradient_fields import (
+        GradientFieldManager, GradientField
+    )
+    from enhancements.bio_inspired.atp_synthase_scheduler import (
+        ATPSynthaseScheduler, SynthaseConfig
+    )
+    from enhancements.bio_inspired.chromatophore_compartments import (
+        CompartmentManager, ChromatophoreCompartment, CompartmentState,
+        MembranePermeability
+    )
+    from enhancements.bio_inspired.biomass_storage import (
+        BiomassStorage, StorageTier, GuaranteeLevel
+    )
+    from enhancements.bio_inspired.photosynthetic_harvester import (
+        PhotosyntheticHarvester
+    )
+    BIO_INSPIRED_AVAILABLE = True
+    logger.info("Bio-inspired modules loaded for Energy Expert")
+except ImportError as e:
+    BIO_INSPIRED_AVAILABLE = False
+    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard energy optimization")
 
+# Try importing from expert registry
+try:
+    from ..expert_registry import ExpertProfile, ExpertDomain, HardwareProfile
+except ImportError:
+    class ExpertDomain(Enum):
+        ENERGY = "energy_optimization"
+    class HardwareProfile(Enum):
+        CPU_EFFICIENT = "cpu_low_power"
 
 # ============================================================================
-# ML-Based Renewable Forecasting
+# Enums and Data Classes
 # ============================================================================
 
-class RenewableForecaster:
-    """
-    Machine learning-based renewable energy forecasting.
+class EnergySource(Enum):
+    """Types of energy sources with carbon intensity"""
+    SOLAR = "solar"
+    WIND = "wind"
+    HYDRO = "hydro"
+    GEOTHERMAL = "geothermal"
+    NUCLEAR = "nuclear"
+    NATURAL_GAS = "natural_gas"
+    COAL = "coal"
+    GRID_MIX = "grid_mix"
+    BATTERY = "battery"
+    HYDROGEN = "hydrogen"
+    GRADIENT_DRIVEN = "gradient_driven"  # BIO-INSPIRED
     
-    Predicts solar and wind availability using historical patterns.
-    """
-    
-    def __init__(self):
-        self.solar_model = self._create_solar_model()
-        self.wind_model = self._create_wind_model()
-        self.training_history: deque = deque(maxlen=8760)  # 1 year hourly
-        
-        logger.info("Renewable Forecaster initialized")
-    
-    def _create_solar_model(self) -> Dict[str, Any]:
-        """Create solar prediction model"""
-        return {
-            'type': 'physical_ml',
-            'features': ['hour', 'day_of_year', 'latitude', 'cloud_cover', 'temperature'],
-            'weights': {
-                'hour_sin': 0.4,
-                'hour_cos': 0.3,
-                'day_of_year_sin': 0.15,
-                'cloud_cover': -0.1,
-                'temperature': -0.05
-            }
+    @property
+    def carbon_intensity_g_per_kwh(self) -> float:
+        intensities = {
+            EnergySource.SOLAR: 0, EnergySource.WIND: 0, EnergySource.HYDRO: 0,
+            EnergySource.GEOTHERMAL: 0, EnergySource.NUCLEAR: 12,
+            EnergySource.NATURAL_GAS: 490, EnergySource.COAL: 820,
+            EnergySource.GRID_MIX: 400, EnergySource.BATTERY: 0,
+            EnergySource.HYDROGEN: 0, EnergySource.GRADIENT_DRIVEN: 200
         }
+        return intensities.get(self, 400)
     
-    def _create_wind_model(self) -> Dict[str, Any]:
-        """Create wind prediction model"""
-        return {
-            'type': 'statistical_ml',
-            'features': ['hour', 'pressure_gradient', 'temperature_gradient', 'season'],
-            'weights': {
-                'pressure_gradient': 0.35,
-                'hour': 0.25,
-                'temperature_gradient': 0.20,
-                'season': 0.20
-            }
-        }
-    
-    def predict_solar(
-        self,
-        latitude: float,
-        hour: int,
-        day_of_year: int,
-        cloud_cover: float = 0.3
-    ) -> float:
-        """
-        Predict solar generation in kW/m².
-        """
-        model = self.solar_model
-        weights = model['weights']
-        
-        # Solar position
-        hour_angle = 2 * np.pi * (hour - 12) / 24
-        declination = 23.45 * np.sin(2 * np.pi * (day_of_year - 80) / 365)
-        
-        # Features
-        hour_sin = np.sin(hour_angle)
-        hour_cos = np.cos(hour_angle)
-        day_sin = np.sin(2 * np.pi * day_of_year / 365)
-        
-        # Prediction
-        solar_radiation = 1000 * (  # W/m² max
-            weights['hour_sin'] * max(0, hour_sin) +
-            weights['hour_cos'] * max(0, hour_cos) +
-            weights['day_of_year_sin'] * max(0, day_sin) +
-            weights['cloud_cover'] * (1 - cloud_cover) +
-            weights['temperature'] * 0.5
-        )
-        
-        # Latitude adjustment
-        latitude_factor = np.cos(np.radians(latitude - declination))
-        
-        return max(0, solar_radiation * latitude_factor)
-    
-    def predict_wind(
-        self,
-        pressure_gradient: float,
-        hour: int,
-        temperature_gradient: float,
-        season: int
-    ) -> float:
-        """
-        Predict wind generation in kW.
-        """
-        model = self.wind_model
-        weights = model['weights']
-        
-        # Wind speed estimation
-        wind_speed = (
-            weights['pressure_gradient'] * pressure_gradient * 10 +
-            weights['hour'] * (1 + 0.5 * np.sin(2 * np.pi * hour / 24)) +
-            weights['temperature_gradient'] * temperature_gradient * 5 +
-            weights['season'] * (1 + 0.3 * np.sin(2 * np.pi * season / 4))
-        )
-        
-        # Power curve (simplified)
-        cut_in_speed = 3  # m/s
-        rated_speed = 12  # m/s
-        cut_out_speed = 25  # m/s
-        
-        if wind_speed < cut_in_speed or wind_speed > cut_out_speed:
-            return 0.0
-        elif wind_speed < rated_speed:
-            return 1000 * (wind_speed / rated_speed) ** 3
-        else:
-            return 1000.0
-    
-    def record_actual(
-        self,
-        solar_actual: float,
-        wind_actual: float,
-        features: Dict[str, float]
-    ):
-        """Record actual generation for model improvement"""
-        self.training_history.append({
-            'solar': solar_actual,
-            'wind': wind_actual,
-            'features': features,
-            'timestamp': datetime.utcnow()
-        })
-    
-    def get_forecast_accuracy(self) -> Dict[str, float]:
-        """Get forecast accuracy metrics"""
-        if len(self.training_history) < 24:
-            return {'solar_mape': 0.15, 'wind_mape': 0.20}
-        
-        recent = list(self.training_history)[-168:]  # Last week
-        
-        # Simplified accuracy calculation
-        return {
-            'solar_mape': 0.12,
-            'wind_mape': 0.18,
-            'combined_mape': 0.15,
-            'samples': len(recent)
-        }
+    @property
+    def is_renewable(self) -> bool:
+        return self in [EnergySource.SOLAR, EnergySource.WIND, EnergySource.HYDRO,
+                       EnergySource.GEOTHERMAL, EnergySource.BATTERY, EnergySource.HYDROGEN]
 
+class PowerState(Enum):
+    """CPU/GPU power states for DVFS"""
+    PERFORMANCE = "performance"
+    BALANCED = "balanced"
+    POWER_SAVE = "power_save"
+    ULTRA_LOW = "ultra_low"
+    DYNAMIC = "dynamic"
+    ATP_DRIVEN = "atp_driven"  # BIO-INSPIRED
+
+class CoolingMethod(Enum):
+    """Cooling methods with energy overhead"""
+    AIR_COOLING = "air"
+    LIQUID_COOLING = "liquid"
+    IMMERSION_COOLING = "immersion"
+    FREE_COOLING = "free"
+    GEOTHERMAL_COOLING = "geothermal"
+    HELIUM_COOLING = "helium"
+    COMPARTMENT_AWARE = "compartment_aware"  # BIO-INSPIRED
+
+@dataclass
+class RenewableProfile:
+    """Renewable energy availability profile"""
+    solar_available_kw: float = 0.0
+    wind_available_kw: float = 0.0
+    battery_level_kwh: float = 0.0
+    battery_capacity_kwh: float = 100.0
+    hydrogen_level_kg: float = 0.0
+    renewable_percentage: float = 0.0
+    forecast_next_hour: float = 0.0
+    peak_solar_time: bool = False
+    
+    # BIO-INSPIRED
+    harvester_contribution_kw: float = 0.0
+    biomass_reserve_kwh: float = 0.0
+    
+    def can_use_renewable(self, required_kw: float) -> bool:
+        available = self.solar_available_kw + self.wind_available_kw + self.battery_level_kwh
+        return available >= required_kw
+
+@dataclass
+class ThermalProfile:
+    """Thermal management profile"""
+    current_temp_c: float = 35.0
+    max_temp_c: float = 85.0
+    throttle_temp_c: float = 75.0
+    ambient_temp_c: float = 25.0
+    cooling_efficiency: float = 0.9
+    requires_throttling: bool = False
+    
+    # BIO-INSPIRED
+    compartment_health: float = 0.7
+    
+    @property
+    def thermal_headroom_c(self) -> float:
+        return self.throttle_temp_c - self.current_temp_c
+
+@dataclass
+class EnergyOptimizationHistory:
+    """Track energy optimization decisions for learning"""
+    timestamp: datetime
+    strategy: str
+    energy_source: str
+    power_state: str
+    energy_saved_kwh: float
+    carbon_saved_kg: float
+    cost_saved: float
+    renewable_used: bool
+    success: bool
+    metrics: Dict[str, float] = field(default_factory=dict)
+    
+    # BIO-INSPIRED
+    ecoatp_generated: float = 0.0
+    gradient_level: float = 0.5
 
 # ============================================================================
-# Building Management System Integration
-# ============================================================================
-
-class BuildingManagementIntegrator:
-    """
-    Integration with building management systems.
-    
-    Optimizes data center cooling and power usage.
-    """
-    
-    def __init__(self):
-        self.building_configs: Dict[str, Dict] = {}
-        self.thermal_zones: Dict[str, Dict] = {}
-        self.power_distribution: Dict[str, Dict] = {}
-        
-        logger.info("Building Management Integrator initialized")
-    
-    def register_building(
-        self,
-        building_id: str,
-        config: Dict[str, Any]
-    ):
-        """Register building configuration"""
-        self.building_configs[building_id] = {
-            'total_power_capacity_kw': config.get('power_capacity', 1000),
-            'cooling_capacity_kw': config.get('cooling_capacity', 500),
-            'num_thermal_zones': config.get('thermal_zones', 4),
-            'pue_target': config.get('pue_target', 1.2),
-            'free_cooling_threshold_c': config.get('free_cooling_temp', 20),
-            'registered_at': datetime.utcnow()
-        }
-        
-        # Initialize thermal zones
-        for zone in range(config.get('thermal_zones', 4)):
-            zone_id = f"{building_id}_zone_{zone}"
-            self.thermal_zones[zone_id] = {
-                'current_temp_c': 25.0,
-                'target_temp_c': 22.0,
-                'cooling_load_kw': 0.0,
-                'airflow_m3h': 1000.0
-            }
-        
-        logger.info(f"Registered building: {building_id}")
-    
-    def optimize_cooling(
-        self,
-        building_id: str,
-        outside_temp_c: float,
-        outside_humidity_percent: float,
-        server_load_kw: float
-    ) -> Dict[str, Any]:
-        """
-        Optimize cooling for building.
-        
-        Returns optimal cooling configuration.
-        """
-        building = self.building_configs.get(building_id)
-        if not building:
-            return {}
-        
-        # Determine if free cooling is available
-        free_cooling_available = (
-            outside_temp_c < building['free_cooling_threshold_c'] and
-            outside_humidity_percent < 80
-        )
-        
-        # Calculate cooling required
-        cooling_required_kw = server_load_kw * 0.8  # ~80% of power becomes heat
-        
-        # Select cooling strategy
-        if free_cooling_available and cooling_required_kw < building['cooling_capacity_kw'] * 0.5:
-            strategy = 'free_cooling'
-            mechanical_cooling_kw = 0
-            energy_savings_percent = 80
-        elif outside_temp_c < 25:
-            strategy = 'mixed_mode'
-            mechanical_cooling_kw = cooling_required_kw * 0.3
-            energy_savings_percent = 50
-        else:
-            strategy = 'mechanical_only'
-            mechanical_cooling_kw = cooling_required_kw * 0.9
-            energy_savings_percent = 0
-        
-        return {
-            'strategy': strategy,
-            'free_cooling_available': free_cooling_available,
-            'cooling_required_kw': cooling_required_kw,
-            'mechanical_cooling_kw': mechanical_cooling_kw,
-            'energy_savings_percent': energy_savings_percent,
-            'estimated_pue': 1.0 + (mechanical_cooling_kw / max(server_load_kw, 1)),
-            'recommendations': self._generate_cooling_recommendations(strategy)
-        }
-    
-    def _generate_cooling_recommendations(self, strategy: str) -> List[str]:
-        """Generate cooling recommendations"""
-        recommendations = []
-        
-        if strategy == 'free_cooling':
-            recommendations.append("Maximize outside air intake")
-            recommendations.append("Reduce chiller operation to minimum")
-        elif strategy == 'mixed_mode':
-            recommendations.append("Use economizer cycle")
-            recommendations.append("Pre-cool with outside air before mechanical")
-        else:
-            recommendations.append("Optimize chiller setpoints")
-            recommendations.append("Consider liquid cooling for high-density racks")
-        
-        return recommendations
-    
-    def get_building_efficiency(self, building_id: str) -> Dict[str, Any]:
-        """Get building efficiency metrics"""
-        building = self.building_configs.get(building_id)
-        if not building:
-            return {}
-        
-        zones = {
-            k: v for k, v in self.thermal_zones.items()
-            if k.startswith(building_id)
-        }
-        
-        return {
-            'building_id': building_id,
-            'thermal_zones': len(zones),
-            'average_temp_c': np.mean([z['current_temp_c'] for z in zones.values()]),
-            'temp_variance': np.var([z['current_temp_c'] for z in zones.values()]),
-            'cooling_load_kw': sum(z['cooling_load_kw'] for z in zones.values()),
-            'pue_target': building['pue_target']
-        }
-
-
-# ============================================================================
-# Dynamic Energy Storage Arbitrage
-# ============================================================================
-
-class EnergyStorageArbitrage:
-    """
-    Dynamic energy storage arbitrage.
-    
-    Optimizes battery charge/discharge based on price signals.
-    """
-    
-    def __init__(self):
-        self.storage_units: Dict[str, Dict] = {}
-        self.price_history: deque = deque(maxlen=168)  # 1 week hourly
-        self.arbitrage_history: deque = deque(maxlen=1000)
-        
-        logger.info("Energy Storage Arbitrage initialized")
-    
-    def register_storage(
-        self,
-        unit_id: str,
-        capacity_kwh: float,
-        max_charge_rate_kw: float,
-        max_discharge_rate_kw: float,
-        efficiency: float = 0.95
-    ):
-        """Register energy storage unit"""
-        self.storage_units[unit_id] = {
-            'capacity_kwh': capacity_kwh,
-            'current_charge_kwh': capacity_kwh * 0.5,
-            'max_charge_kw': max_charge_rate_kw,
-            'max_discharge_kw': max_discharge_rate_kw,
-            'efficiency': efficiency,
-            'cycle_count': 0,
-            'total_energy_throughput_kwh': 0.0,
-            'degradation_percent': 0.0
-        }
-        
-        logger.info(f"Registered storage unit: {unit_id} ({capacity_kwh}kWh)")
-    
-    def update_price(self, hour: int, price_per_kwh: float):
-        """Update electricity price"""
-        self.price_history.append({
-            'hour': hour,
-            'price': price_per_kwh,
-            'timestamp': datetime.utcnow()
-        })
-    
-    def optimize_arbitrage(
-        self,
-        unit_id: str,
-        current_price: float,
-        forecast_prices: List[float],
-        lookahead_hours: int = 24
-    ) -> Dict[str, Any]:
-        """
-        Optimize battery charge/discharge for arbitrage.
-        
-        Buy low, sell high (or use when prices are high).
-        """
-        unit = self.storage_units.get(unit_id)
-        if not unit:
-            return {}
-        
-        # Calculate price statistics
-        avg_price = np.mean(forecast_prices) if forecast_prices else current_price
-        min_price = min(forecast_prices) if forecast_prices else current_price
-        max_price = max(forecast_prices) if forecast_prices else current_price
-        
-        # Decision logic
-        charge_percent = unit['current_charge_kwh'] / unit['capacity_kwh']
-        
-        if current_price < avg_price * 0.8 and charge_percent < 0.9:
-            # Price is low - CHARGE
-            action = 'charge'
-            power_kw = unit['max_charge_kw']
-            energy_kwh = power_kw * 1  # 1 hour
-            expected_profit = (avg_price - current_price) * energy_kwh * unit['efficiency']
-            
-        elif current_price > avg_price * 1.2 and charge_percent > 0.1:
-            # Price is high - DISCHARGE
-            action = 'discharge'
-            power_kw = unit['max_discharge_kw']
-            energy_kwh = power_kw * 1
-            expected_profit = (current_price - avg_price) * energy_kwh * unit['efficiency']
-            
-        else:
-            # Hold
-            action = 'hold'
-            power_kw = 0
-            energy_kwh = 0
-            expected_profit = 0
-        
-        plan = {
-            'unit_id': unit_id,
-            'action': action,
-            'power_kw': power_kw,
-            'energy_kwh': energy_kwh,
-            'expected_profit': expected_profit,
-            'current_charge_percent': charge_percent * 100,
-            'current_price': current_price,
-            'average_price': avg_price,
-            'price_spread': max_price - min_price,
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        self.arbitrage_history.append(plan)
-        
-        return plan
-    
-    def execute_arbitrage(
-        self,
-        unit_id: str,
-        action: str,
-        energy_kwh: float
-    ):
-        """Execute arbitrage action"""
-        unit = self.storage_units.get(unit_id)
-        if not unit:
-            return
-        
-        if action == 'charge':
-            energy_stored = energy_kwh * unit['efficiency']
-            unit['current_charge_kwh'] = min(
-                unit['capacity_kwh'],
-                unit['current_charge_kwh'] + energy_stored
-            )
-        elif action == 'discharge':
-            energy_discharged = energy_kwh / unit['efficiency']
-            unit['current_charge_kwh'] = max(
-                0,
-                unit['current_charge_kwh'] - energy_discharged
-            )
-            unit['total_energy_throughput_kwh'] += energy_kwh
-        
-        unit['cycle_count'] += 1
-        unit['degradation_percent'] = (unit['cycle_count'] / 5000) * 100
-    
-    def get_storage_status(self) -> Dict[str, Any]:
-        """Get storage status"""
-        return {
-            unit_id: {
-                'capacity_kwh': unit['capacity_kwh'],
-                'charge_percent': (unit['current_charge_kwh'] / unit['capacity_kwh']) * 100,
-                'cycles': unit['cycle_count'],
-                'degradation': unit['degradation_percent'],
-                'throughput_mwh': unit['total_energy_throughput_kwh'] / 1000
-            }
-            for unit_id, unit in self.storage_units.items()
-        }
-
-
-# ============================================================================
-# Enhanced Energy Expert with All Integrations
+# Enhanced Energy Expert with Complete Bio-Inspired Integration
 # ============================================================================
 
 class EnergyExpert:
     """
-    Enhanced Energy Expert v3.0.0
+    Enhanced Energy Expert v4.0.0 - Metabolic Energy Producer (Primary Producer/Autotroph)
     
-    New capabilities:
-    - Real-time grid carbon intensity via API
-    - ML-based renewable forecasting
-    - Building management system integration
-    - Dynamic energy storage arbitrage
+    Complete bio-inspired integration:
+    - Gradient-based energy source selection
+    - ATP-driven DVFS power states
+    - Token-cost quantization selection
+    - Compartment thermal state for cooling
+    - Harvester-aligned workload shifting
+    - Biomass-backed energy storage
+    - Harvester-based renewable forecasting
+    - Token-generating carbon offsets
     """
     
     def __init__(
         self,
-        expert_id: str = "energy_optimizer_v3",
-        grid_api_key: Optional[str] = None,
-        enable_grid_api: bool = True,
+        expert_id: str = "energy_optimizer_v4",
+        enable_renewable: bool = True,
+        enable_storage: bool = True,
+        enable_thermal: bool = True,
+        enable_dvfs: bool = True,
         enable_forecasting: bool = True,
-        enable_building_mgmt: bool = True,
-        enable_arbitrage: bool = True
+        enable_bio_integration: bool = True,
+        grid_api_key: Optional[str] = None
     ):
         self.expert_id = expert_id
-        self.version = "3.0.0"
-        
-        # Feature flags
-        self.enable_grid_api = enable_grid_api
+        self.version = "4.0.0"
+        self.enable_renewable = enable_renewable
+        self.enable_storage = enable_storage
+        self.enable_thermal = enable_thermal
+        self.enable_dvfs = enable_dvfs
         self.enable_forecasting = enable_forecasting
-        self.enable_building_mgmt = enable_building_mgmt
-        self.enable_arbitrage = enable_arbitrage
+        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
         
-        # New sub-modules
-        self.grid_api = GridCarbonAPI(grid_api_key) if enable_grid_api else None
-        self.forecaster = RenewableForecaster() if enable_forecasting else None
-        self.building_mgr = BuildingManagementIntegrator() if enable_building_mgmt else None
-        self.arbitrage = EnergyStorageArbitrage() if enable_arbitrage else None
+        # BIO-INSPIRED: Module references (injected)
+        self.token_manager: Optional[EcoATPTokenManager] = None
+        self.gradient_manager: Optional[GradientFieldManager] = None
+        self.scheduler: Optional[ATPSynthaseScheduler] = None
+        self.compartment_manager: Optional[CompartmentManager] = None
+        self.biomass_storage: Optional[BiomassStorage] = None
+        self.harvester: Optional[PhotosyntheticHarvester] = None
+        
+        # Expert profile for registry
+        self.profile = ExpertProfile(
+            expert_id=expert_id,
+            domain=ExpertDomain.ENERGY,
+            hardware_profile=HardwareProfile.CPU_EFFICIENT,
+            helium_per_inference=0.008,
+            carbon_per_inference=0.00008,
+            energy_per_inference=0.0008,
+            avg_latency_ms=40.0,
+            accuracy_score=0.94,
+            reliability_score=0.97,
+            efficiency_score=0.99,
+            supported_task_types=[
+                'inference', 'training', 'optimization',
+                'energy_management', 'carbon_accounting',
+                'renewable_integration', 'workload_scheduling'
+            ]
+        )
+        
+        # DVFS power states
+        self.power_states = {
+            PowerState.PERFORMANCE: {'frequency_percent': 100, 'energy_factor': 1.0, 'performance_factor': 1.0},
+            PowerState.BALANCED: {'frequency_percent': 70, 'energy_factor': 0.7, 'performance_factor': 0.85},
+            PowerState.POWER_SAVE: {'frequency_percent': 50, 'energy_factor': 0.5, 'performance_factor': 0.65},
+            PowerState.ULTRA_LOW: {'frequency_percent': 25, 'energy_factor': 0.25, 'performance_factor': 0.35},
+            PowerState.DYNAMIC: {'frequency_percent': 0, 'energy_factor': 0.0, 'performance_factor': 0.0},
+            PowerState.ATP_DRIVEN: {'frequency_percent': 0, 'energy_factor': 0.0, 'performance_factor': 0.0}
+        }
+        
+        # Quantization levels
+        self.quantization_levels = {
+            'fp32': {'energy_factor': 1.0, 'accuracy_impact': 0.0, 'memory_factor': 1.0, 'ecoatp_cost': 10.0},
+            'fp16': {'energy_factor': 0.5, 'accuracy_impact': 0.01, 'memory_factor': 0.5, 'ecoatp_cost': 5.0},
+            'bf16': {'energy_factor': 0.5, 'accuracy_impact': 0.005, 'memory_factor': 0.5, 'ecoatp_cost': 5.0},
+            'int8': {'energy_factor': 0.25, 'accuracy_impact': 0.03, 'memory_factor': 0.25, 'ecoatp_cost': 2.0},
+            'int4': {'energy_factor': 0.125, 'accuracy_impact': 0.05, 'memory_factor': 0.125, 'ecoatp_cost': 1.0}
+        }
+        
+        # Cooling methods
+        self.cooling_methods = {
+            CoolingMethod.AIR_COOLING: {'energy_overhead': 0.02, 'max_cooling_capacity_kw': 50, 'helium_usage': 0.0},
+            CoolingMethod.LIQUID_COOLING: {'energy_overhead': 0.05, 'max_cooling_capacity_kw': 200, 'helium_usage': 0.0},
+            CoolingMethod.IMMERSION_COOLING: {'energy_overhead': 0.03, 'max_cooling_capacity_kw': 500, 'helium_usage': 0.0},
+            CoolingMethod.FREE_COOLING: {'energy_overhead': 0.0, 'max_cooling_capacity_kw': 30, 'helium_usage': 0.0},
+            CoolingMethod.GEOTHERMAL_COOLING: {'energy_overhead': 0.01, 'max_cooling_capacity_kw': 100, 'helium_usage': 0.0},
+            CoolingMethod.HELIUM_COOLING: {'energy_overhead': 0.10, 'max_cooling_capacity_kw': 1000, 'helium_usage': 0.05},
+            CoolingMethod.COMPARTMENT_AWARE: {'energy_overhead': 0.0, 'max_cooling_capacity_kw': 0, 'helium_usage': 0.0}
+        }
         
         # Optimization history
         self.optimization_history: deque = deque(maxlen=10000)
@@ -664,196 +280,536 @@ class EnergyExpert:
         self.total_energy_saved_kwh = 0.0
         self.total_carbon_saved_kg = 0.0
         self.total_cost_saved = 0.0
+        self.total_ecoatp_generated = 0.0  # BIO-INSPIRED
         
-        logger.info(f"Enhanced Energy Expert v{self.version} initialized")
+        # Adaptive thresholds
+        self.adaptive_thresholds = {
+            'renewable_switch_threshold': 0.3,
+            'battery_use_threshold': 0.5,
+            'thermal_throttle_threshold': 75.0,
+            'dvfs_aggressiveness': 0.5
+        }
+        
+        logger.info(f"Enhanced Energy Expert v{self.version} initialized: bio_integration={self.enable_bio_integration}")
+    
+    # ========================================================================
+    # Bio-Inspired Module Injection
+    # ========================================================================
+    
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        """
+        Inject bio-inspired modules for energy optimization.
+        
+        Connects energy expert to real bio-inspired systems.
+        """
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        
+        injections = {
+            'token_manager': self.token_manager is not None,
+            'gradient_manager': self.gradient_manager is not None,
+            'scheduler': self.scheduler is not None,
+            'compartment_manager': self.compartment_manager is not None,
+            'biomass_storage': self.biomass_storage is not None,
+            'harvester': self.harvester is not None
+        }
+        logger.info(f"Bio-inspired injections into Energy Expert: {injections}")
+        
+        if any(injections.values()):
+            self.enable_bio_integration = True
+    
+    # ========================================================================
+    # Bio-Inspired Data Access Methods
+    # ========================================================================
+    
+    def _get_gradient_energy_source(self) -> EnergySource:
+        """
+        Select energy source based on carbon gradient.
+        
+        High carbon gradient = use stored/battery energy.
+        Low carbon gradient = grid is clean enough.
+        """
+        if self.gradient_manager:
+            carbon = self.gradient_manager.fields.get('carbon')
+            if carbon and carbon.gradient_strength > 0.7:
+                return EnergySource.BATTERY  # Use stored energy in high carbon stress
+            elif carbon and carbon.gradient_strength > 0.4:
+                return EnergySource.GRADIENT_DRIVEN  # Hybrid approach
+            elif carbon and carbon.gradient_strength < 0.3:
+                return EnergySource.GRID_MIX  # Grid is clean enough
+        
+        return EnergySource.SOLAR  # Default renewable
+    
+    def _get_atp_driven_dvfs(self) -> PowerState:
+        """
+        Select DVFS power state based on ATP availability.
+        
+        More ATP = higher performance allowed.
+        """
+        if self.scheduler:
+            driving_force = self.scheduler.calculate_gradient_driving_force()
+            rotation_speed = self.scheduler.calculate_rotation_speed(driving_force)
+            ecoatp_rate = self.scheduler.calculate_atp_production_rate(rotation_speed)
+            
+            if ecoatp_rate > 100:
+                return PowerState.PERFORMANCE
+            elif ecoatp_rate > 50:
+                return PowerState.BALANCED
+            elif ecoatp_rate > 20:
+                return PowerState.POWER_SAVE
+            else:
+                return PowerState.ULTRA_LOW
+        
+        return PowerState.ATP_DRIVEN
+    
+    def _get_token_efficient_quantization(self, task_type: str = 'inference') -> str:
+        """
+        Select quantization based on token availability.
+        
+        Fewer tokens = more aggressive quantization.
+        """
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            balance = summary.get('total_balance', 500)
+            
+            if balance < 100:
+                return 'int4'  # Most efficient when tokens scarce
+            elif balance < 300:
+                return 'int8'  # Balanced
+            else:
+                return 'fp16' if task_type == 'training' else 'int8'
+        
+        return 'int8'
+    
+    def _get_compartment_thermal_state(self) -> ThermalProfile:
+        """
+        Get thermal state from compartment health.
+        
+        Healthier compartments run cooler.
+        """
+        if self.compartment_manager:
+            compartment = self.compartment_manager.find_best_compartment('energy')
+            if compartment:
+                health = compartment.health_score
+                temp = 35.0 + (1.0 - health) * 40.0  # 35°C to 75°C based on health
+                return ThermalProfile(
+                    current_temp_c=temp,
+                    compartment_health=health,
+                    requires_throttling=health < 0.3
+                )
+        
+        return ThermalProfile(current_temp_c=40.0, compartment_health=0.7)
+    
+    def _get_harvester_shift_timing(self) -> Optional[float]:
+        """
+        Get optimal workload shift timing from photosynthetic harvester.
+        
+        Returns seconds to wait before optimal execution window.
+        """
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            recent = stats.get('recent_conversions', [])
+            if recent:
+                avg_energy = np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
+                if avg_energy > 0.6:
+                    return 0.0  # Shift now - good harvesting conditions
+                elif avg_energy > 0.4:
+                    return 1800.0  # Wait 30 minutes
+                else:
+                    return 7200.0  # Wait 2 hours for better conditions
+        return None
+    
+    def _get_biomass_energy_reserve(self) -> float:
+        """
+        Get energy reserve from biomass storage.
+        
+        Returns kWh equivalent stored in biomass.
+        """
+        if self.biomass_storage:
+            stats = self.biomass_storage.get_storage_stats()
+            total_stored = stats.get('total_stored', 0)
+            # Convert stored tasks to energy equivalent
+            return float(total_stored) * 0.01  # 100 tasks ≈ 1 kWh
+        return 0.0
+    
+    def _get_harvester_renewable_forecast(self) -> Dict[str, float]:
+        """
+        Get renewable energy forecast from harvester excitation levels.
+        
+        Maps photosynthetic activity to renewable predictions.
+        """
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            total = stats.get('total_harvested', 0)
+            recent = stats.get('recent_conversions', [])
+            avg_energy = np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]]) if recent else 0.5
+            
+            return {
+                'solar_kw': total * 0.6 * avg_energy,
+                'wind_kw': total * 0.4 * (1.0 - avg_energy),
+                'total_renewable_kw': total * avg_energy,
+                'confidence': avg_energy
+            }
+        
+        return {'solar_kw': 5.0, 'wind_kw': 3.0, 'total_renewable_kw': 8.0, 'confidence': 0.5}
+    
+    def _generate_offset_tokens(self, carbon_kg: float) -> float:
+        """
+        Generate Eco-ATP tokens from carbon offsets.
+        
+        Carbon savings are converted to Eco-ATP currency.
+        """
+        if self.token_manager:
+            tokens = self.token_manager.generate_tokens(
+                account_id='energy_expert_offsets',
+                source=EcoATPSource.CARBON_OFFSET,
+                carbon_saved_kg=carbon_kg,
+                num_tokens=int(carbon_kg * 100)
+            )
+            if tokens:
+                total = sum(t.value for t in tokens)
+                self.total_ecoatp_generated += total
+                return total
+        return 0.0
+    
+    def _get_gradient_levels(self) -> Dict[str, float]:
+        """Get all gradient levels for optimization"""
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+    
+    # ========================================================================
+    # Primary Energy Optimization Method (Enhanced with Bio-Inspired)
+    # ========================================================================
     
     async def optimize_energy(
         self,
         task_config: Dict[str, Any],
         carbon_budget: float,
         latency_requirement_ms: float,
-        region: str = "US_EAST",
-        building_id: Optional[str] = None,
-        **kwargs
+        grid_carbon_intensity: Optional[float] = None,
+        renewable_profile: Optional[RenewableProfile] = None,
+        thermal_profile: Optional[ThermalProfile] = None,
+        time_of_day: Optional[int] = None,
+        energy_price_per_kwh: Optional[float] = None,
+        helium_scarcity: float = 0.0,
+        cross_expert_hints: Optional[Dict[str, Any]] = None,
+        ecoatp_budget: Optional[float] = None  # BIO-INSPIRED
     ) -> Dict[str, Any]:
         """
-        Enhanced energy optimization with all integrations.
+        Comprehensive energy optimization with bio-inspired strategies.
         """
         start_time = datetime.utcnow()
-        optimization_id = f"opt_{start_time.timestamp()}"
+        optimization_id = hashlib.md5(
+            f"{task_config}{carbon_budget}{latency_requirement_ms}{start_time}".encode()
+        ).hexdigest()[:12]
         
-        # Step 1: Get real-time grid data
-        grid_data = None
-        grid_forecast = None
-        if self.enable_grid_api:
-            grid_data = await self.grid_api.get_carbon_intensity(region)
-            grid_forecast = await self.grid_api.get_forecast(region, hours_ahead=24)
+        # BIO-INSPIRED: Get real gradient levels
+        gradient_levels = self._get_gradient_levels() if self.enable_bio_integration else {}
         
-        # Step 2: Renewable forecasting
-        renewable_prediction = None
-        if self.enable_forecasting:
-            now = datetime.utcnow()
-            renewable_prediction = {
-                'solar_kw': self.forecaster.predict_solar(
-                    latitude=kwargs.get('latitude', 40.0),
-                    hour=now.hour,
-                    day_of_year=now.timetuple().tm_yday,
-                    cloud_cover=kwargs.get('cloud_cover', 0.3)
-                ),
-                'wind_kw': self.forecaster.predict_wind(
-                    pressure_gradient=kwargs.get('pressure_gradient', 0.5),
-                    hour=now.hour,
-                    temperature_gradient=kwargs.get('temperature_gradient', 0.3),
-                    season=(now.month % 12) // 3
+        # Step 1: BIO-INSPIRED - Select energy source based on gradient
+        if self.enable_bio_integration:
+            energy_source = self._get_gradient_energy_source()
+        else:
+            energy_source = EnergySource.SOLAR if renewable_profile and renewable_profile.can_use_renewable(10) else EnergySource.GRID_MIX
+        
+        # Step 2: BIO-INSPIRED - Select power state based on ATP
+        if self.enable_bio_integration:
+            power_state = self._get_atp_driven_dvfs()
+        else:
+            if latency_requirement_ms < 10:
+                power_state = PowerState.PERFORMANCE
+            elif latency_requirement_ms < 100:
+                power_state = PowerState.BALANCED
+            else:
+                power_state = PowerState.POWER_SAVE
+        
+        power_config = self.power_states[power_state]
+        
+        # Step 3: BIO-INSPIRED - Select quantization based on tokens
+        if self.enable_bio_integration:
+            quant_level = self._get_token_efficient_quantization(task_config.get('task_type', 'inference'))
+        else:
+            quant_level = 'int8' if carbon_budget < 0.01 else 'fp16'
+        
+        quant_config = self.quantization_levels[quant_level]
+        
+        # Step 4: BIO-INSPIRED - Get thermal state from compartment
+        if self.enable_bio_integration:
+            thermal = self._get_compartment_thermal_state()
+        else:
+            thermal = thermal_profile or ThermalProfile()
+        
+        # Step 5: BIO-INSPIRED - Get workload shift timing from harvester
+        shift_timing = None
+        if self.enable_bio_integration:
+            shift_timing = self._get_harvester_shift_timing()
+        
+        # Step 6: BIO-INSPIRED - Get renewable forecast from harvester
+        if self.enable_bio_integration:
+            harvester_forecast = self._get_harvester_renewable_forecast()
+            if renewable_profile is None:
+                renewable_profile = RenewableProfile(
+                    solar_available_kw=harvester_forecast.get('solar_kw', 5.0),
+                    wind_available_kw=harvester_forecast.get('wind_kw', 3.0),
+                    harvester_contribution_kw=harvester_forecast.get('total_renewable_kw', 8.0)
                 )
-            }
         
-        # Step 3: Building management optimization
-        building_plan = None
-        if self.enable_building_mgmt and building_id:
-            building_plan = self.building_mgr.optimize_cooling(
-                building_id,
-                outside_temp_c=kwargs.get('outside_temp', 25),
-                outside_humidity_percent=kwargs.get('humidity', 50),
-                server_load_kw=kwargs.get('server_load', 100)
-            )
-        
-        # Step 4: Energy storage arbitrage
-        arbitrage_plan = None
-        if self.enable_arbitrage and 'storage_unit_id' in kwargs:
-            prices = [g['carbon_intensity_g_per_kwh'] / 1000 for g in grid_forecast] if grid_forecast else [0.10] * 24
-            arbitrage_plan = self.arbitrage.optimize_arbitrage(
-                kwargs['storage_unit_id'],
-                current_price=grid_data['carbon_intensity_g_per_kwh'] / 1000 if grid_data else 0.10,
-                forecast_prices=prices
-            )
-        
-        # Step 5: Calculate comprehensive estimates
-        carbon_intensity = grid_data['carbon_intensity_g_per_kwh'] if grid_data else 400
-        renewable_percent = grid_data['renewable_percentage'] if grid_data else 25
-        
+        # Step 7: Calculate resource estimates
+        energy_factor = power_config['energy_factor'] * quant_config['energy_factor']
         base_energy = task_config.get('base_energy_kwh', 0.01)
-        effective_carbon = base_energy * carbon_intensity / 1000 * (1 - renewable_percent / 100)
+        estimated_energy = base_energy * energy_factor
         
-        # Calculate savings from optimizations
-        building_savings = building_plan['energy_savings_percent'] / 100 if building_plan else 0
-        arbitrage_savings = arbitrage_plan['expected_profit'] if arbitrage_plan else 0
+        carbon_intensity = energy_source.carbon_intensity_g_per_kwh
+        estimated_carbon = estimated_energy * carbon_intensity / 1000
         
-        total_savings = building_savings * base_energy + arbitrage_savings
+        # BIO-INSPIRED: Calculate Eco-ATP cost
+        ecoatp_cost = estimated_energy * 1000  # 1 kWh = 1000 Eco-ATP
         
+        # BIO-INSPIRED: Check Eco-ATP budget
+        if ecoatp_budget and ecoatp_cost > ecoatp_budget and self.enable_bio_integration:
+            # Downgrade to more efficient settings
+            power_state = PowerState.POWER_SAVE
+            quant_level = 'int8'
+            energy_factor = self.power_states[power_state]['energy_factor'] * self.quantization_levels[quant_level]['energy_factor']
+            estimated_energy = base_energy * energy_factor
+            ecoatp_cost = estimated_energy * 1000
+        
+        # BIO-INSPIRED: Generate offset tokens
+        ecoatp_generated = 0.0
+        if self.enable_bio_integration and estimated_carbon > 0:
+            ecoatp_generated = self._generate_offset_tokens(estimated_carbon)
+        
+        # Build comprehensive plan
         plan = {
             'expert_id': self.expert_id,
             'optimization_id': optimization_id,
             'version': self.version,
             
-            # Grid data
-            'grid_carbon_intensity': carbon_intensity,
-            'renewable_percentage': renewable_percent,
-            'grid_source': grid_data['source'] if grid_data else 'fallback',
+            # Energy source
+            'energy_source': energy_source.value,
+            'renewable_percentage': 100 if energy_source.is_renewable else 25,
             
-            # Renewable prediction
-            'renewable_prediction': renewable_prediction,
+            # Power management
+            'power_state': power_state.value,
+            'frequency_percent': power_config['frequency_percent'],
             
-            # Building optimization
-            'building_plan': building_plan,
-            
-            # Storage arbitrage
-            'arbitrage_plan': arbitrage_plan,
+            # Model optimization
+            'quantization': quant_level,
+            'accuracy_impact': quant_config['accuracy_impact'],
             
             # Resource estimates
-            'estimated_energy_kwh': base_energy * (1 - building_savings),
-            'estimated_carbon_kg': effective_carbon * (1 - building_savings),
-            'estimated_cost': base_energy * 0.10 - arbitrage_savings,
+            'estimated_energy_kwh': estimated_energy,
+            'estimated_carbon_kg': estimated_carbon,
+            'estimated_ecoatp_cost': ecoatp_cost,  # BIO-INSPIRED
+            'estimated_latency_ms': 40.0,
             
-            # Savings
-            'energy_saved_kwh': total_savings if total_savings > 0 else 0,
-            'carbon_saved_kg': total_savings * carbon_intensity / 1000 if total_savings > 0 else 0,
-            'cost_saved': arbitrage_savings if arbitrage_savings > 0 else 0,
+            # Compliance
+            'carbon_budget_compliant': estimated_carbon <= carbon_budget,
             
-            # Strategy
-            'strategy': 'multi_integration_optimization',
-            'timestamp': datetime.utcnow().isoformat(),
+            # BIO-INSPIRED features
+            'bio_integration_active': self.enable_bio_integration,
+            'gradient_levels': gradient_levels,
+            'ecoatp_generated': ecoatp_generated,
+            'harvester_forecast': self._get_harvester_renewable_forecast() if self.enable_bio_integration else {},
+            'biomass_reserve_kwh': self._get_biomass_energy_reserve() if self.enable_bio_integration else 0.0,
+            'shift_timing_seconds': shift_timing,
             
             # Recommendations
-            'recommendations': self._generate_enhanced_recommendations(
-                grid_data, building_plan, arbitrage_plan
-            )
+            'recommendations': self._generate_bio_recommendations(
+                gradient_levels, ecoatp_generated, shift_timing, self.enable_bio_integration
+            ),
+            
+            # Strategy
+            'strategy': 'bio_optimized' if self.enable_bio_integration else 'standard',
+            'timestamp': datetime.utcnow().isoformat()
         }
         
         # Record optimization
-        self.optimization_history.append({
-            'timestamp': start_time,
-            'carbon_intensity': carbon_intensity,
-            'energy_saved': total_savings,
-            'plan': plan
-        })
+        history_entry = EnergyOptimizationHistory(
+            timestamp=start_time,
+            strategy=plan['strategy'],
+            energy_source=energy_source.value,
+            power_state=power_state.value,
+            energy_saved_kwh=max(0, base_energy - estimated_energy),
+            carbon_saved_kg=max(0, base_energy * 400 / 1000 - estimated_carbon),
+            cost_saved=0.0,
+            renewable_used=energy_source.is_renewable,
+            success=True,
+            ecoatp_generated=ecoatp_generated,
+            gradient_level=gradient_levels.get('carbon', 0.5)
+        )
+        
+        self.optimization_history.append(history_entry)
         
         # Update totals
-        self.total_energy_saved_kwh += max(0, total_savings)
-        self.total_carbon_saved_kg += max(0, total_savings * carbon_intensity / 1000)
-        self.total_cost_saved += max(0, arbitrage_savings)
+        self.total_energy_saved_kwh += history_entry.energy_saved_kwh
+        self.total_carbon_saved_kg += history_entry.carbon_saved_kg
+        self.total_ecoatp_generated += ecoatp_generated
         
         logger.info(
-            f"Energy Plan [{optimization_id}]: "
-            f"carbon={carbon_intensity:.0f}g/kWh, "
-            f"renewable={renewable_percent:.0f}%, "
-            f"savings={total_savings:.4f}kWh"
+            f"Energy Plan [{optimization_id}]: source={energy_source.value}, "
+            f"power={power_state.value}, quant={quant_level}, "
+            f"carbon={estimated_carbon:.6f}kg, ecoatp={ecoatp_generated:.1f}, "
+            f"bio={self.enable_bio_integration}"
         )
         
         return plan
     
-    def _generate_enhanced_recommendations(
-        self,
-        grid_data: Optional[Dict],
-        building_plan: Optional[Dict],
-        arbitrage_plan: Optional[Dict]
+    def _generate_bio_recommendations(
+        self, gradient_levels: Dict[str, float], ecoatp_generated: float,
+        shift_timing: Optional[float], bio_active: bool
     ) -> List[str]:
-        """Generate enhanced recommendations"""
+        """Generate bio-inspired recommendations"""
         recommendations = []
         
-        if grid_data:
-            if grid_data['carbon_intensity_g_per_kwh'] > 500:
-                recommendations.append(
-                    f"High grid carbon intensity ({grid_data['carbon_intensity_g_per_kwh']:.0f} g/kWh). "
-                    "Consider deferring non-critical workloads."
-                )
-            if grid_data['renewable_percentage'] > 50:
-                recommendations.append(
-                    f"High renewable availability ({grid_data['renewable_percentage']:.0f}%). "
-                    "Optimal time for energy-intensive tasks."
-                )
-        
-        if building_plan:
-            if building_plan['strategy'] == 'free_cooling':
-                recommendations.append(
-                    f"Free cooling available! Expected {building_plan['energy_savings_percent']}% cooling energy savings."
-                )
-        
-        if arbitrage_plan and arbitrage_plan['action'] != 'hold':
-            recommendations.append(
-                f"Storage arbitrage: {arbitrage_plan['action']} at "
-                f"${arbitrage_plan['current_price']:.3f}/kWh, "
-                f"expected profit: ${arbitrage_plan['expected_profit']:.4f}"
-            )
+        if bio_active:
+            carbon = gradient_levels.get('carbon', 0.5)
+            if carbon > 0.7:
+                recommendations.append(f"High carbon gradient ({carbon:.2f}) - switched to battery/stored energy.")
+            elif carbon < 0.3:
+                recommendations.append(f"Low carbon gradient ({carbon:.2f}) - grid energy is clean.")
+            
+            if ecoatp_generated > 0:
+                recommendations.append(f"Generated {ecoatp_generated:.1f} Eco-ATP from carbon offsets.")
+            
+            if shift_timing and shift_timing > 0:
+                recommendations.append(f"Optimal workload shift in {shift_timing:.0f}s for better harvesting.")
         
         if not recommendations:
             recommendations.append("Energy configuration is optimal for current conditions.")
         
         return recommendations
     
-    def get_expert_statistics(self) -> Dict[str, Any]:
-        """Get enhanced expert statistics"""
+    # ========================================================================
+    # Enhanced Carbon Offset with Token Generation
+    # ========================================================================
+    
+    async def suggest_carbon_offset(
+        self,
+        carbon_impact: float,
+        energy_source_plan: Optional[Dict[str, Any]] = None,
+        renewable_profile: Optional[RenewableProfile] = None
+    ) -> Dict[str, Any]:
+        """Enhanced carbon offset suggestions with token generation"""
+        strategies = [
+            {'type': 'helium_offset', 'amount_kg': carbon_impact * 0.3, 'net_carbon_kg': carbon_impact * 0.7,
+             'cost_per_kg': 0.05, 'total_cost': carbon_impact * 0.3 * 0.05},
+            {'type': 'renewable_certificates', 'amount_kg': carbon_impact * 0.5, 'net_carbon_kg': carbon_impact * 0.5,
+             'cost_per_kg': 0.02, 'total_cost': carbon_impact * 0.5 * 0.02},
+            {'type': 'direct_air_capture', 'amount_kg': carbon_impact * 0.4, 'net_carbon_kg': carbon_impact * 0.6,
+             'cost_per_kg': 0.15, 'total_cost': carbon_impact * 0.4 * 0.15},
+            {'type': 'reforestation', 'amount_kg': carbon_impact * 0.35, 'net_carbon_kg': carbon_impact * 0.65,
+             'cost_per_kg': 0.01, 'total_cost': carbon_impact * 0.35 * 0.01,
+             'co_benefits': ['biodiversity', 'water_conservation']}
+        ]
+        
+        best_strategy = min(strategies, key=lambda s: s['total_cost'])
+        
+        # BIO-INSPIRED: Generate Eco-ATP tokens from the offset
+        ecoatp_generated = 0.0
+        if self.enable_bio_integration:
+            ecoatp_generated = self._generate_offset_tokens(carbon_impact)
+        
         return {
+            'carbon_impact_kg': carbon_impact,
+            'strategies': strategies,
+            'recommended_strategy': best_strategy,
+            'max_offset_possible_kg': sum(s['amount_kg'] for s in strategies),
+            'ecoatp_generated': ecoatp_generated,  # BIO-INSPIRED
+            'bio_integration_active': self.enable_bio_integration,
+            'renewable_energy_used': energy_source_plan is not None and energy_source_plan.get('renewable_percentage', 0) > 0
+        }
+    
+    # ========================================================================
+    # Cross-Expert Energy Coordination with Bio-Inspired Awareness
+    # ========================================================================
+    
+    async def coordinate_with_experts(
+        self, expert_plans: List[Dict[str, Any]], total_carbon_budget: float
+    ) -> Dict[str, Any]:
+        """Coordinate energy usage across experts with bio-inspired awareness"""
+        if not expert_plans:
+            return {'allocation': {}, 'total_carbon': 0}
+        
+        total_carbon = sum(p.get('estimated_carbon_kg', 0) for p in expert_plans)
+        
+        if total_carbon <= total_carbon_budget:
+            return {
+                'allocation': {p.get('expert_id', 'unknown'): 1.0 for p in expert_plans},
+                'total_carbon': total_carbon,
+                'budget_compliant': True,
+                'bio_active': self.enable_bio_integration,
+                'gradient_levels': self._get_gradient_levels() if self.enable_bio_integration else {}
+            }
+        
+        scale_factor = total_carbon_budget / total_carbon
+        
+        # BIO-INSPIRED: Prioritize experts with higher gradient alignment
+        if self.enable_bio_integration and self.gradient_manager:
+            trust = self.gradient_manager.fields.get('trust')
+            if trust:
+                allocation = {}
+                for plan in expert_plans:
+                    expert_id = plan.get('expert_id', 'unknown')
+                    allocation[expert_id] = min(scale_factor * (0.5 + 0.5 * trust.gradient_strength), 1.0)
+                return {
+                    'allocation': allocation,
+                    'total_carbon': total_carbon_budget,
+                    'budget_compliant': True,
+                    'bio_active': True,
+                    'trust_based': True
+                }
+        
+        allocation = {p.get('expert_id', 'unknown'): scale_factor for p in expert_plans}
+        return {'allocation': allocation, 'total_carbon': total_carbon_budget, 'budget_compliant': True}
+    
+    # ========================================================================
+    # Enhanced Statistics
+    # ========================================================================
+    
+    def get_expert_statistics(self) -> Dict[str, Any]:
+        """Get comprehensive energy expert statistics with bio-inspired metrics"""
+        recent = list(self.optimization_history)[-100:]
+        
+        stats = {
             'expert_id': self.expert_id,
             'version': self.version,
             'total_energy_saved_kwh': self.total_energy_saved_kwh,
             'total_carbon_saved_kg': self.total_carbon_saved_kg,
             'total_cost_saved': self.total_cost_saved,
+            'total_ecoatp_generated': self.total_ecoatp_generated,
+            'bio_integration_active': self.enable_bio_integration,
+            'bio_modules_available': BIO_INSPIRED_AVAILABLE,
             'optimizations_performed': len(self.optimization_history),
-            'grid_api_enabled': self.enable_grid_api,
-            'forecasting_enabled': self.enable_forecasting,
-            'building_mgmt_enabled': self.enable_building_mgmt,
-            'arbitrage_enabled': self.enable_arbitrage,
-            'forecast_accuracy': self.forecaster.get_forecast_accuracy() if self.forecaster else {},
-            'storage_status': self.arbitrage.get_storage_status() if self.arbitrage else {}
+            'renewable_usage_rate': sum(1 for r in recent if r.renewable_used) / max(len(recent), 1) if recent else 0,
+            'average_energy_saved_kwh': np.mean([r.energy_saved_kwh for r in recent]) if recent else 0,
+            'average_carbon_saved_kg': np.mean([r.carbon_saved_kg for r in recent]) if recent else 0,
+            'average_ecoatp_generated': np.mean([r.ecoatp_generated for r in recent]) if recent else 0,
+            'adaptive_thresholds': self.adaptive_thresholds
         }
+        
+        # BIO-INSPIRED: Add gradient and harvester data
+        if self.enable_bio_integration:
+            stats['bio_metrics'] = {
+                'gradient_levels': self._get_gradient_levels(),
+                'harvester_forecast': self._get_harvester_renewable_forecast(),
+                'biomass_reserve_kwh': self._get_biomass_energy_reserve(),
+                'compartment_health': self._get_compartment_thermal_state().compartment_health,
+                'atp_power_state': self._get_atp_driven_dvfs().value,
+                'token_efficient_quantization': self._get_token_efficient_quantization()
+            }
+        
+        return stats
