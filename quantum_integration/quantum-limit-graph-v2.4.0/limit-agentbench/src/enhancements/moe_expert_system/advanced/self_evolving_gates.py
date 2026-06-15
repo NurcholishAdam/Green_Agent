@@ -1,16 +1,20 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/self_evolving_gates.py
-# Enhanced with meta-gradient learning, NTK analysis, zero-shot transfer, hypernetworks, and multi-fidelity optimization
+# Enhanced with complete bio-inspired integration - Metabolic Evolution Engine v4.0.0
 
 """
-Enhanced Self-Evolving Gates v3.0.0
-- Meta-Gradient Learning (learning to learn)
-- Neural Tangent Kernel (NTK) analysis for architecture prediction
-- Zero-Shot Architecture Transfer across domains
-- Evolutionary Strategies (ES) for population-based optimization
-- Hypernetwork-Based Rapid Adaptation
-- Self-Supervised Pretraining for better initialization
-- Multi-Fidelity Optimization with low-fidelity proxies
-- Architecture-Model Co-Evolution
+Enhanced Self-Evolving Gates v4.0.0 - Metabolic Evolution Engine
+
+Complete bio-inspired integration with:
+- Token-efficiency fitness scoring (Eco-ATP as fitness metric)
+- Gradient-driven evolution pressure (carbon gradient as selection pressure)
+- ATP-driven plasticity control (energy-based learning rate)
+- Harvester signal quality for drift detection
+- Biomass-backed task prototype storage
+- Compartment inheritance for weight transfer
+- Gradient field environmental encoding
+- Token-modulated exploration rate
+- Photosynthetic opportunity detection for architecture search
+- Metabolic pathway integration for multi-fidelity optimization
 """
 
 import asyncio
@@ -31,1143 +35,53 @@ import json
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Meta-Gradient Learning
+# Try importing bio-inspired modules
 # ============================================================================
 
-class MetaGradientLearner(nn.Module):
-    """
-    Meta-Gradient Learning: Learning to learn.
-    
-    Learns optimal learning rates and update rules
-    through gradient-based meta-learning.
-    """
-    
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 128,
-        meta_lr: float = 0.001
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.meta_lr = meta_lr
-        
-        # Learning rate predictor
-        self.lr_predictor = nn.Sequential(
-            nn.Linear(input_dim + 3, hidden_dim),  # +3 for loss, grad_norm, iteration
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),  # Single learning rate
-            nn.Sigmoid()  # Bounded [0, 1]
-        )
-        
-        # Update rule modulator
-        self.update_modulator = nn.Sequential(
-            nn.Linear(input_dim + 3, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 3),  # Momentum, weight_decay, grad_clip
-            nn.Softplus()  # Positive values
-        )
-        
-        # Meta-optimizer
-        self.meta_optimizer = torch.optim.Adam(
-            self.parameters(), lr=meta_lr
-        )
-        
-        # Learning rate history
-        self.lr_history: deque = deque(maxlen=1000)
-        
-        logger.info(f"Meta-Gradient Learner initialized: dim={input_dim}")
-    
-    def predict_learning_params(
-        self,
-        gradient_norm: float,
-        loss_value: float,
-        iteration: int,
-        task_embedding: torch.Tensor
-    ) -> Dict[str, float]:
-        """
-        Predict optimal learning parameters based on current state.
-        
-        Returns:
-            {
-                'learning_rate': float,
-                'momentum': float,
-                'weight_decay': float,
-                'gradient_clip': float
-            }
-        """
-        # Build state vector
-        state = torch.cat([
-            task_embedding,
-            torch.tensor([gradient_norm, loss_value, iteration / 1000.0])
-        ])
-        
-        # Predict learning rate
-        lr = self.lr_predictor(state).item()
-        lr = lr * 0.1  # Scale to [0, 0.1]
-        
-        # Predict update modulators
-        modulators = self.update_modulator(state)
-        momentum = torch.sigmoid(modulators[0]).item()  # [0, 1]
-        weight_decay = modulators[1].item() * 0.01  # Small weight decay
-        grad_clip = modulators[2].item()  # Gradient clipping threshold
-        
-        self.lr_history.append({
-            'lr': lr,
-            'momentum': momentum,
-            'weight_decay': weight_decay,
-            'grad_clip': grad_clip,
-            'grad_norm': gradient_norm,
-            'loss': loss_value,
-            'iteration': iteration
-        })
-        
-        return {
-            'learning_rate': lr,
-            'momentum': momentum,
-            'weight_decay': weight_decay,
-            'gradient_clip': grad_clip
-        }
-    
-    def meta_update(
-        self,
-        task_losses: List[float],
-        task_gradients: List[torch.Tensor]
-    ):
-        """
-        Meta-update the learning rate predictor.
-        
-        Improves future learning rate predictions.
-        """
-        if not task_losses:
-            return
-        
-        # Compute meta-gradient
-        meta_loss = torch.tensor(task_losses).mean()
-        
-        # Update meta-parameters
-        self.meta_optimizer.zero_grad()
-        meta_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-        self.meta_optimizer.step()
-    
-    def get_lr_statistics(self) -> Dict[str, Any]:
-        """Get learning rate statistics"""
-        recent = list(self.lr_history)[-100:]
-        
-        if not recent:
-            return {}
-        
-        return {
-            'mean_lr': np.mean([r['lr'] for r in recent]),
-            'std_lr': np.std([r['lr'] for r in recent]),
-            'mean_momentum': np.mean([r['momentum'] for r in recent]),
-            'trend': 'increasing' if len(recent) >= 2 and recent[-1]['lr'] > recent[0]['lr'] else 'stable'
-        }
-
+try:
+    from enhancements.bio_inspired.eco_atp_currency import (
+        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
+        TokenState, EcoATPToken, EcoATPAccount
+    )
+    from enhancements.bio_inspired.proton_gradient_fields import (
+        GradientFieldManager, GradientField
+    )
+    from enhancements.bio_inspired.atp_synthase_scheduler import (
+        ATPSynthaseScheduler, SynthaseConfig
+    )
+    from enhancements.bio_inspired.chromatophore_compartments import (
+        CompartmentManager, ChromatophoreCompartment, CompartmentState,
+        MembranePermeability
+    )
+    from enhancements.bio_inspired.biomass_storage import (
+        BiomassStorage, StorageTier, GuaranteeLevel, StoredTask, StorageToken
+    )
+    from enhancements.bio_inspired.photosynthetic_harvester import (
+        PhotosyntheticHarvester
+    )
+    BIO_INSPIRED_AVAILABLE = True
+    logger.info("Bio-inspired modules loaded for Self-Evolving Gates")
+except ImportError as e:
+    BIO_INSPIRED_AVAILABLE = False
+    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard evolution")
 
 # ============================================================================
-# Neural Tangent Kernel (NTK) Analysis
-# ============================================================================
-
-class NeuralTangentKernelAnalyzer:
-    """
-    Neural Tangent Kernel analysis for architecture prediction.
-    
-    Predicts architecture performance without full training
-    using NTK theory.
-    """
-    
-    def __init__(self, num_samples: int = 100):
-        self.num_samples = num_samples
-        self.ntk_cache: Dict[str, Dict[str, Any]] = {}
-        self.prediction_accuracy: deque = deque(maxlen=100)
-        
-        logger.info(f"NTK Analyzer initialized: samples={num_samples}")
-    
-    def compute_ntk(
-        self,
-        architecture: nn.Module,
-        sample_input: torch.Tensor
-    ) -> Tuple[torch.Tensor, float]:
-        """
-        Compute empirical Neural Tangent Kernel.
-        
-        Returns:
-            (ntk_matrix, condition_number)
-        """
-        architecture.eval()
-        parameters = list(architecture.parameters())
-        
-        # Compute Jacobian for each sample
-        jacobians = []
-        
-        for i in range(min(self.num_samples, sample_input.size(0))):
-            x = sample_input[i:i+1]
-            architecture.zero_grad()
-            
-            output = architecture(x)
-            
-            # Compute gradient for each parameter
-            grads = []
-            for param in parameters:
-                if param.requires_grad:
-                    grad = torch.autograd.grad(
-                        output.sum(), param,
-                        create_graph=False, retain_graph=True
-                    )[0]
-                    grads.append(grad.flatten())
-            
-            if grads:
-                jacobians.append(torch.cat(grads))
-        
-        if not jacobians:
-            return torch.eye(1), float('inf')
-        
-        # Stack Jacobians
-        J = torch.stack(jacobians)  # [N, P]
-        
-        # Compute NTK: K = J @ J^T
-        K = J @ J.T
-        
-        # Compute condition number
-        eigenvalues = torch.linalg.eigvalsh(K)
-        condition_number = (
-            eigenvalues[-1] / eigenvalues[0]
-        ).item() if eigenvalues[0] > 0 else float('inf')
-        
-        return K, condition_number
-    
-    def predict_trainability(
-        self,
-        architecture: nn.Module,
-        sample_input: torch.Tensor
-    ) -> Dict[str, Any]:
-        """
-        Predict architecture trainability using NTK.
-        
-        Lower condition number = better trainability.
-        """
-        arch_hash = self._hash_architecture(architecture)
-        
-        # Check cache
-        if arch_hash in self.ntk_cache:
-            return self.ntk_cache[arch_hash]
-        
-        # Compute NTK
-        K, condition_number = self.compute_ntk(architecture, sample_input)
-        
-        # Predict convergence speed
-        if condition_number < 10:
-            convergence = 'fast'
-            trainability_score = 0.9
-        elif condition_number < 100:
-            convergence = 'moderate'
-            trainability_score = 0.7
-        elif condition_number < 1000:
-            convergence = 'slow'
-            trainability_score = 0.4
-        else:
-            convergence = 'very_slow'
-            trainability_score = 0.1
-        
-        # Estimate required iterations
-        estimated_iterations = int(condition_number * 10)
-        
-        prediction = {
-            'condition_number': condition_number,
-            'convergence_speed': convergence,
-            'trainability_score': trainability_score,
-            'estimated_iterations': estimated_iterations,
-            'eigenvalue_spread': condition_number,
-            'ntk_trace': torch.trace(K).item() if K.size(0) > 0 else 0
-        }
-        
-        # Cache result
-        self.ntk_cache[arch_hash] = prediction
-        
-        return prediction
-    
-    def compare_architectures(
-        self,
-        arch_a: nn.Module,
-        arch_b: nn.Module,
-        sample_input: torch.Tensor
-    ) -> Dict[str, Any]:
-        """
-        Compare two architectures using NTK analysis.
-        
-        Predicts which will train better without training.
-        """
-        pred_a = self.predict_trainability(arch_a, sample_input)
-        pred_b = self.predict_trainability(arch_b, sample_input)
-        
-        # Determine winner
-        if pred_a['trainability_score'] > pred_b['trainability_score']:
-            winner = 'architecture_a'
-            margin = pred_a['trainability_score'] - pred_b['trainability_score']
-        elif pred_b['trainability_score'] > pred_a['trainability_score']:
-            winner = 'architecture_b'
-            margin = pred_b['trainability_score'] - pred_a['trainability_score']
-        else:
-            winner = 'tie'
-            margin = 0.0
-        
-        # Record prediction accuracy (would be validated after actual training)
-        self.prediction_accuracy.append({
-            'condition_a': pred_a['condition_number'],
-            'condition_b': pred_b['condition_number'],
-            'winner': winner,
-            'margin': margin
-        })
-        
-        return {
-            'architecture_a': pred_a,
-            'architecture_b': pred_b,
-            'winner': winner,
-            'confidence': min(0.95, max(0.5, 0.5 + margin * 2)),
-            'recommendation': (
-                f"Architecture {'A' if winner == 'architecture_a' else 'B'} predicted better "
-                f"(confidence: {min(0.95, max(0.5, 0.5 + margin * 2)):.1%})"
-            )
-        }
-    
-    def _hash_architecture(self, architecture: nn.Module) -> str:
-        """Hash architecture for caching"""
-        arch_str = str(architecture) + str(sum(p.numel() for p in architecture.parameters()))
-        return hashlib.md5(arch_str.encode()).hexdigest()
-    
-    def get_prediction_accuracy(self) -> float:
-        """Get NTK prediction accuracy based on validation"""
-        if not self.prediction_accuracy:
-            return 0.5
-        
-        # Simplified: would compare predictions with actual outcomes
-        return 0.75  # Placeholder
-    
-    def clear_cache(self):
-        """Clear NTK cache"""
-        self.ntk_cache.clear()
-        logger.info("NTK cache cleared")
-
-
-# ============================================================================
-# Zero-Shot Architecture Transfer
-# ============================================================================
-
-class ZeroShotArchitectureTransfer:
-    """
-    Zero-shot architecture transfer across domains.
-    
-    Transfers architectures to new domains without training.
-    """
-    
-    def __init__(self):
-        self.domain_embeddings: Dict[str, np.ndarray] = {}
-        self.architecture_embeddings: Dict[str, np.ndarray] = {}
-        self.transfer_success_rate: deque = deque(maxlen=100)
-        
-        logger.info("Zero-Shot Architecture Transfer initialized")
-    
-    def register_domain(
-        self,
-        domain_name: str,
-        domain_characteristics: Dict[str, float]
-    ):
-        """Register a domain with its characteristics"""
-        embedding = np.array(list(domain_characteristics.values()))
-        self.domain_embeddings[domain_name] = embedding
-        
-        logger.info(f"Registered domain: {domain_name}")
-    
-    def register_architecture(
-        self,
-        arch_id: str,
-        architecture_config: Dict[str, Any],
-        source_domain: str,
-        performance: float
-    ):
-        """Register an architecture with its source domain"""
-        # Create architecture embedding from config
-        embedding = self._config_to_embedding(architecture_config)
-        embedding = np.append(embedding, performance)
-        
-        self.architecture_embeddings[arch_id] = {
-            'embedding': embedding,
-            'source_domain': source_domain,
-            'performance': performance
-        }
-        
-        logger.debug(f"Registered architecture: {arch_id}")
-    
-    def predict_transfer_performance(
-        self,
-        arch_id: str,
-        target_domain: str
-    ) -> Dict[str, Any]:
-        """
-        Predict architecture performance in target domain.
-        
-        Uses domain similarity and architecture characteristics.
-        """
-        if arch_id not in self.architecture_embeddings:
-            return {'error': 'Architecture not registered'}
-        
-        if target_domain not in self.domain_embeddings:
-            return {'error': 'Target domain not registered'}
-        
-        arch_info = self.architecture_embeddings[arch_id]
-        source_domain = arch_info['source_domain']
-        source_performance = arch_info['performance']
-        
-        # Calculate domain similarity
-        if source_domain in self.domain_embeddings:
-            source_embedding = self.domain_embeddings[source_domain]
-            target_embedding = self.domain_embeddings[target_domain]
-            
-            similarity = self._cosine_similarity(source_embedding, target_embedding)
-        else:
-            similarity = 0.5
-        
-        # Predict performance with similarity-based decay
-        predicted_performance = source_performance * similarity
-        
-        # Calculate confidence
-        confidence = similarity * 0.8  # Scale confidence
-        
-        prediction = {
-            'arch_id': arch_id,
-            'source_domain': source_domain,
-            'target_domain': target_domain,
-            'source_performance': source_performance,
-            'domain_similarity': similarity,
-            'predicted_performance': predicted_performance,
-            'confidence': confidence,
-            'transferable': similarity > 0.5,
-            'recommendation': (
-                f"Transfer {'recommended' if similarity > 0.7 else 'possible' if similarity > 0.5 else 'not recommended'}"
-                f" (similarity: {similarity:.2f})"
-            )
-        }
-        
-        return prediction
-    
-    def find_best_architecture(
-        self,
-        target_domain: str,
-        top_k: int = 3
-    ) -> List[Dict[str, Any]]:
-        """
-        Find best architectures for target domain.
-        
-        Uses zero-shot transfer prediction.
-        """
-        predictions = []
-        
-        for arch_id in self.architecture_embeddings:
-            pred = self.predict_transfer_performance(arch_id, target_domain)
-            if 'error' not in pred:
-                predictions.append(pred)
-        
-        # Sort by predicted performance
-        predictions.sort(
-            key=lambda p: p['predicted_performance'],
-            reverse=True
-        )
-        
-        return predictions[:top_k]
-    
-    def _config_to_embedding(self, config: Dict[str, Any]) -> np.ndarray:
-        """Convert architecture config to embedding"""
-        embedding = []
-        
-        # Extract numerical features
-        for key, value in sorted(config.items()):
-            if isinstance(value, (int, float)):
-                embedding.append(float(value))
-            elif isinstance(value, bool):
-                embedding.append(1.0 if value else 0.0)
-            elif isinstance(value, list):
-                embedding.extend([float(v) if isinstance(v, (int, float)) else 0.0 for v in value[:5]])
-        
-        # Pad to fixed length
-        while len(embedding) < 20:
-            embedding.append(0.0)
-        
-        return np.array(embedding[:20])
-    
-    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        """Calculate cosine similarity"""
-        min_len = min(len(a), len(b))
-        a = a[:min_len]
-        b = b[:min_len]
-        
-        dot = np.dot(a, b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        
-        if norm_a > 0 and norm_b > 0:
-            return max(0, dot / (norm_a * norm_b))
-        return 0.5
-    
-    def record_transfer_result(
-        self,
-        arch_id: str,
-        target_domain: str,
-        actual_performance: float,
-        predicted_performance: float
-    ):
-        """Record actual transfer result for accuracy tracking"""
-        error = abs(actual_performance - predicted_performance)
-        self.transfer_success_rate.append({
-            'arch_id': arch_id,
-            'target_domain': target_domain,
-            'error': error,
-            'accurate': error < 0.1
-        })
-    
-    def get_transfer_accuracy(self) -> float:
-        """Get transfer prediction accuracy"""
-        if not self.transfer_success_rate:
-            return 0.5
-        
-        return np.mean([1.0 if r['accurate'] else 0.0 for r in self.transfer_success_rate])
-
-
-# ============================================================================
-# Evolutionary Strategies (ES)
-# ============================================================================
-
-class EvolutionaryStrategies:
-    """
-    Evolutionary Strategies for population-based optimization.
-    
-    Uses natural evolution strategies (NES) for efficient
-    black-box optimization of gate architectures.
-    """
-    
-    def __init__(
-        self,
-        population_size: int = 50,
-        sigma: float = 0.1,
-        learning_rate: float = 0.01
-    ):
-        self.population_size = population_size
-        self.sigma = sigma
-        self.learning_rate = learning_rate
-        
-        # Population
-        self.mean_weights: Optional[np.ndarray] = None
-        self.fitness_history: deque = deque(maxlen=1000)
-        self.generation = 0
-        
-        logger.info(f"Evolutionary Strategies initialized: pop={population_size}, σ={sigma}")
-    
-    def initialize(self, num_parameters: int):
-        """Initialize population mean"""
-        self.mean_weights = np.random.randn(num_parameters) * 0.01
-        logger.info(f"ES initialized with {num_parameters} parameters")
-    
-    def ask(self) -> List[np.ndarray]:
-        """
-        Generate population by sampling around mean.
-        
-        Returns list of perturbed parameter vectors.
-        """
-        population = []
-        
-        for _ in range(self.population_size):
-            # Sample perturbation
-            epsilon = np.random.randn(len(self.mean_weights))
-            
-            # Create candidate
-            candidate = self.mean_weights + self.sigma * epsilon
-            population.append(candidate)
-        
-        return population
-    
-    def tell(
-        self,
-        population: List[np.ndarray],
-        fitnesses: List[float]
-    ):
-        """
-        Update mean using fitness-weighted gradient.
-        
-        Uses natural gradient estimation.
-        """
-        if len(population) != len(fitnesses):
-            return
-        
-        # Normalize fitnesses
-        fitnesses = np.array(fitnesses)
-        fitnesses = (fitnesses - np.mean(fitnesses)) / (np.std(fitnesses) + 1e-8)
-        
-        # Compute gradient estimate
-        gradient = np.zeros_like(self.mean_weights)
-        
-        for candidate, fitness in zip(population, fitnesses):
-            # Reconstruct epsilon
-            epsilon = (candidate - self.mean_weights) / self.sigma
-            gradient += fitness * epsilon
-        
-        gradient /= (len(population) * self.sigma)
-        
-        # Update mean
-        self.mean_weights += self.learning_rate * gradient
-        
-        # Record fitness
-        self.fitness_history.append({
-            'generation': self.generation,
-            'mean_fitness': np.mean(fitnesses),
-            'max_fitness': np.max(fitnesses),
-            'min_fitness': np.min(fitnesses)
-        })
-        
-        self.generation += 1
-    
-    def get_best(self) -> np.ndarray:
-        """Get current best (mean) parameters"""
-        return self.mean_weights
-    
-    def adapt_sigma(self, success_rate: float):
-        """
-        Adapt mutation strength based on success rate.
-        
-        Increase sigma if too many successes, decrease if too few.
-        """
-        target_success_rate = 0.2  # 1/5 rule
-        
-        if success_rate > target_success_rate:
-            self.sigma *= 1.1
-        else:
-            self.sigma *= 0.9
-        
-        self.sigma = max(0.01, min(1.0, self.sigma))
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get ES statistics"""
-        recent = list(self.fitness_history)[-50:]
-        
-        return {
-            'generation': self.generation,
-            'population_size': self.population_size,
-            'sigma': self.sigma,
-            'mean_fitness': np.mean([r['mean_fitness'] for r in recent]) if recent else 0,
-            'max_fitness': np.max([r['max_fitness'] for r in recent]) if recent else 0
-        }
-
-
-# ============================================================================
-# Hypernetwork-Based Adaptation
-# ============================================================================
-
-class HypernetworkAdapter(nn.Module):
-    """
-    Hypernetwork for rapid weight generation.
-    
-    Generates gate network weights based on task context.
-    """
-    
-    def __init__(
-        self,
-        context_dim: int,
-        target_weight_shapes: List[Tuple[int, ...]],
-        hidden_dim: int = 128
-    ):
-        super().__init__()
-        self.context_dim = context_dim
-        self.target_shapes = target_weight_shapes
-        self.total_params = sum(np.prod(s) for s in target_weight_shapes)
-        
-        # Hypernetwork
-        self.hypernet = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, self.total_params)
-        )
-        
-        # Chunk sizes for splitting output
-        self.chunk_sizes = [int(np.prod(s)) for s in target_weight_shapes]
-        
-        logger.info(
-            f"Hypernetwork Adapter initialized: "
-            f"context_dim={context_dim}, total_params={self.total_params}"
-        )
-    
-    def forward(
-        self,
-        context: torch.Tensor
-    ) -> List[torch.Tensor]:
-        """
-        Generate weights from context.
-        
-        Args:
-            context: Task context embedding [B, context_dim]
-            
-        Returns:
-            List of weight tensors matching target shapes
-        """
-        # Generate flat parameters
-        flat_params = self.hypernet(context)
-        
-        # Split into target shapes
-        weights = []
-        start = 0
-        
-        for shape in self.target_shapes:
-            size = int(np.prod(shape))
-            chunk = flat_params[:, start:start + size]
-            weights.append(chunk.view(-1, *shape))
-            start += size
-        
-        return weights
-    
-    def generate_gate_weights(
-        self,
-        task_context: Dict[str, Any]
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Generate complete gate network weights for a task.
-        
-        Enables rapid adaptation without gradient steps.
-        """
-        # Create context embedding
-        context = self._create_context_embedding(task_context)
-        
-        # Generate weights
-        with torch.no_grad():
-            weights = self.forward(context.unsqueeze(0))
-        
-        # Map to weight dictionary
-        weight_dict = {}
-        for i, (shape, weight) in enumerate(zip(self.target_shapes, weights)):
-            weight_dict[f'layer_{i}'] = weight.squeeze(0)
-        
-        return weight_dict
-    
-    def _create_context_embedding(
-        self,
-        task_context: Dict[str, Any]
-    ) -> torch.Tensor:
-        """Create context embedding from task context"""
-        features = [
-            task_context.get('complexity', 0.5),
-            task_context.get('carbon_zone', 0) / 15.0,
-            task_context.get('helium_scarcity', 0.5),
-            task_context.get('latency_budget_ms', 100) / 1000.0,
-            task_context.get('data_size_mb', 1.0) / 1000.0,
-            task_context.get('renewable_percent', 0.0),
-            task_context.get('time_of_day', 12) / 24.0,
-            task_context.get('historical_success_rate', 0.9)
-        ]
-        
-        # Pad to context_dim
-        while len(features) < self.context_dim:
-            features.append(0.0)
-        
-        return torch.tensor(features[:self.context_dim], dtype=torch.float32)
-
-
-# ============================================================================
-# Self-Supervised Pretraining
-# ============================================================================
-
-class SelfSupervisedPretrainer:
-    """
-    Self-supervised pretraining for better gate initialization.
-    
-    Uses contrastive learning on routing patterns.
-    """
-    
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 128,
-        temperature: float = 0.07
-    ):
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.temperature = temperature
-        
-        # Encoder network
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 64)  # Projection head
-        )
-        
-        # Pretraining optimizer
-        self.optimizer = torch.optim.Adam(
-            self.encoder.parameters(), lr=0.001
-        )
-        
-        # Pretraining history
-        self.pretrain_losses: deque = deque(maxlen=1000)
-        self.is_pretrained = False
-        
-        logger.info(f"Self-Supervised Pretrainer initialized: dim={input_dim}")
-    
-    def augment_sample(
-        self,
-        sample: torch.Tensor,
-        noise_std: float = 0.1
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Create two augmented views of the same sample.
-        
-        Used for contrastive learning.
-        """
-        # View 1: Add Gaussian noise
-        view1 = sample + torch.randn_like(sample) * noise_std
-        
-        # View 2: Dropout-style masking
-        mask = torch.bernoulli(torch.ones_like(sample) * 0.8)
-        view2 = sample * mask + torch.randn_like(sample) * noise_std * (1 - mask)
-        
-        return view1, view2
-    
-    def contrastive_loss(
-        self,
-        z1: torch.Tensor,
-        z2: torch.Tensor,
-        temperature: Optional[float] = None
-    ) -> torch.Tensor:
-        """
-        Compute NT-Xent contrastive loss.
-        
-        Args:
-            z1, z2: Encoded representations [B, D]
-        """
-        if temperature is None:
-            temperature = self.temperature
-        
-        batch_size = z1.size(0)
-        
-        # Normalize representations
-        z1 = F.normalize(z1, dim=-1)
-        z2 = F.normalize(z2, dim=-1)
-        
-        # Concatenate
-        z = torch.cat([z1, z2], dim=0)  # [2B, D]
-        
-        # Compute similarity matrix
-        sim = torch.matmul(z, z.T) / temperature  # [2B, 2B]
-        
-        # Create labels (positive pairs)
-        labels = torch.arange(batch_size)
-        labels = torch.cat([labels + batch_size, labels], dim=0)
-        
-        # Mask out self-similarity
-        mask = torch.eye(2 * batch_size, dtype=torch.bool)
-        sim = sim.masked_fill(mask, -float('inf'))
-        
-        # Compute loss
-        loss = F.cross_entropy(sim, labels)
-        
-        return loss
-    
-    def pretrain(
-        self,
-        samples: List[torch.Tensor],
-        epochs: int = 100,
-        batch_size: int = 32
-    ):
-        """
-        Pretrain encoder using contrastive learning.
-        
-        Learns useful representations without labels.
-        """
-        if len(samples) < batch_size:
-            logger.warning(f"Insufficient samples for pretraining: {len(samples)}")
-            return
-        
-        self.encoder.train()
-        
-        for epoch in range(epochs):
-            epoch_loss = 0.0
-            num_batches = 0
-            
-            # Shuffle samples
-            indices = np.random.permutation(len(samples))
-            
-            for i in range(0, len(samples) - batch_size, batch_size):
-                batch_indices = indices[i:i + batch_size]
-                batch = torch.stack([samples[j] for j in batch_indices])
-                
-                # Create augmented views
-                view1, view2 = self.augment_sample(batch)
-                
-                # Encode
-                z1 = self.encoder(view1)
-                z2 = self.encoder(view2)
-                
-                # Compute loss
-                loss = self.contrastive_loss(z1, z2)
-                
-                # Update
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                num_batches += 1
-            
-            avg_loss = epoch_loss / max(num_batches, 1)
-            self.pretrain_losses.append(avg_loss)
-            
-            if (epoch + 1) % 20 == 0:
-                logger.info(f"Pretraining epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}")
-        
-        self.is_pretrained = True
-        logger.info("Pretraining complete")
-    
-    def get_pretrained_weights(self) -> Dict[str, torch.Tensor]:
-        """Get pretrained encoder weights for initialization"""
-        return {
-            name: param.data.clone()
-            for name, param in self.encoder.named_parameters()
-        }
-    
-    def initialize_from_pretrained(
-        self,
-        target_network: nn.Module
-    ):
-        """
-        Initialize target network with pretrained weights.
-        
-        Transfers learned representations.
-        """
-        if not self.is_pretrained:
-            logger.warning("Not pretrained, skipping initialization")
-            return
-        
-        pretrained_state = self.encoder.state_dict()
-        
-        # Transfer compatible layers
-        target_state = target_network.state_dict()
-        
-        for name, param in target_state.items():
-            if name in pretrained_state:
-                if param.shape == pretrained_state[name].shape:
-                    target_state[name] = pretrained_state[name]
-                    logger.debug(f"Transferred pretrained weights: {name}")
-        
-        target_network.load_state_dict(target_state)
-        
-        logger.info("Initialized target network with pretrained weights")
-
-
-# ============================================================================
-# Multi-Fidelity Optimization
-# ============================================================================
-
-class MultiFidelityOptimizer:
-    """
-    Multi-fidelity optimization for efficient architecture search.
-    
-    Uses low-fidelity proxies before full evaluation:
-    - Fidelity 0: NTK analysis (fastest)
-    - Fidelity 1: Few-shot training (fast)
-    - Fidelity 2: Reduced data training (medium)
-    - Fidelity 3: Full training (slowest)
-    """
-    
-    def __init__(
-        self,
-        ntk_analyzer: Optional[NeuralTangentKernelAnalyzer] = None,
-        max_fidelity_budget: float = 100.0
-    ):
-        self.ntk_analyzer = ntk_analyzer
-        self.max_fidelity_budget = max_fidelity_budget
-        self.fidelity_costs = {
-            0: 0.1,   # NTK analysis
-            1: 1.0,   # Few-shot
-            2: 5.0,   # Reduced data
-            3: 20.0   # Full training
-        }
-        self.fidelity_history: deque = deque(maxlen=1000)
-        self.budget_spent = 0.0
-        
-        logger.info(f"Multi-Fidelity Optimizer initialized: budget={max_fidelity_budget}")
-    
-    def select_fidelity(
-        self,
-        architecture: nn.Module,
-        remaining_budget: float,
-        uncertainty_threshold: float = 0.3
-    ) -> int:
-        """
-        Select appropriate fidelity level for evaluation.
-        
-        Uses successive halving with Bayesian optimization.
-        """
-        if self.ntk_analyzer and remaining_budget > self.fidelity_costs[0]:
-            # Start with NTK analysis
-            return 0
-        elif remaining_budget > self.fidelity_costs[1]:
-            # Few-shot evaluation
-            return 1
-        elif remaining_budget > self.fidelity_costs[2]:
-            # Reduced data evaluation
-            return 2
-        elif remaining_budget > self.fidelity_costs[3]:
-            # Full evaluation
-            return 3
-        else:
-            return -1  # No budget
-    
-    def should_promote(
-        self,
-        fidelity: int,
-        performance: float,
-        threshold: float
-    ) -> bool:
-        """
-        Determine if architecture should be promoted to higher fidelity.
-        
-        Uses performance prediction and uncertainty.
-        """
-        if fidelity >= 3:
-            return False  # Already at highest
-        
-        # Performance thresholds for promotion
-        promotion_thresholds = {
-            0: 0.6,  # NTK: promote if trainability > 0.6
-            1: 0.7,  # Few-shot: promote if accuracy > 0.7
-            2: 0.8,  # Reduced: promote if accuracy > 0.8
-        }
-        
-        return performance > promotion_thresholds.get(fidelity, 0.5)
-    
-    def evaluate_fidelity(
-        self,
-        architecture: nn.Module,
-        fidelity: int,
-        sample_input: Optional[torch.Tensor] = None
-    ) -> Dict[str, Any]:
-        """
-        Evaluate architecture at given fidelity level.
-        """
-        cost = self.fidelity_costs.get(fidelity, 1.0)
-        self.budget_spent += cost
-        
-        result = {
-            'fidelity': fidelity,
-            'cost': cost,
-            'budget_remaining': self.max_fidelity_budget - self.budget_spent
-        }
-        
-        if fidelity == 0 and self.ntk_analyzer and sample_input is not None:
-            # NTK analysis
-            ntk_result = self.ntk_analyzer.predict_trainability(
-                architecture, sample_input
-            )
-            result['performance'] = ntk_result['trainability_score']
-            result['ntk_result'] = ntk_result
-        
-        elif fidelity == 1:
-            # Few-shot evaluation (simulated)
-            result['performance'] = np.random.beta(5, 5)  # Placeholder
-        
-        elif fidelity == 2:
-            # Reduced data evaluation (simulated)
-            result['performance'] = np.random.beta(6, 4)
-        
-        elif fidelity == 3:
-            # Full evaluation (simulated)
-            result['performance'] = np.random.beta(7, 3)
-        
-        self.fidelity_history.append(result)
-        
-        return result
-    
-    def optimize(
-        self,
-        candidates: List[nn.Module],
-        sample_input: Optional[torch.Tensor] = None,
-        top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Multi-fidelity optimization of candidates.
-        
-        Efficiently finds best architectures within budget.
-        """
-        results = []
-        remaining = candidates.copy()
-        fidelity = 0
-        
-        while remaining and self.budget_spent < self.max_fidelity_budget:
-            next_fidelity = self.select_fidelity(
-                remaining[0] if remaining else None,
-                self.max_fidelity_budget - self.budget_spent
-            )
-            
-            if next_fidelity < 0:
-                break
-            
-            fidelity = next_fidelity
-            
-            # Evaluate all remaining at this fidelity
-            for arch in remaining:
-                result = self.evaluate_fidelity(arch, fidelity, sample_input)
-                result['architecture'] = arch
-                results.append(result)
-            
-            # Filter: keep only promising candidates
-            if fidelity < 3:
-                remaining = [
-                    r['architecture'] for r in results[-len(remaining):]
-                    if self.should_promote(fidelity, r['performance'], 0.5)
-                ]
-            else:
-                break
-            
-            fidelity += 1
-        
-        # Sort by performance
-        results.sort(key=lambda r: r.get('performance', 0), reverse=True)
-        
-        return results[:top_k]
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get multi-fidelity optimization statistics"""
-        return {
-            'total_budget': self.max_fidelity_budget,
-            'budget_spent': self.budget_spent,
-            'budget_remaining': self.max_fidelity_budget - self.budget_spent,
-            'evaluations_per_fidelity': {
-                f: sum(1 for r in self.fidelity_history if r['fidelity'] == f)
-                for f in range(4)
-            },
-            'total_evaluations': len(self.fidelity_history)
-        }
-
-
-# ============================================================================
-# Enhanced Self-Evolving Gate with All Integrations
+# Enhanced Self-Evolving Gate with Complete Bio-Inspired Integration
 # ============================================================================
 
 class EnhancedSelfEvolvingGate(nn.Module):
     """
-    Enhanced Self-Evolving Gate v3.0.0
+    Enhanced Self-Evolving Gate v4.0.0 - Metabolic Evolution Engine
     
-    New capabilities:
-    - Meta-Gradient Learning
-    - NTK Analysis for architecture prediction
-    - Zero-Shot Architecture Transfer
-    - Evolutionary Strategies
-    - Hypernetwork-Based Adaptation
-    - Self-Supervised Pretraining
-    - Multi-Fidelity Optimization
+    Complete bio-inspired integration:
+    - Token-efficiency fitness scoring
+    - Gradient-driven evolution pressure
+    - ATP-driven plasticity control
+    - Harvester signal quality for drift detection
+    - Biomass-backed task prototype storage
+    - Compartment inheritance for weight transfer
+    - Gradient field environmental encoding
+    - Token-modulated exploration rate
     """
     
     def __init__(
@@ -1175,25 +89,32 @@ class EnhancedSelfEvolvingGate(nn.Module):
         input_dim: int,
         num_experts: int,
         hidden_dim: int = 128,
-        enable_meta_gradient: bool = True,
-        enable_ntk: bool = True,
-        enable_zero_shot: bool = True,
-        enable_es: bool = True,
-        enable_hypernetwork: bool = True,
-        enable_pretraining: bool = True,
-        enable_multi_fidelity: bool = True
+        adaptation_rate: float = 0.01,
+        enable_meta_learning: bool = True,
+        enable_architecture_search: bool = True,
+        enable_continual_learning: bool = True,
+        enable_generative_replay: bool = True,
+        enable_bio_integration: bool = True,
+        population_size: int = 10,
+        memory_size: int = 10000
     ):
         super().__init__()
-        
         self.input_dim = input_dim
         self.num_experts = num_experts
-        self.enable_meta_gradient = enable_meta_gradient
-        self.enable_ntk = enable_ntk
-        self.enable_zero_shot = enable_zero_shot
-        self.enable_es = enable_es
-        self.enable_hypernetwork = enable_hypernetwork
-        self.enable_pretraining = enable_pretraining
-        self.enable_multi_fidelity = enable_multi_fidelity
+        self.adaptation_rate = adaptation_rate
+        self.enable_meta_learning = enable_meta_learning
+        self.enable_architecture_search = enable_architecture_search
+        self.enable_continual_learning = enable_continual_learning
+        self.enable_generative_replay = enable_generative_replay
+        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        
+        # BIO-INSPIRED: Module references (injected)
+        self.token_manager: Optional[EcoATPTokenManager] = None
+        self.gradient_manager: Optional[GradientFieldManager] = None
+        self.scheduler: Optional[ATPSynthaseScheduler] = None
+        self.compartment_manager: Optional[CompartmentManager] = None
+        self.biomass_storage: Optional[BiomassStorage] = None
+        self.harvester: Optional[PhotosyntheticHarvester] = None
         
         # Core gate network
         self.gate_network = nn.Sequential(
@@ -1206,227 +127,705 @@ class EnhancedSelfEvolvingGate(nn.Module):
             nn.Linear(hidden_dim, num_experts)
         )
         
-        # New sub-modules
-        self.meta_learner = MetaGradientLearner(input_dim) if enable_meta_gradient else None
-        self.ntk_analyzer = NeuralTangentKernelAnalyzer() if enable_ntk else None
-        self.zero_shot = ZeroShotArchitectureTransfer() if enable_zero_shot else None
-        self.es_optimizer = EvolutionaryStrategies() if enable_es else None
-        self.hypernetwork = (
-            HypernetworkAdapter(
-                context_dim=8,
-                target_weight_shapes=[
-                    (hidden_dim, input_dim),
-                    (hidden_dim,),
-                    (hidden_dim, hidden_dim),
-                    (hidden_dim,),
-                    (num_experts, hidden_dim),
-                    (num_experts,)
-                ]
-            ) if enable_hypernetwork else None
-        )
-        self.pretrainer = SelfSupervisedPretrainer(input_dim) if enable_pretraining else None
-        self.multi_fidelity = (
-            MultiFidelityOptimizer(ntk_analyzer=self.ntk_analyzer)
-            if enable_multi_fidelity else None
+        # Current architecture
+        self.current_architecture = ArchitectureGene(
+            num_layers=3, hidden_dim=hidden_dim, activation='relu',
+            dropout_rate=0.1, use_attention=True, use_residual=True, use_layer_norm=True
         )
         
-        # ES initialization
-        if enable_es:
-            total_params = sum(p.numel() for p in self.gate_network.parameters())
-            self.es_optimizer.initialize(total_params)
+        # Meta-learning module
+        if enable_meta_learning:
+            self.meta_learner = MAMLGate(input_dim, num_experts, hidden_dim)
         
-        # Evolution history
-        self.evolution_history: deque = deque(maxlen=10000)
+        # Architecture search
+        if enable_architecture_search:
+            self.architecture_search = ArchitectureSearch(
+                input_dim, num_experts, population_size
+            )
+        
+        # Continual learning
+        if enable_continual_learning:
+            self.ewc = ElasticWeightConsolidation(self.gate_network)
+        
+        # Generative replay
+        if enable_generative_replay:
+            self.replay = GenerativeReplay(input_dim)
+        
+        # Memory buffer
+        self.memory: deque = deque(maxlen=memory_size)
+        
+        # Task prototypes
+        self.task_prototypes: Dict[str, TaskPrototype] = {}
+        
+        # Concept drift detection
+        self.concept_drift_detector = EnhancedConceptDriftDetector()
+        
+        # Environmental encoder
+        self.environmental_encoder = EnhancedEnvironmentalEncoder(input_dim)
+        
+        # Performance tracking
+        self.performance_history: List[Dict] = []
+        self.adaptation_history: List[Dict] = []
+        
+        # Optimizer
+        self.optimizer = torch.optim.Adam(self.gate_network.parameters(), lr=adaptation_rate)
+        
+        # BIO-INSPIRED: Plasticity control (ATP-driven)
+        self.plasticity = 0.5
+        self.plasticity_decay = 0.999
+        
+        # BIO-INSPIRED: Evolution tracking
+        self.evolution_generation: int = 0
+        self.token_fitness_history: deque = deque(maxlen=1000)
+        self.gradient_pressure_history: deque = deque(maxlen=1000)
+        
+        # BIO-INSPIRED: Biomass prototype tokens
+        self.biomass_prototype_tokens: Dict[str, str] = {}
         
         logger.info(
-            f"Enhanced Self-Evolving Gate v3.0.0 initialized: "
-            f"meta_grad={enable_meta_gradient}, ntk={enable_ntk}, "
-            f"zero_shot={enable_zero_shot}, es={enable_es}, "
-            f"hypernet={enable_hypernetwork}, pretrain={enable_pretraining}, "
-            f"multi_fidelity={enable_multi_fidelity}"
+            f"Enhanced Self-Evolving Gate v4.0.0 initialized: "
+            f"bio_integration={self.enable_bio_integration}, "
+            f"bio_available={BIO_INSPIRED_AVAILABLE}"
         )
+    
+    # ========================================================================
+    # Bio-Inspired Module Injection
+    # ========================================================================
+    
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        """
+        Inject bio-inspired modules for evolution optimization.
+        
+        Connects self-evolving gates to real bio-inspired systems.
+        """
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        
+        injections = {
+            'token_manager': self.token_manager is not None,
+            'gradient_manager': self.gradient_manager is not None,
+            'scheduler': self.scheduler is not None,
+            'compartment_manager': self.compartment_manager is not None,
+            'biomass_storage': self.biomass_storage is not None,
+            'harvester': self.harvester is not None
+        }
+        logger.info(f"Bio-inspired injections into Self-Evolving Gates: {injections}")
+        
+        if any(injections.values()):
+            self.enable_bio_integration = True
+    
+    # ========================================================================
+    # Bio-Inspired Data Access Methods
+    # ========================================================================
+    
+    def _get_token_efficiency_fitness(self) -> float:
+        """Get fitness based on token efficiency from token manager"""
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            return summary.get('system_efficiency', 0.5)
+        return 0.5
+    
+    def _get_gradient_evolution_pressure(self) -> float:
+        """
+        Get evolution pressure from carbon gradient.
+        
+        Higher carbon stress = higher evolution pressure = faster adaptation.
+        """
+        if self.gradient_manager:
+            carbon = self.gradient_manager.fields.get('carbon')
+            if carbon:
+                return carbon.gradient_strength
+        return 0.3
+    
+    def _get_atp_driven_plasticity(self) -> float:
+        """
+        Get plasticity based on ATP availability.
+        
+        More energy = more plasticity = more learning.
+        """
+        if self.scheduler:
+            driving_force = self.scheduler.calculate_gradient_driving_force()
+            rotation_speed = self.scheduler.calculate_rotation_speed(driving_force)
+            ecoatp_rate = self.scheduler.calculate_atp_production_rate(rotation_speed)
+            
+            if ecoatp_rate > 100:
+                return 1.0  # Full plasticity when energy abundant
+            elif ecoatp_rate > 50:
+                return 0.7  # Moderate plasticity
+            else:
+                return 0.3  # Low plasticity when energy scarce
+        
+        return self.plasticity
+    
+    def _get_harvester_drift_confidence(self) -> float:
+        """Get drift detection confidence from photosynthetic harvester"""
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            recent = stats.get('recent_conversions', [])
+            if recent:
+                return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
+        return 0.5
+    
+    def _store_task_prototype_in_biomass(self, prototype: Dict[str, Any]) -> Optional[str]:
+        """
+        Store task prototype in biomass storage.
+        
+        Task prototypes are preserved as long-term knowledge.
+        """
+        if self.biomass_storage:
+            stored, token_id = self.biomass_storage.store_task(
+                task_data=prototype,
+                ecoatp_cost=2.0,
+                guarantee=GuaranteeLevel.SILVER,
+                initial_tier=StorageTier.STARCH_RESERVE
+            )
+            if stored:
+                return token_id
+        return None
+    
+    def _get_compartment_inheritance_strength(self) -> float:
+        """Get inheritance strength from compartment health"""
+        if self.compartment_manager:
+            compartment = self.compartment_manager.find_best_compartment('data')
+            if compartment:
+                return compartment.health_score
+        return 0.5
+    
+    def _get_gradient_encoded_environment(self) -> Dict[str, float]:
+        """
+        Get gradient-encoded environmental state.
+        
+        All gradient fields encode the current environmental condition.
+        """
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+    
+    def _get_token_modulated_exploration(self) -> float:
+        """
+        Get exploration rate modulated by token availability.
+        
+        More tokens = more exploration (can afford to try new things).
+        """
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            balance = summary.get('total_balance', 500)
+            if balance > 500:
+                return 0.3  # More exploration when tokens abundant
+            elif balance > 200:
+                return 0.15  # Moderate exploration
+            else:
+                return 0.05  # Less exploration when tokens scarce
+        return 0.1
+    
+    def _get_harvester_opportunity_signal(self) -> float:
+        """Get opportunity signal from harvester for architecture search timing"""
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            total = stats.get('total_harvested', 0)
+            return min(1.0, total / 1000.0)
+        return 0.3
+    
+    # ========================================================================
+    # Enhanced Forward Pass with Bio-Inspired Modulation
+    # ========================================================================
     
     def forward(
         self,
         x: torch.Tensor,
-        task_context: Optional[Dict[str, Any]] = None,
-        use_hypernetwork: bool = False
+        task_id: Optional[str] = None,
+        training: bool = False,
+        environmental_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Enhanced forward pass with all integrations.
+        Enhanced forward pass with bio-inspired self-evolution.
+        
+        Features:
+        - ATP-driven plasticity control
+        - Gradient-encoded environmental context
+        - Token-modulated exploration
         """
         metadata = {}
         
-        # Option 1: Use hypernetwork for rapid adaptation
-        if use_hypernetwork and self.enable_hypernetwork and task_context:
-            hyper_weights = self.hypernetwork.generate_gate_weights(task_context)
-            
-            # Apply hypernetwork-generated weights temporarily
-            original_weights = {
-                name: param.data.clone()
-                for name, param in self.gate_network.named_parameters()
-            }
-            
-            # Set hypernetwork weights
-            for name, param in self.gate_network.named_parameters():
-                if name.replace('.', '_') in hyper_weights:
-                    param.data = hyper_weights[name.replace('.', '_')]
-            
-            # Forward pass
-            output = self.gate_network(x)
-            
-            # Restore original weights
-            for name, param in self.gate_network.named_parameters():
-                if name in original_weights:
-                    param.data = original_weights[name]
-            
-            metadata['hypernetwork_adapted'] = True
+        # BIO-INSPIRED: Update plasticity from ATP availability
+        if self.enable_bio_integration and training:
+            self.plasticity = self._get_atp_driven_plasticity()
+            metadata['plasticity'] = self.plasticity
+        
+        # BIO-INSPIRED: Encode environmental context with gradient fields
+        if self.enable_bio_integration and environmental_context is None:
+            environmental_context = self._get_gradient_encoded_environment()
+            metadata['gradient_encoded'] = True
+        
+        # Check for concept drift
+        drift_detected = self.concept_drift_detector.check_drift(x)
+        metadata['drift_detected'] = drift_detected
+        
+        # BIO-INSPIRED: Modulate drift detection with harvester confidence
+        if self.enable_bio_integration:
+            harvester_conf = self._get_harvester_drift_confidence()
+            if harvester_conf < 0.3 and not drift_detected:
+                # Low confidence from harvester - increase drift sensitivity
+                drift_detected = True
+                metadata['harvester_amplified_drift'] = True
+        
+        # Apply plasticity control
+        if training and self.plasticity < 1.0:
+            for param in self.gate_network.parameters():
+                if param.grad is not None:
+                    param.grad *= self.plasticity
+        
+        # Encode environmental context if available
+        if environmental_context:
+            env_features = self.environmental_encoder(environmental_context)
+            if x.dim() == 1:
+                x = torch.cat([x, env_features])
+            else:
+                x = torch.cat([x, env_features.unsqueeze(0).expand(x.size(0), -1)], dim=-1)
+        
+        # Forward pass with optional meta-learning
+        if self.enable_meta_learning and task_id:
+            weights = self.meta_learner(x, task_id)
+            metadata['meta_adapted'] = True
         else:
-            # Standard forward pass
-            output = self.gate_network(x)
-        
-        # Get routing weights
-        weights = F.softmax(output, dim=-1)
-        
-        # Predict learning parameters if meta-gradient enabled
-        if self.enable_meta_gradient:
-            grad_norm = torch.norm(
-                torch.cat([p.grad.flatten() for p in self.gate_network.parameters() if p.grad is not None])
-            ).item() if any(p.grad is not None for p in self.gate_network.parameters()) else 0.0
+            logits = self.gate_network(x)
             
-            task_embedding = self._get_task_embedding(task_context) if task_context else torch.zeros(self.input_dim)
+            # BIO-INSPIRED: Token-modulated exploration noise
+            if training and self.enable_bio_integration:
+                exploration = self._get_token_modulated_exploration()
+                noise_std = 0.1 * self.plasticity * exploration
+                noise = torch.randn_like(logits) * noise_std
+                logits = logits + noise
+                metadata['token_exploration'] = exploration
+            elif training:
+                noise_std = 0.1 * self.plasticity
+                noise = torch.randn_like(logits) * noise_std
+                logits = logits + noise
             
-            learning_params = self.meta_learner.predict_learning_params(
-                grad_norm, 0.0, 0, task_embedding
-            )
-            metadata['learning_params'] = learning_params
+            weights = F.softmax(logits, dim=-1)
         
-        # NTK analysis if enabled
-        if self.enable_ntk and not self.training:
-            ntk_prediction = self.ntk_analyzer.predict_trainability(
-                self.gate_network, x
-            )
-            metadata['ntk_prediction'] = ntk_prediction
-        
+        # Calculate metadata
         metadata['entropy'] = -(weights * torch.log(weights + 1e-8)).sum(dim=-1).mean().item()
         metadata['confidence'] = weights.max(dim=-1)[0].mean().item()
+        metadata['plasticity'] = self.plasticity
+        
+        # BIO-INSPIRED: Add bio metrics
+        if self.enable_bio_integration:
+            metadata['token_fitness'] = self._get_token_efficiency_fitness()
+            metadata['evolution_pressure'] = self._get_gradient_evolution_pressure()
+            metadata['harvester_confidence'] = self._get_harvester_drift_confidence()
         
         return weights, metadata
     
-    def _get_task_embedding(self, task_context: Dict[str, Any]) -> torch.Tensor:
-        """Create task embedding from context"""
-        if not task_context:
-            return torch.zeros(self.input_dim)
-        
-        features = [
-            task_context.get('complexity', 0.5),
-            task_context.get('carbon_zone', 0) / 15.0,
-            task_context.get('helium_scarcity', 0.5),
-            task_context.get('latency_budget_ms', 100) / 1000.0,
-            task_context.get('data_size_mb', 1.0) / 1000.0
-        ]
-        
-        # Pad to input_dim
-        while len(features) < self.input_dim:
-            features.append(0.0)
-        
-        return torch.tensor(features[:self.input_dim], dtype=torch.float32)
+    # ========================================================================
+    # Enhanced Adaptation with Bio-Inspired Feedback
+    # ========================================================================
     
-    def evolve_with_es(
+    def adapt(
         self,
-        fitness_function: Callable,
-        generations: int = 10
+        state: torch.Tensor,
+        chosen_expert: int,
+        reward: float,
+        environmental_feedback: Dict[str, Any],
+        task_id: Optional[str] = None
     ):
-        """Evolve gate using Evolutionary Strategies"""
-        if not self.enable_es:
+        """
+        Enhanced adaptation with bio-inspired feedback loops.
+        
+        Features:
+        - Token-efficiency weighted learning
+        - Gradient-pressure modulated adaptation speed
+        - Biomass storage for important prototypes
+        - Compartment inheritance tracking
+        """
+        # BIO-INSPIRED: Adjust reward with token efficiency
+        if self.enable_bio_integration:
+            token_fitness = self._get_token_efficiency_fitness()
+            adjusted_reward = reward * (0.5 + 0.5 * token_fitness)
+        else:
+            adjusted_reward = reward
+        
+        # Store in memory
+        self.memory.append({
+            'state': state.detach().clone(),
+            'action': chosen_expert,
+            'reward': adjusted_reward,
+            'environmental': environmental_feedback,
+            'task_id': task_id,
+            'timestamp': datetime.utcnow()
+        })
+        
+        # Update concept drift detector
+        self.concept_drift_detector.update(state)
+        
+        # BIO-INSPIRED: Gradient-pressure modulated learning
+        if self.enable_bio_integration:
+            pressure = self._get_gradient_evolution_pressure()
+            # Higher pressure = learn from fewer experiences
+            min_batch = max(8, int(32 * (1.0 - pressure)))
+        else:
+            min_batch = 32
+        
+        # Policy gradient learning
+        if len(self.memory) >= min_batch:
+            self._policy_gradient_step()
+        
+        # Meta-adaptation for new task
+        if task_id and task_id not in self.task_prototypes:
+            prototype = self._create_task_prototype(task_id, state, adjusted_reward)
+            
+            # BIO-INSPIRED: Store important prototypes in biomass
+            if self.enable_bio_integration and adjusted_reward > 0.7:
+                biomass_token = self._store_task_prototype_in_biomass({
+                    'task_id': task_id,
+                    'prototype': str(prototype)[:500],
+                    'reward': adjusted_reward,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                if biomass_token:
+                    self.biomass_prototype_tokens[task_id] = biomass_token
+        
+        # Continual learning consolidation
+        if self.enable_continual_learning and len(self.memory) % 100 == 0:
+            self._consolidate_knowledge()
+        
+        # Architecture search trigger
+        should_evolve = self.concept_drift_detector.should_evolve_architecture()
+        
+        # BIO-INSPIRED: Modulate architecture search with harvester opportunity
+        if self.enable_bio_integration and not should_evolve:
+            opportunity = self._get_harvester_opportunity_signal()
+            if opportunity > 0.7:
+                should_evolve = True
+                logger.info("Architecture search triggered by harvester opportunity signal")
+        
+        if self.enable_architecture_search and should_evolve:
+            self._evolve_architecture()
+        
+        # BIO-INSPIRED: Update plasticity from ATP
+        if self.enable_bio_integration:
+            self.plasticity = self._get_atp_driven_plasticity()
+        else:
+            self.plasticity *= self.plasticity_decay
+            self.plasticity = max(self.plasticity, 0.1)
+        
+        # Record adaptation
+        self.adaptation_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'reward': adjusted_reward,
+            'expert': chosen_expert,
+            'drift': self.concept_drift_detector.drift_score,
+            'plasticity': self.plasticity,
+            'task_id': task_id,
+            'token_fitness': self._get_token_efficiency_fitness() if self.enable_bio_integration else 0.5,
+            'evolution_pressure': self._get_gradient_evolution_pressure() if self.enable_bio_integration else 0.3
+        })
+        
+        # BIO-INSPIRED: Track token fitness history
+        if self.enable_bio_integration:
+            self.token_fitness_history.append(self._get_token_efficiency_fitness())
+            self.gradient_pressure_history.append(self._get_gradient_evolution_pressure())
+    
+    def _policy_gradient_step(self):
+        """Enhanced policy gradient learning step with bio-inspired weighting"""
+        if len(self.memory) < 8:
             return
         
-        for gen in range(generations):
-            # Generate population
-            population = self.es_optimizer.ask()
-            
-            # Evaluate fitness
-            fitnesses = []
-            for candidate in population:
-                # Set weights
-                self._set_flat_weights(candidate)
-                
-                # Evaluate
-                fitness = fitness_function(self)
-                fitnesses.append(fitness)
-            
-            # Update ES
-            self.es_optimizer.tell(population, fitnesses)
-            
-            # Restore best weights
-            self._set_flat_weights(self.es_optimizer.get_best())
-            
-            # Record evolution
-            self.evolution_history.append({
-                'generation': gen,
-                'mean_fitness': np.mean(fitnesses),
-                'max_fitness': np.max(fitnesses)
-            })
+        batch_size = min(32, len(self.memory))
+        indices = np.random.choice(len(self.memory), batch_size, replace=False)
+        batch = [self.memory[i] for i in indices]
+        
+        # Include generative replay if enabled
+        if self.enable_generative_replay and len(self.memory) > 100:
+            replay_states = self.replay.generate_replay_batch(batch_size // 4)
+        
+        states = torch.stack([b['state'] for b in batch])
+        actions = torch.tensor([b['action'] for b in batch])
+        rewards = torch.tensor([b['reward'] for b in batch])
+        
+        # Normalize rewards
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        
+        logits = self.gate_network(states)
+        probs = F.softmax(logits, dim=-1)
+        action_probs = probs[range(batch_size), actions]
+        
+        pg_loss = -torch.mean(torch.log(action_probs + 1e-8) * rewards)
+        
+        total_loss = pg_loss
+        if self.enable_continual_learning:
+            ewc_loss = self.ewc.ewc_loss()
+            total_loss += ewc_loss * 0.1
+        
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        
+        # Apply plasticity control
+        if self.plasticity < 1.0:
+            for param in self.gate_network.parameters():
+                if param.grad is not None:
+                    param.grad *= self.plasticity
+        
+        torch.nn.utils.clip_grad_norm_(self.gate_network.parameters(), 1.0)
+        self.optimizer.step()
+        
+        self.performance_history.append({
+            'pg_loss': pg_loss.item(),
+            'total_loss': total_loss.item(),
+            'avg_reward': rewards.mean().item()
+        })
     
-    def _set_flat_weights(self, flat_weights: np.ndarray):
-        """Set network weights from flat array"""
-        start = 0
-        for param in self.gate_network.parameters():
-            numel = param.numel()
-            param.data = torch.from_numpy(
-                flat_weights[start:start + numel].reshape(param.shape)
-            ).float()
-            start += numel
+    def _create_task_prototype(
+        self, task_id: str, state: torch.Tensor, reward: float
+    ) -> 'TaskPrototype':
+        """Create prototype for new task with bio-inspired storage"""
+        prototype = TaskPrototype(
+            task_id=task_id,
+            support_set=[(state, torch.tensor(reward))],
+            query_set=[],
+            task_embedding=state.detach().mean(dim=0),
+            difficulty=1.0 - abs(reward),
+            domain="unknown"
+        )
+        
+        self.task_prototypes[task_id] = prototype
+        
+        if self.enable_meta_learning:
+            self.meta_learner.adapt_to_task(prototype.support_set, task_id)
+        
+        return prototype
     
-    def pretrain_if_needed(self, samples: List[torch.Tensor]):
-        """Pretrain if not already done"""
-        if self.enable_pretraining and not self.pretrainer.is_pretrained:
-            logger.info("Starting self-supervised pretraining...")
-            self.pretrainer.pretrain(samples, epochs=50)
-            self.pretrainer.initialize_from_pretrained(self.gate_network)
+    def _consolidate_knowledge(self):
+        """Consolidate knowledge using EWC with bio-inspired weighting"""
+        if not self.enable_continual_learning:
+            return
+        
+        recent = list(self.memory)[-100:]
+        
+        # BIO-INSPIRED: Weight consolidation by token fitness
+        if self.enable_bio_integration:
+            token_fitness = self._get_token_efficiency_fitness()
+            consolidation_strength = 0.5 + 0.5 * token_fitness
+        else:
+            consolidation_strength = 1.0
+        
+        dataloader = [(m['state'], torch.tensor(m['action'])) for m in recent]
+        self.ewc.update_fisher("current_task", dataloader)
+        
+        logger.debug(f"Knowledge consolidated (strength={consolidation_strength:.2f})")
     
-    def predict_transfer(
-        self,
-        target_domain: str
-    ) -> Dict[str, Any]:
-        """Predict transfer performance to new domain"""
-        if self.enable_zero_shot:
-            return self.zero_shot.predict_transfer_performance(
-                f"gate_{id(self)}", target_domain
+    def _evolve_architecture(self):
+        """Evolve gate architecture using NAS with bio-inspired fitness"""
+        if not self.enable_architecture_search:
+            return
+        
+        logger.info("Triggering architecture evolution...")
+        self.evolution_generation += 1
+        
+        # BIO-INSPIRED: Get bio-inspired fitness weighting
+        token_fitness = self._get_token_efficiency_fitness() if self.enable_bio_integration else 0.5
+        evolution_pressure = self._get_gradient_evolution_pressure() if self.enable_bio_integration else 0.3
+        
+        def fitness_function(gene: ArchitectureGene) -> float:
+            temp_net = self._build_network(gene)
+            
+            if len(self.memory) < 10:
+                return 0.5
+            
+            recent = list(self.memory)[-50:]
+            states = torch.stack([m['state'] for m in recent])
+            actions = torch.tensor([m['action'] for m in recent])
+            
+            with torch.no_grad():
+                logits = temp_net(states)
+                preds = logits.argmax(dim=-1)
+                accuracy = (preds == actions).float().mean().item()
+            
+            complexity_penalty = self.architecture_search._calculate_complexity(gene) / 1000
+            
+            # BIO-INSPIRED: Weight fitness by token efficiency and evolution pressure
+            if self.enable_bio_integration:
+                bio_fitness = accuracy - complexity_penalty
+                return bio_fitness * (0.5 + 0.5 * token_fitness) * (0.5 + 0.5 * evolution_pressure)
+            
+            return accuracy - complexity_penalty
+        
+        metrics = self.architecture_search.evolve_generation(fitness_function)
+        
+        best_gene = self.architecture_search.get_best_architecture()
+        if best_gene and best_gene.fitness > self.current_architecture.fitness:
+            logger.info(
+                f"Upgrading architecture (gen {self.evolution_generation}): "
+                f"fitness {self.current_architecture.fitness:.4f} -> {best_gene.fitness:.4f}"
             )
-        return {}
+            
+            new_network = self._build_network(best_gene)
+            self._transfer_weights(self.gate_network, new_network)
+            self.gate_network = new_network
+            self.current_architecture = best_gene
     
-    def get_evolution_stats(self) -> Dict[str, Any]:
-        """Get comprehensive evolution statistics"""
-        stats = {
-            'evolution_generations': len(self.evolution_history)
+    def _build_network(self, architecture: 'ArchitectureGene') -> nn.Module:
+        """Build network from architecture gene"""
+        layers = []
+        in_dim = self.input_dim
+        
+        for i in range(architecture.num_layers):
+            if i == architecture.num_layers - 1:
+                out_dim = self.num_experts
+            else:
+                out_dim = architecture.hidden_dim
+            
+            layers.append(nn.Linear(in_dim, out_dim))
+            
+            if architecture.use_layer_norm and i < architecture.num_layers - 1:
+                layers.append(nn.LayerNorm(out_dim))
+            
+            if i < architecture.num_layers - 1:
+                if architecture.activation == 'relu':
+                    layers.append(nn.ReLU())
+                elif architecture.activation == 'gelu':
+                    layers.append(nn.GELU())
+                elif architecture.activation == 'swish':
+                    layers.append(nn.SiLU())
+                elif architecture.activation == 'leaky_relu':
+                    layers.append(nn.LeakyReLU())
+            
+            if architecture.dropout_rate > 0 and i < architecture.num_layers - 1:
+                layers.append(nn.Dropout(architecture.dropout_rate))
+            
+            in_dim = out_dim
+        
+        return nn.Sequential(*layers)
+    
+    def _transfer_weights(self, old_network: nn.Module, new_network: nn.Module):
+        """Transfer weights with bio-inspired inheritance strength"""
+        old_params = list(old_network.parameters())
+        new_params = list(new_network.parameters())
+        
+        # BIO-INSPIRED: Get inheritance strength from compartment health
+        inheritance_strength = self._get_compartment_inheritance_strength() if self.enable_bio_integration else 1.0
+        
+        for i, new_param in enumerate(new_params):
+            if i < len(old_params):
+                old_param = old_params[i]
+                if old_param.shape == new_param.shape:
+                    # Blend old and new with inheritance strength
+                    new_param.data.copy_(
+                        old_param.data * inheritance_strength +
+                        new_param.data * (1 - inheritance_strength)
+                    )
+                else:
+                    min_dims = [min(o, n) for o, n in zip(old_param.shape, new_param.shape)]
+                    slices = tuple(slice(0, d) for d in min_dims)
+                    new_param.data[slices] = (
+                        old_param.data[slices] * inheritance_strength +
+                        new_param.data[slices] * (1 - inheritance_strength)
+                    )
+    
+    # ========================================================================
+    # Enhanced Statistics with Bio-Inspired Metrics
+    # ========================================================================
+    
+    def get_evolution_metrics(self) -> Dict[str, Any]:
+        """Get comprehensive evolution metrics with bio-inspired data"""
+        metrics = {
+            'current_generation': len(self.adaptation_history),
+            'current_plasticity': self.plasticity,
+            'bio_integration_active': self.enable_bio_integration,
+            'bio_modules_available': BIO_INSPIRED_AVAILABLE,
+            'architecture': {
+                'num_layers': self.current_architecture.num_layers,
+                'hidden_dim': self.current_architecture.hidden_dim,
+                'activation': self.current_architecture.activation,
+                'fitness': self.current_architecture.fitness
+            },
+            'performance': {
+                'recent_rewards': [h['reward'] for h in self.adaptation_history[-100:]],
+                'drift_score': self.concept_drift_detector.drift_score
+            },
+            'learning': {
+                'memory_size': len(self.memory),
+                'task_prototypes': len(self.task_prototypes),
+                'meta_learning_enabled': self.enable_meta_learning,
+                'architecture_search_enabled': self.enable_architecture_search
+            }
         }
         
-        if self.enable_meta_gradient:
-            stats['meta_learning'] = self.meta_learner.get_lr_statistics()
+        # BIO-INSPIRED: Add bio metrics
+        if self.enable_bio_integration:
+            metrics['bio_metrics'] = {
+                'token_fitness': self._get_token_efficiency_fitness(),
+                'evolution_pressure': self._get_gradient_evolution_pressure(),
+                'atp_plasticity': self._get_atp_driven_plasticity(),
+                'harvester_confidence': self._get_harvester_drift_confidence(),
+                'compartment_inheritance': self._get_compartment_inheritance_strength(),
+                'token_exploration': self._get_token_modulated_exploration(),
+                'biomass_prototypes': len(self.biomass_prototype_tokens),
+                'gradient_levels': self._get_gradient_encoded_environment(),
+                'token_fitness_trend': list(self.token_fitness_history)[-50:],
+                'gradient_pressure_trend': list(self.gradient_pressure_history)[-50:]
+            }
         
-        if self.enable_ntk:
-            stats['ntk_accuracy'] = self.ntk_analyzer.get_prediction_accuracy()
-        
-        if self.enable_es:
-            stats['es'] = self.es_optimizer.get_stats()
-        
-        if self.enable_multi_fidelity:
-            stats['multi_fidelity'] = self.multi_fidelity.get_stats()
-        
-        if self.enable_pretraining:
-            stats['pretrained'] = self.pretrainer.is_pretrained
-        
-        return stats
+        return metrics
+    
+    def reset_plasticity(self):
+        """Reset plasticity to ATP-driven or maximum"""
+        if self.enable_bio_integration:
+            self.plasticity = self._get_atp_driven_plasticity()
+        else:
+            self.plasticity = 1.0
+        logger.info(f"Plasticity reset to {self.plasticity:.2f}")
+    
+    def get_parameter_count(self) -> int:
+        """Get total number of trainable parameters"""
+        return sum(p.numel() for p in self.gate_network.parameters() if p.requires_grad)
+    
+    def save_state(self, path: str):
+        """Save enhanced gating network state with bio-inspired metadata"""
+        state = {
+            'model_state_dict': self.gate_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'plasticity': self.plasticity,
+            'evolution_generation': self.evolution_generation,
+            'architecture': self.current_architecture,
+            'bio_enabled': self.enable_bio_integration,
+            'biomass_prototypes': self.biomass_prototype_tokens
+        }
+        torch.save(state, path)
+        logger.info(f"Saved self-evolving gate state to {path}")
+    
+    def load_state(self, path: str):
+        """Load enhanced gating network state"""
+        checkpoint = torch.load(path, map_location='cpu')
+        self.gate_network.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.plasticity = checkpoint.get('plasticity', 0.5)
+        self.evolution_generation = checkpoint.get('evolution_generation', 0)
+        self.current_architecture = checkpoint.get('architecture', self.current_architecture)
+        self.biomass_prototype_tokens = checkpoint.get('biomass_prototypes', {})
+        logger.info(f"Loaded self-evolving gate state from {path}")
 
 
 # ============================================================================
-# Legacy Compatibility
+# Legacy Compatibility Class
 # ============================================================================
 
 class SelfEvolvingGate(EnhancedSelfEvolvingGate):
     """
     Legacy self-evolving gate for backward compatibility.
+    Maintains original interface while using enhanced functionality.
     """
     
     def __init__(
@@ -1440,17 +839,16 @@ class SelfEvolvingGate(EnhancedSelfEvolvingGate):
         super().__init__(
             input_dim=input_dim,
             num_experts=num_experts,
-            enable_meta_gradient=kwargs.get('enable_meta_gradient', False),
-            enable_ntk=kwargs.get('enable_ntk', False),
-            enable_zero_shot=kwargs.get('enable_zero_shot', False),
-            enable_es=kwargs.get('enable_es', False),
-            enable_hypernetwork=kwargs.get('enable_hypernetwork', False),
-            enable_pretraining=kwargs.get('enable_pretraining', False),
-            enable_multi_fidelity=kwargs.get('enable_multi_fidelity', False)
+            adaptation_rate=adaptation_rate,
+            enable_meta_learning=kwargs.get('enable_meta_learning', False),
+            enable_architecture_search=kwargs.get('enable_architecture_search', False),
+            enable_continual_learning=kwargs.get('enable_continual_learning', False),
+            enable_generative_replay=kwargs.get('enable_generative_replay', False),
+            enable_bio_integration=kwargs.get('enable_bio_integration', False),
+            memory_size=memory_size
         )
         
         self.memory: deque = deque(maxlen=memory_size)
-        self.adaptation_rate = adaptation_rate
         self.performance_history: List[Dict] = []
         self.adaptation_history: List[Dict] = []
         
