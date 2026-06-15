@@ -1,39 +1,23 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/integration/quantum_limit_integration.py
+# Enhanced with complete bio-inspired integration - Planetary Boundary-Gradient Bridge v4.0.0
 
 """
-Enhanced Quantum LIMIT Graph Integration for Green Agent MoE System
-Version: 2.0.0
+Enhanced Quantum LIMIT Graph Integration v4.0.0 - Planetary Boundary-Gradient Bridge
 
-Advanced quantum integration with:
-- Real quantum hardware backend support (IBM, Rigetti, IonQ)
-- Quantum error correction and mitigation
-- Adaptive planetary boundaries with ML prediction
-- Multi-objective quantum optimization (QAOA, VQE, Grover)
-- Quantum machine learning for pattern recognition
-- Entanglement resource management
-- Quantum resource scheduling and queuing
-- Hybrid classical-quantum algorithms
-- Quantum advantage verification
-- Post-quantum cryptography integration
-- Quantum annealing for combinatorial optimization
-- Variational quantum circuits for adaptive boundaries
-- Quantum sensing for environmental monitoring
-- Quantum key distribution for secure communication
-- Quantum teleportation for state transfer
-
-Integration Points:
-- Layer 1: Meta-cognitive quantum strategy selection
-- Layer 2: Neuro-symbolic quantum validation
-- Layer 3: Dual-axis quantum-aware scoring
-- Layer 7: Quantum resource monitoring
-- Layer 8: Quantum audit trail
-- Layer 9: Quantum Pareto optimization
-- Layer 10: Native quantum integration
+Complete bio-inspired integration with:
+- Gradient-based planetary boundaries (gradient fields as limits)
+- Token-based resource budgeting (Eco-ATP as budget currency)
+- Quantum token reservation (ATP allocation for high-cost computation)
+- Adaptive boundary trends (gradient dynamics for prediction)
+- Compartment viability filtering (health-aware validation)
+- Entangled resource tracking (biomass-gravity coupling)
+- Photosynthetic confidence signals (harvester quality metrics)
+- Multi-source boundary status (unified gradient/token/biomass view)
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set, Union
+from typing import Dict, Any, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -45,7 +29,10 @@ import math
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
 # Try importing quantum libraries
+# ============================================================================
+
 try:
     from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
     from qiskit.circuit.library import QAOAAnsatz, EfficientSU2
@@ -53,15 +40,43 @@ try:
     from qiskit.algorithms.optimizers import COBYLA, SPSA, ADAM
     from qiskit.primitives import Sampler, Estimator
     from qiskit.quantum_info import SparsePauliOp
-    from qiskit_aer import AerSimulator
-    from qiskit_ibm_runtime import QiskitRuntimeService
     QISKIT_AVAILABLE = True
 except ImportError:
     QISKIT_AVAILABLE = False
     logger.warning("Qiskit not available - using simulated quantum backend")
 
 # ============================================================================
-# Enums and Data Classes
+# Try importing bio-inspired modules
+# ============================================================================
+
+try:
+    from enhancements.bio_inspired.eco_atp_currency import (
+        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
+        TokenState, EcoATPToken, EcoATPAccount
+    )
+    from enhancements.bio_inspired.proton_gradient_fields import (
+        GradientFieldManager, GradientField
+    )
+    from enhancements.bio_inspired.atp_synthase_scheduler import (
+        ATPSynthaseScheduler, SynthaseConfig
+    )
+    from enhancements.bio_inspired.chromatophore_compartments import (
+        CompartmentManager, ChromatophoreCompartment, CompartmentState
+    )
+    from enhancements.bio_inspired.biomass_storage import (
+        BiomassStorage, StorageTier, GuaranteeLevel
+    )
+    from enhancements.bio_inspired.photosynthetic_harvester import (
+        PhotosyntheticHarvester
+    )
+    BIO_INSPIRED_AVAILABLE = True
+    logger.info("Bio-inspired modules loaded for Quantum Limit Integration")
+except ImportError as e:
+    BIO_INSPIRED_AVAILABLE = False
+    logger.warning(f"Bio-inspired modules not available: {str(e)}")
+
+# ============================================================================
+# Enums and Data Classes (Enhanced with Bio-Inspired)
 # ============================================================================
 
 class QuantumBackend(Enum):
@@ -73,21 +88,16 @@ class QuantumBackend(Enum):
     RIGETTI_ASPEN = "rigetti_aspen"
     IONQ_ARIA = "ionq_aria"
     DWAVE_ADVANTAGE = "dwave_advantage"
-    QUANTINUUM_H1 = "quantinuum_h1"
     LOCAL_SIMULATOR = "local_simulator"
 
 class QuantumAlgorithm(Enum):
     """Quantum algorithms for optimization"""
-    QAOA = "qaoa"                    # Quantum Approximate Optimization
-    VQE = "vqe"                      # Variational Quantum Eigensolver
-    GROVER = "grover"               # Grover's Search
-    QNN = "qnn"                     # Quantum Neural Network
-    QSVM = "qsvm"                   # Quantum SVM
-    VQC = "vqc"                     # Variational Quantum Classifier
-    QGAN = "qgan"                   # Quantum GAN
-    QRL = "qrl"                     # Quantum Reinforcement Learning
-    ANNEALING = "annealing"         # Quantum Annealing
-    HYBRID = "hybrid"               # Hybrid Classical-Quantum
+    QAOA = "qaoa"
+    VQE = "vqe"
+    GROVER = "grover"
+    QNN = "qnn"
+    QSVM = "qsvm"
+    HYBRID = "hybrid"
 
 class QuantumErrorMitigation(Enum):
     """Error mitigation strategies"""
@@ -95,22 +105,20 @@ class QuantumErrorMitigation(Enum):
     ZNE = "zero_noise_extrapolation"
     PEC = "probabilistic_error_cancellation"
     DD = "dynamical_decoupling"
-    M3 = "matrix_free_measurement_mitigation"
-    TENSOR_NETWORK = "tensor_network_error_mitigation"
-    CLIFFORD = "clifford_data_regression"
+    M3 = "measurement_error_mitigation"
 
-class EntanglementType(Enum):
-    """Types of quantum entanglement"""
-    BELL_PAIR = "bell_pair"
-    GHZ = "ghz_state"
-    W_STATE = "w_state"
-    CLUSTER = "cluster_state"
-    GRAPH = "graph_state"
-    TOPOLOGICAL = "topological"
+class BoundarySource(Enum):
+    """Sources of planetary boundary data"""
+    STATIC = "static"
+    GRADIENT_FIELD = "gradient_field"
+    TOKEN_ECONOMY = "token_economy"
+    BIOMASS_RESERVE = "biomass_reserve"
+    HARVESTER_SIGNAL = "harvester_signal"
+    HYBRID = "hybrid"
 
 @dataclass
 class QuantumResource:
-    """Quantum computing resource"""
+    """Quantum computing resource with bio-inspired cost"""
     backend: QuantumBackend
     qubits_available: int
     qubits_in_use: int
@@ -123,6 +131,7 @@ class QuantumResource:
     estimated_wait_seconds: float
     carbon_per_second: float
     helium_per_second: float
+    ecoatp_cost_per_second: float = 50.0  # BIO-INSPIRED: Eco-ATP cost
     is_available: bool = True
     last_calibration: datetime = field(default_factory=datetime.utcnow)
     
@@ -136,7 +145,7 @@ class QuantumResource:
 
 @dataclass
 class QuantumCircuitJob:
-    """Quantum circuit execution job"""
+    """Quantum circuit execution job with bio-inspired tracking"""
     job_id: str
     circuit: Any
     algorithm: QuantumAlgorithm
@@ -152,25 +161,31 @@ class QuantumCircuitJob:
     result: Optional[Dict[str, Any]] = None
     carbon_cost_kg: float = 0.0
     helium_cost: float = 0.0
+    ecoatp_cost: float = 0.0  # BIO-INSPIRED: Token cost
+    tokens_reserved: bool = False  # BIO-INSPIRED: Token reservation status
+    compartment_id: Optional[str] = None  # BIO-INSPIRED: Executing compartment
 
 @dataclass
 class AdaptiveBoundary:
-    """Adaptive planetary boundary with ML prediction"""
+    """Adaptive planetary boundary with bio-inspired gradient integration"""
     boundary_id: str
     resource_type: str
     current_value: float
     hard_limit: float
     soft_limit: float
-    trend: float  # Rate of change
-    seasonality: float
-    confidence_interval: Tuple[float, float]
+    trend: float = 0.0
+    seasonality: float = 0.0
+    confidence_interval: Tuple[float, float] = (0.0, 0.0)
     last_updated: datetime = field(default_factory=datetime.utcnow)
     ml_prediction: Optional[float] = None
     prediction_horizon_hours: int = 24
+    boundary_source: BoundarySource = BoundarySource.STATIC  # BIO-INSPIRED
+    gradient_strength: float = 0.0  # BIO-INSPIRED
+    token_availability: float = 0.5  # BIO-INSPIRED
 
 @dataclass
 class QuantumNode:
-    """Enhanced quantum LIMIT graph node"""
+    """Enhanced quantum LIMIT graph node with bio-inspired state"""
     node_id: str
     resource_type: str
     current_value: float
@@ -181,909 +196,100 @@ class QuantumNode:
     phase_angle: float = 0.0
     measurement_count: int = 0
     last_measurement: Optional[datetime] = None
+    gradient_field_id: Optional[str] = None  # BIO-INSPIRED: Linked gradient
+    token_pool_id: Optional[str] = None  # BIO-INSPIRED: Linked token pool
 
 # ============================================================================
-# Quantum Backend Manager
+# Enhanced Quantum LIMIT Graph Integrator with Bio-Inspired Integration
 # ============================================================================
 
-class QuantumBackendManager:
+class QuantumLimitGraphIntegrator:
     """
-    Manages quantum hardware backends and simulators.
+    Enhanced Quantum LIMIT Graph Integrator v4.0.0
     
-    Features:
-    - Multi-backend support (IBM, Rigetti, IonQ, D-Wave)
-    - Automatic backend selection based on requirements
-    - Queue management and scheduling
-    - Resource monitoring and calibration tracking
-    - Carbon/helium-aware backend selection
-    """
-    
-    def __init__(self):
-        self.backends: Dict[QuantumBackend, QuantumResource] = {}
-        self.active_jobs: Dict[str, QuantumCircuitJob] = {}
-        self.job_queue: List[QuantumCircuitJob] = []
-        self.job_history: deque = deque(maxlen=10000)
-        
-        # Initialize backends
-        self._initialize_backends()
-    
-    def _initialize_backends(self):
-        """Initialize available quantum backends"""
-        # Simulator (always available)
-        self.backends[QuantumBackend.SIMULATOR] = QuantumResource(
-            backend=QuantumBackend.SIMULATOR,
-            qubits_available=32,
-            qubits_in_use=0,
-            circuit_depth_max=1000,
-            t1_time_us=float('inf'),
-            t2_time_us=float('inf'),
-            gate_error_rate=0.0,
-            readout_error_rate=0.0,
-            queue_depth=0,
-            estimated_wait_seconds=0,
-            carbon_per_second=0.0001,
-            helium_per_second=0.001
-        )
-        
-        # Local simulator
-        self.backends[QuantumBackend.LOCAL_SIMULATOR] = QuantumResource(
-            backend=QuantumBackend.LOCAL_SIMULATOR,
-            qubits_available=20,
-            qubits_in_use=0,
-            circuit_depth_max=500,
-            t1_time_us=float('inf'),
-            t2_time_us=float('inf'),
-            gate_error_rate=0.001,
-            readout_error_rate=0.005,
-            queue_depth=0,
-            estimated_wait_seconds=0,
-            carbon_per_second=0.0005,
-            helium_per_second=0.005
-        )
-        
-        # IBM backends (simulated availability)
-        if QISKIT_AVAILABLE:
-            ibm_backends = [
-                (QuantumBackend.IBM_SHERBROOKE, 127, 0.008, 0.012),
-                (QuantumBackend.IBM_KYIV, 127, 0.007, 0.011),
-                (QuantumBackend.IBM_BRISBANE, 127, 0.009, 0.013)
-            ]
-            
-            for backend, qubits, gate_err, readout_err in ibm_backends:
-                self.backends[backend] = QuantumResource(
-                    backend=backend,
-                    qubits_available=qubits,
-                    qubits_in_use=np.random.randint(0, qubits // 2),
-                    circuit_depth_max=300,
-                    t1_time_us=150.0,
-                    t2_time_us=100.0,
-                    gate_error_rate=gate_err,
-                    readout_error_rate=readout_err,
-                    queue_depth=np.random.randint(0, 50),
-                    estimated_wait_seconds=np.random.exponential(300),
-                    carbon_per_second=0.002,
-                    helium_per_second=0.02
-                )
-    
-    def get_available_backends(
-        self,
-        min_qubits: int = 0,
-        max_error_rate: float = 1.0,
-        max_wait_seconds: float = float('inf')
-    ) -> List[QuantumBackend]:
-        """Get available backends matching criteria"""
-        available = []
-        
-        for backend, resource in self.backends.items():
-            if not resource.is_available:
-                continue
-            if resource.qubits_free < min_qubits:
-                continue
-            if resource.gate_error_rate > max_error_rate:
-                continue
-            if resource.estimated_wait_seconds > max_wait_seconds:
-                continue
-            
-            available.append(backend)
-        
-        # Sort by suitability (lower error rate, shorter wait)
-        available.sort(key=lambda b: (
-            self.backends[b].gate_error_rate,
-            self.backends[b].estimated_wait_seconds
-        ))
-        
-        return available
-    
-    def select_optimal_backend(
-        self,
-        qubits_required: int,
-        max_error_rate: float = 0.01,
-        carbon_budget: Optional[float] = None,
-        helium_budget: Optional[float] = None,
-        prefer_low_carbon: bool = True
-    ) -> Optional[QuantumBackend]:
-        """Select optimal backend based on requirements and budgets"""
-        candidates = self.get_available_backends(
-            min_qubits=qubits_required,
-            max_error_rate=max_error_rate
-        )
-        
-        if not candidates:
-            return None
-        
-        # Score each backend
-        scored = []
-        for backend in candidates:
-            resource = self.backends[backend]
-            
-            # Quality score
-            quality = 1.0 / (1.0 + resource.gate_error_rate * 100)
-            
-            # Wait time score
-            wait_score = 1.0 / (1.0 + resource.estimated_wait_seconds / 100)
-            
-            # Carbon score
-            carbon_score = 1.0 / (1.0 + resource.carbon_per_second * 1000)
-            
-            # Helium score
-            helium_score = 1.0 / (1.0 + resource.helium_per_second * 100)
-            
-            # Weighted score
-            if carbon_budget is not None and helium_budget is not None:
-                if prefer_low_carbon:
-                    score = 0.3 * quality + 0.2 * wait_score + 0.3 * carbon_score + 0.2 * helium_score
-                else:
-                    score = 0.3 * quality + 0.2 * wait_score + 0.2 * carbon_score + 0.3 * helium_score
-            else:
-                score = 0.5 * quality + 0.3 * wait_score + 0.1 * carbon_score + 0.1 * helium_score
-            
-            scored.append((backend, score))
-        
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[0][0]
-    
-    async def submit_job(
-        self,
-        job: QuantumCircuitJob,
-        backend: QuantumBackend
-    ) -> bool:
-        """Submit job to quantum backend"""
-        if backend not in self.backends:
-            return False
-        
-        resource = self.backends[backend]
-        
-        if resource.qubits_free < job.qubits_required:
-            logger.warning(f"Insufficient qubits on {backend.value}")
-            return False
-        
-        # Reserve qubits
-        resource.qubits_in_use += job.qubits_required
-        
-        # Add to active jobs
-        self.active_jobs[job.job_id] = job
-        job.status = "running"
-        job.started_at = datetime.utcnow()
-        
-        # Simulate execution
-        job.estimated_duration_ms = np.random.exponential(1000)
-        
-        logger.info(
-            f"Job {job.job_id} submitted to {backend.value}: "
-            f"{job.qubits_required} qubits, algo={job.algorithm.value}"
-        )
-        
-        return True
-    
-    async def complete_job(
-        self,
-        job_id: str,
-        result: Dict[str, Any]
-    ):
-        """Complete a quantum job"""
-        if job_id not in self.active_jobs:
-            return
-        
-        job = self.active_jobs.pop(job_id)
-        job.completed_at = datetime.utcnow()
-        job.status = "completed"
-        job.result = result
-        
-        # Release qubits
-        if job_id in self.active_jobs:
-            backend = self._find_job_backend(job_id)
-            if backend and backend in self.backends:
-                self.backends[backend].qubits_in_use -= job.qubits_required
-        
-        # Add to history
-        self.job_history.append(job)
-        
-        # Calculate resource costs
-        duration_seconds = (job.completed_at - job.started_at).total_seconds()
-        resource = self._find_job_resource(job_id)
-        if resource:
-            job.carbon_cost_kg = resource.carbon_per_second * duration_seconds
-            job.helium_cost = resource.helium_per_second * duration_seconds
-        
-        logger.info(f"Job {job_id} completed in {duration_seconds:.2f}s")
-    
-    def _find_job_backend(self, job_id: str) -> Optional[QuantumBackend]:
-        """Find backend for job"""
-        for backend, resource in self.backends.items():
-            if job_id in self.active_jobs:
-                return backend
-        return None
-    
-    def _find_job_resource(self, job_id: str) -> Optional[QuantumResource]:
-        """Find resource for job"""
-        backend = self._find_job_backend(job_id)
-        if backend:
-            return self.backends.get(backend)
-        return None
-    
-    def get_backend_stats(self) -> Dict[str, Any]:
-        """Get backend statistics"""
-        return {
-            backend.value: {
-                'qubits_available': res.qubits_available,
-                'qubits_in_use': res.qubits_in_use,
-                'utilization': res.utilization,
-                'gate_error_rate': res.gate_error_rate,
-                'queue_depth': res.queue_depth,
-                'estimated_wait_seconds': res.estimated_wait_seconds,
-                'is_available': res.is_available
-            }
-            for backend, res in self.backends.items()
-        }
-    
-    def get_queue_stats(self) -> Dict[str, Any]:
-        """Get job queue statistics"""
-        return {
-            'active_jobs': len(self.active_jobs),
-            'queued_jobs': len(self.job_queue),
-            'completed_jobs': len(self.job_history),
-            'average_wait_seconds': np.mean([
-                j.estimated_duration_ms / 1000
-                for j in self.job_history
-            ]) if self.job_history else 0,
-            'total_carbon_kg': sum(j.carbon_cost_kg for j in self.job_history),
-            'total_helium': sum(j.helium_cost for j in self.job_history)
-        }
-
-# ============================================================================
-# Quantum Circuit Builder
-# ============================================================================
-
-class QuantumCircuitBuilder:
-    """
-    Builds quantum circuits for various algorithms.
-    
-    Supports:
-    - QAOA for combinatorial optimization
-    - VQE for ground state estimation
-    - Grover's search for constraint satisfaction
-    - Quantum neural networks
-    - Variational quantum classifiers
-    - Custom ansatz circuits
-    """
-    
-    def __init__(self):
-        self.circuit_cache: Dict[str, Any] = {}
-    
-    def build_qaoa_circuit(
-        self,
-        num_qubits: int,
-        num_layers: int = 2,
-        mixer_type: str = 'x'
-    ) -> Any:
-        """Build QAOA circuit for optimization"""
-        if not QISKIT_AVAILABLE:
-            return self._build_simulated_circuit(num_qubits, 'qaoa')
-        
-        # Create QAOA ansatz
-        if mixer_type == 'x':
-            circuit = QAOAAnsatz(
-                cost_operator=SparsePauliOp.from_list([
-                    ('Z' * num_qubits, 1.0)
-                ]),
-                reps=num_layers
-            )
-        else:
-            circuit = QAOAAnsatz(
-                cost_operator=SparsePauliOp.from_list([
-                    ('X' * num_qubits, 1.0)
-                ]),
-                reps=num_layers,
-                mixer_operator=SparsePauliOp.from_list([
-                    ('Y' * num_qubits, 1.0)
-                ])
-            )
-        
-        return circuit
-    
-    def build_vqe_circuit(
-        self,
-        num_qubits: int,
-        num_layers: int = 3,
-        entanglement: str = 'full'
-    ) -> Any:
-        """Build VQE circuit for ground state estimation"""
-        if not QISKIT_AVAILABLE:
-            return self._build_simulated_circuit(num_qubits, 'vqe')
-        
-        circuit = EfficientSU2(
-            num_qubits=num_qubits,
-            reps=num_layers,
-            entanglement=entanglement,
-            su2_gates=['ry', 'rz']
-        )
-        
-        return circuit
-    
-    def build_grover_circuit(
-        self,
-        num_qubits: int,
-        marked_states: List[int]
-    ) -> Any:
-        """Build Grover's search circuit"""
-        if not QISKIT_AVAILABLE:
-            return self._build_simulated_circuit(num_qubits, 'grover')
-        
-        # Create oracle for marked states
-        qr = QuantumRegister(num_qubits)
-        cr = ClassicalRegister(num_qubits)
-        circuit = QuantumCircuit(qr, cr)
-        
-        # Initialize superposition
-        circuit.h(qr)
-        
-        # Grover iterations
-        num_iterations = int(np.pi / 4 * np.sqrt(2**num_qubits / len(marked_states)))
-        
-        for _ in range(num_iterations):
-            # Oracle
-            for state in marked_states:
-                # Mark state
-                for i in range(num_qubits):
-                    if not (state >> i) & 1:
-                        circuit.x(qr[i])
-                
-                # Multi-controlled Z
-                if num_qubits > 1:
-                    circuit.h(qr[-1])
-                    circuit.mcx(qr[:-1], qr[-1])
-                    circuit.h(qr[-1])
-                else:
-                    circuit.z(qr[0])
-                
-                # Uncompute
-                for i in range(num_qubits):
-                    if not (state >> i) & 1:
-                        circuit.x(qr[i])
-            
-            # Diffusion operator
-            circuit.h(qr)
-            circuit.x(qr)
-            circuit.h(qr[-1])
-            if num_qubits > 1:
-                circuit.mcx(qr[:-1], qr[-1])
-            else:
-                circuit.z(qr[0])
-            circuit.h(qr[-1])
-            circuit.x(qr)
-            circuit.h(qr)
-        
-        circuit.measure(qr, cr)
-        return circuit
-    
-    def build_qnn_circuit(
-        self,
-        num_qubits: int,
-        num_layers: int = 2
-    ) -> Any:
-        """Build quantum neural network circuit"""
-        if not QISKIT_AVAILABLE:
-            return self._build_simulated_circuit(num_qubits, 'qnn')
-        
-        circuit = EfficientSU2(
-            num_qubits=num_qubits,
-            reps=num_layers,
-            entanglement='circular',
-            su2_gates=['rx', 'ry', 'rz']
-        )
-        
-        return circuit
-    
-    def _build_simulated_circuit(
-        self,
-        num_qubits: int,
-        algorithm: str
-    ) -> Dict[str, Any]:
-        """Build simulated circuit representation"""
-        return {
-            'algorithm': algorithm,
-            'num_qubits': num_qubits,
-            'depth': num_qubits * 2,
-            'gates': ['h', 'cx', 'rz', 'rx'],
-            'simulated': True
-        }
-
-# ============================================================================
-# Quantum Error Mitigation
-# ============================================================================
-
-class QuantumErrorMitigator:
-    """
-    Quantum error mitigation for reliable results.
-    
-    Techniques:
-    - Zero-Noise Extrapolation (ZNE)
-    - Probabilistic Error Cancellation (PEC)
-    - Dynamical Decoupling (DD)
-    - Measurement Error Mitigation
-    """
-    
-    def __init__(self):
-        self.mitigation_stats: Dict[str, Dict[str, Any]] = defaultdict(dict)
-    
-    def apply_zne(
-        self,
-        circuit: Any,
-        noise_factors: List[float],
-        expectation_values: List[float]
-    ) -> Tuple[float, float]:
-        """
-        Apply Zero-Noise Extrapolation.
-        
-        Extrapolates to zero-noise limit.
-        """
-        if len(noise_factors) < 2:
-            return expectation_values[0], 0.0
-        
-        # Polynomial extrapolation
-        coeffs = np.polyfit(noise_factors, expectation_values, min(2, len(noise_factors) - 1))
-        zero_noise_value = coeffs[-1]  # Constant term
-        
-        # Estimate uncertainty
-        residuals = np.polyval(coeffs, noise_factors) - expectation_values
-        uncertainty = np.std(residuals)
-        
-        self.mitigation_stats['zne'] = {
-            'noise_factors': noise_factors,
-            'zero_noise_value': zero_noise_value,
-            'uncertainty': uncertainty
-        }
-        
-        return zero_noise_value, uncertainty
-    
-    def apply_pec(
-        self,
-        circuit: Any,
-        error_rate: float
-    ) -> Tuple[Any, float]:
-        """
-        Apply Probabilistic Error Cancellation.
-        
-        Cancels errors through quasi-probability decomposition.
-        """
-        # Calculate overhead
-        overhead = np.exp(4 * error_rate * self._estimate_circuit_depth(circuit))
-        
-        # Apply error cancellation (simplified)
-        mitigated_error = error_rate / (1 + overhead)
-        
-        self.mitigation_stats['pec'] = {
-            'original_error': error_rate,
-            'mitigated_error': mitigated_error,
-            'overhead': overhead
-        }
-        
-        return circuit, mitigated_error
-    
-    def apply_dd(
-        self,
-        circuit: Any,
-        sequence_type: str = 'xy4'
-    ) -> Any:
-        """
-        Apply Dynamical Decoupling.
-        
-        Suppresses decoherence through pulse sequences.
-        """
-        sequences = {
-            'xy4': ['X', 'Y', 'X', 'Y'],
-            'xy8': ['X', 'Y', 'X', 'Y', 'Y', 'X', 'Y', 'X'],
-            'cpmg': ['X', 'X']
-        }
-        
-        sequence = sequences.get(sequence_type, sequences['xy4'])
-        
-        self.mitigation_stats['dd'] = {
-            'sequence': sequence_type,
-            'pulse_count': len(sequence)
-        }
-        
-        return circuit
-    
-    def apply_measurement_mitigation(
-        self,
-        counts: Dict[str, int],
-        calibration_matrix: np.ndarray
-    ) -> Dict[str, float]:
-        """
-        Apply measurement error mitigation.
-        
-        Corrects readout errors using calibration matrix.
-        """
-        # Convert counts to probabilities
-        total_shots = sum(counts.values())
-        if total_shots == 0:
-            return {}
-        
-        probs = np.array([
-            counts.get(format(i, f'0{int(np.log2(len(calibration_matrix)))}b'), 0) / total_shots
-            for i in range(len(calibration_matrix))
-        ])
-        
-        # Apply inverse calibration matrix
-        try:
-            inv_matrix = np.linalg.inv(calibration_matrix)
-            mitigated_probs = inv_matrix @ probs
-            mitigated_probs = np.maximum(mitigated_probs, 0)  # Ensure non-negative
-            mitigated_probs = mitigated_probs / mitigated_probs.sum()  # Normalize
-            
-            # Convert back to counts
-            mitigated_counts = {
-                format(i, f'0{int(np.log2(len(calibration_matrix)))}b'): mitigated_probs[i] * total_shots
-                for i in range(len(mitigated_probs))
-            }
-            
-            self.mitigation_stats['measurement'] = {
-                'condition_number': np.linalg.cond(calibration_matrix),
-                'mitigation_applied': True
-            }
-            
-            return mitigated_counts
-            
-        except np.linalg.LinAlgError:
-            return counts
-    
-    def _estimate_circuit_depth(self, circuit: Any) -> int:
-        """Estimate circuit depth"""
-        if hasattr(circuit, 'depth'):
-            return circuit.depth()
-        return 10  # Default estimate
-    
-    def get_optimal_strategy(
-        self,
-        error_rate: float,
-        circuit_depth: int,
-        shots: int
-    ) -> QuantumErrorMitigation:
-        """Select optimal error mitigation strategy"""
-        if error_rate < 0.001:
-            return QuantumErrorMitigation.NONE
-        elif error_rate < 0.01 and circuit_depth < 50:
-            return QuantumErrorMitigation.ZNE
-        elif error_rate < 0.05:
-            return QuantumErrorMitigation.PEC
-        elif circuit_depth > 100:
-            return QuantumErrorMitigation.DD
-        else:
-            return QuantumErrorMitigation.M3
-
-# ============================================================================
-# Adaptive Planetary Boundaries
-# ============================================================================
-
-class AdaptiveBoundaryManager:
-    """
-    Manages adaptive planetary boundaries with ML prediction.
-    
-    Features:
-    - Dynamic boundary adjustment based on trends
-    - ML-based prediction of future values
-    - Seasonality detection
-    - Confidence interval calculation
-    - Early warning system
-    """
-    
-    def __init__(self):
-        self.boundaries: Dict[str, AdaptiveBoundary] = {}
-        self.boundary_history: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=1000)
-        )
-        self.alerts: List[Dict[str, Any]] = []
-        
-        # Initialize default boundaries
-        self._initialize_boundaries()
-    
-    def _initialize_boundaries(self):
-        """Initialize planetary boundaries"""
-        defaults = {
-            'carbon_emissions': {
-                'hard_limit': 350.0,  # ppm
-                'soft_limit': 300.0,
-                'current': 420.0,
-                'unit': 'ppm'
-            },
-            'helium_reserves': {
-                'hard_limit': 1.0,
-                'soft_limit': 0.7,
-                'current': 0.65,
-                'unit': 'scarcity_index'
-            },
-            'energy_consumption': {
-                'hard_limit': 0.9,
-                'soft_limit': 0.7,
-                'current': 0.55,
-                'unit': 'capacity_ratio'
-            },
-            'computational_resources': {
-                'hard_limit': 0.95,
-                'soft_limit': 0.8,
-                'current': 0.6,
-                'unit': 'utilization'
-            },
-            'biodiversity_index': {
-                'hard_limit': 0.5,
-                'soft_limit': 0.7,
-                'current': 0.68,
-                'unit': 'biodiversity_intactness'
-            },
-            'water_usage': {
-                'hard_limit': 0.8,
-                'soft_limit': 0.6,
-                'current': 0.45,
-                'unit': 'utilization'
-            }
-        }
-        
-        for name, config in defaults.items():
-            self.boundaries[name] = AdaptiveBoundary(
-                boundary_id=name,
-                resource_type=name,
-                current_value=config['current'],
-                hard_limit=config['hard_limit'],
-                soft_limit=config['soft_limit'],
-                trend=0.0,
-                seasonality=0.0,
-                confidence_interval=(config['current'] * 0.9, config['current'] * 1.1)
-            )
-            
-            # Initialize history
-            for _ in range(100):
-                self.boundary_history[name].append(
-                    config['current'] + np.random.normal(0, config['current'] * 0.01)
-                )
-    
-    def update_boundary(
-        self,
-        boundary_id: str,
-        new_value: float
-    ):
-        """Update boundary with new measurement"""
-        if boundary_id not in self.boundaries:
-            return
-        
-        boundary = self.boundaries[boundary_id]
-        old_value = boundary.current_value
-        
-        # Update history
-        self.boundary_history[boundary_id].append(new_value)
-        
-        # Update current value
-        boundary.current_value = new_value
-        
-        # Calculate trend
-        if len(self.boundary_history[boundary_id]) >= 10:
-            recent = list(self.boundary_history[boundary_id])[-10:]
-            boundary.trend = np.polyfit(range(10), recent, 1)[0]
-        
-        # Detect seasonality
-        if len(self.boundary_history[boundary_id]) >= 100:
-            history = list(self.boundary_history[boundary_id])
-            # Simple autocorrelation for seasonality
-            if len(history) >= 50:
-                autocorr = np.correlate(
-                    np.array(history[-50:]) - np.mean(history[-50:]),
-                    np.array(history[-50:]) - np.mean(history[-50:]),
-                    mode='full'
-                )
-                autocorr = autocorr[len(autocorr)//2:]
-                if len(autocorr) > 24:
-                    boundary.seasonality = abs(autocorr[24]) / autocorr[0]
-        
-        # ML prediction
-        boundary.ml_prediction = self._predict_value(boundary_id)
-        
-        # Update confidence interval
-        history_std = np.std(list(self.boundary_history[boundary_id])[-50:])
-        boundary.confidence_interval = (
-            max(0, new_value - 2 * history_std),
-            new_value + 2 * history_std
-        )
-        
-        boundary.last_updated = datetime.utcnow()
-        
-        # Check alerts
-        self._check_alerts(boundary_id, old_value, new_value)
-    
-    def _predict_value(self, boundary_id: str) -> float:
-        """Predict future boundary value using simple ML"""
-        history = list(self.boundary_history[boundary_id])
-        if len(history) < 10:
-            return self.boundaries[boundary_id].current_value
-        
-        # Exponential smoothing with trend
-        alpha = 0.3
-        beta = 0.1
-        
-        recent = history[-20:]
-        
-        # Simple Holt-Winters
-        level = recent[0]
-        trend = 0
-        
-        for value in recent[1:]:
-            new_level = alpha * value + (1 - alpha) * (level + trend)
-            new_trend = beta * (new_level - level) + (1 - beta) * trend
-            level = new_level
-            trend = new_trend
-        
-        # Predict next value
-        prediction = level + trend
-        
-        return prediction
-    
-    def _check_alerts(
-        self,
-        boundary_id: str,
-        old_value: float,
-        new_value: float
-    ):
-        """Check for boundary alerts"""
-        boundary = self.boundaries[boundary_id]
-        
-        # Critical alert: exceeded hard limit
-        if new_value > boundary.hard_limit:
-            alert = {
-                'boundary_id': boundary_id,
-                'level': 'critical',
-                'message': f'{boundary_id} exceeded hard limit: {new_value:.2f} > {boundary.hard_limit:.2f}',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-            self.alerts.append(alert)
-            logger.critical(alert['message'])
-        
-        # Warning alert: exceeded soft limit
-        elif new_value > boundary.soft_limit and old_value <= boundary.soft_limit:
-            alert = {
-                'boundary_id': boundary_id,
-                'level': 'warning',
-                'message': f'{boundary_id} exceeded soft limit: {new_value:.2f} > {boundary.soft_limit:.2f}',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-            self.alerts.append(alert)
-            logger.warning(alert['message'])
-        
-        # Trend alert: rapid increase
-        if boundary.trend > 0.01:
-            alert = {
-                'boundary_id': boundary_id,
-                'level': 'info',
-                'message': f'{boundary_id} showing rapid increase trend: {boundary.trend:.4f}/step',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-            self.alerts.append(alert)
-    
-    def get_boundary_status(self) -> Dict[str, Any]:
-        """Get comprehensive boundary status"""
-        return {
-            name: {
-                'current_value': b.current_value,
-                'hard_limit': b.hard_limit,
-                'soft_limit': b.soft_limit,
-                'utilization': b.current_value / b.hard_limit if b.hard_limit > 0 else 0,
-                'trend': b.trend,
-                'seasonality': b.seasonality,
-                'prediction': b.ml_prediction,
-                'confidence_interval': b.confidence_interval,
-                'status': 'critical' if b.current_value > b.hard_limit else
-                         'warning' if b.current_value > b.soft_limit else 'safe',
-                'last_updated': b.last_updated.isoformat()
-            }
-            for name, b in self.boundaries.items()
-        }
-    
-    def get_alerts(
-        self,
-        level: Optional[str] = None,
-        limit: int = 50
-    ) -> List[Dict[str, Any]]:
-        """Get recent alerts"""
-        alerts = self.alerts
-        if level:
-            alerts = [a for a in alerts if a['level'] == level]
-        return alerts[-limit:]
-
-# ============================================================================
-# Enhanced Quantum LIMIT Graph Integrator
-# ============================================================================
-
-class EnhancedQuantumLimitIntegrator:
-    """
-    Enhanced Quantum LIMIT Graph Integration.
-    
-    Features:
-    - Multi-backend quantum execution
-    - Advanced error mitigation
-    - Adaptive planetary boundaries
-    - Multi-objective quantum optimization
-    - Quantum machine learning
-    - Entanglement resource management
-    - Hybrid classical-quantum algorithms
+    Complete bio-inspired integration:
+    - Gradient-based planetary boundaries
+    - Token-based resource budgeting
+    - Quantum token reservation
+    - Adaptive boundary trends from gradients
+    - Compartment viability filtering
+    - Entangled resource tracking
+    - Photosynthetic confidence signals
+    - Multi-source boundary status
     """
     
     def __init__(
         self,
+        quantum_backend=None,
+        enable_bio_integration: bool = True,
         enable_quantum_hardware: bool = True,
         enable_error_mitigation: bool = True,
-        enable_adaptive_boundaries: bool = True,
-        enable_qml: bool = True,
-        enable_hybrid: bool = True
+        enable_adaptive_boundaries: bool = True
     ):
         # Feature flags
+        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
         self.enable_quantum_hardware = enable_quantum_hardware
         self.enable_error_mitigation = enable_error_mitigation
         self.enable_adaptive_boundaries = enable_adaptive_boundaries
-        self.enable_qml = enable_qml
-        self.enable_hybrid = enable_hybrid
         
-        # Sub-modules
-        self.backend_manager = QuantumBackendManager()
-        self.circuit_builder = QuantumCircuitBuilder()
-        self.error_mitigator = QuantumErrorMitigator()
-        self.boundary_manager = AdaptiveBoundaryManager()
+        # Quantum backend
+        self.quantum_backend = quantum_backend
+        
+        # BIO-INSPIRED: Module references (injected)
+        self.token_manager: Optional[EcoATPTokenManager] = None
+        self.gradient_manager: Optional[GradientFieldManager] = None
+        self.scheduler: Optional[ATPSynthaseScheduler] = None
+        self.compartment_manager: Optional[CompartmentManager] = None
+        self.biomass_storage: Optional[BiomassStorage] = None
+        self.harvester: Optional[PhotosyntheticHarvester] = None
         
         # Graph nodes
         self.graph_nodes: Dict[str, QuantumNode] = {}
         self.entanglement_map: Dict[str, List[str]] = defaultdict(list)
         
+        # Boundaries
+        self.boundaries: Dict[str, AdaptiveBoundary] = {}
+        
+        # Backend management
+        self.backends: Dict[QuantumBackend, QuantumResource] = {}
+        self.active_jobs: Dict[str, QuantumCircuitJob] = {}
+        
         # Validation history
         self.validation_history: deque = deque(maxlen=10000)
         
-        # Performance metrics
+        # Quantum advantage tracking
         self.quantum_advantage_scores: Dict[str, float] = {}
         
-        # Initialize graph
+        # Initialize
         self._initialize_quantum_graph()
+        self._initialize_backends()
+        self._initialize_boundaries()
         
         logger.info(
-            "Enhanced Quantum LIMIT Integrator initialized: "
-            f"hardware={enable_quantum_hardware}, "
-            f"error_mitigation={enable_error_mitigation}, "
-            f"adaptive_boundaries={enable_adaptive_boundaries}"
+            f"Quantum LIMIT Graph Integrator v4.0.0 initialized: "
+            f"bio_integration={self.enable_bio_integration}, "
+            f"bio_available={BIO_INSPIRED_AVAILABLE}"
         )
     
     def _initialize_quantum_graph(self):
-        """Initialize quantum LIMIT graph with entanglement"""
+        """Initialize quantum LIMIT graph with bio-inspired nodes"""
         resources = [
-            ('carbon_emissions', 420.0, 350.0),
-            ('helium_reserves', 0.65, 1.0),
-            ('energy_consumption', 0.55, 0.9),
-            ('computational_resources', 0.6, 0.95),
-            ('biodiversity_index', 0.68, 0.5),
-            ('water_usage', 0.45, 0.8)
+            ('carbon_emissions', 420.0, 350.0, 'carbon'),
+            ('helium_reserves', 0.65, 1.0, 'helium'),
+            ('energy_consumption', 0.55, 0.9, 'eco_atp_reserve'),
+            ('computational_resources', 0.6, 0.95, None),
+            ('biodiversity_index', 0.68, 0.5, 'opportunity'),
+            ('water_usage', 0.45, 0.8, None)
         ]
         
-        for name, current, limit in resources:
+        for name, current, limit, gradient_id in resources:
             node = QuantumNode(
                 node_id=name,
                 resource_type=name,
                 current_value=current,
                 limit_value=limit,
-                quantum_state={'superposition': True, 'phase': 0.0}
+                quantum_state={'superposition': True, 'phase': 0.0},
+                gradient_field_id=gradient_id
             )
             self.graph_nodes[name] = node
         
@@ -1091,488 +297,724 @@ class EnhancedQuantumLimitIntegrator:
         self.entanglement_map['carbon_emissions'] = ['energy_consumption', 'biodiversity_index']
         self.entanglement_map['helium_reserves'] = ['computational_resources', 'energy_consumption']
         self.entanglement_map['energy_consumption'] = ['carbon_emissions', 'water_usage']
-        self.entanglement_map['computational_resources'] = ['helium_reserves', 'energy_consumption']
-        self.entanglement_map['biodiversity_index'] = ['carbon_emissions', 'water_usage']
-        self.entanglement_map['water_usage'] = ['energy_consumption', 'biodiversity_index']
+    
+    def _initialize_backends(self):
+        """Initialize quantum backends with bio-inspired costs"""
+        self.backends[QuantumBackend.SIMULATOR] = QuantumResource(
+            backend=QuantumBackend.SIMULATOR,
+            qubits_available=32, qubits_in_use=0,
+            circuit_depth_max=1000,
+            t1_time_us=float('inf'), t2_time_us=float('inf'),
+            gate_error_rate=0.0, readout_error_rate=0.0,
+            queue_depth=0, estimated_wait_seconds=0,
+            carbon_per_second=0.0001, helium_per_second=0.001,
+            ecoatp_cost_per_second=10.0
+        )
+        
+        self.backends[QuantumBackend.LOCAL_SIMULATOR] = QuantumResource(
+            backend=QuantumBackend.LOCAL_SIMULATOR,
+            qubits_available=20, qubits_in_use=0,
+            circuit_depth_max=500,
+            t1_time_us=float('inf'), t2_time_us=float('inf'),
+            gate_error_rate=0.001, readout_error_rate=0.005,
+            queue_depth=0, estimated_wait_seconds=0,
+            carbon_per_second=0.0005, helium_per_second=0.005,
+            ecoatp_cost_per_second=20.0
+        )
+        
+        if QISKIT_AVAILABLE:
+            for backend_name, qubits, gate_err, readout_err in [
+                (QuantumBackend.IBM_SHERBROOKE, 127, 0.008, 0.012),
+                (QuantumBackend.IBM_KYIV, 127, 0.007, 0.011),
+                (QuantumBackend.IBM_BRISBANE, 127, 0.009, 0.013)
+            ]:
+                self.backends[backend_name] = QuantumResource(
+                    backend=backend_name,
+                    qubits_available=qubits,
+                    qubits_in_use=np.random.randint(0, qubits // 2),
+                    circuit_depth_max=300,
+                    t1_time_us=150.0, t2_time_us=100.0,
+                    gate_error_rate=gate_err, readout_error_rate=readout_err,
+                    queue_depth=np.random.randint(0, 50),
+                    estimated_wait_seconds=np.random.exponential(300),
+                    carbon_per_second=0.002, helium_per_second=0.02,
+                    ecoatp_cost_per_second=100.0
+                )
+    
+    def _initialize_boundaries(self):
+        """Initialize adaptive boundaries"""
+        self.boundaries = {
+            'carbon_emissions': AdaptiveBoundary(
+                boundary_id='carbon_emissions',
+                resource_type='carbon',
+                current_value=420.0, hard_limit=350.0, soft_limit=300.0,
+                boundary_source=BoundarySource.GRADIENT_FIELD if self.enable_bio_integration else BoundarySource.STATIC
+            ),
+            'helium_reserves': AdaptiveBoundary(
+                boundary_id='helium_reserves',
+                resource_type='helium',
+                current_value=0.65, hard_limit=1.0, soft_limit=0.7,
+                boundary_source=BoundarySource.GRADIENT_FIELD if self.enable_bio_integration else BoundarySource.STATIC
+            ),
+            'energy_consumption': AdaptiveBoundary(
+                boundary_id='energy_consumption',
+                resource_type='energy',
+                current_value=0.55, hard_limit=0.9, soft_limit=0.7,
+                boundary_source=BoundarySource.TOKEN_ECONOMY if self.enable_bio_integration else BoundarySource.STATIC
+            ),
+            'computational_resources': AdaptiveBoundary(
+                boundary_id='computational_resources',
+                resource_type='compute',
+                current_value=0.6, hard_limit=0.95, soft_limit=0.8,
+                boundary_source=BoundarySource.HYBRID if self.enable_bio_integration else BoundarySource.STATIC
+            )
+        }
     
     # ========================================================================
-    # Enhanced Validation
+    # Bio-Inspired Module Injection
     # ========================================================================
     
-    async def validate_expert_plan(
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        """
+        Inject bio-inspired modules for complete correlation.
+        
+        Connects quantum limit integration to real bio-inspired systems.
+        """
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        
+        injections = {
+            'token_manager': self.token_manager is not None,
+            'gradient_manager': self.gradient_manager is not None,
+            'scheduler': self.scheduler is not None,
+            'compartment_manager': self.compartment_manager is not None,
+            'biomass_storage': self.biomass_storage is not None,
+            'harvester': self.harvester is not None
+        }
+        logger.info(f"Bio-inspired injections into Quantum Limit Integration: {injections}")
+        
+        if any(injections.values()):
+            self.enable_bio_integration = True
+            # Update boundary sources
+            for boundary in self.boundaries.values():
+                if boundary.resource_type == 'carbon':
+                    boundary.boundary_source = BoundarySource.GRADIENT_FIELD
+                elif boundary.resource_type == 'energy':
+                    boundary.boundary_source = BoundarySource.TOKEN_ECONOMY
+    
+    # ========================================================================
+    # Bio-Inspired Data Access Methods
+    # ========================================================================
+    
+    def _get_gradient_boundary(self, resource_type: str) -> Tuple[float, float]:
+        """
+        Get planetary boundary from gradient field.
+        
+        Returns (current_value, max_value).
+        """
+        if self.gradient_manager:
+            field_id = self._map_resource_to_gradient(resource_type)
+            field = self.gradient_manager.fields.get(field_id)
+            if field:
+                return field.current_value, field.max_value
+        return 0.5, 1.0
+    
+    def _get_token_budget_remaining(self) -> float:
+        """Get remaining token budget from token manager"""
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            return summary.get('total_balance', 1000)
+        return float('inf')
+    
+    def _reserve_tokens_for_quantum(self, amount: float, job_id: str) -> bool:
+        """
+        Reserve Eco-ATP tokens for quantum computation.
+        
+        Quantum operations are token-expensive.
+        """
+        if self.token_manager:
+            success, token_ids = self.token_manager.reserve_tokens(
+                account_id='quantum_computing',
+                amount=amount,
+                consumer=EcoATPConsumer.QUANTUM_COMPUTING
+            )
+            if success:
+                logger.info(f"Reserved {amount:.1f} Eco-ATP for quantum job {job_id}")
+                return True
+            else:
+                logger.warning(f"Insufficient tokens for quantum job {job_id}: need {amount:.1f}")
+                return False
+        return True  # No token system - allow execution
+    
+    def _get_gradient_trend(self, resource_type: str) -> float:
+        """Get gradient trend for adaptive boundaries"""
+        if self.gradient_manager:
+            field_id = self._map_resource_to_gradient(resource_type)
+            field = self.gradient_manager.fields.get(field_id)
+            if field:
+                return field.pumping_rate - field.leakage_rate
+        return 0.0
+    
+    def _check_compartment_viability(self, expert_id: str) -> Tuple[bool, float]:
+        """
+        Check if compartment is viable for execution.
+        
+        Returns (is_viable, health_score).
+        """
+        if self.compartment_manager:
+            compartment = self.compartment_manager.find_best_compartment(expert_id)
+            if compartment:
+                return compartment.is_viable, compartment.health_score
+        return True, 0.7  # Default viable
+    
+    def _get_entangled_resources(self, resource_type: str) -> List[Dict[str, Any]]:
+        """
+        Get resources entangled with given resource.
+        
+        Includes biomass collateral and gradient couplings.
+        """
+        entangled = []
+        
+        # Biomass collateral entanglement
+        if self.biomass_storage:
+            stats = self.biomass_storage.get_storage_stats()
+            collateral = stats.get('collateral_pool', 0)
+            if collateral > 0:
+                entangled.append({
+                    'resource': 'biomass_collateral',
+                    'strength': min(1.0, collateral / 1000.0),
+                    'type': 'financial_entanglement'
+                })
+        
+        # Gradient coupling entanglement
+        if self.gradient_manager:
+            couplings = {
+                ('carbon', 'helium'): 0.2,
+                ('carbon', 'opportunity'): 0.6,
+                ('helium', 'opportunity'): 0.3,
+                ('carbon', 'eco_atp_reserve'): 0.5
+            }
+            for (a, b), strength in couplings.items():
+                if resource_type in (a, b):
+                    other = b if resource_type == a else a
+                    entangled.append({
+                        'resource': other,
+                        'strength': strength,
+                        'type': 'gradient_coupling'
+                    })
+        
+        return entangled
+    
+    def _get_harvester_confidence(self) -> float:
+        """Get confidence from photosynthetic harvester"""
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            recent = stats.get('recent_conversions', [])
+            if recent:
+                return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
+        return 0.5
+    
+    def _map_resource_to_gradient(self, resource_type: str) -> str:
+        """Map resource type to gradient field ID"""
+        mapping = {
+            'carbon': 'carbon',
+            'helium': 'helium',
+            'energy': 'eco_atp_reserve',
+            'compute': 'opportunity'
+        }
+        return mapping.get(resource_type, resource_type)
+    
+    def _get_real_gradient_levels(self) -> Dict[str, float]:
+        """Get all gradient levels"""
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5, 'eco_atp_reserve': 0.5}
+    
+    # ========================================================================
+    # Enhanced Validation with Bio-Inspired Integration
+    # ========================================================================
+    
+    def validate_expert_plan(
         self,
         expert_plan: Dict[str, Any],
-        quantum_enhanced: bool = False,
-        use_hardware: bool = False,
-        error_mitigation: Optional[QuantumErrorMitigation] = None
+        quantum_enhanced: bool = False
     ) -> Tuple[bool, Dict[str, Any]]:
         """
-        Enhanced expert plan validation with quantum optimization.
+        Enhanced expert plan validation with bio-inspired integration.
         
-        Args:
-            expert_plan: Expert execution plan
-            quantum_enhanced: Use quantum optimization
-            use_hardware: Use real quantum hardware
-            error_mitigation: Error mitigation strategy
-            
-        Returns:
-            (is_valid, validation_details)
+        Uses gradient boundaries, token budgets, and compartment health.
         """
         validation_results = {}
         is_valid = True
-        quantum_metrics = {}
         
-        # Validate each resource dimension
-        for resource in ['carbon', 'helium', 'energy']:
-            if f'estimated_{resource}_kg' in expert_plan or resource == 'carbon':
-                key = f'estimated_{resource}_kg' if resource == 'carbon' else (
-                    'helium_per_inference' if resource == 'helium' else 'estimated_energy_kwh'
-                )
-                value = expert_plan.get(key, 0)
-                
-                if quantum_enhanced:
-                    result = await self._quantum_validate_resource(
-                        resource, value, use_hardware, error_mitigation
-                    )
-                    quantum_metrics[resource] = result.get('quantum_metrics', {})
-                else:
-                    result = self._classical_validate_resource(resource, value)
-                
-                validation_results[resource] = result
-                if not result.get('within_limit', True):
-                    is_valid = False
+        # Validate carbon against gradient boundary
+        if 'estimated_carbon_kg' in expert_plan:
+            carbon_val, carbon_max = self._get_gradient_boundary('carbon')
+            carbon_result = {
+                'within_limit': expert_plan['estimated_carbon_kg'] * 1000 <= carbon_max,
+                'limit_source': 'gradient_field' if self.gradient_manager else 'static',
+                'current_gradient': carbon_val,
+                'max_gradient': carbon_max,
+                'trend': self._get_gradient_trend('carbon'),
+                'utilization': carbon_val / max(carbon_max, 1)
+            }
+            validation_results['carbon'] = carbon_result
+            if not carbon_result['within_limit']:
+                is_valid = False
         
-        # Quantum entanglement check
+        # Validate helium against gradient boundary
+        if 'helium_per_inference' in expert_plan or 'estimated_helium_units' in expert_plan:
+            helium_val = expert_plan.get('helium_per_inference', 
+                        expert_plan.get('estimated_helium_units', 0))
+            helium_current, helium_max = self._get_gradient_boundary('helium')
+            helium_result = {
+                'within_limit': helium_val <= helium_max,
+                'limit_source': 'gradient_field' if self.gradient_manager else 'static',
+                'current_gradient': helium_current,
+                'max_gradient': helium_max
+            }
+            validation_results['helium'] = helium_result
+            if not helium_result['within_limit']:
+                is_valid = False
+        
+        # Validate energy against token budget
+        if 'estimated_energy_kwh' in expert_plan:
+            token_budget = self._get_token_budget_remaining()
+            energy_ecoatp = expert_plan['estimated_energy_kwh'] * 1000
+            energy_result = {
+                'within_limit': energy_ecoatp <= token_budget,
+                'limit_source': 'token_economy' if self.token_manager else 'static',
+                'token_budget_remaining': token_budget,
+                'energy_ecoatp_cost': energy_ecoatp
+            }
+            validation_results['energy'] = energy_result
+            if not energy_result['within_limit']:
+                is_valid = False
+        
+        # Validate compartment viability
+        expert_id = expert_plan.get('expert_id', 'unknown')
+        viable, health = self._check_compartment_viability(expert_id)
+        if not viable:
+            validation_results['compartment'] = {
+                'viable': False,
+                'health_score': health
+            }
+            is_valid = False
+        
+        # Check entangled resources for quantum operations
         if quantum_enhanced:
-            entanglement_result = await self._check_quantum_entanglement(
-                expert_plan, use_hardware
+            entangled = self._get_entangled_resources('carbon')
+            validation_results['entangled_resources'] = entangled
+            
+            # Reserve tokens for quantum execution
+            ecoatp_cost = expert_plan.get('estimated_energy_kwh', 0.001) * 1000 * 5  # 5x for quantum
+            tokens_reserved = self._reserve_tokens_for_quantum(
+                ecoatp_cost, 
+                f"validate_{datetime.utcnow().timestamp()}"
             )
-            validation_results['quantum_entanglement'] = entanglement_result
+            validation_results['quantum_tokens_reserved'] = tokens_reserved
+            if not tokens_reserved:
+                is_valid = False
+        
+        # Add harvester confidence
+        if self.enable_bio_integration:
+            validation_results['harvester_confidence'] = self._get_harvester_confidence()
+            validation_results['gradient_levels'] = self._get_real_gradient_levels()
         
         # Record validation
         self.validation_history.append({
             'timestamp': datetime.utcnow().isoformat(),
             'plan': str(expert_plan)[:200],
             'is_valid': is_valid,
-            'quantum_enhanced': quantum_enhanced,
-            'quantum_metrics': quantum_metrics
+            'bio_integrated': self.enable_bio_integration
         })
         
         return is_valid, validation_results
     
-    async def _quantum_validate_resource(
-        self,
-        resource_type: str,
-        proposed_value: float,
-        use_hardware: bool = False,
-        error_mitigation: Optional[QuantumErrorMitigation] = None
-    ) -> Dict[str, Any]:
-        """Validate resource using quantum optimization"""
-        # Get boundary
-        boundary_key = f'{resource_type}_emissions' if resource_type == 'carbon' else (
-            f'{resource_type}_reserves' if resource_type == 'helium' else f'{resource_type}_consumption'
-        )
-        boundary = self.boundary_manager.boundaries.get(boundary_key)
-        
-        if not boundary:
-            return self._classical_validate_resource(resource_type, proposed_value)
-        
-        # Select backend
-        if use_hardware and self.enable_quantum_hardware:
-            backend = self.backend_manager.select_optimal_backend(
-                qubits_required=4,
-                max_error_rate=0.05
-            )
-        else:
-            backend = QuantumBackend.SIMULATOR
-        
-        # Build quantum circuit for validation
-        circuit = self.circuit_builder.build_qaoa_circuit(
-            num_qubits=4,
-            num_layers=2
-        )
-        
-        # Create job
-        job = QuantumCircuitJob(
-            job_id=f"validate_{resource_type}_{datetime.utcnow().timestamp()}",
-            circuit=circuit,
-            algorithm=QuantumAlgorithm.QAOA,
-            qubits_required=4,
-            shots=1000,
-            error_mitigation=error_mitigation or QuantumErrorMitigation.ZNE
-        )
-        
-        # Execute
-        if backend:
-            await self.backend_manager.submit_job(job, backend)
-            
-            # Simulate result
-            optimal_ratio = np.random.beta(2, 5)  # Biased towards lower values
-            remaining_budget = boundary.hard_limit * optimal_ratio
-            
-            await self.backend_manager.complete_job(job.id if hasattr(job, 'id') else job.job_id, {
-                'optimal_ratio': optimal_ratio,
-                'remaining_budget': remaining_budget,
-                'circuit_depth': 4
-            })
-            
-            within_limit = proposed_value <= remaining_budget
-            
-            return {
-                'within_limit': within_limit,
-                'current_value': boundary.current_value,
-                'hard_limit': boundary.hard_limit,
-                'proposed_value': proposed_value,
-                'remaining_budget': remaining_budget,
-                'quantum_enhanced': True,
-                'quantum_metrics': {
-                    'algorithm': 'QAOA',
-                    'backend': backend.value if hasattr(backend, 'value') else str(backend),
-                    'optimal_ratio': optimal_ratio,
-                    'error_mitigation': error_mitigation.value if error_mitigation else 'none'
-                }
-            }
-        
-        return self._classical_validate_resource(resource_type, proposed_value)
-    
-    def _classical_validate_resource(
-        self,
-        resource_type: str,
-        proposed_value: float
-    ) -> Dict[str, Any]:
-        """Classical resource validation"""
-        boundary_key = f'{resource_type}_emissions' if resource_type == 'carbon' else (
-            f'{resource_type}_reserves' if resource_type == 'helium' else f'{resource_type}_consumption'
-        )
-        boundary = self.boundary_manager.boundaries.get(boundary_key)
-        
-        if not boundary:
-            return {'within_limit': True}
-        
-        remaining = boundary.hard_limit - boundary.current_value
-        within_limit = proposed_value <= remaining
-        
-        return {
-            'within_limit': within_limit,
-            'current_value': boundary.current_value,
-            'hard_limit': boundary.hard_limit,
-            'proposed_value': proposed_value,
-            'remaining_budget': remaining,
-            'quantum_enhanced': False
-        }
-    
-    async def _check_quantum_entanglement(
-        self,
-        expert_plan: Dict[str, Any],
-        use_hardware: bool = False
-    ) -> Dict[str, Any]:
-        """Check quantum entanglement constraints"""
-        # Build entanglement circuit
-        num_qubits = min(6, len(self.entanglement_map))
-        
-        circuit = self.circuit_builder.build_qaoa_circuit(
-            num_qubits=num_qubits,
-            num_layers=1
-        )
-        
-        # Simulate entanglement measurement
-        entanglement_strength = np.random.beta(2, 2)
+    def _check_carbon_limit(self, carbon_value: float, quantum_enhanced: bool) -> Dict[str, Any]:
+        """Enhanced carbon limit check with gradient integration"""
+        carbon_current, carbon_max = self._get_gradient_boundary('carbon')
+        remaining = carbon_max - carbon_current
+        within_limit = carbon_value <= remaining
         
         result = {
-            'entanglement_detected': entanglement_strength > 0.3,
-            'entanglement_strength': entanglement_strength,
-            'requires_decoherence': entanglement_strength > 0.7,
-            'entangled_resources': sum(len(v) for v in self.entanglement_map.values()),
-            'circuit_depth': num_qubits
+            'within_limit': within_limit,
+            'current_value': carbon_current,
+            'limit_value': carbon_max,
+            'proposed_value': carbon_value,
+            'remaining_budget': remaining,
+            'quantum_enhanced': quantum_enhanced,
+            'source': 'gradient_field' if self.gradient_manager else 'static',
+            'trend': self._get_gradient_trend('carbon')
         }
+        
+        # If trend is negative (improving), give more flexibility
+        if result['trend'] < -0.01 and not within_limit:
+            result['within_limit'] = carbon_value <= remaining * 1.2
+            result['trend_adjusted'] = True
         
         return result
     
+    def _check_helium_limit(self, helium_value: float, quantum_enhanced: bool) -> Dict[str, Any]:
+        """Enhanced helium limit check with gradient integration"""
+        helium_current, helium_max = self._get_gradient_boundary('helium')
+        adjusted_limit = helium_max * (1 - helium_current * 0.5)
+        within_limit = helium_value <= adjusted_limit
+        
+        return {
+            'within_limit': within_limit,
+            'current_scarcity': helium_current,
+            'adjusted_limit': adjusted_limit,
+            'proposed_value': helium_value,
+            'quantum_enhanced': quantum_enhanced,
+            'source': 'gradient_field' if self.gradient_manager else 'static'
+        }
+    
+    def _check_energy_limit(self, energy_value: float, quantum_enhanced: bool) -> Dict[str, Any]:
+        """Enhanced energy limit check with token integration"""
+        if self.token_manager:
+            token_budget = self._get_token_budget_remaining()
+            available_capacity = token_budget / 1000.0  # Convert to kWh equivalent
+        else:
+            available_capacity = 1.0
+        
+        within_limit = energy_value <= available_capacity
+        
+        return {
+            'within_limit': within_limit,
+            'available_capacity': available_capacity,
+            'proposed_value': energy_value,
+            'quantum_enhanced': quantum_enhanced,
+            'source': 'token_economy' if self.token_manager else 'static',
+            'token_budget_remaining': self._get_token_budget_remaining() if self.token_manager else float('inf')
+        }
+    
     # ========================================================================
-    # Multi-Objective Quantum Optimization
+    # Enhanced Optimization with Bio-Inspired Integration
     # ========================================================================
     
-    async def optimize_expert_routing(
+    def optimize_expert_routing(
         self,
         expert_plans: List[Dict[str, Any]],
-        quantum_enhanced: bool = True,
-        use_hardware: bool = False,
-        objectives: List[str] = None
+        quantum_enhanced: bool = True
     ) -> List[Dict[str, Any]]:
         """
-        Multi-objective quantum optimization for expert routing.
-        
-        Args:
-            expert_plans: Expert execution plans
-            quantum_enhanced: Use quantum optimization
-            use_hardware: Use real quantum hardware
-            objectives: Optimization objectives (carbon, helium, energy, latency)
-            
-        Returns:
-            Optimized expert plans
+        Enhanced expert routing optimization with bio-inspired scoring.
         """
         if not expert_plans:
             return []
         
-        if objectives is None:
-            objectives = ['carbon', 'helium', 'energy', 'latency']
-        
-        # Validate all plans
         validated_plans = []
         for plan in expert_plans:
-            is_valid, validation = await self.validate_expert_plan(
-                plan, quantum_enhanced, use_hardware
-            )
+            is_valid, validation = self.validate_expert_plan(plan, quantum_enhanced)
             if is_valid:
                 plan['limit_validation'] = validation
+                
+                # BIO-INSPIRED: Add token efficiency scores
+                if self.token_manager:
+                    expert_id = plan.get('expert_id', 'unknown')
+                    account = self.token_manager.get_account_summary(f"expert_{expert_id}")
+                    if account:
+                        plan['token_efficiency'] = account.get('efficiency_rating', 0.5)
+                        plan['token_balance'] = account.get('balance', 0)
+                
+                # BIO-INSPIRED: Add compartment health scores
+                if self.compartment_manager:
+                    expert_id = plan.get('expert_id', 'unknown')
+                    viable, health = self._check_compartment_viability(expert_id)
+                    plan['compartment_health'] = health
+                    plan['compartment_viable'] = viable
+                
+                # BIO-INSPIRED: Add gradient alignment
+                if self.gradient_manager:
+                    gradients = self._get_real_gradient_levels()
+                    plan['gradient_alignment'] = {
+                        'carbon': gradients.get('carbon', 0.5),
+                        'trust': gradients.get('trust', 0.5)
+                    }
+                
                 validated_plans.append(plan)
         
-        if not validated_plans:
-            logger.warning("No plans passed LIMIT graph validation")
-            return expert_plans[:1]
-        
-        # Quantum optimization for best combination
-        if quantum_enhanced and len(validated_plans) > 1:
-            if use_hardware and self.enable_quantum_hardware:
-                optimized = await self._quantum_multi_objective_optimize(
-                    validated_plans, objectives
-                )
-            else:
-                optimized = await self._hybrid_optimize(validated_plans, objectives)
-            
-            return optimized
-        
-        # Classical optimization fallback
-        return self._classical_multi_objective_optimize(validated_plans, objectives)
-    
-    async def _quantum_multi_objective_optimize(
-        self,
-        plans: List[Dict[str, Any]],
-        objectives: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Quantum multi-objective optimization using QAOA"""
-        n_plans = len(plans)
-        num_qubits = min(n_plans, 10)
-        
-        # Build QAOA circuit
-        circuit = self.circuit_builder.build_qaoa_circuit(
-            num_qubits=num_qubits,
-            num_layers=2
-        )
-        
-        # Select backend
-        backend = self.backend_manager.select_optimal_backend(
-            qubits_required=num_qubits,
-            max_error_rate=0.05
-        )
-        
-        # Create job
-        job = QuantumCircuitJob(
-            job_id=f"optimize_routing_{datetime.utcnow().timestamp()}",
-            circuit=circuit,
-            algorithm=QuantumAlgorithm.QAOA,
-            qubits_required=num_qubits,
-            shots=2000,
-            error_mitigation=QuantumErrorMitigation.ZNE
-        )
-        
-        if backend:
-            await self.backend_manager.submit_job(job, backend)
-            
-            # Simulate quantum optimization result
-            optimal_indices = list(np.random.choice(
-                len(plans),
-                size=min(3, len(plans)),
-                replace=False
-            ))
-            
-            await self.backend_manager.complete_job(job.id if hasattr(job, 'id') else job.job_id, {
-                'optimal_indices': optimal_indices,
-                'optimization_objectives': objectives,
-                'quantum_advantage': np.random.uniform(1.1, 1.5)
-            })
-            
-            return [plans[i] for i in optimal_indices if i < len(plans)]
-        
-        return plans[:3]
-    
-    async def _hybrid_optimize(
-        self,
-        plans: List[Dict[str, Any]],
-        objectives: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Hybrid classical-quantum optimization"""
-        # Classical pre-filtering
-        scored_plans = self._score_plans(plans, objectives)
-        
-        # Quantum refinement on top candidates
-        top_candidates = scored_plans[:max(5, len(plans)//2)]
-        
-        # Build VQE circuit for refinement
-        num_qubits = min(len(top_candidates), 8)
-        circuit = self.circuit_builder.build_vqe_circuit(
-            num_qubits=num_qubits,
-            num_layers=2
-        )
-        
-        # Simulate hybrid optimization
-        refined_scores = []
-        for i, (plan, score) in enumerate(top_candidates):
-            quantum_adjustment = np.random.normal(0, 0.1)
-            refined_scores.append((plan, score + quantum_adjustment))
-        
-        refined_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        return [plan for plan, _ in refined_scores[:3]]
-    
-    def _classical_multi_objective_optimize(
-        self,
-        plans: List[Dict[str, Any]],
-        objectives: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Classical multi-objective optimization"""
-        scored = self._score_plans(plans, objectives)
-        return [plan for plan, _ in scored[:3]]
-    
-    def _score_plans(
-        self,
-        plans: List[Dict[str, Any]],
-        objectives: List[str]
-    ) -> List[Tuple[Dict[str, Any], float]]:
-        """Score plans based on objectives"""
-        scored = []
-        
-        for plan in plans:
-            score = 0.0
-            weights = {
-                'carbon': 0.35,
-                'helium': 0.25,
-                'energy': 0.20,
-                'latency': 0.20
-            }
-            
-            if 'carbon' in objectives:
-                carbon_val = plan.get('estimated_carbon_kg', 0)
-                score += weights['carbon'] * (1.0 / (1.0 + carbon_val * 1000))
-            
-            if 'helium' in objectives:
-                helium_val = plan.get('helium_per_inference', plan.get('estimated_helium_units', 0))
-                score += weights['helium'] * (1.0 / (1.0 + helium_val * 100))
-            
-            if 'energy' in objectives:
-                energy_val = plan.get('estimated_energy_kwh', 0)
-                score += weights['energy'] * (1.0 / (1.0 + energy_val * 100))
-            
-            if 'latency' in objectives:
-                latency_val = plan.get('estimated_latency_ms', 100)
-                score += weights['latency'] * (1.0 / (1.0 + latency_val / 100))
-            
-            scored.append((plan, score))
-        
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored
-    
-    # ========================================================================
-    # Quantum Advantage Verification
-    # ========================================================================
-    
-    async def verify_quantum_advantage(
-        self,
-        problem_size: int,
-        classical_time_ms: float,
-        quantum_time_ms: float
-    ) -> Dict[str, Any]:
-        """
-        Verify if quantum computing provides advantage.
-        
-        Returns:
-            Advantage assessment with confidence
-        """
-        speedup = classical_time_ms / max(quantum_time_ms, 0.001)
-        
-        # Calculate confidence based on problem size
-        if problem_size < 10:
-            confidence = 0.3
-            advantage_type = 'none'
-        elif problem_size < 50:
-            confidence = 0.6
-            advantage_type = 'possible' if speedup > 1.5 else 'none'
-        elif problem_size < 200:
-            confidence = 0.8
-            advantage_type = 'likely' if speedup > 2.0 else 'possible'
-        else:
-            confidence = 0.95
-            advantage_type = 'significant' if speedup > 5.0 else 'likely'
-        
-        # Calculate error-mitigated speedup
-        mitigated_speedup = speedup * (1.0 - 0.1 * np.log(problem_size))
-        
-        result = {
-            'problem_size': problem_size,
-            'classical_time_ms': classical_time_ms,
-            'quantum_time_ms': quantum_time_ms,
-            'raw_speedup': speedup,
-            'mitigated_speedup': mitigated_speedup,
-            'advantage_type': advantage_type,
-            'confidence': confidence,
-            'recommendation': (
-                'Use quantum' if advantage_type in ['significant', 'likely']
-                else 'Use classical' if advantage_type == 'none'
-                else 'Consider hybrid'
+        # BIO-INSPIRED: Reserve tokens for quantum execution
+        if quantum_enhanced and validated_plans:
+            total_ecoatp = sum(
+                p.get('estimated_energy_kwh', 0.001) * 1000 * 5
+                for p in validated_plans
             )
-        }
+            self._reserve_tokens_for_quantum(total_ecoatp, f"batch_{datetime.utcnow().timestamp()}")
         
-        # Store advantage score
-        problem_key = f"size_{problem_size}"
-        self.quantum_advantage_scores[problem_key] = mitigated_speedup
+        # Sort by bio-inspired composite score
+        if self.enable_bio_integration:
+            validated_plans.sort(
+                key=lambda p: (
+                    p.get('token_efficiency', 0.5) * 0.3 +
+                    p.get('compartment_health', 0.5) * 0.3 +
+                    (1 - p.get('estimated_carbon_kg', 0.001) * 1000) * 0.4
+                ),
+                reverse=True
+            )
         
-        return result
+        return validated_plans
+    
+    def _quantum_estimate_budget(self, resource_type: str, proposed_value: float) -> float:
+        """Enhanced quantum budget estimation with bio-inspired data"""
+        if self.gradient_manager:
+            field_id = self._map_resource_to_gradient(resource_type)
+            field = self.gradient_manager.fields.get(field_id)
+            if field:
+                # Use gradient dynamics for estimation
+                trend = field.pumping_rate - field.leakage_rate
+                adjusted_budget = field.max_value - field.current_value
+                if trend > 0:
+                    adjusted_budget *= (1 + trend * 0.1)
+                return adjusted_budget
+        
+        # Fallback
+        if resource_type in self.graph_nodes:
+            node = self.graph_nodes[resource_type]
+            return node.limit_value - node.current_value
+        return float('inf')
     
     # ========================================================================
-    # Status and Reporting
+    # Enhanced Boundary Status with Bio-Inspired Data
     # ========================================================================
     
     def get_planetary_boundary_status(self) -> Dict[str, Any]:
-        """Get planetary boundary status"""
-        return self.boundary_manager.get_boundary_status()
-    
-    def update_boundary_values(
-        self,
-        resource_type: str,
-        new_value: float
-    ):
-        """Update planetary boundary values"""
-        self.boundary_manager.update_boundary(resource_type, new_value)
-    
-    def get_quantum_resource_status(self) -> Dict[str, Any]:
-        """Get quantum resource status"""
-        return self.backend_manager.get_backend_stats()
-    
-    def get_validation_statistics(self) -> Dict[str, Any]:
-        """Get validation statistics"""
-        recent = list(self.validation_history)[-100:]
+        """
+        Enhanced planetary boundary status with bio-inspired data.
         
-        return {
-            'total_validations': len(self.validation_history),
-            'recent_validation_rate': sum(1 for v in recent if v['is_valid']) / max(len(recent), 1),
-            'quantum_enhanced_rate': sum(1 for v in recent if v['quantum_enhanced']) / max(len(recent), 1),
-            'quantum_advantage_scores': self.quantum_advantage_scores,
-            'boundary_alerts': self.boundary_manager.get_alerts(limit=10)
-        }
-    
-    def get_entanglement_status(self) -> Dict[str, Any]:
-        """Get entanglement status"""
-        return {
-            'total_entanglements': sum(len(v) for v in self.entanglement_map.values()),
-            'entanglement_map': dict(self.entanglement_map),
-            'node_states': {
-                node_id: {
+        Integrates gradient fields, token economy, and biomass reserves.
+        """
+        status = {}
+        
+        # Gradient-based boundaries
+        if self.gradient_manager:
+            for field_id, field in self.gradient_manager.fields.items():
+                status[field_id] = {
+                    'current_value': field.current_value,
+                    'limit_value': field.max_value,
+                    'utilization': field.gradient_strength,
+                    'trend': field.pumping_rate - field.leakage_rate,
+                    'status': 'critical' if field.gradient_strength > 0.8 else
+                             'warning' if field.gradient_strength > 0.6 else 'safe',
+                    'source': 'gradient_field',
+                    'pumping_rate': field.pumping_rate,
+                    'leakage_rate': field.leakage_rate
+                }
+        
+        # Token economy status
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            status['token_economy'] = {
+                'current_value': summary.get('total_consumed', 0),
+                'limit_value': summary.get('total_generated', 1000),
+                'utilization': summary.get('total_consumed', 0) / max(summary.get('total_generated', 1), 1),
+                'status': 'critical' if summary.get('total_balance', 0) < 100 else 'safe',
+                'source': 'token_economy',
+                'total_balance': summary.get('total_balance', 0),
+                'system_efficiency': summary.get('system_efficiency', 0)
+            }
+        
+        # Biomass reserve status
+        if self.biomass_storage:
+            stats = self.biomass_storage.get_storage_stats()
+            status['biomass_reserves'] = {
+                'total_stored': stats.get('total_stored', 0),
+                'collateral_pool': stats.get('collateral_pool', 0),
+                'status': 'critical' if stats.get('total_stored', 0) > 10000 else
+                         'warning' if stats.get('total_stored', 0) > 5000 else 'safe',
+                'source': 'biomass_reserve',
+                'tiers': stats.get('tiers', {})
+            }
+        
+        # Harvester status
+        if self.harvester:
+            harvester_stats = self.harvester.get_harvesting_stats()
+            status['photosynthetic_harvester'] = {
+                'total_harvested': harvester_stats.get('total_harvested', 0),
+                'confidence': self._get_harvester_confidence(),
+                'status': 'active' if self._get_harvester_confidence() > 0.3 else 'low',
+                'source': 'harvester_signal'
+            }
+        
+        # Traditional boundary nodes
+        for node_id, node in self.graph_nodes.items():
+            if node_id not in status:
+                status[node_id] = {
                     'current_value': node.current_value,
                     'limit_value': node.limit_value,
                     'utilization': node.current_value / max(node.limit_value, 1e-9),
+                    'status': 'critical' if node.current_value > node.limit_value else 'safe',
+                    'source': 'static_graph',
                     'entangled_count': len(node.entangled_nodes)
                 }
-                for node_id, node in self.graph_nodes.items()
+        
+        return status
+    
+    def update_boundary_values(self, resource_type: str, new_value: float):
+        """Update boundary values with bio-inspired synchronization"""
+        # Update graph nodes
+        if resource_type in self.graph_nodes:
+            self.graph_nodes[resource_type].current_value = new_value
+        
+        # Update boundaries
+        boundary_key = f"{resource_type}_emissions" if resource_type == 'carbon' else \
+                      f"{resource_type}_reserves" if resource_type == 'helium' else \
+                      f"{resource_type}_consumption"
+        if boundary_key in self.boundaries:
+            self.boundaries[boundary_key].current_value = new_value
+        
+        # BIO-INSPIRED: Pump gradient field
+        if self.gradient_manager:
+            field_id = self._map_resource_to_gradient(resource_type)
+            if field_id in self.gradient_manager.fields:
+                delta = new_value - self.graph_nodes.get(resource_type, 
+                         QuantumNode(resource_type, resource_type, 0, 1)).current_value
+                if delta != 0:
+                    self.gradient_manager.pump_field(
+                        field_id, 
+                        abs(delta) * 0.1,
+                        source=f"quantum_limit_update"
+                    )
+    
+    # ========================================================================
+    # Quantum Resource Management with Bio-Inspired Costs
+    # ========================================================================
+    
+    def select_optimal_backend(
+        self,
+        qubits_required: int,
+        max_error_rate: float = 0.01,
+        carbon_budget: Optional[float] = None,
+        ecoatp_budget: Optional[float] = None
+    ) -> Optional[QuantumBackend]:
+        """
+        Select optimal backend with bio-inspired cost consideration.
+        """
+        candidates = []
+        for backend, resource in self.backends.items():
+            if not resource.is_available:
+                continue
+            if resource.qubits_free < qubits_required:
+                continue
+            if resource.gate_error_rate > max_error_rate:
+                continue
+            
+            # Score with bio-inspired costs
+            quality = 1.0 / (1.0 + resource.gate_error_rate * 100)
+            wait_score = 1.0 / (1.0 + resource.estimated_wait_seconds / 100)
+            carbon_score = 1.0 / (1.0 + resource.carbon_per_second * 1000)
+            ecoatp_score = 1.0 / (1.0 + resource.ecoatp_cost_per_second / 100)
+            
+            if ecoatp_budget is not None:
+                score = 0.3 * quality + 0.2 * wait_score + 0.2 * carbon_score + 0.3 * ecoatp_score
+            else:
+                score = 0.4 * quality + 0.3 * wait_score + 0.3 * carbon_score
+            
+            candidates.append((backend, score))
+        
+        if not candidates:
+            return None
+        
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+    
+    def get_quantum_resource_status(self) -> Dict[str, Any]:
+        """Get quantum resource status with bio-inspired metrics"""
+        status = {}
+        for backend, resource in self.backends.items():
+            status[backend.value] = {
+                'qubits_available': resource.qubits_available,
+                'qubits_in_use': resource.qubits_in_use,
+                'utilization': resource.utilization,
+                'gate_error_rate': resource.gate_error_rate,
+                'ecoatp_cost_per_second': resource.ecoatp_cost_per_second,
+                'carbon_per_second': resource.carbon_per_second,
+                'is_available': resource.is_available
+            }
+        return status
+    
+    # ========================================================================
+    # Enhanced Statistics
+    # ========================================================================
+    
+    def get_validation_statistics(self) -> Dict[str, Any]:
+        """Get validation statistics with bio-inspired data"""
+        recent = list(self.validation_history)[-100:]
+        bio_validations = [v for v in recent if v.get('bio_integrated', False)]
+        
+        stats = {
+            'total_validations': len(self.validation_history),
+            'recent_validation_rate': sum(1 for v in recent if v['is_valid']) / max(len(recent), 1),
+            'bio_integration_active': self.enable_bio_integration,
+            'bio_validations': len(bio_validations),
+            'quantum_advantage_scores': self.quantum_advantage_scores
+        }
+        
+        if self.enable_bio_integration:
+            stats['gradient_levels'] = self._get_real_gradient_levels()
+            stats['token_budget'] = self._get_token_budget_remaining()
+            stats['harvester_confidence'] = self._get_harvester_confidence()
+        
+        return stats
+    
+    def get_entanglement_status(self) -> Dict[str, Any]:
+        """Get entanglement status with bio-inspired coupling"""
+        status = {
+            'total_entanglements': sum(len(v) for v in self.entanglement_map.values()),
+            'entanglement_map': dict(self.entanglement_map),
+            'node_states': {}
+        }
+        
+        for node_id, node in self.graph_nodes.items():
+            node_status = {
+                'current_value': node.current_value,
+                'limit_value': node.limit_value,
+                'utilization': node.current_value / max(node.limit_value, 1e-9),
+                'entangled_count': len(node.entangled_nodes)
+            }
+            
+            # Add bio-inspired entangled resources
+            if self.enable_bio_integration:
+                node_status['bio_entangled'] = self._get_entangled_resources(
+                    node.resource_type
+                )
+                if node.gradient_field_id:
+                    gradient_level = self._get_real_gradient_levels().get(
+                        node.gradient_field_id, 0.5
+                    )
+                    node_status['gradient_strength'] = gradient_level
+            
+            status['node_states'][node_id] = node_status
+        
+        return status
+    
+    def get_comprehensive_limits_report(self) -> Dict[str, Any]:
+        """Generate comprehensive limits report with all bio-inspired sources"""
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'planetary_boundaries': self.get_planetary_boundary_status(),
+            'entanglement': self.get_entanglement_status(),
+            'validation_stats': self.get_validation_statistics(),
+            'quantum_resources': self.get_quantum_resource_status(),
+            'bio_integration': {
+                'active': self.enable_bio_integration,
+                'available': BIO_INSPIRED_AVAILABLE,
+                'gradient_levels': self._get_real_gradient_levels() if self.enable_bio_integration else {},
+                'token_budget': self._get_token_budget_remaining() if self.enable_bio_integration else float('inf'),
+                'harvester_confidence': self._get_harvester_confidence() if self.enable_bio_integration else 0.5
             }
         }
     
@@ -1581,147 +1023,39 @@ class EnhancedQuantumLimitIntegrator:
     # ========================================================================
     
     def validate_expert_plan_sync(
-        self,
-        expert_plan: Dict[str, Any],
-        quantum_enhanced: bool = False
+        self, expert_plan: Dict[str, Any], quantum_enhanced: bool = False
     ) -> Tuple[bool, Dict[str, Any]]:
         """Synchronous validation (legacy compatibility)"""
-        return asyncio.get_event_loop().run_until_complete(
-            self.validate_expert_plan(expert_plan, quantum_enhanced)
-        )
+        return self.validate_expert_plan(expert_plan, quantum_enhanced)
     
     def optimize_expert_routing_sync(
-        self,
-        expert_plans: List[Dict[str, Any]],
-        quantum_enhanced: bool = True
+        self, expert_plans: List[Dict[str, Any]], quantum_enhanced: bool = True
     ) -> List[Dict[str, Any]]:
         """Synchronous optimization (legacy compatibility)"""
-        return asyncio.get_event_loop().run_until_complete(
-            self.optimize_expert_routing(expert_plans, quantum_enhanced)
-        )
+        return self.optimize_expert_routing(expert_plans, quantum_enhanced)
     
     def get_planetary_boundary_status_sync(self) -> Dict[str, Any]:
-        """Get boundary status (legacy compatibility)"""
-        return self.boundary_manager.get_boundary_status()
-
-# ============================================================================
-# Legacy Compatibility Class
-# ============================================================================
-
-class QuantumLimitGraphIntegrator(EnhancedQuantumLimitIntegrator):
-    """
-    Legacy Quantum LIMIT Graph Integrator.
-    
-    Maintains backward compatibility with original interface.
-    """
-    
-    def __init__(self, quantum_backend=None):
-        super().__init__(
-            enable_quantum_hardware=quantum_backend is not None,
-            enable_error_mitigation=True,
-            enable_adaptive_boundaries=True
-        )
-        self.quantum_backend = quantum_backend
-        
-        logger.info("Quantum LIMIT Graph Integrator initialized (compatibility mode)")
-    
-    def validate_expert_plan(
-        self,
-        expert_plan: Dict[str, Any],
-        quantum_enhanced: bool = False
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """Legacy validation method"""
-        return self.validate_expert_plan_sync(expert_plan, quantum_enhanced)
-    
-    def optimize_expert_routing(
-        self,
-        expert_plans: List[Dict[str, Any]],
-        quantum_enhanced: bool = True
-    ) -> List[Dict[str, Any]]:
-        """Legacy optimization method"""
-        return self.optimize_expert_routing_sync(expert_plans, quantum_enhanced)
-    
-    def get_planetary_boundary_status(self) -> Dict[str, Any]:
-        """Legacy boundary status"""
-        return self.get_planetary_boundary_status_sync()
-    
-    def _check_carbon_limit(
-        self,
-        carbon_value: float,
-        quantum_enhanced: bool
-    ) -> Dict[str, Any]:
-        """Legacy carbon check"""
-        result = self.validate_expert_plan_sync(
-            {'estimated_carbon_kg': carbon_value},
-            quantum_enhanced
-        )
-        return result[1].get('carbon', {})
-    
-    def _check_helium_limit(
-        self,
-        helium_value: float,
-        quantum_enhanced: bool
-    ) -> Dict[str, Any]:
-        """Legacy helium check"""
-        result = self.validate_expert_plan_sync(
-            {'helium_per_inference': helium_value},
-            quantum_enhanced
-        )
-        return result[1].get('helium', {})
-    
-    def _check_energy_limit(
-        self,
-        energy_value: float,
-        quantum_enhanced: bool
-    ) -> Dict[str, Any]:
-        """Legacy energy check"""
-        result = self.validate_expert_plan_sync(
-            {'estimated_energy_kwh': energy_value},
-            quantum_enhanced
-        )
-        return result[1].get('energy', {})
-    
-    def _quantum_estimate_budget(
-        self,
-        resource_type: str,
-        proposed_value: float
-    ) -> float:
-        """Legacy quantum budget estimation"""
-        result = self.validate_expert_plan_sync(
-            {f'estimated_{resource_type}_kg': proposed_value},
-            quantum_enhanced=True
-        )
-        return result[1].get(resource_type, {}).get('remaining_budget', proposed_value * 0.8)
+        """Synchronous boundary status (legacy compatibility)"""
+        return self.get_planetary_boundary_status()
     
     def _create_optimization_circuit(
-        self,
-        n_items: int,
-        objectives: List[float]
+        self, n_items: int, objectives: List[float]
     ) -> Dict[str, Any]:
         """Legacy circuit creation"""
         return {
             'circuit_type': 'qaoa',
             'n_qubits': n_items,
             'depth': 2,
-            'parameters': {
-                'objectives': objectives,
-                'constraints': 'minimize_total_impact'
-            }
+            'parameters': {'objectives': objectives, 'constraints': 'minimize_total_impact'}
         }
     
-    def _check_quantum_entanglement(
-        self,
-        expert_plan: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _check_quantum_entanglement(self, expert_plan: Dict[str, Any]) -> Dict[str, Any]:
         """Legacy entanglement check"""
-        return asyncio.get_event_loop().run_until_complete(
-            self._check_quantum_entanglement(expert_plan, False)
-        )
-    
-    def update_boundary_values(
-        self,
-        resource_type: str,
-        new_value: float
-    ):
-        """Update boundary values"""
-        self.boundary_manager.update_boundary(resource_type, new_value)
+        entanglement_strength = np.random.beta(2, 2)
+        return {
+            'entanglement_detected': entanglement_strength > 0.3,
+            'entanglement_strength': entanglement_strength,
+            'requires_decoherence': entanglement_strength > 0.7,
+            'entangled_resources': sum(len(v) for v in self.entanglement_map.values()),
+            'bio_entangled': self._get_entangled_resources('carbon') if self.enable_bio_integration else []
+        }
