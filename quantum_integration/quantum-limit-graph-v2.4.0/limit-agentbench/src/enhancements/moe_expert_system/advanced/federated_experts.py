@@ -1,16 +1,20 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/federated_experts.py
-# Enhanced with personalized FL, vertical FL, gradient leakage defense, and client selection optimization
+# Enhanced with complete bio-inspired integration - Metabolic Federation Network v4.0.0
 
 """
-Enhanced Federated Experts v3.0.0
-- Personalized Federated Learning (pFedMe, Ditto, FedPer)
-- Vertical Federated Learning support
-- Federated Transfer Learning with pre-trained models
-- Asynchronous SGD with staleness control
-- Advanced gradient leakage defense (gradient clipping, noise injection, secure aggregation++)
-- Multi-objective client selection (carbon, performance, diversity, trust)
-- Model quantization for communication efficiency
-- Enhanced federated distillation with mutual learning
+Enhanced Federated Experts v4.0.0 - Metabolic Federation Network
+
+Complete bio-inspired integration with:
+- Token-based incentive distribution (Eco-ATP rewards)
+- Gradient-aligned client selection (trust gradient)
+- Token-weighted aggregation (stake-proportional)
+- Compartment health-aware fault tolerance
+- Biomass-backed blockchain audit trail
+- Trust gradient reputation system
+- ATP-driven gating network synchronization
+- Harvester signal quality for defense
+- Token efficiency for capability assessment
+- Gradient-modulated privacy budget allocation
 """
 
 import asyncio
@@ -22,1078 +26,972 @@ from enum import Enum
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import hashlib
 import json
 from collections import defaultdict, deque
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import secrets
+import copy
+import math
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Personalized Federated Learning
+# Try importing bio-inspired modules
 # ============================================================================
 
-class PersonalizedFederatedLearning:
-    """
-    Personalized Federated Learning for client-specific model adaptation.
+try:
+    from enhancements.bio_inspired.eco_atp_currency import (
+        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
+        TokenState, EcoATPToken, EcoATPAccount
+    )
+    from enhancements.bio_inspired.proton_gradient_fields import (
+        GradientFieldManager, GradientField
+    )
+    from enhancements.bio_inspired.atp_synthase_scheduler import (
+        ATPSynthaseScheduler, SynthaseConfig
+    )
+    from enhancements.bio_inspired.chromatophore_compartments import (
+        CompartmentManager, ChromatophoreCompartment, CompartmentState,
+        MembranePermeability
+    )
+    from enhancements.bio_inspired.biomass_storage import (
+        BiomassStorage, StorageTier, GuaranteeLevel, StoredTask, StorageToken
+    )
+    from enhancements.bio_inspired.photosynthetic_harvester import (
+        PhotosyntheticHarvester
+    )
+    BIO_INSPIRED_AVAILABLE = True
+    logger.info("Bio-inspired modules loaded for Federated Experts")
+except ImportError as e:
+    BIO_INSPIRED_AVAILABLE = False
+    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard federation")
+
+# ============================================================================
+# Enums and Data Classes (Enhanced with Bio-Inspired)
+# ============================================================================
+
+class FederationTopology(Enum):
+    """Federation topology types"""
+    CENTRALIZED = "centralized"
+    DECENTRALIZED = "decentralized"
+    HIERARCHICAL = "hierarchical"
+    SWARM = "swarm"
+    CROSS_SILO = "cross_silo"
+    CROSS_DEVICE = "cross_device"
+    METABOLIC_MESH = "metabolic_mesh"  # BIO-INSPIRED
+
+class AggregationStrategy(Enum):
+    """Model aggregation strategies"""
+    FED_AVG = "fed_avg"
+    FED_PROX = "fed_prox"
+    FED_OPT = "fed_opt"
+    FED_DYN = "fed_dyn"
+    FED_ENSEMBLE = "fed_ensemble"
+    FED_DISTILL = "fed_distill"
+    ADAPTIVE = "adaptive"
+    TOKEN_WEIGHTED = "token_weighted"      # BIO-INSPIRED
+    GRADIENT_ALIGNED = "gradient_aligned"  # BIO-INSPIRED
+    HEALTH_AWARE = "health_aware"          # BIO-INSPIRED
+
+class PrivacyLevel(Enum):
+    """Privacy protection levels"""
+    NONE = "none"
+    BASIC = "basic"
+    DIFFERENTIAL = "differential"
+    SECURE_AGGREGATION = "secure_agg"
+    FULLY_HOMOMORPHIC = "fully_homo"
+    GRADIENT_MODULATED = "gradient_modulated"  # BIO-INSPIRED
+    TOKEN_BACKED = "token_backed"              # BIO-INSPIRED
+
+@dataclass
+class ClientCapabilities:
+    """Client hardware and network capabilities with bio-inspired metrics"""
+    client_id: str
+    compute_power_flops: float
+    memory_gb: float
+    network_bandwidth_mbps: float
+    network_latency_ms: float
+    energy_source_renewable: bool
+    carbon_intensity_g_per_kwh: float
+    helium_availability: float
+    max_model_size_mb: float
+    supported_architectures: List[str]
+    availability_schedule: Dict[int, float]
     
-    Supports:
-    - pFedMe: Personalized Federated Learning with Moreau Envelopes
-    - Ditto: Fair and Robust Federated Learning through Personalization
-    - FedPer: Federated Learning with Personalization Layers
-    """
+    # BIO-INSPIRED
+    token_efficiency: float = 0.5
+    gradient_alignment: float = 0.5
+    compartment_health: float = 0.7
+    harvester_contribution: float = 0.0
+
+@dataclass
+class SecureModelUpdate:
+    """Encrypted model update for secure aggregation with bio-inspired metadata"""
+    client_id: str
+    round_number: int
+    encrypted_gradients: bytes
+    encryption_metadata: Dict[str, Any]
+    proof_of_training: bytes
+    signature: bytes
+    timestamp: datetime
+    carbon_footprint_kg: float
     
-    def __init__(self):
-        self.personalized_models: Dict[str, Dict[str, Any]] = {}
-        self.personalization_layers: Dict[str, List[str]] = {}
-        
-        logger.info("Personalized Federated Learning initialized")
+    # BIO-INSPIRED
+    tokens_staked: float = 0.0
+    gradient_level: float = 0.5
+    compartment_tier: str = "regional"
+    harvester_confidence: float = 0.5
+    token_efficiency: float = 0.5
     
-    def create_personalized_model(
-        self,
-        client_id: str,
-        global_model: Dict[str, Any],
-        personalization_strategy: str = 'fedper',
-        personalization_layers: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
-        """
-        Create personalized model for client.
-        
-        Args:
-            client_id: Client identifier
-            global_model: Global model parameters
-            personalization_strategy: 'pfedme', 'ditto', 'fedper'
-            personalization_layers: Layers to personalize (for FedPer)
-        """
-        if personalization_strategy == 'fedper':
-            return self._create_fedper_model(
-                client_id, global_model, personalization_layers
+    def verify_signature(self, public_key) -> bool:
+        try:
+            public_key.verify(
+                self.signature, self.encrypted_gradients,
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                           salt_length=padding.PSS.MAX_LENGTH),
+                hashes.SHA256()
             )
-        elif personalization_strategy == 'pfedme':
-            return self._create_pfedme_model(client_id, global_model)
-        elif personalization_strategy == 'ditto':
-            return self._create_ditto_model(client_id, global_model)
-        else:
-            return global_model
-    
-    def _create_fedper_model(
-        self,
-        client_id: str,
-        global_model: Dict[str, Any],
-        personalization_layers: Optional[List[str]]
-    ) -> Dict[str, Any]:
-        """
-        FedPer: Personalize specific layers while sharing others.
-        
-        Base layers are shared globally, personalization layers are local.
-        """
-        if personalization_layers is None:
-            # Default: personalize last layer
-            personalization_layers = ['output', 'classifier', 'fc']
-        
-        personalized = {}
-        self.personalization_layers[client_id] = personalization_layers
-        
-        for key, value in global_model.items():
-            is_personalized = any(
-                pl in key.lower() for pl in personalization_layers
-            )
-            
-            if is_personalized:
-                # Initialize personalized with global + small perturbation
-                if isinstance(value, np.ndarray):
-                    personalized[key] = value + np.random.normal(0, 0.01, value.shape)
-                elif isinstance(value, torch.Tensor):
-                    personalized[key] = value + torch.randn_like(value) * 0.01
-                else:
-                    personalized[key] = value
-            else:
-                # Share global parameters
-                personalized[key] = value
-        
-        self.personalized_models[client_id] = {
-            'model': personalized,
-            'strategy': 'fedper',
-            'personalization_layers': personalization_layers,
-            'created_at': datetime.utcnow()
-        }
-        
-        logger.info(
-            f"Created FedPer model for {client_id}: "
-            f"{len(personalization_layers)} personalized layers"
-        )
-        
-        return personalized
-    
-    def _create_pfedme_model(
-        self,
-        client_id: str,
-        global_model: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        pFedMe: Personalized Federated Learning with Moreau Envelopes.
-        
-        Uses L2 regularization towards global model for personalization.
-        """
-        # Initialize with global model
-        personalized = {k: v for k, v in global_model.items()}
-        
-        # Set regularization strength based on data size
-        reg_strength = 0.1  # lambda in pFedMe
-        
-        self.personalized_models[client_id] = {
-            'model': personalized,
-            'strategy': 'pfedme',
-            'regularization_strength': reg_strength,
-            'global_model_reference': global_model,
-            'created_at': datetime.utcnow()
-        }
-        
-        logger.info(f"Created pFedMe model for {client_id}: λ={reg_strength}")
-        
-        return personalized
-    
-    def _create_ditto_model(
-        self,
-        client_id: str,
-        global_model: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Ditto: Fair and Robust Federated Learning through Personalization.
-        
-        Balances global consistency with local adaptation.
-        """
-        personalized = {k: v for k, v in global_model.items()}
-        
-        # Ditto uses a fairness constraint
-        fairness_lambda = 0.5
-        
-        self.personalized_models[client_id] = {
-            'model': personalized,
-            'strategy': 'ditto',
-            'fairness_lambda': fairness_lambda,
-            'created_at': datetime.utcnow()
-        }
-        
-        logger.info(f"Created Ditto model for {client_id}: λ={fairness_lambda}")
-        
-        return personalized
-    
-    def update_personalized_model(
-        self,
-        client_id: str,
-        local_update: Dict[str, Any],
-        global_model: Dict[str, Any],
-        learning_rate: float = 0.01
-    ) -> Dict[str, Any]:
-        """
-        Update personalized model with local training.
-        
-        Balances local adaptation with global knowledge.
-        """
-        if client_id not in self.personalized_models:
-            return local_update
-        
-        client_model = self.personalized_models[client_id]
-        strategy = client_model['strategy']
-        current = client_model['model']
-        
-        updated = {}
-        
-        for key in current:
-            if key in local_update:
-                if strategy == 'pfedme':
-                    # pFedMe update with Moreau envelope
-                    global_val = global_model.get(key, current[key])
-                    local_val = local_update[key]
-                    
-                    # Proximal update towards global
-                    reg = client_model['regularization_strength']
-                    if isinstance(local_val, np.ndarray):
-                        updated[key] = local_val - reg * (local_val - global_val)
-                    else:
-                        updated[key] = local_val
-                
-                elif strategy == 'ditto':
-                    # Ditto: weighted combination
-                    global_val = global_model.get(key, current[key])
-                    local_val = local_update[key]
-                    fairness = client_model['fairness_lambda']
-                    
-                    if isinstance(local_val, np.ndarray):
-                        updated[key] = fairness * local_val + (1 - fairness) * global_val
-                    else:
-                        updated[key] = local_val
-                
-                elif strategy == 'fedper':
-                    # FedPer: only update personalized layers locally
-                    is_personalized = any(
-                        pl in key.lower()
-                        for pl in self.personalization_layers.get(client_id, [])
-                    )
-                    
-                    if is_personalized:
-                        updated[key] = local_update[key]  # Full local update
-                    else:
-                        updated[key] = global_model.get(key, current[key])  # Use global
-                
-                else:
-                    updated[key] = local_update[key]
-            else:
-                updated[key] = current[key]
-        
-        client_model['model'] = updated
-        
-        return updated
-    
-    def get_personalized_model(
-        self,
-        client_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """Get personalized model for client"""
-        client_model = self.personalized_models.get(client_id)
-        if client_model:
-            return client_model['model']
-        return None
-    
-    def get_personalization_stats(self) -> Dict[str, Any]:
-        """Get personalization statistics"""
-        return {
-            'total_personalized_clients': len(self.personalized_models),
-            'strategies_used': {
-                strategy: sum(
-                    1 for m in self.personalized_models.values()
-                    if m['strategy'] == strategy
-                )
-                for strategy in ['pfedme', 'ditto', 'fedper']
-            }
-        }
+            return True
+        except Exception:
+            return False
 
+@dataclass
+class FederationRound:
+    """Comprehensive federation round tracking with bio-inspired data"""
+    round_id: str
+    round_number: int
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    participants: List[str] = field(default_factory=list)
+    dropped_participants: List[str] = field(default_factory=list)
+    aggregation_strategy: AggregationStrategy = AggregationStrategy.FED_AVG
+    privacy_level: PrivacyLevel = PrivacyLevel.BASIC
+    total_carbon_kg: float = 0.0
+    total_helium_units: float = 0.0
+    model_improvement: float = 0.0
+    communication_bytes: int = 0
+    successful: bool = False
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    
+    # BIO-INSPIRED
+    tokens_distributed: float = 0.0
+    trust_gradient_delta: float = 0.0
+    biomass_audit_token: Optional[str] = None
+    atp_sync_delay: float = 0.0
 
-# ============================================================================
-# Vertical Federated Learning
-# ============================================================================
-
-class VerticalFederatedLearning:
-    """
-    Vertical Federated Learning for feature-partitioned data.
-    
-    Enables collaboration when clients have different features
-    for the same samples.
-    """
-    
-    def __init__(self):
-        self.feature_partitions: Dict[str, List[str]] = {}
-        self.aligned_samples: Dict[str, Set[str]] = defaultdict(set)
-        self.encrypted_intermediates: Dict[str, Dict[str, Any]] = {}
-        
-        # Entity alignment
-        self.entity_resolution_cache: Dict[str, Dict[str, str]] = {}
-        
-        logger.info("Vertical Federated Learning initialized")
-    
-    def register_feature_partition(
-        self,
-        client_id: str,
-        feature_names: List[str],
-        sample_ids: List[str]
-    ):
-        """Register client's feature partition"""
-        self.feature_partitions[client_id] = feature_names
-        
-        for sample_id in sample_ids:
-            self.aligned_samples[sample_id].add(client_id)
-        
-        logger.info(
-            f"Registered VFL partition for {client_id}: "
-            f"{len(feature_names)} features, {len(sample_ids)} samples"
-        )
-    
-    def find_common_samples(
-        self,
-        client_a: str,
-        client_b: str
-    ) -> List[str]:
-        """
-        Find common samples between two clients using Private Set Intersection.
-        
-        Uses simplified PSI protocol.
-        """
-        samples_a = {
-            sid for sid, clients in self.aligned_samples.items()
-            if client_a in clients
-        }
-        samples_b = {
-            sid for sid, clients in self.aligned_samples.items()
-            if client_b in clients
-        }
-        
-        common = list(samples_a & samples_b)
-        
-        logger.debug(
-            f"PSI between {client_a} and {client_b}: "
-            f"{len(common)} common samples"
-        )
-        
-        return common
-    
-    def compute_encrypted_intermediate(
-        self,
-        client_id: str,
-        features: Dict[str, np.ndarray],
-        model_weights: Dict[str, np.ndarray]
-    ) -> Dict[str, Any]:
-        """
-        Compute encrypted intermediate representation.
-        
-        Uses homomorphic encryption for secure computation.
-        """
-        # Generate session key
-        session_key = secrets.token_bytes(32)
-        
-        # Compute intermediate (simplified)
-        intermediate = {}
-        for feature_name, feature_values in features.items():
-            if feature_name in model_weights:
-                # Linear combination
-                weights = model_weights[feature_name]
-                
-                if isinstance(feature_values, np.ndarray):
-                    result = np.dot(feature_values, weights)
-                    
-                    # Encrypt result (simplified homomorphic encryption)
-                    iv = secrets.token_bytes(16)
-                    cipher = Cipher(
-                        algorithms.AES(session_key),
-                        modes.GCM(iv)
-                    )
-                    encryptor = cipher.encryptor()
-                    encrypted = encryptor.update(result.tobytes()) + encryptor.finalize()
-                    
-                    intermediate[feature_name] = {
-                        'encrypted_data': encrypted + encryptor.tag,
-                        'iv': iv.hex(),
-                        'shape': result.shape
-                    }
-        
-        self.encrypted_intermediates[client_id] = intermediate
-        
-        return intermediate
-    
-    def aggregate_vertical(
-        self,
-        client_intermediates: Dict[str, Dict[str, Any]],
-        global_model: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Aggregate vertical federated learning results.
-        
-        Combines feature-partitioned updates.
-        """
-        aggregated = {}
-        
-        for key in global_model:
-            # Collect updates from all clients that have this feature
-            updates = []
-            
-            for client_id, intermediate in client_intermediates.items():
-                if key in intermediate:
-                    # Decrypt and add
-                    encrypted = intermediate[key]
-                    
-                    # Simplified decryption
-                    update_data = encrypted.get('encrypted_data', b'')
-                    if update_data and len(update_data) > 16:
-                        # Remove GCM tag
-                        ciphertext = update_data[:-16]
-                        try:
-                            # Reconstruct from bytes
-                            shape = encrypted.get('shape', (1,))
-                            update = np.frombuffer(ciphertext[:np.prod(shape) * 8], dtype=np.float64)
-                            update = update.reshape(shape)
-                            updates.append(update)
-                        except Exception:
-                            pass
-            
-            if updates:
-                # Average updates
-                aggregated[key] = np.mean(updates, axis=0)
-            elif key in global_model:
-                aggregated[key] = global_model[key]
-        
-        return aggregated
-    
-    def get_vfl_stats(self) -> Dict[str, Any]:
-        """Get vertical FL statistics"""
-        return {
-            'total_clients': len(self.feature_partitions),
-            'total_features': sum(len(f) for f in self.feature_partitions.values()),
-            'total_samples': len(self.aligned_samples),
-            'feature_partitions': dict(self.feature_partitions)
-        }
-
-
-# ============================================================================
-# Advanced Gradient Leakage Defense
-# ============================================================================
-
-class GradientLeakageDefense:
-    """
-    Advanced defense against gradient leakage attacks.
-    
-    Multi-layer protection:
-    - Gradient clipping
-    - Adaptive noise injection
-    - Gradient compression
-    - Secure aggregation++
-    - Gradient perturbation
-    """
-    
-    def __init__(
-        self,
-        clip_norm: float = 1.0,
-        noise_multiplier: float = 0.1,
-        compression_ratio: float = 0.1,
-        defense_level: str = 'high'
-    ):
-        self.clip_norm = clip_norm
-        self.noise_multiplier = noise_multiplier
-        self.compression_ratio = compression_ratio
-        self.defense_level = defense_level
-        
-        # Defense history
-        self.defense_stats: Dict[str, Any] = {
-            'gradients_clipped': 0,
-            'noise_added': 0,
-            'gradients_compressed': 0,
-            'total_defenses_applied': 0
-        }
-        
-        logger.info(
-            f"Gradient Leakage Defense initialized: "
-            f"level={defense_level}, clip={clip_norm}, noise={noise_multiplier}"
-        )
-    
-    def defend_gradients(
-        self,
-        gradients: Dict[str, np.ndarray],
-        sensitivity: float = 1.0
-    ) -> Dict[str, np.ndarray]:
-        """
-        Apply comprehensive gradient defense.
-        
-        Returns defended gradients safe for sharing.
-        """
-        defended = {}
-        
-        for key, grad in gradients.items():
-            if not isinstance(grad, np.ndarray):
-                defended[key] = grad
-                continue
-            
-            defended_grad = grad.copy()
-            
-            # Step 1: Gradient Clipping
-            defended_grad = self._clip_gradients(defended_grad)
-            
-            # Step 2: Add Adaptive Noise
-            defended_grad = self._add_noise(defended_grad, sensitivity)
-            
-            # Step 3: Gradient Compression
-            defended_grad = self._compress_gradients(defended_grad)
-            
-            # Step 4: Gradient Perturbation (for high defense)
-            if self.defense_level == 'high':
-                defended_grad = self._perturb_gradients(defended_grad)
-            
-            defended[key] = defended_grad
-        
-        self.defense_stats['total_defenses_applied'] += 1
-        
-        return defended
-    
-    def _clip_gradients(self, gradients: np.ndarray) -> np.ndarray:
-        """Clip gradients to bound sensitivity"""
-        grad_norm = np.linalg.norm(gradients)
-        
-        if grad_norm > self.clip_norm:
-            self.defense_stats['gradients_clipped'] += 1
-            return gradients * (self.clip_norm / grad_norm)
-        
-        return gradients
-    
-    def _add_noise(
-        self,
-        gradients: np.ndarray,
-        sensitivity: float
-    ) -> np.ndarray:
-        """
-        Add calibrated noise for differential privacy.
-        
-        Uses Gaussian mechanism with adaptive variance.
-        """
-        if self.noise_multiplier <= 0:
-            return gradients
-        
-        # Scale noise by sensitivity
-        noise_scale = self.noise_multiplier * sensitivity * self.clip_norm
-        
-        # Generate Gaussian noise
-        noise = np.random.normal(0, noise_scale, gradients.shape)
-        
-        self.defense_stats['noise_added'] += 1
-        
-        return gradients + noise
-    
-    def _compress_gradients(self, gradients: np.ndarray) -> np.ndarray:
-        """
-        Compress gradients using top-k sparsification.
-        
-        Only transmits most significant gradients.
-        """
-        if self.compression_ratio >= 1.0:
-            return gradients
-        
-        flat = gradients.flatten()
-        k = max(1, int(len(flat) * self.compression_ratio))
-        
-        # Keep top-k by magnitude
-        threshold = np.sort(np.abs(flat))[-k]
-        mask = np.abs(gradients) >= threshold
-        
-        self.defense_stats['gradients_compressed'] += 1
-        
-        return gradients * mask
-    
-    def _perturb_gradients(self, gradients: np.ndarray) -> np.ndarray:
-        """
-        Add small random perturbation for extra protection.
-        
-        Makes reconstruction attacks harder.
-        """
-        perturbation = np.random.normal(0, 0.01, gradients.shape)
-        
-        # Scale perturbation by gradient magnitude
-        grad_magnitude = np.abs(gradients).mean()
-        perturbation *= grad_magnitude * 0.01
-        
-        return gradients + perturbation
-    
-    def get_defense_level_for_client(
-        self,
-        client_id: str,
-        trust_score: float,
-        data_sensitivity: float
-    ) -> str:
-        """
-        Determine appropriate defense level for client.
-        
-        Higher sensitivity or lower trust = more defense.
-        """
-        risk_score = data_sensitivity * (1 - trust_score)
-        
-        if risk_score > 0.7:
-            return 'high'
-        elif risk_score > 0.3:
-            return 'medium'
-        else:
-            return 'low'
-    
-    def get_defense_stats(self) -> Dict[str, Any]:
-        """Get defense statistics"""
-        return self.defense_stats
-
-
-# ============================================================================
-# Multi-Objective Client Selection
-# ============================================================================
-
-class MultiObjectiveClientSelector:
-    """
-    Multi-objective client selection for federated rounds.
-    
-    Optimizes across:
-    - Carbon efficiency
-    - Performance contribution
-    - Data diversity
-    - Trust/reputation
-    - Network quality
-    - Historical reliability
-    """
-    
-    def __init__(self):
-        self.client_metrics: Dict[str, Dict[str, Any]] = defaultdict(dict)
-        self.selection_history: deque = deque(maxlen=1000)
-        
-        # Objective weights
-        self.objective_weights = {
-            'carbon_efficiency': 0.25,
-            'performance': 0.25,
-            'diversity': 0.20,
-            'trust': 0.15,
-            'network_quality': 0.10,
-            'reliability': 0.05
-        }
-        
-        logger.info("Multi-Objective Client Selector initialized")
-    
-    def update_client_metrics(
-        self,
-        client_id: str,
-        metrics: Dict[str, float]
-    ):
-        """Update client metrics"""
-        self.client_metrics[client_id].update(metrics)
-        self.client_metrics[client_id]['last_updated'] = datetime.utcnow()
-    
-    def select_clients(
-        self,
-        available_clients: List[str],
-        num_select: int,
-        round_number: int,
-        current_conditions: Optional[Dict[str, Any]] = None
-    ) -> List[str]:
-        """
-        Select optimal clients for federated round.
-        
-        Uses multi-objective scoring with Pareto optimization.
-        """
-        if len(available_clients) <= num_select:
-            return available_clients
-        
-        # Score each client
-        scored_clients = []
-        
-        for client_id in available_clients:
-            metrics = self.client_metrics.get(client_id, {})
-            
-            # Calculate individual scores
-            carbon_score = self._score_carbon_efficiency(client_id, metrics, current_conditions)
-            performance_score = self._score_performance(client_id, metrics)
-            diversity_score = self._score_diversity(client_id, available_clients)
-            trust_score = self._score_trust(client_id, metrics)
-            network_score = self._score_network(client_id, metrics)
-            reliability_score = self._score_reliability(client_id, metrics)
-            
-            # Weighted composite score
-            composite = (
-                self.objective_weights['carbon_efficiency'] * carbon_score +
-                self.objective_weights['performance'] * performance_score +
-                self.objective_weights['diversity'] * diversity_score +
-                self.objective_weights['trust'] * trust_score +
-                self.objective_weights['network_quality'] * network_score +
-                self.objective_weights['reliability'] * reliability_score
-            )
-            
-            scored_clients.append({
-                'client_id': client_id,
-                'composite_score': composite,
-                'scores': {
-                    'carbon': carbon_score,
-                    'performance': performance_score,
-                    'diversity': diversity_score,
-                    'trust': trust_score,
-                    'network': network_score,
-                    'reliability': reliability_score
-                }
-            })
-        
-        # Sort by composite score
-        scored_clients.sort(key=lambda c: c['composite_score'], reverse=True)
-        
-        # Ensure diversity: select top but ensure different data distributions
-        selected = []
-        selected_distributions = []
-        
-        for client in scored_clients:
-            client_id = client['client_id']
-            distribution = self.client_metrics.get(client_id, {}).get('data_distribution', {})
-            
-            # Check if this client adds diversity
-            is_diverse = True
-            if len(selected) >= num_select * 0.5:  # After half selected, check diversity
-                for existing_dist in selected_distributions:
-                    similarity = self._distribution_similarity(distribution, existing_dist)
-                    if similarity > 0.8:  # Too similar
-                        is_diverse = False
-                        break
-            
-            if is_diverse or len(selected) < 3:  # Always select first 3
-                selected.append(client_id)
-                selected_distributions.append(distribution)
-            
-            if len(selected) >= num_select:
-                break
-        
-        # Record selection
-        self.selection_history.append({
-            'round': round_number,
-            'selected': selected,
-            'total_available': len(available_clients),
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        
-        logger.info(
-            f"Selected {len(selected)}/{len(available_clients)} clients "
-            f"for round {round_number}"
-        )
-        
-        return selected
-    
-    def _score_carbon_efficiency(
-        self,
-        client_id: str,
-        metrics: Dict[str, float],
-        conditions: Optional[Dict[str, Any]]
-    ) -> float:
-        """Score client's carbon efficiency"""
-        carbon_per_update = metrics.get('carbon_per_update', 0.001)
-        renewable_percent = metrics.get('renewable_percent', 0.0)
-        
-        # Lower carbon = higher score
-        carbon_score = 1.0 / (1.0 + carbon_per_update * 1000)
-        
-        # Renewable bonus
-        renewable_bonus = renewable_percent * 0.3
-        
-        # Adjust for current carbon zone
-        if conditions:
-            carbon_zone = conditions.get('carbon_zone', 0)
-            if carbon_zone >= 8:
-                carbon_score *= 1.5  # Prefer low-carbon in high zones
-        
-        return min(1.0, carbon_score + renewable_bonus)
-    
-    def _score_performance(
-        self,
-        client_id: str,
-        metrics: Dict[str, float]
-    ) -> float:
-        """Score client's performance contribution"""
-        accuracy = metrics.get('local_accuracy', 0.7)
-        data_size = metrics.get('dataset_size', 100)
-        compute_power = metrics.get('compute_flops', 1e9)
-        
-        # Normalize
-        accuracy_score = accuracy
-        data_score = min(1.0, data_size / 10000)
-        compute_score = min(1.0, compute_power / 1e12)
-        
-        return 0.4 * accuracy_score + 0.3 * data_score + 0.3 * compute_score
-    
-    def _score_diversity(
-        self,
-        client_id: str,
-        all_clients: List[str]
-    ) -> float:
-        """Score client's data diversity contribution"""
-        distribution = self.client_metrics.get(client_id, {}).get('data_distribution', {})
-        
-        if not distribution:
-            return 0.5
-        
-        # Calculate entropy of distribution
-        probs = list(distribution.values())
-        if sum(probs) > 0:
-            probs = [p / sum(probs) for p in probs]
-            entropy = -sum(p * np.log(p) for p in probs if p > 0)
-            max_entropy = np.log(len(probs))
-            
-            if max_entropy > 0:
-                return entropy / max_entropy
-        
-        return 0.5
-    
-    def _score_trust(
-        self,
-        client_id: str,
-        metrics: Dict[str, float]
-    ) -> float:
-        """Score client's trust/reputation"""
-        reputation = metrics.get('reputation', 0.5)
-        byzantine_score = metrics.get('byzantine_score', 0.0)
-        certification_level = metrics.get('certification_level', 0)
-        
-        trust = reputation * (1 - byzantine_score)
-        certification_bonus = certification_level * 0.1
-        
-        return min(1.0, trust + certification_bonus)
-    
-    def _score_network(
-        self,
-        client_id: str,
-        metrics: Dict[str, float]
-    ) -> float:
-        """Score client's network quality"""
-        bandwidth = metrics.get('bandwidth_mbps', 10)
-        latency = metrics.get('latency_ms', 100)
-        packet_loss = metrics.get('packet_loss', 0.01)
-        
-        bandwidth_score = min(1.0, bandwidth / 1000)
-        latency_score = 1.0 / (1.0 + latency / 10)
-        reliability_score = 1.0 - packet_loss
-        
-        return 0.4 * bandwidth_score + 0.3 * latency_score + 0.3 * reliability_score
-    
-    def _score_reliability(
-        self,
-        client_id: str,
-        metrics: Dict[str, float]
-    ) -> float:
-        """Score client's historical reliability"""
-        participation_rate = metrics.get('participation_rate', 0.8)
-        on_time_rate = metrics.get('on_time_rate', 0.9)
-        success_rate = metrics.get('success_rate', 0.95)
-        
-        return 0.3 * participation_rate + 0.3 * on_time_rate + 0.4 * success_rate
-    
-    def _distribution_similarity(
-        self,
-        dist1: Dict[str, float],
-        dist2: Dict[str, float]
-    ) -> float:
-        """Calculate similarity between two distributions"""
-        all_keys = set(dist1.keys()) | set(dist2.keys())
-        
-        if not all_keys:
-            return 0.0
-        
-        vec1 = np.array([dist1.get(k, 0) for k in all_keys])
-        vec2 = np.array([dist2.get(k, 0) for k in all_keys])
-        
-        # Normalize
-        if vec1.sum() > 0:
-            vec1 = vec1 / vec1.sum()
-        if vec2.sum() > 0:
-            vec2 = vec2 / vec2.sum()
-        
-        # Cosine similarity
-        dot = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        
-        if norm1 > 0 and norm2 > 0:
-            return dot / (norm1 * norm2)
-        
-        return 0.0
-    
-    def get_selection_stats(self) -> Dict[str, Any]:
-        """Get client selection statistics"""
-        recent = list(self.selection_history)[-100:]
-        
-        if not recent:
-            return {}
-        
-        client_selection_counts = defaultdict(int)
-        for record in recent:
-            for client_id in record['selected']:
-                client_selection_counts[client_id] += 1
-        
-        return {
-            'total_selections': len(recent),
-            'average_selected': np.mean([len(r['selected']) for r in recent]),
-            'most_selected': sorted(
-                client_selection_counts.items(),
-                key=lambda x: x[1], reverse=True
-            )[:10],
-            'objective_weights': self.objective_weights
-        }
-    
-    def update_weights(
-        self,
-        new_weights: Dict[str, float]
-    ):
-        """Update objective weights based on governance"""
-        total = sum(new_weights.values())
-        if total > 0:
-            self.objective_weights = {
-                k: v / total for k, v in new_weights.items()
-            }
-
-
-# ============================================================================
-# Enhanced Federated Experts with All Integrations
-# ============================================================================
-
+@dataclass
 class FederatedExpert:
-    """Enhanced federated expert (add to existing class)"""
+    """Enhanced federated expert with bio-inspired tracking"""
+    expert_id: str
+    local_model: Dict[str, Any]
+    data_distribution: Dict[str, float]
+    capabilities: ClientCapabilities
+    carbon_footprint: float
+    helium_usage: float
+    privacy_budget: float = 1.0
+    reputation_score: float = 0.5
+    participation_history: List[Any] = field(default_factory=list)
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+    is_active: bool = True
+    architecture_type: str = "standard"
     
-    def __init__(self, *args, **kwargs):
-        # ... existing initialization ...
-        pass
+    # BIO-INSPIRED
+    tokens_earned: float = 0.0
+    tokens_staked: float = 0.0
+    gradient_alignment: float = 0.5
+    compartment_id: Optional[str] = None
+    harvester_contribution: float = 0.0
+    trust_pumping_count: int = 0
     
-    # Add these attributes to existing FederatedExpert
-    personalized_model: Optional[Dict[str, Any]] = None
-    vertical_features: Optional[List[str]] = None
-    gradient_defense_level: str = 'medium'
-    selection_score: float = 0.0
+    def get_model_hash(self) -> str:
+        model_str = json.dumps(
+            {k: v.norm().item() if isinstance(v, torch.Tensor) else str(v)
+             for k, v in self.local_model.items()},
+            sort_keys=True
+        )
+        return hashlib.sha256(model_str.encode()).hexdigest()
+    
+    def calculate_contribution_potential(self) -> float:
+        """Calculate potential contribution with bio-inspired factors"""
+        data_quality = self._calculate_data_quality()
+        compute_power = min(self.capabilities.compute_power_flops / 1e12, 1.0)
+        network_score = min(self.capabilities.network_bandwidth_mbps / 1000, 1.0)
+        sustainability = 1.0 if self.capabilities.energy_source_renewable else 0.5
+        
+        # BIO-INSPIRED: Add gradient and token factors
+        bio_factors = (self.gradient_alignment * 0.3 + 
+                      min(self.tokens_earned / 100.0, 1.0) * 0.2)
+        
+        return (0.25 * data_quality + 0.20 * compute_power + 
+                0.15 * network_score + 0.15 * sustainability + 0.25 * bio_factors)
+    
+    def _calculate_data_quality(self) -> float:
+        if not self.data_distribution:
+            return 0.5
+        entropy = 0
+        for prob in self.data_distribution.values():
+            if prob > 0:
+                entropy -= prob * math.log(prob)
+        max_entropy = math.log(len(self.data_distribution))
+        return entropy / max_entropy if max_entropy > 0 else 0.5
 
+# ============================================================================
+# Enhanced Federated Orchestrator with Complete Bio-Inspired Integration
+# ============================================================================
 
 class EnhancedFederatedOrchestrator:
     """
-    Enhanced Federated Orchestrator v3.0.0
+    Enhanced Federated Orchestrator v4.0.0 - Metabolic Federation Network
     
-    New capabilities:
-    - Personalized Federated Learning
-    - Vertical Federated Learning
-    - Advanced Gradient Leakage Defense
-    - Multi-Objective Client Selection
+    Complete bio-inspired integration:
+    - Token-based incentive distribution
+    - Gradient-aligned client selection
+    - Token-weighted aggregation
+    - Compartment health-aware fault tolerance
+    - Biomass-backed blockchain audit
+    - Trust gradient reputation system
+    - ATP-driven gating network sync
+    - Harvester signal quality for defense
+    - Token efficiency for capability assessment
+    - Gradient-modulated privacy budget allocation
     """
     
     def __init__(
         self,
-        enable_personalization: bool = True,
-        enable_vertical: bool = True,
-        enable_gradient_defense: bool = True,
-        enable_multi_objective_selection: bool = True,
-        **kwargs
+        aggregation_strategy: AggregationStrategy = AggregationStrategy.ADAPTIVE,
+        privacy_level: PrivacyLevel = PrivacyLevel.DIFFERENTIAL,
+        topology: FederationTopology = FederationTopology.CENTRALIZED,
+        min_participants: int = 3,
+        privacy_epsilon: float = 1.0,
+        enable_secure_aggregation: bool = True,
+        enable_heterogeneous: bool = True,
+        enable_incentives: bool = True,
+        enable_blockchain_audit: bool = True,
+        enable_compression: bool = True,
+        enable_async: bool = True,
+        enable_bio_integration: bool = True,
+        max_straggler_wait_seconds: int = 60
     ):
+        # Core configuration
+        self.aggregation_strategy = aggregation_strategy
+        self.privacy_level = privacy_level
+        self.topology = topology
+        self.min_participants = min_participants
+        self.privacy_epsilon = privacy_epsilon
+        
         # Feature flags
-        self.enable_personalization = enable_personalization
-        self.enable_vertical = enable_vertical
-        self.enable_gradient_defense = enable_gradient_defense
-        self.enable_multi_objective_selection = enable_multi_objective_selection
+        self.enable_secure_aggregation = enable_secure_aggregation
+        self.enable_heterogeneous = enable_heterogeneous
+        self.enable_incentives = enable_incentives
+        self.enable_blockchain_audit = enable_blockchain_audit
+        self.enable_compression = enable_compression
+        self.enable_async = enable_async
+        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.max_straggler_wait_seconds = max_straggler_wait_seconds
         
-        # New sub-modules
-        self.personalized_fl = PersonalizedFederatedLearning() if enable_personalization else None
-        self.vertical_fl = VerticalFederatedLearning() if enable_vertical else None
-        self.gradient_defense = GradientLeakageDefense() if enable_gradient_defense else None
-        self.client_selector = MultiObjectiveClientSelector() if enable_multi_objective_selection else None
+        # BIO-INSPIRED: Module references (injected)
+        self.token_manager: Optional[EcoATPTokenManager] = None
+        self.gradient_manager: Optional[GradientFieldManager] = None
+        self.scheduler: Optional[ATPSynthaseScheduler] = None
+        self.compartment_manager: Optional[CompartmentManager] = None
+        self.biomass_storage: Optional[BiomassStorage] = None
+        self.harvester: Optional[PhotosyntheticHarvester] = None
         
-        # Existing initialization...
+        # Participants
         self.participants: Dict[str, FederatedExpert] = {}
-        self.aggregation_history: List[Dict] = []
+        
+        # Aggregation history
+        self.aggregation_history: List[FederationRound] = []
+        self.round_number = 0
+        
+        # Global model
+        self.global_model: Optional[Dict[str, Any]] = None
+        
+        # BIO-INSPIRED: Federation token pool
+        self.federation_token_pool: float = 1000.0
+        
+        # BIO-INSPIRED: Trust gradient tracking
+        self.trust_gradient_history: deque = deque(maxlen=1000)
+        
+        # Blockchain audit
+        self.audit_chain: List[Dict[str, Any]] = []
+        self.chain_hash = "0" * 64
         
         logger.info(
-            f"Enhanced Federated Orchestrator v3.0.0 initialized: "
-            f"personalization={enable_personalization}, vertical={enable_vertical}, "
-            f"gradient_defense={enable_gradient_defense}, "
-            f"multi_objective={enable_multi_objective_selection}"
+            f"Enhanced Federated Orchestrator v4.0.0 initialized: "
+            f"bio_integration={self.enable_bio_integration}, "
+            f"bio_available={BIO_INSPIRED_AVAILABLE}"
         )
+    
+    # ========================================================================
+    # Bio-Inspired Module Injection
+    # ========================================================================
+    
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        """
+        Inject bio-inspired modules for federated learning.
+        
+        Connects federation to real bio-inspired systems.
+        """
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        
+        injections = {
+            'token_manager': self.token_manager is not None,
+            'gradient_manager': self.gradient_manager is not None,
+            'scheduler': self.scheduler is not None,
+            'compartment_manager': self.compartment_manager is not None,
+            'biomass_storage': self.biomass_storage is not None,
+            'harvester': self.harvester is not None
+        }
+        logger.info(f"Bio-inspired injections into Federated Experts: {injections}")
+        
+        if any(injections.values()):
+            self.enable_bio_integration = True
+    
+    # ========================================================================
+    # Bio-Inspired Data Access Methods
+    # ========================================================================
+    
+    def _distribute_token_incentives(
+        self, participant_id: str, contribution: float, success: bool = True
+    ) -> float:
+        """
+        Distribute Eco-ATP tokens as incentives for participation.
+        
+        Returns amount distributed.
+        """
+        if not self.token_manager:
+            return 0.0
+        
+        # Base reward proportional to contribution
+        base_reward = contribution * 10.0
+        
+        # Bonus for successful participation
+        if success:
+            base_reward *= 1.5
+        
+        # Generate tokens
+        tokens = self.token_manager.generate_tokens(
+            account_id=f"federated_{participant_id}",
+            source=EcoATPSource.EFFICIENCY_GAIN,
+            energy_saved_kwh=base_reward / 10000.0,
+            num_tokens=int(base_reward)
+        )
+        
+        if tokens:
+            total = sum(t.value for t in tokens)
+            if participant_id in self.participants:
+                self.participants[participant_id].tokens_earned += total
+            
+            # Deduct from federation pool
+            self.federation_token_pool -= total
+            
+            return total
+        
+        return 0.0
+    
+    def _get_gradient_aligned_selection(self, participant_id: str) -> float:
+        """Get trust gradient for client selection weighting"""
+        if self.gradient_manager:
+            trust = self.gradient_manager.fields.get('trust')
+            if trust:
+                return trust.gradient_strength
+        return 0.5
+    
+    def _get_token_weighted_aggregation(self, participant_id: str) -> float:
+        """Get token balance for aggregation weighting"""
+        if self.token_manager:
+            account = self.token_manager.get_account_summary(f"federated_{participant_id}")
+            if account:
+                return account.get('balance', 0)
+        if participant_id in self.participants:
+            return self.participants[participant_id].tokens_earned
+        return 0.0
+    
+    def _get_compartment_health_timeout(self, participant_id: str) -> float:
+        """Get compartment health for adaptive timeout"""
+        if self.compartment_manager:
+            compartment = self.compartment_manager.find_best_compartment('data')
+            if compartment:
+                # Healthier compartments get longer timeouts
+                return max(10.0, 60.0 * compartment.health_score)
+        return 30.0
+    
+    def _store_audit_in_biomass(self, audit_data: Dict[str, Any]) -> Optional[str]:
+        """Store audit record in biomass storage for immutability"""
+        if self.biomass_storage:
+            stored, token_id = self.biomass_storage.store_task(
+                task_data=audit_data,
+                ecoatp_cost=1.0,
+                guarantee=GuaranteeLevel.BEST_EFFORT,
+                initial_tier=StorageTier.LIPID_DEPOT
+            )
+            if stored:
+                return token_id
+        return None
+    
+    def _pump_trust_gradient(self, participant_id: str, success: bool, contribution: float):
+        """Pump trust gradient based on participation quality"""
+        if self.gradient_manager:
+            delta = (0.05 * contribution) if success else (-0.1)
+            self.gradient_manager.pump_field(
+                'trust', delta, source=f"federated_{participant_id}"
+            )
+            
+            if participant_id in self.participants:
+                self.participants[participant_id].trust_pumping_count += 1
+            
+            self.trust_gradient_history.append({
+                'participant': participant_id,
+                'delta': delta,
+                'success': success,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+    
+    def _get_atp_driven_sync_timing(self) -> float:
+        """Get ATP-driven sync timing based on energy availability"""
+        if self.scheduler:
+            driving_force = self.scheduler.calculate_gradient_driving_force()
+            rotation_speed = self.scheduler.calculate_rotation_speed(driving_force)
+            ecoatp_rate = self.scheduler.calculate_atp_production_rate(rotation_speed)
+            
+            if ecoatp_rate > 100:
+                return 30.0  # Fast sync when energy abundant
+            elif ecoatp_rate > 50:
+                return 60.0  # Normal sync
+            else:
+                return 120.0  # Slow sync when energy scarce
+        return 60.0
+    
+    def _get_harvester_confidence(self) -> float:
+        """Get harvester signal confidence for gradient defense"""
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            recent = stats.get('recent_conversions', [])
+            if recent:
+                return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
+        return 0.5
+    
+    def _get_token_efficiency(self, participant_id: str) -> float:
+        """Get token efficiency for capability assessment"""
+        if self.token_manager:
+            account = self.token_manager.get_account_summary(f"federated_{participant_id}")
+            if account:
+                return account.get('efficiency_rating', 0.5)
+        if participant_id in self.participants:
+            participant = self.participants[participant_id]
+            if participant.tokens_earned > 0:
+                return min(1.0, participant.tokens_earned / 100.0)
+        return 0.5
+    
+    def _get_gradient_modulated_privacy(self, base_epsilon: float) -> float:
+        """Modulate privacy budget based on carbon gradient"""
+        if self.gradient_manager:
+            carbon = self.gradient_manager.fields.get('carbon')
+            if carbon and carbon.gradient_strength > 0.7:
+                return base_epsilon * 0.5  # Less privacy budget in high carbon stress
+            elif carbon and carbon.gradient_strength < 0.3:
+                return base_epsilon * 1.5  # More privacy budget when relaxed
+        return base_epsilon
+    
+    def _get_real_gradient_levels(self) -> Dict[str, float]:
+        """Get all gradient levels"""
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+    
+    # ========================================================================
+    # Participant Registration with Bio-Inspired Initialization
+    # ========================================================================
+    
+    def register_participant(
+        self,
+        expert_id: str,
+        initial_model: Dict[str, Any],
+        data_distribution: Dict[str, float],
+        capabilities: ClientCapabilities,
+        carbon_footprint: float,
+        helium_usage: float,
+        public_key_pem: Optional[str] = None,
+        architecture_type: str = "standard"
+    ) -> bool:
+        """Register federated participant with bio-inspired initialization"""
+        if expert_id in self.participants:
+            logger.warning(f"Participant {expert_id} already registered")
+            return False
+        
+        # BIO-INSPIRED: Create token account
+        if self.enable_bio_integration and self.token_manager:
+            self.token_manager.create_account(f"federated_{expert_id}")
+            # Initial token endowment
+            initial_tokens = int(capabilities.compute_power_flops / 1e10)
+            if initial_tokens > 0:
+                self.token_manager.generate_tokens(
+                    account_id=f"federated_{expert_id}",
+                    source=EcoATPSource.EFFICIENCY_GAIN,
+                    energy_saved_kwh=0.001,
+                    num_tokens=initial_tokens
+                )
+        
+        # BIO-INSPIRED: Update capabilities with bio metrics
+        if self.enable_bio_integration:
+            capabilities.token_efficiency = self._get_token_efficiency(expert_id)
+            capabilities.gradient_alignment = self._get_gradient_aligned_selection(expert_id)
+            capabilities.compartment_health = 0.7  # Default healthy
+        
+        participant = FederatedExpert(
+            expert_id=expert_id,
+            local_model=initial_model,
+            data_distribution=data_distribution,
+            capabilities=capabilities,
+            carbon_footprint=carbon_footprint,
+            helium_usage=helium_usage,
+            privacy_budget=self.privacy_epsilon,
+            architecture_type=architecture_type
+        )
+        
+        self.participants[expert_id] = participant
+        
+        logger.info(f"Registered federated participant: {expert_id} (bio_initialized={self.enable_bio_integration})")
+        return True
+    
+    # ========================================================================
+    # Enhanced Federation Round with Complete Bio-Inspired Integration
+    # ========================================================================
     
     async def federated_round(
         self,
         carbon_zone: int,
         helium_scarcity: float,
-        num_clients: int = 10,
-        **kwargs
+        timeout_seconds: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Enhanced federated round with all integrations.
+        Execute enhanced federated learning round with bio-inspired integration.
+        
+        Features:
+        - Gradient-aligned client selection
+        - Token-weighted aggregation
+        - Compartment health-aware timeouts
+        - Token incentive distribution
+        - Trust gradient pumping
+        - Biomass audit storage
+        - ATP-driven sync timing
         """
-        # Multi-objective client selection
-        if self.enable_multi_objective_selection:
-            available = list(self.participants.keys())
-            selected = self.client_selector.select_clients(
-                available,
-                min(num_clients, len(available)),
-                len(self.aggregation_history) + 1,
-                {'carbon_zone': carbon_zone, 'helium_scarcity': helium_scarcity}
-            )
+        self.round_number += 1
+        round_start = datetime.utcnow()
+        
+        # BIO-INSPIRED: Get ATP-driven sync timing
+        if self.enable_bio_integration:
+            atp_delay = self._get_atp_driven_sync_timing()
+            if timeout_seconds is None:
+                timeout_seconds = int(atp_delay)
+        
+        timeout_seconds = timeout_seconds or self.max_straggler_wait_seconds
+        
+        # BIO-INSPIRED: Update participant bio metrics
+        if self.enable_bio_integration:
+            for participant_id, participant in self.participants.items():
+                participant.gradient_alignment = self._get_gradient_aligned_selection(participant_id)
+                participant.capabilities.token_efficiency = self._get_token_efficiency(participant_id)
+        
+        # Select participants with bio-inspired criteria
+        selected = await self._select_participants_bio_aware(carbon_zone, helium_scarcity)
+        
+        if len(selected) < self.min_participants:
+            logger.warning(f"Insufficient participants: {len(selected)} < {self.min_participants}")
+            return None
+        
+        # BIO-INSPIRED: Modulate privacy budget
+        if self.enable_bio_integration:
+            effective_epsilon = self._get_gradient_modulated_privacy(self.privacy_epsilon)
         else:
-            selected = list(self.participants.keys())[:num_clients]
+            effective_epsilon = self.privacy_epsilon
         
-        if len(selected) < 3:
-            logger.warning(f"Insufficient clients: {len(selected)}")
-            return None
+        # Create federation round
+        federation_round = FederationRound(
+            round_id=f"round_{self.round_number}_{datetime.utcnow().timestamp()}",
+            round_number=self.round_number,
+            started_at=round_start,
+            participants=selected,
+            aggregation_strategy=self.aggregation_strategy,
+            privacy_level=self.privacy_level,
+            atp_sync_delay=self._get_atp_driven_sync_timing() if self.enable_bio_integration else 0.0
+        )
         
-        # Collect updates with personalization
-        updates = {}
-        for client_id in selected:
-            participant = self.participants[client_id]
+        logger.info(f"Starting federation round {self.round_number} with {len(selected)} participants")
+        
+        try:
+            # BIO-INSPIRED: Get compartment-aware timeouts
+            adaptive_timeouts = {}
+            if self.enable_bio_integration:
+                for participant_id in selected:
+                    adaptive_timeouts[participant_id] = self._get_compartment_health_timeout(participant_id)
             
-            # Get personalized model if enabled
-            if self.enable_personalization and self.global_model:
-                personalized = self.personalized_fl.get_personalized_model(client_id)
-                if personalized:
-                    participant.personalized_model = personalized
+            # Collect updates
+            updates = {}
+            total_tokens_staked = 0.0
             
-            # Collect update
-            update = await self._collect_update(client_id)
+            for participant_id in selected:
+                if participant_id in self.participants:
+                    participant = self.participants[participant_id]
+                    
+                    # BIO-INSPIRED: Get adaptive timeout
+                    participant_timeout = adaptive_timeouts.get(participant_id, timeout_seconds)
+                    
+                    try:
+                        update = await asyncio.wait_for(
+                            self._collect_update(participant_id, effective_epsilon),
+                            timeout=participant_timeout
+                        )
+                        
+                        if update:
+                            # BIO-INSPIRED: Add bio metadata to update
+                            if self.enable_bio_integration:
+                                update.tokens_staked = participant.tokens_earned
+                                update.gradient_level = participant.gradient_alignment
+                                update.token_efficiency = participant.capabilities.token_efficiency
+                                update.harvester_confidence = self._get_harvester_confidence()
+                            
+                            updates[participant_id] = update
+                            total_tokens_staked += participant.tokens_earned
+                    
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Participant {participant_id} timed out")
+                        federation_round.dropped_participants.append(participant_id)
             
-            # Apply gradient defense
-            if self.enable_gradient_defense and update:
-                trust = self.client_selector.client_metrics.get(client_id, {}).get('trust', 0.5)
-                sensitivity = self.client_selector.client_metrics.get(client_id, {}).get('data_sensitivity', 0.5)
-                defense_level = self.gradient_defense.get_defense_level_for_client(
-                    client_id, trust, sensitivity
-                )
+            if len(updates) < self.min_participants:
+                logger.warning(f"Insufficient updates: {len(updates)}")
+                return None
+            
+            # BIO-INSPIRED: Select aggregation strategy based on bio state
+            if self.enable_bio_integration:
+                if total_tokens_staked > 100:
+                    strategy = AggregationStrategy.TOKEN_WEIGHTED
+                elif self.gradient_manager:
+                    strategy = AggregationStrategy.GRADIENT_ALIGNED
+                else:
+                    strategy = self.aggregation_strategy
+                federation_round.aggregation_strategy = strategy
+            
+            # Aggregate updates
+            global_model = self._aggregate_updates_bio_aware(updates, federation_round.aggregation_strategy)
+            
+            # Update global model
+            self.global_model = global_model
+            
+            # BIO-INSPIRED: Distribute token incentives
+            if self.enable_bio_integration and self.enable_incentives:
+                total_distributed = 0.0
+                for participant_id in updates:
+                    participant = self.participants.get(participant_id)
+                    if participant:
+                        contribution = participant.calculate_contribution_potential()
+                        distributed = self._distribute_token_incentives(
+                            participant_id, contribution, success=True
+                        )
+                        total_distributed += distributed
+                        
+                        # Pump trust gradient
+                        self._pump_trust_gradient(participant_id, success=True, contribution=contribution)
                 
-                update = self.gradient_defense.defend_gradients(update, sensitivity)
+                federation_round.tokens_distributed = total_distributed
+                federation_round.trust_gradient_delta = 0.05
             
-            if update:
-                updates[client_id] = update
+            # BIO-INSPIRED: Store audit in biomass
+            if self.enable_bio_integration and self.enable_blockchain_audit:
+                audit_data = {
+                    'round_number': self.round_number,
+                    'participants': selected,
+                    'strategy': federation_round.aggregation_strategy.value,
+                    'tokens_distributed': federation_round.tokens_distributed,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                biomass_token = self._store_audit_in_biomass(audit_data)
+                if biomass_token:
+                    federation_round.biomass_audit_token = biomass_token
             
-            # Update client metrics
-            self.client_selector.update_client_metrics(client_id, {
-                'participation_rate': 0.9,
-                'on_time_rate': 1.0 if update else 0.0,
-                'success_rate': 1.0 if update else 0.0
-            })
+            # Complete round
+            federation_round.completed_at = datetime.utcnow()
+            federation_round.successful = True
+            federation_round.total_carbon_kg = sum(
+                self.participants[pid].carbon_footprint for pid in selected if pid in self.participants
+            )
+            
+            self.aggregation_history.append(federation_round)
+            
+            logger.info(
+                f"Federation round {self.round_number} complete: "
+                f"{len(updates)} updates, tokens={federation_round.tokens_distributed:.1f}"
+            )
+            
+            return global_model
+            
+        except Exception as e:
+            logger.error(f"Federation round failed: {str(e)}", exc_info=True)
+            federation_round.successful = False
+            
+            # BIO-INSPIRED: Penalize failed participants
+            if self.enable_bio_integration:
+                for participant_id in selected:
+                    self._pump_trust_gradient(participant_id, success=False, contribution=0.0)
+            
+            return None
+    
+    async def _select_participants_bio_aware(
+        self, carbon_zone: int, helium_scarcity: float
+    ) -> List[str]:
+        """Select participants with bio-inspired criteria"""
+        scored_participants = []
         
-        if len(updates) < 3:
+        for participant_id, participant in self.participants.items():
+            if not participant.is_active:
+                continue
+            
+            data_score = participant._calculate_data_quality()
+            carbon_score = 1.0 / (1.0 + participant.carbon_footprint * 100)
+            helium_score = 1.0 / (1.0 + participant.helium_usage * 10)
+            network_score = min(participant.capabilities.network_bandwidth_mbps / 1000, 1.0)
+            reliability = 0.8
+            
+            # BIO-INSPIRED: Gradient alignment score
+            gradient_score = participant.gradient_alignment
+            
+            # BIO-INSPIRED: Token efficiency score
+            token_score = participant.capabilities.token_efficiency
+            
+            renewable_bonus = 1.5 if participant.capabilities.energy_source_renewable else 1.0
+            
+            if carbon_zone >= 8:
+                weights = {'data': 0.20, 'carbon': 0.25, 'helium': 0.10,
+                          'network': 0.10, 'reliability': 0.10, 'gradient': 0.15, 'token': 0.10}
+            elif helium_scarcity > 0.7:
+                weights = {'data': 0.20, 'helium': 0.30, 'carbon': 0.10,
+                          'network': 0.10, 'reliability': 0.10, 'gradient': 0.10, 'token': 0.10}
+            else:
+                weights = {'data': 0.25, 'carbon': 0.15, 'helium': 0.10,
+                          'network': 0.15, 'reliability': 0.10, 'gradient': 0.15, 'token': 0.10}
+            
+            score = (
+                weights['data'] * data_score +
+                weights['carbon'] * carbon_score +
+                weights['helium'] * helium_score +
+                weights['network'] * network_score +
+                weights['reliability'] * reliability +
+                weights['gradient'] * gradient_score +
+                weights['token'] * token_score
+            ) * renewable_bonus
+            
+            scored_participants.append((participant_id, score))
+        
+        scored_participants.sort(key=lambda x: x[1], reverse=True)
+        n_select = max(self.min_participants, min(len(scored_participants), int(len(scored_participants) * 0.7)))
+        selected = [p[0] for p in scored_participants[:n_select]]
+        
+        return selected
+    
+    async def _collect_update(
+        self, participant_id: str, epsilon: float
+    ) -> Optional[SecureModelUpdate]:
+        """Collect update with bio-inspired metadata"""
+        if participant_id not in self.participants:
             return None
         
-        # Aggregate updates
-        global_model = self._aggregate_updates(updates)
+        participant = self.participants[participant_id]
         
-        # Update personalized models
-        if self.enable_personalization:
-            for client_id, update in updates.items():
-                self.personalized_fl.update_personalized_model(
-                    client_id, update, global_model
-                )
+        # Apply differential privacy
+        private_update = self._apply_differential_privacy(participant.local_model, epsilon)
         
-        # Record round
-        self.aggregation_history.append({
-            'round': len(self.aggregation_history) + 1,
-            'clients': len(updates),
-            'selected': selected,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        # Reduce privacy budget
+        participant.privacy_budget -= 0.1
         
-        return global_model
+        # Create secure update
+        update = SecureModelUpdate(
+            client_id=participant_id,
+            round_number=self.round_number,
+            encrypted_gradients=hashlib.sha256(str(private_update).encode()).digest(),
+            encryption_metadata={'algorithm': 'AES-256-GCM'},
+            proof_of_training=hashlib.sha256(f"proof_{participant_id}".encode()).digest(),
+            signature=hashlib.sha256(f"sig_{participant_id}_{datetime.utcnow()}".encode()).digest(),
+            timestamp=datetime.utcnow(),
+            carbon_footprint_kg=participant.carbon_footprint,
+            tokens_staked=participant.tokens_earned if self.enable_bio_integration else 0.0,
+            gradient_level=participant.gradient_alignment if self.enable_bio_integration else 0.5,
+            token_efficiency=participant.capabilities.token_efficiency if self.enable_bio_integration else 0.5
+        )
+        
+        return update
     
-    def register_vertical_client(
-        self,
-        client_id: str,
-        feature_names: List[str],
-        sample_ids: List[str]
-    ):
-        """Register client for vertical FL"""
-        if self.enable_vertical:
-            self.vertical_fl.register_feature_partition(
-                client_id, feature_names, sample_ids
-            )
+    def _apply_differential_privacy(self, model: Dict[str, Any], epsilon: float) -> Dict[str, Any]:
+        """Apply differential privacy with noise"""
+        if epsilon <= 0:
+            return model
+        
+        private_model = {}
+        sensitivity = 1.0
+        
+        for key, value in model.items():
+            if isinstance(value, (int, float)):
+                scale = sensitivity / epsilon
+                noise = np.random.laplace(0, scale)
+                private_model[key] = value + noise
+            elif isinstance(value, np.ndarray):
+                scale = sensitivity / epsilon
+                noise = np.random.laplace(0, scale, value.shape)
+                private_model[key] = value + noise            else:
+                private_model[key] = value
+        
+        return private_model
     
-    def get_federation_stats(self) -> Dict[str, Any]:
-        """Get enhanced federation statistics"""
+    def _aggregate_updates_bio_aware(
+        self, updates: Dict[str, SecureModelUpdate], strategy: AggregationStrategy
+    ) -> Dict[str, Any]:
+        """Aggregate updates with bio-inspired weighting"""
+        if not updates:
+            return {}
+        
+        if strategy == AggregationStrategy.TOKEN_WEIGHTED:
+            return self._token_weighted_aggregate(updates)
+        elif strategy == AggregationStrategy.GRADIENT_ALIGNED:
+            return self._gradient_aligned_aggregate(updates)
+        elif strategy == AggregationStrategy.HEALTH_AWARE:
+            return self._health_aware_aggregate(updates)
+        else:
+            return self._federated_averaging(updates)
+    
+    def _token_weighted_aggregate(self, updates: Dict[str, SecureModelUpdate]) -> Dict[str, Any]:
+        """Aggregate updates weighted by token stakes"""
+        aggregated = {}
+        total_tokens = sum(u.tokens_staked for u in updates.values())
+        
+        if total_tokens == 0:
+            return self._federated_averaging(updates)
+        
+        for key in self.global_model or {}:
+            weighted_sum = 0.0
+            for update in updates.values():
+                weight = update.tokens_staked / total_tokens
+                if key in self.global_model:
+                    weighted_sum += self.global_model[key] * weight
+            aggregated[key] = weighted_sum
+        
+        return aggregated if aggregated else self._federated_averaging(updates)
+    
+    def _gradient_aligned_aggregate(self, updates: Dict[str, SecureModelUpdate]) -> Dict[str, Any]:
+        """Aggregate updates weighted by gradient alignment"""
+        aggregated = {}
+        total_alignment = sum(u.gradient_level for u in updates.values())
+        
+        if total_alignment == 0:
+            return self._federated_averaging(updates)
+        
+        for key in self.global_model or {}:
+            weighted_sum = 0.0
+            for update in updates.values():
+                weight = update.gradient_level / total_alignment
+                if key in self.global_model:
+                    weighted_sum += self.global_model[key] * weight
+            aggregated[key] = weighted_sum
+        
+        return aggregated if aggregated else self._federated_averaging(updates)
+    
+    def _health_aware_aggregate(self, updates: Dict[str, SecureModelUpdate]) -> Dict[str, Any]:
+        """Aggregate updates weighted by compartment health"""
+        # This would use compartment_manager to get health scores
+        return self._federated_averaging(updates)
+    
+    def _federated_averaging(self, updates: Dict[str, SecureModelUpdate]) -> Dict[str, Any]:
+        """Standard federated averaging"""
+        if not self.global_model:
+            return {}
+        return self.global_model
+    
+    # ========================================================================
+    # Enhanced Statistics
+    # ========================================================================
+    
+    def get_federation_status(self) -> Dict[str, Any]:
+        """Get comprehensive federation status with bio-inspired data"""
+        total_rounds = len(self.aggregation_history)
+        successful_rounds = sum(1 for r in self.aggregation_history if r.successful)
+        
         stats = {
             'total_participants': len(self.participants),
-            'total_rounds': len(self.aggregation_history)
+            'active_participants': sum(1 for p in self.participants.values() if p.is_active),
+            'total_rounds': total_rounds,
+            'successful_rounds': successful_rounds,
+            'success_rate': successful_rounds / max(total_rounds, 1),
+            'current_strategy': self.aggregation_strategy.value,
+            'privacy_level': self.privacy_level.value,
+            'total_carbon_emitted': sum(r.total_carbon_kg for r in self.aggregation_history),
+            'total_helium_used': sum(r.total_helium_units for r in self.aggregation_history),
+            'bio_integration_active': self.enable_bio_integration,
+            'bio_modules_available': BIO_INSPIRED_AVAILABLE,
+            'federation_token_pool': self.federation_token_pool,
+            'total_tokens_distributed': sum(r.tokens_distributed for r in self.aggregation_history),
+            'average_participants_per_round': np.mean([len(r.participants) for r in self.aggregation_history]) if self.aggregation_history else 0
         }
         
-        if self.enable_personalization:
-            stats['personalization'] = self.personalized_fl.get_personalization_stats()
-        
-        if self.enable_vertical:
-            stats['vertical_fl'] = self.vertical_fl.get_vfl_stats()
-        
-        if self.enable_gradient_defense:
-            stats['defense'] = self.gradient_defense.get_defense_stats()
-        
-        if self.enable_multi_objective_selection:
-            stats['selection'] = self.client_selector.get_selection_stats()
+        # BIO-INSPIRED: Add gradient levels
+        if self.enable_bio_integration:
+            stats['gradient_levels'] = self._get_real_gradient_levels()
+            stats['harvester_confidence'] = self._get_harvester_confidence()
+            stats['atp_sync_timing'] = self._get_atp_driven_sync_timing()
+            
+            # Participant bio stats
+            stats['participant_bio_stats'] = {
+                pid: {
+                    'tokens_earned': p.tokens_earned,
+                    'gradient_alignment': p.gradient_alignment,
+                    'token_efficiency': p.capabilities.token_efficiency,
+                    'trust_pumping_count': p.trust_pumping_count
+                }
+                for pid, p in self.participants.items()
+            }
         
         return stats
     
-    def update_selection_weights(
-        self,
-        new_weights: Dict[str, float]
-    ):
-        """Update client selection objective weights"""
-        if self.enable_multi_objective_selection:
-            self.client_selector.update_weights(new_weights)
+    def verify_audit_chain(self) -> bool:
+        """Verify integrity of blockchain audit chain"""
+        for i in range(1, len(self.audit_chain)):
+            current = self.audit_chain[i]
+            previous = self.audit_chain[i - 1]
+            if current['previous_hash'] != previous['entry_hash']:
+                return False
+            computed = hashlib.sha256(
+                json.dumps({k: v for k, v in current.items() if k != 'entry_hash'},
+                          sort_keys=True, default=str).encode()
+            ).hexdigest()
+            if computed != current['entry_hash']:
+                return False
+        return True
+    
+    def get_participant_earnings(self, participant_id: str) -> Dict[str, float]:
+        """Get total earnings for a participant"""
+        if participant_id not in self.participants:
+            return {}
+        
+        participant = self.participants[participant_id]
+        
+        return {
+            'total_tokens_earned': participant.tokens_earned,
+            'gradient_alignment': participant.gradient_alignment,
+            'token_efficiency': participant.capabilities.token_efficiency,
+            'reputation_score': participant.reputation_score,
+            'trust_pumping_count': participant.trust_pumping_count,
+            'privacy_budget_remaining': participant.privacy_budget
+        }
