@@ -1,22 +1,18 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/expert_registry.py
-# Enhanced with bio-inspired genetic encoding, species management, and evolutionary mechanisms
+# Enhanced with complete bio-inspired correlation - Genome Repository v4.0.0
 
 """
-Enhanced Expert Registry v4.0.0 - Genome Repository
-Complete bio-inspired integration with genetic encoding, species taxonomy,
-population genetics, and evolutionary tracking.
+Enhanced Expert Registry v4.0.0 - Complete Bio-Inspired Genome Repository
 
-New Capabilities:
-- Genetic encoding of expert profiles (DNA)
-- Species taxonomy and population management
-- Allele tracking and genetic diversity monitoring
-- Inheritance rules for compartment spawning
-- Natural selection through fitness scoring
-- Gene flow tracking from federated imports
-- Evolutionary fossil record via blockchain
-- Phenotype validation and expression tracking
-- Mutation tracking and adaptation monitoring
-- Ecosystem health indicators
+Full correlation with bio-inspired modules:
+- Eco-ATP efficiency filtering
+- Species population tracking from compartments
+- Natural selection based on fitness scores
+- Gradient-based fitness updates
+- Biomass storage integration for expert history
+- Token economy integration for expert accounting
+- Compartment lifecycle ↔ Registry lifecycle mapping
+- Evolutionary lineage tracking
 """
 
 import asyncio
@@ -32,643 +28,754 @@ import networkx as nx
 from collections import defaultdict, deque
 import uuid
 import math
+import copy
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Genetic Encoding Enums
+# Try importing bio-inspired modules
 # ============================================================================
 
-class GeneExpression(Enum):
-    """Gene expression states (maps to lifecycle)"""
-    SILENCED = "silenced"          # Gene inactive
-    ACTIVATING = "activating"      # Gene being turned on
-    EXPRESSED = "expressed"        # Gene fully active
-    OVEREXPRESSED = "overexpressed"  # Gene amplified
-    DOWNREGULATED = "downregulated"  # Gene suppressed
-    MUTATED = "mutated"            # Gene altered
-
-class AlleleType(Enum):
-    """Types of genetic alleles"""
-    DOMINANT = "dominant"          # Always expressed
-    RECESSIVE = "recessive"        # Only expressed when homozygous
-    CODOMINANT = "codominant"      # Both alleles expressed
-    EPISTATIC = "epistatic"        # Modifies other genes
-
-class SpeciesStatus(Enum):
-    """Species population status"""
-    THRIVING = "thriving"          # Growing population
-    STABLE = "stable"              # Equilibrium
-    DECLINING = "declining"        # Shrinking population
-    ENDANGERED = "endangered"      # Critical low population
-    EXTINCT_IN_WILD = "extinct_wild"  # Only in registry
-    EXTINCT = "extinct"            # No living instances
-
-class MutationType(Enum):
-    """Types of genetic mutations"""
-    POINT = "point"                # Single parameter change
-    INSERTION = "insertion"        # New capability added
-    DELETION = "deletion"          # Capability removed
-    DUPLICATION = "duplication"    # Capability copied
-    INVERSION = "inversion"        # Capability reordered
-    FRAMESHIFT = "frameshift"      # Major structural change
+try:
+    from enhancements.bio_inspired.eco_atp_currency import (
+        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
+        TokenState, EcoATPToken, EcoATPAccount
+    )
+    from enhancements.bio_inspired.proton_gradient_fields import (
+        GradientFieldManager, GradientField
+    )
+    from enhancements.bio_inspired.chromatophore_compartments import (
+        CompartmentManager, ChromatophoreCompartment, CompartmentState, 
+        MembranePermeability, CompartmentResource
+    )
+    from enhancements.bio_inspired.biomass_storage import (
+        BiomassStorage, StorageTier, GuaranteeLevel, StoredTask, StorageToken
+    )
+    BIO_INSPIRED_AVAILABLE = True
+    logger.info("Bio-inspired modules loaded for Expert Registry correlation")
+except ImportError as e:
+    BIO_INSPIRED_AVAILABLE = False
+    logger.warning(f"Bio-inspired modules not available: {str(e)}")
 
 # ============================================================================
-# Genetic Data Classes
+# Existing Enums and Data Classes (preserved from original)
 # ============================================================================
+
+class ExpertDomain(Enum):
+    ENERGY = "energy_optimization"
+    DATA = "data_engineering"
+    IOT = "iot_edge_computing"
+    QUANTUM = "quantum_computing"
+    HELIUM = "helium_aware_computing"
+    CARBON = "carbon_optimization"
+    SECURITY = "security_computing"
+    GENERAL = "general_purpose"
+
+class HardwareProfile(Enum):
+    CPU_EFFICIENT = "cpu_low_power"
+    CPU_PERFORMANCE = "cpu_high_performance"
+    GPU_ACCELERATED = "gpu_cuda"
+    QUANTUM_BACKEND = "quantum_processor"
+    EDGE_DEVICE = "edge_iot_device"
+    HYBRID = "hybrid_cpu_gpu"
+
+class ExpertLifecycleState(Enum):
+    REGISTERED = "registered"
+    VALIDATING = "validating"
+    CERTIFIED = "certified"
+    ACTIVE = "active"
+    CANARY = "canary"
+    DEPRECATED = "deprecated"
+    DEGRADED = "degraded"
+    MAINTENANCE = "maintenance"
+    RETIRED = "retired"
+    ARCHIVED = "archived"
+    
+    def is_available(self) -> bool:
+        return self in [self.CERTIFIED, self.ACTIVE, self.CANARY]
+    
+    def is_usable(self) -> bool:
+        return self in [self.CERTIFIED, self.ACTIVE, self.CANARY, self.DEPRECATED, self.DEGRADED]
+    
+    def to_compartment_state(self) -> 'CompartmentState':
+        """Map registry lifecycle to compartment state"""
+        if not BIO_INSPIRED_AVAILABLE:
+            return None
+        mapping = {
+            ExpertLifecycleState.REGISTERED: CompartmentState.GENESIS,
+            ExpertLifecycleState.VALIDATING: CompartmentState.MATURING,
+            ExpertLifecycleState.CERTIFIED: CompartmentState.MATURING,
+            ExpertLifecycleState.ACTIVE: CompartmentState.ACTIVE,
+            ExpertLifecycleState.CANARY: CompartmentState.ACTIVE,
+            ExpertLifecycleState.DEPRECATED: CompartmentState.SENESCENT,
+            ExpertLifecycleState.DEGRADED: CompartmentState.STRESSED,
+            ExpertLifecycleState.MAINTENANCE: CompartmentState.STRESSED,
+            ExpertLifecycleState.RETIRED: CompartmentState.APOPTOTIC,
+            ExpertLifecycleState.ARCHIVED: CompartmentState.DECOMMISSIONED
+        }
+        return mapping.get(self)
+
+class CertificationLevel(Enum):
+    NONE = "none"
+    SELF_CERTIFIED = "self_certified"
+    INTERNAL_AUDIT = "internal_audit"
+    THIRD_PARTY = "third_party"
+    ISO_COMPLIANT = "iso_compliant"
 
 @dataclass
-class GeneticMarker:
-    """Individual genetic marker (gene)"""
-    gene_id: str
-    gene_name: str
-    trait: str                    # What this gene controls
-    allele_type: AlleleType = AlleleType.CODOMINANT
-    expression: GeneExpression = GeneExpression.EXPRESSED
-    value: float = 0.5            # Expression level
-    mutation_rate: float = 0.01   # Probability of mutation
-    heritability: float = 0.8     # Probability of inheritance
-    epigenetic_factors: Dict[str, float] = field(default_factory=dict)
-    mutation_history: List[Dict] = field(default_factory=list)
+class ExpertVersion:
+    major: int
+    minor: int
+    patch: int
+    prerelease: Optional[str] = None
+    build: Optional[str] = None
+    
+    def to_string(self) -> str:
+        version = f"{self.major}.{self.minor}.{self.patch}"
+        if self.prerelease:
+            version += f"-{self.prerelease}"
+        if self.build:
+            version += f"+{self.build}"
+        return version
+    
+    @classmethod
+    def from_string(cls, version_str: str) -> 'ExpertVersion':
+        try:
+            parts = version_str.replace('-beta', '').split('.')
+            return cls(major=int(parts[0]), minor=int(parts[1]) if len(parts) > 1 else 0,
+                      patch=int(parts[2]) if len(parts) > 2 else 0)
+        except Exception:
+            return cls(major=1, minor=0, patch=0)
+    
+    def is_compatible_with(self, other: 'ExpertVersion') -> bool:
+        return self.major == other.major
+    
+    def is_newer_than(self, other: 'ExpertVersion') -> bool:
+        if self.major != other.major: return self.major > other.major
+        if self.minor != other.minor: return self.minor > other.minor
+        return self.patch > other.patch
 
 @dataclass
-class Genome:
-    """Complete genetic sequence of an expert"""
-    genome_id: str
-    species: str                  # Expert type
-    markers: Dict[str, GeneticMarker] = field(default_factory=dict)
-    chromosome_count: int = 1
-    ploidy: int = 2              # Diploid by default
-    total_genes: int = 0
-    gc_content: float = 0.5      # Gene density
+class ExpertDependency:
+    dependency_id: str
+    dependency_type: str
+    version_requirement: str
+    is_optional: bool = False
+    is_runtime: bool = True
+    description: str = ""
+
+@dataclass
+class ExpertCertification:
+    certification_id: str
+    level: CertificationLevel
+    issued_by: str
+    issued_at: datetime
+    expires_at: Optional[datetime] = None
+    validation_results: Dict[str, Any] = field(default_factory=dict)
+    is_valid: bool = True
+
+@dataclass
+class HealthMetrics:
+    success_rate: float = 1.0
+    avg_latency_ms: float = 0.0
+    error_rate: float = 0.0
+    carbon_efficiency: float = 1.0
+    helium_efficiency: float = 1.0
+    availability: float = 1.0
+    last_heartbeat: datetime = field(default_factory=datetime.utcnow)
+    degradation_score: float = 0.0
+    
+    def calculate_health_score(self) -> float:
+        weights = {'success_rate': 0.30, 'availability': 0.25, 'error_rate': 0.20,
+                   'carbon_efficiency': 0.10, 'helium_efficiency': 0.10, 'degradation_score': 0.05}
+        score = (weights['success_rate'] * self.success_rate +
+                 weights['availability'] * self.availability +
+                 weights['error_rate'] * (1 - self.error_rate) +
+                 weights['carbon_efficiency'] * self.carbon_efficiency +
+                 weights['helium_efficiency'] * self.helium_efficiency +
+                 weights['degradation_score'] * (1 - self.degradation_score))
+        heartbeat_age = (datetime.utcnow() - self.last_heartbeat).total_seconds()
+        if heartbeat_age > 300: score *= 0.5
+        return max(0.0, min(1.0, score))
+
+@dataclass
+class ExpertLineage:
+    lineage_id: str
+    parent_expert_id: Optional[str] = None
+    created_from: Optional[str] = None
+    training_data_hash: Optional[str] = None
+    training_duration_hours: float = 0.0
+    training_carbon_kg: float = 0.0
+    model_architecture: str = ""
+    hyperparameters: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.utcnow)
-    parent_genome: Optional[str] = None
-    
-    def add_gene(self, gene: GeneticMarker):
-        """Add a gene to the genome"""
-        self.markers[gene.gene_id] = gene
-        self.total_genes = len(self.markers)
-    
-    def express_trait(self, gene_id: str) -> float:
-        """Get expressed value of a gene"""
-        if gene_id not in self.markers:
-            return 0.5
-        gene = self.markers[gene_id]
-        if gene.expression in [GeneExpression.SILENCED, GeneExpression.DOWNREGULATED]:
-            return gene.value * 0.3
-        elif gene.expression == GeneExpression.OVEREXPRESSED:
-            return gene.value * 1.5
-        return gene.value
-    
-    def mutate(self, mutation_rate: float = 0.01) -> List[str]:
-        """Introduce random mutations"""
-        mutations = []
-        for gene_id, gene in self.markers.items():
-            if np.random.random() < mutation_rate * gene.mutation_rate:
-                old_value = gene.value
-                mutation_type = np.random.choice(list(MutationType))
-                
-                if mutation_type == MutationType.POINT:
-                    gene.value += np.random.normal(0, 0.1)
-                    gene.value = max(0.0, min(1.0, gene.value))
-                
-                gene.mutation_history.append({
-                    'type': mutation_type.value,
-                    'old_value': old_value,
-                    'new_value': gene.value,
-                    'timestamp': datetime.utcnow().isoformat()
-                })
-                mutations.append(gene_id)
-        
-        return mutations
-    
-    def recombine(self, other: 'Genome', crossover_rate: float = 0.5) -> 'Genome':
-        """Sexual reproduction through genetic recombination"""
-        child_genome = Genome(
-            genome_id=f"genome_{uuid.uuid4().hex[:12]}",
-            species=self.species,
-            parent_genome=self.genome_id
-        )
-        
-        all_genes = set(self.markers.keys()) | set(other.markers.keys())
-        
-        for gene_id in all_genes:
-            if gene_id in self.markers and gene_id in other.markers:
-                # Both parents have gene - crossover
-                if np.random.random() < crossover_rate:
-                    child_gene = copy.deepcopy(self.markers[gene_id])
-                else:
-                    child_gene = copy.deepcopy(other.markers[gene_id])
-            elif gene_id in self.markers:
-                child_gene = copy.deepcopy(self.markers[gene_id])
-            else:
-                child_gene = copy.deepcopy(other.markers[gene_id])
-            
-            child_genome.add_gene(child_gene)
-        
-        return child_genome
 
 @dataclass
-class Species:
-    """Species taxonomy and population tracking"""
-    species_id: str
-    species_name: str
-    genus: str = "Unknown"
-    family: str = "Unknown"
-    order: str = "Unknown"
-    class_name: str = "Unknown"
-    phylum: str = "MoE_Experts"
-    kingdom: str = "GreenAgent"
+class ExpertProfile:
+    expert_id: str
+    expert_name: str = ""
+    version: ExpertVersion = field(default_factory=lambda: ExpertVersion(1, 0, 0))
+    domain: ExpertDomain = ExpertDomain.GENERAL
+    hardware_profile: HardwareProfile = HardwareProfile.CPU_EFFICIENT
+    lifecycle_state: ExpertLifecycleState = ExpertLifecycleState.REGISTERED
+    registered_at: datetime = field(default_factory=datetime.utcnow)
+    activated_at: Optional[datetime] = None
+    retired_at: Optional[datetime] = None
+    replaces_expert: Optional[str] = None
+    replaced_by: Optional[str] = None
+    helium_per_inference: float = 0.0
+    carbon_per_inference: float = 0.0
+    energy_per_inference: float = 0.0
+    avg_latency_ms: float = 0.0
+    memory_usage_mb: float = 0.0
+    accuracy_score: float = 0.0
+    reliability_score: float = 0.0
+    efficiency_score: float = 0.0
+    security_score: float = 0.0
+    min_carbon_zone: int = 0
+    max_helium_scarcity: float = 1.0
+    supported_task_types: List[str] = field(default_factory=list)
+    incompatible_with: List[str] = field(default_factory=list)
+    dependencies: List[ExpertDependency] = field(default_factory=list)
+    certifications: List[ExpertCertification] = field(default_factory=list)
+    health: HealthMetrics = field(default_factory=HealthMetrics)
+    lineage: Optional[ExpertLineage] = None
+    is_remote: bool = False
+    remote_endpoint: Optional[str] = None
+    origin_region: str = "local"
+    dynamic_weights: Dict[str, float] = field(default_factory=dict)
+    tags: List[str] = field(default_factory=list)
+    capabilities: List[str] = field(default_factory=list)
+    is_active: bool = True
     
-    # Population genetics
-    total_population: int = 0
-    active_population: int = 0
-    allele_frequencies: Dict[str, float] = field(default_factory=dict)
-    genetic_diversity: float = 0.0
-    status: SpeciesStatus = SpeciesStatus.STABLE
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'expert_id': self.expert_id, 'expert_name': self.expert_name,
+            'version': self.version.to_string(), 'domain': self.domain.value,
+            'hardware_profile': self.hardware_profile.value,
+            'lifecycle_state': self.lifecycle_state.value,
+            'helium_per_inference': self.helium_per_inference,
+            'carbon_per_inference': self.carbon_per_inference,
+            'energy_per_inference': self.energy_per_inference,
+            'avg_latency_ms': self.avg_latency_ms,
+            'accuracy_score': self.accuracy_score,
+            'reliability_score': self.reliability_score,
+            'efficiency_score': self.efficiency_score,
+            'health_score': self.health.calculate_health_score(),
+            'is_active': self.is_active and self.lifecycle_state.is_available(),
+            'tags': self.tags, 'capabilities': self.capabilities,
+            'supports_task_types': self.supported_task_types,
+            'origin_region': self.origin_region, 'is_remote': self.is_remote
+        }
     
-    # Evolutionary metrics
-    generation_count: int = 0
-    speciation_events: int = 0
-    extinction_risk: float = 0.0
+    def compute_hash(self) -> str:
+        profile_str = json.dumps(self.to_dict(), sort_keys=True)
+        return hashlib.sha256(profile_str.encode()).hexdigest()
     
-    # Ecosystem role
-    trophic_level: int = 1  # 1=producer, 2=consumer, 3=decomposer
-    keystone_species: bool = False
-    invasive_potential: float = 0.0
+    def is_compatible_with(self, other: 'ExpertProfile') -> bool:
+        if other.expert_id in self.incompatible_with: return False
+        if self.expert_id in other.incompatible_with: return False
+        if self.expert_name == other.expert_name:
+            return self.version.is_compatible_with(other.version)
+        return True
     
-    def calculate_genetic_diversity(self, genomes: List[Genome]) -> float:
-        """Calculate genetic diversity using allele frequency variance"""
-        if not genomes:
-            return 0.0
-        
-        all_genes = set()
-        for genome in genomes:
-            all_genes.update(genome.markers.keys())
-        
-        if not all_genes:
-            return 0.0
-        
-        diversity_scores = []
-        for gene_id in all_genes:
-            values = []
-            for genome in genomes:
-                if gene_id in genome.markers:
-                    values.append(genome.markers[gene_id].value)
-            
-            if values:
-                variance = np.var(values)
-                diversity_scores.append(min(variance * 10, 1.0))
-        
-        self.genetic_diversity = np.mean(diversity_scores) if diversity_scores else 0.0
-        return self.genetic_diversity
-    
-    def assess_extinction_risk(self) -> float:
-        """Calculate extinction risk based on population and diversity"""
-        if self.active_population == 0:
-            return 1.0
-        
-        population_risk = 1.0 / (1.0 + self.active_population)
-        diversity_risk = 1.0 - self.genetic_diversity
-        
-        self.extinction_risk = 0.6 * population_risk + 0.4 * diversity_risk
-        
-        # Update status
-        if self.extinction_risk > 0.8:
-            self.status = SpeciesStatus.ENDANGERED
-        elif self.extinction_risk > 0.5:
-            self.status = SpeciesStatus.DECLINING
-        elif self.active_population == 0:
-            self.status = SpeciesStatus.EXTINCT
-        
-        return self.extinction_risk
+    def get_certification_level(self) -> CertificationLevel:
+        if not self.certifications: return CertificationLevel.NONE
+        levels = [c.level for c in self.certifications if c.is_valid]
+        if not levels: return CertificationLevel.NONE
+        level_order = list(CertificationLevel)
+        return max(levels, key=lambda l: level_order.index(l))
 
 # ============================================================================
-# Fitness Scoring System
+# Fitness Score for Natural Selection
 # ============================================================================
 
 @dataclass
 class FitnessScore:
-    """Multi-dimensional fitness scoring"""
+    """Multi-dimensional fitness scoring for natural selection"""
     expert_id: str
     overall_fitness: float = 0.5
-    survival_fitness: float = 0.5    # Can it survive?
-    reproductive_fitness: float = 0.5  # Can it reproduce?
-    ecological_fitness: float = 0.5   # Does it fit the ecosystem?
-    
-    # Component scores
     resource_efficiency: float = 0.5
     adaptation_speed: float = 0.5
     cooperation_score: float = 0.5
-    competition_score: float = 0.5
     resilience_score: float = 0.5
-    
-    # Selection pressure
-    selection_coefficient: float = 0.0  # Relative fitness advantage
-    reproductive_success: int = 0       # Number of offspring
+    selection_coefficient: float = 0.0
+    reproductive_success: int = 0
+    ecoatp_efficiency: float = 0.5
     
     def calculate_overall(self):
-        """Calculate overall fitness from components"""
         self.overall_fitness = (
-            self.resource_efficiency * 0.25 +
+            self.resource_efficiency * 0.30 +
+            self.resilience_score * 0.25 +
             self.adaptation_speed * 0.20 +
             self.cooperation_score * 0.15 +
-            self.competition_score * 0.15 +
-            self.resilience_score * 0.25
-        )
-        
-        self.survival_fitness = (
-            self.resource_efficiency * 0.4 +
-            self.resilience_score * 0.6
-        )
-        
-        self.reproductive_fitness = (
-            self.adaptation_speed * 0.5 +
-            self.competition_score * 0.5
-        )
-        
-        self.ecological_fitness = (
-            self.cooperation_score * 0.6 +
-            self.resource_efficiency * 0.4
+            self.ecoatp_efficiency * 0.10
         )
 
 # ============================================================================
-# Enhanced Expert Registry with Bio-Inspired Features
+# Enhanced Expert Registry with Complete Bio-Inspired Correlation
 # ============================================================================
 
 class ExpertRegistry:
     """
-    Enhanced Expert Registry v4.0.0 - Genome Repository
+    Enhanced Expert Registry v4.0.0 - Complete Bio-Inspired Genome Repository
     
-    Bio-inspired capabilities:
-    - Genetic encoding of expert profiles
-    - Species taxonomy and population management
-    - Natural selection through fitness scoring
-    - Inheritance rules for compartment spawning
-    - Evolutionary fossil record
-    - Ecosystem health monitoring
+    Full correlation with bio-inspired modules:
+    - Eco-ATP efficiency filtering for expert selection
+    - Species population tracking from chromatophore compartments
+    - Natural selection based on multi-dimensional fitness scores
+    - Gradient-based fitness updates from proton gradient fields
+    - Biomass storage integration for expert performance history
+    - Token economy integration for expert resource accounting
+    - Compartment lifecycle ↔ Registry lifecycle bidirectional mapping
+    - Evolutionary lineage tracking across generations
     """
     
     def __init__(
         self,
         registry_id: str = "default",
-        enable_genetics: bool = True,
-        enable_evolution: bool = True,
-        enable_ecosystem: bool = True,
-        enable_blockchain: bool = True,
-        enable_marketplace: bool = True
+        enable_bio_correlation: bool = True,
+        enable_natural_selection: bool = True,
+        enable_fitness_tracking: bool = True,
+        enable_population_tracking: bool = True
     ):
         self.registry_id = registry_id
         
         # Feature flags
-        self.enable_genetics = enable_genetics
-        self.enable_evolution = enable_evolution
-        self.enable_ecosystem = enable_ecosystem
-        self.enable_blockchain = enable_blockchain
-        self.enable_marketplace = enable_marketplace
+        self.enable_bio_correlation = enable_bio_correlation and BIO_INSPIRED_AVAILABLE
+        self.enable_natural_selection = enable_natural_selection and BIO_INSPIRED_AVAILABLE
+        self.enable_fitness_tracking = enable_fitness_tracking
+        self.enable_population_tracking = enable_population_tracking and BIO_INSPIRED_AVAILABLE
+        
+        # Bio-inspired module references (injected)
+        self.token_manager: Optional[EcoATPTokenManager] = None
+        self.gradient_manager: Optional[GradientFieldManager] = None
+        self.compartment_manager: Optional[CompartmentManager] = None
+        self.biomass_storage: Optional[BiomassStorage] = None
         
         # Core storage
-        self._experts: Dict[str, Any] = {}
-        
-        # Genetic storage
-        self.genomes: Dict[str, Genome] = {}
-        self.species_registry: Dict[str, Species] = {}
+        self._experts: Dict[str, ExpertProfile] = {}
+        self._domain_index: Dict[ExpertDomain, Set[str]] = defaultdict(set)
+        self._hardware_index: Dict[HardwareProfile, Set[str]] = defaultdict(set)
+        self._lifecycle_index: Dict[ExpertLifecycleState, Set[str]] = defaultdict(set)
+        self._tag_index: Dict[str, Set[str]] = defaultdict(set)
+        self._capability_index: Dict[str, Set[str]] = defaultdict(set)
+        self._task_type_index: Dict[str, Set[str]] = defaultdict(set)
+        self._region_index: Dict[str, Set[str]] = defaultdict(set)
+        self._version_family_index: Dict[str, List[str]] = defaultdict(list)
         
         # Fitness tracking
         self.fitness_scores: Dict[str, FitnessScore] = {}
-        self.selection_pressure: float = 1.0
         
-        # Population tracking
-        self.compartment_populations: Dict[str, int] = defaultdict(int)
-        self.total_compartments: int = 0
+        # Performance history
+        self._performance_history: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         
-        # Evolutionary history
+        # Dependency graph
+        self._dependency_graph = nx.DiGraph()
+        
+        # Federation
+        self._remote_registries: Dict[str, str] = {}
+        self._federated_experts: Dict[str, str] = {}
+        
+        # A/B testing
+        self._ab_tests: Dict[str, Dict[str, Any]] = {}
+        
+        # Migration paths
+        self._migration_paths: Dict[str, str] = {}
+        
+        # Evolutionary tracking
         self.evolutionary_events: deque = deque(maxlen=10000)
-        self.speciation_events: List[Dict] = []
-        self.extinction_events: List[Dict] = []
+        self.speciation_count: int = 0
+        self.extinction_count: int = 0
+        self.total_generations: int = 0
         
-        # Inheritance rules
-        self.inheritance_rules = {
-            'base_heritability': 0.8,
-            'mutation_rate': 0.01,
-            'crossover_enabled': True,
-            'epigenetic_inheritance': True
+        # Statistics
+        self._stats = {
+            'total_registrations': 0,
+            'total_deregistrations': 0,
+            'total_natural_selections': 0,
+            'last_selection': None
         }
         
-        # Ecosystem metrics
-        self.ecosystem_health: Dict[str, Any] = {}
-        
-        # Initialize species taxonomy
-        self._initialize_species_taxonomy()
+        # Start background tasks
+        if self.enable_bio_correlation:
+            asyncio.create_task(self._bio_correlation_loop())
         
         logger.info(
-            f"Enhanced Expert Registry v4.0.0 (Genome Repository) initialized: "
-            f"genetics={enable_genetics}, evolution={enable_evolution}, "
-            f"ecosystem={enable_ecosystem}"
+            f"Expert Registry v4.0.0 initialized: "
+            f"bio_correlation={self.enable_bio_correlation}, "
+            f"natural_selection={self.enable_natural_selection}, "
+            f"bio_available={BIO_INSPIRED_AVAILABLE}"
         )
     
-    def _initialize_species_taxonomy(self):
-        """Initialize biological taxonomy for expert species"""
-        species_definitions = {
-            'energy': Species(
-                species_id='energy_expert',
-                species_name='Energy Expert',
-                genus='Energy',
-                family='Renewable_Harvesters',
-                order='Energy_Producers',
-                class_name='Metabolic_Experts',
-                trophic_level=1,  # Primary producer
-                keystone_species=True
-            ),
-            'data': Species(
-                species_id='data_expert',
-                species_name='Data Expert',
-                genus='Data',
-                family='Stream_Processors',
-                order='Data_Processors',
-                class_name='Metabolic_Experts',
-                trophic_level=2  # Primary consumer
-            ),
-            'iot': Species(
-                species_id='iot_expert',
-                species_name='IoT Expert',
-                genus='IoT',
-                family='Edge_Decomposers',
-                order='Edge_Processors',
-                class_name='Metabolic_Experts',
-                trophic_level=3  # Decomposer
-            ),
-            'quantum': Species(
-                species_id='quantum_expert',
-                species_name='Quantum Expert',
-                genus='Quantum',
-                family='Catalytic_Enzymes',
-                order='Specialized_Catalysts',
-                class_name='Metabolic_Experts',
-                trophic_level=1
-            ),
-            'helium': Species(
-                species_id='helium_expert',
-                species_name='Helium Expert',
-                genus='Helium',
-                family='Homeostatic_Regulators',
-                order='Resource_Regulators',
-                class_name='Metabolic_Experts',
-                trophic_level=1,
-                keystone_species=True
-            )
-        }
+    # ========================================================================
+    # Bio-Inspired Module Injection
+    # ========================================================================
+    
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        """
+        Inject bio-inspired modules for complete correlation.
         
-        for species_id, species in species_definitions.items():
-            self.species_registry[species_id] = species
+        This connects the registry to actual bio-inspired systems.
+        """
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+        
+        injections = {
+            'token_manager': self.token_manager is not None,
+            'gradient_manager': self.gradient_manager is not None,
+            'compartment_manager': self.compartment_manager is not None,
+            'biomass_storage': self.biomass_storage is not None
+        }
+        logger.info(f"Bio-inspired injections into Expert Registry: {injections}")
+        
+        # Enable correlation if modules available
+        if any(injections.values()):
+            self.enable_bio_correlation = True
     
     # ========================================================================
-    # Genetic Registration
+    # Bio-Inspired Data Access Methods
+    # ========================================================================
+    
+    def _get_expert_ecoatp_efficiency(self, expert_id: str) -> float:
+        """Get Eco-ATP efficiency from token manager"""
+        if self.token_manager:
+            account = self.token_manager.get_account_summary(f"expert_{expert_id}")
+            if account:
+                return account.get('efficiency_rating', 0.5)
+        return 0.5
+    
+    def _get_expert_token_balance(self, expert_id: str) -> float:
+        """Get token balance from token manager"""
+        if self.token_manager:
+            account = self.token_manager.get_account_summary(f"expert_{expert_id}")
+            if account:
+                return account.get('balance', 0)
+        return 0.0
+    
+    def _get_gradient_strength(self, field_id: str) -> float:
+        """Get gradient strength from gradient manager"""
+        if self.gradient_manager:
+            return self.gradient_manager.fields.get(field_id, 
+                GradientField(field_id, field_id)).gradient_strength
+        return 0.5
+    
+    def _get_species_population(self, species_id: str) -> int:
+        """Get species population from compartment manager"""
+        if self.compartment_manager:
+            return sum(1 for c in self.compartment_manager.compartments.values()
+                      if c.expert_type == species_id and c.is_viable)
+        # Fallback: count from registry
+        return len([e for e in self._experts.values()
+                   if hasattr(e, 'domain') and species_id in str(e.domain).lower()])
+    
+    def _get_total_compartment_population(self) -> int:
+        """Get total compartment population"""
+        if self.compartment_manager:
+            return len([c for c in self.compartment_manager.compartments.values() if c.is_viable])
+        return len([e for e in self._experts.values() if e.lifecycle_state.is_available()])
+    
+    def _get_species_id(self, profile: ExpertProfile) -> str:
+        """Extract species ID from expert profile"""
+        domain = profile.domain.value if hasattr(profile.domain, 'value') else str(profile.domain)
+        if 'energy' in domain.lower(): return 'energy'
+        if 'data' in domain.lower(): return 'data'
+        if 'iot' in domain.lower(): return 'iot'
+        if 'quantum' in domain.lower(): return 'quantum'
+        if 'helium' in domain.lower(): return 'helium'
+        return 'general'
+    
+    # ========================================================================
+    # Expert Registration with Bio-Inspired Correlation
     # ========================================================================
     
     def register_expert(
         self,
-        profile: Any,
+        profile: ExpertProfile,
         validate: bool = True,
         auto_certify: bool = False,
-        parent_genome_id: Optional[str] = None,
-        mutation_history: Optional[List[Dict]] = None
+        create_ecoatp_account: bool = True,
+        register_compartment: bool = True
     ) -> Tuple[bool, str]:
         """
-        Register expert with genetic encoding.
+        Register expert with bio-inspired correlation.
         
-        Creates genome from profile and registers species.
+        Creates Eco-ATP account and optionally a chromatophore compartment.
         """
-        expert_id = profile.expert_id
+        if profile.expert_id in self._experts:
+            existing = self._experts[profile.expert_id]
+            if profile.version.is_newer_than(existing.version):
+                logger.info(f"Updating expert {profile.expert_id} from "
+                           f"v{existing.version.to_string()} to v{profile.version.to_string()}")
+                existing.lifecycle_state = ExpertLifecycleState.ARCHIVED
+                profile.replaces_expert = existing.expert_id
+                self._migration_paths[existing.expert_id] = profile.expert_id
+            else:
+                return False, f"Expert {profile.expert_id} already registered with newer version"
         
-        if expert_id in self._experts:
-            return False, f"Expert {expert_id} already registered"
+        # Validate profile
+        if validate:
+            is_valid, message = self._validate_profile(profile)
+            if not is_valid:
+                return False, f"Validation failed: {message}"
+        
+        # Set lifecycle state
+        if auto_certify:
+            profile.lifecycle_state = ExpertLifecycleState.CERTIFIED
+        elif validate:
+            profile.lifecycle_state = ExpertLifecycleState.VALIDATING
+        else:
+            profile.lifecycle_state = ExpertLifecycleState.REGISTERED
         
         # Store expert
-        self._experts[expert_id] = profile
+        self._experts[profile.expert_id] = profile
+        self._update_indexes(profile)
         
-        # Create genetic encoding
-        if self.enable_genetics:
-            genome = self._profile_to_genome(profile, parent_genome_id)
-            self.genomes[expert_id] = genome
+        # BIO-INSPIRED: Create Eco-ATP account
+        if self.enable_bio_correlation and create_ecoatp_account and self.token_manager:
+            account_id = f"expert_{profile.expert_id}"
+            self.token_manager.create_account(account_id)
             
-            # Apply mutations if any
-            if mutation_history:
-                for mutation in mutation_history:
-                    if mutation['gene_id'] in genome.markers:
-                        genome.markers[mutation['gene_id']].mutation_history.append(mutation)
-            
-            # Update species population
-            species_id = self._get_species_id(profile)
-            if species_id in self.species_registry:
-                species = self.species_registry[species_id]
-                species.total_population += 1
-                species.active_population += 1
-                species.generation_count += 1
-                
-                # Update genetic diversity
-                species_genomes = [
-                    g for gid, g in self.genomes.items()
-                    if self._get_species_id(self._experts.get(gid)) == species_id
-                ]
-                species.calculate_genetic_diversity(species_genomes)
-                species.assess_extinction_risk()
+            # Initial token endowment based on efficiency
+            initial_tokens = int(profile.efficiency_score * 100)
+            if initial_tokens > 0:
+                self.token_manager.generate_tokens(
+                    account_id=account_id,
+                    source=EcoATPSource.EFFICIENCY_GAIN,
+                    energy_saved_kwh=profile.efficiency_score * 0.001,
+                    num_tokens=initial_tokens
+                )
+            logger.info(f"Created Eco-ATP account for {profile.expert_id}: {initial_tokens} tokens")
         
-        # Fitness scoring
-        if self.enable_evolution:
-            fitness = self._calculate_initial_fitness(profile)
-            self.fitness_scores[expert_id] = fitness
+        # BIO-INSPIRED: Register with compartment manager
+        if self.enable_bio_correlation and register_compartment and self.compartment_manager:
+            species = self._get_species_id(profile)
+            self.compartment_manager.create_compartment(
+                expert_type=species,
+                expert_instance=None  # Would be the actual expert instance
+            )
+            logger.info(f"Created chromatophore compartment for {profile.expert_id}")
+        
+        # Initialize fitness score
+        if self.enable_fitness_tracking:
+            self.fitness_scores[profile.expert_id] = FitnessScore(
+                expert_id=profile.expert_id,
+                resource_efficiency=min(1.0, 1.0 / (1.0 + profile.carbon_per_inference * 10000)),
+                resilience_score=profile.reliability_score,
+                adaptation_speed=0.5,
+                cooperation_score=0.5,
+                ecoatp_efficiency=profile.efficiency_score
+            )
+            self.fitness_scores[profile.expert_id].calculate_overall()
+        
+        # Update dependency graph
+        self._update_dependency_graph(profile)
+        self._version_family_index[profile.expert_name].append(profile.expert_id)
+        self._stats['total_registrations'] += 1
+        self.total_generations += 1
         
         # Record evolutionary event
-        if self.enable_blockchain:
-            self._record_evolutionary_event(
-                'speciation' if not parent_genome_id else 'birth',
-                expert_id,
-                {'parent_genome': parent_genome_id}
-            )
+        self.evolutionary_events.append({
+            'type': 'speciation' if not profile.replaces_expert else 'evolution',
+            'expert_id': profile.expert_id,
+            'species': self._get_species_id(profile),
+            'generation': self.total_generations,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        self.speciation_count += 1
         
-        logger.info(
-            f"Registered expert {expert_id} with genome: "
-            f"{len(genome.markers) if self.enable_genetics else 0} genes"
-        )
+        logger.info(f"Registered expert: {profile.expert_id} v{profile.version.to_string()} "
+                   f"(species: {self._get_species_id(profile)}, generation: {self.total_generations})")
         
-        return True, f"Expert {expert_id} registered with genetic encoding"
+        return True, f"Expert {profile.expert_id} registered successfully"
     
-    def _profile_to_genome(
-        self,
-        profile: Any,
-        parent_genome_id: Optional[str] = None
-    ) -> Genome:
-        """Convert expert profile to genetic sequence"""
-        species = self._get_species_id(profile)
-        
-        genome = Genome(
-            genome_id=f"genome_{profile.expert_id}",
-            species=species,
-            parent_genome=parent_genome_id
-        )
-        
-        # Metabolic genes
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_helium_metabolism",
-            gene_name="Helium Metabolism",
-            trait="helium_per_inference",
-            value=min(1.0, 1.0 / (1.0 + getattr(profile, 'helium_per_inference', 0.01) * 100)),
-            heritability=0.9
-        ))
-        
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_carbon_fixation",
-            gene_name="Carbon Fixation Efficiency",
-            trait="carbon_per_inference",
-            value=min(1.0, 1.0 / (1.0 + getattr(profile, 'carbon_per_inference', 0.0001) * 10000)),
-            heritability=0.85
-        ))
-        
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_energy_metabolism",
-            gene_name="Energy Metabolism Rate",
-            trait="energy_per_inference",
-            value=min(1.0, 1.0 / (1.0 + getattr(profile, 'energy_per_inference', 0.001) * 1000)),
-            heritability=0.8
-        ))
-        
-        # Fitness genes
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_accuracy",
-            gene_name="Functional Accuracy",
-            trait="accuracy_score",
-            value=getattr(profile, 'accuracy_score', 0.9),
-            heritability=0.7
-        ))
-        
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_reliability",
-            gene_name="Operational Reliability",
-            trait="reliability_score",
-            value=getattr(profile, 'reliability_score', 0.95),
-            heritability=0.75
-        ))
-        
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_efficiency",
-            gene_name="Resource Efficiency",
-            trait="efficiency_score",
-            value=getattr(profile, 'efficiency_score', 0.9),
-            heritability=0.8
-        ))
-        
-        # Regulatory genes
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_carbon_tolerance",
-            gene_name="Carbon Zone Tolerance",
-            trait="min_carbon_zone",
-            value=1.0 - (getattr(profile, 'min_carbon_zone', 0) / 15.0),
-            heritability=0.6
-        ))
-        
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_helium_tolerance",
-            gene_name="Helium Scarcity Tolerance",
-            trait="max_helium_scarcity",
-            value=getattr(profile, 'max_helium_scarcity', 1.0),
-            heritability=0.6
-        ))
-        
-        # Adaptation genes
-        genome.add_gene(GeneticMarker(
-            gene_id=f"{profile.expert_id}_response_time",
-            gene_name="Response Time",
-            trait="avg_latency_ms",
-            value=min(1.0, 1.0 / (1.0 + getattr(profile, 'avg_latency_ms', 50.0) / 100)),
-            heritability=0.5,
-            mutation_rate=0.02  # Higher mutation rate for adaptation
-        ))
-        
-        return genome
+    def _validate_profile(self, profile: ExpertProfile) -> Tuple[bool, str]:
+        """Validate expert profile completeness"""
+        errors = []
+        if not profile.expert_id: errors.append("expert_id is required")
+        if not profile.expert_name: errors.append("expert_name is required")
+        if profile.version.major < 0: errors.append("Invalid version")
+        for score_name, score_value in [('accuracy_score', profile.accuracy_score),
+                                         ('reliability_score', profile.reliability_score),
+                                         ('efficiency_score', profile.efficiency_score)]:
+            if not (0.0 <= score_value <= 1.0): errors.append(f"{score_name} must be between 0 and 1")
+        for metric_name, metric_value in [('helium_per_inference', profile.helium_per_inference),
+                                           ('carbon_per_inference', profile.carbon_per_inference),
+                                           ('energy_per_inference', profile.energy_per_inference)]:
+            if metric_value < 0: errors.append(f"{metric_name} cannot be negative")
+        for dep in profile.dependencies:
+            if not dep.is_optional and dep.dependency_id not in self._experts:
+                errors.append(f"Required dependency {dep.dependency_id} not registered")
+        for incompatible_id in profile.incompatible_with:
+            if incompatible_id == profile.expert_id:
+                errors.append("Cannot be incompatible with self")
+        if errors: return False, "; ".join(errors)
+        return True, "Profile valid"
     
-    def _get_species_id(self, profile: Any) -> str:
-        """Get species ID from profile"""
-        if hasattr(profile, 'domain'):
-            domain = profile.domain.value if hasattr(profile.domain, 'value') else str(profile.domain)
-            if 'energy' in domain.lower():
-                return 'energy'
-            elif 'data' in domain.lower():
-                return 'data'
-            elif 'iot' in domain.lower():
-                return 'iot'
-            elif 'quantum' in domain.lower():
-                return 'quantum'
-            elif 'helium' in domain.lower():
-                return 'helium'
-        return 'general'
+    def _update_indexes(self, profile: ExpertProfile):
+        """Update all indexes for an expert"""
+        self._domain_index[profile.domain].add(profile.expert_id)
+        self._hardware_index[profile.hardware_profile].add(profile.expert_id)
+        self._lifecycle_index[profile.lifecycle_state].add(profile.expert_id)
+        for tag in profile.tags: self._tag_index[tag].add(profile.expert_id)
+        for cap in profile.capabilities: self._capability_index[cap].add(profile.expert_id)
+        for tt in profile.supported_task_types: self._task_type_index[tt].add(profile.expert_id)
+        self._region_index[profile.origin_region].add(profile.expert_id)
+    
+    def _update_dependency_graph(self, profile: ExpertProfile):
+        """Update dependency graph"""
+        self._dependency_graph.add_node(profile.expert_id, name=profile.expert_name,
+                                        version=profile.version.to_string())
+        for dep in profile.dependencies:
+            self._dependency_graph.add_edge(profile.expert_id, dep.dependency_id,
+                                           optional=dep.is_optional,
+                                           version_req=dep.version_requirement)
     
     # ========================================================================
-    # Fitness and Natural Selection
+    # Bio-Inspired Filtering Methods
     # ========================================================================
     
-    def _calculate_initial_fitness(self, profile: Any) -> FitnessScore:
-        """Calculate initial fitness score for new expert"""
-        fitness = FitnessScore(expert_id=profile.expert_id)
-        
-        fitness.resource_efficiency = min(1.0, 
-            1.0 / (1.0 + getattr(profile, 'carbon_per_inference', 0.0001) * 10000)
-        )
-        fitness.adaptation_speed = 0.5  # Start neutral
-        fitness.cooperation_score = 0.5
-        fitness.competition_score = 0.5
-        fitness.resilience_score = getattr(profile, 'reliability_score', 0.95)
-        
-        fitness.calculate_overall()
-        
-        return fitness
-    
-    def update_fitness(
+    def filter_by_ecoatp_efficiency(
         self,
-        expert_id: str,
-        performance_metrics: Dict[str, float]
-    ):
-        """Update fitness based on observed performance"""
-        if expert_id not in self.fitness_scores:
+        min_efficiency: float = 0.5,
+        min_token_balance: float = 10.0
+    ) -> List[ExpertProfile]:
+        """
+        Filter experts by Eco-ATP efficiency and token balance.
+        
+        Uses real data from token manager when available.
+        """
+        if not self.enable_bio_correlation or not self.token_manager:
+            return self.get_all_active_experts()
+        
+        efficient = []
+        for expert_id, expert in self._experts.items():
+            if not expert.lifecycle_state.is_available():
+                continue
+            
+            efficiency = self._get_expert_ecoatp_efficiency(expert_id)
+            balance = self._get_expert_token_balance(expert_id)
+            
+            if efficiency >= min_efficiency and balance >= min_token_balance:
+                efficient.append(expert)
+        
+        logger.debug(f"Eco-ATP filter: {len(efficient)}/{len(self._experts)} experts passed "
+                    f"(min_efficiency={min_efficiency}, min_balance={min_token_balance})")
+        
+        return efficient
+    
+    def filter_by_health_and_fitness(
+        self,
+        min_health: float = 0.5,
+        min_fitness: float = 0.4
+    ) -> List[ExpertProfile]:
+        """Filter experts by health score and fitness"""
+        qualified = []
+        for expert_id, expert in self._experts.items():
+            if not expert.lifecycle_state.is_available():
+                continue
+            
+            health = expert.health.calculate_health_score()
+            fitness = self.fitness_scores.get(expert_id, FitnessScore(expert_id)).overall_fitness
+            
+            if health >= min_health and fitness >= min_fitness:
+                qualified.append(expert)
+        
+        return qualified
+    
+    def filter_by_gradient_alignment(
+        self,
+        carbon_threshold: float = 0.3,
+        trust_threshold: float = 0.4
+    ) -> List[ExpertProfile]:
+        """Filter experts aligned with current gradient conditions"""
+        if not self.enable_bio_correlation or not self.gradient_manager:
+            return self.get_all_active_experts()
+        
+        carbon_strength = self._get_gradient_strength('carbon')
+        trust_strength = self._get_gradient_strength('trust')
+        
+        # In high carbon zones, prefer low-carbon experts
+        if carbon_strength > carbon_threshold:
+            return sorted(
+                [e for e in self.get_all_active_experts()],
+                key=lambda e: e.carbon_per_inference
+            )[:max(1, len(self._experts) // 2)]
+        
+        # In low trust zones, prefer high-reliability experts
+        if trust_strength < trust_threshold:
+            return sorted(
+                [e for e in self.get_all_active_experts()],
+                key=lambda e: e.reliability_score,
+                reverse=True
+            )[:max(1, len(self._experts) // 2)]
+        
+        return self.get_all_active_experts()
+    
+    # ========================================================================
+    # Natural Selection and Evolution
+    # ========================================================================
+    
+    def update_fitness_from_gradients(self):
+        """Update expert fitness scores based on gradient fields"""
+        if not self.enable_bio_correlation or not self.gradient_manager:
             return
         
-        fitness = self.fitness_scores[expert_id]
-        alpha = 0.1  # Learning rate
+        trust_strength = self._get_gradient_strength('trust')
+        carbon_strength = self._get_gradient_strength('carbon')
         
-        if 'success_rate' in performance_metrics:
+        for expert_id, fitness in self.fitness_scores.items():
+            if expert_id not in self._experts:
+                continue
+            
+            expert = self._experts[expert_id]
+            
+            # Update resilience from trust gradient
             fitness.resilience_score = (
-                fitness.resilience_score * (1 - alpha) +
-                performance_metrics['success_rate'] * alpha
+                fitness.resilience_score * 0.7 + trust_strength * 0.3
             )
-        
-        if 'carbon_efficiency' in performance_metrics:
+            
+            # Update resource efficiency from carbon gradient
+            carbon_efficiency = 1.0 / (1.0 + expert.carbon_per_inference * 10000)
             fitness.resource_efficiency = (
-                fitness.resource_efficiency * (1 - alpha) +
-                performance_metrics['carbon_efficiency'] * alpha
+                fitness.resource_efficiency * 0.8 + carbon_efficiency * 0.2
             )
-        
-        if 'adaptation_speed' in performance_metrics:
-            fitness.adaptation_speed = (
-                fitness.adaptation_speed * (1 - alpha) +
-                performance_metrics['adaptation_speed'] * alpha
-            )
-        
-        fitness.calculate_overall()
-        
-        # Update selection coefficient
-        avg_fitness = np.mean([f.overall_fitness for f in self.fitness_scores.values()])
-        if avg_fitness > 0:
-            fitness.selection_coefficient = (fitness.overall_fitness - avg_fitness) / avg_fitness
+            
+            # Update Eco-ATP efficiency
+            fitness.ecoatp_efficiency = self._get_expert_ecoatp_efficiency(expert_id)
+            
+            # Update cooperation score from compartment health
+            if self.compartment_manager:
+                compartment = self.compartment_manager.find_best_compartment(
+                    self._get_species_id(expert)
+                )
+                if compartment:
+                    fitness.cooperation_score = (
+                        fitness.cooperation_score * 0.8 + compartment.health_score * 0.2
+                    )
+            
+            fitness.calculate_overall()
     
-    def natural_selection(self):
+    def trigger_natural_selection(self):
         """
         Apply natural selection pressure.
         
-        Experts with low fitness are deprecated (die).
-        Experts with high fitness are encouraged to reproduce.
+        Experts with low fitness are deprecated.
+        Experts with high fitness are marked for reproduction.
         """
-        if not self.enable_evolution:
+        if not self.enable_natural_selection:
             return
+        
+        # Update fitness from gradients first
+        self.update_fitness_from_gradients()
         
         # Calculate fitness threshold (bottom 20%)
         fitnesses = [f.overall_fitness for f in self.fitness_scores.values()]
@@ -676,444 +783,331 @@ class ExpertRegistry:
             return
         
         threshold = np.percentile(fitnesses, 20)
-        
-        # Deprecate low-fitness experts
-        deprecated = []
-        for expert_id, fitness in self.fitness_scores.items():
-            if fitness.overall_fitness < threshold and fitness.reproductive_success == 0:
-                if expert_id in self._experts:
-                    self.deprecate_expert(expert_id, reason="natural_selection")
-                    deprecated.append(expert_id)
-        
-        # Identify high-fitness experts for reproduction
         top_threshold = np.percentile(fitnesses, 80)
-        reproducers = [
-            eid for eid, f in self.fitness_scores.items()
-            if f.overall_fitness > top_threshold and f.reproductive_success < 5
-        ]
         
-        if deprecated:
-            logger.info(
-                f"Natural selection: {len(deprecated)} deprecated, "
-                f"{len(reproducers)} selected for reproduction"
-            )
+        deprecated_count = 0
+        reproducer_count = 0
+        
+        for expert_id, fitness in list(self.fitness_scores.items()):
+            if expert_id not in self._experts:
+                continue
             
-            self._record_evolutionary_event(
-                'selection',
-                'population',
-                {'deprecated': len(deprecated), 'reproducers': len(reproducers)}
-            )
+            expert = self._experts[expert_id]
+            
+            # Deprecate low-fitness experts
+            if (fitness.overall_fitness < threshold and
+                fitness.reproductive_success == 0 and
+                expert.lifecycle_state in [ExpertLifecycleState.ACTIVE, ExpertLifecycleState.CERTIFIED]):
+                
+                self.deprecate_expert(expert_id, reason="natural_selection_low_fitness")
+                deprecated_count += 1
+                
+                # Store knowledge before deprecation
+                if self.biomass_storage:
+                    self.biomass_storage.store_task(
+                        task_data={'expert_id': expert_id, 'knowledge': expert.to_dict()},
+                        ecoatp_cost=1.0,
+                        guarantee=GuaranteeLevel.BEST_EFFORT,
+                        initial_tier=StorageTier.LIPID_DEPOT
+                    )
+                
+                self.evolutionary_events.append({
+                    'type': 'extinction',
+                    'expert_id': expert_id,
+                    'fitness': fitness.overall_fitness,
+                    'reason': 'natural_selection',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                self.extinction_count += 1
+            
+            # Mark high-fitness for reproduction
+            elif fitness.overall_fitness > top_threshold and fitness.reproductive_success < 3:
+                fitness.reproductive_success += 1
+                reproducer_count += 1
+        
+        self._stats['total_natural_selections'] += 1
+        self._stats['last_selection'] = datetime.utcnow()
+        
+        if deprecated_count > 0 or reproducer_count > 0:
+            logger.info(f"Natural selection: {deprecated_count} deprecated, "
+                       f"{reproducer_count} marked for reproduction "
+                       f"(threshold={threshold:.3f}, population={len(fitnesses)})")
+    
+    def deprecate_expert(
+        self,
+        expert_id: str,
+        replacement_id: Optional[str] = None,
+        reason: str = "manual"
+    ) -> Tuple[bool, str]:
+        """Deprecate expert with reason tracking"""
+        if expert_id not in self._experts:
+            return False, f"Expert {expert_id} not found"
+        
+        profile = self._experts[expert_id]
+        profile.lifecycle_state = ExpertLifecycleState.DEPRECATED
+        profile.is_active = False
+        
+        if replacement_id and replacement_id in self._experts:
+            profile.replaced_by = replacement_id
+            self._migration_paths[expert_id] = replacement_id
+        
+        # Update lifecycle index
+        self._lifecycle_index[ExpertLifecycleState.DEPRECATED].add(expert_id)
+        
+        logger.info(f"Deprecated expert: {expert_id} (reason: {reason}, replacement: {replacement_id})")
+        return True, f"Expert {expert_id} deprecated"
+    
+    def activate_expert(self, expert_id: str) -> Tuple[bool, str]:
+        """Activate expert for production use"""
+        if expert_id not in self._experts:
+            return False, f"Expert {expert_id} not found"
+        
+        profile = self._experts[expert_id]
+        
+        if not profile.lifecycle_state.is_available():
+            return False, f"Expert {expert_id} is not in certifiable state"
+        
+        profile.lifecycle_state = ExpertLifecycleState.ACTIVE
+        profile.activated_at = datetime.utcnow()
+        profile.is_active = True
+        
+        self._lifecycle_index[ExpertLifecycleState.ACTIVE].add(expert_id)
+        
+        logger.info(f"Activated expert: {expert_id}")
+        return True, f"Expert {expert_id} activated"
     
     # ========================================================================
-    # Reproduction and Inheritance
+    # Performance Tracking with Bio-Inspired Integration
     # ========================================================================
     
-    def reproduce_expert(
+    def update_performance(
         self,
-        parent_id: str,
-        mutation_rate: Optional[float] = None
-    ) -> Optional[str]:
-        """
-        Create offspring through genetic reproduction.
+        expert_id: str,
+        metrics: Dict[str, Any]
+    ):
+        """Record expert performance with bio-inspired updates"""
+        if expert_id not in self._experts:
+            return
         
-        Args:
-            parent_id: Parent expert ID
-            mutation_rate: Override default mutation rate
-            
-        Returns:
-            Child expert ID if successful
-        """
-        if not self.enable_genetics or parent_id not in self.genomes:
-            return None
+        # Add to performance history
+        self._performance_history[expert_id].append({
+            **metrics,
+            'timestamp': datetime.utcnow().isoformat()
+        })
         
-        parent_genome = self.genomes[parent_id]
-        parent_profile = self._experts.get(parent_id)
+        # Keep last 10000 records
+        if len(self._performance_history[expert_id]) > 10000:
+            self._performance_history[expert_id] = self._performance_history[expert_id][-10000:]
         
-        if not parent_profile:
-            return None
-        
-        # Check if parent is fit to reproduce
-        if parent_id in self.fitness_scores:
-            fitness = self.fitness_scores[parent_id]
-            if fitness.reproductive_success >= 5:
-                return None  # Limit offspring count
-        
-        # Create child genome through mutation
-        child_genome = copy.deepcopy(parent_genome)
-        child_genome.genome_id = f"genome_{uuid.uuid4().hex[:12]}"
-        child_genome.parent_genome = parent_genome.genome_id
-        child_genome.created_at = datetime.utcnow()
-        
-        # Apply mutations
-        mut_rate = mutation_rate or self.inheritance_rules['mutation_rate']
-        mutations = child_genome.mutate(mut_rate)
-        
-        # Create child profile
-        import copy
-        child_profile = copy.deepcopy(parent_profile)
-        child_profile.expert_id = f"{parent_id}_offspring_{child_genome.genome_id[:8]}"
-        
-        if hasattr(child_profile, 'version'):
-            current = child_profile.version
-            child_profile.version = type(current)(
-                major=current.major,
-                minor=current.minor + 1,
-                patch=0
+        # Update health metrics
+        expert = self._experts[expert_id]
+        if 'success' in metrics:
+            alpha = 0.1
+            expert.health.success_rate = (
+                expert.health.success_rate * (1 - alpha) +
+                (1.0 if metrics['success'] else 0.0) * alpha
             )
+        if 'latency_ms' in metrics:
+            expert.health.avg_latency_ms = metrics['latency_ms']
+        if 'carbon_kg' in metrics:
+            expert.health.carbon_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 1000)
+        if 'helium_units' in metrics:
+            expert.health.helium_efficiency = 1.0 / (1.0 + metrics['helium_units'] * 100)
         
-        # Apply genetic expression to profile
-        for gene_id, gene in child_genome.markers.items():
-            trait = gene.trait
-            if hasattr(child_profile, trait):
-                current_val = getattr(child_profile, trait)
-                # Blend parent value with genetic expression
-                new_val = current_val * (1 - gene.heritability) + gene.value * gene.heritability
-                setattr(child_profile, trait, new_val)
+        expert.health.last_heartbeat = datetime.utcnow()
         
-        # Register child
-        success, message = self.register_expert(
-            child_profile,
-            parent_genome_id=parent_genome.genome_id,
-            mutation_history=[
-                {'gene_id': gid, 'type': 'point', 'timestamp': datetime.utcnow().isoformat()}
-                for gid in mutations
-            ] if mutations else None
-        )
-        
-        if success:
-            # Update parent reproductive success
-            if parent_id in self.fitness_scores:
-                self.fitness_scores[parent_id].reproductive_success += 1
+        # BIO-INSPIRED: Update fitness score
+        if self.enable_fitness_tracking and expert_id in self.fitness_scores:
+            fitness = self.fitness_scores[expert_id]
             
-            # Update species
-            species_id = self._get_species_id(parent_profile)
-            if species_id in self.species_registry:
-                self.species_registry[species_id].generation_count += 1
-            
-            logger.info(
-                f"Reproduction: {parent_id} → {child_profile.expert_id} "
-                f"({len(mutations)} mutations)"
-            )
-            
-            return child_profile.expert_id
-        
-        return None
-    
-    def sexual_reproduction(
-        self,
-        parent1_id: str,
-        parent2_id: str
-    ) -> Optional[str]:
-        """
-        Create offspring through sexual reproduction (crossover).
-        
-        Combines genetic material from two parents.
-        """
-        if not self.enable_genetics:
-            return None
-        
-        if parent1_id not in self.genomes or parent2_id not in self.genomes:
-            return None
-        
-        # Check same species (can interbreed)
-        genome1 = self.genomes[parent1_id]
-        genome2 = self.genomes[parent2_id]
-        
-        if genome1.species != genome2.species:
-            # Different species - hybrid possible but rare
-            if np.random.random() > 0.1:  # 10% chance of hybrid
-                return None
-        
-        # Genetic recombination
-        child_genome = genome1.recombine(genome2)
-        
-        # Create hybrid profile
-        parent1_profile = self._experts.get(parent1_id)
-        parent2_profile = self._experts.get(parent2_id)
-        
-        if not parent1_profile or not parent2_profile:
-            return None
-        
-        import copy
-        child_profile = copy.deepcopy(parent1_profile)
-        child_profile.expert_id = f"hybrid_{genome1.species}_{child_genome.genome_id[:8]}"
-        
-        # Blend traits from both parents
-        for trait in ['accuracy_score', 'reliability_score', 'efficiency_score']:
-            if hasattr(child_profile, trait) and hasattr(parent2_profile, trait):
-                blended = (
-                    getattr(parent1_profile, trait) * 0.5 +
-                    getattr(parent2_profile, trait) * 0.5
+            if 'success' in metrics:
+                fitness.resilience_score = (
+                    fitness.resilience_score * 0.8 +
+                    (1.0 if metrics['success'] else 0.0) * 0.2
                 )
-                setattr(child_profile, trait, blended)
+            
+            if 'carbon_kg' in metrics:
+                fitness.resource_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 10000)
+            
+            if 'ecoatp_efficiency' in metrics:
+                fitness.ecoatp_efficiency = metrics['ecoatp_efficiency']
+            
+            fitness.calculate_overall()
         
-        # Register hybrid
-        success, message = self.register_expert(
-            child_profile,
-            parent_genome_id=f"{genome1.genome_id}+{genome2.genome_id}"
-        )
+        # BIO-INSPIRED: Pump trust gradient on success
+        if self.enable_bio_correlation and self.gradient_manager:
+            trust_delta = 0.05 if metrics.get('success', False) else -0.1
+            self.gradient_manager.pump_field('trust', trust_delta, source=f"expert_{expert_id}")
         
-        if success:
-            logger.info(
-                f"Hybrid created: {parent1_id} × {parent2_id} → {child_profile.expert_id}"
-            )
-            return child_profile.expert_id
-        
-        return None
+        # Check health and auto-degrade if needed
+        health_score = expert.health.calculate_health_score()
+        if health_score < 0.3 and expert.lifecycle_state == ExpertLifecycleState.ACTIVE:
+            expert.lifecycle_state = ExpertLifecycleState.DEGRADED
+            logger.warning(f"Expert {expert_id} auto-degraded (health: {health_score:.2f})")
+        elif health_score > 0.7 and expert.lifecycle_state == ExpertLifecycleState.DEGRADED:
+            expert.lifecycle_state = ExpertLifecycleState.ACTIVE
+            logger.info(f"Expert {expert_id} auto-recovered (health: {health_score:.2f})")
     
     # ========================================================================
-    # Ecosystem Health Monitoring
+    # Bio-Inspired Background Tasks
     # ========================================================================
     
-    def assess_ecosystem_health(self) -> Dict[str, Any]:
-        """Assess overall ecosystem health"""
-        if not self.enable_ecosystem:
-            return {}
-        
-        # Species richness
-        active_species = [
-            s for s in self.species_registry.values()
-            if s.active_population > 0
-        ]
-        
-        # Genetic diversity
-        total_diversity = np.mean([
-            s.genetic_diversity for s in self.species_registry.values()
-        ])
-        
-        # Population stability
-        populations = [s.active_population for s in self.species_registry.values()]
-        population_stability = 1.0 - (np.std(populations) / max(np.mean(populations), 1))
-        
-        # Extinction risk
-        endangered_count = sum(
-            1 for s in self.species_registry.values()
-            if s.status in [SpeciesStatus.ENDANGERED, SpeciesStatus.DECLINING]
-        )
-        
-        # Keystone species health
-        keystone_health = np.mean([
-            s.active_population / max(s.total_population, 1)
-            for s in self.species_registry.values()
-            if s.keystone_species
-        ])
-        
-        health_score = (
-            (len(active_species) / max(len(self.species_registry), 1)) * 0.3 +
-            total_diversity * 0.25 +
-            population_stability * 0.2 +
-            (1 - endangered_count / max(len(self.species_registry), 1)) * 0.15 +
-            keystone_health * 0.1
-        )
-        
-        self.ecosystem_health = {
-            'health_score': health_score,
-            'status': 'healthy' if health_score > 0.7 else 'degraded' if health_score > 0.4 else 'critical',
-            'species_richness': len(active_species),
-            'total_species': len(self.species_registry),
-            'genetic_diversity': total_diversity,
-            'population_stability': population_stability,
-            'endangered_species': endangered_count,
-            'keystone_health': keystone_health,
-            'trophic_structure': {
-                'producers': sum(1 for s in self.species_registry.values() if s.trophic_level == 1 and s.active_population > 0),
-                'consumers': sum(1 for s in self.species_registry.values() if s.trophic_level == 2 and s.active_population > 0),
-                'decomposers': sum(1 for s in self.species_registry.values() if s.trophic_level == 3 and s.active_population > 0)
-            }
-        }
-        
-        return self.ecosystem_health
-    
-    def update_compartment_population(
-        self,
-        species_id: str,
-        active_count: int,
-        total_count: int
-    ):
-        """Update compartment population counts"""
-        if species_id in self.species_registry:
-            species = self.species_registry[species_id]
-            species.active_population = active_count
-            species.total_population = total_count
-            species.assess_extinction_risk()
-        
-        self.compartment_populations[species_id] = active_count
-        self.total_compartments = sum(self.compartment_populations.values())
+    async def _bio_correlation_loop(self):
+        """Background loop for bio-inspired correlation maintenance"""
+        while True:
+            try:
+                if self.enable_bio_correlation:
+                    # Update fitness from gradients
+                    if self.gradient_manager:
+                        self.update_fitness_from_gradients()
+                    
+                    # Trigger natural selection periodically
+                    if self.enable_natural_selection:
+                        self.trigger_natural_selection()
+                    
+                    # Update compartment population tracking
+                    if self.compartment_manager and self.enable_population_tracking:
+                        for species_id in ['energy', 'data', 'iot', 'quantum', 'helium']:
+                            population = self._get_species_population(species_id)
+                            logger.debug(f"Species {species_id} population: {population}")
+                
+                await asyncio.sleep(300)  # Every 5 minutes
+                
+            except Exception as e:
+                logger.error(f"Bio-correlation loop error: {str(e)}")
+                await asyncio.sleep(60)
     
     # ========================================================================
-    # Evolutionary Event Recording
-    # ========================================================================
-    
-    def _record_evolutionary_event(
-        self,
-        event_type: str,
-        entity_id: str,
-        details: Dict[str, Any]
-    ):
-        """Record evolutionary event for fossil record"""
-        event = {
-            'event_id': f"evo_{datetime.utcnow().timestamp()}_{uuid.uuid4().hex[:6]}",
-            'event_type': event_type,
-            'entity_id': entity_id,
-            'details': details,
-            'timestamp': datetime.utcnow().isoformat(),
-            'generation': len(self.evolutionary_events) + 1
-        }
-        
-        self.evolutionary_events.append(event)
-        
-        if event_type == 'speciation':
-            self.speciation_events.append(event)
-        elif event_type == 'extinction':
-            self.extinction_events.append(event)
-    
-    # ========================================================================
-    # Enhanced Statistics
+    # Enhanced Statistics and Reporting
     # ========================================================================
     
     def get_registry_stats(self) -> Dict[str, Any]:
-        """Get enhanced registry statistics with bio-inspired metrics"""
+        """Get comprehensive registry statistics with bio-inspired metrics"""
+        total = len(self._experts)
+        available = len(self.get_all_active_experts())
+        
         stats = {
             'registry_id': self.registry_id,
-            'total_experts': len(self._experts),
-            'active_experts': len([
-                e for e in self._experts.values()
-                if hasattr(e, 'lifecycle_state') and e.lifecycle_state.is_available()
-            ])
-        }
-        
-        # Genetic stats
-        if self.enable_genetics:
-            stats['genetics'] = {
-                'total_genomes': len(self.genomes),
-                'total_genes': sum(g.total_genes for g in self.genomes.values()),
-                'average_genes_per_genome': np.mean([g.total_genes for g in self.genomes.values()]) if self.genomes else 0
-            }
-        
-        # Species stats
-        if self.enable_ecosystem:
-            stats['species'] = {
-                species_id: {
-                    'population': s.active_population,
-                    'total_population': s.total_population,
-                    'status': s.status.value,
-                    'genetic_diversity': s.genetic_diversity,
-                    'extinction_risk': s.extinction_risk,
-                    'generation': s.generation_count,
-                    'trophic_level': s.trophic_level,
-                    'keystone': s.keystone_species
-                }
-                for species_id, s in self.species_registry.items()
-            }
-            stats['ecosystem_health'] = self.ecosystem_health
-        
-        # Evolution stats
-        if self.enable_evolution:
-            stats['evolution'] = {
-                'total_evolutionary_events': len(self.evolutionary_events),
-                'speciation_events': len(self.speciation_events),
-                'extinction_events': len(self.extinction_events),
-                'selection_pressure': self.selection_pressure,
+            'total_experts': total,
+            'available_experts': available,
+            'degraded_experts': len(self._lifecycle_index.get(ExpertLifecycleState.DEGRADED, set())),
+            'deprecated_experts': len(self._lifecycle_index.get(ExpertLifecycleState.DEPRECATED, set())),
+            
+            # Domain distribution
+            'domains': {domain.value: len(experts) for domain, experts in self._domain_index.items()},
+            'hardware_distribution': {hw.value: len(experts) for hw, experts in self._hardware_index.items()},
+            'lifecycle_distribution': {state.value: len(self._lifecycle_index.get(state, set())) 
+                                       for state in ExpertLifecycleState},
+            
+            # Bio-inspired metrics
+            'bio_correlation_enabled': self.enable_bio_correlation,
+            'bio_modules_available': BIO_INSPIRED_AVAILABLE,
+            
+            # Evolutionary metrics
+            'evolution': {
+                'total_generations': self.total_generations,
+                'speciation_events': self.speciation_count,
+                'extinction_events': self.extinction_count,
+                'natural_selections': self._stats['total_natural_selections'],
+                'last_selection': self._stats['last_selection'].isoformat() if self._stats['last_selection'] else None,
                 'average_fitness': np.mean([f.overall_fitness for f in self.fitness_scores.values()]) if self.fitness_scores else 0,
                 'top_fitness': max([f.overall_fitness for f in self.fitness_scores.values()]) if self.fitness_scores else 0
+            }
+        }
+        
+        # Population tracking
+        if self.enable_population_tracking:
+            stats['species_populations'] = {
+                species: self._get_species_population(species)
+                for species in ['energy', 'data', 'iot', 'quantum', 'helium']
+            }
+            stats['total_population'] = self._get_total_compartment_population()
+        
+        # Token economy
+        if self.token_manager:
+            stats['token_economy'] = self.token_manager.get_system_summary()
+        
+        # Gradient health
+        if self.gradient_manager:
+            stats['gradient_health'] = self.gradient_manager.get_field_strengths()
+        
+        # Fitness distribution
+        if self.fitness_scores:
+            fitnesses = [f.overall_fitness for f in self.fitness_scores.values()]
+            stats['fitness_distribution'] = {
+                'mean': np.mean(fitnesses),
+                'median': np.median(fitnesses),
+                'std': np.std(fitnesses),
+                'min': np.min(fitnesses),
+                'max': np.max(fitnesses),
+                'q25': np.percentile(fitnesses, 25),
+                'q75': np.percentile(fitnesses, 75)
             }
         
         return stats
     
-    def get_species_report(self, species_id: str) -> Dict[str, Any]:
-        """Get detailed species report"""
-        if species_id not in self.species_registry:
-            return {}
-        
-        species = self.species_registry[species_id]
-        
-        # Get all genomes for this species
-        species_genomes = [
-            g for gid, g in self.genomes.items()
-            if self._get_species_id(self._experts.get(gid)) == species_id
-        ]
-        
+    def get_expert_performance(self, expert_id: str) -> List[Dict]:
+        """Get performance history for expert"""
+        return self._performance_history.get(expert_id, [])
+    
+    def get_all_active_experts(self) -> List[ExpertProfile]:
+        """Get all currently active experts"""
+        return [e for e in self._experts.values()
+                if e.is_active and e.lifecycle_state.is_available()]
+    
+    def get_expert(self, expert_id: str) -> Optional[ExpertProfile]:
+        """Get expert by ID"""
+        return self._experts.get(expert_id)
+    
+    def get_experts_by_domain(self, domain: ExpertDomain) -> List[ExpertProfile]:
+        """Get experts by domain"""
+        expert_ids = self._domain_index.get(domain, set())
+        return [self._experts[eid] for eid in expert_ids if eid in self._experts]
+    
+    def get_experts_by_lifecycle(self, state: ExpertLifecycleState) -> List[ExpertProfile]:
+        """Get experts by lifecycle state"""
+        expert_ids = self._lifecycle_index.get(state, set())
+        return [self._experts[eid] for eid in expert_ids if eid in self._experts]
+    
+    def get_fitness_score(self, expert_id: str) -> Optional[FitnessScore]:
+        """Get fitness score for expert"""
+        return self.fitness_scores.get(expert_id)
+    
+    def get_top_fitness_experts(self, n: int = 5) -> List[Tuple[str, float]]:
+        """Get top N experts by fitness"""
+        sorted_fitness = sorted(self.fitness_scores.items(),
+                               key=lambda x: x[1].overall_fitness, reverse=True)
+        return [(eid, f.overall_fitness) for eid, f in sorted_fitness[:n]]
+    
+    def get_ecosystem_health_report(self) -> Dict[str, Any]:
+        """Generate comprehensive ecosystem health report"""
         return {
-            'taxonomy': {
-                'species': species.species_name,
-                'genus': species.genus,
-                'family': species.family,
-                'order': species.order,
-                'class': species.class_name
-            },
-            'population': {
-                'active': species.active_population,
-                'total': species.total_population,
-                'status': species.status.value,
-                'extinction_risk': species.extinction_risk
-            },
-            'genetics': {
-                'diversity': species.genetic_diversity,
-                'genomes_sequenced': len(species_genomes),
-                'generation': species.generation_count
-            },
-            'ecology': {
-                'trophic_level': species.trophic_level,
-                'keystone': species.keystone_species,
-                'invasive_potential': species.invasive_potential
-            },
-            'evolution': {
-                'speciation_events': species.speciation_events,
-                'fitness_trend': self._get_fitness_trend(species_id)
-            }
+            'timestamp': datetime.utcnow().isoformat(),
+            'total_species': len(set(self._get_species_id(e) for e in self._experts.values())),
+            'total_population': self._get_total_compartment_population(),
+            'genetic_diversity': len(self._experts),
+            'fitness_scores': {eid: f.overall_fitness for eid, f in self.fitness_scores.items()},
+            'top_performers': self.get_top_fitness_experts(5),
+            'gradient_health': self.gradient_manager.get_field_strengths() if self.gradient_manager else {},
+            'token_economy': self.token_manager.get_system_summary() if self.token_manager else {},
+            'biomass_reserves': self.biomass_storage.get_storage_stats() if self.biomass_storage else {},
+            'evolutionary_events': list(self.evolutionary_events)[-10:]
         }
     
-    def _get_fitness_trend(self, species_id: str) -> str:
-        """Get fitness trend for species"""
-        species_experts = [
-            eid for eid, e in self._experts.items()
-            if self._get_species_id(e) == species_id
-        ]
+    def cleanup_deprecated(self, max_age_days: int = 90) -> int:
+        """Clean up experts deprecated longer than max_age_days"""
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        retired_count = 0
         
-        if len(species_experts) < 2:
-            return 'stable'
+        for expert_id in list(self._experts.keys()):
+            profile = self._experts[expert_id]
+            if (profile.lifecycle_state == ExpertLifecycleState.DEPRECATED and
+                profile.retired_at is None):
+                if expert_id in self._migration_paths:
+                    profile.lifecycle_state = ExpertLifecycleState.RETIRED
+                    profile.retired_at = datetime.utcnow()
+                    retired_count += 1
         
-        recent_fitness = [
-            self.fitness_scores[eid].overall_fitness
-            for eid in species_experts[-5:]
-            if eid in self.fitness_scores
-        ]
-        
-        if len(recent_fitness) < 2:
-            return 'stable'
-        
-        trend = np.polyfit(range(len(recent_fitness)), recent_fitness, 1)[0]
-        
-        if trend > 0.01:
-            return 'improving'
-        elif trend < -0.01:
-            return 'declining'
-        return 'stable'
-    
-    def trigger_natural_selection(self):
-        """Manually trigger natural selection"""
-        if self.enable_evolution:
-            self.natural_selection()
-            self.assess_ecosystem_health()
-    
-    def get_reproduction_candidates(
-        self,
-        min_fitness: float = 0.7,
-        max_offspring: int = 5
-    ) -> List[str]:
-        """Get experts eligible for reproduction"""
-        candidates = []
-        
-        for expert_id, fitness in self.fitness_scores.items():
-            if (fitness.overall_fitness >= min_fitness and
-                fitness.reproductive_success < max_offspring and
-                expert_id in self._experts):
-                candidates.append(expert_id)
-        
-        # Sort by fitness
-        candidates.sort(
-            key=lambda eid: self.fitness_scores[eid].overall_fitness,
-            reverse=True
-        )
-        
-        return candidates
+        self._stats['last_cleanup'] = datetime.utcnow()
+        logger.info(f"Cleanup: retired {retired_count} deprecated experts")
+        return retired_count
