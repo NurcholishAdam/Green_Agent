@@ -58,6 +58,50 @@ async def initialize_enhanced_agent_with_integrations():
         enable_cache=True,
         enable_circuit_breaker=True
     )
+
+    # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/run_enhanced_agent.py
+# Add bio-inspired integration to the existing agent runner
+
+async def initialize_bio_inspired_agent():
+    """Initialize Green Agent with bio-inspired architecture"""
+    
+    from enhancements.bio_inspired import BioInspiredGreenCore, BioInspiredMoEIntegrator
+    
+    # Initialize bio-inspired core
+    bio_core = BioInspiredGreenCore()
+    
+    # Initialize expert router (existing)
+    expert_router = ExpertRouter(enable_quantum=True)
+    
+    # Initialize bio-inspired MoE integrator
+    bio_integrator = BioInspiredMoEIntegrator(bio_core, expert_router)
+    
+    # Register all experts with Eco-ATP accounts
+    for expert_id in ['energy', 'data', 'iot', 'quantum', 'helium']:
+        bio_integrator.register_expert(
+            expert_id,
+            base_consumption_rate={
+                'energy': 10.0,
+                'data': 8.0,
+                'iot': 5.0,
+                'quantum': 50.0,
+                'helium': 12.0
+            }.get(expert_id, 10.0)
+        )
+    
+    logger.info("=" * 60)
+    logger.info("BIO-INSPIRED GREEN AGENT INITIALIZED")
+    logger.info("=" * 60)
+    logger.info(f"System Balance: {bio_core.get_system_status()['eco_atp']['total_balance']:.1f} Eco-ATP")
+    logger.info(f"Active Gradients: {bio_core.get_system_status()['gradients']}")
+    logger.info(f"Scheduler: {bio_core.get_system_status()['scheduler']['is_active']}")
+    logger.info("=" * 60)
+    
+    return {
+        'bio_core': bio_core,
+        'bio_integrator': bio_integrator,
+        'expert_router': expert_router
+    }
     
     # 10. Register all layers with layer integrator
     await layer_integrator.integrate_layer_0(workload_classifier)
