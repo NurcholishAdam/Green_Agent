@@ -1,97 +1,228 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/chromatophore_compartments.py
-
-"""
-Chromatophore Compartment System for Green Agent
-Version: 1.0.0
-
-Full modular isolation for MoE experts inspired by bacterial chromatophores.
-Each compartment is a self-contained execution environment with:
-- Selective membrane (API gateway)
-- Local Eco-ATP pool
-- Internal gradient fields
-- Independent lifecycle management
-"""
+# Enhanced with mandatory validation gates and trusted anomaly detection
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 import numpy as np
-from collections import deque
-import hashlib
+from collections import defaultdict, deque
 import uuid
+import hashlib
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Enums
+# ============================================================================
+
 class CompartmentState(Enum):
-    """Compartment lifecycle states"""
-    GENESIS = "genesis"          # Being created
-    MATURING = "maturing"        # Building trust
-    ACTIVE = "active"            # Fully operational
-    STRESSED = "stressed"        # Resource constrained
-    SENESCENT = "senescent"      # Declining
-    APOPTOTIC = "apoptotic"      # Programmed death
+    GENESIS = "genesis"
+    MATURING = "maturing"
+    ACTIVE = "active"
+    STRESSED = "stressed"
+    SENESCENT = "senescent"
+    APOPTOTIC = "apoptotic"
     DECOMMISSIONED = "decommissioned"
 
 class MembranePermeability(Enum):
-    """Membrane permeability levels"""
-    IMPERMEABLE = 0.0     # Complete isolation
-    RESTRICTIVE = 0.3     # Minimal communication
-    SELECTIVE = 0.6       # Balanced
-    PERMEABLE = 0.8       # Open collaboration
-    POROUS = 1.0          # Full transparency
+    IMPERMEABLE = "impermeable"
+    RESTRICTIVE = "restrictive"
+    SELECTIVE = "selective"
+    PERMEABLE = "permeable"
 
-@dataclass
-class CompartmentResource:
-    """Resource allocation for a compartment"""
-    cpu_cores: float = 1.0
-    memory_mb: float = 256.0
-    storage_mb: float = 1024.0
-    network_mbps: float = 100.0
-    max_tokens: float = 1000.0
-    
-    @property
-    def utilization(self) -> float:
-        return (self.cpu_cores + self.memory_mb/256 + self.storage_mb/1024) / 3
+# ============================================================================
+# Enhanced Membrane Gate with Mandatory Validation
+# ============================================================================
 
-@dataclass
 class MembraneGate:
-    """Controls what crosses the compartment membrane"""
-    compartment_id: str
-    permeability: MembranePermeability = MembranePermeability.SELECTIVE
-    inbound_rate_limit: float = 100.0  # requests/second
-    outbound_rate_limit: float = 200.0
-    trusted_peers: List[str] = field(default_factory=list)
-    blocked_peers: List[str] = field(default_factory=list)
+    """
+    Enhanced Membrane Gate with:
+    - Mandatory validation for critical operations
+    - Trusted anomaly detection
+    - Rate limiting for critical operations
+    - Security audit logging
+    """
     
-    # Traffic tracking
-    inbound_count: int = 0
-    outbound_count: int = 0
-    rejected_count: int = 0
-    
-    def can_pass(self, source_id: str, direction: str = 'inbound') -> bool:
-        """Check if communication can cross membrane"""
-        if source_id in self.blocked_peers:
-            self.rejected_count += 1
-            return False
+    def __init__(self, compartment_id: str):
+        self.compartment_id = compartment_id
+        self.permeability: MembranePermeability = MembranePermeability.SELECTIVE
+        self.inbound_rate_limit: float = 100.0
+        self.outbound_rate_limit: float = 200.0
+        self.trusted_peers: List[str] = field(default_factory=list)
+        self.blocked_peers: List[str] = field(default_factory=list)
         
-        if self.permeability == MembranePermeability.IMPERMEABLE:
+        # Traffic tracking
+        self.inbound_count: int = 0
+        self.outbound_count: int = 0
+        self.rejected_count: int = 0
+        
+        # ====================================================================
+        # FIX 5: Mandatory Validation for Critical Operations
+        # ====================================================================
+        self.mandatory_validation_for = {
+            'model_update': True,
+            'token_transfer': True,
+            'configuration_change': True,
+            'data_sharing': False,
+            'status_query': False
+        }
+        
+        self.validation_history: deque = deque(maxlen=1000)
+        self.blocked_operations: deque = deque(maxlen=500)
+        
+        # Anomaly detection for trusted sources
+        self.trusted_anomaly_threshold = 0.3
+        self._critical_op_timestamps: Dict[str, List[datetime]] = defaultdict(list)
+        self._source_operation_history: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    
+    def can_pass(
+        self, source_id: str, direction: str = 'inbound',
+        operation_type: str = 'status_query', payload_size: int = 0
+    ) -> Tuple[bool, str]:
+        """Enhanced permission check with mandatory validation for critical operations"""
+        
+        # Blocked peers always denied
+        if source_id in self.blocked_peers:
+            self._record_blocked(source_id, operation_type, 'blocked_peer')
             self.rejected_count += 1
-            return False
+            return False, "Source is blocked"
+        
+        # Mandatory validation for critical operations
+        if self.mandatory_validation_for.get(operation_type, False):
+            validation_passed = self._validate_critical_operation(
+                source_id, operation_type, payload_size
+            )
+            if not validation_passed:
+                self._record_blocked(source_id, operation_type, 'validation_failed')
+                self.rejected_count += 1
+                return False, "Critical operation validation failed"
+        
+        # For non-critical operations, use trust-based permeability
+        if self.permeability == MembranePermeability.IMPERMEABLE:
+            self._record_blocked(source_id, operation_type, 'impermeable')
+            self.rejected_count += 1
+            return False, "Membrane is impermeable"
         
         if self.permeability == MembranePermeability.RESTRICTIVE:
             if source_id not in self.trusted_peers:
+                self._record_blocked(source_id, operation_type, 'not_trusted')
                 self.rejected_count += 1
-                return False
+                return False, "Source not in trusted peers"
         
+        # Even for trusted sources, check for anomalies
+        if source_id in self.trusted_peers and self.permeability == MembranePermeability.PERMEABLE:
+            anomaly_score = self._check_trusted_anomaly(source_id, operation_type)
+            if anomaly_score > self.trusted_anomaly_threshold:
+                logger.warning(
+                    f"Anomaly detected from trusted peer {source_id}: "
+                    f"score={anomaly_score:.2f}, operation={operation_type}"
+                )
+                self._record_blocked(source_id, operation_type, f'anomaly_{anomaly_score:.2f}')
+                self.rejected_count += 1
+                return False, f"Anomaly detected (score: {anomaly_score:.2f})"
+        
+        # Track successful passage
         if direction == 'inbound':
             self.inbound_count += 1
         else:
             self.outbound_count += 1
         
+        return True, "Passed"
+    
+    def _validate_critical_operation(
+        self, source_id: str, operation_type: str, payload_size: int
+    ) -> bool:
+        """Validate critical operations regardless of trust level"""
+        now = datetime.utcnow()
+        
+        # Rate limiting for critical operations
+        recent_ops = [
+            t for t in self._critical_op_timestamps[source_id]
+            if (now - t).total_seconds() < 60
+        ]
+        
+        if len(recent_ops) > 10:
+            logger.warning(f"Critical operation rate limit exceeded for {source_id}")
+            return False
+        
+        self._critical_op_timestamps[source_id].append(now)
+        
+        # Size validation for model updates
+        if operation_type == 'model_update' and payload_size > 100 * 1024 * 1024:
+            logger.warning(f"Model update too large from {source_id}: {payload_size} bytes")
+            return False
+        
+        # Token transfer validation
+        if operation_type == 'token_transfer':
+            if not self._validate_token_transfer(source_id):
+                return False
+        
         return True
+    
+    def _validate_token_transfer(self, source_id: str) -> bool:
+        """Validate token transfer operations"""
+        # Check transfer frequency
+        now = datetime.utcnow()
+        recent_transfers = [
+            t for t in self._critical_op_timestamps.get(f"transfer_{source_id}", [])
+            if (now - t).total_seconds() < 300  # 5 minutes
+        ]
+        
+        if len(recent_transfers) > 20:  # Max 20 transfers per 5 minutes
+            logger.warning(f"Token transfer rate limit exceeded for {source_id}")
+            return False
+        
+        if not hasattr(self, '_transfer_timestamps'):
+            self._transfer_timestamps = defaultdict(list)
+        self._transfer_timestamps[f"transfer_{source_id}"].append(now)
+        
+        return True
+    
+    def _check_trusted_anomaly(self, source_id: str, operation_type: str) -> float:
+        """Check for anomalous behavior from trusted sources"""
+        anomaly_score = 0.0
+        
+        # Check frequency anomaly
+        now = datetime.utcnow()
+        recent_count = sum(
+            1 for t in self._critical_op_timestamps.get(source_id, [])
+            if (now - t).total_seconds() < 10
+        )
+        if recent_count > 5:
+            anomaly_score += 0.3
+        
+        # Check operation type anomaly
+        history = self._source_operation_history[source_id]
+        total_ops = sum(history.values())
+        
+        if total_ops > 50:
+            op_frequency = history.get(operation_type, 0) / total_ops
+            if op_frequency < 0.05:
+                anomaly_score += 0.2
+        
+        # Check payload size anomaly
+        if total_ops > 100:
+            if hasattr(self, '_payload_history'):
+                avg_payload = np.mean(self._payload_history.get(source_id, [1000]))
+                if operation_type == 'model_update' and hasattr(self, '_current_payload'):
+                    if self._current_payload > avg_payload * 10:
+                        anomaly_score += 0.3
+        
+        self._source_operation_history[source_id][operation_type] += 1
+        
+        return min(1.0, anomaly_score)
+    
+    def _record_blocked(self, source_id: str, operation_type: str, reason: str):
+        """Record blocked operation for security audit"""
+        self.blocked_operations.append({
+            'source_id': source_id,
+            'operation_type': operation_type,
+            'reason': reason,
+            'timestamp': datetime.utcnow().isoformat()
+        })
     
     def adjust_permeability(self, trust_score: float, token_balance: float):
         """Dynamically adjust membrane permeability"""
@@ -103,452 +234,107 @@ class MembraneGate:
             self.permeability = MembranePermeability.RESTRICTIVE
         else:
             self.permeability = MembranePermeability.IMPERMEABLE
-
-class ChromatophoreCompartment:
-    """
-    Self-contained expert execution compartment.
     
-    Inspired by bacterial chromatophore vesicles.
-    """
-    
-    def __init__(
-        self,
-        compartment_id: str,
-        expert_type: str,
-        expert_instance: Any = None,
-        resources: Optional[CompartmentResource] = None
-    ):
-        self.compartment_id = compartment_id
-        self.expert_type = expert_type
-        self.expert = expert_instance
-        self.resources = resources or CompartmentResource()
-        
-        # Lifecycle
-        self.state = CompartmentState.GENESIS
-        self.birth_time = datetime.utcnow()
-        self.generation = 1
-        self.parent_id: Optional[str] = None
-        
-        # Membrane
-        self.membrane = MembraneGate(compartment_id)
-        
-        # Local Eco-ATP pool
-        self.token_balance: float = 100.0  # Initial endowment
-        self.total_earned: float = 0.0
-        self.total_spent: float = 0.0
-        
-        # Local gradient fields (simplified)
-        self.trust_gradient: float = 0.1  # Starts low, builds with success
-        self.efficiency_gradient: float = 0.5
-        
-        # Performance tracking
-        self.tasks_completed: int = 0
-        self.tasks_failed: int = 0
-        self.total_latency_ms: float = 0.0
-        self.carbon_emitted_kg: float = 0.0
-        
-        # Biomass storage (local)
-        self.atp_cache: deque = deque(maxlen=100)
-        self.glycogen_queue: deque = deque(maxlen=1000)
-        self.starch_reserve: deque = deque(maxlen=5000)
-        self.lipid_depot: deque = deque(maxlen=10000)
-        
-        # Communication history
-        self.signal_history: deque = deque(maxlen=500)
-        
-        logger.info(f"Compartment {compartment_id} created: {expert_type}")
-    
-    @property
-    def success_rate(self) -> float:
-        total = self.tasks_completed + self.tasks_failed
-        return self.tasks_completed / max(total, 1)
-    
-    @property
-    def efficiency_score(self) -> float:
-        if self.tasks_completed == 0:
-            return 0.5
-        return self.token_balance / max(self.total_earned, 1)
-    
-    @property
-    def health_score(self) -> float:
-        """Composite health score"""
-        return (
-            self.success_rate * 0.4 +
-            self.efficiency_score * 0.3 +
-            self.trust_gradient * 0.3
-        )
-    
-    @property
-    def is_viable(self) -> bool:
-        """Check if compartment is viable"""
-        return (
-            self.state in [CompartmentState.MATURING, CompartmentState.ACTIVE] and
-            self.health_score > 0.2 and
-            self.token_balance > 0
-        )
-    
-    def receive_tokens(self, amount: float, source: str = "scheduler") -> bool:
-        """Receive Eco-ATP tokens through membrane"""
-        if not self.membrane.can_pass(source, 'inbound'):
-            return False
-        
-        self.token_balance += amount
-        self.total_earned += amount
-        return True
-    
-    def spend_tokens(self, amount: float, purpose: str = "execution") -> bool:
-        """Spend Eco-ATP tokens for task execution"""
-        if self.token_balance < amount:
-            return False
-        
-        self.token_balance -= amount
-        self.total_spent += amount
-        return True
-    
-    def record_task_result(
-        self,
-        success: bool,
-        latency_ms: float,
-        carbon_kg: float,
-        tokens_consumed: float
-    ):
-        """Record task execution result"""
-        if success:
-            self.tasks_completed += 1
-            self.trust_gradient = min(1.0, self.trust_gradient + 0.05)
-            self.efficiency_gradient = min(1.0, 
-                self.efficiency_gradient + 0.02 * (1 - tokens_consumed / max(self.token_balance, 1))
+    def get_security_stats(self) -> Dict[str, Any]:
+        """Get security statistics"""
+        return {
+            'total_blocked': len(self.blocked_operations),
+            'recent_blocks': list(self.blocked_operations)[-20:],
+            'rejection_rate': self.rejected_count / max(self.inbound_count + self.outbound_count, 1),
+            'anomaly_detections': sum(
+                1 for b in self.blocked_operations if 'anomaly' in b.get('reason', '')
             )
+        }
+
+# ============================================================================
+# Bio-Core Buffer for Graceful Degradation
+# ============================================================================
+
+class BioCoreBuffer:
+    """
+    Local buffer that caches bio-core data for graceful degradation.
+    
+    FIX 6: Allows experts to operate during bio-core outages using cached values.
+    """
+    
+    def __init__(self, buffer_ttl_seconds: float = 30.0):
+        self.buffer_ttl = buffer_ttl_seconds
+        self.cached_gradient_levels: Dict[str, float] = {}
+        self.cached_token_balance: float = 500.0
+        self.cached_compartment_health: float = 0.7
+        self.last_sync_time: Optional[datetime] = None
+        self.bio_core_available: bool = True
+        self.degraded_mode: bool = False
+        self.degraded_operations_count: int = 0
+    
+    def sync_from_bio_core(self, bio_core) -> bool:
+        """Sync buffer from bio-core. Returns True if successful."""
+        try:
+            if bio_core and hasattr(bio_core, 'gradient_manager'):
+                self.cached_gradient_levels = bio_core.gradient_manager.get_field_strengths()
+            if bio_core and hasattr(bio_core, 'token_manager'):
+                summary = bio_core.token_manager.get_system_summary()
+                self.cached_token_balance = summary.get('total_balance', 500)
+            if bio_core and hasattr(bio_core, 'compartment_manager'):
+                compartment = bio_core.compartment_manager.find_best_compartment('data')
+                if compartment:
+                    self.cached_compartment_health = compartment.health_score
+            
+            self.last_sync_time = datetime.utcnow()
+            self.bio_core_available = True
+            self.degraded_mode = False
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to sync from bio-core: {str(e)}")
+            self._check_degraded()
+            return False
+    
+    def get_gradient(self, field_id: str) -> float:
+        """Get gradient level with graceful degradation"""
+        if not self.degraded_mode:
+            return self.cached_gradient_levels.get(field_id, 0.5)
         else:
-            self.tasks_failed += 1
-            self.trust_gradient = max(0.0, self.trust_gradient - 0.1)
-            self.efficiency_gradient = max(0.1, self.efficiency_gradient - 0.05)
-        
-        self.total_latency_ms += latency_ms
-        self.carbon_emitted_kg += carbon_kg
-        
-        # Adjust membrane permeability
-        self.membrane.adjust_permeability(self.trust_gradient, self.token_balance)
-        
-        # Check for state transitions
-        self._evaluate_lifecycle()
+            self.degraded_operations_count += 1
+            cached = self.cached_gradient_levels.get(field_id, 0.5)
+            # Conservative estimate with uncertainty noise
+            return max(0.0, min(1.0, cached * 0.8 + np.random.normal(0, 0.1)))
     
-    def _evaluate_lifecycle(self):
-        """Evaluate and transition lifecycle state"""
-        if self.health_score < 0.1 and self.state == CompartmentState.ACTIVE:
-            self.state = CompartmentState.SENESCENT
-            logger.warning(f"Compartment {self.compartment_id} entering senescence")
-        
-        elif self.health_score < 0.05:
-            self.state = CompartmentState.APOPTOTIC
-            logger.warning(f"Compartment {self.compartment_id} marked for apoptosis")
-        
-        elif self.health_score > 0.3 and self.state == CompartmentState.MATURING:
-            self.state = CompartmentState.ACTIVE
-            logger.info(f"Compartment {self.compartment_id} now active")
+    def get_token_balance(self) -> float:
+        """Get token balance with graceful degradation"""
+        if not self.degraded_mode:
+            return self.cached_token_balance
+        else:
+            self.degraded_operations_count += 1
+            return self.cached_token_balance * 0.7  # Conservative 30% reduction
     
-    def spawn_child(self, expert_type: Optional[str] = None) -> 'ChromatophoreCompartment':
-        """Spawn a child compartment (reproduction)"""
-        child_id = f"{self.compartment_id}_child_{self.generation}"
-        child_type = expert_type or self.expert_type
-        
-        # Transfer some tokens to child (endowment)
-        endowment = self.token_balance * 0.2
-        self.token_balance -= endowment
-        
-        child = ChromatophoreCompartment(
-            compartment_id=child_id,
-            expert_type=child_type,
-            resources=CompartmentResource(
-                cpu_cores=self.resources.cpu_cores * 0.5,
-                memory_mb=self.resources.memory_mb * 0.5
-            )
-        )
-        
-        child.parent_id = self.compartment_id
-        child.generation = self.generation + 1
-        child.token_balance = endowment
-        child.trust_gradient = self.trust_gradient * 0.5  # Inherit partial trust
-        
-        self.generation += 1
-        
-        logger.info(f"Compartment {self.compartment_id} spawned child {child_id}")
-        
-        return child
+    def get_compartment_health(self) -> float:
+        """Get compartment health with graceful degradation"""
+        if not self.degraded_mode:
+            return self.cached_compartment_health
+        else:
+            return max(0.1, self.cached_compartment_health * 0.8)
     
-    def prepare_apoptosis(self) -> Tuple[float, Dict[str, Any]]:
-        """Prepare for programmed cell death"""
-        # Distill knowledge before death
-        knowledge_summary = {
-            'expert_type': self.expert_type,
-            'tasks_completed': self.tasks_completed,
-            'success_rate': self.success_rate,
-            'efficiency_score': self.efficiency_score,
-            'learned_patterns': list(self.atp_cache)[-10:],
-            'best_practices': {
-                'avg_latency_ms': self.total_latency_ms / max(self.tasks_completed, 1),
-                'carbon_per_task_kg': self.carbon_emitted_kg / max(self.tasks_completed, 1)
-            }
-        }
-        
-        # Return remaining tokens to pool
-        remaining_tokens = self.token_balance
-        
-        self.state = CompartmentState.DECOMMISSIONED
-        
-        return remaining_tokens, knowledge_summary
+    def _check_degraded(self):
+        """Check if should enter degraded mode"""
+        if self.last_sync_time:
+            elapsed = (datetime.utcnow() - self.last_sync_time).total_seconds()
+            if elapsed > self.buffer_ttl:
+                if not self.degraded_mode:
+                    self.degraded_mode = True
+                    logger.warning(
+                        f"Entering DEGRADED MODE: Bio-core unavailable for {elapsed:.0f}s"
+                    )
     
-    def get_status(self) -> Dict[str, Any]:
-        """Get compartment status"""
+    def is_degraded(self) -> bool:
+        """Check if operating in degraded mode"""
+        return self.degraded_mode
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get buffer statistics"""
         return {
-            'compartment_id': self.compartment_id,
-            'expert_type': self.expert_type,
-            'state': self.state.value,
-            'generation': self.generation,
-            'health_score': self.health_score,
-            'token_balance': self.token_balance,
-            'trust_gradient': self.trust_gradient,
-            'efficiency_gradient': self.efficiency_gradient,
-            'success_rate': self.success_rate,
-            'membrane_permeability': self.membrane.permeability.value,
-            'tasks_completed': self.tasks_completed,
-            'storage': {
-                'atp_cache': len(self.atp_cache),
-                'glycogen_queue': len(self.glycogen_queue),
-                'starch_reserve': len(self.starch_reserve),
-                'lipid_depot': len(self.lipid_depot)
-            }
-        }
-
-
-class CompartmentManager:
-    """
-    Manages the ecosystem of chromatophore compartments.
-    
-    Handles compartment lifecycle, resource allocation, and inter-compartment coordination.
-    """
-    
-    def __init__(self, token_manager=None):
-        self.token_manager = token_manager
-        self.compartments: Dict[str, ChromatophoreCompartment] = {}
-        self.global_resource_pool = CompartmentResource(
-            cpu_cores=16.0, memory_mb=4096.0, storage_mb=10240.0
-        )
-        
-        # Ecosystem metrics
-        self.total_compartments_created = 0
-        self.total_apoptosis_events = 0
-        self.knowledge_bank: Dict[str, List[Dict]] = defaultdict(list)
-        
-        # Market for inter-compartment trading
-        self.market_orders: List[Dict] = []
-        
-        # Start maintenance tasks
-        asyncio.create_task(self._ecosystem_maintenance())
-        
-        logger.info("Compartment Manager initialized")
-    
-    def create_compartment(
-        self,
-        expert_type: str,
-        expert_instance: Any = None,
-        resources: Optional[CompartmentResource] = None,
-        parent_id: Optional[str] = None
-    ) -> ChromatophoreCompartment:
-        """Create a new chromatophore compartment"""
-        compartment_id = f"comp_{expert_type}_{uuid.uuid4().hex[:8]}"
-        
-        # Allocate resources from global pool
-        if resources is None:
-            resources = CompartmentResource(
-                cpu_cores=min(2.0, self.global_resource_pool.cpu_cores * 0.1),
-                memory_mb=min(256.0, self.global_resource_pool.memory_mb * 0.1),
-                storage_mb=min(512.0, self.global_resource_pool.storage_mb * 0.05)
-            )
-        
-        # Deduct from global pool
-        self.global_resource_pool.cpu_cores -= resources.cpu_cores
-        self.global_resource_pool.memory_mb -= resources.memory_mb
-        self.global_resource_pool.storage_mb -= resources.storage_mb
-        
-        compartment = ChromatophoreCompartment(
-            compartment_id=compartment_id,
-            expert_type=expert_type,
-            expert_instance=expert_instance,
-            resources=resources
-        )
-        
-        if parent_id:
-            compartment.parent_id = parent_id
-        
-        # Initial token endowment
-        if self.token_manager:
-            self.token_manager.create_account(compartment_id)
-            tokens = self.token_manager.generate_tokens(
-                account_id=compartment_id,
-                source=EcoATPSource.EFFICIENCY_GAIN,
-                energy_saved_kwh=0.001,
-                num_tokens=10
-            )
-            if tokens:
-                compartment.receive_tokens(sum(t.value for t in tokens))
-        
-        self.compartments[compartment_id] = compartment
-        self.total_compartments_created += 1
-        
-        compartment.state = CompartmentState.MATURING
-        
-        return compartment
-    
-    def decommission_compartment(self, compartment_id: str) -> Dict[str, Any]:
-        """Decommission a compartment (apoptosis)"""
-        if compartment_id not in self.compartments:
-            return {}
-        
-        compartment = self.compartments[compartment_id]
-        
-        # Prepare apoptosis
-        remaining_tokens, knowledge = compartment.prepare_apoptosis()
-        
-        # Store knowledge
-        self.knowledge_bank[compartment.expert_type].append(knowledge)
-        
-        # Return resources to global pool
-        self.global_resource_pool.cpu_cores += compartment.resources.cpu_cores
-        self.global_resource_pool.memory_mb += compartment.resources.memory_mb
-        self.global_resource_pool.storage_mb += compartment.resources.storage_mb
-        
-        # Return tokens if token manager available
-        if self.token_manager and remaining_tokens > 0:
-            main_account = "green_agent_core"
-            self.token_manager.generate_tokens(
-                account_id=main_account,
-                source=EcoATPSource.EFFICIENCY_GAIN,
-                energy_saved_kwh=remaining_tokens / 10000.0,
-                num_tokens=int(remaining_tokens / 10)
-            )
-        
-        del self.compartments[compartment_id]
-        self.total_apoptosis_events += 1
-        
-        logger.info(f"Compartment {compartment_id} decommissioned")
-        
-        return knowledge
-    
-    def find_best_compartment(
-        self,
-        expert_type: str,
-        task_complexity: float = 1.0
-    ) -> Optional[ChromatophoreCompartment]:
-        """Find the best compartment for a task"""
-        candidates = [
-            c for c in self.compartments.values()
-            if c.expert_type == expert_type and c.is_viable
-        ]
-        
-        if not candidates:
-            return None
-        
-        # Score by health, efficiency, and token balance
-        scored = []
-        for c in candidates:
-            score = (
-                c.health_score * 0.4 +
-                c.efficiency_score * 0.3 +
-                min(c.token_balance / (task_complexity * 10), 1.0) * 0.3
-            )
-            scored.append((c, score))
-        
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[0][0] if scored else None
-    
-    def balance_load(self):
-        """Balance load across compartments"""
-        overloaded = [
-            c for c in self.compartments.values()
-            if c.is_viable and len(c.glycogen_queue) > 500
-        ]
-        
-        underloaded = [
-            c for c in self.compartments.values()
-            if c.is_viable and len(c.glycogen_queue) < 100 and c.expert_type in [oc.expert_type for oc in overloaded]
-        ]
-        
-        for ol in overloaded:
-            for ul in underloaded:
-                if ol.expert_type == ul.expert_type:
-                    # Transfer some tasks
-                    transfer_count = min(50, len(ol.glycogen_queue) - 500)
-                    for _ in range(transfer_count):
-                        if ol.glycogen_queue:
-                            task = ol.glycogen_queue.popleft()
-                            ul.glycogen_queue.append(task)
-    
-    def spawn_if_needed(self):
-        """Spawn new compartments if demand exceeds supply"""
-        expert_types = set(c.expert_type for c in self.compartments.values())
-        
-        for etype in expert_types:
-            active = [
-                c for c in self.compartments.values()
-                if c.expert_type == etype and c.is_viable
-            ]
-            
-            if len(active) < 2:  # Minimum 2 compartments per type
-                self.create_compartment(etype)
-            
-            # Check load
-            avg_queue = np.mean([len(c.glycogen_queue) for c in active]) if active else 0
-            if avg_queue > 300 and self.global_resource_pool.cpu_cores > 2:
-                self.create_compartment(etype)
-    
-    def cull_unhealthy(self):
-        """Remove unhealthy compartments"""
-        for cid in list(self.compartments.keys()):
-            compartment = self.compartments[cid]
-            
-            if compartment.state == CompartmentState.APOPTOTIC:
-                self.decommission_compartment(cid)
-            elif compartment.state == CompartmentState.SENESCENT:
-                # Give time to recover
-                if compartment.health_score < 0.05:
-                    compartment.state = CompartmentState.APOPTOTIC
-    
-    async def _ecosystem_maintenance(self):
-        """Periodic ecosystem maintenance"""
-        while True:
-            try:
-                self.balance_load()
-                self.spawn_if_needed()
-                self.cull_unhealthy()
-                await asyncio.sleep(30)
-            except Exception as e:
-                logger.error(f"Ecosystem maintenance error: {str(e)}")
-                await asyncio.sleep(60)
-    
-    def get_ecosystem_stats(self) -> Dict[str, Any]:
-        """Get ecosystem statistics"""
-        compartments_by_type = defaultdict(list)
-        for c in self.compartments.values():
-            compartments_by_type[c.expert_type].append(c)
-        
-        return {
-            'total_compartments': len(self.compartments),
-            'total_created': self.total_compartments_created,
-            'total_apoptosis': self.total_apoptosis_events,
-            'global_resources': {
-                'cpu_cores': self.global_resource_pool.cpu_cores,
-                'memory_mb': self.global_resource_pool.memory_mb,
-                'storage_mb': self.global_resource_pool.storage_mb
-            },
-            'by_type': {
-                etype: {
-                    'count': len(comps),
-                    'avg_health': np.mean([c.health_score for c in comps]),
-                    'total_tokens': sum(c.token_balance for c in comps),
-                    'total_tasks': sum(c.tasks_completed for c in comps)
-                }
-                for etype, comps in compartments_by_type.items()
-            },
-            'knowledge_bank_size': sum(len(v) for v in self.knowledge_bank.values())
+            'degraded_mode': self.degraded_mode,
+            'bio_core_available': self.bio_core_available,
+            'last_sync': self.last_sync_time.isoformat() if self.last_sync_time else None,
+            'degraded_operations': self.degraded_operations_count,
+            'buffer_ttl': self.buffer_ttl
         }
