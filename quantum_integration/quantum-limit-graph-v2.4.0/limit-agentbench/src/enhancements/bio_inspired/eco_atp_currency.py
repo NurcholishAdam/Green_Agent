@@ -1,9 +1,14 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/eco_atp_currency.py
-# Enhanced with emergency bypass, DoS protection, batch processing, and tenant quotas
+# Complete enhanced file with TokenSupplyManager and PredictiveTokenAllocator
+
+"""
+Enhanced Eco-ATP Currency System v5.0.0
+Complete implementation with supply management, pre-allocation, and protocol support
+"""
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set
+from typing import Dict, Any, List, Optional, Tuple, Set, Protocol
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -14,6 +19,21 @@ import json
 import math
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Protocol Definition
+# ============================================================================
+
+class TokenServiceProtocol(Protocol):
+    """Explicit contract for token management services"""
+    def get_system_summary(self) -> Dict[str, Any]: ...
+    def get_account_summary(self, account_id: str) -> Dict[str, Any]: ...
+    def reserve_tokens(self, account_id: str, amount: float, consumer: Any,
+                       tenant_id: str, priority: int) -> Tuple[bool, List[str]]: ...
+    def generate_tokens(self, account_id: str, source: Any, **kwargs) -> List[Any]: ...
+    def consume_tokens(self, token_ids: List[str], consumer: Any, operation_success: bool) -> float: ...
+    def recover_tokens(self, token_ids: List[str], completion_percentage: float) -> float: ...
+    def create_account(self, account_id: str) -> Any: ...
 
 # ============================================================================
 # Enums and Data Classes
@@ -28,7 +48,7 @@ class EcoATPSource(Enum):
     HELIUM_RECOVERY = "helium_recovery"
     EXTERNAL_TRADE = "external_trade"
     GRADIENT_CONVERSION = "gradient_conversion"
-    EMERGENCY_SUBSTRATE = "emergency_substrate"  # NEW: Anaerobic pathway
+    EMERGENCY_SUBSTRATE = "emergency_substrate"
 
 class EcoATPConsumer(Enum):
     EXPERT_EXECUTION = "expert_execution"
@@ -146,17 +166,11 @@ class DynamicExchangeRate:
         }
 
 # ============================================================================
-# Enhanced Eco-ATP Token Manager with All Fixes
+# Enhanced Eco-ATP Token Manager
 # ============================================================================
 
 class EcoATPTokenManager:
-    """
-    Enhanced Eco-ATP Token Manager with:
-    - Emergency anaerobic metabolism bypass
-    - Per-tenant DoS protection and rate limiting
-    - Batched token operations for reduced latency
-    - Suspicious activity detection
-    """
+    """Enhanced Eco-ATP Token Manager with all features"""
     
     def __init__(self, exchange_rate: Optional[DynamicExchangeRate] = None):
         self.exchange_rate = exchange_rate or DynamicExchangeRate()
@@ -164,20 +178,13 @@ class EcoATPTokenManager:
         self.active_tokens: Dict[str, EcoATPToken] = {}
         self.token_history: deque = deque(maxlen=10000)
         
-        # Anti-hoarding configuration
         self.hoarding_threshold = 2.0
         self.tax_rate = 0.1
         self.redistribution_interval = timedelta(minutes=30)
         self.last_redistribution = datetime.utcnow()
         
-        # Recovery rates
-        self.recovery_rates = {
-            0.0: 0.0, 0.25: 0.125, 0.5: 0.25, 0.75: 0.6, 0.9: 0.8, 1.0: 0.95
-        }
+        self.recovery_rates = {0.0: 0.0, 0.25: 0.125, 0.5: 0.25, 0.75: 0.6, 0.9: 0.8, 1.0: 0.95}
         
-        # ====================================================================
-        # FIX 1: Emergency Anaerobic Metabolism Bypass
-        # ====================================================================
         self.emergency_mode = False
         self.emergency_token_rate = 10.0
         self.emergency_reserve = 1000.0
@@ -186,135 +193,85 @@ class EcoATPTokenManager:
         self.substrate_reserves = 500.0
         self.last_generation_time: Optional[datetime] = None
         
-        # ====================================================================
-        # FIX 4: DoS Protection - Per-Tenant Quotas
-        # ====================================================================
         self.tenant_quotas: Dict[str, Dict[str, Any]] = {}
-        self.default_quota = {
-            'max_tokens_per_minute': 100.0,
-            'max_concurrent_tasks': 5,
-            'min_priority_for_reservation': 2,
-            'reservation_cooldown_seconds': 1.0
-        }
+        self.default_quota = {'max_tokens_per_minute': 100.0, 'max_concurrent_tasks': 5,
+                             'min_priority_for_reservation': 2, 'reservation_cooldown_seconds': 1.0}
         self.tenant_usage: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
         self.tenant_last_reservation: Dict[str, datetime] = {}
         self.suspicious_tenants: Set[str] = set()
         self.suspicious_threshold = 5
         self._failed_attempts: Dict[str, int] = defaultdict(int)
         
-        # ====================================================================
-        # FIX 7: Batch Processing for Reduced Latency
-        # ====================================================================
         self.batch_queue: List[Dict[str, Any]] = []
         self.batch_size = 10
-        self.batch_timeout = 0.005
         self._batch_lock = asyncio.Lock()
         
-        # Start background tasks
         asyncio.create_task(self._emergency_monitor_loop())
         asyncio.create_task(self._batch_processor_loop())
         asyncio.create_task(self._maintenance_loop())
         
-        logger.info("Enhanced Eco-ATP Token Manager initialized with all fixes")
+        logger.info("Enhanced Eco-ATP Token Manager initialized")
     
-    # ========================================================================
-    # FIX 1: Emergency Anaerobic Metabolism
-    # ========================================================================
+    def create_account(self, account_id: str) -> EcoATPAccount:
+        if account_id not in self.accounts:
+            self.accounts[account_id] = EcoATPAccount(account_id=account_id)
+        return self.accounts[account_id]
     
-    async def _emergency_monitor_loop(self):
-        """Monitor for ATP synthase failure and activate emergency mode"""
-        while True:
-            try:
-                summary = self.get_system_summary()
-                balance = summary.get('total_balance', 0)
-                
-                if self.last_generation_time:
-                    time_since_last = (datetime.utcnow() - self.last_generation_time).total_seconds()
-                    
-                    if time_since_last > 30 and balance < self.emergency_threshold:
-                        if not self.emergency_mode:
-                            self._activate_emergency_mode()
-                    elif self.emergency_mode and time_since_last < 10:
-                        self._deactivate_emergency_mode()
-                
-                if self.emergency_mode:
-                    self._generate_emergency_tokens()
-                
-                await asyncio.sleep(5)
-            except Exception as e:
-                logger.error(f"Emergency monitor error: {str(e)}")
-                await asyncio.sleep(10)
-    
-    def _activate_emergency_mode(self):
-        """Activate anaerobic metabolism bypass"""
-        self.emergency_mode = True
-        self.substrate_phosphorylation_active = True
-        logger.critical(
-            f"EMERGENCY MODE ACTIVATED: ATP Synthase bypass engaged. "
-            f"Emergency reserve: {self.emergency_reserve:.0f} Eco-ATP, "
-            f"Substrate reserves: {self.substrate_reserves:.0f}"
-        )
-    
-    def _deactivate_emergency_mode(self):
-        """Deactivate emergency mode when ATP synthase recovers"""
-        self.emergency_mode = False
-        self.substrate_phosphorylation_active = False
-        logger.info("Emergency mode deactivated - ATP Synthase recovered")
-    
-    def _generate_emergency_tokens(self):
-        """Substrate-level phosphorylation - direct ATP from stored substrates"""
-        if self.substrate_reserves <= 0:
-            logger.critical("EMERGENCY RESERVES EXHAUSTED!")
-            return
+    def generate_tokens(self, account_id: str, source: EcoATPSource,
+                       carbon_saved_kg: float = 0.0, helium_saved_units: float = 0.0,
+                       energy_saved_kwh: float = 0.0, efficiency: float = 1.0,
+                       num_tokens: Optional[int] = None) -> List[EcoATPToken]:
+        if account_id not in self.accounts:
+            self.create_account(account_id)
         
-        substrate_used = min(self.emergency_token_rate, self.substrate_reserves)
-        self.substrate_reserves -= substrate_used
-        emergency_tokens = substrate_used * 0.5
+        carbon_value = self.exchange_rate.carbon_to_ecoatp(carbon_saved_kg)
+        helium_value = self.exchange_rate.helium_to_ecoatp(helium_saved_units)
+        energy_value = energy_saved_kwh * 1000
+        total_value = carbon_value + helium_value + energy_value
         
-        critical_accounts = ['energy_expert', 'helium_expert', 'green_agent_core']
-        per_account = emergency_tokens / len(critical_accounts)
+        if num_tokens is None:
+            num_tokens = max(1, int(total_value / 10))
         
-        for account_id in critical_accounts:
-            if account_id in self.accounts:
-                self.accounts[account_id].balance += per_account
+        token_value = total_value / num_tokens
+        tokens = []
+        
+        for i in range(num_tokens):
+            token = EcoATPToken(
+                token_id=f"eco_{account_id}_{datetime.utcnow().timestamp()}_{i}",
+                value=token_value, source=source,
+                generated_at=datetime.utcnow(),
+                expires_at=datetime.utcnow() + timedelta(hours=24),
+                carbon_equivalent_kg=carbon_saved_kg / num_tokens,
+                helium_equivalent_units=helium_saved_units / num_tokens,
+                generation_efficiency=efficiency
+            )
+            tokens.append(token)
+            self.active_tokens[token.token_id] = token
+            self.accounts[account_id].balance += token_value
+            self.accounts[account_id].total_generated += token_value
         
         self.last_generation_time = datetime.utcnow()
-        logger.warning(
-            f"EMERGENCY: Generated {emergency_tokens:.1f} Eco-ATP via substrate phosphorylation. "
-            f"Reserves remaining: {self.substrate_reserves:.1f}"
-        )
+        
+        if total_value > 100 and self.substrate_reserves < 500:
+            self.substrate_reserves = min(1000.0, self.substrate_reserves + total_value * 0.05)
+        
+        return tokens
     
-    def replenish_substrate_reserves(self, amount: float):
-        """Replenish substrate reserves from normal operation surplus"""
-        self.substrate_reserves = min(1000.0, self.substrate_reserves + amount)
-    
-    # ========================================================================
-    # FIX 4: DoS Protection - Per-Tenant Quotas
-    # ========================================================================
-    
-    def reserve_tokens(
-        self, account_id: str, amount: float,
-        consumer: EcoATPConsumer, tenant_id: str = "default",
-        priority: int = 2
-    ) -> Tuple[bool, List[str]]:
-        """Enhanced token reservation with DoS protection"""
+    def reserve_tokens(self, account_id: str, amount: float, consumer: EcoATPConsumer,
+                      tenant_id: str = "default", priority: int = 2) -> Tuple[bool, List[str]]:
         tenant_quota = self.tenant_quotas.get(tenant_id, self.default_quota)
         
         if tenant_id in self.suspicious_tenants:
-            logger.warning(f"Suspicious tenant {tenant_id} blocked from reservation")
+            logger.warning(f"Suspicious tenant {tenant_id} blocked")
             return False, []
         
         if priority > tenant_quota['min_priority_for_reservation']:
             return False, []
         
         if not self._check_rate_limit(tenant_id, amount, tenant_quota):
-            logger.warning(f"Tenant {tenant_id} rate limit exceeded")
             return False, []
         
         if not self._check_cooldown(tenant_id, tenant_quota):
-            return False, []
-        
-        if not self._check_concurrent_tasks(account_id, tenant_quota):
             return False, []
         
         success, token_ids = self._do_reserve_tokens(account_id, amount, consumer)
@@ -327,10 +284,7 @@ class EcoATPTokenManager:
         
         return success, token_ids
     
-    def _do_reserve_tokens(
-        self, account_id: str, amount: float, consumer: EcoATPConsumer
-    ) -> Tuple[bool, List[str]]:
-        """Actual token reservation logic"""
+    def _do_reserve_tokens(self, account_id: str, amount: float, consumer: EcoATPConsumer) -> Tuple[bool, List[str]]:
         if account_id not in self.accounts:
             self.create_account(account_id)
         
@@ -372,148 +326,7 @@ class EcoATPTokenManager:
         account.balance -= amount
         return True, reserved_tokens
     
-    def _check_rate_limit(self, tenant_id: str, amount: float, quota: Dict[str, Any]) -> bool:
-        now = datetime.utcnow()
-        minute_ago = now - timedelta(minutes=1)
-        recent_usage = sum(
-            u['amount'] for u in self.tenant_usage[tenant_id]
-            if u['timestamp'] > minute_ago
-        )
-        return (recent_usage + amount) <= quota['max_tokens_per_minute']
-    
-    def _check_cooldown(self, tenant_id: str, quota: Dict[str, Any]) -> bool:
-        if tenant_id in self.tenant_last_reservation:
-            elapsed = (datetime.utcnow() - self.tenant_last_reservation[tenant_id]).total_seconds()
-            if elapsed < quota['reservation_cooldown_seconds']:
-                return False
-        return True
-    
-    def _check_concurrent_tasks(self, account_id: str, quota: Dict[str, Any]) -> bool:
-        active_count = sum(
-            1 for token in self.active_tokens.values()
-            if token.state == TokenState.RESERVED and account_id in token.token_id
-        )
-        return active_count < quota['max_concurrent_tasks']
-    
-    def _track_failed_attempt(self, tenant_id: str):
-        self._failed_attempts[tenant_id] += 1
-        if self._failed_attempts[tenant_id] >= self.suspicious_threshold:
-            self.suspicious_tenants.add(tenant_id)
-            logger.critical(
-                f"Tenant {tenant_id} marked as SUSPICIOUS after "
-                f"{self._failed_attempts[tenant_id]} failed attempts"
-            )
-    
-    def clear_suspicious_status(self, tenant_id: str):
-        self.suspicious_tenants.discard(tenant_id)
-        self._failed_attempts[tenant_id] = 0
-    
-    def set_tenant_quota(self, tenant_id: str, quota: Dict[str, Any]):
-        self.tenant_quotas[tenant_id] = {**self.default_quota, **quota}
-    
-    # ========================================================================
-    # FIX 7: Batch Processing
-    # ========================================================================
-    
-    async def _batch_processor_loop(self):
-        """Process token operations in batches for efficiency"""
-        while True:
-            try:
-                if self.batch_queue:
-                    batch = self.batch_queue[:self.batch_size]
-                    self.batch_queue = self.batch_queue[self.batch_size:]
-                    
-                    async with self._batch_lock:
-                        for request in batch:
-                            try:
-                                result = self._do_reserve_tokens(
-                                    request['account_id'],
-                                    request['amount'],
-                                    request['consumer']
-                                )
-                                if request.get('future'):
-                                    request['future'].set_result(result)
-                            except Exception as e:
-                                if request.get('future'):
-                                    request['future'].set_exception(e)
-                
-                await asyncio.sleep(0.001)
-            except Exception as e:
-                logger.error(f"Batch processor error: {str(e)}")
-                await asyncio.sleep(0.01)
-    
-    async def reserve_tokens_async(
-        self, account_id: str, amount: float, consumer: EcoATPConsumer
-    ) -> Tuple[bool, List[str]]:
-        """Asynchronous token reservation with batching"""
-        future = asyncio.Future()
-        self.batch_queue.append({
-            'account_id': account_id, 'amount': amount,
-            'consumer': consumer, 'future': future,
-            'timestamp': datetime.utcnow()
-        })
-        try:
-            result = await asyncio.wait_for(future, timeout=0.01)
-            return result
-        except asyncio.TimeoutError:
-            return False, []
-    
-    # ========================================================================
-    # Core Methods
-    # ========================================================================
-    
-    def create_account(self, account_id: str) -> EcoATPAccount:
-        if account_id not in self.accounts:
-            self.accounts[account_id] = EcoATPAccount(account_id=account_id)
-        return self.accounts[account_id]
-    
-    def generate_tokens(
-        self, account_id: str, source: EcoATPSource,
-        carbon_saved_kg: float = 0.0, helium_saved_units: float = 0.0,
-        energy_saved_kwh: float = 0.0, efficiency: float = 1.0,
-        num_tokens: Optional[int] = None
-    ) -> List[EcoATPToken]:
-        if account_id not in self.accounts:
-            self.create_account(account_id)
-        
-        carbon_value = self.exchange_rate.carbon_to_ecoatp(carbon_saved_kg)
-        helium_value = self.exchange_rate.helium_to_ecoatp(helium_saved_units)
-        energy_value = energy_saved_kwh * 1000
-        total_value = carbon_value + helium_value + energy_value
-        
-        if num_tokens is None:
-            num_tokens = max(1, int(total_value / 10))
-        
-        token_value = total_value / num_tokens
-        tokens = []
-        
-        for i in range(num_tokens):
-            token = EcoATPToken(
-                token_id=f"eco_{account_id}_{datetime.utcnow().timestamp()}_{i}",
-                value=token_value, source=source,
-                generated_at=datetime.utcnow(),
-                expires_at=datetime.utcnow() + timedelta(hours=24),
-                carbon_equivalent_kg=carbon_saved_kg / num_tokens,
-                helium_equivalent_units=helium_saved_units / num_tokens,
-                generation_efficiency=efficiency
-            )
-            tokens.append(token)
-            self.active_tokens[token.token_id] = token
-            self.accounts[account_id].balance += token_value
-            self.accounts[account_id].total_generated += token_value
-        
-        self.last_generation_time = datetime.utcnow()
-        
-        # Replenish substrate reserves from surplus
-        if total_value > 100 and self.substrate_reserves < 500:
-            self.replenish_substrate_reserves(total_value * 0.05)
-        
-        return tokens
-    
-    def consume_tokens(
-        self, token_ids: List[str], consumer: EcoATPConsumer,
-        operation_success: bool = True
-    ) -> float:
+    def consume_tokens(self, token_ids: List[str], consumer: EcoATPConsumer, operation_success: bool = True) -> float:
         consumed = 0.0
         for token_id in token_ids:
             if token_id in self.active_tokens:
@@ -521,9 +334,6 @@ class EcoATPTokenManager:
                 effective_value = token.apply_decay(datetime.utcnow())
                 token.state = TokenState.CONSUMED
                 consumed += effective_value
-                for account_id, account in self.accounts.items():
-                    if account_id in token_id:
-                        account.total_consumed += effective_value
         return consumed
     
     def recover_tokens(self, token_ids: List[str], completion_percentage: float) -> float:
@@ -554,51 +364,280 @@ class EcoATPTokenManager:
         avg_balance = np.mean(balances)
         return self.accounts[account_id].balance > avg_balance * self.hoarding_threshold
     
+    def _check_rate_limit(self, tenant_id: str, amount: float, quota: Dict[str, Any]) -> bool:
+        now = datetime.utcnow()
+        minute_ago = now - timedelta(minutes=1)
+        recent_usage = sum(u['amount'] for u in self.tenant_usage[tenant_id] if u['timestamp'] > minute_ago)
+        return (recent_usage + amount) <= quota['max_tokens_per_minute']
+    
+    def _check_cooldown(self, tenant_id: str, quota: Dict[str, Any]) -> bool:
+        if tenant_id in self.tenant_last_reservation:
+            elapsed = (datetime.utcnow() - self.tenant_last_reservation[tenant_id]).total_seconds()
+            if elapsed < quota['reservation_cooldown_seconds']:
+                return False
+        return True
+    
+    def _track_failed_attempt(self, tenant_id: str):
+        self._failed_attempts[tenant_id] += 1
+        if self._failed_attempts[tenant_id] >= self.suspicious_threshold:
+            self.suspicious_tenants.add(tenant_id)
+    
+    async def _emergency_monitor_loop(self):
+        while True:
+            try:
+                summary = self.get_system_summary()
+                balance = summary.get('total_balance', 0)
+                if self.last_generation_time:
+                    time_since = (datetime.utcnow() - self.last_generation_time).total_seconds()
+                    if time_since > 30 and balance < self.emergency_threshold and not self.emergency_mode:
+                        self._activate_emergency_mode()
+                    elif self.emergency_mode and time_since < 10:
+                        self._deactivate_emergency_mode()
+                if self.emergency_mode:
+                    self._generate_emergency_tokens()
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Emergency monitor error: {str(e)}")
+                await asyncio.sleep(10)
+    
+    def _activate_emergency_mode(self):
+        self.emergency_mode = True
+        self.substrate_phosphorylation_active = True
+        logger.critical(f"EMERGENCY MODE: Reserve={self.emergency_reserve:.0f}, Substrate={self.substrate_reserves:.0f}")
+    
+    def _deactivate_emergency_mode(self):
+        self.emergency_mode = False
+        self.substrate_phosphorylation_active = False
+        logger.info("Emergency mode deactivated")
+    
+    def _generate_emergency_tokens(self):
+        if self.substrate_reserves <= 0:
+            return
+        substrate_used = min(self.emergency_token_rate, self.substrate_reserves)
+        self.substrate_reserves -= substrate_used
+        emergency_tokens = substrate_used * 0.5
+        critical_accounts = ['energy_expert', 'helium_expert', 'green_agent_core']
+        per_account = emergency_tokens / len(critical_accounts)
+        for account_id in critical_accounts:
+            if account_id in self.accounts:
+                self.accounts[account_id].balance += per_account
+        self.last_generation_time = datetime.utcnow()
+    
+    async def _batch_processor_loop(self):
+        while True:
+            try:
+                if self.batch_queue:
+                    batch = self.batch_queue[:self.batch_size]
+                    self.batch_queue = self.batch_queue[self.batch_size:]
+                    async with self._batch_lock:
+                        for request in batch:
+                            try:
+                                result = self._do_reserve_tokens(request['account_id'], request['amount'], request['consumer'])
+                                if request.get('future'):
+                                    request['future'].set_result(result)
+                            except Exception as e:
+                                if request.get('future'):
+                                    request['future'].set_exception(e)
+                await asyncio.sleep(0.001)
+            except Exception as e:
+                logger.error(f"Batch processor error: {str(e)}")
+                await asyncio.sleep(0.01)
+    
+    async def _maintenance_loop(self):
+        while True:
+            try:
+                now = datetime.utcnow()
+                for token_id, token in list(self.active_tokens.items()):
+                    if token.is_expired(now) and token.state == TokenState.AVAILABLE:
+                        token.state = TokenState.EXPIRED
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Maintenance error: {str(e)}")
+                await asyncio.sleep(60)
+    
     def get_account_summary(self, account_id: str) -> Dict[str, Any]:
         if account_id not in self.accounts:
             return {}
         account = self.accounts[account_id]
-        return {
-            'account_id': account_id, 'balance': account.balance,
-            'total_generated': account.total_generated,
-            'total_consumed': account.total_consumed,
-            'total_recovered': account.total_recovered,
-            'total_expired': account.total_expired,
-            'utilization_rate': account.utilization_rate,
-            'efficiency_rating': account.efficiency_rating
-        }
+        return {'account_id': account_id, 'balance': account.balance, 'total_generated': account.total_generated,
+                'total_consumed': account.total_consumed, 'efficiency_rating': account.efficiency_rating}
     
     def get_system_summary(self) -> Dict[str, Any]:
         total_balance = sum(acc.balance for acc in self.accounts.values())
         total_generated = sum(acc.total_generated for acc in self.accounts.values())
         total_consumed = sum(acc.total_consumed for acc in self.accounts.values())
         return {
-            'total_accounts': len(self.accounts),
-            'total_balance': total_balance,
-            'total_generated': total_generated,
-            'total_consumed': total_consumed,
+            'total_accounts': len(self.accounts), 'total_balance': total_balance,
+            'total_generated': total_generated, 'total_consumed': total_consumed,
             'system_efficiency': total_consumed / max(total_generated, 1),
             'active_tokens': len([t for t in self.active_tokens.values() if t.state == TokenState.AVAILABLE]),
-            'emergency_mode': self.emergency_mode,
-            'substrate_reserves': self.substrate_reserves,
+            'emergency_mode': self.emergency_mode, 'substrate_reserves': self.substrate_reserves,
             'suspicious_tenants': len(self.suspicious_tenants)
         }
     
-    async def _maintenance_loop(self):
-        """Background maintenance loop"""
+    def explain_system_state(self) -> Dict[str, Any]:
+        summary = self.get_system_summary()
+        if summary.get('emergency_mode'):
+            health = "CRITICAL: System operating in emergency mode."
+        elif summary.get('total_balance', 0) < 100:
+            health = "WARNING: Token reserves critically low."
+        elif summary.get('system_efficiency', 0) > 0.9:
+            health = "EXCELLENT: Peak efficiency with healthy reserves."
+        else:
+            health = "NORMAL: System operating within parameters."
+        
+        return {'health_assessment': health, 'metrics': summary, 'timestamp': datetime.utcnow().isoformat()}
+
+# ============================================================================
+# Token Supply Manager (NEW)
+# ============================================================================
+
+class TokenSupplyManager:
+    """Manages token supply to prevent inflation/deflation"""
+    
+    def __init__(self, token_manager: EcoATPTokenManager, target_utilization: float = 0.75):
+        self.token_manager = token_manager
+        self.target_utilization = target_utilization
+        self.base_generation_rate = 150.0
+        self.current_generation_rate = 150.0
+        self.burn_rate = 0.0
+        self.total_burned = 0.0
+        self.supply_history: deque = deque(maxlen=1000)
+        asyncio.create_task(self._supply_management_loop())
+        logger.info(f"Token Supply Manager initialized: target={target_utilization:.0%}")
+    
+    async def _supply_management_loop(self):
         while True:
             try:
-                # Expire old tokens
-                now = datetime.utcnow()
-                for token_id, token in list(self.active_tokens.items()):
-                    if token.is_expired(now) and token.state == TokenState.AVAILABLE:
-                        token.state = TokenState.EXPIRED
-                
-                # Redistribute wealth
-                if now - self.last_redistribution > self.redistribution_interval:
-                    self.last_redistribution = now
-                
+                self.adjust_supply()
                 await asyncio.sleep(300)
             except Exception as e:
-                logger.error(f"Maintenance error: {str(e)}")
-                await asyncio.sleep(60)
+                logger.error(f"Supply management error: {str(e)}")
+                await asyncio.sleep(600)
+    
+    def adjust_supply(self):
+        summary = self.token_manager.get_system_summary()
+        total_supply = summary.get('total_balance', 0)
+        total_generated = summary.get('total_generated', 0)
+        total_consumed = summary.get('total_consumed', 0)
+        
+        utilization = total_consumed / max(total_generated, 1)
+        inflation_pressure = (total_generated - total_consumed) / max(total_consumed, 1) if total_consumed > 0 else 0.0
+        
+        if utilization < self.target_utilization - 0.15:
+            reduction = min(0.5, (self.target_utilization - utilization) * 2)
+            self.current_generation_rate = self.base_generation_rate * (1 - reduction)
+            if inflation_pressure > 0.2:
+                excess = total_supply * inflation_pressure * 0.1
+                self._burn_tokens(excess)
+        elif utilization > self.target_utilization + 0.15:
+            increase = min(0.5, (utilization - self.target_utilization) * 2)
+            self.current_generation_rate = self.base_generation_rate * (1 + increase)
+        else:
+            self.current_generation_rate += (self.base_generation_rate - self.current_generation_rate) * 0.1
+        
+        self.supply_history.append({
+            'timestamp': datetime.utcnow().isoformat(), 'total_supply': total_supply,
+            'utilization': utilization, 'inflation_pressure': inflation_pressure,
+            'generation_rate': self.current_generation_rate, 'total_burned': self.total_burned
+        })
+    
+    def _burn_tokens(self, amount: float):
+        if amount <= 0:
+            return
+        summary = self.token_manager.get_system_summary()
+        total_balance = max(summary.get('total_balance', 1), 1)
+        burned = 0.0
+        for account_id, account in list(self.token_manager.accounts.items()):
+            if account.balance <= 0:
+                continue
+            proportion = account.balance / total_balance
+            burn_amount = min(account.balance, amount * proportion)
+            if burn_amount > 0:
+                account.balance -= burn_amount
+                account.total_consumed += burn_amount
+                burned += burn_amount
+        self.burn_rate = burned
+        self.total_burned += burned
+        if burned > 0:
+            logger.info(f"Burned {burned:.1f} tokens (total: {self.total_burned:.1f})")
+    
+    def get_economic_indicators(self) -> Dict[str, Any]:
+        summary = self.token_manager.get_system_summary()
+        return {
+            'total_supply': summary.get('total_balance', 0),
+            'utilization': summary.get('system_efficiency', 0),
+            'inflation_pressure': (summary.get('total_generated', 0) - summary.get('total_consumed', 1)) / max(summary.get('total_consumed', 1), 1),
+            'current_generation_rate': self.current_generation_rate,
+            'total_burned': self.total_burned,
+            'target_utilization': self.target_utilization,
+            'health': 'healthy' if 0.6 < summary.get('system_efficiency', 0) < 0.9 else 'unbalanced'
+        }
+
+# ============================================================================
+# Predictive Token Allocator (NEW)
+# ============================================================================
+
+class PredictiveTokenAllocator:
+    """Pre-allocates token batches based on demand prediction"""
+    
+    def __init__(self, token_manager: EcoATPTokenManager, prediction_horizon_seconds: float = 5.0):
+        self.token_manager = token_manager
+        self.prediction_horizon = prediction_horizon_seconds
+        self.local_cache: Dict[str, float] = {}
+        self.demand_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.pre_allocation_count = 0
+        asyncio.create_task(self._pre_allocation_loop())
+        logger.info(f"Predictive Token Allocator initialized: horizon={prediction_horizon_seconds}s")
+    
+    def record_demand(self, account_id: str, amount: float):
+        self.demand_history[account_id].append({'amount': amount, 'timestamp': datetime.utcnow()})
+    
+    def predict_demand(self, account_id: str) -> float:
+        history = list(self.demand_history.get(account_id, []))
+        if len(history) < 5:
+            return 10.0
+        recent = [h['amount'] for h in history[-20:]]
+        alpha = 0.3
+        prediction = recent[0]
+        for actual in recent[1:]:
+            prediction = alpha * actual + (1 - alpha) * prediction
+        return prediction * 1.2
+    
+    async def _pre_allocation_loop(self):
+        while True:
+            try:
+                for account_id in list(self.demand_history.keys()):
+                    predicted = self.predict_demand(account_id)
+                    if predicted > 0:
+                        success, _ = self.token_manager.reserve_tokens(
+                            account_id=account_id, amount=predicted, consumer=EcoATPConsumer.EXPERT_EXECUTION)
+                        if success:
+                            self.local_cache[account_id] = self.local_cache.get(account_id, 0) + predicted
+                            self.pre_allocation_count += 1
+                await asyncio.sleep(self.prediction_horizon)
+            except Exception as e:
+                logger.error(f"Pre-allocation error: {str(e)}")
+                await asyncio.sleep(10)
+    
+    def get_tokens(self, account_id: str, amount: float) -> Tuple[bool, float]:
+        if self.local_cache.get(account_id, 0) >= amount:
+            self.local_cache[account_id] -= amount
+            self.cache_hits += 1
+            return True, 0.0
+        self.cache_misses += 1
+        success, _ = self.token_manager.reserve_tokens(
+            account_id=account_id, amount=amount, consumer=EcoATPConsumer.EXPERT_EXECUTION)
+        return success, 1.0
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        total = self.cache_hits + self.cache_misses
+        return {
+            'cache_hits': self.cache_hits, 'cache_misses': self.cache_misses,
+            'hit_rate': self.cache_hits / max(total, 1),
+            'pre_allocations': self.pre_allocation_count,
+            'active_accounts': len(self.demand_history),
+            'total_cached_tokens': sum(self.local_cache.values())
+        }
