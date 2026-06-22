@@ -28,6 +28,147 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import yaml
 import json
 
+
+# Add to imports at top of carbon_nas_unified.py
+from src.enhancements.reasoning_engine import (
+    GreenAgentReasoningEngine,
+    CarbonIntensityAwareScheduler,
+    CarbonCausalModel,
+    EthicalCarbonReasoner,
+    ContextAwareOptimizer,
+    SystemicCarbonPlanner,
+    PurposeAwareOptimizer
+)
+
+# Modify UnifiedCarbonNAS class to include reasoning
+class UnifiedCarbonNAS:
+    """Enhanced Unified Carbon NAS with reasoning capabilities"""
+    
+    def __init__(
+        self,
+        expert_registry: Optional[Any] = None,
+        population_size: int = 30,
+        max_generations: int = 50,
+        carbon_budget_kg: float = 10.0,
+        auto_register: bool = True,
+        enable_compression: bool = True,
+        enable_hardware_profiling: bool = True,
+        enable_pareto: bool = True,
+        min_accuracy_threshold: float = 0.85,
+        # New reasoning parameters
+        enable_reasoning: bool = True,
+        context: str = 'cloud_inference',
+        purpose: str = 'balanced',
+        enable_ethical_reasoning: bool = True
+    ):
+        # Original initialization
+        # ... [existing code] ...
+        
+        # New: Reasoning engine
+        self.enable_reasoning = enable_reasoning
+        self.context = context
+        self.purpose = purpose
+        self.enable_ethical_reasoning = enable_ethical_reasoning
+        
+        if enable_reasoning:
+            self.reasoning_engine = GreenAgentReasoningEngine()
+            self.reasoning_history = []
+            logger.info("Reasoning engine enabled")
+        else:
+            self.reasoning_engine = None
+            logger.info("Reasoning engine disabled")
+
+    # Modified evaluation with reasoning
+    async def _evaluate_population(self, fitness_function: Callable):
+        """Evaluate all architectures with reasoning"""
+        for gene in self.population:
+            if gene.fitness.composite_score > 0:
+                continue
+            
+            try:
+                # Original evaluation
+                fitness_result = await fitness_function(gene.config)
+                
+                # ... [existing fitness calculation] ...
+                
+                # Apply reasoning if enabled
+                if self.enable_reasoning:
+                    reasoning = await self.reasoning_engine.reason_about_architecture(
+                        architecture_config=gene.config.to_dict(),
+                        fitness_metrics=fitness_result,
+                        context=self.context,
+                        purpose=self.purpose
+                    )
+                    
+                    # Store reasoning result
+                    gene.reasoning = reasoning
+                    self.reasoning_history.append(reasoning)
+                    
+                    # Apply reasoning insights
+                    if self.enable_ethical_reasoning:
+                        ethical_score = reasoning.get('ethical', {}).get('overall_ethical_score', 0.5)
+                        # Adjust fitness based on ethical score
+                        if ethical_score < 0.3:
+                            # Penalize unethical architectures
+                            gene.fitness.composite_score *= 0.8
+                            logger.debug(f"Ethical penalty applied: {ethical_score:.2f}")
+                    
+                    # Apply temporal recommendations
+                    temporal = reasoning.get('temporal', {})
+                    if temporal.get('action') == 'schedule':
+                        # Postpone evaluation to better time
+                        await asyncio.sleep(0.1)  # Simulated delay
+                        logger.debug(f"Temporal scheduling applied: {temporal.get('schedule')}")
+                    
+                    # Apply contextual recommendations
+                    contextual = reasoning.get('contextual', {})
+                    suggestions = contextual.get('suggestions', [])
+                    for suggestion in suggestions[:1]:
+                        if suggestion.get('action') == 'increase_pruning':
+                            gene.config.pruning_rate = suggestion.get('to', 0.3)
+                            logger.debug(f"Contextual adjustment: increased pruning to {gene.config.pruning_rate}")
+            
+            except Exception as e:
+                logger.error(f"Evaluation with reasoning error: {str(e)}")
+                # Fallback to original evaluation
+                gene.fitness = MultiObjectiveFitness()
+
+    # New method: Get reasoned recommendations
+    async def get_reasoned_recommendations(self) -> Dict[str, Any]:
+        """Get comprehensive reasoning-based recommendations"""
+        if not self.enable_reasoning:
+            return {'status': 'reasoning_disabled'}
+        
+        return await self.reasoning_engine.get_reasoning_summary()
+
+    # Modified evolution method
+    async def evolve(
+        self,
+        fitness_function: Callable,
+        generations: Optional[int] = None,
+        early_stopping_patience: int = 10
+    ) -> Dict[str, Any]:
+        """Enhanced evolution with reasoning capabilities"""
+        
+        # Systemic planning
+        if self.enable_reasoning:
+            plan = self.reasoning_engine.planner.plan_carbon_investment(
+                current_accuracy=0.75,  # Estimate from initial population
+                target_accuracy=0.90,
+                carbon_budget=self.carbon_budget_kg
+            )
+            
+            if plan['decision'] == 'save':
+                logger.info(f"Systemic decision: {plan['reason']}")
+                return {'status': 'postponed', 'reason': plan['reason']}
+            
+            logger.info(f"Systemic decision: {plan['decision']} - {plan['reason']}")
+        
+        # Rest of evolution with reasoning
+        # ... [existing evolution code with reasoning integration] ...
+        
+        return super().evolve(fitness_function, generations, early_stopping_patience)
+
 class UnifiedNASConfig(BaseModel):
     """Enhanced unified configuration with validation"""
     
