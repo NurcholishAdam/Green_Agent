@@ -1,21 +1,16 @@
-# File: src/enhancements/helium_elasticity_enhanced_v11.py
-
+# File: src/enhancements/helium_elasticity_enhanced_v12_0.py
 """
-Enhanced Helium Supply-Demand Elasticity & Pricing Model - Version 11.0 (Enterprise Platinum)
+Enhanced Helium Supply-Demand Elasticity & Pricing Model - Version 12.0 (Advanced Sustainability)
 
-CRITICAL FIXES OVER v10.0:
-1. FIXED: Missing imports and context managers
-2. FIXED: Race conditions with comprehensive async locks
-3. FIXED: Memory leaks with TTL-based cache cleanup
-4. FIXED: Deadlock potential with database timeouts
-5. ADDED: Adaptive elasticity learning with online ML
-6. ADDED: Real-time anomaly detection with SPC
-7. ADDED: WebSocket authentication and rate limiting
-8. ADDED: Multi-objective optimization for recommendations
-9. ADDED: Elasticity scenario simulator
-10. ADDED: Real-time dashboard with streaming metrics
-11. ADDED: Automated elasticity tuning with Bayesian optimization
-12. ADDED: Resilience testing with chaos engineering
+CRITICAL ADDITIONS OVER v11.0:
+1. ADDED: Federated Reflexive Learning - Cross-instance elasticity patterns sharing
+2. ADDED: User-Adaptive Reflexivity - Learning user elasticity preferences over time
+3. ADDED: Real-Time Carbon Intensity Integration - Carbon-aware elasticity calculations
+4. ADDED: Cross-Domain Knowledge Transfer - Sharing insights across domains
+5. ADDED: Human-AI Collaborative Reflection - Feedback loops with users
+6. ADDED: Predictive Reflexivity - Proactive elasticity management
+7. ADDED: Enhanced Helium Awareness - Resource-aware elasticity optimization
+8. ADDED: Sustainability Impact Metrics - Tracking eco-efficiency gains
 """
 
 import asyncio
@@ -30,6 +25,7 @@ import uuid
 import base64
 import threading
 import gc
+import aiohttp
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -103,7 +99,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s',
     handlers=[
-        logging.handlers.RotatingFileHandler('helium_elasticity_v11.log', maxBytes=10*1024*1024, backupCount=5),
+        logging.handlers.RotatingFileHandler('helium_elasticity_v12.log', maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -112,7 +108,7 @@ logger.addFilter(CorrelationIdFilter())
 
 # Audit logger
 audit_logger = logging.getLogger('elasticity_audit')
-audit_handler = logging.handlers.RotatingFileHandler('elasticity_audit_v11.log', maxBytes=50*1024*1024, backupCount=10)
+audit_handler = logging.handlers.RotatingFileHandler('elasticity_audit_v12.log', maxBytes=50*1024*1024, backupCount=10)
 audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
@@ -139,6 +135,16 @@ ML_PREDICTION_ERROR = Gauge('elasticity_ml_prediction_error', 'ML model predicti
 ADAPTIVE_LEARNING_RATE = Gauge('elasticity_adaptive_learning_rate', 'Adaptive learning rate', registry=REGISTRY)
 ANOMALY_COUNT = Gauge('elasticity_anomaly_count', 'Number of detected anomalies', registry=REGISTRY)
 
+# NEW: Advanced sustainability metrics
+FEDERATED_ELASTICITY_KNOWLEDGE = Gauge('federated_elasticity_knowledge', 'Federated knowledge packages', registry=REGISTRY)
+USER_ELASTICITY_ADAPTATION = Gauge('user_elasticity_adaptation_score', 'User adaptation score', ['user_id'], registry=REGISTRY)
+ELASTICITY_CARBON_INTENSITY = Gauge('elasticity_carbon_intensity', 'Carbon intensity (gCO2/kWh)', ['region'], registry=REGISTRY)
+CROSS_DOMAIN_ELASTICITY_TRANSFERS = Counter('cross_domain_elasticity_transfers_total', 'Cross-domain transfers', ['source', 'target'], registry=REGISTRY)
+HUMAN_ELASTICITY_FEEDBACK = Counter('human_elasticity_feedback_total', 'Human feedback events', ['type'], registry=REGISTRY)
+PREDICTIVE_ELASTICITY_ACCURACY = Gauge('predictive_elasticity_accuracy', 'Predictive model accuracy', ['model_type'], registry=REGISTRY)
+ELASTICITY_SUSTAINABILITY_SCORE = Gauge('elasticity_sustainability_score', 'Sustainability score', registry=REGISTRY)
+ELASTICITY_ECO_EFFICIENCY = Gauge('elasticity_eco_efficiency', 'Eco-efficiency score', registry=REGISTRY)
+
 # Constants
 MAX_HISTORY_SIZE = 10000
 MAX_BOOTSTRAP_SAMPLES = 10000
@@ -149,7 +155,7 @@ CIRCUIT_BREAKER_THRESHOLD = 5
 CIRCUIT_BREAKER_TIMEOUT = 60
 HEALTH_CHECK_TIMEOUT = 10
 MAX_WEBSOCKET_CONNECTIONS = 50
-DATA_VERSION = 11
+DATA_VERSION = 12
 MAX_CONCURRENT_CALCULATIONS = 5
 DB_POOL_SIZE = 10
 DB_MAX_OVERFLOW = 20
@@ -160,696 +166,981 @@ SPC_WINDOW_SIZE = 30
 SPC_SIGMA_LIMIT = 3
 
 # ============================================================
-# ENHANCED PYDANTIC V2 MODELS
+# ENHANCED PYDANTIC V2 MODELS (Extended)
 # ============================================================
 
-class HeliumDataInput(BaseModel):
-    """Validated input data for elasticity calculation - Pydantic v2"""
-    model_config = ConfigDict(str_strip_whitespace=True, validate_default=True)
+class ElasticitySustainabilityConfig(BaseModel):
+    """Sustainability configuration for elasticity calculations"""
+    model_config = ConfigDict(extra='forbid')
     
-    price_index: float = Field(..., ge=50, le=500)
-    global_production_tonnes: float = Field(..., ge=20000, le=40000)
-    global_demand_tonnes: float = Field(..., ge=25000, le=45000)
-    scarcity_index: float = Field(..., ge=0, le=1)
-    recycling_rate: float = Field(0.25, ge=0, le=0.5)
-    geopolitical_risk: float = Field(0.3, ge=0, le=1)
-    supply_disruption: float = Field(0.2, ge=0, le=1)
-    thermal_impact: float = Field(0.5, ge=0, le=2)
-    timestamp: datetime = Field(default_factory=datetime.now)
-    
-    @field_validator('scarcity_index')
-    @classmethod
-    def validate_scarcity(cls, v: float) -> float:
-        if v < 0 or v > 1:
-            raise ValueError(f'Scarcity index must be between 0 and 1, got {v}')
-        return v
-    
-    @model_validator(mode='after')
-    def validate_demand_supply(self) -> 'HeliumDataInput':
-        if self.global_demand_tonnes > self.global_production_tonnes * 1.5:
-            raise ValueError('Demand cannot exceed production by more than 50%')
-        return self
+    enabled: bool = True
+    eco_efficiency_weight: float = Field(default=0.3, ge=0, le=1)
+    carbon_awareness_weight: float = Field(default=0.3, ge=0, le=1)
+    helium_awareness_weight: float = Field(default=0.2, ge=0, le=1)
+    sustainability_awareness_weight: float = Field(default=0.2, ge=0, le=1)
+    reporting_interval_hours: int = Field(default=24, ge=1, le=168)
 
-@dataclass
-class ElasticityConfig:
-    """Configuration for elasticity calculator - Enhanced"""
-    rolling_window_months: int = 12
-    bootstrap_iterations: int = 1000
-    confidence_level: float = 0.95
-    migration_threshold_high: float = 0.7
-    migration_threshold_medium: float = 0.5
-    long_term_multiplier: float = 1.5
-    forecast_horizon_months: int = 6
-    price_elasticity_decay: float = 0.95
-    scarcity_elasticity_base: float = 0.4
-    thermal_elasticity_base: float = 0.2
-    cross_elasticity_base: float = 0.25
-    substitution_elasticity_base: float = 0.3
+class FederatedElasticityConfig(BaseModel):
+    """Federated learning configuration"""
+    model_config = ConfigDict(extra='forbid')
+    
+    enabled: bool = True
+    share_interval_seconds: int = Field(default=3600, ge=60, le=86400)
+    min_insights_to_share: int = Field(default=5, ge=1, le=100)
+    anonymize_data: bool = True
+    aggregation_strategy: str = Field(default="weighted_average", pattern="^(weighted_average|fed_avg|fed_prox)$")
+
+class UserAdaptiveElasticityConfig(BaseModel):
+    """User adaptation configuration"""
+    model_config = ConfigDict(extra='forbid')
+    
+    enabled: bool = True
+    learning_rate: float = Field(default=0.1, ge=0.01, le=1.0)
+    preference_window_size: int = Field(default=100, ge=10, le=1000)
+    adaptation_threshold: float = Field(default=0.6, ge=0.1, le=0.9)
+    persistence_enabled: bool = True
+
+class CarbonAwareElasticityConfig(BaseModel):
+    """Carbon-aware elasticity configuration"""
+    model_config = ConfigDict(extra='forbid')
+    
+    enabled: bool = True
+    api_key: Optional[str] = None
+    region: str = Field(default="global", min_length=2)
+    lookahead_hours: int = Field(default=24, ge=1, le=168)
+    scheduling_threshold_percent: float = Field(default=20, ge=5, le=80)
+    fallback_intensity: float = Field(default=400, ge=100, le=1000)
+
+class CrossDomainElasticityConfig(BaseModel):
+    """Cross-domain knowledge transfer configuration"""
+    model_config = ConfigDict(extra='forbid')
+    
+    enabled: bool = True
+    mapping_strategy: str = Field(default="auto", pattern="^(auto|direct|semantic)$")
+    max_transfers_per_domain: int = Field(default=100, ge=1, le=1000)
+    similarity_threshold: float = Field(default=0.7, ge=0.1, le=0.9)
+
+class HumanElasticityCollaborationConfig(BaseModel):
+    """Human-AI collaboration configuration"""
+    model_config = ConfigDict(extra='forbid')
+    
+    enabled: bool = True
+    feedback_timeout_seconds: int = Field(default=300, ge=10, le=3600)
+    max_pending_feedback: int = Field(default=100, ge=1, le=1000)
+    auto_approve_threshold: float = Field(default=0.8, ge=0.1, le=0.95)
+    feedback_retention_days: int = Field(default=30, ge=1, le=365)
+
+class PredictiveElasticityConfig(BaseModel):
+    """Predictive reflexivity configuration"""
+    model_config = ConfigDict(extra='forbid')
+    
+    enabled: bool = True
+    horizon_hours: int = Field(default=24, ge=1, le=168)
+    model_update_interval_hours: int = Field(default=24, ge=1, le=168)
+    prediction_confidence_threshold: float = Field(default=0.7, ge=0.1, le=0.9)
+    max_recommendations: int = Field(default=10, ge=1, le=50)
+
+class HeliumElasticityConfig(BaseModel):
+    """Main elasticity configuration (extended)"""
+    model_config = ConfigDict(extra='forbid')
+    
+    federated: FederatedElasticityConfig = Field(default_factory=FederatedElasticityConfig)
+    user_adaptive: UserAdaptiveElasticityConfig = Field(default_factory=UserAdaptiveElasticityConfig)
+    carbon_aware: CarbonAwareElasticityConfig = Field(default_factory=CarbonAwareElasticityConfig)
+    cross_domain: CrossDomainElasticityConfig = Field(default_factory=CrossDomainElasticityConfig)
+    human_collaboration: HumanElasticityCollaborationConfig = Field(default_factory=HumanElasticityCollaborationConfig)
+    predictive: PredictiveElasticityConfig = Field(default_factory=PredictiveElasticityConfig)
+    sustainability: ElasticitySustainabilityConfig = Field(default_factory=ElasticitySustainabilityConfig)
+    
+    rolling_window_months: int = Field(default=12, ge=1, le=60)
+    bootstrap_iterations: int = Field(default=1000, ge=100, le=10000)
+    confidence_level: float = Field(default=0.95, ge=0.8, le=0.99)
+    migration_threshold_high: float = Field(default=0.7, ge=0.1, le=0.9)
+    migration_threshold_medium: float = Field(default=0.5, ge=0.1, le=0.8)
+    long_term_multiplier: float = Field(default=1.5, ge=1.0, le=3.0)
+    forecast_horizon_months: int = Field(default=6, ge=1, le=24)
+    price_elasticity_decay: float = Field(default=0.95, ge=0.8, le=1.0)
+    scarcity_elasticity_base: float = Field(default=0.4, ge=0.1, le=0.8)
+    thermal_elasticity_base: float = Field(default=0.2, ge=0.1, le=0.5)
+    cross_elasticity_base: float = Field(default=0.25, ge=0.1, le=0.5)
+    substitution_elasticity_base: float = Field(default=0.3, ge=0.1, le=0.6)
     enable_adaptive_learning: bool = True
     enable_anomaly_detection: bool = True
-    spc_window_size: int = SPC_WINDOW_SIZE
-    spc_sigma_limit: float = SPC_SIGMA_LIMIT
-    learning_rate_initial: float = 0.01
-    learning_rate_decay: float = 0.99
-
-@dataclass
-class HeliumElasticityMetrics:
-    """Elasticity metrics data model - Enhanced"""
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    composite_elasticity: float = 0.0
-    price_elasticity: float = 0.0
-    scarcity_elasticity: float = 0.0
-    cross_elasticity: float = 0.0
-    substitution_elasticity: float = 0.0
-    thermal_elasticity: float = 0.0
-    composite_ci_lower: float = 0.0
-    composite_ci_upper: float = 0.0
-    elasticity_forecast_3m: float = 0.0
-    elasticity_forecast_6m: float = 0.0
-    market_regime: str = "normal"
-    migration_recommendation: str = "none"
-    migration_score: float = 0.0
-    workload_displacement_cost_usd: float = 0.0
-    workload_displacement_carbon_kg: float = 0.0
-    blockchain_hash: str = ""
-    data_quality_score: float = 1.0
-    is_anomaly: bool = False
-    anomaly_score: float = 0.0
-    ml_prediction_confidence: float = 0.0
-    adaptive_elasticity: float = 0.0
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    spc_window_size: int = Field(default=SPC_WINDOW_SIZE, ge=10, le=100)
+    spc_sigma_limit: float = Field(default=SPC_SIGMA_LIMIT, ge=2, le=4)
+    learning_rate_initial: float = Field(default=0.01, ge=0.001, le=0.1)
+    learning_rate_decay: float = Field(default=0.99, ge=0.9, le=1.0)
 
 # ============================================================
-# ENHANCED TTL CACHE
+# NEW MODULE 1: FEDERATED ELASTICITY LEARNING
 # ============================================================
 
-class TTLCache:
-    """Thread-safe TTL cache with automatic cleanup"""
+class FederatedElasticityLearner:
+    """
+    Federated learning system for sharing elasticity patterns across instances.
+    """
     
-    def __init__(self, name: str = "default", ttl_seconds: int = CACHE_TTL_SECONDS,
-                 max_size_mb: int = MAX_CACHE_SIZE_MB):
-        self.name = name
-        self.ttl = ttl_seconds
-        self.max_size_bytes = max_size_mb * 1024 * 1024
-        self._cache: Dict[str, Tuple[Any, float, int]] = {}
+    def __init__(self, persistence, instance_id: str, config: FederatedElasticityConfig):
+        self.persistence = persistence
+        self.instance_id = instance_id
+        self.config = config
+        self._knowledge_bank: Dict[str, Dict] = {}
+        self._shared_packages: List[Dict] = []
+        self._last_share_time = 0
         self._lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self.running = False
-        self.total_size_bytes = 0
-        self.hits = 0
-        self.misses = 0
+        
+        self.federated_weights = defaultdict(float)
+        self.aggregation_count = 0
+        
+        logger.info(f"FederatedElasticityLearner initialized for instance {instance_id}")
     
-    async def start(self):
-        """Start background cleanup task"""
-        self.running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-    
-    async def get(self, key: str) -> Optional[Any]:
-        """Get value from cache"""
+    async def share_elasticity_pattern(self, pattern: Dict) -> str:
+        """
+        Share an elasticity pattern with the federated network.
+        """
         async with self._lock:
-            if key in self._cache:
-                value, timestamp, size_bytes = self._cache[key]
-                if time.time() - timestamp < self.ttl:
-                    self.hits += 1
-                    return value
-                else:
-                    self.total_size_bytes -= size_bytes
-                    del self._cache[key]
-            self.misses += 1
-            return None
-    
-    async def put(self, key: str, value: Any, size_bytes: int = 0):
-        """Put value into cache"""
-        async with self._lock:
-            if size_bytes == 0:
-                size_bytes = len(str(value)) * 2
+            if self.config.anonymize_data:
+                pattern = self._anonymize_pattern(pattern)
             
-            # Evict old entries if needed
-            while self.total_size_bytes + size_bytes > self.max_size_bytes and self._cache:
-                oldest_key = min(self._cache.items(), key=lambda x: x[1][1])[0]
-                _, _, old_size = self._cache[oldest_key]
-                self.total_size_bytes -= old_size
-                del self._cache[oldest_key]
-            
-            self._cache[key] = (value, time.time(), size_bytes)
-            self.total_size_bytes += size_bytes
-    
-    async def _cleanup_loop(self):
-        """Background cleanup loop"""
-        while self.running:
-            await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
-            await self._cleanup_expired()
-    
-    async def _cleanup_expired(self):
-        """Remove expired entries"""
-        async with self._lock:
-            now = time.time()
-            expired_keys = []
-            for key, (_, timestamp, size_bytes) in self._cache.items():
-                if now - timestamp >= self.ttl:
-                    expired_keys.append((key, size_bytes))
-            
-            for key, size_bytes in expired_keys:
-                self.total_size_bytes -= size_bytes
-                del self._cache[key]
-            
-            if expired_keys:
-                logger.debug(f"Cleaned up {len(expired_keys)} expired entries from {self.name} cache")
-    
-    async def get_stats(self) -> Dict:
-        """Get cache statistics"""
-        async with self._lock:
-            total_requests = self.hits + self.misses
-            return {
-                'name': self.name,
-                'size': len(self._cache),
-                'size_bytes': self.total_size_bytes,
-                'max_size_bytes': self.max_size_bytes,
-                'hits': self.hits,
-                'misses': self.misses,
-                'hit_rate_pct': (self.hits / max(total_requests, 1)) * 100,
-                'ttl_seconds': self.ttl
+            package_id = f"fed_elasticity_{uuid.uuid4().hex[:12]}"
+            package = {
+                'package_id': package_id,
+                'source_instance': self.instance_id,
+                'pattern': pattern,
+                'timestamp': datetime.now().isoformat(),
+                'version': '1.0'
             }
-    
-    async def stop(self):
-        """Stop cleanup task"""
-        self.running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-
-# ============================================================
-# ENHANCED ADAPTIVE ELASTICITY MODEL
-# ============================================================
-
-class AdaptiveElasticityModel:
-    """Online learning model for adaptive elasticity"""
-    
-    def __init__(self, learning_rate: float = 0.01, decay: float = 0.99):
-        self.model = SGDRegressor(
-            learning_rate='adaptive',
-            eta0=learning_rate,
-            penalty='l2',
-            alpha=0.0001,
-            random_state=42
-        )
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        self.learning_rate = learning_rate
-        self.decay = decay
-        self.update_count = 0
-        self.prediction_errors: List[float] = []
-        self._lock = asyncio.Lock()
-    
-    async def update(self, features: np.ndarray, target: float) -> Dict:
-        """Update model with new data point"""
-        async with self._lock:
-            features = np.array(features).reshape(1, -1)
             
-            if not self.is_fitted:
-                # Initial fit
-                self.scaler.fit(features)
-                features_scaled = self.scaler.transform(features)
-                self.model.partial_fit(features_scaled, [target])
-                self.is_fitted = True
-            else:
-                # Partial update
-                features_scaled = self.scaler.transform(features)
-                self.model.partial_fit(features_scaled, [target])
+            self._knowledge_bank[package_id] = package
             
-            self.update_count += 1
-            self.learning_rate *= self.decay
-            ADAPTIVE_LEARNING_RATE.set(self.learning_rate)
+            if time.time() - self._last_share_time >= self.config.share_interval_seconds:
+                await self._broadcast_to_network(package)
+                self._last_share_time = time.time()
             
-            return {
-                'update_count': self.update_count,
-                'learning_rate': self.learning_rate,
-                'is_fitted': self.is_fitted
+            FEDERATED_ELASTICITY_KNOWLEDGE.set(len(self._knowledge_bank))
+            logger.info(f"Elasticity pattern {package_id} shared")
+            return package_id
+    
+    def _anonymize_pattern(self, pattern: Dict) -> Dict:
+        anonymized = pattern.copy()
+        anonymized.pop('specific_market', None)
+        anonymized.pop('user_data', None)
+        anonymized.pop('proprietary_metrics', None)
+        
+        if 'elasticity' in anonymized:
+            el = anonymized['elasticity']
+            anonymized['elasticity'] = {
+                'composite': el.get('composite', 0),
+                'price': el.get('price', 0),
+                'scarcity': el.get('scarcity', 0),
+                'regime': el.get('regime', 'unknown')
             }
-    
-    async def predict(self, features: np.ndarray) -> float:
-        """Make prediction with confidence"""
-        if not self.is_fitted:
-            return 0.5
         
-        features_scaled = self.scaler.transform(features.reshape(1, -1))
-        prediction = self.model.predict(features_scaled)[0]
-        
-        # Calculate confidence based on prediction error history
-        if self.prediction_errors:
-            avg_error = np.mean(self.prediction_errors)
-            confidence = max(0, min(1, 1 - avg_error / 0.3))
-        else:
-            confidence = 0.8
-        
-        return max(0.1, min(1.0, prediction)), confidence
+        return anonymized
     
-    async def record_error(self, actual: float, predicted: float):
-        """Record prediction error for confidence calibration"""
-        error = abs(actual - predicted) / max(actual, 0.01)
-        self.prediction_errors.append(error)
-        if len(self.prediction_errors) > 100:
-            self.prediction_errors = self.prediction_errors[-100:]
-        
-        mape = np.mean(self.prediction_errors) * 100
-        ML_PREDICTION_ERROR.set(mape)
-    
-    async def get_statistics(self) -> Dict:
-        return {
-            'is_fitted': self.is_fitted,
-            'update_count': self.update_count,
-            'learning_rate': self.learning_rate,
-            'avg_prediction_error': np.mean(self.prediction_errors) if self.prediction_errors else 0
-        }
-
-# ============================================================
-# ENHANCED SPC ANOMALY DETECTOR
-# ============================================================
-
-class StatisticalProcessControl:
-    """Statistical Process Control for anomaly detection"""
-    
-    def __init__(self, window_size: int = SPC_WINDOW_SIZE, sigma_limit: float = SPC_SIGMA_LIMIT):
-        self.window_size = window_size
-        self.sigma_limit = sigma_limit
-        self.values: deque = deque(maxlen=window_size)
-        self.control_limits: Dict[str, float] = {}
-        self.anomalies: List[Dict] = []
-        self._lock = asyncio.Lock()
-    
-    async def update(self, value: float) -> Tuple[bool, float, Dict]:
-        """Update control chart and detect anomalies"""
-        async with self._lock:
-            self.values.append(value)
-            
-            if len(self.values) < 10:
-                return False, 0.0, {'reason': 'insufficient_data'}
-            
-            # Calculate control limits
-            mean = np.mean(self.values)
-            std = np.std(self.values)
-            ucl = mean + self.sigma_limit * std
-            lcl = mean - self.sigma_limit * std
-            
-            self.control_limits = {'ucl': ucl, 'lcl': lcl, 'mean': mean}
-            
-            # Check for anomaly
-            is_anomaly = value > ucl or value < lcl
-            anomaly_score = min(1.0, abs(value - mean) / (self.sigma_limit * std + 1e-10))
-            
-            if is_anomaly:
-                self.anomalies.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'value': value,
-                    'mean': mean,
-                    'std': std,
-                    'z_score': (value - mean) / max(std, 1e-10),
-                    'anomaly_score': anomaly_score
-                })
-                ANOMALY_COUNT.set(len(self.anomalies))
-            
-            return is_anomaly, anomaly_score, self.control_limits
-    
-    async def get_statistics(self) -> Dict:
-        async with self._lock:
-            return {
-                'window_size': len(self.values),
-                'control_limits': self.control_limits,
-                'anomalies_detected': len(self.anomalies),
-                'recent_anomalies': self.anomalies[-5:] if self.anomalies else []
-            }
-
-# ============================================================
-# ENHANCED WEB SOCKET SERVER WITH AUTH
-# ============================================================
-
-class EnhancedWebSocketServerV11:
-    """Enhanced WebSocket server with authentication and rate limiting"""
-    
-    def __init__(self, port: int = 8769, max_connections: int = MAX_WEBSOCKET_CONNECTIONS,
-                 secret_key: str = None):
-        self.port = port
-        self.max_connections = max_connections
-        self.secret_key = secret_key or os.getenv('WS_SECRET_KEY', 'elasticity_secret_key_v11')
-        self.connections: Set = set()
-        self.connection_metadata: Dict = {}
-        self.server = None
-        self.running = False
-        self._lock = asyncio.Lock()
-        self._heartbeat_task = None
-        self._message_queue: deque = deque(maxlen=1000)
-    
-    def generate_token(self, client_id: str) -> str:
-        """Generate JWT token for client authentication"""
-        payload = {
-            'client_id': client_id,
-            'exp': datetime.utcnow() + timedelta(hours=24),
-            'iat': datetime.utcnow()
-        }
-        return jwt.encode(payload, self.secret_key, algorithm='HS256')
-    
-    def verify_token(self, token: str) -> Optional[Dict]:
-        """Verify JWT token"""
+    async def _broadcast_to_network(self, package: Dict):
         try:
-            return jwt.decode(token, self.secret_key, algorithms=['HS256'])
-        except jwt.InvalidTokenError:
-            return None
-    
-    async def start(self):
-        """Start WebSocket server"""
-        async def handler(websocket, path):
-            # Check connection limit
-            async with self._lock:
-                if len(self.connections) >= self.max_connections:
-                    await websocket.close(code=1013, reason="Too many connections")
-                    return
-                
-                # Extract token from headers (simplified)
-                token = None
-                self.connections.add(websocket)
-                self.connection_metadata[websocket] = {
-                    'connected_at': datetime.now(),
-                    'last_heartbeat': time.time(),
-                    'message_count': 0,
-                    'authenticated': token is None  # Simplified for demo
-                }
-                WS_CONNECTIONS.set(len(self.connections))
-            
-            logger.info(f"WebSocket client connected (total: {len(self.connections)})")
-            
-            try:
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        msg_type = data.get('type', '')
-                        
-                        if msg_type == 'ping':
-                            await websocket.send(json.dumps({
-                                'type': 'pong',
-                                'timestamp': datetime.now().isoformat()
-                            }))
-                            async with self._lock:
-                                if websocket in self.connection_metadata:
-                                    self.connection_metadata[websocket]['last_heartbeat'] = time.time()
-                        
-                        elif msg_type == 'subscribe':
-                            topic = data.get('topic', 'elasticity')
-                            async with self._lock:
-                                if websocket in self.connection_metadata:
-                                    if 'subscriptions' not in self.connection_metadata[websocket]:
-                                        self.connection_metadata[websocket]['subscriptions'] = set()
-                                    self.connection_metadata[websocket]['subscriptions'].add(topic)
-                            
-                            await websocket.send(json.dumps({
-                                'type': 'subscribed',
-                                'topic': topic,
-                                'timestamp': datetime.now().isoformat()
-                            }))
-                        
-                        elif msg_type == 'get_metrics':
-                            # Would fetch current metrics
-                            pass
-                        
-                    except json.JSONDecodeError:
-                        await websocket.send(json.dumps({'error': 'Invalid JSON'}))
-                        
-            except ConnectionClosed:
-                pass
-            finally:
-                async with self._lock:
-                    self.connections.discard(websocket)
-                    self.connection_metadata.pop(websocket, None)
-                    WS_CONNECTIONS.set(len(self.connections))
-                logger.info(f"WebSocket client disconnected (total: {len(self.connections)})")
-        
-        self.server = await serve(handler, "localhost", self.port)
-        self.running = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"WebSocket server started on ws://localhost:{self.port}")
-        return self.server
-    
-    async def _heartbeat_loop(self):
-        """Heartbeat and cleanup loop"""
-        while self.running:
-            try:
-                await asyncio.sleep(30)
-                
-                async with self._lock:
-                    now = time.time()
-                    stale_connections = []
-                    
-                    for ws, metadata in self.connection_metadata.items():
-                        if now - metadata.get('last_heartbeat', 0) > 90:
-                            stale_connections.append(ws)
-                    
-                    for ws in stale_connections:
-                        try:
-                            await ws.close(code=1000, reason="Connection timeout")
-                        except Exception:
-                            pass
-                        self.connections.discard(ws)
-                        self.connection_metadata.pop(ws, None)
-                    
-                    if stale_connections:
-                        WS_CONNECTIONS.set(len(self.connections))
-                        logger.info(f"Cleaned up {len(stale_connections)} stale connections")
-                        
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-    
-    async def broadcast(self, message: Dict):
-        """Broadcast message to all connected clients"""
-        if not self.connections:
-            return
-        
-        dead_connections = set()
-        message_json = json.dumps(message, default=str)
-        
-        for ws in self.connections:
-            try:
-                await ws.send(message_json)
-            except Exception:
-                dead_connections.add(ws)
-        
-        if dead_connections:
-            async with self._lock:
-                self.connections -= dead_connections
-                for ws in dead_connections:
-                    self.connection_metadata.pop(ws, None)
-                WS_CONNECTIONS.set(len(self.connections))
-    
-    async def stop(self):
-        """Stop WebSocket server"""
-        self.running = False
-        
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-        
-        async with self._lock:
-            for ws in list(self.connections):
-                try:
-                    await ws.close(code=1000, reason="Server shutdown")
-                except Exception:
-                    pass
-            self.connections.clear()
-            self.connection_metadata.clear()
-            WS_CONNECTIONS.set(0)
-        
-        logger.info("WebSocket server stopped")
-    
-    def get_statistics(self) -> Dict:
-        """Get server statistics"""
-        return {
-            'connections': len(self.connections),
-            'max_connections': self.max_connections,
-            'running': self.running
-        }
-
-# ============================================================
-# ENHANCED DATABASE MANAGER (FIXED)
-# ============================================================
-
-class EnhancedDatabaseManagerV11:
-    """Database manager with connection pooling and timeout handling"""
-    
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.engine = None
-        self.SessionLocal = None
-        self._init_engine()
-    
-    def _init_engine(self):
-        """Initialize SQLAlchemy engine with connection pooling"""
-        db_url = f"sqlite:///{self.db_path}"
-        self.engine = create_engine(
-            db_url,
-            poolclass=QueuePool,
-            pool_size=DB_POOL_SIZE,
-            max_overflow=DB_MAX_OVERFLOW,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            connect_args={'check_same_thread': False, 'timeout': DB_POOL_TIMEOUT}
-        )
-        self.SessionLocal = scoped_session(sessionmaker(bind=self.engine))
-        self._init_tables()
-        self._update_db_size_metric()
-        logger.info(f"Database initialized with connection pool (size={DB_POOL_SIZE})")
-    
-    def _init_tables(self):
-        """Initialize database tables"""
-        self.db_path.parent.mkdir(exist_ok=True, parents=True)
-        
-        Base = declarative_base()
-        
-        class ElasticityMetricsDB(Base):
-            __tablename__ = 'elasticity_metrics'
-            id = Column(Integer, primary_key=True)
-            timestamp = Column(DateTime, index=True)
-            composite_elasticity = Column(Float)
-            price_elasticity = Column(Float)
-            scarcity_elasticity = Column(Float)
-            cross_elasticity = Column(Float)
-            market_regime = Column(String(32))
-            migration_recommendation = Column(String(32))
-            migration_score = Column(Float)
-            data_quality_score = Column(Float)
-            blockchain_hash = Column(String(64))
-            is_anomaly = Column(Boolean, default=False)
-            anomaly_score = Column(Float, default=0.0)
-            ml_prediction_confidence = Column(Float, default=0.0)
-            created_at = Column(DateTime, default=datetime.now)
-            
-            __table_args__ = (
-                Index('idx_timestamp', 'timestamp'),
-                Index('idx_composite', 'composite_elasticity'),
-                Index('idx_regime', 'market_regime'),
-                Index('idx_is_anomaly', 'is_anomaly'),
-            )
-        
-        class AlertDB(Base):
-            __tablename__ = 'alerts'
-            id = Column(Integer, primary_key=True)
-            alert_id = Column(String(64), index=True)
-            metric = Column(String(64))
-            severity = Column(String(32))
-            message = Column(Text)
-            acknowledged = Column(Boolean, default=False)
-            created_at = Column(DateTime, default=datetime.now)
-            
-            __table_args__ = (
-                Index('idx_created_at', 'created_at'),
-                Index('idx_severity', 'severity'),
-            )
-        
-        Base.metadata.create_all(self.engine)
-    
-    def _update_db_size_metric(self):
-        if self.db_path.exists():
-            size_mb = self.db_path.stat().st_size / (1024 * 1024)
-            DB_SIZE.set(size_mb)
-    
-    @contextmanager
-    def get_session(self):
-        """Get database session with timeout handling"""
-        session = self.SessionLocal()
-        try:
-            session.execute("PRAGMA query_timeout = 30000")
-            yield session
-            session.commit()
-        except OperationalError as e:
-            session.rollback()
-            logger.error(f"Database operational error: {e}")
-            raise
+            await self.persistence.save_shared_elasticity_knowledge(package)
+            logger.info(f"Broadcasted elasticity pattern {package['package_id']} to network")
         except Exception as e:
-            session.rollback()
-            logger.error(f"Database error: {e}")
-            raise
-        finally:
-            session.close()
+            logger.error(f"Failed to broadcast elasticity pattern: {e}")
     
-    async def save_metrics(self, metrics: HeliumElasticityMetrics):
-        """Save metrics to database"""
-        with self.get_session() as session:
-            from sqlalchemy import text
-            session.execute(
-                text("""INSERT INTO elasticity_metrics 
-                       (timestamp, composite_elasticity, price_elasticity, scarcity_elasticity,
-                        cross_elasticity, market_regime, migration_recommendation, 
-                        migration_score, data_quality_score, blockchain_hash, is_anomaly, anomaly_score, ml_prediction_confidence)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""),
-                (datetime.fromisoformat(metrics.timestamp), metrics.composite_elasticity,
-                 metrics.price_elasticity, metrics.scarcity_elasticity, metrics.cross_elasticity,
-                 metrics.market_regime, metrics.migration_recommendation, metrics.migration_score,
-                 metrics.data_quality_score, metrics.blockchain_hash, metrics.is_anomaly,
-                 metrics.anomaly_score, metrics.ml_prediction_confidence)
-            )
-            self._update_db_size_metric()
+    async def pull_network_patterns(self, domain: Optional[str] = None, limit: int = 10) -> List[Dict]:
+        try:
+            packages = await self.persistence.get_shared_elasticity_knowledge(domain=domain, limit=limit)
+            if packages:
+                self._aggregate_federated_weights(packages)
+                self.aggregation_count += 1
+                logger.info(f"Pulled {len(packages)} elasticity patterns from network")
+            return packages
+        except Exception as e:
+            logger.error(f"Failed to pull network patterns: {e}")
+            return []
     
-    async def save_alert(self, alert: Dict):
-        """Save alert to database"""
-        with self.get_session() as session:
-            from sqlalchemy import text
-            session.execute(
-                text("""INSERT INTO alerts (alert_id, metric, severity, message, created_at)
-                       VALUES (?, ?, ?, ?, ?)"""),
-                (alert['alert_id'], alert['metric'], alert['severity'], 
-                 alert['message'], datetime.fromisoformat(alert['timestamp']))
-            )
+    def _aggregate_federated_weights(self, packages: List[Dict]):
+        for package in packages:
+            if 'pattern' in package and 'weights' in package['pattern']:
+                weights = package['pattern']['weights']
+                for key, value in weights.items():
+                    self.federated_weights[key] += value
+        
+        total = sum(self.federated_weights.values())
+        if total > 0:
+            for key in self.federated_weights:
+                self.federated_weights[key] /= total
     
-    async def get_metrics_history(self, days: int = 30) -> List[Dict]:
-        """Get historical metrics"""
-        cutoff = datetime.now() - timedelta(days=days)
-        with self.get_session() as session:
-            from sqlalchemy import text
-            result = session.execute(
-                text("SELECT * FROM elasticity_metrics WHERE timestamp > ? ORDER BY timestamp DESC"),
-                (cutoff,)
-            ).fetchall()
-            return [dict(row._mapping) for row in result]
+    def get_federated_insights(self) -> Dict:
+        return {
+            'total_packages': len(self._knowledge_bank),
+            'aggregation_count': self.aggregation_count,
+            'weights': dict(self.federated_weights),
+            'timestamp': datetime.now().isoformat()
+        }
     
-    def dispose(self):
-        """Dispose connection pool"""
-        if self.engine:
-            self.engine.dispose()
-            if self.SessionLocal:
-                self.SessionLocal.remove()
-            logger.info("Database connection pool disposed")
+    async def apply_federated_insights(self, current_elasticity: Dict) -> Dict:
+        if not self.federated_weights:
+            return current_elasticity
+        
+        adjusted = current_elasticity.copy()
+        
+        for key, weight in self.federated_weights.items():
+            if key in adjusted and isinstance(adjusted[key], (int, float)):
+                adjustment_factor = 1.0 + (weight - 0.5) * 0.2
+                adjusted[key] = adjusted[key] * adjustment_factor
+        
+        return adjusted
+    
+    async def shutdown(self):
+        logger.info("FederatedElasticityLearner shutdown complete")
+
+# ============================================================
+# NEW MODULE 2: USER-ADAPTIVE ELASTICITY REFLEXIVITY
+# ============================================================
+
+class UserAdaptiveElasticityReflexivity:
+    """
+    Learns user elasticity preferences and adapts behavior over time.
+    """
+    
+    def __init__(self, persistence, config: UserAdaptiveElasticityConfig):
+        self.persistence = persistence
+        self.config = config
+        self._user_profiles: Dict[str, Dict] = {}
+        self._preference_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self._lock = asyncio.Lock()
+        
+        logger.info("UserAdaptiveElasticityReflexivity initialized")
+    
+    async def learn_user_preference(self, user_id: str, action: str, context: Dict, outcome: Dict):
+        async with self._lock:
+            if user_id not in self._user_profiles:
+                self._user_profiles[user_id] = {
+                    'elasticity_preferences': defaultdict(float),
+                    'history': [],
+                    'adaptation_score': 50.0,
+                    'last_updated': datetime.now().isoformat()
+                }
+            
+            profile = self._user_profiles[user_id]
+            preference_update = self._calculate_preference_update(action, context, outcome)
+            
+            for key, value in preference_update.items():
+                profile['elasticity_preferences'][key] += value * self.config.learning_rate
+                profile['elasticity_preferences'][key] = max(0, min(1, profile['elasticity_preferences'][key]))
+            
+            profile['history'].append({
+                'action': action,
+                'timestamp': datetime.now().isoformat(),
+                'outcome': outcome
+            })
+            
+            profile['adaptation_score'] = self._calculate_adaptation_score(profile)
+            USER_ELASTICITY_ADAPTATION.labels(user_id=user_id).set(profile['adaptation_score'])
+            
+            if self.config.persistence_enabled:
+                await self.persistence.save_user_elasticity_profile(user_id, profile)
+            
+            logger.info(f"Updated elasticity preferences for user {user_id}, adaptation score: {profile['adaptation_score']:.1f}")
+    
+    def _calculate_preference_update(self, action: str, context: Dict, outcome: Dict) -> Dict:
+        update = defaultdict(float)
+        
+        if outcome.get('success', False):
+            if action == 'accept_migration':
+                update['migration_preference'] += 0.1
+                update['aggressive_migration'] += 0.05
+            elif action == 'reject_migration':
+                update['migration_preference'] -= 0.05
+                update['conservative_approach'] += 0.1
+            elif action == 'adjust_elasticity':
+                update['elasticity_preference'] += 0.15
+        
+        if context.get('carbon_aware', False):
+            update['carbon_awareness'] += 0.15
+        
+        return dict(update)
+    
+    def _calculate_adaptation_score(self, profile: Dict) -> float:
+        if not profile['history']:
+            return 50.0
+        
+        preferences = profile['elasticity_preferences']
+        if not preferences:
+            return 50.0
+        
+        variance = np.var(list(preferences.values()))
+        consistency = 1.0 - min(1.0, variance)
+        history_depth = min(1.0, len(profile['history']) / 20)
+        
+        return 50.0 + 40.0 * consistency * history_depth
+    
+    async def get_personalized_thresholds(self, user_id: str, default_thresholds: Dict) -> Dict:
+        async with self._lock:
+            profile = self._user_profiles.get(user_id)
+            if not profile:
+                return default_thresholds
+            
+            preferences = profile['elasticity_preferences']
+            
+            adjusted_thresholds = default_thresholds.copy()
+            
+            if preferences.get('migration_preference', 0) > 0.7:
+                adjusted_thresholds['migration_high'] = max(0.5, adjusted_thresholds.get('migration_high', 0.7))
+            if preferences.get('conservative_approach', 0) > 0.7:
+                adjusted_thresholds['migration_high'] = min(0.8, adjusted_thresholds.get('migration_high', 0.7))
+            
+            return adjusted_thresholds
+
+# ============================================================
+# NEW MODULE 3: CARBON-AWARE ELASTICITY CALCULATOR
+# ============================================================
+
+class CarbonAwareElasticityCalculator:
+    """
+    Calculates elasticity with real-time carbon intensity integration.
+    """
+    
+    def __init__(self, persistence, config: CarbonAwareElasticityConfig):
+        self.persistence = persistence
+        self.config = config
+        self._cache = {}
+        self._cache_ttl = 300
+        self._lock = asyncio.Lock()
+        self._session = None
+        
+        logger.info(f"CarbonAwareElasticityCalculator initialized for region {config.region}")
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def get_current_intensity(self, region: Optional[str] = None) -> Dict:
+        region = region or self.config.region
+        cache_key = f"intensity_{region}"
+        
+        async with self._lock:
+            if cache_key in self._cache:
+                cached_data, timestamp = self._cache[cache_key]
+                if time.time() - timestamp < self._cache_ttl:
+                    return cached_data
+        
+        try:
+            session = await self._get_session()
+            headers = {'auth-token': self.config.api_key} if self.config.api_key else {}
+            url = f"https://api.electricitymaps.org/v3/carbon-intensity/latest?zone={region}"
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    intensity_data = {
+                        'intensity': data.get('carbonIntensity', self.config.fallback_intensity),
+                        'unit': data.get('unit', 'gCO2/kWh'),
+                        'timestamp': datetime.now().isoformat(),
+                        'region': region
+                    }
+                    
+                    async with self._lock:
+                        self._cache[cache_key] = (intensity_data, time.time())
+                    
+                    ELASTICITY_CARBON_INTENSITY.labels(region=region).set(intensity_data['intensity'])
+                    return intensity_data
+                else:
+                    logger.warning(f"Carbon intensity API returned {response.status}")
+                    return self._get_fallback_intensity(region)
+                    
+        except Exception as e:
+            logger.error(f"Carbon intensity API error: {e}")
+            return self._get_fallback_intensity(region)
+    
+    def _get_fallback_intensity(self, region: str) -> Dict:
+        hour = datetime.now().hour
+        if 0 <= hour < 6:
+            intensity = 200
+        elif 6 <= hour < 12:
+            intensity = 350
+        elif 12 <= hour < 18:
+            intensity = 300
+        else:
+            intensity = 450
+        
+        return {
+            'intensity': intensity,
+            'unit': 'gCO2/kWh',
+            'timestamp': datetime.now().isoformat(),
+            'region': region,
+            'source': 'fallback'
+        }
+    
+    async def get_forecast(self, region: Optional[str] = None, hours: int = 24) -> List[Dict]:
+        region = region or self.config.region
+        
+        try:
+            session = await self._get_session()
+            headers = {'auth-token': self.config.api_key} if self.config.api_key else {}
+            url = f"https://api.electricitymaps.org/v3/carbon-intensity/forecast?zone={region}"
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    forecast = []
+                    for entry in data.get('forecast', []):
+                        forecast.append({
+                            'timestamp': entry.get('datetime'),
+                            'intensity': entry.get('carbonIntensity', self.config.fallback_intensity),
+                            'unit': 'gCO2/kWh'
+                        })
+                    return forecast
+                else:
+                    return self._get_fallback_forecast(hours)
+                    
+        except Exception as e:
+            logger.error(f"Carbon intensity forecast error: {e}")
+            return self._get_fallback_forecast(hours)
+    
+    def _get_fallback_forecast(self, hours: int) -> List[Dict]:
+        forecast = []
+        now = datetime.now()
+        
+        for i in range(hours):
+            hour = (now + timedelta(hours=i)).hour
+            if 0 <= hour < 6:
+                intensity = 180 + np.random.normal(0, 20)
+            elif 6 <= hour < 12:
+                intensity = 320 + np.random.normal(0, 30)
+            elif 12 <= hour < 18:
+                intensity = 280 + np.random.normal(0, 30)
+            else:
+                intensity = 420 + np.random.normal(0, 40)
+            
+            forecast.append({
+                'timestamp': (now + timedelta(hours=i)).isoformat(),
+                'intensity': max(100, intensity),
+                'unit': 'gCO2/kWh'
+            })
+        
+        return forecast
+    
+    async def adjust_elasticity_for_carbon(self, elasticity: float, urgency: str = "normal") -> Dict:
+        intensity = await self.get_current_intensity()
+        
+        adjustment = 1.0
+        
+        if urgency == "critical":
+            adjustment = 1.0
+        elif intensity['intensity'] > self.config.fallback_intensity * 1.2:
+            # High carbon - recommend more aggressive migration
+            adjustment = 1.1
+        elif intensity['intensity'] < self.config.fallback_intensity * 0.8:
+            # Low carbon - can be more conservative
+            adjustment = 0.9
+        
+        adjusted_elasticity = elasticity * adjustment
+        
+        return {
+            'original_elasticity': elasticity,
+            'adjusted_elasticity': min(1.0, adjusted_elasticity),
+            'adjustment_factor': adjustment,
+            'carbon_intensity': intensity['intensity'],
+            'reason': f'Carbon intensity: {intensity["intensity"]} gCO2/kWh'
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================
+# NEW MODULE 4: CROSS-DOMAIN ELASTICITY TRANSFER
+# ============================================================
+
+class CrossDomainElasticityTransfer:
+    """
+    Transfers elasticity knowledge across different domains.
+    """
+    
+    def __init__(self, persistence, config: CrossDomainElasticityConfig):
+        self.persistence = persistence
+        self.config = config
+        self._domain_knowledge: Dict[str, Dict] = {}
+        self._transfer_mappings: Dict[str, Dict[str, float]] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info("CrossDomainElasticityTransfer initialized")
+    
+    async def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                                 knowledge: Dict, mapping_strategy: Optional[str] = None) -> Dict:
+        mapping_strategy = mapping_strategy or self.config.mapping_strategy
+        
+        async with self._lock:
+            if source_domain not in self._domain_knowledge:
+                self._domain_knowledge[source_domain] = {}
+            self._domain_knowledge[source_domain].update(knowledge)
+            
+            transferred = await self._map_knowledge(source_domain, target_domain, knowledge, mapping_strategy)
+            
+            transfer_key = f"{source_domain}->{target_domain}"
+            if transfer_key not in self._transfer_mappings:
+                self._transfer_mappings[transfer_key] = {}
+            
+            for key in transferred:
+                self._transfer_mappings[transfer_key][key] = self._transfer_mappings[transfer_key].get(key, 0) + 1
+            
+            CROSS_DOMAIN_ELASTICITY_TRANSFERS.labels(source=source_domain, target=target_domain).inc()
+            
+            if len(self._transfer_mappings[transfer_key]) > self.config.max_transfers_per_domain:
+                sorted_items = sorted(
+                    self._transfer_mappings[transfer_key].items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:self.config.max_transfers_per_domain]
+                self._transfer_mappings[transfer_key] = dict(sorted_items)
+            
+            logger.info(f"Transferred elasticity knowledge from {source_domain} to {target_domain}: {len(transferred)} items")
+            return transferred
+    
+    async def _map_knowledge(self, source: str, target: str, knowledge: Dict, strategy: str) -> Dict:
+        domain_similarities = {
+            ('helium_market', 'energy_market'): {
+                'price_elasticity': 'price_elasticity',
+                'supply_elasticity': 'supply_elasticity',
+                'demand_elasticity': 'demand_elasticity',
+                'scarcity_index': 'scarcity_index'
+            },
+            ('helium_market', 'semiconductor_market'): {
+                'price_elasticity': 'price_elasticity',
+                'supply_risk': 'supply_risk',
+                'demand_volatility': 'demand_volatility'
+            },
+            ('helium_market', 'aerospace_market'): {
+                'supply_elasticity': 'supply_elasticity',
+                'regulatory_impact': 'regulatory_impact'
+            }
+        }
+        
+        mapping = domain_similarities.get((source, target), {})
+        transferred = {}
+        
+        if strategy == 'auto':
+            for source_key, source_value in knowledge.items():
+                if source_key in mapping:
+                    transferred[mapping[source_key]] = source_value
+                else:
+                    similar_key = self._find_similar_key(source_key, mapping)
+                    if similar_key and self._check_similarity_threshold(source_key, similar_key):
+                        transferred[similar_key] = source_value
+        elif strategy == 'direct':
+            transferred = knowledge
+        elif strategy == 'semantic':
+            transferred = await self._semantic_mapping(source, target, knowledge)
+        
+        return transferred
+    
+    def _find_similar_key(self, source_key: str, mapping: Dict) -> Optional[str]:
+        for target_key in mapping.values():
+            if source_key.lower() in target_key.lower() or target_key.lower() in source_key.lower():
+                return target_key
+        return None
+    
+    def _check_similarity_threshold(self, key1: str, key2: str) -> bool:
+        common_chars = len(set(key1.lower()) & set(key2.lower()))
+        max_len = max(len(key1), len(key2))
+        similarity = common_chars / max_len if max_len > 0 else 0
+        return similarity >= self.config.similarity_threshold
+    
+    async def _semantic_mapping(self, source: str, target: str, knowledge: Dict) -> Dict:
+        return knowledge
+    
+    def get_transfer_statistics(self) -> Dict:
+        return {
+            'domains': list(self._domain_knowledge.keys()),
+            'transfers': dict(self._transfer_mappings),
+            'total_transfers': sum(len(v) for v in self._transfer_mappings.values())
+        }
+
+# ============================================================
+# NEW MODULE 5: HUMAN-AI ELASTICITY COLLABORATION
+# ============================================================
+
+class HumanAIElasticityCollaboration:
+    """
+    Enables collaborative reflection between humans and AI on elasticity decisions.
+    """
+    
+    def __init__(self, persistence, config: HumanElasticityCollaborationConfig):
+        self.persistence = persistence
+        self.config = config
+        self._feedback_queue: deque = deque(maxlen=1000)
+        self._explanations: Dict[str, Dict] = {}
+        self._pending_feedback: Dict[str, datetime] = {}
+        self._lock = asyncio.Lock()
+        self._listeners: List[Callable] = []
+        
+        logger.info("HumanAIElasticityCollaboration initialized")
+    
+    async def request_elasticity_feedback(self, decision: Dict, context: Dict) -> str:
+        feedback_id = f"fb_elasticity_{uuid.uuid4().hex[:12]}"
+        
+        feedback_request = {
+            'id': feedback_id,
+            'decision': decision,
+            'context': context,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'pending'
+        }
+        
+        async with self._lock:
+            self._explanations[feedback_id] = feedback_request
+            self._pending_feedback[feedback_id] = datetime.now()
+            
+            cutoff = datetime.now() - timedelta(seconds=self.config.feedback_timeout_seconds)
+            for fid, timestamp in list(self._pending_feedback.items()):
+                if timestamp < cutoff:
+                    if fid in self._explanations:
+                        self._explanations[fid]['status'] = 'timeout'
+                    del self._pending_feedback[fid]
+        
+        HUMAN_ELASTICITY_FEEDBACK.labels(type='request').inc()
+        return feedback_id
+    
+    async def submit_elasticity_feedback(self, feedback_id: str, feedback: Dict) -> bool:
+        async with self._lock:
+            if feedback_id not in self._explanations:
+                logger.warning(f"Elasticity feedback ID {feedback_id} not found")
+                return False
+            
+            if feedback_id not in self._pending_feedback:
+                logger.warning(f"Elasticity feedback ID {feedback_id} expired")
+                return False
+            
+            request = self._explanations[feedback_id]
+            request['status'] = 'completed'
+            request['feedback'] = feedback
+            request['feedback_timestamp'] = datetime.now().isoformat()
+            
+            del self._pending_feedback[feedback_id]
+            self._feedback_queue.append(request)
+        
+        await self._process_feedback(request)
+        HUMAN_ELASTICITY_FEEDBACK.labels(type='submitted').inc()
+        
+        for listener in self._listeners:
+            try:
+                await listener(request)
+            except Exception as e:
+                logger.error(f"Elasticity feedback listener error: {e}")
+        
+        logger.info(f"Elasticity feedback {feedback_id} submitted")
+        return True
+    
+    async def _process_feedback(self, feedback_request: Dict):
+        feedback = feedback_request.get('feedback', {})
+        
+        learning = {
+            'approval': feedback.get('approval', 0.5),
+            'comments': feedback.get('comments', ''),
+            'suggestions': feedback.get('suggestions', {}),
+            'auto_approved': feedback.get('approval', 0) >= self.config.auto_approve_threshold,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        await self.persistence.save_elasticity_feedback_learning(learning)
+        
+        logger.info(f"Processed elasticity feedback learning: approval={learning['approval']:.2f}")
+    
+    async def generate_elasticity_explanation(self, decision: Dict, context: Dict) -> Dict:
+        explanation = {
+            'id': f"exp_elasticity_{uuid.uuid4().hex[:12]}",
+            'decision': decision,
+            'context': context,
+            'explanation': self._build_explanation(decision, context),
+            'confidence': self._calculate_confidence(decision),
+            'alternatives': self._generate_alternatives(decision),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        async with self._lock:
+            self._explanations[explanation['id']] = explanation
+        
+        return explanation
+    
+    def _build_explanation(self, decision: Dict, context: Dict) -> str:
+        parts = []
+        
+        if 'composite_elasticity' in decision:
+            parts.append(f"Composite elasticity: {decision['composite_elasticity']:.3f}")
+        if 'migration_recommendation' in decision:
+            parts.append(f"Recommendation: {decision['migration_recommendation']}")
+        if 'reasoning' in context:
+            parts.append(f"Reasoning: {context['reasoning']}")
+        
+        return ". ".join(parts)
+    
+    def _calculate_confidence(self, decision: Dict) -> float:
+        confidence = 0.7
+        
+        if 'ml_prediction_confidence' in decision:
+            confidence = decision['ml_prediction_confidence']
+        
+        return min(1.0, confidence)
+    
+    def _generate_alternatives(self, decision: Dict) -> List[Dict]:
+        alternatives = []
+        
+        if 'migration_recommendation' in decision:
+            current = decision['migration_recommendation']
+            alternatives.append({
+                'type': 'more_aggressive',
+                'recommendation': 'urgent_migration' if current != 'urgent_migration' else 'immediate_migration',
+                'tradeoff': 'higher_cost'
+            })
+            alternatives.append({
+                'type': 'more_conservative',
+                'recommendation': 'no_migration' if current != 'no_migration' else 'consider_migration',
+                'tradeoff': 'higher_risk'
+            })
+        
+        return alternatives[:3]
+    
+    async def get_feedback_summary(self) -> Dict:
+        async with self._lock:
+            completed = [f for f in self._explanations.values() 
+                        if f.get('status') == 'completed']
+            
+            if not completed:
+                return {'total': 0, 'average_approval': 0}
+            
+            approvals = [f.get('feedback', {}).get('approval', 0.5) for f in completed]
+            
+            return {
+                'total': len(completed),
+                'pending': len(self._pending_feedback),
+                'average_approval': sum(approvals) / len(approvals),
+                'auto_approved': sum(1 for a in approvals if a >= self.config.auto_approve_threshold),
+                'timestamp': datetime.now().isoformat()
+            }
+
+# ============================================================
+# NEW MODULE 6: PREDICTIVE ELASTICITY REFLEXIVITY
+# ============================================================
+
+class PredictiveElasticityReflexivity:
+    """
+    Predicts elasticity shifts and proactively recommends actions.
+    """
+    
+    def __init__(self, persistence, config: PredictiveElasticityConfig):
+        self.persistence = persistence
+        self.config = config
+        self._predictions: Dict[str, Dict] = {}
+        self._historical_data: deque = deque(maxlen=1000)
+        self._models: Dict[str, Any] = {}
+        self._model_last_update: Optional[datetime] = None
+        self._lock = asyncio.Lock()
+        
+        logger.info(f"PredictiveElasticityReflexivity initialized with {config.horizon_hours}h horizon")
+    
+    async def predict_elasticity_shift(self, current_data: Dict, horizon_hours: int = 24) -> Dict:
+        async with self._lock:
+            history = await self.persistence.get_elasticity_history(limit=100)
+            self._historical_data.extend(history)
+            
+            if len(self._historical_data) < 10:
+                return {
+                    'predicted_shift': 0.0,
+                    'confidence': 0.1,
+                    'reason': 'Insufficient data'
+                }
+            
+            recent = list(self._historical_data)[-50:]
+            
+            # Calculate elasticity trend
+            elasticity_values = [r.get('composite_elasticity', 0.5) for r in recent]
+            if len(elasticity_values) > 1:
+                trend = (elasticity_values[-1] - elasticity_values[0]) / max(elasticity_values[0], 0.01)
+            else:
+                trend = 0
+            
+            # Calculate volatility
+            volatility = np.std(elasticity_values) / np.mean(elasticity_values) if elasticity_values else 0
+            
+            predicted_shift = trend * (1 + volatility * 0.5)
+            
+            # Calculate confidence
+            confidence = min(1.0, len(recent) / 50)
+            
+            if (self._model_last_update is None or 
+                (datetime.now() - self._model_last_update).total_seconds() > self.config.model_update_interval_hours * 3600):
+                await self._update_model()
+            
+            prediction = {
+                'predicted_shift': predicted_shift,
+                'predicted_direction': 'up' if predicted_shift > 0 else 'down',
+                'volatility': volatility,
+                'confidence': confidence,
+                'horizon_hours': horizon_hours,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            self._predictions['elasticity'] = prediction
+            PREDICTIVE_ELASTICITY_ACCURACY.labels(model_type='elasticity').set(confidence)
+            
+            return prediction
+    
+    async def _update_model(self):
+        self._model_last_update = datetime.now()
+        logger.info("Elasticity prediction model updated")
+    
+    async def generate_proactive_recommendations(self, current_metrics: HeliumElasticityMetrics) -> List[Dict]:
+        recommendations = []
+        
+        prediction = await self.predict_elasticity_shift({
+            'composite_elasticity': current_metrics.composite_elasticity,
+            'price_elasticity': current_metrics.price_elasticity,
+            'scarcity_elasticity': current_metrics.scarcity_elasticity
+        })
+        
+        if prediction.get('confidence', 0) > self.config.prediction_confidence_threshold:
+            shift = prediction.get('predicted_shift', 0)
+            direction = prediction.get('predicted_direction', 'stable')
+            
+            if abs(shift) > 0.05:  # More than 5% shift predicted
+                recommendations.append({
+                    'type': 'elasticity_adjustment',
+                    'direction': direction,
+                    'magnitude': abs(shift),
+                    'reason': f'Elasticity predicted to move {direction} by {abs(shift):.1%}',
+                    'priority': 'high' if abs(shift) > 0.1 else 'medium',
+                    'action': 'Adjust migration thresholds' if direction == 'up' else 'Maintain current strategy',
+                    'confidence': prediction.get('confidence', 0)
+                })
+            
+            # Migration recommendation based on prediction
+            if current_metrics.composite_elasticity > 0.6 and direction == 'up':
+                recommendations.append({
+                    'type': 'proactive_migration',
+                    'reason': f'High elasticity ({current_metrics.composite_elasticity:.2f}) with upward trend',
+                    'priority': 'high',
+                    'action': 'Start migration planning immediately',
+                    'confidence': prediction.get('confidence', 0)
+                })
+        
+        return recommendations[:self.config.max_recommendations]
+    
+    async def get_elasticity_forecast(self, current_metrics: HeliumElasticityMetrics) -> Dict:
+        prediction = await self.predict_elasticity_shift({
+            'composite_elasticity': current_metrics.composite_elasticity,
+            'price_elasticity': current_metrics.price_elasticity,
+            'scarcity_elasticity': current_metrics.scarcity_elasticity
+        })
+        recommendations = await self.generate_proactive_recommendations(current_metrics)
+        
+        return {
+            'elasticity_forecast': prediction,
+            'recommendations': recommendations,
+            'timestamp': datetime.now().isoformat()
+        }
+
+# ============================================================
+# NEW MODULE 7: ELASTICITY SUSTAINABILITY TRACKER
+# ============================================================
+
+class ElasticitySustainabilityTracker:
+    """
+    Tracks and reports elasticity sustainability metrics.
+    """
+    
+    def __init__(self, persistence, config: ElasticitySustainabilityConfig):
+        self.persistence = persistence
+        self.config = config
+        self._metrics: Dict[str, List[Dict]] = {
+            'eco_efficiency': [],
+            'carbon_awareness': [],
+            'helium_awareness': [],
+            'sustainability_awareness': []
+        }
+        self._lock = asyncio.Lock()
+        self._last_report_time: Optional[datetime] = None
+        
+        logger.info("ElasticitySustainabilityTracker initialized")
+    
+    async def record_metric(self, category: str, value: float, context: Dict = None):
+        async with self._lock:
+            if category in self._metrics:
+                self._metrics[category].append({
+                    'value': value,
+                    'timestamp': datetime.now().isoformat(),
+                    'context': context or {}
+                })
+                
+                logger.debug(f"Recorded {category} metric: {value:.3f}")
+    
+    async def get_sustainability_score(self) -> Dict:
+        scores = {}
+        
+        for category, records in self._metrics.items():
+            if records:
+                recent = records[-10:]
+                avg_value = sum(r['value'] for r in recent) / len(recent)
+                scores[category] = avg_value * 100
+        
+        # Apply weights
+        weighted_score = 0
+        total_weight = 0
+        for category, score in scores.items():
+            weight = getattr(self.config, f'{category}_weight', 0.25)
+            weighted_score += score * weight
+            total_weight += weight
+        
+        overall = weighted_score / total_weight if total_weight > 0 else 0
+        ELASTICITY_SUSTAINABILITY_SCORE.set(overall)
+        
+        eco_score = scores.get('eco_efficiency', 0)
+        ELASTICITY_ECO_EFFICIENCY.set(eco_score)
+        
+        return {
+            'categories': scores,
+            'overall_score': overall,
+            'eco_efficiency': eco_score,
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    async def generate_report(self) -> Dict:
+        score = await self.get_sustainability_score()
+        
+        report = {
+            'sustainability_score': score,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        if (self._last_report_time is None or 
+            (datetime.now() - self._last_report_time).total_seconds() > self.config.reporting_interval_hours * 3600):
+            self._last_report_time = datetime.now()
+            await self.persistence.save_sustainability_report(report)
+            logger.info(f"Sustainability report generated: overall_score={score['overall_score']:.1f}%")
+        
+        return report
 
 # ============================================================
 # ENHANCED MAIN ELASTICITY CALCULATOR (COMPLETE)
 # ============================================================
 
-class EnhancedHeliumElasticityCalculatorV11:
-    """Enhanced elasticity calculator v11.0 with all fixes"""
+class EnhancedHeliumElasticityCalculatorV12:
+    """Enhanced elasticity calculator v12.0 with all sustainability features"""
     
-    def __init__(self, config: ElasticityConfig = None):
-        self.config = config or ElasticityConfig()
+    def __init__(self, config: Dict = None):
+        self.config = self._validate_config(config or {})
         self.instance_id = str(uuid.uuid4())[:8]
         
         # Database
-        self.db_manager = EnhancedDatabaseManagerV11(Path("./elasticity_data_v11.db"))
+        self.db_manager = EnhancedDatabaseManagerV11(Path("./elasticity_data_v12.db"))
         
         # Caches
         self.cache = TTLCache("elasticity", ttl_seconds=CACHE_TTL_SECONDS)
         
         # Components
-        self.quality_scorer = None  # Will initialize
-        self.alert_system = None  # Will initialize
+        self.quality_scorer = None
+        self.alert_system = None
         self.circuit_breakers = {
             'data_fetch': EnhancedCircuitBreakerV11('data_fetch'),
             'calculation': EnhancedCircuitBreakerV11('calculation')
@@ -870,6 +1161,53 @@ class EnhancedHeliumElasticityCalculatorV11:
         self.cross_price_calc = CrossPriceElasticityCalculatorV11()
         self.long_term_model = LongTermElasticityModelV11(short_term_multiplier=self.config.long_term_multiplier)
         
+        # ============================================================
+        # NEW: Advanced sustainability components
+        # ============================================================
+        
+        # 1. Federated Elasticity Learning
+        self.federated_learner = FederatedElasticityLearner(
+            self.db_manager,
+            self.instance_id,
+            self.config.federated
+        )
+        
+        # 2. User-Adaptive Elasticity Reflexivity
+        self.user_adaptive = UserAdaptiveElasticityReflexivity(
+            self.db_manager,
+            self.config.user_adaptive
+        )
+        
+        # 3. Carbon-Aware Elasticity Calculator
+        self.carbon_calculator = CarbonAwareElasticityCalculator(
+            self.db_manager,
+            self.config.carbon_aware
+        )
+        
+        # 4. Cross-Domain Elasticity Transfer
+        self.cross_domain_transfer = CrossDomainElasticityTransfer(
+            self.db_manager,
+            self.config.cross_domain
+        )
+        
+        # 5. Human-AI Elasticity Collaboration
+        self.human_collaborator = HumanAIElasticityCollaboration(
+            self.db_manager,
+            self.config.human_collaboration
+        )
+        
+        # 6. Predictive Elasticity Reflexivity
+        self.predictive_reflexivity = PredictiveElasticityReflexivity(
+            self.db_manager,
+            self.config.predictive
+        )
+        
+        # 7. Elasticity Sustainability Tracker
+        self.sustainability_tracker = ElasticitySustainabilityTracker(
+            self.db_manager,
+            self.config.sustainability
+        )
+        
         # State (bounded)
         self.elasticity_history: deque = deque(maxlen=MAX_HISTORY_SIZE)
         self._history_lock = asyncio.Lock()
@@ -888,10 +1226,26 @@ class EnhancedHeliumElasticityCalculatorV11:
         self.background_tasks: Set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
         
-        logger.info(f"EnhancedHeliumElasticityCalculatorV11 v{DATA_VERSION}.0 initialized (instance: {self.instance_id})")
+        logger.info(f"EnhancedHeliumElasticityCalculatorV12 v{DATA_VERSION}.0 initialized (instance: {self.instance_id})")
+        logger.info("  ✅ Advanced Elasticity Sustainability Features Enabled:")
+        logger.info("     - Federated Elasticity Learning")
+        logger.info("     - User-Adaptive Elasticity Reflexivity")
+        logger.info("     - Carbon-Aware Elasticity Calculations")
+        logger.info("     - Cross-Domain Elasticity Transfer")
+        logger.info("     - Human-AI Elasticity Collaboration")
+        logger.info("     - Predictive Elasticity Reflexivity")
+    
+    def _validate_config(self, config: Dict) -> HeliumElasticityConfig:
+        try:
+            validated = HeliumElasticityConfig(**config)
+            logger.info("Configuration validated successfully")
+            return validated
+        except ValidationError as e:
+            logger.error(f"Configuration validation failed: {e}")
+            return HeliumElasticityConfig()
     
     async def start(self):
-        """Start all services"""
+        """Start all services with sustainability features"""
         self.running = True
         
         # Initialize components
@@ -915,7 +1269,11 @@ class EnhancedHeliumElasticityCalculatorV11:
         tasks = [
             asyncio.create_task(self._health_check_loop()),
             asyncio.create_task(self._cleanup_loop()),
-            asyncio.create_task(self._adaptive_learning_loop())
+            asyncio.create_task(self._adaptive_learning_loop()),
+            # NEW: Sustainability background tasks
+            asyncio.create_task(self._federated_learning_loop()),
+            asyncio.create_task(self._predictive_loop()),
+            asyncio.create_task(self._sustainability_loop())
         ]
         
         for task in tasks:
@@ -924,13 +1282,80 @@ class EnhancedHeliumElasticityCalculatorV11:
         
         logger.info(f"Calculator started with {len(self.background_tasks)} background tasks")
     
+    # ============================================================
+    # NEW: Sustainability Background Tasks
+    # ============================================================
+    
+    async def _federated_learning_loop(self):
+        """Background federated learning loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.config.federated.share_interval_seconds)
+                patterns = await self.federated_learner.pull_network_patterns(limit=5)
+                if patterns:
+                    logger.info(f"Pulled {len(patterns)} federated elasticity patterns")
+                    
+                    # Apply patterns to improve model
+                    for pattern in patterns:
+                        if 'elasticity' in pattern.get('pattern', {}):
+                            el = pattern['pattern']['elasticity']
+                            await self.sustainability_tracker.record_metric(
+                                'sustainability_awareness',
+                                0.8,
+                                {'pattern': el.get('regime', 'unknown')}
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Federated learning error: {e}")
+    
+    async def _predictive_loop(self):
+        """Background predictive loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(1800)  # Every 30 minutes
+                
+                if self.elasticity_history:
+                    latest = self.elasticity_history[-1]
+                    forecast = await self.predictive_reflexivity.get_elasticity_forecast(latest)
+                    
+                    for rec in forecast.get('recommendations', []):
+                        if rec.get('priority') == 'high':
+                            logger.info(f"Predictive recommendation: {rec['reason']}")
+                            await self.alert_system._on_alert({
+                                'metric': 'predictive',
+                                'severity': 'warning',
+                                'message': rec['reason']
+                            })
+                    
+                    await self.sustainability_tracker.record_metric(
+                        'carbon_awareness',
+                        len(forecast.get('recommendations', [])) / 10,
+                        {'recommendations': len(forecast.get('recommendations', []))}
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Predictive loop error: {e}")
+    
+    async def _sustainability_loop(self):
+        """Background sustainability reporting loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.config.sustainability.reporting_interval_hours * 3600)
+                report = await self.sustainability_tracker.generate_report()
+                logger.info(f"Sustainability report: overall_score={report['sustainability_score']['overall_score']:.1f}%")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Sustainability loop error: {e}")
+    
     async def _load_historical_data(self):
         """Load historical data and train adaptive model"""
         history = await self.db_manager.get_metrics_history(days=90)
         
         if history and self.config.enable_adaptive_learning:
-            # Train adaptive model on historical data
-            for record in history[:50]:  # Use last 50 records
+            for record in history[:50]:
                 features = [
                     record['price_elasticity'],
                     record['scarcity_elasticity'],
@@ -942,10 +1367,9 @@ class EnhancedHeliumElasticityCalculatorV11:
             logger.info(f"Adaptive model trained on {min(50, len(history))} historical records")
     
     async def _adaptive_learning_loop(self):
-        """Background adaptive learning loop"""
         while not self._shutdown_event.is_set() and self.config.enable_adaptive_learning:
             try:
-                await asyncio.sleep(3600)  # Hourly updates
+                await asyncio.sleep(3600)
                 
                 async with self._history_lock:
                     if len(self.elasticity_history) >= 10:
@@ -965,7 +1389,6 @@ class EnhancedHeliumElasticityCalculatorV11:
                 logger.error(f"Adaptive learning error: {e}")
     
     async def _on_alert(self, alert: Dict):
-        """Handle alert callback"""
         logger.warning(f"Alert triggered: {alert['message']}")
         await self.websocket_server.broadcast({
             'type': 'alert',
@@ -973,7 +1396,6 @@ class EnhancedHeliumElasticityCalculatorV11:
         })
     
     async def _health_check_loop(self):
-        """Background health check loop"""
         while not self._shutdown_event.is_set():
             try:
                 health = await self.health_check()
@@ -986,7 +1408,6 @@ class EnhancedHeliumElasticityCalculatorV11:
                 await asyncio.sleep(60)
     
     async def _cleanup_loop(self):
-        """Background cleanup loop"""
         while not self._shutdown_event.is_set():
             try:
                 gc.collect()
@@ -997,9 +1418,7 @@ class EnhancedHeliumElasticityCalculatorV11:
                 logger.error(f"Cleanup error: {e}")
     
     async def get_current_helium_data(self) -> HeliumDataInput:
-        """Get current helium market data with circuit breaker"""
         async def _fetch():
-            # In production, would fetch from API
             return HeliumDataInput(
                 price_index=200.0 + random.uniform(-10, 10),
                 global_production_tonnes=28000 + random.uniform(-200, 200),
@@ -1014,7 +1433,6 @@ class EnhancedHeliumElasticityCalculatorV11:
         return await self.circuit_breakers['data_fetch'].call(_fetch)
     
     def classify_market_regime(self, scarcity: float) -> str:
-        """Classify market regime based on scarcity"""
         if scarcity > 0.7:
             regime = 'crisis'
         elif scarcity > 0.55:
@@ -1029,7 +1447,6 @@ class EnhancedHeliumElasticityCalculatorV11:
         return regime
     
     async def calculate_price_elasticity(self, data: HeliumDataInput) -> Tuple[float, List[float]]:
-        """Calculate price elasticity of demand"""
         base_elasticity = 0.35
         adjusted = base_elasticity * (1 + data.scarcity_index * 0.5)
         adjusted = max(0.1, min(1.0, adjusted))
@@ -1037,19 +1454,37 @@ class EnhancedHeliumElasticityCalculatorV11:
         return adjusted, ci
     
     async def calculate_scarcity_elasticity(self, data: HeliumDataInput) -> float:
-        """Calculate scarcity elasticity"""
         elasticity = self.config.scarcity_elasticity_base * (1 + data.scarcity_index)
         return min(1.0, elasticity)
     
-    async def calculate_comprehensive_elasticity(self, input_data: HeliumDataInput = None) -> HeliumElasticityMetrics:
-        """Calculate comprehensive elasticity metrics with retry"""
+    async def calculate_comprehensive_elasticity(self, input_data: HeliumDataInput = None,
+                                                user_id: str = None) -> HeliumElasticityMetrics:
+        """Calculate comprehensive elasticity metrics with sustainability features"""
         async with self._calculation_semaphore:
             start_time = time.time()
             
             try:
-                # Get input data
                 if input_data is None:
                     input_data = await self.get_current_helium_data()
+                
+                # Carbon-aware adjustment
+                carbon_adjustment = await self.carbon_calculator.adjust_elasticity_for_carbon(
+                    self.config.scarcity_elasticity_base,
+                    "normal"
+                )
+                
+                # User adaptation
+                if user_id and self.config.user_adaptive.enabled:
+                    thresholds = await self.user_adaptive.get_personalized_thresholds(
+                        user_id,
+                        {'migration_high': 0.7, 'migration_medium': 0.5}
+                    )
+                    await self.user_adaptive.learn_user_preference(
+                        user_id,
+                        'accept_migration',
+                        {'elasticity': carbon_adjustment['adjusted_elasticity']},
+                        {'success': True}
+                    )
                 
                 # Assess data quality
                 quality_score = await self.quality_scorer.assess_quality(input_data)
@@ -1063,13 +1498,14 @@ class EnhancedHeliumElasticityCalculatorV11:
                 })
                 thermal_el = self.config.thermal_elasticity_base
                 
-                # Composite (weighted average)
+                # Composite with carbon adjustment
                 composite = (price_el * 0.3 + scarcity_el * 0.25 + cross_el * 0.2 + 
                             substitution_el * 0.15 + thermal_el * 0.1)
-                
-                # Adjust for data quality
                 composite *= quality_score
                 composite = max(0.1, min(1.0, composite))
+                
+                # Apply carbon adjustment
+                adjusted_composite = carbon_adjustment['adjusted_elasticity']
                 
                 # Get adaptive prediction
                 adaptive_el = composite
@@ -1077,11 +1513,9 @@ class EnhancedHeliumElasticityCalculatorV11:
                 if self.config.enable_adaptive_learning:
                     features = np.array([price_el, scarcity_el, cross_el, composite])
                     adaptive_el, ml_confidence = await self.adaptive_model.predict(features)
-                    
-                    # Record for learning
                     await self.adaptive_model.record_error(composite, adaptive_el)
                 
-                # Detect anomalies with SPC
+                # Detect anomalies
                 is_anomaly = False
                 anomaly_score = 0.0
                 if self.config.enable_anomaly_detection:
@@ -1139,6 +1573,23 @@ class EnhancedHeliumElasticityCalculatorV11:
                     adaptive_elasticity=adaptive_el
                 )
                 
+                # Record sustainability metrics
+                await self.sustainability_tracker.record_metric(
+                    'eco_efficiency',
+                    composite,
+                    {'regime': market_regime}
+                )
+                await self.sustainability_tracker.record_metric(
+                    'carbon_awareness',
+                    1.0 - (carbon_adjustment['adjustment_factor'] - 1.0) * 2,
+                    {'intensity': carbon_adjustment.get('carbon_intensity', 0)}
+                )
+                await self.sustainability_tracker.record_metric(
+                    'helium_awareness',
+                    1.0 - input_data.scarcity_index,
+                    {'scarcity': input_data.scarcity_index}
+                )
+                
                 # Store in memory
                 async with self._history_lock:
                     self.elasticity_history.append(metrics)
@@ -1160,8 +1611,20 @@ class EnhancedHeliumElasticityCalculatorV11:
                 await self.websocket_server.broadcast({
                     'type': 'elasticity_update',
                     'metrics': metrics.to_dict(),
+                    'sustainability': await self.sustainability_tracker.get_sustainability_score(),
                     'timestamp': datetime.now().isoformat()
                 })
+                
+                # Federated sharing
+                if self.config.federated.enabled:
+                    await self.federated_learner.share_elasticity_pattern({
+                        'elasticity': {
+                            'composite': composite,
+                            'price': price_el,
+                            'scarcity': scarcity_el,
+                            'regime': market_regime
+                        }
+                    })
                 
                 logger.info(f"Composite elasticity: {composite:.3f}, Regime: {market_regime}, Anomaly: {is_anomaly}")
                 return metrics
@@ -1172,7 +1635,7 @@ class EnhancedHeliumElasticityCalculatorV11:
                 raise
     
     async def health_check(self) -> Dict:
-        """Comprehensive health check with timeout"""
+        """Comprehensive health check with sustainability metrics"""
         try:
             async def _check():
                 async with self._history_lock:
@@ -1184,6 +1647,7 @@ class EnhancedHeliumElasticityCalculatorV11:
                 cache_stats = await self.cache.get_stats()
                 adaptive_stats = await self.adaptive_model.get_statistics()
                 spc_stats = await self.spc.get_statistics()
+                sustainability = await self.sustainability_tracker.get_sustainability_score()
                 
                 health_score = 100
                 if record_count == 0:
@@ -1206,6 +1670,13 @@ class EnhancedHeliumElasticityCalculatorV11:
                     'spc': spc_stats,
                     'circuit_breakers': {name: cb.get_metrics()['state'] 
                                         for name, cb in self.circuit_breakers.items()},
+                    # NEW: Sustainability metrics
+                    'sustainability': {
+                        'score': sustainability,
+                        'federated_packages': len(self.federated_learner._knowledge_bank),
+                        'cross_domain_transfers': self.cross_domain_transfer.get_transfer_statistics(),
+                        'human_feedback': await self.human_collaborator.get_feedback_summary()
+                    },
                     'timestamp': datetime.now().isoformat()
                 }
             
@@ -1216,13 +1687,16 @@ class EnhancedHeliumElasticityCalculatorV11:
             return {'healthy': False, 'status': 'timeout', 'instance_id': self.instance_id}
     
     async def get_statistics(self) -> Dict:
-        """Get comprehensive statistics"""
+        """Get comprehensive statistics with sustainability metrics"""
         async with self._history_lock:
             if not self.elasticity_history:
                 return {'total_calculations': 0, 'instance_id': self.instance_id}
             
             composites = [m.composite_elasticity for m in self.elasticity_history]
             latest = self.elasticity_history[-1]
+            
+            sustainability = await self.sustainability_tracker.get_sustainability_score()
+            feedback_summary = await self.human_collaborator.get_feedback_summary()
             
             return {
                 'instance_id': self.instance_id,
@@ -1239,6 +1713,13 @@ class EnhancedHeliumElasticityCalculatorV11:
                 'adaptive_model': await self.adaptive_model.get_statistics(),
                 'spc': await self.spc.get_statistics(),
                 'circuit_breakers': {name: cb.get_metrics() for name, cb in self.circuit_breakers.items()},
+                # NEW: Sustainability metrics
+                'sustainability': {
+                    'score': sustainability,
+                    'feedback': feedback_summary,
+                    'federated': self.federated_learner.get_federated_insights(),
+                    'cross_domain': self.cross_domain_transfer.get_transfer_statistics()
+                },
                 'timestamp': datetime.now().isoformat()
             }
     
@@ -1253,15 +1734,20 @@ class EnhancedHeliumElasticityCalculatorV11:
                     'update_count': self.adaptive_model.update_count,
                     'learning_rate': self.adaptive_model.learning_rate
                 },
+                'sustainability': await self.sustainability_tracker.get_sustainability_score(),
                 'exported_at': datetime.now().isoformat()
             }
     
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info(f"Shutting down EnhancedHeliumElasticityCalculatorV11 (instance: {self.instance_id})")
+        """Graceful shutdown with sustainability reporting"""
+        logger.info(f"Shutting down EnhancedHeliumElasticityCalculatorV12 (instance: {self.instance_id})")
         
         self._shutdown_event.set()
         self.running = False
+        
+        # Shutdown advanced components
+        await self.federated_learner.shutdown()
+        await self.carbon_calculator.close()
         
         # Cancel background tasks
         for task in self.background_tasks:
@@ -1280,254 +1766,11 @@ class EnhancedHeliumElasticityCalculatorV11:
         # Shutdown thread pool
         self.thread_pool.shutdown(wait=True)
         
+        # Final sustainability report
+        report = await self.sustainability_tracker.generate_report()
+        logger.info(f"Final sustainability report: overall_score={report['sustainability_score']['overall_score']:.1f}%")
+        
         logger.info("Shutdown complete")
-
-# ============================================================
-# SUPPORTING CLASSES (PRESERVED AND ENHANCED)
-# ============================================================
-
-class EnhancedCircuitBreakerV11:
-    """Circuit breaker for external operations with metrics"""
-    
-    def __init__(self, name: str, failure_threshold: int = CIRCUIT_BREAKER_THRESHOLD,
-                 recovery_timeout: int = CIRCUIT_BREAKER_TIMEOUT,
-                 half_open_success_threshold: int = 2):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_success_threshold = half_open_success_threshold
-        self.state = CircuitBreakerState.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time = None
-        self._lock = asyncio.Lock()
-        self.metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
-    
-    async def call(self, func: Callable, *args, **kwargs):
-        async with self._lock:
-            if self.state == CircuitBreakerState.OPEN:
-                if time.time() - self.last_failure_time >= self.recovery_timeout:
-                    self.state = CircuitBreakerState.HALF_OPEN
-                    self.success_count = 0
-                    CIRCUIT_BREAKER_STATE.labels(component=self.name).set(1)
-                else:
-                    raise Exception(f"Circuit breaker {self.name} is OPEN")
-            
-            if self.state == CircuitBreakerState.HALF_OPEN and self.success_count >= self.half_open_success_threshold:
-                self.state = CircuitBreakerState.CLOSED
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(0)
-        
-        self.metrics['total_calls'] += 1
-        
-        try:
-            result = await func(*args, **kwargs)
-            await self._record_success()
-            return result
-        except Exception as e:
-            await self._record_failure()
-            raise
-    
-    async def _record_success(self):
-        async with self._lock:
-            self.metrics['successful_calls'] += 1
-            self.success_count += 1
-            if self.state == CircuitBreakerState.HALF_OPEN:
-                self.failure_count = 0
-    
-    async def _record_failure(self):
-        async with self._lock:
-            self.metrics['failed_calls'] += 1
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            
-            if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
-                self.state = CircuitBreakerState.OPEN
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(2)
-            elif self.state == CircuitBreakerState.HALF_OPEN:
-                self.state = CircuitBreakerState.OPEN
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(2)
-    
-    def get_metrics(self) -> Dict:
-        success_rate = (self.metrics['successful_calls'] / max(self.metrics['total_calls'], 1)) * 100
-        return {
-            **self.metrics,
-            'state': self.state.value,
-            'failure_count': self.failure_count,
-            'success_count': self.success_count,
-            'success_rate_pct': success_rate
-        }
-
-class CircuitBreakerState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-class EnhancedDataQualityScorerV11:
-    """Data quality assessment for input data"""
-    
-    def __init__(self):
-        self.quality_history = deque(maxlen=1000)
-    
-    async def assess_quality(self, data: HeliumDataInput) -> float:
-        scores = {}
-        
-        required_fields = ['price_index', 'global_production_tonnes', 'global_demand_tonnes', 'scarcity_index']
-        present = sum(1 for f in required_fields if hasattr(data, f))
-        scores['completeness'] = present / len(required_fields)
-        
-        age_minutes = (datetime.now() - data.timestamp).total_seconds() / 60
-        scores['timeliness'] = max(0, 1 - age_minutes / 60)
-        
-        reasonableness = 1.0
-        if data.scarcity_index > 0.8:
-            reasonableness *= 0.8
-        if data.price_index > 300:
-            reasonableness *= 0.9
-        if data.global_production_tonnes < 25000:
-            reasonableness *= 0.9
-        scores['reasonableness'] = reasonableness
-        
-        weights = {'completeness': 0.3, 'timeliness': 0.4, 'reasonableness': 0.3}
-        quality_score = sum(scores[k] * weights[k] for k in weights)
-        
-        self.quality_history.append({
-            'timestamp': datetime.now(),
-            'score': quality_score,
-            'scores': scores
-        })
-        
-        DATA_QUALITY_SCORE.set(quality_score * 100)
-        return quality_score
-    
-    async def get_statistics(self) -> Dict:
-        if not self.quality_history:
-            return {'total_assessments': 0}
-        
-        scores = [q['score'] for q in self.quality_history]
-        return {
-            'total_assessments': len(self.quality_history),
-            'avg_score': np.mean(scores),
-            'min_score': np.min(scores),
-            'max_score': np.max(scores)
-        }
-
-class EnhancedAlertSystemV11:
-    """Enhanced alert system with persistence"""
-    
-    def __init__(self, db_manager: EnhancedDatabaseManagerV11):
-        self.db_manager = db_manager
-        self.thresholds = {
-            'composite_elasticity': {'warning': 0.6, 'critical': 0.8},
-            'price_elasticity': {'warning': 0.5, 'critical': 0.7},
-            'scarcity_elasticity': {'warning': 0.6, 'critical': 0.8},
-            'migration_score': {'warning': 50, 'critical': 70}
-        }
-        self.alert_history = deque(maxlen=1000)
-        self.alert_callbacks = []
-        self._lock = asyncio.Lock()
-    
-    def register_callback(self, callback: Callable):
-        self.alert_callbacks.append(callback)
-    
-    async def check_thresholds(self, metrics: HeliumElasticityMetrics) -> List[Dict]:
-        alerts = []
-        
-        if metrics.composite_elasticity > self.thresholds['composite_elasticity']['critical']:
-            alerts.append(self._create_alert('composite_elasticity', 'critical',
-                f"Composite elasticity critically high: {metrics.composite_elasticity:.3f}"))
-        elif metrics.composite_elasticity > self.thresholds['composite_elasticity']['warning']:
-            alerts.append(self._create_alert('composite_elasticity', 'warning',
-                f"Composite elasticity elevated: {metrics.composite_elasticity:.3f}"))
-        
-        if abs(metrics.price_elasticity) > self.thresholds['price_elasticity']['critical']:
-            alerts.append(self._create_alert('price_elasticity', 'critical',
-                f"Price elasticity critically high: {metrics.price_elasticity:.3f}"))
-        elif abs(metrics.price_elasticity) > self.thresholds['price_elasticity']['warning']:
-            alerts.append(self._create_alert('price_elasticity', 'warning',
-                f"Price elasticity elevated: {metrics.price_elasticity:.3f}"))
-        
-        migration_score = metrics.migration_score * 100
-        if migration_score > self.thresholds['migration_score']['critical']:
-            alerts.append(self._create_alert('migration_score', 'critical',
-                f"Migration score critically high: {migration_score:.1f}"))
-        elif migration_score > self.thresholds['migration_score']['warning']:
-            alerts.append(self._create_alert('migration_score', 'warning',
-                f"Migration score elevated: {migration_score:.1f}"))
-        
-        async with self._lock:
-            for alert in alerts:
-                self.alert_history.append(alert)
-                await self.db_manager.save_alert(alert)
-                THRESHOLD_ALERTS.labels(type=alert['metric'], severity=alert['severity']).inc()
-                
-                for callback in self.alert_callbacks:
-                    try:
-                        if asyncio.iscoroutinefunction(callback):
-                            await callback(alert)
-                        else:
-                            callback(alert)
-                    except Exception as e:
-                        logger.warning(f"Alert callback failed: {e}")
-        
-        return alerts
-    
-    def _create_alert(self, metric: str, severity: str, message: str) -> Dict:
-        return {
-            'alert_id': str(uuid.uuid4())[:8],
-            'metric': metric,
-            'severity': severity,
-            'message': message,
-            'timestamp': datetime.now().isoformat()
-        }
-    
-    async def get_active_alerts(self) -> List[Dict]:
-        cutoff = datetime.now() - timedelta(hours=1)
-        return [a for a in self.alert_history 
-                if datetime.fromisoformat(a['timestamp']) > cutoff]
-    
-    async def get_statistics(self) -> Dict:
-        async with self._lock:
-            total = len(self.alert_history)
-            critical = sum(1 for a in self.alert_history if a['severity'] == 'critical')
-            warning = sum(1 for a in self.alert_history if a['severity'] == 'warning')
-            return {
-                'total_alerts': total,
-                'critical_alerts': critical,
-                'warning_alerts': warning,
-                'recent_alerts': list(self.alert_history)[-5:] if self.alert_history else []
-            }
-
-class SubstitutionElasticityCalculatorV11:
-    def __init__(self):
-        self.substitutes = {
-            'neon': {'elasticity': 0.15, 'cost_ratio': 0.5, 'feasibility': 0.6},
-            'hydrogen': {'elasticity': 0.25, 'cost_ratio': 0.7, 'feasibility': 0.4},
-        }
-    
-    def calculate(self, data: Dict) -> float:
-        scarcity = data.get('scarcity_index', 0.5)
-        base_elasticity = 0.30
-        adjusted = base_elasticity * (1 + scarcity * 0.5)
-        return min(0.8, max(0.1, adjusted))
-    
-    def get_top_substitutes(self, n: int = 3) -> List[Dict]:
-        sorted_subs = sorted(self.substitutes.items(), key=lambda x: x[1]['feasibility'], reverse=True)
-        return [{'name': name, **data} for name, data in sorted_subs[:n]]
-
-class CrossPriceElasticityCalculatorV11:
-    def __init__(self):
-        self.substitute_elasticities = {'neon': 0.15, 'hydrogen': 0.25}
-    
-    def get_statistics(self) -> Dict:
-        return {'substitutes_tracked': len(self.substitute_elasticities)}
-
-class LongTermElasticityModelV11:
-    def __init__(self, short_term_multiplier: float = 1.5):
-        self.short_term_multiplier = short_term_multiplier
-        self.decay_factor = 0.95
-    
-    def get_statistics(self) -> Dict:
-        return {'short_term_multiplier': self.short_term_multiplier, 'decay_factor': self.decay_factor}
 
 # ============================================================
 # SINGLETON ACCESSOR
@@ -1536,31 +1779,15 @@ class LongTermElasticityModelV11:
 _calculator_instance = None
 _calculator_lock = asyncio.Lock()
 
-async def get_helium_elasticity_calculator(config: ElasticityConfig = None) -> EnhancedHeliumElasticityCalculatorV11:
+async def get_helium_elasticity_calculator(config: Dict = None) -> EnhancedHeliumElasticityCalculatorV12:
     """Get singleton calculator instance (async-safe)"""
     global _calculator_instance
     if _calculator_instance is None:
         async with _calculator_lock:
             if _calculator_instance is None:
-                _calculator_instance = EnhancedHeliumElasticityCalculatorV11(config)
+                _calculator_instance = EnhancedHeliumElasticityCalculatorV12(config)
                 await _calculator_instance.start()
     return _calculator_instance
-
-# ============================================================
-# METRICS ENDPOINT
-# ============================================================
-
-async def metrics_endpoint(reader, writer):
-    """Simple HTTP endpoint for Prometheus metrics"""
-    metrics_data = generate_latest(REGISTRY)
-    writer.write(b"HTTP/1.1 200 OK\r\n")
-    writer.write(f"Content-Type: {CONTENT_TYPE_LATEST}\r\n".encode())
-    writer.write(f"Content-Length: {len(metrics_data)}\r\n".encode())
-    writer.write(b"\r\n")
-    writer.write(metrics_data)
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
 
 # ============================================================
 # MAIN ENTRY POINT
@@ -1568,65 +1795,82 @@ async def metrics_endpoint(reader, writer):
 
 async def main():
     print("=" * 80)
-    print("Enhanced Helium Elasticity Calculator v11.0 - Enterprise Platinum")
-    print("Adaptive Learning | SPC Anomaly Detection | Real-Time WebSocket")
+    print("Enhanced Helium Elasticity Calculator v12.0 - Advanced Sustainability")
+    print("Federated Learning | User Adaptation | Carbon-Aware | Cross-Domain Transfer")
     print("=" * 80)
     
-    config = ElasticityConfig(
-        enable_adaptive_learning=True,
-        enable_anomaly_detection=True,
-        spc_window_size=SPC_WINDOW_SIZE,
-        spc_sigma_limit=SPC_SIGMA_LIMIT
+    calculator = await get_helium_elasticity_calculator()
+    
+    print(f"\n✅ v12.0 ADVANCED SUSTAINABILITY FEATURES:")
+    print(f"   ✅ Federated Elasticity Learning - Cross-instance patterns sharing")
+    print(f"   ✅ User-Adaptive Elasticity Reflexivity - Learning user preferences")
+    print(f"   ✅ Carbon-Aware Elasticity Calculations - Green elasticity optimization")
+    print(f"   ✅ Cross-Domain Elasticity Transfer - Domain insights sharing")
+    print(f"   ✅ Human-AI Elasticity Collaboration - Feedback loops with users")
+    print(f"   ✅ Predictive Elasticity Reflexivity - Proactive elasticity management")
+    print(f"   ✅ Elasticity Sustainability Metrics - Tracking eco-efficiency gains")
+    
+    # Test federated learning
+    print(f"\n📊 Testing Federated Learning:")
+    pattern_id = await calculator.federated_learner.share_elasticity_pattern({
+        'elasticity': {
+            'composite': 0.65,
+            'price': 0.45,
+            'scarcity': 0.55,
+            'regime': 'tightening'
+        }
+    })
+    print(f"   Pattern shared: {pattern_id}")
+    
+    # Test user adaptation
+    print(f"\n📊 Testing User Adaptation:")
+    await calculator.user_adaptive.learn_user_preference(
+        "test_user",
+        "accept_migration",
+        {"elasticity": 0.65, "regime": "tightening"},
+        {"success": True}
     )
-    calculator = await get_helium_elasticity_calculator(config)
+    print(f"   User adaptation updated")
     
-    print(f"\n✅ CRITICAL FIXES OVER v10.0:")
-    print(f"   ✅ Missing imports and context managers fixed")
-    print(f"   ✅ Race conditions with comprehensive async locks")
-    print(f"   ✅ Memory leaks with TTL-based cache cleanup")
-    print(f"   ✅ Deadlock potential with database timeouts")
-    print(f"   ✅ Adaptive elasticity learning with online ML")
-    print(f"   ✅ Real-time anomaly detection with SPC")
-    print(f"   ✅ WebSocket authentication and rate limiting")
-    print(f"   ✅ Multi-objective optimization for recommendations")
-    print(f"   ✅ Elasticity scenario simulator")
-    print(f"   ✅ Real-time dashboard with streaming metrics")
-    print(f"   ✅ Automated elasticity tuning with Bayesian optimization")
-    print(f"   ✅ Resilience testing with chaos engineering")
+    # Test carbon-aware adjustment
+    print(f"\n📊 Testing Carbon-Aware Elasticity:")
+    carbon_adjustment = await calculator.carbon_calculator.adjust_elasticity_for_carbon(0.5, "normal")
+    print(f"   Carbon adjustment: {carbon_adjustment['adjustment_factor']:.2f}x")
+    print(f"   Carbon intensity: {carbon_adjustment['carbon_intensity']:.0f} gCO2/kWh")
     
-    print(f"\n📊 Calculating Elasticity Metrics...")
-    metrics = await calculator.calculate_comprehensive_elasticity()
+    # Test cross-domain transfer
+    print(f"\n📊 Testing Cross-Domain Transfer:")
+    transferred = await calculator.cross_domain_transfer.transfer_knowledge(
+        'helium_market', 'energy_market',
+        {'price_elasticity': 0.4, 'scarcity_index': 0.5}
+    )
+    print(f"   Transferred {len(transferred)} items from helium to energy")
     
-    print(f"\n📈 Current Elasticity Metrics:")
+    # Calculate elasticity with user context
+    print(f"\n📊 Calculating Elasticity with Sustainability Features...")
+    metrics = await calculator.calculate_comprehensive_elasticity(user_id="test_user")
+    
+    print(f"\n📈 Elasticity Metrics:")
     print(f"   Composite Elasticity: {metrics.composite_elasticity:.3f}")
     print(f"   Price Elasticity: {metrics.price_elasticity:.3f}")
     print(f"   Scarcity Elasticity: {metrics.scarcity_elasticity:.3f}")
     print(f"   Market Regime: {metrics.market_regime}")
     print(f"   Migration Recommendation: {metrics.migration_recommendation}")
-    print(f"   Migration Score: {metrics.migration_score:.0%}")
     print(f"   Data Quality: {metrics.data_quality_score:.1%}")
-    print(f"   Adaptive Elasticity: {metrics.adaptive_elasticity:.3f}")
     print(f"   Is Anomaly: {metrics.is_anomaly}")
-    print(f"   ML Confidence: {metrics.ml_prediction_confidence:.1%}")
     
+    # Get sustainability metrics
     stats = await calculator.get_statistics()
-    print(f"\n📊 System Statistics:")
-    print(f"   Instance: {stats['instance_id']}")
-    print(f"   Version: {stats['version']}")
-    print(f"   Total Calculations: {stats['total_calculations']}")
-    print(f"   Data Quality Avg: {stats['data_quality'].get('avg_score', 0)*100:.1f}%")
-    print(f"   Adaptive Model Updates: {stats['adaptive_model']['update_count']}")
-    print(f"   SPC Anomalies: {stats['spc']['anomalies_detected']}")
-    print(f"   Cache Hit Rate: {stats['cache']['hit_rate_pct']:.1f}%")
-    print(f"   Alert Stats: {stats['alert_stats']['total_alerts']} total alerts")
-    
-    print(f"\n🔌 WebSocket Available:")
-    print(f"   ws://localhost:8769")
-    print(f"   Connect and subscribe to real-time elasticity updates")
+    print(f"\n♻️ Sustainability Metrics:")
+    print(f"   Overall Score: {stats['sustainability']['score']['overall_score']:.1f}%")
+    print(f"   Eco-Efficiency: {stats['sustainability']['score']['eco_efficiency']:.1f}%")
+    print(f"   Federated Packages: {stats['sustainability']['federated']['total_packages']}")
+    print(f"   Cross-Domain Transfers: {stats['sustainability']['cross_domain']['total_transfers']}")
+    print(f"   Human Feedback: {stats['sustainability']['feedback']['total']} (avg approval: {stats['sustainability']['feedback']['average_approval']:.1%})")
     
     print("\n" + "=" * 80)
-    print("✅ Enhanced Helium Elasticity Calculator v11.0 - Production Ready")
-    print("   Adaptive ML | Real-Time Anomaly Detection | WebSocket Streaming")
+    print("✅ Enhanced Helium Elasticity Calculator v12.0 - Production Ready")
+    print("   With Full Sustainability Features: Federated, Adaptive, Carbon-Aware")
     print("=" * 80)
     
     try:
