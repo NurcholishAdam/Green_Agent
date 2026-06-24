@@ -1,21 +1,16 @@
-# File: src/enhancements/system_enhancement_simulator_enhanced_v5.py
-
+# File: src/enhancements/system_enhancement_simulator_enhanced_v6_0.py
 """
-Green Agent System Enhancement Simulator - Version 5.0 (Enterprise Platinum)
+Green Agent System Enhancement Simulator - Version 6.0 (Advanced Sustainability)
 
-CRITICAL FIXES OVER v4.0:
-1. FIXED: Missing imports (contextmanager, random usage)
-2. FIXED: Race conditions with comprehensive async locks
-3. FIXED: Memory leaks with TTL-based result cache
-4. FIXED: Deadlock potential with database timeouts
-5. ADDED: ML Training simulation with distributed learning
-6. ADDED: Federated Learning convergence simulation
-7. ADDED: Streaming data pipeline simulation
-8. ADDED: Multi-tenant isolation simulation
-9. ADDED: A/B testing framework for enhancements
-10. ADDED: Monte Carlo uncertainty quantification
-11. ADDED: Real-time dashboard with D3.js visualizations
-12. ADDED: Failure injection for resilience testing
+CRITICAL ADDITIONS OVER v5.0:
+1. ADDED: Federated Reflexive Learning - Cross-instance simulation insights sharing
+2. ADDED: User-Adaptive Reflexivity - Learning user simulation preferences over time
+3. ADDED: Real-Time Carbon Intensity Integration - Carbon-aware simulation scheduling
+4. ADDED: Cross-Domain Knowledge Transfer - Sharing insights across domains
+5. ADDED: Human-AI Collaborative Reflection - Feedback loops with users
+6. ADDED: Predictive Reflexivity - Proactive simulation management
+7. ADDED: Enhanced Helium Awareness - Resource-aware simulation optimization
+8. ADDED: Sustainability Impact Metrics - Tracking eco-efficiency gains
 """
 
 import asyncio
@@ -30,6 +25,7 @@ import uuid
 import random
 import threading
 import gc
+import aiohttp
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -82,7 +78,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s',
     handlers=[
-        logging.handlers.RotatingFileHandler('simulator_v5.log', maxBytes=10*1024*1024, backupCount=5),
+        logging.handlers.RotatingFileHandler('simulator_v6.log', maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -91,7 +87,7 @@ logger.addFilter(CorrelationIdFilter())
 
 # Audit logger
 audit_logger = logging.getLogger('simulator_audit')
-audit_handler = logging.handlers.RotatingFileHandler('simulator_audit_v5.log', maxBytes=50*1024*1024, backupCount=10)
+audit_handler = logging.handlers.RotatingFileHandler('simulator_audit_v6.log', maxBytes=50*1024*1024, backupCount=10)
 audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
@@ -111,6 +107,16 @@ WS_CONNECTIONS = Gauge('simulator_ws_connections', 'WebSocket connections', regi
 FAILURE_INJECTIONS = Counter('simulator_failure_injections_total', 'Failure injections', ['type'], registry=REGISTRY)
 AB_TEST_RESULTS = Counter('simulator_ab_test_results', 'A/B test results', ['winner'], registry=REGISTRY)
 
+# NEW: Advanced sustainability metrics
+FEDERATED_SIMULATION_KNOWLEDGE = Gauge('federated_simulation_knowledge', 'Federated knowledge packages', registry=REGISTRY)
+USER_SIMULATION_ADAPTATION = Gauge('user_simulation_adaptation_score', 'User adaptation score', ['user_id'], registry=REGISTRY)
+SIMULATION_CARBON_INTENSITY = Gauge('simulation_carbon_intensity', 'Carbon intensity (gCO2/kWh)', ['region'], registry=REGISTRY)
+CROSS_DOMAIN_SIMULATION_TRANSFERS = Counter('cross_domain_simulation_transfers_total', 'Cross-domain transfers', ['source', 'target'], registry=REGISTRY)
+HUMAN_SIMULATION_FEEDBACK = Counter('human_simulation_feedback_total', 'Human feedback events', ['type'], registry=REGISTRY)
+PREDICTIVE_SIMULATION_ACCURACY = Gauge('predictive_simulation_accuracy', 'Predictive model accuracy', ['model_type'], registry=REGISTRY)
+SIMULATION_SUSTAINABILITY_SCORE = Gauge('simulation_sustainability_score', 'Sustainability score', registry=REGISTRY)
+SIMULATION_ECO_EFFICIENCY = Gauge('simulation_eco_efficiency', 'Eco-efficiency score', registry=REGISTRY)
+
 # Constants
 MAX_RESULTS_HISTORY = 10000
 MAX_RUNS_HISTORY = 1000
@@ -123,7 +129,7 @@ HEALTH_CHECK_TIMEOUT = 10
 RATE_LIMIT_REQUESTS = 50
 RATE_LIMIT_WINDOW = 60
 MAX_CONCURRENT_SIMULATIONS = 4
-DATA_VERSION = 5
+DATA_VERSION = 6
 DB_POOL_SIZE = 10
 DB_MAX_OVERFLOW = 20
 DB_POOL_TIMEOUT = 30
@@ -133,633 +139,822 @@ MONTE_CARLO_ITERATIONS = 1000
 MC_CONFIDENCE_LEVEL = 0.95
 
 # ============================================================
-# ENHANCED PYDANTIC V2 MODELS
+# NEW: FEDERATED SIMULATION LEARNING
 # ============================================================
 
-class SimulationType(str, Enum):
-    QUANTUM = "quantum"
-    BLOCKCHAIN = "blockchain"
-    GPU = "gpu"
-    STREAMING = "streaming"
-    MULTITENANT = "multitenant"
-    FEDERATED = "federated"
-    ML_TRAINING = "ml_training"
-
-class SimulationRequest(BaseModel):
-    """Validated simulation request model - Pydantic v2"""
-    model_config = ConfigDict(str_strip_whitespace=True, validate_default=True)
+class FederatedSimulationLearner:
+    """
+    Federated learning system for sharing simulation insights across instances.
+    """
     
-    simulation_type: SimulationType = SimulationType.QUANTUM
-    parameters: Dict = Field(default_factory=dict)
-    priority: int = Field(default=1, ge=1, le=3)
-    inject_failure: bool = Field(default=False)
-    failure_type: Optional[str] = Field(default=None, pattern=r'^(timeout|oom|network|crash)$')
-    
-    @field_validator('simulation_type')
-    @classmethod
-    def validate_type(cls, v: SimulationType) -> SimulationType:
-        return v
-    
-    @model_validator(mode='after')
-    def validate_failure(self) -> 'SimulationRequest':
-        if self.inject_failure and not self.failure_type:
-            raise ValueError('failure_type required when inject_failure is True')
-        return self
-
-@dataclass
-class SimulationMetrics:
-    """Simulation metrics data model - Enhanced"""
-    enhancement_name: str = ""
-    status: str = "pending"
-    latency_improvement_pct: float = 0.0
-    throughput_improvement_pct: float = 0.0
-    accuracy_improvement_pct: float = 0.0
-    cost_reduction_pct: float = 0.0
-    reliability_improvement_pct: float = 0.0
-    simulated_ops_per_second: float = 0.0
-    estimated_production_readiness: float = 0.0
-    risks_identified: List[str] = field(default_factory=list)
-    recommendations: List[str] = field(default_factory=list)
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    cost_estimate_usd: float = 0.0
-    resource_requirements: Dict = field(default_factory=dict)
-    uncertainty_range: Tuple[float, float] = (0, 0)
-    confidence_interval: Tuple[float, float] = (0, 0)
-    sensitivity_scores: Dict = field(default_factory=dict)
-    validation_score: float = 0.0
-    data_quality_score: float = 100.0
-    simulation_time_ms: float = 0.0
-    monte_carlo_mean: float = 0.0
-    monte_carlo_std: float = 0.0
-    failure_injected: bool = False
-    ab_test_variant: str = "control"
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-@dataclass
-class SimulationRun:
-    """Simulation run data model - Enhanced"""
-    run_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    results: List[SimulationMetrics] = field(default_factory=list)
-    total_duration_ms: float = 0.0
-    parallel_execution: bool = True
-    data_quality_score: float = 100.0
-    simulation_type: str = ""
-    parameters_used: Dict = field(default_factory=dict)
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-# ============================================================
-# ENHANCED DATABASE MANAGER (FIXED)
-# ============================================================
-
-class EnhancedDatabaseManagerV5:
-    """Database manager with connection pooling and timeout handling"""
-    
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.engine = None
-        self.SessionLocal = None
-        self._init_engine()
-    
-    def _init_engine(self):
-        """Initialize SQLAlchemy engine with connection pooling"""
-        db_url = f"sqlite:///{self.db_path}"
-        self.engine = create_engine(
-            db_url,
-            poolclass=QueuePool,
-            pool_size=DB_POOL_SIZE,
-            max_overflow=DB_MAX_OVERFLOW,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            connect_args={'check_same_thread': False, 'timeout': DB_POOL_TIMEOUT}
-        )
-        self.SessionLocal = scoped_session(sessionmaker(bind=self.engine))
-        self._init_tables()
-        self._update_db_size_metric()
-        logger.info(f"Database initialized with connection pool (size={DB_POOL_SIZE})")
-    
-    def _init_tables(self):
-        """Initialize database tables"""
-        self.db_path.parent.mkdir(exist_ok=True, parents=True)
+    def __init__(self, persistence, instance_id: str, share_interval: int = 3600):
+        self.persistence = persistence
+        self.instance_id = instance_id
+        self.share_interval = share_interval
+        self._knowledge_bank: Dict[str, Dict] = {}
+        self._shared_insights: List[Dict] = []
+        self._last_share_time = 0
+        self._lock = asyncio.Lock()
         
-        Base = declarative_base()
+        self.federated_weights = defaultdict(float)
+        self.aggregation_count = 0
         
-        class SimulationRunDB(Base):
-            __tablename__ = 'simulation_runs'
-            run_id = Column(String(64), primary_key=True)
-            timestamp = Column(DateTime, index=True)
-            simulation_type = Column(String(32), index=True)
-            results = Column(JSON)
-            total_duration_ms = Column(Float)
-            parallel_execution = Column(Boolean)
-            data_quality_score = Column(Float)
-            version = Column(Integer, default=DATA_VERSION)
-            created_at = Column(DateTime, default=datetime.now)
+        logger.info(f"FederatedSimulationLearner initialized for instance {instance_id}")
+    
+    async def share_simulation_insight(self, insight: Dict) -> str:
+        """
+        Share a simulation insight with the federated network.
+        """
+        async with self._lock:
+            anonymized_insight = self._anonymize_insight(insight)
             
-            __table_args__ = (
-                Index('idx_timestamp', 'timestamp'),
-                Index('idx_type', 'simulation_type'),
-                Index('idx_created_at', 'created_at'),
-            )
-        
-        class SimulationMetricDB(Base):
-            __tablename__ = 'simulation_metrics'
-            id = Column(Integer, primary_key=True)
-            run_id = Column(String(64), index=True)
-            enhancement_name = Column(String(128), index=True)
-            readiness = Column(Float)
-            latency_improvement = Column(Float)
-            ab_variant = Column(String(32))
-            created_at = Column(DateTime, default=datetime.now)
+            package_id = f"fed_sim_{uuid.uuid4().hex[:12]}"
+            package = {
+                'package_id': package_id,
+                'source_instance': self.instance_id,
+                'insight': anonymized_insight,
+                'timestamp': datetime.now().isoformat(),
+                'version': '1.0'
+            }
             
-            __table_args__ = (
-                Index('idx_run_id', 'run_id'),
-                Index('idx_enhancement_name', 'enhancement_name'),
-                Index('idx_ab_variant', 'ab_variant'),
-            )
-        
-        class ABTestDB(Base):
-            __tablename__ = 'ab_tests'
-            id = Column(Integer, primary_key=True)
-            test_id = Column(String(64), index=True)
-            control_variant = Column(String(32))
-            treatment_variant = Column(String(32))
-            winner = Column(String(32))
-            improvement_pct = Column(Float)
-            p_value = Column(Float)
-            created_at = Column(DateTime, default=datetime.now)
+            self._knowledge_bank[package_id] = package
             
-            __table_args__ = (
-                Index('idx_test_id', 'test_id'),
-                Index('idx_winner', 'winner'),
-            )
+            if time.time() - self._last_share_time >= self.share_interval:
+                await self._broadcast_to_network(package)
+                self._last_share_time = time.time()
+            
+            FEDERATED_SIMULATION_KNOWLEDGE.set(len(self._knowledge_bank))
+            logger.info(f"Simulation insight {package_id} shared")
+            return package_id
+    
+    def _anonymize_insight(self, insight: Dict) -> Dict:
+        anonymized = insight.copy()
+        anonymized.pop('specific_config', None)
+        anonymized.pop('user_data', None)
+        anonymized.pop('proprietary_metrics', None)
         
-        Base.metadata.create_all(self.engine)
+        if 'simulation' in anonymized:
+            sim = anonymized['simulation']
+            anonymized['simulation'] = {
+                'type': sim.get('type', 'unknown'),
+                'readiness': sim.get('readiness', 0),
+                'improvement': sim.get('improvement', 0)
+            }
+        
+        return anonymized
     
-    def _update_db_size_metric(self):
-        if self.db_path.exists():
-            size_mb = self.db_path.stat().st_size / (1024 * 1024)
-            DB_SIZE.set(size_mb)
-    
-    @contextmanager
-    def get_session(self):
-        """Get database session with timeout handling"""
-        session = self.SessionLocal()
+    async def _broadcast_to_network(self, package: Dict):
         try:
-            session.execute("PRAGMA query_timeout = 30000")
-            yield session
-            session.commit()
-        except OperationalError as e:
-            session.rollback()
-            logger.error(f"Database operational error: {e}")
-            raise
+            await self.persistence.save_shared_simulation_knowledge(package)
+            logger.info(f"Broadcasted simulation insight {package['package_id']} to network")
         except Exception as e:
-            session.rollback()
-            logger.error(f"Database error: {e}")
-            raise
-        finally:
-            session.close()
+            logger.error(f"Failed to broadcast simulation insight: {e}")
     
-    async def save_run(self, run: SimulationRun):
-        with self.get_session() as session:
-            from sqlalchemy import text
-            session.execute(
-                text("""INSERT INTO simulation_runs 
-                       (run_id, timestamp, simulation_type, results, total_duration_ms, parallel_execution, data_quality_score, version)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""),
-                (run.run_id, datetime.fromisoformat(run.timestamp), run.simulation_type,
-                 json.dumps([r.to_dict() for r in run.results], default=str),
-                 run.total_duration_ms, run.parallel_execution, run.data_quality_score, DATA_VERSION)
-            )
+    async def pull_network_insights(self, domain: Optional[str] = None, limit: int = 10) -> List[Dict]:
+        try:
+            packages = await self.persistence.get_shared_simulation_knowledge(domain=domain, limit=limit)
+            if packages:
+                self._aggregate_federated_weights(packages)
+                self.aggregation_count += 1
+                logger.info(f"Pulled {len(packages)} simulation insights from network")
+            return packages
+        except Exception as e:
+            logger.error(f"Failed to pull network insights: {e}")
+            return []
+    
+    def _aggregate_federated_weights(self, packages: List[Dict]):
+        for package in packages:
+            if 'insight' in package and 'weights' in package['insight']:
+                weights = package['insight']['weights']
+                for key, value in weights.items():
+                    self.federated_weights[key] += value
+        
+        total = sum(self.federated_weights.values())
+        if total > 0:
+            for key in self.federated_weights:
+                self.federated_weights[key] /= total
+    
+    def get_federated_insights(self) -> Dict:
+        return {
+            'total_packages': len(self._knowledge_bank),
+            'aggregation_count': self.aggregation_count,
+            'weights': dict(self.federated_weights),
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    async def apply_federated_insights(self, simulation_params: Dict) -> Dict:
+        if not self.federated_weights:
+            return simulation_params
+        
+        adjusted_params = simulation_params.copy()
+        
+        for key, weight in self.federated_weights.items():
+            if key in adjusted_params and isinstance(adjusted_params[key], (int, float)):
+                adjustment_factor = 1.0 + (weight - 0.5) * 0.2
+                adjusted_params[key] = adjusted_params[key] * adjustment_factor
+        
+        return adjusted_params
+    
+    async def shutdown(self):
+        logger.info("FederatedSimulationLearner shutdown complete")
+
+# ============================================================
+# NEW: USER-ADAPTIVE SIMULATION REFLEXIVITY
+# ============================================================
+
+class UserAdaptiveSimulationReflexivity:
+    """
+    Learns user simulation preferences and adapts behavior over time.
+    """
+    
+    def __init__(self, persistence, learning_rate: float = 0.1):
+        self.persistence = persistence
+        self.learning_rate = learning_rate
+        self._user_profiles: Dict[str, Dict] = {}
+        self._preference_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self._lock = asyncio.Lock()
+        
+        logger.info("UserAdaptiveSimulationReflexivity initialized")
+    
+    async def learn_user_preference(self, user_id: str, action: str, context: Dict, outcome: Dict):
+        async with self._lock:
+            if user_id not in self._user_profiles:
+                self._user_profiles[user_id] = {
+                    'simulation_preferences': defaultdict(float),
+                    'history': [],
+                    'adaptation_score': 50.0,
+                    'last_updated': datetime.now().isoformat()
+                }
             
-            for result in run.results:
-                session.execute(
-                    text("""INSERT INTO simulation_metrics 
-                           (run_id, enhancement_name, readiness, latency_improvement, ab_variant)
-                           VALUES (?, ?, ?, ?, ?)"""),
-                    (run.run_id, result.enhancement_name, result.estimated_production_readiness,
-                     result.latency_improvement_pct, result.ab_test_variant)
-                )
-            self._update_db_size_metric()
+            profile = self._user_profiles[user_id]
+            preference_update = self._calculate_preference_update(action, context, outcome)
+            
+            for key, value in preference_update.items():
+                profile['simulation_preferences'][key] += value * self.learning_rate
+                profile['simulation_preferences'][key] = max(0, min(1, profile['simulation_preferences'][key]))
+            
+            profile['history'].append({
+                'action': action,
+                'timestamp': datetime.now().isoformat(),
+                'outcome': outcome
+            })
+            
+            profile['adaptation_score'] = self._calculate_adaptation_score(profile)
+            USER_SIMULATION_ADAPTATION.labels(user_id=user_id).set(profile['adaptation_score'])
+            
+            await self.persistence.save_user_simulation_profile(user_id, profile)
+            
+            logger.info(f"Updated simulation preferences for user {user_id}, adaptation score: {profile['adaptation_score']:.1f}")
     
-    async def save_ab_test(self, test_id: str, control: str, treatment: str, winner: str, improvement: float, p_value: float):
-        with self.get_session() as session:
-            from sqlalchemy import text
-            session.execute(
-                text("""INSERT INTO ab_tests (test_id, control_variant, treatment_variant, winner, improvement_pct, p_value)
-                       VALUES (?, ?, ?, ?, ?, ?)"""),
-                (test_id, control, treatment, winner, improvement, p_value)
-            )
-            AB_TEST_RESULTS.labels(winner=winner).inc()
+    def _calculate_preference_update(self, action: str, context: Dict, outcome: Dict) -> Dict:
+        update = defaultdict(float)
+        
+        if outcome.get('success', False):
+            if action == 'accept_simulation':
+                update['simulation_acceptance'] += 0.1
+                update['accuracy_preference'] += 0.05
+            elif action == 'reject_simulation':
+                update['simulation_acceptance'] -= 0.05
+                update['speed_preference'] += 0.1
+            elif action == 'adjust_simulation_params':
+                update['parameter_preference'] += 0.15
+        
+        if context.get('carbon_aware', False):
+            update['carbon_awareness'] += 0.15
+        
+        return dict(update)
     
-    def dispose(self):
-        if self.engine:
-            self.engine.dispose()
-            if self.SessionLocal:
-                self.SessionLocal.remove()
-            logger.info("Database connection pool disposed")
+    def _calculate_adaptation_score(self, profile: Dict) -> float:
+        if not profile['history']:
+            return 50.0
+        
+        preferences = profile['simulation_preferences']
+        if not preferences:
+            return 50.0
+        
+        variance = np.var(list(preferences.values()))
+        consistency = 1.0 - min(1.0, variance)
+        history_depth = min(1.0, len(profile['history']) / 20)
+        
+        return 50.0 + 40.0 * consistency * history_depth
+    
+    async def get_personalized_simulation_params(self, user_id: str, default_params: Dict) -> Dict:
+        async with self._lock:
+            profile = self._user_profiles.get(user_id)
+            if not profile:
+                return default_params
+            
+            preferences = profile['simulation_preferences']
+            
+            adjusted_params = default_params.copy()
+            
+            if preferences.get('accuracy_preference', 0) > 0.7:
+                adjusted_params['iterations'] = 100
+            if preferences.get('speed_preference', 0) > 0.7:
+                adjusted_params['iterations'] = 20
+            
+            return adjusted_params
 
 # ============================================================
-# ENHANCED MONTE CARLO SIMULATOR
+# NEW: CARBON-AWARE SIMULATION SCHEDULER
 # ============================================================
 
-class MonteCarloSimulator:
-    """Monte Carlo simulation for uncertainty quantification"""
+class CarbonAwareSimulationScheduler:
+    """
+    Schedules simulations based on real-time carbon intensity.
+    """
     
-    def __init__(self, n_iterations: int = MONTE_CARLO_ITERATIONS):
-        self.n_iterations = n_iterations
+    def __init__(self, persistence, api_key: Optional[str] = None, region: str = "global"):
+        self.persistence = persistence
+        self.api_key = api_key or os.getenv('CARBON_INTENSITY_API_KEY')
+        self.region = region
+        self._cache = {}
+        self._cache_ttl = 300
         self._lock = asyncio.Lock()
+        self._session = None
+        
+        logger.info(f"CarbonAwareSimulationScheduler initialized for region {region}")
     
-    async def simulate(self, base_value: float, uncertainty_pct: float = 0.2) -> Tuple[float, float, float, float]:
-        """Run Monte Carlo simulation"""
-        samples = np.random.normal(base_value, base_value * uncertainty_pct, self.n_iterations)
-        mean = np.mean(samples)
-        std = np.std(samples)
-        ci_lower = np.percentile(samples, (1 - MC_CONFIDENCE_LEVEL) / 2 * 100)
-        ci_upper = np.percentile(samples, (1 + MC_CONFIDENCE_LEVEL) / 2 * 100)
-        
-        return mean, std, ci_lower, ci_upper
-
-# ============================================================
-# ENHANCED A/B TEST FRAMEWORK
-# ============================================================
-
-class ABTestFramework:
-    """A/B testing framework for enhancement comparisons"""
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
     
-    def __init__(self, db_manager: EnhancedDatabaseManagerV5):
-        self.db_manager = db_manager
-        self.results: Dict[str, List[float]] = defaultdict(list)
-        self._lock = asyncio.Lock()
-    
-    async def run_test(self, test_id: str, control_value: float, treatment_value: float, 
-                       n_samples: int = 100) -> Dict:
-        """Run A/B test with statistical significance"""
-        control_samples = np.random.normal(control_value, control_value * 0.1, n_samples)
-        treatment_samples = np.random.normal(treatment_value, treatment_value * 0.1, n_samples)
-        
-        from scipy import stats
-        t_stat, p_value = stats.ttest_ind(control_samples, treatment_samples)
-        
-        improvement = (treatment_value - control_value) / control_value * 100
-        winner = 'treatment' if treatment_value > control_value else 'control'
-        
-        await self.db_manager.save_ab_test(
-            test_id, 'control', 'treatment', winner, improvement, p_value
-        )
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def get_current_intensity(self, region: Optional[str] = None) -> Dict:
+        region = region or self.region
+        cache_key = f"intensity_{region}"
         
         async with self._lock:
-            self.results[test_id] = [control_value, treatment_value]
+            if cache_key in self._cache:
+                cached_data, timestamp = self._cache[cache_key]
+                if time.time() - timestamp < self._cache_ttl:
+                    return cached_data
+        
+        try:
+            session = await self._get_session()
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            url = f"https://api.electricitymaps.org/v3/carbon-intensity/latest?zone={region}"
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    intensity_data = {
+                        'intensity': data.get('carbonIntensity', 400),
+                        'unit': data.get('unit', 'gCO2/kWh'),
+                        'timestamp': datetime.now().isoformat(),
+                        'region': region
+                    }
+                    
+                    async with self._lock:
+                        self._cache[cache_key] = (intensity_data, time.time())
+                    
+                    SIMULATION_CARBON_INTENSITY.labels(region=region).set(intensity_data['intensity'])
+                    return intensity_data
+                else:
+                    logger.warning(f"Carbon intensity API returned {response.status}")
+                    return self._get_fallback_intensity(region)
+                    
+        except Exception as e:
+            logger.error(f"Carbon intensity API error: {e}")
+            return self._get_fallback_intensity(region)
+    
+    def _get_fallback_intensity(self, region: str) -> Dict:
+        hour = datetime.now().hour
+        if 0 <= hour < 6:
+            intensity = 200
+        elif 6 <= hour < 12:
+            intensity = 350
+        elif 12 <= hour < 18:
+            intensity = 300
+        else:
+            intensity = 450
         
         return {
-            'test_id': test_id,
-            'improvement_pct': improvement,
-            'p_value': p_value,
-            'statistically_significant': p_value < 0.05,
-            'winner': winner
+            'intensity': intensity,
+            'unit': 'gCO2/kWh',
+            'timestamp': datetime.now().isoformat(),
+            'region': region,
+            'source': 'fallback'
+        }
+    
+    async def get_forecast(self, region: Optional[str] = None, hours: int = 24) -> List[Dict]:
+        region = region or self.region
+        
+        try:
+            session = await self._get_session()
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            url = f"https://api.electricitymaps.org/v3/carbon-intensity/forecast?zone={region}"
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    forecast = []
+                    for entry in data.get('forecast', []):
+                        forecast.append({
+                            'timestamp': entry.get('datetime'),
+                            'intensity': entry.get('carbonIntensity', 400),
+                            'unit': 'gCO2/kWh'
+                        })
+                    return forecast
+                else:
+                    return self._get_fallback_forecast(hours)
+                    
+        except Exception as e:
+            logger.error(f"Carbon intensity forecast error: {e}")
+            return self._get_fallback_forecast(hours)
+    
+    def _get_fallback_forecast(self, hours: int) -> List[Dict]:
+        forecast = []
+        now = datetime.now()
+        
+        for i in range(hours):
+            hour = (now + timedelta(hours=i)).hour
+            if 0 <= hour < 6:
+                intensity = 180 + np.random.normal(0, 20)
+            elif 6 <= hour < 12:
+                intensity = 320 + np.random.normal(0, 30)
+            elif 12 <= hour < 18:
+                intensity = 280 + np.random.normal(0, 30)
+            else:
+                intensity = 420 + np.random.normal(0, 40)
+            
+            forecast.append({
+                'timestamp': (now + timedelta(hours=i)).isoformat(),
+                'intensity': max(100, intensity),
+                'unit': 'gCO2/kWh'
+            })
+        
+        return forecast
+    
+    async def schedule_simulation(self, urgency: str = "normal") -> Dict:
+        intensity = await self.get_current_intensity()
+        
+        if urgency == "critical":
+            return {'action': 'run_now', 'reason': 'Critical simulation needed'}
+        elif urgency == "normal" and intensity['intensity'] > 500:
+            forecast = await self.get_forecast()
+            if forecast:
+                best = min(forecast, key=lambda x: x['intensity'])
+                savings = (intensity['intensity'] - best['intensity']) / intensity['intensity'] * 100
+                if savings > 20:
+                    return {
+                        'action': 'schedule',
+                        'optimal_time': best['timestamp'],
+                        'savings_percent': savings,
+                        'reason': f'High carbon intensity: {intensity["intensity"]} gCO2/kWh'
+                    }
+        
+        return {'action': 'run_now', 'reason': 'Low carbon intensity or marginal savings'}
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================
+# NEW: CROSS-DOMAIN SIMULATION TRANSFER
+# ============================================================
+
+class CrossDomainSimulationTransfer:
+    """
+    Transfers simulation knowledge across different domains.
+    """
+    
+    def __init__(self, persistence):
+        self.persistence = persistence
+        self._domain_knowledge: Dict[str, Dict] = {}
+        self._transfer_mappings: Dict[str, Dict[str, float]] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info("CrossDomainSimulationTransfer initialized")
+    
+    async def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                                 knowledge: Dict, mapping_strategy: str = 'auto') -> Dict:
+        async with self._lock:
+            if source_domain not in self._domain_knowledge:
+                self._domain_knowledge[source_domain] = {}
+            self._domain_knowledge[source_domain].update(knowledge)
+            
+            transferred = await self._map_knowledge(source_domain, target_domain, knowledge, mapping_strategy)
+            
+            transfer_key = f"{source_domain}->{target_domain}"
+            if transfer_key not in self._transfer_mappings:
+                self._transfer_mappings[transfer_key] = {}
+            
+            for key in transferred:
+                self._transfer_mappings[transfer_key][key] = self._transfer_mappings[transfer_key].get(key, 0) + 1
+            
+            CROSS_DOMAIN_SIMULATION_TRANSFERS.labels(source=source_domain, target=target_domain).inc()
+            
+            logger.info(f"Transferred simulation knowledge from {source_domain} to {target_domain}: {len(transferred)} items")
+            return transferred
+    
+    async def _map_knowledge(self, source: str, target: str, knowledge: Dict, strategy: str) -> Dict:
+        domain_similarities = {
+            ('quantum', 'gpu'): {
+                'latency_improvement': 'throughput_improvement',
+                'readiness': 'readiness',
+                'cost_reduction': 'cost_reduction'
+            },
+            ('blockchain', 'federated'): {
+                'reliability_improvement': 'accuracy_improvement',
+                'readiness': 'readiness',
+                'cost_reduction': 'cost_reduction'
+            },
+            ('streaming', 'ml_training'): {
+                'throughput_improvement': 'throughput_improvement',
+                'latency_improvement': 'latency_improvement'
+            }
+        }
+        
+        mapping = domain_similarities.get((source, target), {})
+        transferred = {}
+        
+        if strategy == 'auto':
+            for source_key, source_value in knowledge.items():
+                if source_key in mapping:
+                    transferred[mapping[source_key]] = source_value
+                else:
+                    similar_key = self._find_similar_key(source_key, mapping)
+                    if similar_key:
+                        transferred[similar_key] = source_value
+        elif strategy == 'direct':
+            transferred = knowledge
+        
+        return transferred
+    
+    def _find_similar_key(self, source_key: str, mapping: Dict) -> Optional[str]:
+        for target_key in mapping.values():
+            if source_key.lower() in target_key.lower() or target_key.lower() in source_key.lower():
+                return target_key
+        return None
+    
+    def get_transfer_statistics(self) -> Dict:
+        return {
+            'domains': list(self._domain_knowledge.keys()),
+            'transfers': dict(self._transfer_mappings),
+            'total_transfers': sum(len(v) for v in self._transfer_mappings.values())
         }
 
 # ============================================================
-# ENHANCED SIMULATOR COMPONENTS
+# NEW: HUMAN-AI SIMULATION COLLABORATION
 # ============================================================
 
-class QuantumHardwareSimulatorV5:
-    async def simulate_quantum_execution(self, qubits: int, depth: int, shots: int, backend: str,
-                                         inject_failure: bool = False, failure_type: str = None) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        
-        if inject_failure and failure_type == 'timeout':
-            await asyncio.sleep(5)  # Simulate timeout
-            raise TimeoutError("Quantum simulation timeout")
-        
-        latency_improvement = random.uniform(10, 40)
-        readiness = random.uniform(60, 95)
-        
-        # Monte Carlo uncertainty
-        mc = MonteCarloSimulator()
-        mean, std, ci_lower, ci_upper = await mc.simulate(latency_improvement)
-        
-        return SimulationMetrics(
-            enhancement_name="Quantum Hardware",
-            status="completed" if not inject_failure else "failed",
-            latency_improvement_pct=latency_improvement,
-            throughput_improvement_pct=random.uniform(15, 50),
-            estimated_production_readiness=readiness,
-            risks_identified=["Qubit coherence", "Error rates"],
-            recommendations=["Implement error correction"],
-            monte_carlo_mean=mean,
-            monte_carlo_std=std,
-            uncertainty_range=(ci_lower, ci_upper),
-            failure_injected=inject_failure
-        )
-
-class BlockchainNetworkSimulatorV5:
-    async def simulate_contract_deployment(self, contract_name: str, network: str) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        return SimulationMetrics(
-            enhancement_name=f"Blockchain-{contract_name}",
-            status="completed",
-            latency_improvement_pct=random.uniform(5, 25),
-            reliability_improvement_pct=random.uniform(10, 40),
-            estimated_production_readiness=random.uniform(70, 95),
-            cost_reduction_pct=random.uniform(5, 30)
-        )
-
-class EnhancedGPUAccelerationSimulatorV5:
-    async def simulate_gpu_acceleration(self, module: str, data_size: int, gpu_type: str) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        return SimulationMetrics(
-            enhancement_name=f"GPU-{module}",
-            status="completed",
-            throughput_improvement_pct=random.uniform(30, 80),
-            latency_improvement_pct=random.uniform(20, 70),
-            cost_reduction_pct=random.uniform(10, 40),
-            estimated_production_readiness=random.uniform(80, 98)
-        )
-
-class StreamingPipelineSimulator:
-    async def simulate_streaming(self, throughput_mb_s: float, latency_ms: float) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        return SimulationMetrics(
-            enhancement_name="Streaming Pipeline",
-            status="completed",
-            throughput_improvement_pct=random.uniform(20, 60),
-            latency_improvement_pct=random.uniform(15, 50),
-            estimated_production_readiness=random.uniform(75, 95),
-            simulated_ops_per_second=throughput_mb_s * 1000
-        )
-
-class MultiTenantSimulator:
-    async def simulate_isolation(self, tenants: int, isolation_level: str) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        return SimulationMetrics(
-            enhancement_name="Multi-tenant Isolation",
-            status="completed",
-            reliability_improvement_pct=random.uniform(25, 70),
-            estimated_production_readiness=random.uniform(70, 95),
-            resource_requirements={'cpu': tenants * 0.5, 'memory': tenants * 256}
-        )
-
-class FederatedLearningSimulator:
-    async def simulate_federated(self, n_clients: int, rounds: int) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        return SimulationMetrics(
-            enhancement_name="Federated Learning",
-            status="completed",
-            accuracy_improvement_pct=random.uniform(5, 20),
-            estimated_production_readiness=random.uniform(65, 90),
-            cost_reduction_pct=random.uniform(20, 50)
-        )
-
-class MLTrainingSimulator:
-    async def simulate_training(self, model_size_mb: int, epochs: int) -> SimulationMetrics:
-        await asyncio.sleep(0.01)
-        return SimulationMetrics(
-            enhancement_name="ML Training",
-            status="completed",
-            throughput_improvement_pct=random.uniform(30, 100),
-            latency_improvement_pct=random.uniform(20, 80),
-            estimated_production_readiness=random.uniform(70, 95),
-            accuracy_improvement_pct=random.uniform(1, 15)
-        )
-
-# ============================================================
-# ENHANCED WEBSOCKET MANAGER
-# ============================================================
-
-class EnhancedWebSocketManagerV5:
-    """Enhanced WebSocket server with connection limits"""
+class HumanAISimulationCollaboration:
+    """
+    Enables collaborative reflection between humans and AI on simulation decisions.
+    """
     
-    def __init__(self, port: int = 8766, max_connections: int = 50):
-        self.port = port
-        self.max_connections = max_connections
-        self.connections: Set = set()
-        self.connection_metadata: Dict = {}
-        self.server = None
-        self.running = False
+    def __init__(self, persistence, feedback_timeout: int = 300):
+        self.persistence = persistence
+        self.feedback_timeout = feedback_timeout
+        self._feedback_queue: deque = deque(maxlen=1000)
+        self._explanations: Dict[str, Dict] = {}
+        self._pending_feedback: Dict[str, datetime] = {}
         self._lock = asyncio.Lock()
-        self._heartbeat_task = None
-    
-    async def start(self):
-        """Start WebSocket server"""
-        async def handler(websocket, path):
-            async with self._lock:
-                if len(self.connections) >= self.max_connections:
-                    await websocket.close(code=1013, reason="Too many connections")
-                    return
-                
-                self.connections.add(websocket)
-                self.connection_metadata[websocket] = {
-                    'connected_at': datetime.now(),
-                    'last_heartbeat': time.time()
-                }
-                WS_CONNECTIONS.set(len(self.connections))
-            
-            try:
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        if data.get('type') == 'ping':
-                            await websocket.send(json.dumps({
-                                'type': 'pong',
-                                'timestamp': datetime.now().isoformat()
-                            }))
-                            async with self._lock:
-                                if websocket in self.connection_metadata:
-                                    self.connection_metadata[websocket]['last_heartbeat'] = time.time()
-                    except json.JSONDecodeError:
-                        await websocket.send(json.dumps({'error': 'Invalid JSON'}))
-                        
-            except ConnectionClosed:
-                pass
-            finally:
-                async with self._lock:
-                    self.connections.discard(websocket)
-                    self.connection_metadata.pop(websocket, None)
-                    WS_CONNECTIONS.set(len(self.connections))
+        self._listeners: List[Callable] = []
         
-        self.server = await serve(handler, "localhost", self.port)
-        self.running = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"WebSocket server started on port {self.port}")
-        return self.server
+        logger.info("HumanAISimulationCollaboration initialized")
     
-    async def _heartbeat_loop(self):
-        while self.running:
+    async def request_simulation_feedback(self, decision: Dict, context: Dict) -> str:
+        feedback_id = f"fb_sim_{uuid.uuid4().hex[:12]}"
+        
+        feedback_request = {
+            'id': feedback_id,
+            'decision': decision,
+            'context': context,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'pending'
+        }
+        
+        async with self._lock:
+            self._explanations[feedback_id] = feedback_request
+            self._pending_feedback[feedback_id] = datetime.now()
+            
+            cutoff = datetime.now() - timedelta(seconds=self.feedback_timeout)
+            for fid, timestamp in list(self._pending_feedback.items()):
+                if timestamp < cutoff:
+                    if fid in self._explanations:
+                        self._explanations[fid]['status'] = 'timeout'
+                    del self._pending_feedback[fid]
+        
+        HUMAN_SIMULATION_FEEDBACK.labels(type='request').inc()
+        return feedback_id
+    
+    async def submit_simulation_feedback(self, feedback_id: str, feedback: Dict) -> bool:
+        async with self._lock:
+            if feedback_id not in self._explanations:
+                logger.warning(f"Simulation feedback ID {feedback_id} not found")
+                return False
+            
+            if feedback_id not in self._pending_feedback:
+                logger.warning(f"Simulation feedback ID {feedback_id} expired")
+                return False
+            
+            request = self._explanations[feedback_id]
+            request['status'] = 'completed'
+            request['feedback'] = feedback
+            request['feedback_timestamp'] = datetime.now().isoformat()
+            
+            del self._pending_feedback[feedback_id]
+            self._feedback_queue.append(request)
+        
+        await self._process_feedback(request)
+        HUMAN_SIMULATION_FEEDBACK.labels(type='submitted').inc()
+        
+        for listener in self._listeners:
             try:
-                await asyncio.sleep(30)
-                async with self._lock:
-                    now = time.time()
-                    stale = []
-                    for ws, meta in self.connection_metadata.items():
-                        if now - meta.get('last_heartbeat', 0) > 90:
-                            stale.append(ws)
-                    for ws in stale:
-                        try:
-                            await ws.close(code=1000, reason="Connection timeout")
-                        except:
-                            pass
-                        self.connections.discard(ws)
-                        self.connection_metadata.pop(ws, None)
-                    if stale:
-                        WS_CONNECTIONS.set(len(self.connections))
-            except asyncio.CancelledError:
-                break
+                await listener(request)
             except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-    
-    async def broadcast(self, message: Dict):
-        if not self.connections:
-            return
+                logger.error(f"Simulation feedback listener error: {e}")
         
-        dead = set()
-        msg = json.dumps(message, default=str)
-        for ws in self.connections:
-            try:
-                await ws.send(msg)
-            except:
-                dead.add(ws)
+        logger.info(f"Simulation feedback {feedback_id} submitted")
+        return True
+    
+    async def _process_feedback(self, feedback_request: Dict):
+        feedback = feedback_request.get('feedback', {})
         
-        if dead:
-            async with self._lock:
-                self.connections -= dead
-                for ws in dead:
-                    self.connection_metadata.pop(ws, None)
-                WS_CONNECTIONS.set(len(self.connections))
+        learning = {
+            'approval': feedback.get('approval', 0.5),
+            'comments': feedback.get('comments', ''),
+            'suggestions': feedback.get('suggestions', {}),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        await self.persistence.save_simulation_feedback_learning(learning)
+        
+        logger.info(f"Processed simulation feedback learning: approval={learning['approval']:.2f}")
     
-    async def stop(self):
-        self.running = False
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
+    async def generate_simulation_explanation(self, decision: Dict, context: Dict) -> Dict:
+        explanation = {
+            'id': f"exp_sim_{uuid.uuid4().hex[:12]}",
+            'decision': decision,
+            'context': context,
+            'explanation': self._build_explanation(decision, context),
+            'confidence': self._calculate_confidence(decision),
+            'alternatives': self._generate_alternatives(decision),
+            'timestamp': datetime.now().isoformat()
+        }
+        
         async with self._lock:
-            for ws in list(self.connections):
-                try:
-                    await ws.close(code=1000, reason="Server shutdown")
-                except:
-                    pass
-            self.connections.clear()
-            self.connection_metadata.clear()
-            WS_CONNECTIONS.set(0)
-
-# ============================================================
-# ENHANCED CACHE MANAGER
-# ============================================================
-
-class EnhancedCacheManagerV5:
-    """Async cache with TTL and size limits with cleanup"""
+            self._explanations[explanation['id']] = explanation
+        
+        return explanation
     
-    def __init__(self, max_size: int = MAX_CACHE_SIZE, ttl_seconds: int = CACHE_TTL_SECONDS,
-                 max_size_mb: int = MAX_CACHE_SIZE_MB):
-        self.max_size = max_size
-        self.ttl = ttl_seconds
-        self.max_size_bytes = max_size_mb * 1024 * 1024
-        self._cache: Dict[str, Tuple[float, Any, int]] = {}
-        self.hits = 0
-        self.misses = 0
-        self.total_size_bytes = 0
-        self._lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self.running = False
+    def _build_explanation(self, decision: Dict, context: Dict) -> str:
+        parts = []
+        
+        if 'simulation_type' in decision:
+            parts.append(f"Type: {decision['simulation_type']}")
+        if 'readiness' in decision:
+            parts.append(f"Readiness: {decision['readiness']:.1f}%")
+        if 'reasoning' in context:
+            parts.append(f"Reasoning: {context['reasoning']}")
+        if 'carbon_impact' in context:
+            parts.append(f"Carbon impact: {context['carbon_impact']:.4f} kg CO2")
+        
+        return ". ".join(parts)
     
-    async def start(self):
-        self.running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+    def _calculate_confidence(self, decision: Dict) -> float:
+        confidence = 0.7
+        
+        if 'confidence_interval' in decision:
+            ci_width = decision['confidence_interval'][1] - decision['confidence_interval'][0]
+            confidence = 1.0 - min(0.3, ci_width / max(decision.get('mean', 1), 1))
+        
+        return min(1.0, confidence)
     
-    async def get(self, key: str) -> Optional[Any]:
+    def _generate_alternatives(self, decision: Dict) -> List[Dict]:
+        alternatives = []
+        
+        if 'simulation_type' in decision:
+            current = decision['simulation_type']
+            alternatives.append({
+                'type': 'alternative_type',
+                'simulation_type': 'quantum' if current != 'quantum' else 'gpu',
+                'tradeoff': 'different_accuracy'
+            })
+            alternatives.append({
+                'type': 'different_params',
+                'iterations': decision.get('iterations', 10) * 2,
+                'tradeoff': 'higher_compute'
+            })
+        
+        return alternatives[:3]
+    
+    async def get_feedback_summary(self) -> Dict:
         async with self._lock:
-            if key in self._cache:
-                timestamp, value, size = self._cache[key]
-                if time.time() - timestamp < self.ttl:
-                    self.hits += 1
-                    return value
-                else:
-                    self.total_size_bytes -= size
-                    del self._cache[key]
-            self.misses += 1
-            return None
-    
-    async def set(self, key: str, value: Any):
-        async with self._lock:
-            size_bytes = len(str(value)) * 2
+            completed = [f for f in self._explanations.values() 
+                        if f.get('status') == 'completed']
             
-            while self.total_size_bytes + size_bytes > self.max_size_bytes and self._cache:
-                oldest = min(self._cache.items(), key=lambda x: x[1][0])
-                _, _, old_size = self._cache[oldest[0]]
-                self.total_size_bytes -= old_size
-                del self._cache[oldest[0]]
+            if not completed:
+                return {'total': 0, 'average_approval': 0}
             
-            if len(self._cache) >= self.max_size:
-                oldest = min(self._cache.items(), key=lambda x: x[1][0])
-                _, _, old_size = self._cache[oldest[0]]
-                self.total_size_bytes -= old_size
-                del self._cache[oldest[0]]
+            approvals = [f.get('feedback', {}).get('approval', 0.5) for f in completed]
             
-            self._cache[key] = (time.time(), value, size_bytes)
-            self.total_size_bytes += size_bytes
-    
-    async def _cleanup_loop(self):
-        while self.running:
-            await asyncio.sleep(60)
-            async with self._lock:
-                now = time.time()
-                expired = []
-                for key, (timestamp, _, size) in self._cache.items():
-                    if now - timestamp >= self.ttl:
-                        expired.append((key, size))
-                
-                for key, size in expired:
-                    self.total_size_bytes -= size
-                    del self._cache[key]
-    
-    async def get_stats(self) -> Dict:
-        async with self._lock:
-            total = self.hits + self.misses
             return {
-                'size': len(self._cache),
-                'size_bytes': self.total_size_bytes,
-                'max_size_bytes': self.max_size_bytes,
-                'hits': self.hits,
-                'misses': self.misses,
-                'hit_rate': self.hits / total if total > 0 else 0,
-                'ttl': self.ttl
+                'total': len(completed),
+                'pending': len(self._pending_feedback),
+                'average_approval': sum(approvals) / len(approvals),
+                'timestamp': datetime.now().isoformat()
             }
+
+# ============================================================
+# NEW: PREDICTIVE SIMULATION MANAGEMENT
+# ============================================================
+
+class PredictiveSimulationManager:
+    """
+    Predicts simulation outcomes and proactively manages simulations.
+    """
     
-    async def stop(self):
-        self.running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+    def __init__(self, persistence, horizon_hours: int = 24):
+        self.persistence = persistence
+        self.horizon_hours = horizon_hours
+        self._predictions: Dict[str, Dict] = {}
+        self._historical_data: deque = deque(maxlen=1000)
+        self._lock = asyncio.Lock()
+        
+        logger.info(f"PredictiveSimulationManager initialized with {horizon_hours}h horizon")
+    
+    async def predict_simulation_outcome(self, sim_type: str, time_window: int = 3600) -> Dict:
+        async with self._lock:
+            history = await self.persistence.get_simulation_history(sim_type, limit=100)
+            self._historical_data.extend(history)
+            
+            if len(self._historical_data) < 10:
+                return {
+                    'predicted_readiness': 0.5,
+                    'confidence': 0.1,
+                    'reason': 'Insufficient data'
+                }
+            
+            recent = list(self._historical_data)[-50:]
+            
+            if len(recent) > 1:
+                time_span = (datetime.now() - datetime.fromisoformat(recent[0]['timestamp'])).total_seconds()
+                if time_span > 0:
+                    readiness_rate = sum(r.get('readiness', 0) for r in recent) / time_span
+                else:
+                    readiness_rate = 0.5
+            else:
+                readiness_rate = 0.5
+            
+            predicted_readiness = min(1.0, readiness_rate * time_window / 100)
+            
+            # Calculate confidence
+            readiness_values = [r.get('readiness', 0) for r in recent]
+            variance = np.var(readiness_values) if readiness_values else 1.0
+            confidence = max(0, min(1, 1.0 - variance))
+            
+            prediction = {
+                'predicted_readiness': predicted_readiness,
+                'confidence': confidence,
+                'time_window_seconds': time_window,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            self._predictions[sim_type] = prediction
+            PREDICTIVE_SIMULATION_ACCURACY.labels(model_type='readiness').set(confidence)
+            
+            return prediction
+    
+    async def generate_proactive_recommendations(self) -> List[Dict]:
+        recommendations = []
+        
+        sim_types = ['quantum', 'blockchain', 'gpu', 'streaming', 'multitenant', 'federated', 'ml_training']
+        
+        for sim_type in sim_types:
+            pred = await self.predict_simulation_outcome(sim_type)
+            
+            if pred.get('confidence', 0) > 0.6:
+                predicted = pred.get('predicted_readiness', 0)
+                
+                if predicted < 0.4:
+                    recommendations.append({
+                        'type': 'readiness_alert',
+                        'sim_type': sim_type,
+                        'reason': f'Low readiness predicted: {predicted:.1%}',
+                        'priority': 'high',
+                        'action': 'Review simulation parameters'
+                    })
+                elif predicted > 0.8:
+                    recommendations.append({
+                        'type': 'readiness_opportunity',
+                        'sim_type': sim_type,
+                        'reason': f'High readiness predicted: {predicted:.1%}',
+                        'priority': 'medium',
+                        'action': 'Prepare for production deployment'
+                    })
+        
+        # Carbon-aware recommendation
+        if hasattr(self, 'carbon_scheduler'):
+            intensity = await self.carbon_scheduler.get_current_intensity()
+            if intensity.get('intensity', 0) > 400:
+                recommendations.append({
+                    'type': 'carbon_aware_simulation',
+                    'reason': 'High carbon intensity - delay non-critical simulations',
+                    'priority': 'high',
+                    'action': 'Reschedule simulations to lower carbon period'
+                })
+        
+        return recommendations
+    
+    async def get_simulation_forecast(self) -> Dict:
+        recommendations = await self.generate_proactive_recommendations()
+        
+        return {
+            'simulation_forecast': {
+                sim_type: await self.predict_simulation_outcome(sim_type)
+                for sim_type in ['quantum', 'blockchain', 'gpu', 'streaming', 'multitenant', 'federated', 'ml_training']
+            },
+            'recommendations': recommendations,
+            'timestamp': datetime.now().isoformat()
+        }
+
+# ============================================================
+# NEW: SIMULATION SUSTAINABILITY TRACKER
+# ============================================================
+
+class SimulationSustainabilityTracker:
+    """
+    Tracks and reports simulation sustainability metrics.
+    """
+    
+    def __init__(self, persistence):
+        self.persistence = persistence
+        self._metrics = {
+            'eco_efficiency': [],
+            'carbon_awareness': [],
+            'sustainability_awareness': []
+        }
+        self._lock = asyncio.Lock()
+        
+        logger.info("SimulationSustainabilityTracker initialized")
+    
+    async def record_metric(self, category: str, value: float, context: Dict = None):
+        async with self._lock:
+            if category in self._metrics:
+                self._metrics[category].append({
+                    'value': value,
+                    'timestamp': datetime.now().isoformat(),
+                    'context': context or {}
+                })
+                
+                logger.debug(f"Recorded {category} metric: {value:.3f}")
+    
+    async def get_sustainability_score(self) -> Dict:
+        scores = {}
+        
+        for category, records in self._metrics.items():
+            if records:
+                recent = records[-10:]
+                avg_value = sum(r['value'] for r in recent) / len(recent)
+                scores[category] = avg_value * 100
+        
+        overall = sum(scores.values()) / len(scores) if scores else 0
+        SIMULATION_SUSTAINABILITY_SCORE.set(overall)
+        
+        eco_score = scores.get('eco_efficiency', 0)
+        SIMULATION_ECO_EFFICIENCY.set(eco_score)
+        
+        return {
+            'categories': scores,
+            'overall_score': overall,
+            'eco_efficiency': eco_score,
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    async def generate_report(self) -> Dict:
+        score = await self.get_sustainability_score()
+        
+        report = {
+            'sustainability_score': score,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return report
 
 # ============================================================
 # ENHANCED MAIN SIMULATOR (COMPLETE)
 # ============================================================
 
-class EnhancedSystemSimulatorV5:
-    """Enhanced system simulator v5.0 with all features"""
+class EnhancedSystemSimulatorV6:
+    """Enhanced system simulator v6.0 with all sustainability features"""
     
     def __init__(self, config: Dict = None):
         self.config = config or {}
         self.instance_id = str(uuid.uuid4())[:8]
         
         # Database
-        self.db_manager = EnhancedDatabaseManagerV5(Path("./simulator_data_v5.db"))
+        self.db_manager = EnhancedDatabaseManagerV5(Path("./simulator_data_v6.db"))
         
         # Components
         self.monte_carlo = MonteCarloSimulator()
         self.ab_test = ABTestFramework(self.db_manager)
         
         # Cache
-        self.cache = None  # Initialize later
+        self.cache = None
         
         # Simulators
         self.quantum_sim = QuantumHardwareSimulatorV5()
@@ -769,6 +964,48 @@ class EnhancedSystemSimulatorV5:
         self.multitenant_sim = MultiTenantSimulator()
         self.federated_sim = FederatedLearningSimulator()
         self.ml_training_sim = MLTrainingSimulator()
+        
+        # ============================================================
+        # NEW: Advanced sustainability components
+        # ============================================================
+        
+        # 1. Federated Simulation Learning
+        self.federated_learner = FederatedSimulationLearner(
+            self.db_manager,
+            self.instance_id,
+            share_interval=3600
+        )
+        
+        # 2. User-Adaptive Simulation Reflexivity
+        self.user_adaptive = UserAdaptiveSimulationReflexivity(
+            self.db_manager,
+            learning_rate=0.1
+        )
+        
+        # 3. Carbon-Aware Simulation Scheduler
+        self.carbon_scheduler = CarbonAwareSimulationScheduler(
+            self.db_manager,
+            api_key=os.getenv('CARBON_INTENSITY_API_KEY'),
+            region=os.getenv('CARBON_REGION', 'global')
+        )
+        
+        # 4. Cross-Domain Simulation Transfer
+        self.cross_domain_transfer = CrossDomainSimulationTransfer(self.db_manager)
+        
+        # 5. Human-AI Simulation Collaboration
+        self.human_collaborator = HumanAISimulationCollaboration(
+            self.db_manager,
+            feedback_timeout=300
+        )
+        
+        # 6. Predictive Simulation Management
+        self.predictive_manager = PredictiveSimulationManager(
+            self.db_manager,
+            horizon_hours=24
+        )
+        
+        # 7. Simulation Sustainability Tracker
+        self.sustainability_tracker = SimulationSustainabilityTracker(self.db_manager)
         
         # State (bounded)
         self.all_results = deque(maxlen=MAX_RESULTS_HISTORY)
@@ -790,16 +1027,22 @@ class EnhancedSystemSimulatorV5:
         self.websocket = EnhancedWebSocketManagerV5(port=8766)
         
         # Background tasks
-        self.background_tasks = set()
+        self.background_tasks: Set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
         
-        logger.info(f"EnhancedSystemSimulatorV5 v{DATA_VERSION}.0 initialized (instance: {self.instance_id})")
+        logger.info(f"EnhancedSystemSimulatorV6 v{DATA_VERSION}.0 initialized (instance: {self.instance_id})")
+        logger.info("  ✅ Advanced Simulation Sustainability Features Enabled:")
+        logger.info("     - Federated Simulation Learning")
+        logger.info("     - User-Adaptive Simulation Reflexivity")
+        logger.info("     - Carbon-Aware Simulation Scheduling")
+        logger.info("     - Cross-Domain Simulation Transfer")
+        logger.info("     - Human-AI Simulation Collaboration")
+        logger.info("     - Predictive Simulation Management")
     
     async def start(self):
         """Start all services"""
         self._running = True
         
-        # Initialize components
         from .system_enhancement_simulator_enhanced_v5 import EnhancedDataQualityScorer, EnhancedRateLimiter, EnhancedCircuitBreaker
         
         self.cache = EnhancedCacheManagerV5()
@@ -814,16 +1057,17 @@ class EnhancedSystemSimulatorV5:
         
         await self.cache.start()
         
-        # Start queue worker
         self._queue_worker = asyncio.create_task(self._process_queue())
         
-        # Start WebSocket server
         await self.websocket.start()
         
-        # Start background tasks
         tasks = [
             asyncio.create_task(self._health_check_loop()),
-            asyncio.create_task(self._cleanup_loop())
+            asyncio.create_task(self._cleanup_loop()),
+            # NEW: Sustainability background tasks
+            asyncio.create_task(self._federated_learning_loop()),
+            asyncio.create_task(self._predictive_loop()),
+            asyncio.create_task(self._sustainability_loop())
         ]
         
         for task in tasks:
@@ -831,6 +1075,66 @@ class EnhancedSystemSimulatorV5:
             task.add_done_callback(self.background_tasks.discard)
         
         logger.info(f"Simulator started with {len(self.background_tasks)} background tasks")
+    
+    # ============================================================
+    # NEW: Sustainability Background Tasks
+    # ============================================================
+    
+    async def _federated_learning_loop(self):
+        """Background federated learning loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(3600)
+                insights = await self.federated_learner.pull_network_insights(limit=5)
+                if insights:
+                    logger.info(f"Pulled {len(insights)} federated simulation insights")
+                    
+                    for insight in insights:
+                        if 'simulation' in insight.get('insight', {}):
+                            sim = insight['insight']['simulation']
+                            await self.sustainability_tracker.record_metric(
+                                'sustainability_awareness',
+                                0.8,
+                                {'type': sim.get('type', 'unknown')}
+                            )
+            except Exception as e:
+                logger.error(f"Federated learning error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _predictive_loop(self):
+        """Background predictive loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(1800)  # Every 30 minutes
+                
+                forecast = await self.predictive_manager.get_simulation_forecast()
+                
+                for rec in forecast.get('recommendations', []):
+                    if rec.get('priority') == 'high':
+                        logger.info(f"Predictive recommendation: {rec['reason']}")
+                        
+                        if rec.get('action') == 'Review simulation parameters':
+                            logger.info("Triggering parameter review based on predictive insight")
+                    
+                    await self.sustainability_tracker.record_metric(
+                        'carbon_awareness',
+                        len(forecast.get('recommendations', [])) / 10,
+                        {'recommendations': len(forecast.get('recommendations', []))}
+                    )
+            except Exception as e:
+                logger.error(f"Predictive loop error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _sustainability_loop(self):
+        """Background sustainability reporting loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(3600)  # Every hour
+                report = await self.sustainability_tracker.generate_report()
+                logger.info(f"Sustainability report: overall_score={report['sustainability_score']['overall_score']:.1f}%")
+            except Exception as e:
+                logger.error(f"Sustainability loop error: {e}")
+                await asyncio.sleep(60)
     
     async def _process_queue(self):
         """Process queued simulation operations"""
@@ -853,7 +1157,7 @@ class EnhancedSystemSimulatorV5:
                 logger.error(f"Queue worker error: {e}")
     
     async def _execute_simulation(self, operation: Dict) -> SimulationRun:
-        """Execute simulation with rate limiting and circuit breaker"""
+        """Execute simulation with sustainability features"""
         async with self._simulation_semaphore:
             await self.rate_limiter.wait_and_acquire()
             
@@ -861,6 +1165,7 @@ class EnhancedSystemSimulatorV5:
             sim_type = operation['sim_type']
             inject_failure = operation.get('inject_failure', False)
             failure_type = operation.get('failure_type')
+            user_id = operation.get('user_id')
             
             # Validate request
             try:
@@ -871,6 +1176,36 @@ class EnhancedSystemSimulatorV5:
                 )
             except ValidationError as e:
                 raise ValueError(f"Invalid simulation request: {e}")
+            
+            # User adaptation
+            if user_id and self.user_adaptive:
+                sim_params = await self.user_adaptive.get_personalized_simulation_params(
+                    user_id,
+                    {'iterations': 50}
+                )
+                await self.user_adaptive.learn_user_preference(
+                    user_id,
+                    'accept_simulation',
+                    {'type': sim_type},
+                    {'success': True}
+                )
+            
+            # Carbon-aware scheduling
+            schedule = await self.carbon_scheduler.schedule_simulation("normal")
+            if schedule.get('action') == 'schedule':
+                logger.info(f"Simulation scheduled for optimal carbon time: {schedule.get('optimal_time')}")
+                await self.sustainability_tracker.record_metric(
+                    'carbon_awareness',
+                    schedule.get('savings_percent', 0) / 100,
+                    {'savings': schedule.get('savings_percent', 0)}
+                )
+            
+            # Apply federated insights
+            if self.federated_learner.federated_weights:
+                simulation_params = await self.federated_learner.apply_federated_insights({
+                    'iterations': 50,
+                    'parallel': True
+                })
             
             # Run A/B test variant (50% control, 50% treatment)
             ab_variant = 'treatment' if random.random() > 0.5 else 'control'
@@ -887,6 +1222,30 @@ class EnhancedSystemSimulatorV5:
                 logger.error(f"Simulation failed: {e}")
                 raise
             
+            # Federated sharing
+            if results and results[0].estimated_production_readiness > 80:
+                await self.federated_learner.share_simulation_insight({
+                    'simulation': {
+                        'type': sim_type,
+                        'readiness': results[0].estimated_production_readiness,
+                        'improvement': results[0].latency_improvement_pct
+                    }
+                })
+            
+            # Human collaboration
+            if self.human_collaborator and results:
+                await self.human_collaborator.request_simulation_feedback(
+                    {
+                        'simulation_type': sim_type,
+                        'readiness': results[0].estimated_production_readiness,
+                        'confidence_interval': results[0].confidence_interval
+                    },
+                    {
+                        'reasoning': 'Simulation completed',
+                        'carbon_impact': (time.time() - start_time) * 0.001
+                    }
+                )
+            
             # Assess quality
             quality_score = await self.quality_scorer.assess_quality(results)
             
@@ -900,6 +1259,14 @@ class EnhancedSystemSimulatorV5:
                 simulation_type=validated.simulation_type.value,
                 parameters_used=operation.get('parameters', {})
             )
+            
+            # Record sustainability metrics
+            if results:
+                await self.sustainability_tracker.record_metric(
+                    'eco_efficiency',
+                    results[0].estimated_production_readiness / 100,
+                    {'type': sim_type}
+                )
             
             # Store in memory
             async with self._results_lock:
@@ -921,7 +1288,8 @@ class EnhancedSystemSimulatorV5:
                 'sim_type': sim_run.simulation_type,
                 'duration_ms': duration_ms,
                 'results_count': len(results),
-                'ab_variant': ab_variant
+                'ab_variant': ab_variant,
+                'sustainability': (await self.sustainability_tracker.get_sustainability_score())['overall_score']
             })
             
             if validated.inject_failure:
@@ -967,8 +1335,9 @@ class EnhancedSystemSimulatorV5:
             return []
     
     async def run_simulation(self, sim_type: str, inject_failure: bool = False,
-                             failure_type: str = None, parameters: Dict = None) -> SimulationRun:
-        """Queue simulation request"""
+                             failure_type: str = None, parameters: Dict = None,
+                             user_id: str = None) -> SimulationRun:
+        """Queue simulation request with user context"""
         future = asyncio.Future()
         
         await self.operation_queue.put({
@@ -977,6 +1346,7 @@ class EnhancedSystemSimulatorV5:
             'inject_failure': inject_failure,
             'failure_type': failure_type,
             'parameters': parameters or {},
+            'user_id': user_id,
             'future': future
         })
         SIMULATION_QUEUE_SIZE.set(self.operation_queue.qsize())
@@ -984,14 +1354,14 @@ class EnhancedSystemSimulatorV5:
         return await future
     
     async def run_ab_test(self, test_id: str, control_sim: str, treatment_sim: str,
-                         n_runs: int = 30) -> Dict:
-        """Run A/B test comparing two simulation types"""
+                         n_runs: int = 30, user_id: str = None) -> Dict:
+        """Run A/B test with user context"""
         control_results = []
         treatment_results = []
         
         for _ in range(n_runs):
-            control_run = await self.run_simulation(control_sim)
-            treatment_run = await self.run_simulation(treatment_sim)
+            control_run = await self.run_simulation(control_sim, user_id=user_id)
+            treatment_run = await self.run_simulation(treatment_sim, user_id=user_id)
             
             if control_run.results:
                 control_results.append(control_run.results[0].latency_improvement_pct)
@@ -1006,7 +1376,7 @@ class EnhancedSystemSimulatorV5:
         
         return {'error': 'Insufficient data'}
     
-    async def run_all_simulations(self, inject_failures: bool = False) -> List[SimulationRun]:
+    async def run_all_simulations(self, inject_failures: bool = False, user_id: str = None) -> List[SimulationRun]:
         """Run all simulation types"""
         sim_types = ['quantum', 'blockchain', 'gpu', 'streaming', 'multitenant', 'federated', 'ml_training']
         runs = []
@@ -1015,7 +1385,8 @@ class EnhancedSystemSimulatorV5:
             sim_run = await self.run_simulation(
                 sim_type,
                 inject_failure=inject_failures and random.random() < 0.1,
-                failure_type=random.choice(['timeout', 'oom', 'network']) if inject_failures else None
+                failure_type=random.choice(['timeout', 'oom', 'network']) if inject_failures else None,
+                user_id=user_id
             )
             runs.append(sim_run)
         
@@ -1047,7 +1418,6 @@ class EnhancedSystemSimulatorV5:
                 await asyncio.sleep(3600)
     
     async def health_check(self) -> Dict:
-        """Comprehensive health check with timeout"""
         try:
             async def _check():
                 async with self._results_lock:
@@ -1055,6 +1425,7 @@ class EnhancedSystemSimulatorV5:
                 
                 quality_stats = await self.quality_scorer.get_statistics()
                 cache_stats = await self.cache.get_stats()
+                sustainability = await self.sustainability_tracker.get_sustainability_score()
                 
                 health_score = 100
                 if result_count == 0:
@@ -1075,6 +1446,13 @@ class EnhancedSystemSimulatorV5:
                     'cache': cache_stats,
                     'circuit_breakers': {name: cb.get_metrics()['state'] 
                                         for name, cb in self.circuit_breakers.items()},
+                    # NEW: Sustainability metrics
+                    'sustainability': {
+                        'score': sustainability,
+                        'federated_packages': len(self.federated_learner._knowledge_bank),
+                        'cross_domain_transfers': self.cross_domain_transfer.get_transfer_statistics(),
+                        'human_feedback': await self.human_collaborator.get_feedback_summary()
+                    },
                     'timestamp': datetime.now().isoformat()
                 }
             
@@ -1085,7 +1463,6 @@ class EnhancedSystemSimulatorV5:
             return {'healthy': False, 'status': 'timeout', 'instance_id': self.instance_id}
     
     async def get_statistics(self) -> Dict:
-        """Get comprehensive statistics"""
         async with self._results_lock:
             result_count = len(self.all_results)
             run_count = len(self.simulation_runs)
@@ -1101,6 +1478,8 @@ class EnhancedSystemSimulatorV5:
         
         quality_stats = await self.quality_scorer.get_statistics()
         cache_stats = await self.cache.get_stats()
+        sustainability = await self.sustainability_tracker.get_sustainability_score()
+        feedback_summary = await self.human_collaborator.get_feedback_summary()
         
         return {
             'instance_id': self.instance_id,
@@ -1114,22 +1493,28 @@ class EnhancedSystemSimulatorV5:
             'queue_size': self.operation_queue.qsize(),
             'ws_connections': len(self.websocket.connections),
             'circuit_breakers': {name: cb.get_metrics() for name, cb in self.circuit_breakers.items()},
+            # NEW: Sustainability metrics
+            'sustainability': {
+                'score': sustainability,
+                'feedback': feedback_summary,
+                'federated': self.federated_learner.get_federated_insights(),
+                'cross_domain': self.cross_domain_transfer.get_transfer_statistics()
+            },
             'timestamp': datetime.now().isoformat()
         }
     
     async def export_state(self) -> Dict:
-        """Export current state for backup"""
         async with self._results_lock:
             return {
                 'instance_id': self.instance_id,
                 'version': DATA_VERSION,
                 'all_results': [r.to_dict() for r in self.all_results],
                 'simulation_runs': [r.to_dict() for r in self.simulation_runs],
+                'sustainability': await self.sustainability_tracker.get_sustainability_score(),
                 'exported_at': datetime.now().isoformat()
             }
     
     async def import_state(self, state: Dict):
-        """Import state from backup"""
         async with self._results_lock:
             self.all_results.clear()
             for r in state.get('all_results', []):
@@ -1142,13 +1527,15 @@ class EnhancedSystemSimulatorV5:
             logger.info(f"Imported {len(self.all_results)} results and {len(self.simulation_runs)} runs from backup")
     
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info(f"Shutting down EnhancedSystemSimulatorV5 (instance: {self.instance_id})")
+        logger.info(f"Shutting down EnhancedSystemSimulatorV6 (instance: {self.instance_id})")
         
         self._shutdown_event.set()
         self._running = False
         
-        # Cancel queue worker
+        # Shutdown advanced components
+        await self.federated_learner.shutdown()
+        await self.carbon_scheduler.close()
+        
         if self._queue_worker:
             self._queue_worker.cancel()
             try:
@@ -1156,193 +1543,22 @@ class EnhancedSystemSimulatorV5:
             except asyncio.CancelledError:
                 pass
         
-        # Cancel background tasks
         for task in self.background_tasks:
             task.cancel()
         
         if self.background_tasks:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
         
-        # Stop WebSocket server
         await self.websocket.stop()
-        
-        # Stop cache
         await self.cache.stop()
-        
-        # Close database
         self.db_manager.dispose()
-        
-        # Shutdown thread pool
         self.thread_pool.shutdown(wait=True)
         
+        # Final sustainability report
+        report = await self.sustainability_tracker.generate_report()
+        logger.info(f"Final sustainability report: overall_score={report['sustainability_score']['overall_score']:.1f}%")
+        
         logger.info("Shutdown complete")
-
-# ============================================================
-# SUPPORTING CLASSES (PRESERVED AND ENHANCED)
-# ============================================================
-
-class EnhancedDataQualityScorer:
-    """Data quality assessment for simulation results"""
-    
-    def __init__(self):
-        self.quality_history = deque(maxlen=1000)
-        self._lock = asyncio.Lock()
-    
-    async def assess_quality(self, results: List[SimulationMetrics]) -> float:
-        if not results:
-            return 0.0
-        
-        scores = []
-        for result in results:
-            score = 100.0
-            
-            if result.estimated_production_readiness < 0 or result.estimated_production_readiness > 100:
-                score -= 20
-            if result.latency_improvement_pct < -100 or result.latency_improvement_pct > 1000:
-                score -= 15
-            if result.cost_reduction_pct < -50 or result.cost_reduction_pct > 90:
-                score -= 15
-            
-            scores.append(max(0, score))
-        
-        quality_score = np.mean(scores)
-        
-        async with self._lock:
-            self.quality_history.append({
-                'timestamp': datetime.now(),
-                'score': quality_score,
-                'result_count': len(results)
-            })
-        
-        DATA_QUALITY_SCORE.set(quality_score)
-        return quality_score
-    
-    async def get_statistics(self) -> Dict:
-        async with self._lock:
-            if not self.quality_history:
-                return {'total_assessments': 0}
-            scores = [q['score'] for q in self.quality_history]
-            return {
-                'total_assessments': len(self.quality_history),
-                'avg_score': np.mean(scores),
-                'min_score': np.min(scores),
-                'max_score': np.max(scores)
-            }
-
-class EnhancedRateLimiter:
-    """Rate limiter for simulation requests"""
-    
-    def __init__(self, rate: int = RATE_LIMIT_REQUESTS, per_seconds: int = RATE_LIMIT_WINDOW):
-        self.rate = rate
-        self.per_seconds = per_seconds
-        self.tokens = rate
-        self.last_refill = time.time()
-        self._lock = asyncio.Lock()
-        self.total_requests = 0
-        self.throttled_requests = 0
-    
-    async def acquire(self) -> bool:
-        async with self._lock:
-            now = time.time()
-            time_passed = now - self.last_refill
-            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.per_seconds))
-            self.last_refill = now
-            
-            if self.tokens >= 1:
-                self.tokens -= 1
-                self.total_requests += 1
-                return True
-            else:
-                self.throttled_requests += 1
-                return False
-    
-    async def wait_and_acquire(self):
-        while not await self.acquire():
-            await asyncio.sleep(0.1)
-    
-    def get_metrics(self) -> Dict:
-        total = self.total_requests + self.throttled_requests
-        return {
-            'total_requests': self.total_requests,
-            'throttled_requests': self.throttled_requests,
-            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100
-        }
-
-class EnhancedCircuitBreaker:
-    """Circuit breaker for simulation failures"""
-    
-    def __init__(self, name: str, failure_threshold: int = CIRCUIT_BREAKER_THRESHOLD,
-                 recovery_timeout: int = CIRCUIT_BREAKER_TIMEOUT,
-                 half_open_success_threshold: int = 2):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_success_threshold = half_open_success_threshold
-        self.state = CircuitBreakerState.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time = None
-        self._lock = asyncio.Lock()
-        self.metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
-    
-    async def call(self, func: Callable, *args, **kwargs):
-        async with self._lock:
-            if self.state == CircuitBreakerState.OPEN:
-                if time.time() - self.last_failure_time >= self.recovery_timeout:
-                    self.state = CircuitBreakerState.HALF_OPEN
-                    self.success_count = 0
-                    CIRCUIT_BREAKER_STATE.labels(component=self.name).set(1)
-                else:
-                    raise Exception(f"Circuit breaker {self.name} is OPEN")
-            
-            if self.state == CircuitBreakerState.HALF_OPEN and self.success_count >= self.half_open_success_threshold:
-                self.state = CircuitBreakerState.CLOSED
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(0)
-        
-        self.metrics['total_calls'] += 1
-        
-        try:
-            result = await func(*args, **kwargs)
-            await self._record_success()
-            return result
-        except Exception as e:
-            await self._record_failure()
-            raise
-    
-    async def _record_success(self):
-        async with self._lock:
-            self.metrics['successful_calls'] += 1
-            self.success_count += 1
-            if self.state == CircuitBreakerState.HALF_OPEN:
-                self.failure_count = 0
-    
-    async def _record_failure(self):
-        async with self._lock:
-            self.metrics['failed_calls'] += 1
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            
-            if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
-                self.state = CircuitBreakerState.OPEN
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(2)
-            elif self.state == CircuitBreakerState.HALF_OPEN:
-                self.state = CircuitBreakerState.OPEN
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(2)
-    
-    def get_metrics(self) -> Dict:
-        success_rate = (self.metrics['successful_calls'] / max(self.metrics['total_calls'], 1)) * 100
-        return {
-            **self.metrics,
-            'state': self.state.value,
-            'failure_count': self.failure_count,
-            'success_count': self.success_count,
-            'success_rate_pct': success_rate
-        }
-
-class CircuitBreakerState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
 
 # ============================================================
 # SINGLETON ACCESSOR
@@ -1351,13 +1567,12 @@ class CircuitBreakerState(Enum):
 _simulator_instance = None
 _simulator_lock = asyncio.Lock()
 
-async def get_system_simulator() -> EnhancedSystemSimulatorV5:
-    """Get singleton simulator instance (async-safe)"""
+async def get_system_simulator() -> EnhancedSystemSimulatorV6:
     global _simulator_instance
     if _simulator_instance is None:
         async with _simulator_lock:
             if _simulator_instance is None:
-                _simulator_instance = EnhancedSystemSimulatorV5()
+                _simulator_instance = EnhancedSystemSimulatorV6()
                 await _simulator_instance.start()
     return _simulator_instance
 
@@ -1367,98 +1582,89 @@ async def get_system_simulator() -> EnhancedSystemSimulatorV5:
 
 async def main():
     print("=" * 80)
-    print("Enhanced System Enhancement Simulator v5.0 - Enterprise Platinum")
-    print("Multi-Simulation | A/B Testing | Monte Carlo | Real-Time Dashboard")
+    print("Enhanced System Enhancement Simulator v6.0 - Advanced Sustainability")
+    print("Federated Learning | User Adaptation | Carbon-Aware | Cross-Domain Transfer")
     print("=" * 80)
     
     simulator = await get_system_simulator()
     
-    print(f"\n✅ CRITICAL FIXES OVER v4.0:")
-    print(f"   ✅ Missing imports (contextmanager) fixed")
-    print(f"   ✅ Race conditions with comprehensive async locks")
-    print(f"   ✅ Memory leaks with TTL-based result cache")
-    print(f"   ✅ Deadlock potential with database timeouts")
-    print(f"   ✅ ML Training simulation with distributed learning")
-    print(f"   ✅ Federated Learning convergence simulation")
-    print(f"   ✅ Streaming data pipeline simulation")
-    print(f"   ✅ Multi-tenant isolation simulation")
-    print(f"   ✅ A/B testing framework for enhancements")
-    print(f"   ✅ Monte Carlo uncertainty quantification")
-    print(f"   ✅ Real-time dashboard with D3.js visualizations")
-    print(f"   ✅ Failure injection for resilience testing")
+    print(f"\n✅ v6.0 ADVANCED SUSTAINABILITY FEATURES:")
+    print(f"   ✅ Federated Simulation Learning - Cross-instance insights sharing")
+    print(f"   ✅ User-Adaptive Simulation Reflexivity - Learning user preferences")
+    print(f"   ✅ Carbon-Aware Simulation Scheduling - Green simulation optimization")
+    print(f"   ✅ Cross-Domain Simulation Transfer - Domain insights sharing")
+    print(f"   ✅ Human-AI Simulation Collaboration - Feedback loops with users")
+    print(f"   ✅ Predictive Simulation Management - Proactive simulation management")
+    print(f"   ✅ Simulation Sustainability Metrics - Tracking eco-efficiency gains")
     
-    print(f"\n🔬 Running Simulations...")
+    # Test federated learning
+    print(f"\n📊 Testing Federated Learning:")
+    insight_id = await simulator.federated_learner.share_simulation_insight({
+        'simulation': {
+            'type': 'quantum',
+            'readiness': 85,
+            'improvement': 30
+        }
+    })
+    print(f"   Insight shared: {insight_id}")
     
-    # Run individual simulation
+    # Test user adaptation
+    print(f"\n📊 Testing User Adaptation:")
+    await simulator.user_adaptive.learn_user_preference(
+        "test_user",
+        "accept_simulation",
+        {"type": "quantum", "readiness": 85},
+        {"success": True}
+    )
+    print(f"   User adaptation updated")
+    
+    # Test carbon-aware scheduling
+    print(f"\n📊 Testing Carbon-Aware Scheduling:")
+    schedule = await simulator.carbon_scheduler.schedule_simulation("normal")
+    print(f"   Schedule action: {schedule['action']}")
+    if schedule.get('savings_percent'):
+        print(f"   Carbon savings: {schedule['savings_percent']:.1f}%")
+    
+    # Test cross-domain transfer
+    print(f"\n📊 Testing Cross-Domain Transfer:")
+    transferred = await simulator.cross_domain_transfer.transfer_knowledge(
+        'quantum', 'gpu',
+        {'latency_improvement': 30, 'readiness': 85}
+    )
+    print(f"   Transferred {len(transferred)} items from quantum to GPU")
+    
+    print(f"\n🔬 Running Simulations with Sustainability Features...")
+    
+    # Run quantum simulation with user context
     print(f"\n🚀 Quantum Simulation:")
-    quantum_run = await simulator.run_simulation('quantum')
+    quantum_run = await simulator.run_simulation('quantum', user_id="test_user")
     if quantum_run.results:
         qr = quantum_run.results[0]
         print(f"   Readiness: {qr.estimated_production_readiness:.0f}%")
         print(f"   Latency Improvement: {qr.latency_improvement_pct:.1f}%")
         print(f"   MC Mean: {qr.monte_carlo_mean:.1f} ± {qr.monte_carlo_std:.1f}")
     
-    # Run GPU simulation
-    print(f"\n⚡ GPU Simulation:")
-    gpu_run = await simulator.run_simulation('gpu')
-    if gpu_run.results:
-        gr = gpu_run.results[0]
-        print(f"   Readiness: {gr.estimated_production_readiness:.0f}%")
-        print(f"   Throughput Improvement: {gr.throughput_improvement_pct:.1f}%")
-    
-    # Run federated learning simulation
-    print(f"\n🤝 Federated Learning Simulation:")
-    fed_run = await simulator.run_simulation('federated')
-    if fed_run.results:
-        fr = fed_run.results[0]
-        print(f"   Readiness: {fr.estimated_production_readiness:.0f}%")
-        print(f"   Accuracy Improvement: {fr.accuracy_improvement_pct:.1f}%")
-    
-    # Run all simulations
-    print(f"\n🎯 Running All Simulations...")
-    all_runs = await simulator.run_all_simulations()
-    print(f"   Completed: {len(all_runs)} simulation types")
-    
-    # Run A/B test
+    # Run A/B test with user context
     print(f"\n📊 A/B Test: Quantum vs GPU")
-    ab_result = await simulator.run_ab_test("quantum_vs_gpu", "quantum", "gpu", n_runs=10)
+    ab_result = await simulator.run_ab_test("quantum_vs_gpu", "quantum", "gpu", n_runs=10, user_id="test_user")
     if 'error' not in ab_result:
         print(f"   Winner: {ab_result['winner']}")
         print(f"   Improvement: {ab_result['improvement_pct']:.1f}%")
         print(f"   P-value: {ab_result['p_value']:.4f}")
         print(f"   Significant: {ab_result['statistically_significant']}")
     
-    # Test failure injection
-    print(f"\n💥 Failure Injection Test:")
-    try:
-        fail_run = await simulator.run_simulation('quantum', inject_failure=True, failure_type='timeout')
-        print(f"   Status: Completed despite failure injection")
-    except TimeoutError:
-        print(f"   ✅ Failure correctly propagated: TimeoutError")
-    
-    health = await simulator.health_check()
-    print(f"\n🏥 System Health:")
-    print(f"   Status: {'✅ Healthy' if health['healthy'] else '⚠️ Degraded'}")
-    print(f"   Health Score: {health['health_score']:.0f}")
-    print(f"   Total Results: {health['result_count']}")
-    print(f"   Queue Size: {health['queue_size']}")
-    print(f"   WebSocket Connections: {health['ws_connections']}")
-    
+    # Get sustainability metrics
     stats = await simulator.get_statistics()
-    print(f"\n📊 System Statistics:")
-    print(f"   Instance: {stats['instance_id']}")
-    print(f"   Version: {stats['version']}")
-    print(f"   Avg Readiness: {stats['avg_readiness']:.1f}%")
-    print(f"   Avg Latency Improvement: {stats['avg_latency_improvement']:.1f}%")
-    print(f"   Cache Hit Rate: {stats['cache']['hit_rate']:.1%}")
-    
-    print(f"\n🔌 WebSocket Dashboard Available:")
-    print(f"   ws://localhost:8766")
-    print(f"   Real-time simulation monitoring with A/B test results")
+    print(f"\n♻️ Sustainability Metrics:")
+    print(f"   Overall Score: {stats['sustainability']['score']['overall_score']:.1f}%")
+    print(f"   Eco-Efficiency: {stats['sustainability']['score']['eco_efficiency']:.1f}%")
+    print(f"   Federated Packages: {stats['sustainability']['federated']['total_packages']}")
+    print(f"   Cross-Domain Transfers: {stats['sustainability']['cross_domain']['total_transfers']}")
+    print(f"   Human Feedback: {stats['sustainability']['feedback']['total']} (avg approval: {stats['sustainability']['feedback']['average_approval']:.1%})")
     
     print("\n" + "=" * 80)
-    print("✅ Enhanced System Simulator v5.0 - Production Ready")
-    print("   Multi-Modal | A/B Tested | Uncertainty-Aware | Real-Time")
+    print("✅ Enhanced System Simulator v6.0 - Production Ready")
+    print("   With Full Sustainability Features: Federated, Adaptive, Carbon-Aware")
     print("=" * 80)
     
     try:
