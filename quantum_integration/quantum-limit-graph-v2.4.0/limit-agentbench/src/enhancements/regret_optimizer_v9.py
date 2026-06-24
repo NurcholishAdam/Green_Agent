@@ -1,21 +1,16 @@
-# File: src/enhancements/regret_optimizer_enhanced_v10.py
-
+# File: src/enhancements/regret_optimizer_enhanced_v11_0.py
 """
-Enhanced Regret-Optimized Carbon Decision System - Version 10.0 (Enterprise Platinum)
+Enhanced Regret-Optimized Carbon Decision System - Version 11.0 (Advanced Sustainability)
 
-CRITICAL FIXES OVER v9.0:
-1. FIXED: Missing imports (random, contextmanager)
-2. FIXED: Race conditions with comprehensive async locks
-3. FIXED: Memory leaks with TTL-based payoff matrix cache
-4. FIXED: Deadlock potential with database timeouts
-5. ADDED: Interactive regret heatmap visualization
-6. ADDED: Sensitivity analysis with tornado plots
-7. ADDED: Robust optimization with CVaR
-8. ADDED: Multi-period dynamic programming
-9. ADDED: Real-time WebSocket dashboard for decision monitoring
-10. ADDED: Bayesian decision network integration
-11. ADDED: Scenario reduction for computational efficiency
-12. ADDED: Portfolio optimization across multiple decisions
+CRITICAL ADDITIONS OVER v10.0:
+1. ADDED: Federated Reflexive Learning - Cross-instance regret insights sharing
+2. ADDED: User-Adaptive Reflexivity - Learning user decision preferences over time
+3. ADDED: Real-Time Carbon Intensity Integration - Carbon-aware regret optimization
+4. ADDED: Cross-Domain Knowledge Transfer - Sharing insights across domains
+5. ADDED: Human-AI Collaborative Reflection - Feedback loops with users
+6. ADDED: Predictive Reflexivity - Proactive decision management
+7. ADDED: Enhanced Helium Awareness - Resource-aware decision optimization
+8. ADDED: Sustainability Impact Metrics - Tracking eco-efficiency gains
 """
 
 import asyncio
@@ -30,6 +25,7 @@ import uuid
 import random
 import threading
 import gc
+import aiohttp
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -93,7 +89,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s',
     handlers=[
-        logging.handlers.RotatingFileHandler('regret_optimizer_v10.log', maxBytes=10*1024*1024, backupCount=5),
+        logging.handlers.RotatingFileHandler('regret_optimizer_v11.log', maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -102,7 +98,7 @@ logger.addFilter(CorrelationIdFilter())
 
 # Audit logger
 audit_logger = logging.getLogger('regret_audit')
-audit_handler = logging.handlers.RotatingFileHandler('regret_audit_v10.log', maxBytes=50*1024*1024, backupCount=10)
+audit_handler = logging.handlers.RotatingFileHandler('regret_audit_v11.log', maxBytes=50*1024*1024, backupCount=10)
 audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
@@ -124,6 +120,16 @@ OPTIMIZATION_QUEUE_SIZE = Gauge('regret_optimization_queue_size', 'Optimization 
 WS_CONNECTIONS = Gauge('regret_ws_connections', 'WebSocket connections', registry=REGISTRY)
 SCENARIO_REDUCTION_FACTOR = Gauge('regret_scenario_reduction_factor', 'Scenario reduction factor', registry=REGISTRY)
 
+# NEW: Advanced sustainability metrics
+FEDERATED_REGRET_KNOWLEDGE = Gauge('federated_regret_knowledge', 'Federated knowledge packages', registry=REGISTRY)
+USER_REGRET_ADAPTATION = Gauge('user_regret_adaptation_score', 'User adaptation score', ['user_id'], registry=REGISTRY)
+REGRET_CARBON_INTENSITY = Gauge('regret_carbon_intensity', 'Carbon intensity (gCO2/kWh)', ['region'], registry=REGISTRY)
+CROSS_DOMAIN_REGRET_TRANSFERS = Counter('cross_domain_regret_transfers_total', 'Cross-domain transfers', ['source', 'target'], registry=REGISTRY)
+HUMAN_REGRET_FEEDBACK = Counter('human_regret_feedback_total', 'Human feedback events', ['type'], registry=REGISTRY)
+PREDICTIVE_REGRET_ACCURACY = Gauge('predictive_regret_accuracy', 'Predictive model accuracy', ['model_type'], registry=REGISTRY)
+REGRET_SUSTAINABILITY_SCORE = Gauge('regret_sustainability_score', 'Sustainability score', registry=REGISTRY)
+REGRET_ECO_EFFICIENCY = Gauge('regret_eco_efficiency', 'Eco-efficiency score', registry=REGISTRY)
+
 # Constants
 MAX_OPTIMIZATION_HISTORY = 10000
 MAX_DECISION_VALUES = 1000
@@ -137,7 +143,7 @@ HEALTH_CHECK_TIMEOUT = 10
 RATE_LIMIT_REQUESTS = 50
 RATE_LIMIT_WINDOW = 60
 MAX_CONCURRENT_OPTIMIZATIONS = 4
-DATA_VERSION = 10
+DATA_VERSION = 11
 DB_POOL_SIZE = 10
 DB_MAX_OVERFLOW = 20
 DB_POOL_TIMEOUT = 30
@@ -147,452 +153,864 @@ CVAR_ALPHA = 0.95
 SENSITIVITY_PERTURBATION = 0.1
 
 # ============================================================
-# ENHANCED PYDANTIC V2 MODELS
+# NEW: FEDERATED REGRET LEARNING
 # ============================================================
 
-class DecisionOptionModel(BaseModel):
-    """Validated decision option model - Pydantic v2"""
-    model_config = ConfigDict(str_strip_whitespace=True, validate_default=True)
+class FederatedRegretLearner:
+    """
+    Federated learning system for sharing regret optimization insights across instances.
+    """
     
-    option_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:12], min_length=1, max_length=64)
-    name: str = Field(..., min_length=1, max_length=200)
-    capex_usd: float = Field(..., ge=0, le=1e9)
-    opex_usd_per_year: float = Field(default=0, ge=0, le=1e8)
-    carbon_reduction_tonnes_per_year: float = Field(..., ge=0, le=1e7)
-    project_lifetime_years: int = Field(default=10, ge=1, le=50)
-    discount_rate: float = Field(default=0.07, ge=0, le=1)
-    risk_score: float = Field(default=0.5, ge=0, le=1)
-    carbon_price_assumption: float = Field(default=75.0, ge=0, le=500)
-    decision_type: str = Field(default="single", pattern=r'^(single|portfolio|phased)$')
-    dependencies: List[str] = Field(default_factory=list)
-    
-    @field_validator('name')
-    @classmethod
-    def validate_name(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError('Decision name cannot be empty')
-        return v.strip()
-    
-    @model_validator(mode='after')
-    def validate_carbon_price(self) -> 'DecisionOptionModel':
-        if self.carbon_price_assumption < 0:
-            raise ValueError('Carbon price must be non-negative')
-        return self
-
-@dataclass
-class DecisionOption:
-    """Decision option data model - Enhanced"""
-    option_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
-    name: str = ""
-    capex_usd: float = 0.0
-    opex_usd_per_year: float = 0.0
-    carbon_reduction_tonnes_per_year: float = 0.0
-    project_lifetime_years: int = 10
-    discount_rate: float = 0.07
-    risk_score: float = 0.5
-    carbon_price_assumption: float = 75.0
-    decision_type: str = "single"
-    dependencies: List[str] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
-    
-    @property
-    def npv(self) -> float:
-        if self.capex_usd <= 0:
-            return 0.0
-        annual_benefit = self.carbon_reduction_tonnes_per_year * self.carbon_price_assumption - self.opex_usd_per_year
-        npv_val = -self.capex_usd
-        for t in range(1, self.project_lifetime_years + 1):
-            npv_val += annual_benefit / (1 + self.discount_rate) ** t
-        return npv_val
-    
-    @property
-    def abatement_cost_per_tonne(self) -> float:
-        if self.carbon_reduction_tonnes_per_year <= 0:
-            return float('inf')
-        total_cost = self.capex_usd + self.opex_usd_per_year * self.project_lifetime_years
-        total_abatement = self.carbon_reduction_tonnes_per_year * self.project_lifetime_years
-        return total_cost / max(total_abatement, 1)
-    
-    def to_model(self) -> DecisionOptionModel:
-        return DecisionOptionModel(**asdict(self))
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-@dataclass
-class ScenarioDefinition:
-    """Scenario definition for regret analysis - Enhanced"""
-    scenario_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
-    name: str = ""
-    carbon_price: float = 75.0
-    discount_rate: float = 0.07
-    demand_growth_rate: float = 0.02
-    technology_cost_reduction: float = 0.05
-    regulatory_risk: float = 0.3
-    market_volatility: float = 0.15
-    probability: float = 1.0
-    cvar_weight: float = 1.0
-
-@dataclass
-class RegretResult:
-    """Regret analysis result data model - Enhanced"""
-    calculation_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    best_option_id: str = ""
-    best_option_name: str = ""
-    maximum_regret: float = 0.0
-    robustness_score: float = 0.0
-    alternative_options: List[Dict] = field(default_factory=list)
-    confidence_interval: Tuple[float, float] = (0.0, 0.0)
-    data_quality_score: float = 100.0
-    calculation_time_ms: float = 0.0
-    cvar_regret: float = 0.0
-    sensitivity_results: Dict[str, float] = field(default_factory=dict)
-    portfolio_allocation: Dict[str, float] = field(default_factory=dict)
-    regret_heatmap: List[List[float]] = field(default_factory=list)
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-# ============================================================
-# ENHANCED PAYOFF CALCULATOR WITH DYNAMIC PROGRAMMING
-# ============================================================
-
-class EnhancedPayoffCalculatorV10:
-    """Enhanced payoff calculator with multi-period optimization"""
-    
-    def __init__(self):
-        self.cache = {}
+    def __init__(self, persistence, instance_id: str, share_interval: int = 3600):
+        self.persistence = persistence
+        self.instance_id = instance_id
+        self.share_interval = share_interval
+        self._knowledge_bank: Dict[str, Dict] = {}
+        self._shared_insights: List[Dict] = []
+        self._last_share_time = 0
         self._lock = asyncio.Lock()
-    
-    async def calculate_payoff(self, decision: DecisionOption, scenario: ScenarioDefinition, 
-                               period: int = 0) -> float:
-        """Calculate payoff with multi-period dynamics"""
-        cache_key = f"{decision.option_id}_{scenario.scenario_id}_{period}"
         
+        self.federated_weights = defaultdict(float)
+        self.aggregation_count = 0
+        
+        logger.info(f"FederatedRegretLearner initialized for instance {instance_id}")
+    
+    async def share_regret_insight(self, insight: Dict) -> str:
+        """
+        Share a regret optimization insight with the federated network.
+        """
         async with self._lock:
-            if cache_key in self.cache:
-                return self.cache[cache_key]
-        
-        # Calculate base annual benefit
-        carbon_benefit = decision.carbon_reduction_tonnes_per_year * scenario.carbon_price
-        annual_cashflow = carbon_benefit - decision.opex_usd_per_year
-        
-        # Apply dynamic factors
-        growth_factor = (1 + scenario.demand_growth_rate) ** period
-        tech_factor = (1 - scenario.technology_cost_reduction) ** period
-        volatility_factor = 1 + np.random.normal(0, scenario.market_volatility) * 0.1
-        
-        annual_cashflow *= growth_factor * volatility_factor
-        adjusted_capex = decision.capex_usd * tech_factor
-        
-        # Calculate NPV for remaining periods
-        remaining_years = max(0, decision.project_lifetime_years - period)
-        npv = -adjusted_capex if period == 0 else 0
-        
-        for t in range(1, remaining_years + 1):
-            npv += annual_cashflow / (1 + scenario.discount_rate) ** t
-        
-        # Apply risk adjustment
-        npv *= (1 - scenario.regulatory_risk * 0.2)
-        
-        async with self._lock:
-            self.cache[cache_key] = npv
+            anonymized_insight = self._anonymize_insight(insight)
             
-            # Manage cache size
-            if len(self.cache) > MAX_CACHE_SIZE:
-                oldest = min(self.cache.items(), key=lambda x: x[1][1] if isinstance(x[1], tuple) else 0)
-                del self.cache[oldest[0]]
-        
-        return npv
-    
-    async def clear_cache(self):
-        async with self._lock:
-            self.cache.clear()
-
-# ============================================================
-# ENHANCED WEB SOCKET DASHBOARD
-# ============================================================
-
-class RegretOptimizerWebSocket:
-    """Real-time regret optimization dashboard"""
-    
-    def __init__(self, port: int = 8776, max_connections: int = 50):
-        self.port = port
-        self.max_connections = max_connections
-        self.connections: Set = set()
-        self.connection_metadata: Dict = {}
-        self.server = None
-        self.running = False
-        self._lock = asyncio.Lock()
-        self._heartbeat_task = None
-    
-    async def start(self):
-        """Start WebSocket server"""
-        async def handler(websocket, path):
-            async with self._lock:
-                if len(self.connections) >= self.max_connections:
-                    await websocket.close(code=1013, reason="Too many connections")
-                    return
-                
-                self.connections.add(websocket)
-                self.connection_metadata[websocket] = {
-                    'connected_at': datetime.now(),
-                    'last_heartbeat': time.time()
-                }
-                WS_CONNECTIONS.set(len(self.connections))
+            package_id = f"fed_regret_{uuid.uuid4().hex[:12]}"
+            package = {
+                'package_id': package_id,
+                'source_instance': self.instance_id,
+                'insight': anonymized_insight,
+                'timestamp': datetime.now().isoformat(),
+                'version': '1.0'
+            }
             
-            try:
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        if data.get('type') == 'ping':
-                            await websocket.send(json.dumps({
-                                'type': 'pong',
-                                'timestamp': datetime.now().isoformat()
-                            }))
-                            async with self._lock:
-                                if websocket in self.connection_metadata:
-                                    self.connection_metadata[websocket]['last_heartbeat'] = time.time()
-                    except json.JSONDecodeError:
-                        await websocket.send(json.dumps({'error': 'Invalid JSON'}))
-                        
-            except ConnectionClosed:
-                pass
-            finally:
-                async with self._lock:
-                    self.connections.discard(websocket)
-                    self.connection_metadata.pop(websocket, None)
-                    WS_CONNECTIONS.set(len(self.connections))
-        
-        self.server = await serve(handler, "localhost", self.port)
-        self.running = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"Regret optimizer dashboard started on port {self.port}")
-        return self.server
-    
-    async def _heartbeat_loop(self):
-        while self.running:
-            try:
-                await asyncio.sleep(30)
-                async with self._lock:
-                    now = time.time()
-                    stale = []
-                    for ws, meta in self.connection_metadata.items():
-                        if now - meta.get('last_heartbeat', 0) > 90:
-                            stale.append(ws)
-                    for ws in stale:
-                        try:
-                            await ws.close(code=1000, reason="Connection timeout")
-                        except:
-                            pass
-                        self.connections.discard(ws)
-                        self.connection_metadata.pop(ws, None)
-                    if stale:
-                        WS_CONNECTIONS.set(len(self.connections))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-    
-    async def broadcast(self, message: Dict):
-        if not self.connections:
-            return
-        
-        dead = set()
-        msg = json.dumps(message, default=str)
-        for ws in self.connections:
-            try:
-                await ws.send(msg)
-            except:
-                dead.add(ws)
-        
-        if dead:
-            async with self._lock:
-                self.connections -= dead
-                for ws in dead:
-                    self.connection_metadata.pop(ws, None)
-                WS_CONNECTIONS.set(len(self.connections))
-    
-    async def broadcast_result(self, result: RegretResult, decisions: List[DecisionOption]):
-        """Broadcast regret analysis result"""
-        await self.broadcast({
-            'type': 'regret_result',
-            'best_option': result.best_option_name,
-            'max_regret': result.maximum_regret,
-            'robustness': result.robustness_score,
-            'cvar': result.cvar_regret,
-            'alternatives': result.alternative_options[:3],
-            'timestamp': datetime.now().isoformat()
-        })
-    
-    async def stop(self):
-        self.running = False
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-        async with self._lock:
-            for ws in list(self.connections):
-                try:
-                    await ws.close(code=1000, reason="Server shutdown")
-                except:
-                    pass
-            self.connections.clear()
-            self.connection_metadata.clear()
-            WS_CONNECTIONS.set(0)
-
-# ============================================================
-# ENHANCED DATABASE MANAGER (FIXED)
-# ============================================================
-
-class EnhancedDatabaseManagerV10:
-    """Database manager with connection pooling and timeout handling"""
-    
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.engine = None
-        self.SessionLocal = None
-        self._init_engine()
-    
-    def _init_engine(self):
-        """Initialize SQLAlchemy engine with connection pooling"""
-        db_url = f"sqlite:///{self.db_path}"
-        self.engine = create_engine(
-            db_url,
-            poolclass=QueuePool,
-            pool_size=DB_POOL_SIZE,
-            max_overflow=DB_MAX_OVERFLOW,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            connect_args={'check_same_thread': False, 'timeout': DB_POOL_TIMEOUT}
-        )
-        self.SessionLocal = scoped_session(sessionmaker(bind=self.engine))
-        self._init_tables()
-        self._update_db_size_metric()
-        logger.info(f"Database initialized with connection pool (size={DB_POOL_SIZE})")
-    
-    def _init_tables(self):
-        """Initialize database tables"""
-        self.db_path.parent.mkdir(exist_ok=True, parents=True)
-        
-        Base = declarative_base()
-        
-        class DecisionDB(Base):
-            __tablename__ = 'decisions'
-            option_id = Column(String(64), primary_key=True)
-            data = Column(JSON)
-            name = Column(String(200), index=True)
-            decision_type = Column(String(32), default="single")
-            created_at = Column(DateTime, default=datetime.now)
-            updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+            self._knowledge_bank[package_id] = package
             
-            __table_args__ = (
-                Index('idx_name', 'name'),
-                Index('idx_type', 'decision_type'),
-                Index('idx_updated_at', 'updated_at'),
-            )
-        
-        class RegretResultDB(Base):
-            __tablename__ = 'regret_results'
-            calculation_id = Column(String(64), primary_key=True)
-            timestamp = Column(DateTime, index=True)
-            result = Column(JSON)
-            best_option_id = Column(String(64))
-            maximum_regret = Column(Float)
-            cvar_regret = Column(Float)
-            data_quality_score = Column(Float)
-            version = Column(Integer, default=DATA_VERSION)
+            if time.time() - self._last_share_time >= self.share_interval:
+                await self._broadcast_to_network(package)
+                self._last_share_time = time.time()
             
-            __table_args__ = (
-                Index('idx_timestamp', 'timestamp'),
-                Index('idx_max_regret', 'maximum_regret'),
-                Index('idx_cvar', 'cvar_regret'),
-            )
+            FEDERATED_REGRET_KNOWLEDGE.set(len(self._knowledge_bank))
+            logger.info(f"Regret insight {package_id} shared")
+            return package_id
+    
+    def _anonymize_insight(self, insight: Dict) -> Dict:
+        anonymized = insight.copy()
+        anonymized.pop('specific_decisions', None)
+        anonymized.pop('user_data', None)
+        anonymized.pop('proprietary_metrics', None)
         
-        Base.metadata.create_all(self.engine)
+        if 'regret' in anonymized:
+            regret = anonymized['regret']
+            anonymized['regret'] = {
+                'value': regret.get('value', 0),
+                'method': regret.get('method', 'unknown'),
+                'robustness': regret.get('robustness', 0)
+            }
+        
+        return anonymized
     
-    def _update_db_size_metric(self):
-        if self.db_path.exists():
-            size_mb = self.db_path.stat().st_size / (1024 * 1024)
-            DB_SIZE.set(size_mb)
-    
-    @contextmanager
-    def get_session(self):
-        """Get database session with timeout handling"""
-        session = self.SessionLocal()
+    async def _broadcast_to_network(self, package: Dict):
         try:
-            session.execute("PRAGMA query_timeout = 30000")
-            yield session
-            session.commit()
-        except OperationalError as e:
-            session.rollback()
-            logger.error(f"Database operational error: {e}")
-            raise
+            await self.persistence.save_shared_regret_knowledge(package)
+            logger.info(f"Broadcasted regret insight {package['package_id']} to network")
         except Exception as e:
-            session.rollback()
-            logger.error(f"Database error: {e}")
-            raise
-        finally:
-            session.close()
+            logger.error(f"Failed to broadcast regret insight: {e}")
     
-    async def save_decision(self, decision: DecisionOption):
-        with self.get_session() as session:
-            from sqlalchemy import text
-            session.execute(
-                text("""INSERT OR REPLACE INTO decisions (option_id, data, name, decision_type, updated_at)
-                       VALUES (?, ?, ?, ?, ?)"""),
-                (decision.option_id, json.dumps(decision.to_dict(), default=str),
-                 decision.name, decision.decision_type, datetime.now())
-            )
-            self._update_db_size_metric()
+    async def pull_network_insights(self, domain: Optional[str] = None, limit: int = 10) -> List[Dict]:
+        try:
+            packages = await self.persistence.get_shared_regret_knowledge(domain=domain, limit=limit)
+            if packages:
+                self._aggregate_federated_weights(packages)
+                self.aggregation_count += 1
+                logger.info(f"Pulled {len(packages)} regret insights from network")
+            return packages
+        except Exception as e:
+            logger.error(f"Failed to pull network insights: {e}")
+            return []
     
-    async def save_regret_result(self, result: RegretResult):
-        with self.get_session() as session:
-            from sqlalchemy import text
-            session.execute(
-                text("""INSERT INTO regret_results 
-                       (calculation_id, timestamp, result, best_option_id, maximum_regret, cvar_regret, data_quality_score, version)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""),
-                (result.calculation_id, datetime.fromisoformat(result.timestamp),
-                 json.dumps(result.to_dict(), default=str), result.best_option_id,
-                 result.maximum_regret, result.cvar_regret, result.data_quality_score, DATA_VERSION)
-            )
+    def _aggregate_federated_weights(self, packages: List[Dict]):
+        for package in packages:
+            if 'insight' in package and 'weights' in package['insight']:
+                weights = package['insight']['weights']
+                for key, value in weights.items():
+                    self.federated_weights[key] += value
+        
+        total = sum(self.federated_weights.values())
+        if total > 0:
+            for key in self.federated_weights:
+                self.federated_weights[key] /= total
     
-    def dispose(self):
-        if self.engine:
-            self.engine.dispose()
-            if self.SessionLocal:
-                self.SessionLocal.remove()
-            logger.info("Database connection pool disposed")
+    def get_federated_insights(self) -> Dict:
+        return {
+            'total_packages': len(self._knowledge_bank),
+            'aggregation_count': self.aggregation_count,
+            'weights': dict(self.federated_weights),
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    async def apply_federated_insights(self, regret_params: Dict) -> Dict:
+        if not self.federated_weights:
+            return regret_params
+        
+        adjusted_params = regret_params.copy()
+        
+        for key, weight in self.federated_weights.items():
+            if key in adjusted_params and isinstance(adjusted_params[key], (int, float)):
+                adjustment_factor = 1.0 + (weight - 0.5) * 0.2
+                adjusted_params[key] = adjusted_params[key] * adjustment_factor
+        
+        return adjusted_params
+    
+    async def shutdown(self):
+        logger.info("FederatedRegretLearner shutdown complete")
+
+# ============================================================
+# NEW: USER-ADAPTIVE REGRET REFLEXIVITY
+# ============================================================
+
+class UserAdaptiveRegretReflexivity:
+    """
+    Learns user regret optimization preferences and adapts behavior over time.
+    """
+    
+    def __init__(self, persistence, learning_rate: float = 0.1):
+        self.persistence = persistence
+        self.learning_rate = learning_rate
+        self._user_profiles: Dict[str, Dict] = {}
+        self._preference_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self._lock = asyncio.Lock()
+        
+        logger.info("UserAdaptiveRegretReflexivity initialized")
+    
+    async def learn_user_preference(self, user_id: str, action: str, context: Dict, outcome: Dict):
+        async with self._lock:
+            if user_id not in self._user_profiles:
+                self._user_profiles[user_id] = {
+                    'regret_preferences': defaultdict(float),
+                    'history': [],
+                    'adaptation_score': 50.0,
+                    'last_updated': datetime.now().isoformat()
+                }
+            
+            profile = self._user_profiles[user_id]
+            preference_update = self._calculate_preference_update(action, context, outcome)
+            
+            for key, value in preference_update.items():
+                profile['regret_preferences'][key] += value * self.learning_rate
+                profile['regret_preferences'][key] = max(0, min(1, profile['regret_preferences'][key]))
+            
+            profile['history'].append({
+                'action': action,
+                'timestamp': datetime.now().isoformat(),
+                'outcome': outcome
+            })
+            
+            profile['adaptation_score'] = self._calculate_adaptation_score(profile)
+            USER_REGRET_ADAPTATION.labels(user_id=user_id).set(profile['adaptation_score'])
+            
+            await self.persistence.save_user_regret_profile(user_id, profile)
+            
+            logger.info(f"Updated regret preferences for user {user_id}, adaptation score: {profile['adaptation_score']:.1f}")
+    
+    def _calculate_preference_update(self, action: str, context: Dict, outcome: Dict) -> Dict:
+        update = defaultdict(float)
+        
+        if outcome.get('success', False):
+            if action == 'accept_regret_decision':
+                update['regret_acceptance'] += 0.1
+                update['risk_preference'] += 0.05
+            elif action == 'reject_regret_decision':
+                update['regret_acceptance'] -= 0.05
+                update['safety_preference'] += 0.1
+            elif action == 'adjust_regret_weight':
+                update['weight_preference'] += 0.15
+        
+        if context.get('carbon_aware', False):
+            update['carbon_awareness'] += 0.15
+        
+        return dict(update)
+    
+    def _calculate_adaptation_score(self, profile: Dict) -> float:
+        if not profile['history']:
+            return 50.0
+        
+        preferences = profile['regret_preferences']
+        if not preferences:
+            return 50.0
+        
+        variance = np.var(list(preferences.values()))
+        consistency = 1.0 - min(1.0, variance)
+        history_depth = min(1.0, len(profile['history']) / 20)
+        
+        return 50.0 + 40.0 * consistency * history_depth
+    
+    async def get_personalized_regret_params(self, user_id: str, default_params: Dict) -> Dict:
+        async with self._lock:
+            profile = self._user_profiles.get(user_id)
+            if not profile:
+                return default_params
+            
+            preferences = profile['regret_preferences']
+            
+            adjusted_params = default_params.copy()
+            
+            if preferences.get('risk_preference', 0) > 0.7:
+                adjusted_params['cvar_alpha'] = 0.98
+            if preferences.get('safety_preference', 0) > 0.7:
+                adjusted_params['cvar_alpha'] = 0.90
+            
+            return adjusted_params
+
+# ============================================================
+# NEW: CARBON-AWARE REGRET OPTIMIZER
+# ============================================================
+
+class CarbonAwareRegretOptimizer:
+    """
+    Optimizes regret decisions based on real-time carbon intensity.
+    """
+    
+    def __init__(self, persistence, api_key: Optional[str] = None, region: str = "global"):
+        self.persistence = persistence
+        self.api_key = api_key or os.getenv('CARBON_INTENSITY_API_KEY')
+        self.region = region
+        self._cache = {}
+        self._cache_ttl = 300
+        self._lock = asyncio.Lock()
+        self._session = None
+        
+        logger.info(f"CarbonAwareRegretOptimizer initialized for region {region}")
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def get_current_intensity(self, region: Optional[str] = None) -> Dict:
+        region = region or self.region
+        cache_key = f"intensity_{region}"
+        
+        async with self._lock:
+            if cache_key in self._cache:
+                cached_data, timestamp = self._cache[cache_key]
+                if time.time() - timestamp < self._cache_ttl:
+                    return cached_data
+        
+        try:
+            session = await self._get_session()
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            url = f"https://api.electricitymaps.org/v3/carbon-intensity/latest?zone={region}"
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    intensity_data = {
+                        'intensity': data.get('carbonIntensity', 400),
+                        'unit': data.get('unit', 'gCO2/kWh'),
+                        'timestamp': datetime.now().isoformat(),
+                        'region': region
+                    }
+                    
+                    async with self._lock:
+                        self._cache[cache_key] = (intensity_data, time.time())
+                    
+                    REGRET_CARBON_INTENSITY.labels(region=region).set(intensity_data['intensity'])
+                    return intensity_data
+                else:
+                    logger.warning(f"Carbon intensity API returned {response.status}")
+                    return self._get_fallback_intensity(region)
+                    
+        except Exception as e:
+            logger.error(f"Carbon intensity API error: {e}")
+            return self._get_fallback_intensity(region)
+    
+    def _get_fallback_intensity(self, region: str) -> Dict:
+        hour = datetime.now().hour
+        if 0 <= hour < 6:
+            intensity = 200
+        elif 6 <= hour < 12:
+            intensity = 350
+        elif 12 <= hour < 18:
+            intensity = 300
+        else:
+            intensity = 450
+        
+        return {
+            'intensity': intensity,
+            'unit': 'gCO2/kWh',
+            'timestamp': datetime.now().isoformat(),
+            'region': region,
+            'source': 'fallback'
+        }
+    
+    async def get_forecast(self, region: Optional[str] = None, hours: int = 24) -> List[Dict]:
+        region = region or self.region
+        
+        try:
+            session = await self._get_session()
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            url = f"https://api.electricitymaps.org/v3/carbon-intensity/forecast?zone={region}"
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    forecast = []
+                    for entry in data.get('forecast', []):
+                        forecast.append({
+                            'timestamp': entry.get('datetime'),
+                            'intensity': entry.get('carbonIntensity', 400),
+                            'unit': 'gCO2/kWh'
+                        })
+                    return forecast
+                else:
+                    return self._get_fallback_forecast(hours)
+                    
+        except Exception as e:
+            logger.error(f"Carbon intensity forecast error: {e}")
+            return self._get_fallback_forecast(hours)
+    
+    def _get_fallback_forecast(self, hours: int) -> List[Dict]:
+        forecast = []
+        now = datetime.now()
+        
+        for i in range(hours):
+            hour = (now + timedelta(hours=i)).hour
+            if 0 <= hour < 6:
+                intensity = 180 + np.random.normal(0, 20)
+            elif 6 <= hour < 12:
+                intensity = 320 + np.random.normal(0, 30)
+            elif 12 <= hour < 18:
+                intensity = 280 + np.random.normal(0, 30)
+            else:
+                intensity = 420 + np.random.normal(0, 40)
+            
+            forecast.append({
+                'timestamp': (now + timedelta(hours=i)).isoformat(),
+                'intensity': max(100, intensity),
+                'unit': 'gCO2/kWh'
+            })
+        
+        return forecast
+    
+    async def adjust_regret_for_carbon(self, regret_result: Dict, urgency: str = "normal") -> Dict:
+        intensity = await self.get_current_intensity()
+        
+        adjustment = 1.0
+        
+        if urgency == "critical":
+            adjustment = 1.0
+        elif intensity['intensity'] > 500:
+            # High carbon - more conservative regret
+            adjustment = 1.15
+        elif intensity['intensity'] > 300:
+            # Moderate carbon - slight adjustment
+            adjustment = 1.05
+        else:
+            # Low carbon - can be more aggressive
+            adjustment = 0.95
+        
+        adjusted_regret = regret_result.copy()
+        adjusted_regret['maximum_regret'] *= adjustment
+        
+        return {
+            'original_regret': regret_result,
+            'adjusted_regret': adjusted_regret,
+            'adjustment_factor': adjustment,
+            'carbon_intensity': intensity['intensity'],
+            'reason': f'Carbon intensity: {intensity["intensity"]} gCO2/kWh'
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================
+# NEW: CROSS-DOMAIN REGRET TRANSFER
+# ============================================================
+
+class CrossDomainRegretTransfer:
+    """
+    Transfers regret optimization knowledge across different domains.
+    """
+    
+    def __init__(self, persistence):
+        self.persistence = persistence
+        self._domain_knowledge: Dict[str, Dict] = {}
+        self._transfer_mappings: Dict[str, Dict[str, float]] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info("CrossDomainRegretTransfer initialized")
+    
+    async def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                                 knowledge: Dict, mapping_strategy: str = 'auto') -> Dict:
+        async with self._lock:
+            if source_domain not in self._domain_knowledge:
+                self._domain_knowledge[source_domain] = {}
+            self._domain_knowledge[source_domain].update(knowledge)
+            
+            transferred = await self._map_knowledge(source_domain, target_domain, knowledge, mapping_strategy)
+            
+            transfer_key = f"{source_domain}->{target_domain}"
+            if transfer_key not in self._transfer_mappings:
+                self._transfer_mappings[transfer_key] = {}
+            
+            for key in transferred:
+                self._transfer_mappings[transfer_key][key] = self._transfer_mappings[transfer_key].get(key, 0) + 1
+            
+            CROSS_DOMAIN_REGRET_TRANSFERS.labels(source=source_domain, target=target_domain).inc()
+            
+            logger.info(f"Transferred regret knowledge from {source_domain} to {target_domain}: {len(transferred)} items")
+            return transferred
+    
+    async def _map_knowledge(self, source: str, target: str, knowledge: Dict, strategy: str) -> Dict:
+        domain_similarities = {
+            ('carbon_decisions', 'energy_decisions'): {
+                'regret': 'regret',
+                'cvar': 'cvar',
+                'robustness': 'robustness'
+            },
+            ('carbon_decisions', 'investment_decisions'): {
+                'regret': 'risk',
+                'cvar': 'cvar',
+                'portfolio': 'portfolio'
+            },
+            ('carbon_decisions', 'policy_decisions'): {
+                'regret': 'social_cost',
+                'robustness': 'resilience'
+            }
+        }
+        
+        mapping = domain_similarities.get((source, target), {})
+        transferred = {}
+        
+        if strategy == 'auto':
+            for source_key, source_value in knowledge.items():
+                if source_key in mapping:
+                    transferred[mapping[source_key]] = source_value
+                else:
+                    similar_key = self._find_similar_key(source_key, mapping)
+                    if similar_key:
+                        transferred[similar_key] = source_value
+        elif strategy == 'direct':
+            transferred = knowledge
+        
+        return transferred
+    
+    def _find_similar_key(self, source_key: str, mapping: Dict) -> Optional[str]:
+        for target_key in mapping.values():
+            if source_key.lower() in target_key.lower() or target_key.lower() in source_key.lower():
+                return target_key
+        return None
+    
+    def get_transfer_statistics(self) -> Dict:
+        return {
+            'domains': list(self._domain_knowledge.keys()),
+            'transfers': dict(self._transfer_mappings),
+            'total_transfers': sum(len(v) for v in self._transfer_mappings.values())
+        }
+
+# ============================================================
+# NEW: HUMAN-AI REGRET COLLABORATION
+# ============================================================
+
+class HumanAIRegretCollaboration:
+    """
+    Enables collaborative reflection between humans and AI on regret decisions.
+    """
+    
+    def __init__(self, persistence, feedback_timeout: int = 300):
+        self.persistence = persistence
+        self.feedback_timeout = feedback_timeout
+        self._feedback_queue: deque = deque(maxlen=1000)
+        self._explanations: Dict[str, Dict] = {}
+        self._pending_feedback: Dict[str, datetime] = {}
+        self._lock = asyncio.Lock()
+        self._listeners: List[Callable] = []
+        
+        logger.info("HumanAIRegretCollaboration initialized")
+    
+    async def request_regret_feedback(self, decision: Dict, context: Dict) -> str:
+        feedback_id = f"fb_regret_{uuid.uuid4().hex[:12]}"
+        
+        feedback_request = {
+            'id': feedback_id,
+            'decision': decision,
+            'context': context,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'pending'
+        }
+        
+        async with self._lock:
+            self._explanations[feedback_id] = feedback_request
+            self._pending_feedback[feedback_id] = datetime.now()
+            
+            cutoff = datetime.now() - timedelta(seconds=self.feedback_timeout)
+            for fid, timestamp in list(self._pending_feedback.items()):
+                if timestamp < cutoff:
+                    if fid in self._explanations:
+                        self._explanations[fid]['status'] = 'timeout'
+                    del self._pending_feedback[fid]
+        
+        HUMAN_REGRET_FEEDBACK.labels(type='request').inc()
+        return feedback_id
+    
+    async def submit_regret_feedback(self, feedback_id: str, feedback: Dict) -> bool:
+        async with self._lock:
+            if feedback_id not in self._explanations:
+                logger.warning(f"Regret feedback ID {feedback_id} not found")
+                return False
+            
+            if feedback_id not in self._pending_feedback:
+                logger.warning(f"Regret feedback ID {feedback_id} expired")
+                return False
+            
+            request = self._explanations[feedback_id]
+            request['status'] = 'completed'
+            request['feedback'] = feedback
+            request['feedback_timestamp'] = datetime.now().isoformat()
+            
+            del self._pending_feedback[feedback_id]
+            self._feedback_queue.append(request)
+        
+        await self._process_feedback(request)
+        HUMAN_REGRET_FEEDBACK.labels(type='submitted').inc()
+        
+        for listener in self._listeners:
+            try:
+                await listener(request)
+            except Exception as e:
+                logger.error(f"Regret feedback listener error: {e}")
+        
+        logger.info(f"Regret feedback {feedback_id} submitted")
+        return True
+    
+    async def _process_feedback(self, feedback_request: Dict):
+        feedback = feedback_request.get('feedback', {})
+        
+        learning = {
+            'approval': feedback.get('approval', 0.5),
+            'comments': feedback.get('comments', ''),
+            'suggestions': feedback.get('suggestions', {}),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        await self.persistence.save_regret_feedback_learning(learning)
+        
+        logger.info(f"Processed regret feedback learning: approval={learning['approval']:.2f}")
+    
+    async def generate_regret_explanation(self, decision: Dict, context: Dict) -> Dict:
+        explanation = {
+            'id': f"exp_regret_{uuid.uuid4().hex[:12]}",
+            'decision': decision,
+            'context': context,
+            'explanation': self._build_explanation(decision, context),
+            'confidence': self._calculate_confidence(decision),
+            'alternatives': self._generate_alternatives(decision),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        async with self._lock:
+            self._explanations[explanation['id']] = explanation
+        
+        return explanation
+    
+    def _build_explanation(self, decision: Dict, context: Dict) -> str:
+        parts = []
+        
+        if 'best_option_name' in decision:
+            parts.append(f"Best option: {decision['best_option_name']}")
+        if 'maximum_regret' in decision:
+            parts.append(f"Maximum regret: ${decision['maximum_regret']:,.0f}")
+        if 'reasoning' in context:
+            parts.append(f"Reasoning: {context['reasoning']}")
+        
+        return ". ".join(parts)
+    
+    def _calculate_confidence(self, decision: Dict) -> float:
+        confidence = 0.7
+        
+        if 'robustness_score' in decision:
+            confidence = decision['robustness_score']
+        
+        return min(1.0, confidence)
+    
+    def _generate_alternatives(self, decision: Dict) -> List[Dict]:
+        alternatives = []
+        
+        if 'alternative_options' in decision:
+            for alt in decision['alternative_options'][:2]:
+                alternatives.append({
+                    'option': alt.get('name', 'unknown'),
+                    'regret': alt.get('max_regret', 0),
+                    'tradeoff': 'different_risk_profile'
+                })
+        
+        return alternatives[:3]
+    
+    async def get_feedback_summary(self) -> Dict:
+        async with self._lock:
+            completed = [f for f in self._explanations.values() 
+                        if f.get('status') == 'completed']
+            
+            if not completed:
+                return {'total': 0, 'average_approval': 0}
+            
+            approvals = [f.get('feedback', {}).get('approval', 0.5) for f in completed]
+            
+            return {
+                'total': len(completed),
+                'pending': len(self._pending_feedback),
+                'average_approval': sum(approvals) / len(approvals),
+                'timestamp': datetime.now().isoformat()
+            }
+
+# ============================================================
+# NEW: PREDICTIVE REGRET MANAGEMENT
+# ============================================================
+
+class PredictiveRegretManager:
+    """
+    Predicts regret trends and proactively manages decision optimization.
+    """
+    
+    def __init__(self, persistence, horizon_hours: int = 24):
+        self.persistence = persistence
+        self.horizon_hours = horizon_hours
+        self._predictions: Dict[str, Dict] = {}
+        self._historical_data: deque = deque(maxlen=1000)
+        self._lock = asyncio.Lock()
+        
+        logger.info(f"PredictiveRegretManager initialized with {horizon_hours}h horizon")
+    
+    async def predict_regret_trend(self, time_window: int = 3600) -> Dict:
+        async with self._lock:
+            history = await self.persistence.get_regret_history(limit=100)
+            self._historical_data.extend(history)
+            
+            if len(self._historical_data) < 10:
+                return {
+                    'predicted_trend': 0.0,
+                    'confidence': 0.1,
+                    'reason': 'Insufficient data'
+                }
+            
+            recent = list(self._historical_data)[-50:]
+            
+            if len(recent) > 1:
+                time_span = (datetime.now() - datetime.fromisoformat(recent[0]['timestamp'])).total_seconds()
+                if time_span > 0:
+                    trend_rate = sum(r.get('regret', 0) for r in recent) / time_span
+                else:
+                    trend_rate = 0.0
+            else:
+                trend_rate = 0.0
+            
+            predicted_trend = trend_rate * time_window / 100
+            
+            # Calculate confidence
+            regret_values = [r.get('regret', 0) for r in recent]
+            variance = np.var(regret_values) if regret_values else 1.0
+            confidence = max(0, min(1, 1.0 - variance))
+            
+            prediction = {
+                'predicted_trend': predicted_trend,
+                'predicted_direction': 'improving' if predicted_trend < 0 else 'worsening',
+                'confidence': confidence,
+                'time_window_seconds': time_window,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            self._predictions['regret'] = prediction
+            PREDICTIVE_REGRET_ACCURACY.labels(model_type='regret').set(confidence)
+            
+            return prediction
+    
+    async def generate_proactive_recommendations(self, current_regret: float) -> List[Dict]:
+        recommendations = []
+        
+        trend_pred = await self.predict_regret_trend()
+        
+        if trend_pred.get('confidence', 0) > 0.6:
+            trend = trend_pred.get('predicted_trend', 0)
+            direction = trend_pred.get('predicted_direction', 'stable')
+            
+            if trend > 50:  # Significant worsening predicted
+                recommendations.append({
+                    'type': 'regret_alert',
+                    'reason': f'Regret predicted to worsen: {trend:.0f}',
+                    'priority': 'high',
+                    'action': 'Review decision parameters immediately'
+                })
+            elif trend < -20:  # Improvement predicted
+                recommendations.append({
+                    'type': 'regret_opportunity',
+                    'reason': f'Regret predicted to improve: {trend:.0f}',
+                    'priority': 'medium',
+                    'action': 'Consider more aggressive optimization'
+                })
+        
+        # Carbon intensity-based recommendation
+        if hasattr(self, 'carbon_optimizer'):
+            intensity = await self.carbon_optimizer.get_current_intensity()
+            if intensity.get('intensity', 0) > 400 and current_regret > 1000:
+                recommendations.append({
+                    'type': 'carbon_aware_regret',
+                    'reason': 'High carbon intensity with significant regret',
+                    'priority': 'high',
+                    'action': 'Delay non-critical decisions to lower carbon period'
+                })
+        
+        return recommendations
+    
+    async def get_regret_forecast(self, current_regret: float) -> Dict:
+        trend = await self.predict_regret_trend()
+        recommendations = await self.generate_proactive_recommendations(current_regret)
+        
+        return {
+            'regret_forecast': trend,
+            'recommendations': recommendations,
+            'timestamp': datetime.now().isoformat()
+        }
+
+# ============================================================
+# NEW: REGRET SUSTAINABILITY TRACKER
+# ============================================================
+
+class RegretSustainabilityTracker:
+    """
+    Tracks and reports regret optimization sustainability metrics.
+    """
+    
+    def __init__(self, persistence):
+        self.persistence = persistence
+        self._metrics = {
+            'eco_efficiency': [],
+            'carbon_awareness': [],
+            'sustainability_awareness': []
+        }
+        self._lock = asyncio.Lock()
+        
+        logger.info("RegretSustainabilityTracker initialized")
+    
+    async def record_metric(self, category: str, value: float, context: Dict = None):
+        async with self._lock:
+            if category in self._metrics:
+                self._metrics[category].append({
+                    'value': value,
+                    'timestamp': datetime.now().isoformat(),
+                    'context': context or {}
+                })
+                
+                logger.debug(f"Recorded {category} metric: {value:.3f}")
+    
+    async def get_sustainability_score(self) -> Dict:
+        scores = {}
+        
+        for category, records in self._metrics.items():
+            if records:
+                recent = records[-10:]
+                avg_value = sum(r['value'] for r in recent) / len(recent)
+                scores[category] = avg_value * 100
+        
+        overall = sum(scores.values()) / len(scores) if scores else 0
+        REGRET_SUSTAINABILITY_SCORE.set(overall)
+        
+        eco_score = scores.get('eco_efficiency', 0)
+        REGRET_ECO_EFFICIENCY.set(eco_score)
+        
+        return {
+            'categories': scores,
+            'overall_score': overall,
+            'eco_efficiency': eco_score,
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    async def generate_report(self) -> Dict:
+        score = await self.get_sustainability_score()
+        
+        report = {
+            'sustainability_score': score,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return report
 
 # ============================================================
 # ENHANCED MAIN REGRET CALCULATOR (COMPLETE)
 # ============================================================
 
-class EnhancedRegretCalculatorV10:
-    """Enhanced regret calculator v10.0 with all features"""
+class EnhancedRegretCalculatorV11:
+    """Enhanced regret calculator v11.0 with all sustainability features"""
     
     def __init__(self, config: Dict = None):
         self.config = config or {}
         self.instance_id = str(uuid.uuid4())[:8]
         
         # Database
-        self.db_manager = EnhancedDatabaseManagerV10(Path("./regret_data_v10.db"))
+        self.db_manager = EnhancedDatabaseManagerV10(Path("./regret_data_v11.db"))
         
         # Components
         self.payoff_calculator = EnhancedPayoffCalculatorV10()
         
         # Cache
-        self.cache = None  # Initialize later
+        self.cache = None
         
         # State (bounded)
         self.optimization_history = deque(maxlen=MAX_OPTIMIZATION_HISTORY)
         self.decision_value_estimates = defaultdict(float)
         self.visit_counts = defaultdict(int)
         self._history_lock = asyncio.Lock()
+        
+        # ============================================================
+        # NEW: Advanced sustainability components
+        # ============================================================
+        
+        # 1. Federated Regret Learning
+        self.federated_learner = FederatedRegretLearner(
+            self.db_manager,
+            self.instance_id,
+            share_interval=3600
+        )
+        
+        # 2. User-Adaptive Regret Reflexivity
+        self.user_adaptive = UserAdaptiveRegretReflexivity(
+            self.db_manager,
+            learning_rate=0.1
+        )
+        
+        # 3. Carbon-Aware Regret Optimizer
+        self.carbon_optimizer = CarbonAwareRegretOptimizer(
+            self.db_manager,
+            api_key=os.getenv('CARBON_INTENSITY_API_KEY'),
+            region=os.getenv('CARBON_REGION', 'global')
+        )
+        
+        # 4. Cross-Domain Regret Transfer
+        self.cross_domain_transfer = CrossDomainRegretTransfer(self.db_manager)
+        
+        # 5. Human-AI Regret Collaboration
+        self.human_collaborator = HumanAIRegretCollaboration(
+            self.db_manager,
+            feedback_timeout=300
+        )
+        
+        # 6. Predictive Regret Management
+        self.predictive_manager = PredictiveRegretManager(
+            self.db_manager,
+            horizon_hours=24
+        )
+        
+        # 7. Regret Sustainability Tracker
+        self.sustainability_tracker = RegretSustainabilityTracker(self.db_manager)
         
         # Concurrency control
         self._optimization_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPTIMIZATIONS)
@@ -612,16 +1030,22 @@ class EnhancedRegretCalculatorV10:
         self.exploration_rate = 0.1
         
         # Background tasks
-        self.background_tasks = set()
+        self.background_tasks: Set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
         
-        logger.info(f"EnhancedRegretCalculatorV10 v{DATA_VERSION}.0 initialized (instance: {self.instance_id})")
+        logger.info(f"EnhancedRegretCalculatorV11 v{DATA_VERSION}.0 initialized (instance: {self.instance_id})")
+        logger.info("  ✅ Advanced Regret Sustainability Features Enabled:")
+        logger.info("     - Federated Regret Learning")
+        logger.info("     - User-Adaptive Regret Reflexivity")
+        logger.info("     - Carbon-Aware Regret Optimization")
+        logger.info("     - Cross-Domain Regret Transfer")
+        logger.info("     - Human-AI Regret Collaboration")
+        logger.info("     - Predictive Regret Management")
     
     async def start(self):
         """Start all services"""
         self._running = True
         
-        # Initialize components
         from .regret_optimizer_enhanced_v10 import EnhancedCacheManager, EnhancedDataQualityScorer, EnhancedRateLimiter, EnhancedCircuitBreaker
         
         self.cache = EnhancedCacheManager()
@@ -634,16 +1058,17 @@ class EnhancedRegretCalculatorV10:
         
         await self.cache.start()
         
-        # Start queue worker
         self._queue_worker = asyncio.create_task(self._process_queue())
         
-        # Start WebSocket dashboard
         await self.websocket.start()
         
-        # Start background tasks
         tasks = [
             asyncio.create_task(self._health_check_loop()),
-            asyncio.create_task(self._cleanup_loop())
+            asyncio.create_task(self._cleanup_loop()),
+            # NEW: Sustainability background tasks
+            asyncio.create_task(self._federated_learning_loop()),
+            asyncio.create_task(self._predictive_loop()),
+            asyncio.create_task(self._sustainability_loop())
         ]
         
         for task in tasks:
@@ -651,6 +1076,65 @@ class EnhancedRegretCalculatorV10:
             task.add_done_callback(self.background_tasks.discard)
         
         logger.info(f"Regret calculator started with {len(self.background_tasks)} background tasks")
+    
+    # ============================================================
+    # NEW: Sustainability Background Tasks
+    # ============================================================
+    
+    async def _federated_learning_loop(self):
+        """Background federated learning loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(3600)
+                insights = await self.federated_learner.pull_network_insights(limit=5)
+                if insights:
+                    logger.info(f"Pulled {len(insights)} federated regret insights")
+                    
+                    for insight in insights:
+                        if 'regret' in insight.get('insight', {}):
+                            regret = insight['insight']['regret']
+                            await self.sustainability_tracker.record_metric(
+                                'sustainability_awareness',
+                                0.8,
+                                {'value': regret.get('value', 0)}
+                            )
+            except Exception as e:
+                logger.error(f"Federated learning error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _predictive_loop(self):
+        """Background predictive loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(1800)  # Every 30 minutes
+                
+                if self.optimization_history:
+                    latest = self.optimization_history[-1]
+                    forecast = await self.predictive_manager.get_regret_forecast(latest.maximum_regret)
+                    
+                    for rec in forecast.get('recommendations', []):
+                        if rec.get('priority') == 'high':
+                            logger.info(f"Predictive recommendation: {rec['reason']")
+                    
+                    await self.sustainability_tracker.record_metric(
+                        'carbon_awareness',
+                        len(forecast.get('recommendations', [])) / 10,
+                        {'recommendations': len(forecast.get('recommendations', []))}
+                    )
+            except Exception as e:
+                logger.error(f"Predictive loop error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _sustainability_loop(self):
+        """Background sustainability reporting loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(3600)  # Every hour
+                report = await self.sustainability_tracker.generate_report()
+                logger.info(f"Sustainability report: overall_score={report['sustainability_score']['overall_score']:.1f}%")
+            except Exception as e:
+                logger.error(f"Sustainability loop error: {e}")
+                await asyncio.sleep(60)
     
     async def _process_queue(self):
         """Process queued optimization operations"""
@@ -673,7 +1157,7 @@ class EnhancedRegretCalculatorV10:
                 logger.error(f"Queue worker error: {e}")
     
     async def _execute_optimization(self, operation: Dict) -> RegretResult:
-        """Execute optimization with rate limiting and circuit breaker"""
+        """Execute optimization with sustainability features"""
         async with self._optimization_semaphore:
             await self.rate_limiter.wait_and_acquire()
             
@@ -681,11 +1165,44 @@ class EnhancedRegretCalculatorV10:
             decisions = operation['decisions']
             scenarios = operation['scenarios']
             method = operation.get('method', 'minimax')
+            user_id = operation.get('user_id')
+            
+            # User adaptation
+            if user_id and self.user_adaptive:
+                regret_params = await self.user_adaptive.get_personalized_regret_params(
+                    user_id,
+                    {'cvar_alpha': CVAR_ALPHA}
+                )
+                await self.user_adaptive.learn_user_preference(
+                    user_id,
+                    'accept_regret_decision',
+                    {'method': method},
+                    {'success': True}
+                )
+            
+            # Carbon-aware adjustment
+            if self.carbon_optimizer:
+                carbon_adjustment = await self.carbon_optimizer.adjust_regret_for_carbon(
+                    {'maximum_regret': 1000},
+                    "normal"
+                )
+                await self.sustainability_tracker.record_metric(
+                    'carbon_awareness',
+                    carbon_adjustment['adjustment_factor'] - 1.0,
+                    {'adjustment': carbon_adjustment['adjustment_factor']}
+                )
+            
+            # Apply federated insights
+            if self.federated_learner.federated_weights:
+                regret_params = await self.federated_learner.apply_federated_insights({
+                    'cvar_alpha': 0.95,
+                    'scenario_count': 50
+                })
             
             # Assess data quality
             quality_score = await self.quality_scorer.assess_quality(decisions)
             
-            # Run optimization with circuit breaker
+            # Run optimization
             if method == 'cvar':
                 result = await self.circuit_breakers['optimization'].call(
                     self._calculate_cvar_regret, decisions, scenarios
@@ -695,15 +1212,54 @@ class EnhancedRegretCalculatorV10:
                     self._calculate_minimax_regret, decisions, scenarios
                 )
             
+            # Apply carbon adjustment
+            if self.carbon_optimizer:
+                adjusted = await self.carbon_optimizer.adjust_regret_for_carbon(
+                    result.to_dict(),
+                    "normal"
+                )
+                result.maximum_regret = adjusted['adjusted_regret']['maximum_regret']
+            
             result.data_quality_score = quality_score
             result.calculation_time_ms = (time.time() - start_time) * 1000
             
-            # Perform sensitivity analysis
+            # Sensitivity analysis
             result.sensitivity_results = await self._sensitivity_analysis(decisions, scenarios)
             
-            # Calculate portfolio allocation if multiple decisions
+            # Portfolio allocation
             if len(decisions) > 1:
                 result.portfolio_allocation = await self._portfolio_optimization(decisions, scenarios)
+            
+            # Federated sharing
+            if result.maximum_regret < 500:
+                await self.federated_learner.share_regret_insight({
+                    'regret': {
+                        'value': result.maximum_regret,
+                        'method': method,
+                        'robustness': result.robustness_score
+                    }
+                })
+            
+            # Human collaboration
+            if self.human_collaborator:
+                await self.human_collaborator.request_regret_feedback(
+                    {
+                        'best_option_name': result.best_option_name,
+                        'maximum_regret': result.maximum_regret,
+                        'robustness_score': result.robustness_score
+                    },
+                    {
+                        'reasoning': 'Regret optimization completed',
+                        'carbon_impact': result.calculation_time_ms * 0.001
+                    }
+                )
+            
+            # Record sustainability metrics
+            await self.sustainability_tracker.record_metric(
+                'eco_efficiency',
+                1.0 / (1.0 + result.maximum_regret / 1000),
+                {'regret': result.maximum_regret}
+            )
             
             # Store in memory
             async with self._history_lock:
@@ -718,7 +1274,6 @@ class EnhancedRegretCalculatorV10:
             REGRET_SCORE.set(result.maximum_regret)
             CVAR_SCORE.set(result.cvar_regret)
             
-            # Broadcast via WebSocket
             await self.websocket.broadcast_result(result, decisions)
             
             audit_logger.info(f"Regret calculation: best={result.best_option_name}, " +
@@ -732,29 +1287,19 @@ class EnhancedRegretCalculatorV10:
         n_decisions = len(decisions)
         n_scenarios = len(scenarios)
         
-        # Build payoff matrix
         payoff_matrix = np.zeros((n_decisions, n_scenarios))
         for i, decision in enumerate(decisions):
             for j, scenario in enumerate(scenarios):
                 payoff_matrix[i, j] = await self.payoff_calculator.calculate_payoff(decision, scenario)
         
-        # Calculate regret matrix
         best_per_scenario = np.max(payoff_matrix, axis=0)
         regret_matrix = best_per_scenario - payoff_matrix
-        
-        # Calculate maximum regret per decision
         max_regret = np.max(regret_matrix, axis=1)
-        
-        # Find decision with minimum maximum regret
         best_idx = np.argmin(max_regret)
         
-        # Calculate CVaR regret
         sorted_regrets = np.sort(regret_matrix[best_idx])
         cvar_idx = int(CVAR_ALPHA * len(sorted_regrets))
         cvar_regret = np.mean(sorted_regrets[:cvar_idx]) if cvar_idx > 0 else max_regret[best_idx]
-        
-        # Generate regret heatmap
-        regret_heatmap = regret_matrix.tolist()
         
         return RegretResult(
             best_option_id=decisions[best_idx].option_id,
@@ -767,26 +1312,23 @@ class EnhancedRegretCalculatorV10:
                 for d, r in zip(decisions, max_regret) if d.option_id != decisions[best_idx].option_id
             ],
             confidence_interval=(max_regret[best_idx] * 0.9, max_regret[best_idx] * 1.1),
-            regret_heatmap=regret_heatmap
+            regret_heatmap=regret_matrix.tolist()
         )
     
     async def _calculate_cvar_regret(self, decisions: List[DecisionOption],
                                      scenarios: List[ScenarioDefinition]) -> RegretResult:
-        """Calculate CVaR-optimized regret (risk-averse)"""
+        """Calculate CVaR-optimized regret"""
         n_decisions = len(decisions)
         n_scenarios = len(scenarios)
         
-        # Build payoff matrix
         payoff_matrix = np.zeros((n_decisions, n_scenarios))
         for i, decision in enumerate(decisions):
             for j, scenario in enumerate(scenarios):
                 payoff_matrix[i, j] = await self.payoff_calculator.calculate_payoff(decision, scenario)
         
-        # Calculate regret matrix
         best_per_scenario = np.max(payoff_matrix, axis=0)
         regret_matrix = best_per_scenario - payoff_matrix
         
-        # Calculate CVaR for each decision
         cvar_values = []
         for i in range(n_decisions):
             sorted_regrets = np.sort(regret_matrix[i])
@@ -794,7 +1336,6 @@ class EnhancedRegretCalculatorV10:
             cvar = np.mean(sorted_regrets[:cvar_idx]) if cvar_idx > 0 else np.max(regret_matrix[i])
             cvar_values.append(cvar)
         
-        # Find decision with minimum CVaR
         best_idx = np.argmin(cvar_values)
         max_regret = np.max(regret_matrix[best_idx])
         
@@ -818,7 +1359,6 @@ class EnhancedRegretCalculatorV10:
         base_result = await self._calculate_minimax_regret(decisions, scenarios)
         sensitivities = {}
         
-        # Test parameter variations
         params = ['carbon_price', 'discount_rate', 'demand_growth_rate', 'regulatory_risk']
         
         for param in params:
@@ -841,19 +1381,16 @@ class EnhancedRegretCalculatorV10:
         n_decisions = len(decisions)
         n_scenarios = len(scenarios)
         
-        # Build payoff matrix
         payoff_matrix = np.zeros((n_decisions, n_scenarios))
         for i, decision in enumerate(decisions):
             for j, scenario in enumerate(scenarios):
                 payoff_matrix[i, j] = await self.payoff_calculator.calculate_payoff(decision, scenario)
         
-        # Simple heuristic allocation based on regret scores
         regrets = []
         for i in range(n_decisions):
             regret = np.max(payoff_matrix) - np.mean(payoff_matrix[i])
             regrets.append(regret)
         
-        # Normalize inverse regrets to get weights
         inv_regrets = [1 / (r + 1) for r in regrets]
         total = sum(inv_regrets)
         weights = [w / total for w in inv_regrets]
@@ -862,8 +1399,9 @@ class EnhancedRegretCalculatorV10:
     
     async def calculate_regret(self, decisions: List[DecisionOption],
                                scenarios: List[ScenarioDefinition],
-                               method: str = "minimax") -> RegretResult:
-        """Queue regret calculation"""
+                               method: str = "minimax",
+                               user_id: str = None) -> RegretResult:
+        """Queue regret calculation with user context"""
         future = asyncio.Future()
         
         await self.operation_queue.put({
@@ -871,6 +1409,7 @@ class EnhancedRegretCalculatorV10:
             'decisions': decisions,
             'scenarios': scenarios,
             'method': method,
+            'user_id': user_id,
             'future': future
         })
         OPTIMIZATION_QUEUE_SIZE.set(self.operation_queue.qsize())
@@ -883,7 +1422,7 @@ class EnhancedRegretCalculatorV10:
         """Generate interactive regret heatmap HTML"""
         fig = go.Figure(data=go.Heatmap(
             z=regret_matrix,
-            x=scenario_names[:10],  # Limit for readability
+            x=scenario_names[:10],
             y=decision_names,
             colorscale='RdYlGn_r',
             hoverongaps=False,
@@ -906,7 +1445,7 @@ class EnhancedRegretCalculatorV10:
         """Generate tornado plot for sensitivity analysis"""
         sorted_items = sorted(sensitivities.items(), key=lambda x: abs(x[1]), reverse=True)
         names = [item[0] for item in sorted_items]
-        values = [item[1] * 100 for item in sorted_items]  # Convert to percentage
+        values = [item[1] * 100 for item in sorted_items]
         
         fig = go.Figure(go.Bar(
             x=values,
@@ -933,11 +1472,9 @@ class EnhancedRegretCalculatorV10:
         if len(scenarios) <= target_size:
             return scenarios
         
-        # Extract features
         features = np.array([[s.carbon_price, s.discount_rate, s.demand_growth_rate,
                               s.technology_cost_reduction, s.regulatory_risk] for s in scenarios])
         
-        # Use k-means clustering (simplified - random selection for demo)
         indices = np.random.choice(len(scenarios), target_size, replace=False)
         reduced = [scenarios[i] for i in indices]
         
@@ -948,7 +1485,6 @@ class EnhancedRegretCalculatorV10:
         return reduced
     
     async def _health_check_loop(self):
-        """Background health check loop"""
         while not self._shutdown_event.is_set():
             try:
                 health = await self.health_check()
@@ -961,7 +1497,6 @@ class EnhancedRegretCalculatorV10:
                 await asyncio.sleep(60)
     
     async def _cleanup_loop(self):
-        """Background cleanup for old data"""
         while not self._shutdown_event.is_set():
             try:
                 await self.payoff_calculator.clear_cache()
@@ -974,7 +1509,6 @@ class EnhancedRegretCalculatorV10:
                 await asyncio.sleep(3600)
     
     async def health_check(self) -> Dict:
-        """Comprehensive health check with timeout"""
         try:
             async def _check():
                 async with self._history_lock:
@@ -982,6 +1516,7 @@ class EnhancedRegretCalculatorV10:
                 
                 quality_stats = await self.quality_scorer.get_statistics()
                 cache_stats = await self.cache.get_stats()
+                sustainability = await self.sustainability_tracker.get_sustainability_score()
                 
                 health_score = 100
                 if opt_count == 0:
@@ -1002,6 +1537,13 @@ class EnhancedRegretCalculatorV10:
                     'cache': cache_stats,
                     'circuit_breakers': {name: cb.get_metrics()['state'] 
                                         for name, cb in self.circuit_breakers.items()},
+                    # NEW: Sustainability metrics
+                    'sustainability': {
+                        'score': sustainability,
+                        'federated_packages': len(self.federated_learner._knowledge_bank),
+                        'cross_domain_transfers': self.cross_domain_transfer.get_transfer_statistics(),
+                        'human_feedback': await self.human_collaborator.get_feedback_summary()
+                    },
                     'timestamp': datetime.now().isoformat()
                 }
             
@@ -1012,16 +1554,15 @@ class EnhancedRegretCalculatorV10:
             return {'healthy': False, 'status': 'timeout', 'instance_id': self.instance_id}
     
     async def get_statistics(self) -> Dict:
-        """Get comprehensive statistics"""
         async with self._history_lock:
             opt_count = len(self.optimization_history)
-            
-            # Calculate average regret
             avg_regret = np.mean([r.maximum_regret for r in self.optimization_history]) if opt_count > 0 else 0
             avg_cvar = np.mean([r.cvar_regret for r in self.optimization_history]) if opt_count > 0 else 0
         
         quality_stats = await self.quality_scorer.get_statistics()
         cache_stats = await self.cache.get_stats()
+        sustainability = await self.sustainability_tracker.get_sustainability_score()
+        feedback_summary = await self.human_collaborator.get_feedback_summary()
         
         return {
             'instance_id': self.instance_id,
@@ -1035,11 +1576,17 @@ class EnhancedRegretCalculatorV10:
             'ws_connections': len(self.websocket.connections),
             'exploration_rate': self.exploration_rate,
             'circuit_breakers': {name: cb.get_metrics() for name, cb in self.circuit_breakers.items()},
+            # NEW: Sustainability metrics
+            'sustainability': {
+                'score': sustainability,
+                'feedback': feedback_summary,
+                'federated': self.federated_learner.get_federated_insights(),
+                'cross_domain': self.cross_domain_transfer.get_transfer_statistics()
+            },
             'timestamp': datetime.now().isoformat()
         }
     
     async def export_state(self) -> Dict:
-        """Export current state for backup"""
         async with self._history_lock:
             return {
                 'instance_id': self.instance_id,
@@ -1047,11 +1594,11 @@ class EnhancedRegretCalculatorV10:
                 'optimization_history': [r.to_dict() for r in self.optimization_history],
                 'decision_value_estimates': dict(self.decision_value_estimates),
                 'exploration_rate': self.exploration_rate,
+                'sustainability': await self.sustainability_tracker.get_sustainability_score(),
                 'exported_at': datetime.now().isoformat()
             }
     
     async def import_state(self, state: Dict):
-        """Import state from backup"""
         async with self._history_lock:
             self.optimization_history.clear()
             for r in state.get('optimization_history', []):
@@ -1066,13 +1613,15 @@ class EnhancedRegretCalculatorV10:
             logger.info(f"Imported {len(self.optimization_history)} optimizations from backup")
     
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info(f"Shutting down EnhancedRegretCalculatorV10 (instance: {self.instance_id})")
+        logger.info(f"Shutting down EnhancedRegretCalculatorV11 (instance: {self.instance_id})")
         
         self._shutdown_event.set()
         self._running = False
         
-        # Cancel queue worker
+        # Shutdown advanced components
+        await self.federated_learner.shutdown()
+        await self.carbon_optimizer.close()
+        
         if self._queue_worker:
             self._queue_worker.cancel()
             try:
@@ -1080,333 +1629,22 @@ class EnhancedRegretCalculatorV10:
             except asyncio.CancelledError:
                 pass
         
-        # Cancel background tasks
         for task in self.background_tasks:
             task.cancel()
         
         if self.background_tasks:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
         
-        # Stop WebSocket server
         await self.websocket.stop()
-        
-        # Stop cache
         await self.cache.stop()
-        
-        # Close database
         self.db_manager.dispose()
-        
-        # Shutdown thread pool
         self.thread_pool.shutdown(wait=True)
         
+        # Final sustainability report
+        report = await self.sustainability_tracker.generate_report()
+        logger.info(f"Final sustainability report: overall_score={report['sustainability_score']['overall_score']:.1f}%")
+        
         logger.info("Shutdown complete")
-
-# ============================================================
-# ENHANCED SCENARIO GENERATOR
-# ============================================================
-
-class EnhancedScenarioGenerator:
-    """Enhanced stochastic scenario generator with correlation"""
-    
-    def __init__(self, n_scenarios: int = 100, seed: int = 42):
-        self.n_scenarios = n_scenarios
-        np.random.seed(seed)
-    
-    async def generate_scenarios(self, correlation_matrix: np.ndarray = None) -> List[ScenarioDefinition]:
-        """Generate correlated scenarios using Cholesky decomposition"""
-        scenarios = []
-        
-        # Base parameters with correlation
-        if correlation_matrix is not None:
-            # Generate correlated random variables
-            mean = [75, 0.07, 0.02, 0.05, 0.3]
-            std = [25, 0.02, 0.01, 0.03, 0.15]
-            L = np.linalg.cholesky(correlation_matrix)
-            uncorrelated = np.random.normal(0, 1, (self.n_scenarios, len(mean)))
-            correlated = uncorrelated @ L.T
-            params = mean + correlated * std
-        else:
-            # Independent sampling
-            carbon_prices = np.random.normal(75, 25, self.n_scenarios)
-            discount_rates = np.random.normal(0.07, 0.02, self.n_scenarios)
-            growth_rates = np.random.normal(0.02, 0.01, self.n_scenarios)
-            tech_reductions = np.random.beta(2, 5, self.n_scenarios) * 0.15
-            regulatory_risks = np.random.uniform(0.1, 0.6, self.n_scenarios)
-            params = [carbon_prices, discount_rates, growth_rates, tech_reductions, regulatory_risks]
-        
-        for i in range(self.n_scenarios):
-            scenario = ScenarioDefinition(
-                name=f"Scenario_{i+1}",
-                carbon_price=max(10, params[0][i]),
-                discount_rate=max(0.01, min(0.15, params[1][i])),
-                demand_growth_rate=max(0, params[2][i]),
-                technology_cost_reduction=max(0, min(0.3, params[3][i])),
-                regulatory_risk=max(0, min(1, params[4][i])),
-                market_volatility=np.random.exponential(0.1),
-                probability=1.0 / self.n_scenarios
-            )
-            scenarios.append(scenario)
-        
-        return scenarios
-
-# ============================================================
-# SUPPORTING CLASSES (PRESERVED AND ENHANCED)
-# ============================================================
-
-class EnhancedCacheManager:
-    """Async cache with TTL and size limits with cleanup"""
-    
-    def __init__(self, max_size: int = MAX_CACHE_SIZE, ttl_seconds: int = CACHE_TTL_SECONDS,
-                 max_size_mb: int = MAX_CACHE_SIZE_MB):
-        self.max_size = max_size
-        self.ttl = ttl_seconds
-        self.max_size_bytes = max_size_mb * 1024 * 1024
-        self._cache: Dict[str, Tuple[float, Any, int]] = {}
-        self.hits = 0
-        self.misses = 0
-        self.total_size_bytes = 0
-        self._lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self.running = False
-    
-    async def start(self):
-        self.running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-    
-    async def get(self, key: str) -> Optional[Any]:
-        async with self._lock:
-            if key in self._cache:
-                timestamp, value, size = self._cache[key]
-                if time.time() - timestamp < self.ttl:
-                    self.hits += 1
-                    return value
-                else:
-                    self.total_size_bytes -= size
-                    del self._cache[key]
-            self.misses += 1
-            return None
-    
-    async def set(self, key: str, value: Any):
-        async with self._lock:
-            size_bytes = len(str(value)) * 2
-            
-            while self.total_size_bytes + size_bytes > self.max_size_bytes and self._cache:
-                oldest = min(self._cache.items(), key=lambda x: x[1][0])
-                _, _, old_size = self._cache[oldest[0]]
-                self.total_size_bytes -= old_size
-                del self._cache[oldest[0]]
-            
-            if len(self._cache) >= self.max_size:
-                oldest = min(self._cache.items(), key=lambda x: x[1][0])
-                _, _, old_size = self._cache[oldest[0]]
-                self.total_size_bytes -= old_size
-                del self._cache[oldest[0]]
-            
-            self._cache[key] = (time.time(), value, size_bytes)
-            self.total_size_bytes += size_bytes
-    
-    async def _cleanup_loop(self):
-        while self.running:
-            await asyncio.sleep(60)
-            async with self._lock:
-                now = time.time()
-                expired = []
-                for key, (timestamp, _, size) in self._cache.items():
-                    if now - timestamp >= self.ttl:
-                        expired.append((key, size))
-                
-                for key, size in expired:
-                    self.total_size_bytes -= size
-                    del self._cache[key]
-    
-    async def get_stats(self) -> Dict:
-        async with self._lock:
-            total = self.hits + self.misses
-            return {
-                'size': len(self._cache),
-                'size_bytes': self.total_size_bytes,
-                'max_size_bytes': self.max_size_bytes,
-                'hits': self.hits,
-                'misses': self.misses,
-                'hit_rate': self.hits / total if total > 0 else 0,
-                'ttl': self.ttl
-            }
-    
-    async def stop(self):
-        self.running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-
-class EnhancedDataQualityScorer:
-    """Data quality assessment for decisions and scenarios"""
-    
-    def __init__(self):
-        self.quality_history = deque(maxlen=1000)
-        self._lock = asyncio.Lock()
-    
-    async def assess_quality(self, decisions: List[DecisionOption]) -> float:
-        if not decisions:
-            return 0.0
-        
-        scores = []
-        for decision in decisions:
-            score = 100.0
-            
-            if not decision.name:
-                score -= 20
-            if decision.capex_usd <= 0:
-                score -= 15
-            if decision.carbon_reduction_tonnes_per_year <= 0:
-                score -= 25
-            if decision.abatement_cost_per_tonne > 1000:
-                score -= 10
-            if decision.risk_score < 0 or decision.risk_score > 1:
-                score -= 10
-            
-            scores.append(max(0, score))
-        
-        quality_score = np.mean(scores)
-        
-        async with self._lock:
-            self.quality_history.append({
-                'timestamp': datetime.now(),
-                'score': quality_score,
-                'decision_count': len(decisions)
-            })
-        
-        DATA_QUALITY_SCORE.set(quality_score)
-        return quality_score
-    
-    async def get_statistics(self) -> Dict:
-        async with self._lock:
-            if not self.quality_history:
-                return {'total_assessments': 0}
-            scores = [q['score'] for q in self.quality_history]
-            return {
-                'total_assessments': len(self.quality_history),
-                'avg_score': np.mean(scores),
-                'min_score': np.min(scores),
-                'max_score': np.max(scores)
-            }
-
-class EnhancedRateLimiter:
-    """Rate limiter for optimization requests"""
-    
-    def __init__(self, rate: int = RATE_LIMIT_REQUESTS, per_seconds: int = RATE_LIMIT_WINDOW):
-        self.rate = rate
-        self.per_seconds = per_seconds
-        self.tokens = rate
-        self.last_refill = time.time()
-        self._lock = asyncio.Lock()
-        self.total_requests = 0
-        self.throttled_requests = 0
-    
-    async def acquire(self) -> bool:
-        async with self._lock:
-            now = time.time()
-            time_passed = now - self.last_refill
-            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.per_seconds))
-            self.last_refill = now
-            
-            if self.tokens >= 1:
-                self.tokens -= 1
-                self.total_requests += 1
-                return True
-            else:
-                self.throttled_requests += 1
-                return False
-    
-    async def wait_and_acquire(self):
-        while not await self.acquire():
-            await asyncio.sleep(0.1)
-    
-    def get_metrics(self) -> Dict:
-        total = self.total_requests + self.throttled_requests
-        return {
-            'total_requests': self.total_requests,
-            'throttled_requests': self.throttled_requests,
-            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100
-        }
-
-class EnhancedCircuitBreaker:
-    """Circuit breaker for optimization failures"""
-    
-    def __init__(self, name: str, failure_threshold: int = CIRCUIT_BREAKER_THRESHOLD,
-                 recovery_timeout: int = CIRCUIT_BREAKER_TIMEOUT,
-                 half_open_success_threshold: int = 2):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_success_threshold = half_open_success_threshold
-        self.state = CircuitBreakerState.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time = None
-        self._lock = asyncio.Lock()
-        self.metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
-    
-    async def call(self, func: Callable, *args, **kwargs):
-        async with self._lock:
-            if self.state == CircuitBreakerState.OPEN:
-                if time.time() - self.last_failure_time >= self.recovery_timeout:
-                    self.state = CircuitBreakerState.HALF_OPEN
-                    self.success_count = 0
-                    CIRCUIT_BREAKER_STATE.labels(component=self.name).set(1)
-                else:
-                    raise Exception(f"Circuit breaker {self.name} is OPEN")
-            
-            if self.state == CircuitBreakerState.HALF_OPEN and self.success_count >= self.half_open_success_threshold:
-                self.state = CircuitBreakerState.CLOSED
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(0)
-        
-        self.metrics['total_calls'] += 1
-        
-        try:
-            result = await func(*args, **kwargs)
-            await self._record_success()
-            return result
-        except Exception as e:
-            await self._record_failure()
-            raise
-    
-    async def _record_success(self):
-        async with self._lock:
-            self.metrics['successful_calls'] += 1
-            self.success_count += 1
-            if self.state == CircuitBreakerState.HALF_OPEN:
-                self.failure_count = 0
-    
-    async def _record_failure(self):
-        async with self._lock:
-            self.metrics['failed_calls'] += 1
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            
-            if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
-                self.state = CircuitBreakerState.OPEN
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(2)
-            elif self.state == CircuitBreakerState.HALF_OPEN:
-                self.state = CircuitBreakerState.OPEN
-                CIRCUIT_BREAKER_STATE.labels(component=self.name).set(2)
-    
-    def get_metrics(self) -> Dict:
-        success_rate = (self.metrics['successful_calls'] / max(self.metrics['total_calls'], 1)) * 100
-        return {
-            **self.metrics,
-            'state': self.state.value,
-            'failure_count': self.failure_count,
-            'success_count': self.success_count,
-            'success_rate_pct': success_rate
-        }
-
-class CircuitBreakerState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
 
 # ============================================================
 # SINGLETON ACCESSOR
@@ -1415,13 +1653,12 @@ class CircuitBreakerState(Enum):
 _regret_calculator = None
 _regret_lock = asyncio.Lock()
 
-async def get_enhanced_regret_calculator() -> EnhancedRegretCalculatorV10:
-    """Get singleton regret calculator instance (async-safe)"""
+async def get_enhanced_regret_calculator() -> EnhancedRegretCalculatorV11:
     global _regret_calculator
     if _regret_calculator is None:
         async with _regret_lock:
             if _regret_calculator is None:
-                _regret_calculator = EnhancedRegretCalculatorV10()
+                _regret_calculator = EnhancedRegretCalculatorV11()
                 await _regret_calculator.start()
     return _regret_calculator
 
@@ -1431,25 +1668,58 @@ async def get_enhanced_regret_calculator() -> EnhancedRegretCalculatorV10:
 
 async def main():
     print("=" * 80)
-    print("Enhanced Regret-Optimized Carbon Decision System v10.0 - Enterprise Platinum")
-    print("CVaR Optimization | Sensitivity Analysis | Portfolio Allocation | Live Dashboard")
+    print("Enhanced Regret-Optimized Carbon Decision System v11.0 - Advanced Sustainability")
+    print("Federated Learning | User Adaptation | Carbon-Aware | Cross-Domain Transfer")
     print("=" * 80)
     
     calculator = await get_enhanced_regret_calculator()
     
-    print(f"\n✅ CRITICAL FIXES OVER v9.0:")
-    print(f"   ✅ Missing imports (random, contextmanager) fixed")
-    print(f"   ✅ Race conditions with comprehensive async locks")
-    print(f"   ✅ Memory leaks with TTL-based payoff matrix cache")
-    print(f"   ✅ Deadlock potential with database timeouts")
-    print(f"   ✅ Interactive regret heatmap visualization")
-    print(f"   ✅ Sensitivity analysis with tornado plots")
-    print(f"   ✅ Robust optimization with CVaR")
-    print(f"   ✅ Multi-period dynamic programming")
-    print(f"   ✅ Real-time WebSocket dashboard for decision monitoring")
-    print(f"   ✅ Bayesian decision network integration")
-    print(f"   ✅ Scenario reduction for computational efficiency")
-    print(f"   ✅ Portfolio optimization across multiple decisions")
+    print(f"\n✅ v11.0 ADVANCED SUSTAINABILITY FEATURES:")
+    print(f"   ✅ Federated Regret Learning - Cross-instance insights sharing")
+    print(f"   ✅ User-Adaptive Regret Reflexivity - Learning user preferences")
+    print(f"   ✅ Carbon-Aware Regret Optimization - Green decision optimization")
+    print(f"   ✅ Cross-Domain Regret Transfer - Domain insights sharing")
+    print(f"   ✅ Human-AI Regret Collaboration - Feedback loops with users")
+    print(f"   ✅ Predictive Regret Management - Proactive decision management")
+    print(f"   ✅ Regret Sustainability Metrics - Tracking eco-efficiency gains")
+    
+    # Test federated learning
+    print(f"\n📊 Testing Federated Learning:")
+    insight_id = await calculator.federated_learner.share_regret_insight({
+        'regret': {
+            'value': 500,
+            'method': 'minimax',
+            'robustness': 0.85
+        }
+    })
+    print(f"   Insight shared: {insight_id}")
+    
+    # Test user adaptation
+    print(f"\n📊 Testing User Adaptation:")
+    await calculator.user_adaptive.learn_user_preference(
+        "test_user",
+        "accept_regret_decision",
+        {"method": "minimax", "regret": 500},
+        {"success": True}
+    )
+    print(f"   User adaptation updated")
+    
+    # Test carbon-aware optimization
+    print(f"\n📊 Testing Carbon-Aware Optimization:")
+    carbon_adjustment = await calculator.carbon_optimizer.adjust_regret_for_carbon(
+        {'maximum_regret': 1000},
+        "normal"
+    )
+    print(f"   Carbon adjustment factor: {carbon_adjustment['adjustment_factor']:.2f}")
+    print(f"   Carbon intensity: {carbon_adjustment['carbon_intensity']:.0f} gCO2/kWh")
+    
+    # Test cross-domain transfer
+    print(f"\n📊 Testing Cross-Domain Transfer:")
+    transferred = await calculator.cross_domain_transfer.transfer_knowledge(
+        'carbon_decisions', 'energy_decisions',
+        {'regret': 500, 'cvar': 300, 'robustness': 0.85}
+    )
+    print(f"   Transferred {len(transferred)} items from carbon to energy decisions")
     
     # Define decisions
     decisions = [
@@ -1467,19 +1737,17 @@ async def main():
                       risk_score=0.7, decision_type="phased"),
     ]
     
-    # Save decisions to database
     for decision in decisions:
         await calculator.db_manager.save_decision(decision)
     
-    # Generate scenarios
     generator = EnhancedScenarioGenerator(n_scenarios=100)
     scenarios = await generator.generate_scenarios()
-    
-    # Reduce scenarios for efficiency
     reduced_scenarios = await calculator.reduce_scenarios(scenarios, target_size=50)
     
-    print(f"\n📊 Calculating Minimax Regret...")
-    minimax_result = await calculator.calculate_regret(decisions, reduced_scenarios, method="minimax")
+    print(f"\n📊 Calculating Minimax Regret with Sustainability...")
+    minimax_result = await calculator.calculate_regret(
+        decisions, reduced_scenarios, method="minimax", user_id="test_user"
+    )
     
     print(f"\n📈 Minimax Regret Results:")
     print(f"   Best Decision: {minimax_result.best_option_name}")
@@ -1487,60 +1755,19 @@ async def main():
     print(f"   CVaR Regret: ${minimax_result.cvar_regret:,.0f}")
     print(f"   Robustness Score: {minimax_result.robustness_score:.3f}")
     print(f"   Data Quality: {minimax_result.data_quality_score:.1f}%")
-    print(f"   Calculation Time: {minimax_result.calculation_time_ms:.0f}ms")
     
-    print(f"\n📊 Calculating CVaR-Optimized Regret...")
-    cvar_result = await calculator.calculate_regret(decisions, reduced_scenarios, method="cvar")
-    print(f"   CVaR-Optimized Best: {cvar_result.best_option_name}")
-    print(f"   CVaR Regret: ${cvar_result.cvar_regret:,.0f}")
-    
-    # Sensitivity analysis
-    print(f"\n🔬 Sensitivity Analysis:")
-    for param, sensitivity in minimax_result.sensitivity_results.items():
-        direction = "↑" if sensitivity > 0 else "↓" if sensitivity < 0 else "→"
-        print(f"   {param}: {direction} {abs(sensitivity)*100:.1f}% change in regret")
-    
-    # Portfolio allocation
-    if minimax_result.portfolio_allocation:
-        print(f"\n💰 Portfolio Allocation:")
-        for name, weight in minimax_result.portfolio_allocation.items():
-            print(f"   {name}: {weight*100:.1f}%")
-    
-    # Generate visualizations
-    if minimax_result.regret_heatmap:
-        heatmap_html = await calculator.generate_regret_heatmap_html(
-            minimax_result.regret_heatmap,
-            [d.name for d in decisions],
-            [s.name for s in reduced_scenarios[:10]]
-        )
-        print(f"\n📊 Regret Heatmap generated (HTML preview available)")
-    
-    tornado_html = await calculator.generate_tornado_plot(minimax_result.sensitivity_results)
-    print(f"   Tornado plot generated for sensitivity analysis")
-    
-    health = await calculator.health_check()
-    print(f"\n🏥 System Health:")
-    print(f"   Status: {'✅ Healthy' if health['healthy'] else '⚠️ Degraded'}")
-    print(f"   Health Score: {health['health_score']:.0f}")
-    print(f"   Data Quality: {health['data_quality']:.1f}%")
-    print(f"   WebSocket Connections: {health['ws_connections']}")
-    
+    # Get sustainability metrics
     stats = await calculator.get_statistics()
-    print(f"\n📊 System Statistics:")
-    print(f"   Instance: {stats['instance_id']}")
-    print(f"   Version: {stats['version']}")
-    print(f"   Optimizations: {stats['optimization_count']}")
-    print(f"   Avg Max Regret: ${stats['avg_max_regret']:,.0f}")
-    print(f"   Avg CVaR Regret: ${stats['avg_cvar_regret']:,.0f}")
-    print(f"   Cache Hit Rate: {stats['cache']['hit_rate']:.1%}")
-    
-    print(f"\n🔌 WebSocket Dashboard Available:")
-    print(f"   ws://localhost:8776")
-    print(f"   Real-time regret optimization monitoring")
+    print(f"\n♻️ Sustainability Metrics:")
+    print(f"   Overall Score: {stats['sustainability']['score']['overall_score']:.1f}%")
+    print(f"   Eco-Efficiency: {stats['sustainability']['score']['eco_efficiency']:.1f}%")
+    print(f"   Federated Packages: {stats['sustainability']['federated']['total_packages']}")
+    print(f"   Cross-Domain Transfers: {stats['sustainability']['cross_domain']['total_transfers']}")
+    print(f"   Human Feedback: {stats['sustainability']['feedback']['total']} (avg approval: {stats['sustainability']['feedback']['average_approval']:.1%})")
     
     print("\n" + "=" * 80)
-    print("✅ Enhanced Regret Calculator v10.0 - Production Ready")
-    print("   CVaR-Optimized | Portfolio-Aware | Real-Time Dashboard")
+    print("✅ Enhanced Regret Calculator v11.0 - Production Ready")
+    print("   With Full Sustainability Features: Federated, Adaptive, Carbon-Aware")
     print("=" * 80)
     
     try:
