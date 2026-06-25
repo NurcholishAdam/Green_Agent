@@ -1,9 +1,9 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/iot_expert.py
-# Complete enhanced file with digital twin simulation and mesh explanations
-
 """
-Enhanced IoT Expert v5.0.0 - Complete Metabolic Edge Decomposer
-With Digital Twin Simulation, What-If Analysis, and Natural Language Explanations
+Enhanced IoT Expert v6.0.0 - Complete Metabolic Edge Decomposer
+With Digital Twin Simulation, What-If Analysis, Natural Language Explanations,
+Federated Reflexive Learning, Cross-Domain Knowledge Transfer, Predictive Sustainability,
+Enhanced Carbon/Helium Awareness, and Advanced Sustainability Features
 """
 
 import asyncio
@@ -19,6 +19,15 @@ import hashlib
 import json
 import math
 import uuid
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import aiohttp
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +72,11 @@ class ProcessingMode(Enum):
     LOCAL_ONLY = "local_only"; MESH_COLLABORATIVE = "mesh_collaborative"
     CLOUD_OFFLOAD = "cloud_offload"; HYBRID = "hybrid"
     OPPORTUNISTIC = "opportunistic"; ATP_DRIVEN = "atp_driven"
+    FEDERATED = "federated"  # New: Federated learning mode
 
 class MeshRole(Enum):
     LEADER = "leader"; ROUTER = "router"; LEAF = "leaf"; MEMBRANE_GATED = "membrane_gated"
+    FEDERATED = "federated"  # New: Federated role
 
 @dataclass
 class EdgeDevice:
@@ -101,6 +112,8 @@ class EdgeDevice:
     token_balance: float = 0.0
     harvester_contribution: float = 0.0
     biomass_storage_token: Optional[str] = None
+    federated_round: int = 0  # New: Federated learning round
+    cross_domain_transfers: List[str] = field(default_factory=list)  # New
     
     @property
     def energy_remaining_percent(self) -> float:
@@ -124,6 +137,8 @@ class MeshNetwork:
     last_topology_update: datetime = field(default_factory=datetime.utcnow)
     membrane_permeability: str = "selective"
     atp_available: float = 0.0
+    federated_sharing_ratio: float = 0.0  # New
+    sustainability_score: float = 0.0  # New
     
     def add_device(self, device: EdgeDevice):
         self.devices[device.device_id] = device
@@ -161,29 +176,492 @@ class MeshNetwork:
             'total_processing_power_flops': sum(d.available_processing_flops for d in self.devices.values()),
             'total_battery_wh': sum(d.current_battery_wh for d in self.devices.values()),
             'average_gradient_health': np.mean([d.gradient_health for d in self.devices.values()]),
-            'membrane_permeability': self.membrane_permeability
+            'membrane_permeability': self.membrane_permeability,
+            'federated_sharing_ratio': self.federated_sharing_ratio,
+            'sustainability_score': self.sustainability_score
         }
 
 # ============================================================================
-# Enhanced IoT Expert
+# Federated Reflexive Learning Module
 # ============================================================================
-class IoTExpert:
-    """Enhanced IoT Expert v5.0.0 with Digital Twin and Explanations"""
+
+class FederatedIoTLearner:
+    """Federated reflexive learning for distributed IoT optimization"""
     
-    def __init__(self, expert_id: str = "iot_expert_v5", enable_mesh: bool = True,
-                 enable_collaborative: bool = True, enable_offline: bool = True,
-                 enable_energy_harvesting: bool = True, enable_bio_integration: bool = True):
+    def __init__(self, expert_id: str, server_url: Optional[str] = None):
         self.expert_id = expert_id
-        self.version = "5.0.0"
+        self.server_url = server_url
+        self.round = 0
+        self.local_model = None
+        self.global_model = None
+        self.participants = []
+        self.contribution_score = 0.0
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.device_models = {}
+        
+        # Initialize local model
+        self._init_iot_model()
+    
+    def _init_iot_model(self):
+        """Initialize local IoT optimization model"""
+        class IoTModel(nn.Module):
+            def __init__(self, input_size=10, hidden_size=64):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(input_size, hidden_size),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size),
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size // 2),
+                    nn.Linear(hidden_size // 2, 1)
+                )
+            
+            def forward(self, x):
+                return self.network(x)
+        
+        self.local_model = IoTModel()
+        self.global_model = IoTModel()
+    
+    async def _get_session(self):
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def train_local_model(self, device_data: List[Dict[str, float]], epochs: int = 10) -> float:
+        """Train local IoT model on device data"""
+        if not device_data:
+            return 0.0
+        
+        X = []
+        y = []
+        for item in device_data:
+            X.append([
+                item.get('battery_percent', 0.5),
+                item.get('processing_load', 0.5),
+                item.get('network_quality', 0.5),
+                item.get('harvesting_available', 0.5),
+                item.get('carbon_intensity', 0.5),
+                item.get('helium_scarcity', 0.5),
+                item.get('gradient_health', 0.5),
+                item.get('connection_count', 0.5),
+                item.get('mesh_connectivity', 0.5),
+                item.get('ecoatp_balance', 0.5)
+            ])
+            y.append(item.get('optimization_score', 0.5))
+        
+        X = torch.FloatTensor(X)
+        y = torch.FloatTensor(y).unsqueeze(1)
+        
+        dataset = TensorDataset(X, y)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        optimizer = optim.Adam(self.local_model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        
+        total_loss = 0
+        for epoch in range(epochs):
+            epoch_loss = 0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                output = self.local_model(batch_X)
+                loss = criterion(output, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.local_model.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+            total_loss += epoch_loss
+        
+        avg_loss = total_loss / epochs
+        logger.info(f"Local IoT model trained. Loss: {avg_loss:.4f}")
+        return avg_loss
+    
+    async def send_local_update(self, performance_metric: float = 1.0) -> Dict:
+        """Send local model update to federated server"""
+        if not self.server_url:
+            return {'status': 'disabled'}
+        
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                weights = self.local_model.state_dict()
+                weights_serialized = {k: v.tolist() for k, v in weights.items()}
+                
+                update_data = {
+                    'expert_id': self.expert_id,
+                    'round': self.round,
+                    'weights': weights_serialized,
+                    'performance': performance_metric,
+                    'device_count': len(self.device_models),
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                
+                async with session.post(
+                    f"{self.server_url}/federated/update",
+                    json=update_data,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.round += 1
+                        self.contribution_score += performance_metric
+                        logger.info(f"Federated IoT update sent. Round: {self.round}")
+                        return result
+                    else:
+                        logger.error(f"Federated update failed: {response.status}")
+                        return {'status': 'failed'}
+                        
+            except Exception as e:
+                logger.error(f"Federated update error: {e}")
+                return {'status': 'error'}
+    
+    async def get_global_model(self) -> Optional[Dict]:
+        """Get global model from federated server"""
+        if not self.server_url:
+            return None
+        
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                async with session.get(
+                    f"{self.server_url}/federated/global/iot",
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        weights = data.get('weights', {})
+                        self.round = data.get('round', 0)
+                        self.participants = data.get('participants', [])
+                        
+                        for k, v in weights.items():
+                            self.global_model.state_dict()[k] = torch.FloatTensor(v)
+                        
+                        return weights
+                        
+            except Exception as e:
+                logger.error(f"Global model fetch error: {e}")
+                return None
+    
+    async def participate_in_round(self, device_data: List[Dict[str, float]], 
+                                  performance: float = 1.0) -> Dict:
+        """Full participation in federated learning round"""
+        await self.train_local_model(device_data)
+        result = await self.send_local_update(performance)
+        global_weights = await self.get_global_model()
+        
+        if global_weights:
+            self.global_model.load_state_dict(global_weights)
+            if self.expert_id not in self.participants:
+                self.participants.append(self.expert_id)
+        
+        return {
+            'round': self.round,
+            'participated': bool(global_weights),
+            'contribution_score': self.contribution_score,
+            'performance': performance,
+            'peer_count': len(self.participants),
+            'timestamp': datetime.utcnow().isoformat()
+        }
+    
+    def get_federated_insights(self) -> Dict:
+        """Get insights from federated learning"""
+        return {
+            'round': self.round,
+            'contribution_score': self.contribution_score,
+            'participants': len(self.participants),
+            'has_global_model': self.global_model is not None,
+            'device_models': len(self.device_models),
+            'last_aggregation': datetime.utcnow().isoformat()
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Cross-Domain Knowledge Transfer Module
+# ============================================================================
+
+class IoTCrossDomainTransfer:
+    """Cross-domain knowledge transfer for IoT optimization"""
+    
+    def __init__(self):
+        self.knowledge_base = {}
+        self.transfer_logs = deque(maxlen=1000)
+        self.domain_mappings = {
+            'iot→energy': {
+                'harvesting_patterns': ['solar', 'wind', 'kinetic', 'rf'],
+                'power_strategies': ['adaptive', 'predictive', 'opportunistic']
+            },
+            'iot→data': {
+                'compression_strategies': ['edge', 'fog', 'cloud', 'distributed'],
+                'processing_patterns': ['batch', 'streaming', 'event-driven']
+            },
+            'iot→carbon': {
+                'intensity_patterns': ['diurnal', 'location-based', 'load-dependent'],
+                'optimization_strategies': ['load-shifting', 'efficiency-first']
+            },
+            'iot→helium': {
+                'scarcity_patterns': ['supply-constrained', 'price-sensitive'],
+                'efficiency_strategies': ['recovery', 'reuse', 'minimization']
+            }
+        }
+        self._lock = asyncio.Lock()
+        self.effectiveness_history = deque(maxlen=100)
+    
+    def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                          knowledge_type: str, data: Dict[str, Any]) -> Dict:
+        """Transfer knowledge between domains"""
+        key = f"{source_domain}→{target_domain}"
+        
+        if key not in self.knowledge_base:
+            self.knowledge_base[key] = {}
+        
+        if knowledge_type not in self.knowledge_base[key]:
+            self.knowledge_base[key][knowledge_type] = {
+                'data': data,
+                'transfer_count': 1,
+                'effectiveness_score': 0.5,
+                'last_used': datetime.utcnow()
+            }
+        else:
+            existing = self.knowledge_base[key][knowledge_type]
+            existing['data'].update(data)
+            existing['transfer_count'] += 1
+            existing['last_used'] = datetime.utcnow()
+        
+        self.transfer_logs.append({
+            'timestamp': datetime.utcnow(),
+            'source': source_domain,
+            'target': target_domain,
+            'type': knowledge_type
+        })
+        
+        logger.info(f"IoT knowledge transferred: {source_domain}→{target_domain} ({knowledge_type})")
+        return self.knowledge_base[key][knowledge_type]
+    
+    def get_transferred_knowledge(self, source_domain: str, target_domain: str, 
+                                 knowledge_type: str) -> Optional[Dict]:
+        """Retrieve transferred knowledge"""
+        key = f"{source_domain}→{target_domain}"
+        if key in self.knowledge_base and knowledge_type in self.knowledge_base[key]:
+            return self.knowledge_base[key][knowledge_type]
+        return None
+    
+    async def apply_energy_knowledge(self, device_data: Dict) -> Dict:
+        """Apply knowledge from energy domain to IoT optimization"""
+        energy_knowledge = self.get_transferred_knowledge('energy', 'iot', 'harvesting_patterns')
+        if energy_knowledge:
+            patterns = energy_knowledge.get('data', {}).get('patterns', [])
+            return {
+                'applied_pattern': patterns[0] if patterns else 'default',
+                'efficiency_gain': energy_knowledge.get('effectiveness_score', 0.5) * 0.15,
+                'source': 'energy_domain'
+            }
+        return {'applied_pattern': 'default', 'source': 'local'}
+    
+    def get_transfer_statistics(self) -> Dict:
+        """Get cross-domain transfer statistics"""
+        total_transfers = len(self.transfer_logs)
+        domain_pairs = {}
+        
+        for log in self.transfer_logs:
+            key = f"{log['source']}→{log['target']}"
+            domain_pairs[key] = domain_pairs.get(key, 0) + 1
+        
+        return {
+            'total_transfers': total_transfers,
+            'domain_pairs': domain_pairs,
+            'knowledge_types': list(self.knowledge_base.keys()),
+            'recent_transfers': list(self.transfer_logs)[-10:]
+        }
+
+# ============================================================================
+# Predictive Sustainability Module
+# ============================================================================
+
+class PredictiveIoTSustainability:
+    """Predictive sustainability analytics for IoT systems"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.device_history = deque(maxlen=history_window)
+        self.sustainability_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        
+        # Multiple models for ensemble forecasting
+        self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    
+    def update_history(self, device_data: Dict, sustainability_metrics: Dict):
+        """Update device and sustainability history"""
+        self.device_history.append({
+            'timestamp': datetime.utcnow(),
+            'battery_level': device_data.get('battery_percent', 50),
+            'processing_load': device_data.get('processing_load', 0.5),
+            'network_quality': device_data.get('network_quality', 0.5),
+            'harvesting_available': device_data.get('harvesting_available', 0)
+        })
+        
+        self.sustainability_history.append({
+            'timestamp': datetime.utcnow(),
+            'carbon_savings': sustainability_metrics.get('carbon_savings_kg', 0),
+            'energy_savings': sustainability_metrics.get('energy_savings_kwh', 0),
+            'sustainability_score': sustainability_metrics.get('sustainability_score', 0)
+        })
+    
+    async def train_forecast_model(self):
+        """Train ensemble forecasting models"""
+        if len(self.device_history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.device_history)}
+        
+        X = []
+        y = []
+        history_list = list(self.device_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['battery_level'],
+                    data['processing_load'],
+                    data['network_quality'],
+                    data['harvesting_available']
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['battery_level'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"IoT sustainability models trained. R² scores: {results}")
+        return {'status': 'success', 'results': results, 'samples': len(X)}
+    
+    async def predict_device_health(self, hours: int = 24) -> Dict:
+        """Predict future device health and sustainability"""
+        if not self.is_trained or len(self.device_history) < 10:
+            return {
+                'predicted_battery': 50,
+                'confidence': 0.0,
+                'trend': 'insufficient_data'
+            }
+        
+        recent = list(self.device_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['battery_level'],
+                data['processing_load'],
+                data['network_quality'],
+                data['harvesting_available']
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return {'predicted_battery': 50, 'confidence': 0.0, 'trend': 'no_models'}
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        return {
+            'predicted_battery': float(prediction),
+            'confidence': confidence,
+            'trend': trend,
+            'recommended_actions': self._generate_actions(prediction)
+        }
+    
+    def _generate_actions(self, battery_prediction: float) -> List[str]:
+        """Generate recommended actions based on predictions"""
+        actions = []
+        if battery_prediction < 30:
+            actions.append("Activate power-saving mode")
+            actions.append("Reduce processing load")
+        elif battery_prediction < 50:
+            actions.append("Optimize energy harvesting")
+            actions.append("Schedule non-critical tasks")
+        return actions or ["Device health is sustainable"]
+    
+    def get_sustainability_summary(self) -> Dict:
+        """Get sustainability summary"""
+        if not self.sustainability_history:
+            return {'status': 'insufficient_data'}
+        
+        recent = list(self.sustainability_history)[-50:]
+        
+        return {
+            'average_carbon_savings': np.mean([h['carbon_savings'] for h in recent]),
+            'average_energy_savings': np.mean([h['energy_savings'] for h in recent]),
+            'current_sustainability_score': recent[-1]['sustainability_score'] if recent else 0,
+            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
+        }
+
+# ============================================================================
+# Enhanced IoT Expert (Main Class)
+# ============================================================================
+
+class IoTExpert:
+    """Enhanced IoT Expert v6.0.0 with all green agent capabilities"""
+    
+    def __init__(self, expert_id: str = "iot_expert_v6", enable_mesh: bool = True,
+                 enable_collaborative: bool = True, enable_offline: bool = True,
+                 enable_energy_harvesting: bool = True, enable_bio_integration: bool = True,
+                 enable_federated: bool = True, enable_cross_domain: bool = True,
+                 enable_predictive_sustainability: bool = True):
+        self.expert_id = expert_id
+        self.version = "6.0.0"
         self.enable_mesh = enable_mesh
         self.enable_collaborative = enable_collaborative
         self.enable_offline = enable_offline
         self.enable_energy_harvesting = enable_energy_harvesting
         self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_federated = enable_federated
+        self.enable_cross_domain = enable_cross_domain
+        self.enable_predictive_sustainability = enable_predictive_sustainability
         
         # Bio-inspired references
-        self.token_manager = None; self.gradient_manager = None; self.scheduler = None
-        self.compartment_manager = None; self.biomass_storage = None; self.harvester = None
+        self.token_manager = None
+        self.gradient_manager = None
+        self.scheduler = None
+        self.compartment_manager = None
+        self.biomass_storage = None
+        self.harvester = None
+        
+        # New modules
+        self.federated_learner = FederatedIoTLearner(expert_id)
+        self.cross_domain_transfer = IoTCrossDomainTransfer()
+        self.predictive_sustainability = PredictiveIoTSustainability()
         
         self.mesh_networks: Dict[str, MeshNetwork] = {}
         self.devices: Dict[str, EdgeDevice] = {}
@@ -191,9 +669,12 @@ class IoTExpert:
         self.total_tasks_processed = 0
         self.total_energy_harvested_kwh = 0.0
         self.total_ecoatp_saved = 0.0
+        self.total_carbon_saved_kg = 0.0
+        self.total_helium_saved_l = 0.0
         self.simulation_results: deque = deque(maxlen=500)
+        self.sustainability_score = 0.0
         
-        logger.info(f"IoT Expert v{self.version} initialized")
+        logger.info(f"IoT Expert v{self.version} initialized with all green agent features")
     
     def inject_bio_core(self, bio_core=None, **kwargs):
         if bio_core:
@@ -216,14 +697,18 @@ class IoTExpert:
     # ========================================================================
     # Bio-Inspired Data Access
     # ========================================================================
+    
     def _get_membrane_mesh_role(self, device_id: str) -> MeshRole:
         if self.compartment_manager:
             compartment = self.compartment_manager.find_best_compartment('iot')
             if compartment:
                 perm = compartment.membrane.permeability
-                if perm == MembranePermeability.PERMEABLE: return MeshRole.LEADER
-                elif perm == MembranePermeability.SELECTIVE: return MeshRole.ROUTER
-                else: return MeshRole.LEAF
+                if perm == MembranePermeability.PERMEABLE:
+                    return MeshRole.LEADER
+                elif perm == MembranePermeability.SELECTIVE:
+                    return MeshRole.ROUTER
+                else:
+                    return MeshRole.LEAF
         return MeshRole.MEMBRANE_GATED
     
     def _get_atp_collaborative_workers(self) -> int:
@@ -247,35 +732,51 @@ class IoTExpert:
     def _get_gradient_device_health(self, device_id: str) -> float:
         if self.gradient_manager:
             trust = self.gradient_manager.fields.get('trust')
-            if trust: return trust.gradient_strength
+            if trust:
+                return trust.gradient_strength
         return 0.7
     
     def _get_gradient_levels(self) -> Dict[str, float]:
-        if self.gradient_manager: return self.gradient_manager.get_field_strengths()
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
         return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
     
     # ========================================================================
-    # Device Registration
+    # Device Registration with Enhanced Features
     # ========================================================================
+    
     def register_device(self, device_id: str, device_type: DeviceType, capabilities: Dict[str, float],
                        location: Optional[Dict[str, float]] = None, mesh_id: Optional[str] = None) -> EdgeDevice:
         mesh_role = self._get_membrane_mesh_role(device_id) if self.enable_bio_integration else MeshRole.LEAF
         gradient_health = self._get_gradient_device_health(device_id) if self.enable_bio_integration else 0.7
         
-        device = EdgeDevice(device_id=device_id, device_type=device_type, capabilities=capabilities,
-                           location=location, mesh_id=mesh_id, mesh_role=mesh_role,
-                           gradient_health=gradient_health)
+        device = EdgeDevice(
+            device_id=device_id,
+            device_type=device_type,
+            capabilities=capabilities,
+            location=location,
+            mesh_id=mesh_id,
+            mesh_role=mesh_role,
+            gradient_health=gradient_health
+        )
         self.devices[device_id] = device
+        
         if mesh_id and self.enable_mesh:
             if mesh_id not in self.mesh_networks:
                 self.mesh_networks[mesh_id] = MeshNetwork(mesh_id=mesh_id)
             self.mesh_networks[mesh_id].add_device(device)
+        
+        # Register for federated learning
+        if self.enable_federated:
+            self.federated_learner.device_models[device_id] = {}
+        
         return device
     
     def create_mesh(self, mesh_id: str, device_ids: List[str]) -> MeshNetwork:
         mesh = MeshNetwork(mesh_id=mesh_id)
         for device_id in device_ids:
-            if device_id in self.devices: mesh.add_device(self.devices[device_id])
+            if device_id in self.devices:
+                mesh.add_device(self.devices[device_id])
         for i, d1 in enumerate(device_ids):
             for d2 in device_ids[i+1:]:
                 if d1 in self.devices and d2 in self.devices:
@@ -285,12 +786,19 @@ class IoTExpert:
         return mesh
     
     # ========================================================================
-    # Digital Twin Simulation
+    # Digital Twin Simulation with Enhanced Features
     # ========================================================================
+    
     def simulate_mesh_scenario(self, scenario: Dict[str, Any]) -> Dict[str, Any]:
         scenario_type = scenario.get('type', 'device_failure')
         params = scenario.get('parameters', {})
-        result = {'scenario_type': scenario_type, 'parameters': params, 'timestamp': datetime.utcnow().isoformat(), 'predictions': {}}
+        result = {
+            'scenario_type': scenario_type,
+            'parameters': params,
+            'timestamp': datetime.utcnow().isoformat(),
+            'predictions': {},
+            'sustainability_impact': {}
+        }
         
         if scenario_type == 'device_failure':
             result['predictions'] = self._simulate_device_failure(params)
@@ -300,6 +808,11 @@ class IoTExpert:
             result['predictions'] = self._simulate_load_spike(params)
         elif scenario_type == 'energy_depletion':
             result['predictions'] = self._simulate_energy_depletion(params)
+        elif scenario_type == 'federated_failure':
+            result['predictions'] = self._simulate_federated_failure(params)
+        
+        # Calculate sustainability impact
+        result['sustainability_impact'] = self._calculate_sustainability_impact(result['predictions'])
         
         self.simulation_results.append(result)
         return result
@@ -310,7 +823,8 @@ class IoTExpert:
         if mesh_id and mesh_id in self.mesh_networks:
             mesh = self.mesh_networks[mesh_id]
             device = mesh.devices.get(device_id)
-            if not device: return {'error': 'Device not found'}
+            if not device:
+                return {'error': 'Device not found'}
             role = device.mesh_role
             connections = len(device.connections)
             
@@ -342,12 +856,23 @@ class IoTExpert:
             partitioned = int(total * partition_pct)
             offline_tasks = partitioned * 10
             biomass_needed = offline_tasks * 1.0
+            
+            # Federated sharing ratio
+            if self.enable_federated:
+                federated_insights = self.federated_learner.get_federated_insights()
+                sharing_ratio = federated_insights.get('participants', 1) / 10
+            else:
+                sharing_ratio = 0.3
+            
             return {
                 'total_devices': total, 'partitioned_devices': partitioned,
                 'connected_devices': total - partitioned, 'predicted_offline_tasks': offline_tasks,
                 'biomass_storage_needed_ecoatp': biomass_needed,
                 'recovery_time_seconds': partitioned * 0.5,
-                'recommendation': f"Pre-allocate {biomass_needed:.1f} Eco-ATP for biomass. Connected: {total - partitioned} devices."
+                'federated_sharing_ratio': sharing_ratio,
+                'recommendation': f"Pre-allocate {biomass_needed:.1f} Eco-ATP for biomass. "
+                                 f"Connected: {total - partitioned} devices. "
+                                 f"Federated sharing: {sharing_ratio:.1%}"
             }
         return {'error': 'Mesh not found'}
     
@@ -363,11 +888,17 @@ class IoTExpert:
                 new_load = d.processing_utilization * spike
                 if new_load > 0.9:
                     overloaded.append({'device_id': did, 'current': d.processing_utilization, 'predicted': min(1.0, new_load)})
+            
+            # ATP-driven load balancing
+            atp_workers = self._get_atp_collaborative_workers() if self.enable_bio_integration else 4
+            
             return {
                 'spike_factor': spike, 'total_processing_deficit_flops': deficit,
                 'overloaded_devices': len(overloaded), 'overloaded_details': overloaded[:5],
                 'estimated_queue_delay_ms': len(overloaded) * 50,
-                'recommendation': f"{'URGENT: ' if deficit > 0 else ''}Deficit: {deficit:.0f} FLOPS. {len(overloaded)} devices overloaded."
+                'atp_workers_available': atp_workers,
+                'recommendation': f"{'URGENT: ' if deficit > 0 else ''}Deficit: {deficit:.0f} FLOPS. "
+                                 f"{len(overloaded)} devices overloaded. {atp_workers} ATP workers available."
             }
         return {'error': 'Mesh not found'}
     
@@ -388,32 +919,103 @@ class IoTExpert:
                     }
             critical = sorted([(did, d) for did, d in depletion_times.items() if d['time_to_deplete_hours'] is not None],
                             key=lambda x: x[1]['time_to_deplete_hours'])[:3]
+            
+            # Renewable energy prediction
+            harvester_energy = self._get_harvester_energy_prediction() if self.enable_bio_integration else {}
+            
             return {
                 'depletion_rate': rate,
                 'devices_at_risk': len([d for d in depletion_times.values() if not d['can_sustain']]),
                 'critical_devices': [{'device_id': did, 'time_hours': f"{d['time_to_deplete_hours']:.1f}"} for did, d in critical],
                 'estimated_survival_hours': min(d['time_to_deplete_hours'] for _, d in critical) if critical else float('inf'),
-                'recommendation': f"{len(critical)} devices at risk. Reduce load or boost harvesting."
+                'harvester_energy_kw': harvester_energy.get('total_kw', 0),
+                'recommendation': f"{len(critical)} devices at risk. Reduce load or boost harvesting. "
+                                 f"Harvester energy: {harvester_energy.get('total_kw', 0):.2f} kW"
             }
         return {'error': 'Mesh not found'}
     
+    def _simulate_federated_failure(self, params: Dict) -> Dict[str, Any]:
+        """New: Simulate federated learning failure"""
+        mesh_id = params.get('mesh_id')
+        if mesh_id and mesh_id in self.mesh_networks:
+            mesh = self.mesh_networks[mesh_id]
+            total = len(mesh.devices)
+            
+            # Simulate loss of federated coordination
+            loss_factor = params.get('loss_factor', 0.5)
+            affected_devices = int(total * loss_factor)
+            
+            if self.enable_federated:
+                federated_insights = self.federated_learner.get_federated_insights()
+                current_round = federated_insights.get('round', 0)
+                participants = federated_insights.get('participants', 0)
+            else:
+                current_round = 0
+                participants = 0
+            
+            return {
+                'affected_devices': affected_devices,
+                'loss_factor': loss_factor,
+                'federated_round': current_round,
+                'participants': participants,
+                'recovery_time_seconds': affected_devices * 0.3,
+                'recommendation': f"Restore federated coordination. {affected_devices} devices affected. "
+                                 f"Round {current_round} in progress."
+            }
+        return {'error': 'Mesh not found'}
+    
+    def _calculate_sustainability_impact(self, predictions: Dict) -> Dict:
+        """Calculate sustainability impact of simulation"""
+        impact = {
+            'carbon_impact_kg': 0.0,
+            'energy_impact_kwh': 0.0,
+            'federated_impact': 0.0
+        }
+        
+        if 'partitioned_devices' in predictions:
+            # Network partition impact
+            impact['carbon_impact_kg'] = predictions.get('partitioned_devices', 0) * 0.01
+            impact['energy_impact_kwh'] = predictions.get('partitioned_devices', 0) * 0.05
+        
+        if 'overloaded_devices' in predictions:
+            # Load spike impact
+            impact['carbon_impact_kg'] += predictions.get('overloaded_devices', 0) * 0.02
+            impact['energy_impact_kwh'] += predictions.get('overloaded_devices', 0) * 0.1
+        
+        if 'federated_sharing_ratio' in predictions:
+            # Federated impact
+            impact['federated_impact'] = predictions.get('federated_sharing_ratio', 0) * 0.5
+        
+        return impact
+    
     # ========================================================================
-    # Natural Language Explanations
+    # Natural Language Explanations with Enhanced Features
     # ========================================================================
+    
     def explain_mesh_topology(self, mesh_id: str) -> Dict[str, Any]:
-        if mesh_id not in self.mesh_networks: return {'error': 'Mesh not found'}
+        if mesh_id not in self.mesh_networks:
+            return {'error': 'Mesh not found'}
         mesh = self.mesh_networks[mesh_id]
         stats = mesh.get_mesh_statistics()
         health = "Network is fully connected and operational." if stats.get('is_connected') else "WARNING: Network has disconnected segments."
         
         devices_by_role = defaultdict(int)
-        for d in mesh.devices.values(): devices_by_role[d.mesh_role.value] += 1
+        for d in mesh.devices.values():
+            devices_by_role[d.mesh_role.value] += 1
         
         explanation = {
-            'mesh_id': mesh_id, 'health_assessment': health,
-            'statistics': {'total_devices': stats.get('device_count', 0), 'leader': mesh.leader_id,
-                          'average_gradient_health': f"{stats.get('average_gradient_health', 0):.2f}"},
-            'device_roles': dict(devices_by_role), 'vulnerabilities': [], 'recommendations': []
+            'mesh_id': mesh_id,
+            'health_assessment': health,
+            'statistics': {
+                'total_devices': stats.get('device_count', 0),
+                'leader': mesh.leader_id,
+                'average_gradient_health': f"{stats.get('average_gradient_health', 0):.2f}",
+                'federated_sharing_ratio': f"{stats.get('federated_sharing_ratio', 0):.2f}",
+                'sustainability_score': f"{stats.get('sustainability_score', 0):.2f}"
+            },
+            'device_roles': dict(devices_by_role),
+            'vulnerabilities': [],
+            'recommendations': []
         }
         
         if mesh.leader_id and mesh.leader_id in mesh.devices:
@@ -427,30 +1029,73 @@ class IoTExpert:
             explanation['vulnerabilities'].append(f"Only {router_count} router(s)")
             explanation['recommendations'].append("Promote devices to router role.")
         
+        if self.enable_federated:
+            federated_insights = self.federated_learner.get_federated_insights()
+            if federated_insights.get('participants', 0) > 0:
+                explanation['recommendations'].append(
+                    f"Federated learning active with {federated_insights['participants']} participants."
+                )
+        
+        if self.enable_cross_domain:
+            transfer_stats = self.cross_domain_transfer.get_transfer_statistics()
+            if transfer_stats.get('total_transfers', 0) > 0:
+                explanation['recommendations'].append(
+                    f"Cross-domain knowledge transferred: {transfer_stats['total_transfers']} transfers."
+                )
+        
         return explanation
     
     def compare_deployment_strategies(self, task: Dict[str, Any]) -> Dict[str, Any]:
         strategies = [
-            {'name': 'Single Device', 'type': 'single', 'latency': 15.0, 'energy': 0.005, 'reliability': 0.90},
-            {'name': 'Mesh Collaborative', 'type': 'mesh', 'latency': 10.0, 'energy': 0.003, 'reliability': 0.95},
-            {'name': 'Cloud Offload', 'type': 'cloud', 'latency': 50.0, 'energy': 0.001, 'reliability': 0.99}
+            {'name': 'Single Device', 'type': 'single', 'latency': 15.0, 'energy': 0.005, 'reliability': 0.90, 'sustainability': 0.7},
+            {'name': 'Mesh Collaborative', 'type': 'mesh', 'latency': 10.0, 'energy': 0.003, 'reliability': 0.95, 'sustainability': 0.85},
+            {'name': 'Cloud Offload', 'type': 'cloud', 'latency': 50.0, 'energy': 0.001, 'reliability': 0.99, 'sustainability': 0.6},
+            {'name': 'Federated IoT', 'type': 'federated', 'latency': 8.0, 'energy': 0.002, 'reliability': 0.96, 'sustainability': 0.9}
         ]
-        results = [{'strategy': s['name'], 'predicted_latency_ms': s['latency'],
-                    'predicted_energy_kwh': s['energy'], 'ecoatp_cost': s['energy'] * 1000} for s in strategies]
-        best = min(results, key=lambda r: r['ecoatp_cost'])
+        
+        results = []
+        for s in strategies:
+            results.append({
+                'strategy': s['name'],
+                'predicted_latency_ms': s['latency'],
+                'predicted_energy_kwh': s['energy'],
+                'ecoatp_cost': s['energy'] * 1000,
+                'sustainability_score': s['sustainability']
+            })
+        
+        # Apply federated learning boost if enabled
+        if self.enable_federated:
+            federated_insights = self.federated_learner.get_federated_insights()
+            if federated_insights.get('participants', 0) > 1:
+                for r in results:
+                    if r['strategy'] == 'Federated IoT':
+                        r['sustainability_score'] *= (1 + 0.05 * federated_insights['participants'])
+        
+        best = min(results, key=lambda r: r['ecoatp_cost'] / r['sustainability_score'])
+        
         return {
-            'task_type': task.get('task_type', 'general'), 'strategies_compared': results,
+            'task_type': task.get('task_type', 'general'),
+            'strategies_compared': results,
             'recommended_strategy': best['strategy'],
-            'recommendation_reason': f"Lowest Eco-ATP cost ({best['ecoatp_cost']:.1f}) with acceptable latency ({best['predicted_latency_ms']:.1f}ms)"
+            'recommendation_reason': (f"Best sustainability per Eco-ATP cost ({best['ecoatp_cost']:.1f}) "
+                                     f"with latency ({best['predicted_latency_ms']:.1f}ms)")
         }
     
     # ========================================================================
-    # Primary Optimization
+    # Primary Optimization with Enhanced Features
     # ========================================================================
+    
     async def optimize_edge_deployment(self, device_type: str, carbon_zone: int, helium_scarcity: float,
                                       task_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         suitable = [d for d in self.devices.values() if d.device_type.value == device_type or device_type == 'any']
-        if not suitable: return {'expert_id': self.expert_id, 'recommendation': 'no_suitable_devices'}
+        if not suitable:
+            return {'expert_id': self.expert_id, 'recommendation': 'no_suitable_devices'}
+        
+        # Apply cross-domain knowledge
+        if self.enable_cross_domain:
+            energy_knowledge = await self.cross_domain_transfer.apply_energy_knowledge({'device_count': len(suitable)})
+            if energy_knowledge.get('applied_pattern') != 'default':
+                logger.info(f"Applied energy knowledge: {energy_knowledge['applied_pattern']}")
         
         atp_workers = self._get_atp_collaborative_workers() if self.enable_bio_integration else 4
         harvester_energy = self._get_harvester_energy_prediction() if self.enable_bio_integration else {}
@@ -459,26 +1104,83 @@ class IoTExpert:
         if self.enable_mesh and self.mesh_networks:
             for mesh in self.mesh_networks.values():
                 if len([d for d in mesh.devices.values() if d in suitable]) >= 2:
-                    best_mesh = mesh; break
+                    best_mesh = mesh
+                    break
         
         best_device = max(suitable, key=lambda d: (d.available_processing_flops * 0.3 + d.energy_remaining_percent / 100 * 0.2 +
                                                     d.gradient_health * 0.3 + (1.0 - d.processing_utilization) * 0.2))
         
-        return {
-            'expert_id': self.expert_id, 'version': self.version,
+        # Federated learning participation
+        federated_result = None
+        if self.enable_federated and best_device:
+            device_data = [{
+                'battery_percent': best_device.energy_remaining_percent,
+                'processing_load': best_device.processing_utilization,
+                'network_quality': 0.8,
+                'harvesting_available': best_device.harvesting_available_w,
+                'optimization_score': best_device.gradient_health
+            }]
+            federated_result = await self.federated_learner.participate_in_round(
+                device_data,
+                performance=best_device.gradient_health
+            )
+        
+        # Predictive sustainability
+        predictive_forecast = None
+        if self.enable_predictive_sustainability and best_device:
+            self.predictive_sustainability.update_history(
+                {
+                    'battery_percent': best_device.energy_remaining_percent,
+                    'processing_load': best_device.processing_utilization,
+                    'network_quality': 0.8,
+                    'harvesting_available': best_device.harvesting_available_w
+                },
+                {
+                    'carbon_savings_kg': self.total_carbon_saved_kg,
+                    'energy_savings_kwh': self.total_energy_harvested_kwh,
+                    'sustainability_score': self.sustainability_score
+                }
+            )
+            await self.predictive_sustainability.train_forecast_model()
+            predictive_forecast = await self.predictive_sustainability.predict_device_health(24)
+        
+        plan = {
+            'expert_id': self.expert_id,
+            'version': self.version,
             'strategy': 'bio_mesh_collaborative' if best_mesh and self.enable_bio_integration else 'single_device',
-            'primary_device': best_device.device_id, 'mesh_id': best_mesh.mesh_id if best_mesh else None,
+            'primary_device': best_device.device_id,
+            'mesh_id': best_mesh.mesh_id if best_mesh else None,
             'mesh_size': len(best_mesh.devices) if best_mesh else 1,
             'estimated_carbon_kg': best_device.carbon_per_operation_g / 1000,
             'energy_remaining_percent': best_device.energy_remaining_percent,
             'can_operate_indefinitely': best_device.can_operate_indefinitely,
             'bio_integration_active': self.enable_bio_integration,
+            'federated_active': self.enable_federated,
+            'cross_domain_active': self.enable_cross_domain,
+            'predictive_sustainability_active': self.enable_predictive_sustainability,
             'gradient_health': best_device.gradient_health,
             'atp_workers': atp_workers,
             'harvester_energy_kw': harvester_energy.get('total_kw', 0),
             'gradient_levels': self._get_gradient_levels() if self.enable_bio_integration else {},
+            'federated_round': federated_result.get('round', 0) if federated_result else 0,
+            'federated_contribution': federated_result.get('contribution_score', 0) if federated_result else 0,
+            'predictive_forecast': predictive_forecast,
+            'sustainability_score': self.sustainability_score,
             'recommendations': self._generate_recommendations(best_device, best_mesh)
         }
+        
+        # Update sustainability metrics
+        self.total_tasks_processed += 1
+        self.total_energy_harvested_kwh += harvester_energy.get('total_kw', 0) * 0.01
+        self.total_carbon_saved_kg += best_device.carbon_per_operation_g / 1000 * 0.1
+        self.sustainability_score = min(1.0, (
+            (best_device.energy_remaining_percent / 100) * 0.3 +
+            best_device.gradient_health * 0.3 +
+            (1.0 - best_device.processing_utilization) * 0.2 +
+            (1.0 - helium_scarcity) * 0.2
+        ))
+        
+        return plan
     
     def _generate_recommendations(self, device: EdgeDevice, mesh: Optional[MeshNetwork]) -> List[str]:
         recs = []
@@ -490,21 +1192,80 @@ class IoTExpert:
             recs.append("Mesh network available for collaborative processing.")
         if device.can_operate_indefinitely:
             recs.append("Device has sufficient energy harvesting for continuous operation.")
+        
+        if self.enable_federated:
+            federated_insights = self.federated_learner.get_federated_insights()
+            if federated_insights.get('participants', 0) > 1:
+                recs.append(f"Federated learning active with {federated_insights['participants']} participants.")
+        
+        if self.enable_cross_domain:
+            transfer_stats = self.cross_domain_transfer.get_transfer_statistics()
+            if transfer_stats.get('total_transfers', 0) > 0:
+                recs.append(f"Cross-domain knowledge transferred: {transfer_stats['total_transfers']} transfers.")
+        
+        if self.enable_predictive_sustainability:
+            summary = self.predictive_sustainability.get_sustainability_summary()
+            if summary.get('status') != 'insufficient_data':
+                recs.append(f"Sustainability trend: {summary.get('trend', 'stable')}")
+        
         return recs if recs else ["Deployment configuration is optimal."]
     
+    # ========================================================================
+    # Expert Statistics with Enhanced Features
+    # ========================================================================
+    
     def get_expert_statistics(self) -> Dict[str, Any]:
-        return {
-            'expert_id': self.expert_id, 'version': self.version,
-            'total_devices': len(self.devices), 'mesh_networks': len(self.mesh_networks),
+        stats = {
+            'expert_id': self.expert_id,
+            'version': self.version,
+            'total_devices': len(self.devices),
+            'mesh_networks': len(self.mesh_networks),
+            'total_tasks_processed': self.total_tasks_processed,
+            'total_energy_harvested_kwh': self.total_energy_harvested_kwh,
+            'total_carbon_saved_kg': self.total_carbon_saved_kg,
+            'total_ecoatp_saved': self.total_ecoatp_saved,
+            'sustainability_score': self.sustainability_score,
             'bio_integration_active': self.enable_bio_integration,
+            'federated_active': self.enable_federated,
+            'cross_domain_active': self.enable_cross_domain,
+            'predictive_sustainability_active': self.enable_predictive_sustainability,
             'average_gradient_health': np.mean([d.gradient_health for d in self.devices.values()]) if self.devices else 0,
             'gradient_levels': self._get_gradient_levels() if self.enable_bio_integration else {},
             'harvester_energy': self._get_harvester_energy_prediction() if self.enable_bio_integration else {},
             'simulation_count': len(self.simulation_results)
         }
+        
+        if self.enable_federated:
+            stats['federated_insights'] = self.federated_learner.get_federated_insights()
+        
+        if self.enable_cross_domain:
+            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
+        
+        if self.enable_predictive_sustainability:
+            stats['sustainability_summary'] = self.predictive_sustainability.get_sustainability_summary()
+        
+        return stats
     
     def get_device_status(self) -> Dict[str, Any]:
-        return {did: {'type': d.device_type.value, 'online': d.is_online,
-                      'battery_percent': d.energy_remaining_percent, 'mesh_role': d.mesh_role.value,
-                      'gradient_health': d.gradient_health, 'token_balance': d.token_balance}
-                for did, d in self.devices.items()}
+        status = {}
+        for did, d in self.devices.items():
+            status[did] = {
+                'type': d.device_type.value,
+                'online': d.is_online,
+                'battery_percent': d.energy_remaining_percent,
+                'mesh_role': d.mesh_role.value,
+                'gradient_health': d.gradient_health,
+                'token_balance': d.token_balance,
+                'federated_round': d.federated_round if hasattr(d, 'federated_round') else 0
+            }
+        return status
+    
+    # ========================================================================
+    # Async Shutdown
+    # ========================================================================
+    
+    async def shutdown(self):
+        """Graceful shutdown of all components"""
+        logger.info(f"Shutting down IoT Expert {self.expert_id}")
+        await self.federated_learner.close()
+        logger.info("IoT Expert shutdown complete")
