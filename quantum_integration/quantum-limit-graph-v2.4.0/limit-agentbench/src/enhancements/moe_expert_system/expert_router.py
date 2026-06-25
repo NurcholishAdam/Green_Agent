@@ -1,9 +1,8 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/expert_router.py
-# Complete enhanced file with all bio-inspired integration and gap fixes
-
 """
-Enhanced Expert Router v5.0.0 - Complete Signal Transduction Cascade
-With What-If Analysis, Causal Inference, and Natural Language Explanations
+Enhanced Expert Router v6.0.0 - Complete Signal Transduction Cascade
+With Federated Learning, Predictive Analytics, Carbon/Helium Optimization,
+What-If Analysis, Causal Inference, and Natural Language Explanations
 """
 
 import asyncio
@@ -19,11 +18,496 @@ import hashlib
 import json
 import math
 import uuid
+import aiohttp
+import os
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Enums and Data Classes
+# Carbon Intensity Integration Module
+# ============================================================================
+
+class CarbonIntensityManager:
+    """Real-time carbon intensity integration with API support"""
+    
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                url = f"{self.endpoint}/latest?zone={region}"
+                headers = {'auth-token': self.api_key} if self.api_key else {}
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.carbon_intensity = data.get('carbonIntensity', 400)
+                        self.region = region
+                        self.last_update = datetime.now()
+                        self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
+                        self.historical_intensities.append(self.carbon_intensity)
+                    else:
+                        self.carbon_intensity = self._get_fallback_intensity(region)
+                        self.last_update = datetime.now()
+            except Exception as e:
+                logger.error(f"Carbon intensity fetch error: {e}")
+                self.carbon_intensity = self._get_fallback_intensity(region)
+                self.last_update = datetime.now()
+            return {'intensity': self.carbon_intensity, 'region': self.region,
+                    'timestamp': self.last_update.isoformat() if self.last_update else None}
+    
+    def _get_fallback_intensity(self, region: str) -> float:
+        fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
+        return fallback_values.get(region, 400)
+    
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Helium Efficiency Optimization Module
+# ============================================================================
+
+class HeliumEfficiencyOptimizer:
+    """Optimize helium allocation across experts and routing"""
+    
+    def __init__(self, helium_budget_l: float = 100.0):
+        self.helium_budget_l = helium_budget_l
+        self.helium_usage: Dict[str, float] = defaultdict(float)
+        self.helium_allocation: Dict[str, float] = defaultdict(float)
+        self.helium_efficiency_scores: Dict[str, float] = defaultdict(lambda: 0.5)
+        self._lock = asyncio.Lock()
+        self.optimization_history = deque(maxlen=1000)
+        
+        logger.info(f"Helium Efficiency Optimizer initialized: budget={helium_budget_l}L")
+    
+    def record_helium_usage(self, expert_id: str, amount_l: float):
+        """Record helium usage for an expert"""
+        self.helium_usage[expert_id] += amount_l
+    
+    def set_helium_allocation(self, expert_id: str, amount_l: float):
+        """Set helium allocation for an expert"""
+        self.helium_allocation[expert_id] = amount_l
+    
+    def update_efficiency_score(self, expert_id: str, score: float):
+        """Update helium efficiency score for an expert"""
+        self.helium_efficiency_scores[expert_id] = score
+    
+    async def optimize_helium_allocation(self, expert_requirements: Dict[str, float]) -> Dict[str, float]:
+        """
+        Optimize helium allocation across experts based on efficiency scores.
+        
+        Args:
+            expert_requirements: Dict of expert_id -> required helium amount
+            
+        Returns:
+            Optimized allocation dict
+        """
+        async with self._lock:
+            total_required = sum(expert_requirements.values())
+            
+            if total_required <= self.helium_budget_l:
+                return expert_requirements
+            
+            # Allocate based on efficiency scores
+            optimized = {}
+            total_efficiency = sum(self.helium_efficiency_scores.get(eid, 0.5) for eid in expert_requirements)
+            
+            if total_efficiency == 0:
+                # Fallback to equal distribution
+                ratio = self.helium_budget_l / total_required
+                for expert_id, required in expert_requirements.items():
+                    optimized[expert_id] = required * ratio
+            else:
+                # Efficiency-weighted allocation
+                for expert_id, required in expert_requirements.items():
+                    efficiency_weight = self.helium_efficiency_scores.get(expert_id, 0.5) / total_efficiency
+                    optimized[expert_id] = self.helium_budget_l * efficiency_weight
+            
+            # Record optimization
+            self.optimization_history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'total_required': total_required,
+                'total_allocated': self.helium_budget_l,
+                'allocations': optimized
+            })
+            
+            logger.info(f"Optimized helium allocation: {len(optimized)} experts")
+            return optimized
+    
+    def get_helium_status(self) -> Dict[str, Any]:
+        """Get current helium status"""
+        total_usage = sum(self.helium_usage.values())
+        total_allocated = sum(self.helium_allocation.values())
+        
+        return {
+            'budget_l': self.helium_budget_l,
+            'total_usage_l': total_usage,
+            'total_allocated_l': total_allocated,
+            'remaining_budget_l': self.helium_budget_l - total_usage,
+            'expert_usage': dict(self.helium_usage),
+            'expert_allocation': dict(self.helium_allocation),
+            'efficiency_scores': dict(self.helium_efficiency_scores),
+            'optimization_count': len(self.optimization_history)
+        }
+
+# ============================================================================
+# Federated Routing Learner Module
+# ============================================================================
+
+class FederatedRoutingLearner:
+    """Federated reflexive learning for routing decisions"""
+    
+    def __init__(self, server_url: Optional[str] = None):
+        self.server_url = server_url
+        self.round = 0
+        self.local_model = None
+        self.global_model = None
+        self.participants = []
+        self.contribution_scores = {}
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.routing_history = deque(maxlen=10000)
+        
+        # Initialize local model
+        self._init_routing_model()
+        
+        logger.info("Federated Routing Learner initialized")
+    
+    def _init_routing_model(self):
+        """Initialize local routing model"""
+        class RoutingModel(nn.Module):
+            def __init__(self, input_size=10, hidden_size=64):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(input_size, hidden_size),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size),
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size // 2),
+                    nn.Linear(hidden_size // 2, 5)  # 5 experts
+                )
+            
+            def forward(self, x):
+                return self.network(x)
+        
+        self.local_model = RoutingModel()
+        self.global_model = RoutingModel()
+    
+    async def _get_session(self):
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def train_local_model(self, routing_data: List[Dict], epochs: int = 10) -> float:
+        """Train local routing model on routing history"""
+        if not routing_data:
+            return 0.0
+        
+        X = []
+        y = []
+        for item in routing_data:
+            X.append([
+                item.get('carbon_zone', 0) / 10,
+                item.get('helium_scarcity', 0.5),
+                item.get('task_complexity', 0.5),
+                item.get('token_balance', 500) / 1000,
+                item.get('carbon_gradient', 0.5),
+                item.get('trust_gradient', 0.5),
+                item.get('opportunity_gradient', 0.5),
+                item.get('stress_level', 0.5),
+                item.get('latency_budget', 100) / 1000,
+                item.get('energy_budget', 100) / 1000
+            ])
+            # One-hot encoded expert selection
+            selected = [0] * 5
+            expert_idx = item.get('selected_expert_idx', 0)
+            if expert_idx < 5:
+                selected[expert_idx] = 1
+            y.append(selected)
+        
+        X = torch.FloatTensor(X)
+        y = torch.FloatTensor(y)
+        
+        dataset = TensorDataset(X, y)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        optimizer = optim.Adam(self.local_model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+        
+        total_loss = 0
+        for epoch in range(epochs):
+            epoch_loss = 0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                output = self.local_model(batch_X)
+                loss = criterion(output, torch.argmax(batch_y, dim=1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.local_model.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+            total_loss += epoch_loss
+        
+        avg_loss = total_loss / epochs
+        logger.info(f"Local routing model trained. Loss: {avg_loss:.4f}")
+        return avg_loss
+    
+    async def send_local_update(self, performance_metric: float = 1.0) -> Dict:
+        """Send local model update to federated server"""
+        if not self.server_url:
+            return {'status': 'disabled'}
+        
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                weights = self.local_model.state_dict()
+                weights_serialized = {k: v.tolist() for k, v in weights.items()}
+                
+                update_data = {
+                    'router_id': 'expert_router',
+                    'round': self.round,
+                    'weights': weights_serialized,
+                    'performance': performance_metric,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                
+                async with session.post(
+                    f"{self.server_url}/federated/routing/update",
+                    json=update_data,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.round += 1
+                        self.contribution_scores['router'] = performance_metric
+                        logger.info(f"Federated routing update sent. Round: {self.round}")
+                        return result
+                    else:
+                        logger.error(f"Federated update failed: {response.status}")
+                        return {'status': 'failed'}
+                        
+            except Exception as e:
+                logger.error(f"Federated update error: {e}")
+                return {'status': 'error'}
+    
+    async def get_global_model(self) -> Optional[Dict]:
+        """Get global routing model from federated server"""
+        if not self.server_url:
+            return None
+        
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                async with session.get(
+                    f"{self.server_url}/federated/routing/global",
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        weights = data.get('weights', {})
+                        self.round = data.get('round', 0)
+                        self.participants = data.get('participants', [])
+                        
+                        for k, v in weights.items():
+                            self.global_model.state_dict()[k] = torch.FloatTensor(v)
+                        
+                        return weights
+                        
+            except Exception as e:
+                logger.error(f"Global model fetch error: {e}")
+                return None
+    
+    async def participate_in_round(self, routing_data: List[Dict], performance: float = 1.0) -> Dict:
+        """Full participation in federated learning round"""
+        await self.train_local_model(routing_data)
+        result = await self.send_local_update(performance)
+        global_weights = await self.get_global_model()
+        
+        if global_weights:
+            self.global_model.load_state_dict(global_weights)
+            if 'router' not in self.participants:
+                self.participants.append('router')
+        
+        return {
+            'round': self.round,
+            'participated': bool(global_weights),
+            'contribution_score': self.contribution_scores.get('router', 0),
+            'performance': performance,
+            'peer_count': len(self.participants),
+            'timestamp': datetime.utcnow().isoformat()
+        }
+    
+    def get_federated_insights(self) -> Dict:
+        """Get insights from federated learning"""
+        return {
+            'round': self.round,
+            'contribution_score': self.contribution_scores.get('router', 0),
+            'participants': len(self.participants),
+            'has_global_model': bool(self.global_model),
+            'local_model_trained': self.local_model is not None
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Predictive Routing Analytics Module
+# ============================================================================
+
+class PredictiveRoutingAnalyzer:
+    """Predictive reflexivity with ensemble forecasting for routing performance"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.routing_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        
+        self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    
+    def update_history(self, routing_metrics: Dict):
+        """Update routing history for forecasting"""
+        self.routing_history.append({
+            'timestamp': datetime.utcnow(),
+            'success_rate': routing_metrics.get('success_rate', 0.8),
+            'avg_latency_ms': routing_metrics.get('avg_latency_ms', 100),
+            'carbon_efficiency': routing_metrics.get('carbon_efficiency', 0.5),
+            'helium_efficiency': routing_metrics.get('helium_efficiency', 0.5),
+            'expert_utilization': routing_metrics.get('expert_utilization', 0.5)
+        })
+    
+    async def train_forecast_model(self):
+        """Train ensemble forecasting models"""
+        if len(self.routing_history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.routing_history)}
+        
+        X = []
+        y = []
+        history_list = list(self.routing_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['success_rate'],
+                    data['avg_latency_ms'] / 1000,
+                    data['carbon_efficiency'],
+                    data['helium_efficiency'],
+                    data['expert_utilization']
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['success_rate'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"Routing forecast models trained. R²: {results}")
+        return {'status': 'success', 'results': results, 'samples': len(X)}
+    
+    async def predict_routing_performance(self, hours: int = 24) -> Dict:
+        """Predict future routing performance"""
+        if not self.is_trained or len(self.routing_history) < 10:
+            return {'predicted_success_rate': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
+        
+        recent = list(self.routing_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['success_rate'],
+                data['avg_latency_ms'] / 1000,
+                data['carbon_efficiency'],
+                data['helium_efficiency'],
+                data['expert_utilization']
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return {'predicted_success_rate': 0.5, 'confidence': 0.0, 'trend': 'no_models'}
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        self.forecast_history.append({'prediction': prediction, 'trend': trend})
+        return {
+            'predicted_success_rate': prediction,
+            'confidence': confidence,
+            'trend': trend,
+            'recommended_actions': self._generate_predictive_actions(prediction)
+        }
+    
+    def _generate_predictive_actions(self, prediction: float) -> List[str]:
+        actions = []
+        if prediction < 0.5:
+            actions.append("Optimize expert selection criteria")
+            actions.append("Increase carbon budget allocation")
+        elif prediction < 0.7:
+            actions.append("Enhance signal transduction sensitivity")
+            actions.append("Improve allosteric regulation")
+        else:
+            actions.append("Maintain current routing configuration")
+        return actions
+
+# ============================================================================
+# Enums and Data Classes (Preserved)
 # ============================================================================
 
 class SignalType(Enum):
@@ -120,6 +604,8 @@ class RoutingMetrics:
     fallback_routes: int = 0
     biomass_stored_routes: int = 0
     average_latency_ms: float = 0.0
+    carbon_savings_kg: float = 0.0
+    helium_savings_l: float = 0.0
     
     @property
     def success_rate(self) -> float:
@@ -167,7 +653,7 @@ class ExpertCircuitBreaker:
         return True
 
 # ============================================================================
-# Signal Transduction Engine
+# Signal Transduction Engine (Preserved)
 # ============================================================================
 
 class SignalTransductionEngine:
@@ -308,7 +794,7 @@ class SignalTransductionEngine:
         }
 
 # ============================================================================
-# Allosteric Regulation System
+# Allosteric Regulation System (Preserved)
 # ============================================================================
 
 class AllostericRegulationSystem:
@@ -376,7 +862,7 @@ class AllostericRegulationSystem:
         }
 
 # ============================================================================
-# Metabolic Pathway Router
+# Metabolic Pathway Router (Preserved)
 # ============================================================================
 
 class MetabolicPathwayRouter:
@@ -506,7 +992,7 @@ class MetabolicPathwayRouter:
 
 class ExpertRouter:
     """
-    Enhanced Expert Router v5.0.0 - Complete Signal Transduction Cascade
+    Enhanced Expert Router v6.0.0 - Complete Signal Transduction Cascade
     
     Features:
     - Signal transduction for task routing
@@ -516,6 +1002,9 @@ class ExpertRouter:
     - Causal inference for decision factors
     - Natural language explanations
     - Routing forecasts
+    - Federated learning integration
+    - Predictive analytics
+    - Carbon/Helium optimization
     """
     
     def __init__(
@@ -527,14 +1016,31 @@ class ExpertRouter:
         enable_metabolic_pathways: bool = True,
         enable_cooperative_binding: bool = True,
         enable_homeostasis: bool = True,
-        enable_bio_integration: bool = True
+        enable_bio_integration: bool = True,
+        enable_federated: bool = True,
+        enable_predictive: bool = True,
+        enable_carbon_intensity: bool = True,
+        enable_helium_optimization: bool = True,
+        server_url: Optional[str] = None,
+        helium_budget_l: float = 100.0
     ):
+        # Feature flags
         self.enable_signal_transduction = enable_signal_transduction
         self.enable_allosteric = enable_allosteric
         self.enable_metabolic_pathways = enable_metabolic_pathways
         self.enable_cooperative_binding = enable_cooperative_binding
         self.enable_homeostasis = enable_homeostasis
         self.enable_bio_integration = enable_bio_integration
+        self.enable_federated = enable_federated
+        self.enable_predictive = enable_predictive
+        self.enable_carbon_intensity = enable_carbon_intensity
+        self.enable_helium_optimization = enable_helium_optimization
+        
+        # New modules
+        self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
+        self.helium_optimizer = HeliumEfficiencyOptimizer(helium_budget_l) if enable_helium_optimization else None
+        self.federated_learner = FederatedRoutingLearner(server_url) if enable_federated else None
+        self.predictive_analyzer = PredictiveRoutingAnalyzer() if enable_predictive else None
         
         # Bio-inspired subsystems
         self.signal_engine = SignalTransductionEngine() if enable_signal_transduction else None
@@ -584,7 +1090,7 @@ class ExpertRouter:
         self._initialize_experts(enable_quantum)
         self._start_background_tasks()
         
-        logger.info(f"Expert Router v5.0.0 initialized with all features")
+        logger.info(f"Expert Router v6.0.0 initialized with all features")
     
     def _initialize_experts(self, enable_quantum: bool):
         try:
@@ -614,6 +1120,121 @@ class ExpertRouter:
         asyncio.create_task(self._signal_transduction_loop())
         asyncio.create_task(self._homeostasis_loop())
         asyncio.create_task(self._product_inhibition_loop())
+        if self.enable_carbon_intensity:
+            asyncio.create_task(self._carbon_update_loop())
+        if self.enable_federated:
+            asyncio.create_task(self._federated_sync_loop())
+        if self.enable_predictive:
+            asyncio.create_task(self._predictive_update_loop())
+    
+    # ========================================================================
+    # Background Loops
+    # ========================================================================
+    
+    async def _carbon_update_loop(self):
+        while True:
+            try:
+                if self.carbon_manager:
+                    await self.carbon_manager.update_carbon_intensity()
+                await asyncio.sleep(self.carbon_manager.update_interval if self.carbon_manager else 300)
+            except Exception as e:
+                logger.error(f"Carbon update error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _federated_sync_loop(self):
+        while True:
+            try:
+                if self.federated_learner and self.routing_history:
+                    routing_data = []
+                    for record in list(self.routing_history)[-100:]:
+                        routing_data.append({
+                            'carbon_zone': record.get('context', {}).get('carbon_zone', 0),
+                            'helium_scarcity': record.get('context', {}).get('helium_scarcity', 0.5),
+                            'task_complexity': record.get('context', {}).get('task_complexity', 0.5),
+                            'token_balance': 500,
+                            'carbon_gradient': 0.5,
+                            'trust_gradient': 0.5,
+                            'opportunity_gradient': 0.5,
+                            'stress_level': 0.3,
+                            'latency_budget': 100,
+                            'energy_budget': 100,
+                            'selected_expert_idx': 0
+                        })
+                    await self.federated_learner.participate_in_round(
+                        routing_data,
+                        performance=self.metrics.success_rate
+                    )
+                await asyncio.sleep(3600)
+            except Exception as e:
+                logger.error(f"Federated sync error: {str(e)}")
+                await asyncio.sleep(300)
+    
+    async def _predictive_update_loop(self):
+        while True:
+            try:
+                if self.predictive_analyzer:
+                    self.predictive_analyzer.update_history({
+                        'success_rate': self.metrics.success_rate,
+                        'avg_latency_ms': self.metrics.average_latency_ms,
+                        'carbon_efficiency': 0.5,
+                        'helium_efficiency': 0.5,
+                        'expert_utilization': self.active_routes / max(self.max_concurrent_routes, 1)
+                    })
+                    await self.predictive_analyzer.train_forecast_model()
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Predictive update error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _signal_transduction_loop(self):
+        while True:
+            try:
+                if self.signal_engine:
+                    gradient_levels = self._get_real_gradient_levels()
+                    self.signal_engine.bind_ligand('carbon_receptor', gradient_levels.get('carbon', 0.5))
+                    self.signal_engine.bind_ligand('helium_receptor', gradient_levels.get('helium', 0.5))
+                    self.signal_engine.bind_ligand('trust_receptor', gradient_levels.get('trust', 0.5))
+                    token_level = self._get_real_token_availability()
+                    stress_level = self._get_real_stress_level()
+                    if stress_level > 0.5:
+                        self.signal_engine.bind_ligand('stress_receptor', stress_level)
+                    self.signal_engine.apply_crosstalk()
+                    if self.allosteric_system:
+                        self.allosteric_system.bind_modulator('carbon_site', gradient_levels.get('carbon', 0.5))
+                        self.allosteric_system.bind_modulator('helium_site', gradient_levels.get('helium', 0.5))
+                        self.allosteric_system.bind_modulator('trust_site', gradient_levels.get('trust', 0.5))
+                        self.allosteric_system.bind_modulator('token_site', token_level)
+                        if stress_level > 0.3:
+                            self.allosteric_system.bind_modulator('stress_site', stress_level)
+                await asyncio.sleep(2.0)
+            except Exception as e:
+                logger.error(f"Signal transduction error: {str(e)}")
+                await asyncio.sleep(5.0)
+    
+    async def _homeostasis_loop(self):
+        while True:
+            try:
+                if self.enable_homeostasis and self.allosteric_system:
+                    modulation = self.allosteric_system.get_routing_modulation()
+                    if modulation['conservation_mode'] > 0.7:
+                        if np.random.random() < 0.1:
+                            self.allosteric_system.bind_modulator('token_site', 0.8)
+                    if modulation['risk_tolerance'] > 0.4:
+                        self.allosteric_system.bind_modulator('stress_site', 0.3)
+                await asyncio.sleep(10.0)
+            except Exception as e:
+                logger.error(f"Homeostasis error: {str(e)}")
+                await asyncio.sleep(30.0)
+    
+    async def _product_inhibition_loop(self):
+        while True:
+            try:
+                if self.metabolic_router:
+                    self.metabolic_router.apply_product_inhibition()
+                await asyncio.sleep(30.0)
+            except Exception as e:
+                logger.error(f"Product inhibition error: {str(e)}")
+                await asyncio.sleep(60.0)
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -675,60 +1296,6 @@ class ExpertRouter:
         return 0.7
     
     # ========================================================================
-    # Background Loops
-    # ========================================================================
-    
-    async def _signal_transduction_loop(self):
-        while True:
-            try:
-                if self.signal_engine:
-                    gradient_levels = self._get_real_gradient_levels()
-                    self.signal_engine.bind_ligand('carbon_receptor', gradient_levels.get('carbon', 0.5))
-                    self.signal_engine.bind_ligand('helium_receptor', gradient_levels.get('helium', 0.5))
-                    self.signal_engine.bind_ligand('trust_receptor', gradient_levels.get('trust', 0.5))
-                    token_level = self._get_real_token_availability()
-                    stress_level = self._get_real_stress_level()
-                    if stress_level > 0.5:
-                        self.signal_engine.bind_ligand('stress_receptor', stress_level)
-                    self.signal_engine.apply_crosstalk()
-                    if self.allosteric_system:
-                        self.allosteric_system.bind_modulator('carbon_site', gradient_levels.get('carbon', 0.5))
-                        self.allosteric_system.bind_modulator('helium_site', gradient_levels.get('helium', 0.5))
-                        self.allosteric_system.bind_modulator('trust_site', gradient_levels.get('trust', 0.5))
-                        self.allosteric_system.bind_modulator('token_site', token_level)
-                        if stress_level > 0.3:
-                            self.allosteric_system.bind_modulator('stress_site', stress_level)
-                await asyncio.sleep(2.0)
-            except Exception as e:
-                logger.error(f"Signal transduction error: {str(e)}")
-                await asyncio.sleep(5.0)
-    
-    async def _homeostasis_loop(self):
-        while True:
-            try:
-                if self.enable_homeostasis and self.allosteric_system:
-                    modulation = self.allosteric_system.get_routing_modulation()
-                    if modulation['conservation_mode'] > 0.7:
-                        if np.random.random() < 0.1:
-                            self.allosteric_system.bind_modulator('token_site', 0.8)
-                    if modulation['risk_tolerance'] > 0.4:
-                        self.allosteric_system.bind_modulator('stress_site', 0.3)
-                await asyncio.sleep(10.0)
-            except Exception as e:
-                logger.error(f"Homeostasis error: {str(e)}")
-                await asyncio.sleep(30.0)
-    
-    async def _product_inhibition_loop(self):
-        while True:
-            try:
-                if self.metabolic_router:
-                    self.metabolic_router.apply_product_inhibition()
-                await asyncio.sleep(30.0)
-            except Exception as e:
-                logger.error(f"Product inhibition error: {str(e)}")
-                await asyncio.sleep(60.0)
-    
-    # ========================================================================
     # Main Routing Method
     # ========================================================================
     
@@ -746,6 +1313,9 @@ class ExpertRouter:
         
         try:
             gradient_levels = self._get_real_gradient_levels()
+            carbon_intensity = 400
+            if self.carbon_manager:
+                carbon_intensity = await self.carbon_manager.get_current_intensity()
             
             signal_activated = False
             if self.signal_engine:
@@ -775,6 +1345,15 @@ class ExpertRouter:
                     task_type, substrate_conc, modulator_levels, energy_budget
                 )
             
+            # Optimize helium allocation
+            if self.helium_optimizer and selected_pathway:
+                expert_requirements = {}
+                for expert_id in self.experts:
+                    expert_requirements[expert_id] = 0.01  # Default helium requirement
+                optimized_allocation = await self.helium_optimizer.optimize_helium_allocation(expert_requirements)
+                for expert_id, allocation in optimized_allocation.items():
+                    self.helium_optimizer.set_helium_allocation(expert_id, allocation)
+            
             gating_context = self._build_gating_context(workload_profile, meta_cognitive_state, dual_axis_context)
             routing_result = self.gating_network.route(gating_context) if self.gating_network else {
                 'expert_indices': [0, 1], 'weights': [0.6, 0.4], 'confidence': 0.8
@@ -800,6 +1379,13 @@ class ExpertRouter:
             
             final_plan = await self._aggregate_plans(expert_plans, dual_axis_context, gating_context)
             
+            # Apply carbon-aware decisions
+            if self.carbon_manager:
+                current_intensity = await self.carbon_manager.get_current_intensity()
+                if current_intensity > 500 and final_plan.get('action') == 'execute_full':
+                    final_plan['action'] = 'execute_throttled'
+                    final_plan['reason'] = 'High carbon intensity'
+            
             if self.enable_homeostasis and final_plan.get('action') == 'execute_full':
                 carbon_zone = dual_axis_context.get('carbon_zone', 0)
                 conservation = routing_modulation.get('conservation_mode', 0)
@@ -823,7 +1409,9 @@ class ExpertRouter:
                     'pathway_efficiency': pathway_efficiency, 'gradient_levels': gradient_levels,
                     'token_availability': self._get_real_token_availability(),
                     'stress_level': self._get_real_stress_level(),
+                    'carbon_intensity': carbon_intensity,
                     'routing_modulation': routing_modulation,
+                    'helium_allocation': self.helium_optimizer.get_helium_status() if self.helium_optimizer else {},
                     'second_messenger_levels': {
                         sm.value: self.signal_engine.get_second_messenger_level(sm)
                         for sm in SecondMessenger
@@ -838,6 +1426,27 @@ class ExpertRouter:
                 'context': gating_context, 'confidence': routing_result.get('confidence', 0.5),
                 'timestamp': datetime.utcnow()
             })
+            
+            # Federated learning participation
+            if self.federated_learner and len(self.routing_history) % 100 == 0:
+                federated_result = await self.federated_learner.participate_in_round(
+                    [{'success_rate': self.metrics.success_rate, 'avg_latency_ms': self.metrics.average_latency_ms}],
+                    performance=self.metrics.success_rate
+                )
+                response['federated_round'] = federated_result.get('round', 0)
+            
+            # Predictive analytics update
+            if self.predictive_analyzer:
+                self.predictive_analyzer.update_history({
+                    'success_rate': self.metrics.success_rate,
+                    'avg_latency_ms': self.metrics.average_latency_ms,
+                    'carbon_efficiency': 0.5,
+                    'helium_efficiency': 0.5,
+                    'expert_utilization': self.active_routes / max(self.max_concurrent_routes, 1)
+                })
+                await self.predictive_analyzer.train_forecast_model()
+                forecast = await self.predictive_analyzer.predict_routing_performance()
+                response['predictive_forecast'] = forecast
             
             return response
             
@@ -1127,19 +1736,42 @@ class ExpertRouter:
                 'successful_routes': self.metrics.successful_routes,
                 'failed_routes': self.metrics.failed_routes,
                 'success_rate': self.metrics.success_rate,
-                'active_routes': self.active_routes
+                'active_routes': self.active_routes,
+                'carbon_savings_kg': self.metrics.carbon_savings_kg,
+                'helium_savings_l': self.metrics.helium_savings_l
             },
             'gradient_levels': self._get_real_gradient_levels(),
             'token_availability': self._get_real_token_availability(),
-            'stress_level': self._get_real_stress_level()
+            'stress_level': self._get_real_stress_level(),
+            'carbon_intensity': self.carbon_manager.get_current_intensity() if self.carbon_manager else 400
         }
+        
         if self.signal_engine:
             stats['signal_transduction'] = self.signal_engine.get_signaling_status()
         if self.allosteric_system:
             stats['allosteric_regulation'] = self.allosteric_system.get_regulation_status()
         if self.metabolic_router:
             stats['metabolic_pathways'] = self.metabolic_router.get_pathway_stats()
+        if self.helium_optimizer:
+            stats['helium_status'] = self.helium_optimizer.get_helium_status()
+        if self.federated_learner:
+            stats['federated_insights'] = self.federated_learner.get_federated_insights()
+        if self.predictive_analyzer:
+            stats['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_routing_performance())
+        
         return stats
+    
+    def get_helium_efficiency_report(self) -> Dict[str, Any]:
+        """Get helium efficiency report"""
+        if self.helium_optimizer:
+            return self.helium_optimizer.get_helium_status()
+        return {'status': 'helium_optimization_not_enabled'}
+    
+    def get_predictive_forecast(self) -> Dict[str, Any]:
+        """Get predictive routing forecast"""
+        if self.predictive_analyzer:
+            return asyncio.run(self.predictive_analyzer.predict_routing_performance())
+        return {'status': 'predictive_analysis_not_enabled'}
     
     def trigger_stress_response(self, stress_level: float):
         if self.signal_engine:
@@ -1150,3 +1782,12 @@ class ExpertRouter:
             for receptor in self.signal_engine.receptors.values():
                 receptor.state = ReceptorState.RESENSITIZED
                 receptor.bound_ligands = 0
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("Shutting down Expert Router")
+        if self.carbon_manager:
+            await self.carbon_manager.close()
+        if self.federated_learner:
+            await self.federated_learner.close()
+        logger.info("Shutdown complete")
