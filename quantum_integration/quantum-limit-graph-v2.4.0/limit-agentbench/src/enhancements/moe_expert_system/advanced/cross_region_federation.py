@@ -1,20 +1,16 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/cross_region_federation.py
-# Enhanced with complete bio-inspired integration - Metabolic Federation Network v4.0.0
-
 """
-Enhanced Cross-Region Federation v4.0.0 - Metabolic Federation Network
+Enhanced Cross-Region Federation v5.0.0 - Metabolic Federation Network
 
 Complete bio-inspired integration with:
-- Gradient-aligned carbon scheduling (carbon gradient drives sync timing)
-- Token-backed update submission (Eco-ATP staking for updates)
-- Compartment-tier aggregation hierarchy (compartment levels as tiers)
-- Harvester signal quality for drift detection
-- Trust-based Byzantine fault detection
-- Biomass-backed conflict resolution
-- Token-weighted smart contract governance
-- Local gradient field personalization
-- Photosynthetic opportunity detection for sync windows
-- ATP-driven federation round scheduling
+- Federated Reflexive Learning with global model sharing
+- User-Adaptive Reflexivity with dynamic thresholds
+- Real-time Carbon Intensity Integration with API support
+- Cross-Domain Knowledge Transfer with domain mapping
+- Human-AI Collaborative Reflection with feedback loops
+- Predictive Reflexivity with ensemble forecasting
+- Sustainability Score with multi-metric aggregation
+- Enhanced Carbon/Helium Awareness with real-time tracking
 """
 
 import asyncio
@@ -29,6 +25,15 @@ import hashlib
 import json
 import math
 import secrets
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import aiohttp
+import asyncio
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -36,9 +41,8 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Try importing bio-inspired modules
+# Bio-Inspired Import Check
 # ============================================================================
-
 try:
     from enhancements.bio_inspired.eco_atp_currency import (
         EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
@@ -72,60 +76,34 @@ except ImportError as e:
 
 class Region(Enum):
     """Geographic regions"""
-    US_EAST = "us_east"
-    US_WEST = "us_west"
-    EU_WEST = "eu_west"
-    EU_NORTH = "eu_north"
-    ASIA_EAST = "asia_east"
-    ASIA_SOUTHEAST = "asia_southeast"
-    AUSTRALIA = "australia"
-    SOUTH_AMERICA = "south_america"
-    AFRICA = "africa"
-    MIDDLE_EAST = "middle_east"
+    US_EAST = "us_east"; US_WEST = "us_west"; EU_WEST = "eu_west"
+    EU_NORTH = "eu_north"; ASIA_EAST = "asia_east"; ASIA_SOUTHEAST = "asia_southeast"
+    AUSTRALIA = "australia"; SOUTH_AMERICA = "south_america"; AFRICA = "africa"; MIDDLE_EAST = "middle_east"
 
 class SyncMode(Enum):
-    """Synchronization modes"""
-    SYNCHRONOUS = "synchronous"
-    ASYNCHRONOUS = "asynchronous"
-    EVENTUAL = "eventual"
-    OPPORTUNISTIC = "opportunistic"
-    GRADIENT_DRIVEN = "gradient_driven"  # BIO-INSPIRED
-    TOKEN_GATED = "token_gated"          # BIO-INSPIRED
+    SYNCHRONOUS = "synchronous"; ASYNCHRONOUS = "asynchronous"; EVENTUAL = "eventual"
+    OPPORTUNISTIC = "opportunistic"; GRADIENT_DRIVEN = "gradient_driven"; TOKEN_GATED = "token_gated"
 
 class AggregationTier(Enum):
-    """Aggregation hierarchy tiers with bio-inspired mapping"""
-    EDGE = "edge"
-    REGIONAL = "regional"
-    CONTINENTAL = "continental"
-    GLOBAL = "global"
-    CHROMATOPHORE = "chromatophore"  # BIO-INSPIRED: Compartment-level
-    MEMBRANE = "membrane"            # BIO-INSPIRED: Cross-membrane
+    EDGE = "edge"; REGIONAL = "regional"; CONTINENTAL = "continental"; GLOBAL = "global"
+    CHROMATOPHORE = "chromatophore"; MEMBRANE = "membrane"
 
 class FederationTopology(Enum):
-    """Federation topology types"""
-    CENTRALIZED = "centralized"
-    DECENTRALIZED = "decentralized"
-    HIERARCHICAL = "hierarchical"
-    SWARM = "swarm"
-    CROSS_SILO = "cross_silo"
-    CROSS_DEVICE = "cross_device"
-    METABOLIC_MESH = "metabolic_mesh"  # BIO-INSPIRED
+    CENTRALIZED = "centralized"; DECENTRALIZED = "decentralized"; HIERARCHICAL = "hierarchical"
+    SWARM = "swarm"; CROSS_SILO = "cross_silo"; CROSS_DEVICE = "cross_device"; METABOLIC_MESH = "metabolic_mesh"
 
 class AggregationStrategy(Enum):
-    """Model aggregation strategies"""
-    FED_AVG = "fed_avg"
-    FED_PROX = "fed_prox"
-    FED_OPT = "fed_opt"
-    FED_DYN = "fed_dyn"
-    FED_ENSEMBLE = "fed_ensemble"
-    FED_DISTILL = "fed_distill"
-    ADAPTIVE = "adaptive"
-    TOKEN_WEIGHTED = "token_weighted"      # BIO-INSPIRED
-    GRADIENT_ALIGNED = "gradient_aligned"  # BIO-INSPIRED
+    FED_AVG = "fed_avg"; FED_PROX = "fed_prox"; FED_OPT = "fed_opt"; FED_DYN = "fed_dyn"
+    FED_ENSEMBLE = "fed_ensemble"; FED_DISTILL = "fed_distill"; ADAPTIVE = "adaptive"
+    TOKEN_WEIGHTED = "token_weighted"; GRADIENT_ALIGNED = "gradient_aligned"
+    SUSTAINABILITY_WEIGHTED = "sustainability_weighted"  # NEW
+
+# ============================================================================
+# Enhanced Data Classes
+# ============================================================================
 
 @dataclass
 class RegionalProfile:
-    """Regional characteristics with bio-inspired metadata"""
     region: Region
     timezone_offset: int
     typical_renewable_hours: List[int]
@@ -137,17 +115,17 @@ class RegionalProfile:
     helium_availability: float
     data_sovereignty_constraints: List[str]
     optimal_sync_windows: List[Tuple[int, int]]
-    
-    # BIO-INSPIRED
     local_carbon_gradient: float = 0.5
     local_trust_gradient: float = 0.5
     token_balance: float = 0.0
     compartment_count: int = 0
     harvester_vitality: float = 0.5
+    sustainability_score: float = 0.5  # NEW
+    carbon_savings_kg: float = 0.0  # NEW
+    helium_savings_l: float = 0.0  # NEW
 
 @dataclass
 class AsyncUpdate:
-    """Asynchronous model update with bio-inspired metadata"""
     update_id: str
     source_region: Region
     model_delta: Dict[str, Any]
@@ -158,34 +136,56 @@ class AsyncUpdate:
     local_accuracy: float
     vector_clock: Dict[str, int]
     signature: str
-    
-    # BIO-INSPIRED
     tokens_staked: float = 0.0
     gradient_level_at_update: float = 0.5
     compartment_tier: str = "regional"
     harvester_confidence: float = 0.5
+    sustainability_impact: float = 0.0  # NEW
+    carbon_savings: float = 0.0  # NEW
 
 @dataclass
-class AggregationNode:
-    """Multi-tier aggregation node with bio-inspired mapping"""
-    node_id: str
-    tier: AggregationTier
-    region: Optional[Region]
-    parent_node: Optional[str]
-    child_nodes: List[str]
-    aggregated_model: Optional[Dict[str, Any]] = None
-    last_aggregation: Optional[datetime] = None
-    updates_received: int = 0
-    carbon_footprint_kg: float = 0.0
-    
-    # BIO-INSPIRED
+class FederatedExpert:
+    expert_id: str
+    local_model: Dict[str, Any]
+    data_distribution: Dict[str, float]
+    capabilities: 'ClientCapabilities'
+    carbon_footprint: float
+    helium_usage: float
+    privacy_budget: float = 1.0
+    reputation_score: float = 0.5
+    participation_history: List[Any] = field(default_factory=list)
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+    is_active: bool = True
+    architecture_type: str = "standard"
+    tokens_staked: float = 0.0
+    gradient_alignment: float = 0.5
     compartment_id: Optional[str] = None
-    membrane_permeability: str = "selective"
-    token_pool: float = 0.0
+    harvester_contribution: float = 0.0
+    sustainability_contribution: float = 0.0  # NEW
+    federated_round: int = 0  # NEW
+
+@dataclass
+class PredictiveFederationForecast:
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    predicted_carbon_impact: float = 0.0
+    predicted_helium_usage: float = 0.0
+    predicted_sustainability_score: float = 0.0
+    confidence: float = 0.0
+    trend: str = "stable"
+    recommended_actions: List[str] = field(default_factory=list)
+
+@dataclass
+class CrossDomainKnowledge:
+    source_domain: str
+    target_domain: str
+    knowledge_type: str
+    data: Dict[str, Any]
+    effectiveness_score: float = 0.0
+    transfer_count: int = 0
+    last_used: Optional[datetime] = None
 
 @dataclass
 class ClientCapabilities:
-    """Client hardware and network capabilities"""
     client_id: str
     compute_power_flops: float
     memory_gb: float
@@ -198,45 +198,465 @@ class ClientCapabilities:
     supported_architectures: List[str]
     availability_schedule: Dict[int, float]
 
-@dataclass
-class FederatedExpert:
-    """Enhanced federated expert with bio-inspired tracking"""
-    expert_id: str
-    local_model: Dict[str, Any]
-    data_distribution: Dict[str, float]
-    capabilities: ClientCapabilities
-    carbon_footprint: float
-    helium_usage: float
-    privacy_budget: float = 1.0
-    reputation_score: float = 0.5
-    participation_history: List[Any] = field(default_factory=list)
-    last_updated: datetime = field(default_factory=datetime.utcnow)
-    is_active: bool = True
-    architecture_type: str = "standard"
+# ============================================================================
+# Federated Reflexive Learning Module
+# ============================================================================
+
+class FederatedReflexiveLearner:
+    """Federated reflexive learning with global model sharing"""
     
-    # BIO-INSPIRED
-    tokens_staked: float = 0.0
-    gradient_alignment: float = 0.5
-    compartment_id: Optional[str] = None
-    harvester_contribution: float = 0.0
+    def __init__(self, server_url: Optional[str] = None):
+        self.server_url = server_url
+        self.round = 0
+        self.global_model = None
+        self.local_models = {}
+        self.participants = []
+        self.contribution_scores = {}
+        self._lock = asyncio.Lock()
+        self._session = None
+        
+        # Initialize model registry
+        self.model_registry = {}
+    
+    async def _get_session(self):
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def register_participant(self, participant_id: str, initial_model: Dict):
+        """Register participant with local model"""
+        self.local_models[participant_id] = initial_model
+        self.participants.append(participant_id)
+        self.contribution_scores[participant_id] = 0.0
+    
+    async def send_local_update(self, participant_id: str, model_delta: Dict, 
+                                performance: float = 1.0) -> Dict:
+        """Send local model update to federated server"""
+        if not self.server_url:
+            return {'status': 'local'}
+        
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                update_data = {
+                    'participant_id': participant_id,
+                    'round': self.round,
+                    'model_delta': model_delta,
+                    'performance': performance,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                
+                async with session.post(
+                    f"{self.server_url}/federated/update",
+                    json=update_data,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.round += 1
+                        self.contribution_scores[participant_id] += performance
+                        return result
+                    return {'status': 'failed'}
+            except Exception as e:
+                logger.error(f"Federated update error: {e}")
+                return {'status': 'error'}
+    
+    async def get_global_model(self) -> Optional[Dict]:
+        """Get global model from federated server"""
+        if not self.server_url:
+            return self.global_model
+        
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                async with session.get(
+                    f"{self.server_url}/federated/global",
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.global_model = data.get('model', {})
+                        self.round = data.get('round', 0)
+                        self.participants = data.get('participants', [])
+                        return self.global_model
+            except Exception as e:
+                logger.error(f"Global model fetch error: {e}")
+                return None
+    
+    def aggregate_models(self, models: List[Dict], strategy: AggregationStrategy) -> Dict:
+        """Aggregate models using specified strategy"""
+        if not models:
+            return {}
+        
+        if strategy == AggregationStrategy.FED_AVG:
+            return self._fed_avg_aggregate(models)
+        elif strategy == AggregationStrategy.SUSTAINABILITY_WEIGHTED:
+            return self._sustainability_weighted_aggregate(models)
+        elif strategy == AggregationStrategy.TOKEN_WEIGHTED:
+            return self._token_weighted_aggregate(models)
+        else:
+            return self._fed_avg_aggregate(models)
+    
+    def _fed_avg_aggregate(self, models: List[Dict]) -> Dict:
+        """Standard federated averaging"""
+        aggregated = {}
+        n = len(models)
+        
+        for key in models[0].keys():
+            values = [m[key] for m in models if key in m]
+            if values:
+                if isinstance(values[0], np.ndarray):
+                    aggregated[key] = np.mean(values, axis=0)
+                else:
+                    aggregated[key] = sum(values) / n
+        
+        return aggregated
+    
+    def _sustainability_weighted_aggregate(self, models: List[Dict]) -> Dict:
+        """Weight models by sustainability contribution"""
+        aggregated = {}
+        total_weight = sum(m.get('sustainability_score', 1.0) for m in models)
+        
+        if total_weight == 0:
+            return self._fed_avg_aggregate(models)
+        
+        for key in models[0].keys():
+            weighted_sum = 0.0
+            for m in models:
+                if key in m:
+                    weight = m.get('sustainability_score', 1.0) / total_weight
+                    weighted_sum += m[key] * weight
+            aggregated[key] = weighted_sum
+        
+        return aggregated
+    
+    def _token_weighted_aggregate(self, models: List[Dict]) -> Dict:
+        """Weight models by token stake"""
+        aggregated = {}
+        total_tokens = sum(m.get('tokens_staked', 0) for m in models)
+        
+        if total_tokens == 0:
+            return self._fed_avg_aggregate(models)
+        
+        for key in models[0].keys():
+            weighted_sum = 0.0
+            for m in models:
+                if key in m:
+                    weight = m.get('tokens_staked', 0) / total_tokens
+                    weighted_sum += m[key] * weight
+            aggregated[key] = weighted_sum
+        
+        return aggregated
+    
+    def get_federated_stats(self) -> Dict:
+        """Get federated learning statistics"""
+        return {
+            'round': self.round,
+            'participants': len(self.participants),
+            'has_global_model': self.global_model is not None,
+            'contribution_scores': self.contribution_scores,
+            'server_url': self.server_url
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
 
 # ============================================================================
-# Enhanced Cross-Region Federation with Complete Bio-Inspired Integration
+# Carbon Intensity Integration Module
+# ============================================================================
+
+class CarbonIntensityManager:
+    """Real-time carbon intensity integration with API support"""
+    
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300  # 5 minutes
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        """Fetch real-time carbon intensity from API"""
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                url = f"{self.endpoint}/latest?zone={region}"
+                headers = {'auth-token': self.api_key} if self.api_key else {}
+                
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.carbon_intensity = data.get('carbonIntensity', 400)
+                        self.region = region
+                        self.last_update = datetime.now()
+                        self.cache[region] = {
+                            'intensity': self.carbon_intensity,
+                            'timestamp': self.last_update
+                        }
+                        self.historical_intensities.append(self.carbon_intensity)
+                    else:
+                        self.carbon_intensity = self._get_fallback_intensity(region)
+                        self.last_update = datetime.now()
+            except Exception as e:
+                logger.error(f"Carbon intensity fetch error: {e}")
+                self.carbon_intensity = self._get_fallback_intensity(region)
+                self.last_update = datetime.now()
+            
+            return {
+                'intensity': self.carbon_intensity,
+                'region': self.region,
+                'timestamp': self.last_update.isoformat() if self.last_update else None
+            }
+    
+    def _get_fallback_intensity(self, region: str) -> float:
+        fallback_values = {
+            'us-east': 420, 'us-west': 350, 'eu': 280,
+            'asia': 500, 'default': 400
+        }
+        return fallback_values.get(region, 400)
+    
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or \
+           (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Predictive Reflexivity Module
+# ============================================================================
+
+class PredictiveFederationAnalyzer:
+    """Predictive reflexivity with ensemble forecasting"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.federation_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        
+        self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    
+    def update_history(self, federation_metrics: Dict):
+        """Update federation history"""
+        self.federation_history.append({
+            'timestamp': datetime.utcnow(),
+            'participants': federation_metrics.get('participants', 0),
+            'carbon_intensity': federation_metrics.get('carbon_intensity', 400),
+            'helium_scarcity': federation_metrics.get('helium_scarcity', 0.5),
+            'sustainability_score': federation_metrics.get('sustainability_score', 0.5),
+            'token_pool': federation_metrics.get('token_pool', 0)
+        })
+    
+    async def train_forecast_model(self):
+        """Train ensemble forecasting models"""
+        if len(self.federation_history) < 10:
+            return {'status': 'insufficient_data'}
+        
+        X, y = [], []
+        history_list = list(self.federation_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['participants'],
+                    data['carbon_intensity'] / 100,
+                    data['helium_scarcity'],
+                    data['sustainability_score'],
+                    data['token_pool'] / 100
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['sustainability_score'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"Federation forecast models trained. R²: {results}")
+        return {'status': 'success', 'results': results}
+    
+    async def predict_federation_trend(self, hours: int = 24) -> PredictiveFederationForecast:
+        """Predict future federation trends"""
+        if not self.is_trained or len(self.federation_history) < 10:
+            return PredictiveFederationForecast(confidence=0.0, trend="insufficient_data")
+        
+        recent = list(self.federation_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['participants'],
+                data['carbon_intensity'] / 100,
+                data['helium_scarcity'],
+                data['sustainability_score'],
+                data['token_pool'] / 100
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return PredictiveFederationForecast(confidence=0.0, trend="no_models")
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        forecast = PredictiveFederationForecast(
+            predicted_sustainability_score=prediction,
+            confidence=confidence,
+            trend=trend,
+            recommended_actions=self._generate_actions(prediction)
+        )
+        
+        self.forecast_history.append(forecast)
+        return forecast
+    
+    def _generate_actions(self, prediction: float) -> List[str]:
+        actions = []
+        if prediction < 0.5:
+            actions.append("Increase federated participation")
+            actions.append("Optimize carbon-aware scheduling")
+        elif prediction < 0.7:
+            actions.append("Enhance token staking incentives")
+            actions.append("Improve cross-domain knowledge transfer")
+        return actions or ["Current federation trends are sustainable"]
+    
+    def get_sustainability_summary(self) -> Dict:
+        if not self.federation_history:
+            return {'status': 'insufficient_data'}
+        
+        recent = list(self.federation_history)[-50:]
+        
+        return {
+            'average_sustainability_score': np.mean([h['sustainability_score'] for h in recent]),
+            'average_carbon_intensity': np.mean([h['carbon_intensity'] for h in recent]),
+            'average_helium_scarcity': np.mean([h['helium_scarcity'] for h in recent]),
+            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
+        }
+
+# ============================================================================
+# Cross-Domain Knowledge Transfer Module
+# ============================================================================
+
+class FederationCrossDomainTransfer:
+    """Cross-domain knowledge transfer for federation"""
+    
+    def __init__(self):
+        self.knowledge_base: Dict[str, Dict[str, CrossDomainKnowledge]] = {}
+        self.transfer_logs = deque(maxlen=1000)
+        self.domain_mappings = {
+            'federation→energy': {
+                'scheduling_patterns': ['carbon-aware', 'gradient-driven', 'opportunistic'],
+                'resource_allocation': ['dynamic', 'adaptive', 'predictive']
+            },
+            'federation→carbon': {
+                'intensity_patterns': ['diurnal', 'regional', 'trending'],
+                'optimization_strategies': ['load-shifting', 'efficiency-first', 'renewable-tracking']
+            },
+            'federation→helium': {
+                'scarcity_patterns': ['supply-constrained', 'price-sensitive'],
+                'efficiency_strategies': ['recovery', 'reuse', 'minimization']
+            },
+            'federation→data': {
+                'aggregation_patterns': ['weighted', 'adaptive', 'hierarchical'],
+                'compression_strategies': ['lossy', 'lossless', 'adaptive']
+            }
+        }
+        self._lock = asyncio.Lock()
+    
+    def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                          knowledge_type: str, data: Dict[str, Any]) -> Dict:
+        """Transfer knowledge between domains"""
+        key = f"{source_domain}→{target_domain}"
+        
+        if key not in self.knowledge_base:
+            self.knowledge_base[key] = {}
+        
+        if knowledge_type not in self.knowledge_base[key]:
+            self.knowledge_base[key][knowledge_type] = {
+                'data': data,
+                'transfer_count': 1,
+                'effectiveness_score': 0.5,
+                'last_used': datetime.utcnow()
+            }
+        else:
+            existing = self.knowledge_base[key][knowledge_type]
+            existing['data'].update(data)
+            existing['transfer_count'] += 1
+            existing['last_used'] = datetime.utcnow()
+        
+        self.transfer_logs.append({
+            'timestamp': datetime.utcnow(),
+            'source': source_domain,
+            'target': target_domain,
+            'type': knowledge_type
+        })
+        
+        return self.knowledge_base[key][knowledge_type]
+    
+    def get_transfer_statistics(self) -> Dict:
+        total_transfers = len(self.transfer_logs)
+        domain_pairs = {}
+        
+        for log in self.transfer_logs:
+            key = f"{log['source']}→{log['target']}"
+            domain_pairs[key] = domain_pairs.get(key, 0) + 1
+        
+        return {
+            'total_transfers': total_transfers,
+            'domain_pairs': domain_pairs,
+            'knowledge_types': list(self.knowledge_base.keys())
+        }
+
+# ============================================================================
+# Enhanced Cross-Region Federation Optimizer
 # ============================================================================
 
 class CrossRegionFederationOptimizer:
     """
-    Enhanced Cross-Region Federation v4.0.0 - Metabolic Federation Network
-    
-    Complete bio-inspired integration:
-    - Gradient-aligned carbon scheduling
-    - Token-backed update submission
-    - Compartment-tier aggregation hierarchy
-    - Harvester signal quality for drift detection
-    - Trust-based Byzantine fault detection
-    - Biomass-backed conflict resolution
-    - Token-weighted smart contract governance
-    - Local gradient field personalization
+    Enhanced Cross-Region Federation v5.0.0 - Complete Green Agent Implementation
     """
     
     def __init__(
@@ -247,11 +667,11 @@ class CrossRegionFederationOptimizer:
         enable_multi_tier: bool = True,
         enable_personalization: bool = True,
         enable_bio_integration: bool = True,
-        # BIO-INSPIRED
-        enable_gradient_scheduling: bool = True,
-        enable_token_staking: bool = True,
-        enable_compartment_tiers: bool = True,
-        enable_harvester_drift: bool = True
+        enable_federated_reflexive: bool = True,
+        enable_carbon_intensity: bool = True,
+        enable_predictive: bool = True,
+        enable_cross_domain: bool = True,
+        enable_sustainability_scoring: bool = True
     ):
         # Feature flags
         self.enable_async = enable_async
@@ -260,27 +680,25 @@ class CrossRegionFederationOptimizer:
         self.enable_multi_tier = enable_multi_tier
         self.enable_personalization = enable_personalization
         self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_federated_reflexive = enable_federated_reflexive
+        self.enable_carbon_intensity = enable_carbon_intensity
+        self.enable_predictive = enable_predictive
+        self.enable_cross_domain = enable_cross_domain
+        self.enable_sustainability_scoring = enable_sustainability_scoring
         
-        # BIO-INSPIRED feature flags
-        self.enable_gradient_scheduling = enable_gradient_scheduling
-        self.enable_token_staking = enable_token_staking
-        self.enable_compartment_tiers = enable_compartment_tiers
-        self.enable_harvester_drift = enable_harvester_drift
+        # Bio-inspired modules
+        self.token_manager = None
+        self.gradient_manager = None
+        self.scheduler = None
+        self.compartment_manager = None
+        self.biomass_storage = None
+        self.harvester = None
         
-        # BIO-INSPIRED: Module references (injected)
-        self.token_manager: Optional[EcoATPTokenManager] = None
-        self.gradient_manager: Optional[GradientFieldManager] = None
-        self.scheduler: Optional[ATPSynthaseScheduler] = None
-        self.compartment_manager: Optional[CompartmentManager] = None
-        self.biomass_storage: Optional[BiomassStorage] = None
-        self.harvester: Optional[PhotosyntheticHarvester] = None
-        
-        # Sub-modules
-        self.async_protocol = None
-        self.carbon_scheduler = None
-        self.network_compressor = None
-        self.multi_tier_aggregator = None
-        self.model_personalizer = None
+        # New modules
+        self.federated_learner = FederatedReflexiveLearner()
+        self.carbon_manager = CarbonIntensityManager()
+        self.predictive_analyzer = PredictiveFederationAnalyzer()
+        self.cross_domain_transfer = FederationCrossDomainTransfer()
         
         # Regional profiles
         self.regional_profiles: Dict[Region, RegionalProfile] = {}
@@ -295,45 +713,31 @@ class CrossRegionFederationOptimizer:
         # Global model
         self.global_model: Optional[Dict[str, Any]] = None
         
-        # BIO-INSPIRED: Federation token pool
+        # Sustainability tracking
         self.federation_token_pool: float = 0.0
-        
-        # BIO-INSPIRED: Gradient sync history
-        self.gradient_sync_history: deque = deque(maxlen=1000)
+        self.total_carbon_savings_kg = 0.0
+        self.total_helium_savings_l = 0.0
+        self.sustainability_score = 0.0
         
         # Initialize regional profiles
         self._initialize_regional_profiles()
         
         logger.info(
-            f"Cross-Region Federation v4.0.0 initialized: "
+            f"Cross-Region Federation v5.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
-            f"bio_available={BIO_INSPIRED_AVAILABLE}"
+            f"federated_reflexive={self.enable_federated_reflexive}, "
+            f"predictive={self.enable_predictive}"
         )
     
     def _initialize_regional_profiles(self):
         """Initialize regional carbon profiles with bio-inspired metadata"""
         profiles = {
-            Region.US_EAST: {
-                'timezone': -5,
-                'renewable_hours': [2, 3, 4, 5],
-                'carbon_peak_hours': [14, 15, 16, 17, 18],
-                'carbon_low_hours': [2, 3, 4, 5, 22, 23],
-                'renewable_mix': {'wind': 0.15, 'solar': 0.10, 'nuclear': 0.30, 'gas': 0.35, 'coal': 0.10}
-            },
-            Region.EU_WEST: {
-                'timezone': 0,
-                'renewable_hours': [12, 13, 14],
-                'carbon_peak_hours': [17, 18, 19, 20],
-                'carbon_low_hours': [1, 2, 3, 4, 12, 13],
-                'renewable_mix': {'wind': 0.25, 'solar': 0.15, 'nuclear': 0.25, 'gas': 0.25, 'coal': 0.10}
-            },
-            Region.ASIA_EAST: {
-                'timezone': 8,
-                'renewable_hours': [10, 11, 12, 13],
-                'carbon_peak_hours': [18, 19, 20, 21],
-                'carbon_low_hours': [2, 3, 4, 5],
-                'renewable_mix': {'wind': 0.10, 'solar': 0.15, 'nuclear': 0.10, 'coal': 0.50, 'gas': 0.15}
-            }
+            Region.US_EAST: {'timezone': -5, 'renewable_hours': [2, 3, 4, 5],
+                'carbon_low_hours': [2, 3, 4, 5, 22, 23], 'renewable_mix': {'wind': 0.15, 'solar': 0.10, 'nuclear': 0.30, 'gas': 0.35, 'coal': 0.10}},
+            Region.EU_WEST: {'timezone': 0, 'renewable_hours': [12, 13, 14],
+                'carbon_low_hours': [1, 2, 3, 4, 12, 13], 'renewable_mix': {'wind': 0.25, 'solar': 0.15, 'nuclear': 0.25, 'gas': 0.25, 'coal': 0.10}},
+            Region.ASIA_EAST: {'timezone': 8, 'renewable_hours': [10, 11, 12, 13],
+                'carbon_low_hours': [2, 3, 4, 5], 'renewable_mix': {'wind': 0.10, 'solar': 0.15, 'nuclear': 0.10, 'coal': 0.50, 'gas': 0.15}}
         }
         
         for region, data in profiles.items():
@@ -341,8 +745,6 @@ class CrossRegionFederationOptimizer:
             for hour in range(24):
                 if hour in data['carbon_low_hours']:
                     carbon_profile[hour] = np.random.uniform(50, 200)
-                elif hour in data['carbon_peak_hours']:
-                    carbon_profile[hour] = np.random.uniform(400, 700)
                 else:
                     carbon_profile[hour] = np.random.uniform(200, 400)
             
@@ -365,11 +767,6 @@ class CrossRegionFederationOptimizer:
     # ========================================================================
     
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        """
-        Inject bio-inspired modules for federation optimization.
-        
-        Connects federation to real bio-inspired systems.
-        """
         if bio_core:
             self.token_manager = getattr(bio_core, 'token_manager', None)
             self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
@@ -385,54 +782,28 @@ class CrossRegionFederationOptimizer:
             self.biomass_storage = kwargs.get('biomass_storage')
             self.harvester = kwargs.get('harvester')
         
-        injections = {
-            'token_manager': self.token_manager is not None,
-            'gradient_manager': self.gradient_manager is not None,
-            'scheduler': self.scheduler is not None,
-            'compartment_manager': self.compartment_manager is not None,
-            'biomass_storage': self.biomass_storage is not None,
-            'harvester': self.harvester is not None
-        }
-        logger.info(f"Bio-inspired injections into Cross-Region Federation: {injections}")
-        
-        if any(injections.values()):
+        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
             self.enable_bio_integration = True
+        
+        # Also inject into sub-modules
+        if self.token_manager and self.enable_federated_reflexive:
+            self.federated_learner.token_manager = self.token_manager
     
     # ========================================================================
     # Bio-Inspired Data Access Methods
     # ========================================================================
     
     def _get_gradient_aligned_schedule(self, region: Region) -> float:
-        """
-        Get optimal sync time based on carbon gradient.
-        
-        Lower carbon gradient = sooner sync.
-        """
-        if self.gradient_manager:
+        if self.gradient_manager and self.enable_bio_integration:
             carbon = self.gradient_manager.fields.get('carbon')
             if carbon and carbon.gradient_strength < 0.3:
-                return 0.0  # Immediate sync - low carbon stress
+                return 0.0
             elif carbon:
-                return carbon.gradient_strength * 3600  # Delay in seconds
-        
-        # Update regional profile with gradient data
-        if region in self.regional_profiles:
-            profile = self.regional_profiles[region]
-            if self.gradient_manager:
-                profile.local_carbon_gradient = self.gradient_manager.fields.get('carbon', 
-                    GradientField('carbon', 'carbon')).gradient_strength
-                profile.local_trust_gradient = self.gradient_manager.fields.get('trust',
-                    GradientField('trust', 'trust')).gradient_strength
-        
+                return carbon.gradient_strength * 3600
         return 0.0
     
     def _stake_tokens_for_update(self, region: str, amount: float) -> Tuple[bool, float]:
-        """
-        Stake Eco-ATP tokens for update submission.
-        
-        Higher stake = higher priority in aggregation.
-        """
-        if self.token_manager:
+        if self.token_manager and self.enable_bio_integration:
             success, token_ids = self.token_manager.reserve_tokens(
                 account_id=f"federation_{region}",
                 amount=amount,
@@ -445,9 +816,7 @@ class CrossRegionFederationOptimizer:
         return True, 0.0
     
     def _get_compartment_tier(self, region: str) -> AggregationTier:
-        """Get aggregation tier from compartment hierarchy"""
-        if self.compartment_manager:
-            # Map region to compartment type
+        if self.compartment_manager and self.enable_bio_integration:
             region_types = {
                 'us_east': 'data', 'us_west': 'energy',
                 'eu_west': 'data', 'eu_north': 'energy',
@@ -458,15 +827,12 @@ class CrossRegionFederationOptimizer:
             if compartment:
                 if compartment.state == CompartmentState.ACTIVE:
                     return AggregationTier.REGIONAL
-                elif compartment.state == CompartmentState.MATURING:
-                    return AggregationTier.EDGE
                 elif compartment.health_score > 0.8:
                     return AggregationTier.CONTINENTAL
         return AggregationTier.REGIONAL
     
     def _get_harvester_signal_quality(self) -> float:
-        """Get signal quality from photosynthetic harvester for drift detection"""
-        if self.harvester:
+        if self.harvester and self.enable_bio_integration:
             stats = self.harvester.get_harvesting_stats()
             recent = stats.get('recent_conversions', [])
             if recent:
@@ -474,52 +840,14 @@ class CrossRegionFederationOptimizer:
         return 0.5
     
     def _get_trust_based_byzantine_threshold(self, region: str) -> float:
-        """Get Byzantine detection threshold from trust gradient"""
-        if self.gradient_manager:
+        if self.gradient_manager and self.enable_bio_integration:
             trust = self.gradient_manager.fields.get('trust')
             if trust:
-                # Higher trust = lower threshold (more tolerant)
                 return max(0.1, 1.0 - trust.gradient_strength)
         return 0.5
     
-    def _get_token_weighted_voting_power(self, region: str) -> float:
-        """Get voting power based on token balance"""
-        if self.token_manager:
-            account = self.token_manager.get_account_summary(f"federation_{region}")
-            if account:
-                return min(10.0, account.get('balance', 0) / 100.0)
-        return 1.0
-    
-    def _get_compartment_health_for_region(self, region: str) -> float:
-        """Get compartment health score for a region"""
-        if self.compartment_manager:
-            region_types = {
-                'us_east': 'data', 'us_west': 'energy',
-                'eu_west': 'data', 'eu_north': 'energy',
-                'asia_east': 'iot', 'asia_southeast': 'data'
-            }
-            expert_type = region_types.get(region, 'data')
-            compartment = self.compartment_manager.find_best_compartment(expert_type)
-            if compartment:
-                return compartment.health_score
-        return 0.7
-    
-    def _get_biomass_backed_conflict_resolution(self, conflict_key: str) -> Optional[Dict[str, Any]]:
-        """Use biomass storage for conflict resolution"""
-        if self.biomass_storage:
-            # Store conflicting updates and resolve later
-            stored, token_id = self.biomass_storage.store_task(
-                task_data={'conflict_key': conflict_key},
-                ecoatp_cost=5.0,
-                guarantee=GuaranteeLevel.SILVER,
-                initial_tier=StorageTier.GLYCOGEN_QUEUE
-            )
-            if stored:
-                return {'resolution': 'deferred', 'biomass_token': token_id}
-        return None
-    
     # ========================================================================
-    # Enhanced Federation Round with Bio-Inspired Integration
+    # Enhanced Federation Round
     # ========================================================================
     
     async def federated_round(
@@ -528,109 +856,81 @@ class CrossRegionFederationOptimizer:
         helium_scarcity: float,
         timeout_seconds: int = 300
     ) -> Optional[Dict[str, Any]]:
-        """
-        Execute enhanced federated learning round with bio-inspired integration.
-        """
         self.round_number += 1
         round_start = datetime.utcnow()
         
-        # BIO-INSPIRED: Get gradient-aligned scheduling
-        if self.enable_bio_integration and self.enable_gradient_scheduling:
-            for region in self.regional_profiles:
-                delay = self._get_gradient_aligned_schedule(region)
-                if delay > 0:
-                    logger.info(f"Region {region.value} sync delayed by {delay:.0f}s (gradient-aligned)")
+        # Update carbon intensity if enabled
+        if self.enable_carbon_intensity:
+            carbon_data = await self.carbon_manager.update_carbon_intensity('us-east')
+            carbon_intensity = carbon_data.get('intensity', 400)
+        else:
+            carbon_intensity = 400
         
-        # BIO-INSPIRED: Update regional profiles with gradient data
-        if self.enable_bio_integration and self.gradient_manager:
-            for region, profile in self.regional_profiles.items():
-                profile.local_carbon_gradient = self.gradient_manager.fields.get('carbon',
-                    GradientField('carbon', 'carbon')).gradient_strength
-                profile.local_trust_gradient = self.gradient_manager.fields.get('trust',
-                    GradientField('trust', 'trust')).gradient_strength
-                profile.harvester_vitality = self._get_harvester_signal_quality()
-                
-                # Update compartment count
-                if self.compartment_manager:
-                    profile.compartment_count = sum(
-                        1 for c in self.compartment_manager.compartments.values()
-                        if c.is_viable
-                    )
-                
-                # Update token balance
-                if self.token_manager:
-                    account = self.token_manager.get_account_summary(f"federation_{region.value}")
-                    if account:
-                        profile.token_balance = account.get('balance', 0)
-        
-        # Select participants with bio-inspired criteria
-        selected = await self._select_participants_multi_criteria(carbon_zone, helium_scarcity)
+        # Select participants with enhanced criteria
+        selected = await self._select_participants_multi_criteria(carbon_zone, helium_scarcity, carbon_intensity)
         
         if len(selected) < 3:
             logger.warning(f"Insufficient participants: {len(selected)}")
             return None
         
-        # BIO-INSPIRED: Stake tokens for selected participants
-        if self.enable_bio_integration and self.enable_token_staking:
-            for participant_id in selected:
-                if participant_id in self.participants:
-                    participant = self.participants[participant_id]
-                    stake_amount = participant.carbon_footprint * 100  # Higher carbon = higher stake
-                    success, staked = self._stake_tokens_for_update(participant_id, stake_amount)
-                    if success:
-                        participant.tokens_staked = staked
+        # Stake tokens for selected participants
+        for participant_id in selected:
+            if participant_id in self.participants:
+                participant = self.participants[participant_id]
+                stake_amount = participant.carbon_footprint * 100
+                success, staked = self._stake_tokens_for_update(participant_id, stake_amount)
+                if success:
+                    participant.tokens_staked = staked
         
         # Collect updates
         updates = {}
         for participant_id in selected:
             if participant_id in self.participants:
-                participant = self.participants[participant_id]
-                update = await self._collect_update(participant_id)
+                update = await self._collect_update(participant_id, carbon_intensity)
                 if update:
-                    # BIO-INSPIRED: Add bio metadata to update
-                    if self.enable_bio_integration:
-                        update.gradient_level_at_update = self.regional_profiles.get(
-                            Region(participant_id) if participant_id in [r.value for r in Region] else Region.US_EAST,
-                            RegionalProfile(Region.US_EAST, 0, [], {}, {}, {}, 0, 0, 0, [], [])
-                        ).local_carbon_gradient
-                        update.compartment_tier = self._get_compartment_tier(participant_id).value
-                        update.harvester_confidence = self._get_harvester_signal_quality()
-                    
                     updates[participant_id] = update
         
         if len(updates) < 3:
             return None
         
-        # BIO-INSPIRED: Apply trust-based Byzantine detection
-        if self.enable_bio_integration:
-            for participant_id in list(updates.keys()):
-                threshold = self._get_trust_based_byzantine_threshold(participant_id)
-                if threshold > 0.7:  # High suspicion
-                    logger.warning(f"High Byzantine risk for {participant_id}: threshold={threshold:.2f}")
-                    # Could filter out suspicious updates here
+        # Apply trust-based Byzantine detection
+        for participant_id in list(updates.keys()):
+            threshold = self._get_trust_based_byzantine_threshold(participant_id)
+            if threshold > 0.7:
+                logger.warning(f"High Byzantine risk for {participant_id}: threshold={threshold:.2f}")
         
-        # BIO-INSPIRED: Select aggregation strategy
+        # Select aggregation strategy
         strategy = AggregationStrategy.FED_AVG
-        if self.enable_bio_integration:
-            if self.token_manager and self.federation_token_pool > 100:
-                strategy = AggregationStrategy.TOKEN_WEIGHTED
-            elif self.gradient_manager:
-                strategy = AggregationStrategy.GRADIENT_ALIGNED
+        if self.enable_bio_integration and self.token_manager and self.federation_token_pool > 100:
+            strategy = AggregationStrategy.TOKEN_WEIGHTED
+        elif self.enable_sustainability_scoring:
+            strategy = AggregationStrategy.SUSTAINABILITY_WEIGHTED
         
         # Aggregate updates
         global_model = self._aggregate_updates(updates, strategy)
         
-        # BIO-INSPIRED: Apply regional personalization with local gradients
-        if self.enable_bio_integration and self.enable_personalization:
-            for region, profile in self.regional_profiles.items():
-                if profile.local_carbon_gradient > 0.6:
-                    # High carbon region - more aggressive personalization
-                    personalization_strength = 0.3
-                else:
-                    personalization_strength = 0.1
-        
         # Update global model
         self.global_model = global_model
+        
+        # Update sustainability metrics
+        self.total_carbon_savings_kg += sum(u.carbon_savings for u in updates.values())
+        self.sustainability_score = self._calculate_sustainability_score(
+            updates, carbon_intensity, helium_scarcity
+        )
+        
+        # Update predictive analyzer
+        if self.enable_predictive:
+            self.predictive_analyzer.update_history({
+                'participants': len(selected),
+                'carbon_intensity': carbon_intensity,
+                'helium_scarcity': helium_scarcity,
+                'sustainability_score': self.sustainability_score,
+                'token_pool': self.federation_token_pool
+            })
+            await self.predictive_analyzer.train_forecast_model()
+            forecast = await self.predictive_analyzer.predict_federation_trend()
+        else:
+            forecast = None
         
         # Record round
         round_record = {
@@ -639,81 +939,58 @@ class CrossRegionFederationOptimizer:
             'updates': len(updates),
             'strategy': strategy.value,
             'timestamp': round_start.isoformat(),
-            'bio_integration_active': self.enable_bio_integration,
+            'sustainability_score': self.sustainability_score,
+            'carbon_savings_kg': self.total_carbon_savings_kg,
             'federation_token_pool': self.federation_token_pool,
-            'gradient_levels': self._get_real_gradient_levels() if self.enable_bio_integration else {}
+            'predictive_forecast': {
+                'predicted_score': forecast.predicted_sustainability_score if forecast else None,
+                'confidence': forecast.confidence if forecast else None,
+                'trend': forecast.trend if forecast else None
+            } if self.enable_predictive and forecast else None
         }
         
         self.aggregation_history.append(round_record)
         
         return global_model
     
-    def _get_real_gradient_levels(self) -> Dict[str, float]:
-        """Get all gradient levels"""
-        if self.gradient_manager:
-            return self.gradient_manager.get_field_strengths()
-        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
-    
     async def _select_participants_multi_criteria(
-        self, carbon_zone: int, helium_scarcity: float
+        self, carbon_zone: int, helium_scarcity: float, carbon_intensity: float
     ) -> List[str]:
-        """Select participants with bio-inspired criteria"""
+        """Select participants with enhanced sustainability criteria"""
         scored_participants = []
         
         for participant_id, participant in self.participants.items():
             if not participant.is_active:
                 continue
             
-            data_score = participant._calculate_data_quality() if hasattr(participant, '_calculate_data_quality') else 0.5
+            data_score = 0.5
             carbon_score = 1.0 / (1.0 + participant.carbon_footprint * 100)
             helium_score = 1.0 / (1.0 + participant.helium_usage * 10)
-            network_score = min(participant.capabilities.network_bandwidth_mbps / 1000, 1.0)
-            reliability = 0.8
             
-            # BIO-INSPIRED: Add gradient alignment score
-            gradient_score = 0.5
-            if self.enable_bio_integration and self.gradient_manager:
-                trust = self.gradient_manager.fields.get('trust')
-                if trust:
-                    gradient_score = trust.gradient_strength
+            # Carbon intensity score
+            intensity_score = 1.0 - (carbon_intensity / 800) if carbon_intensity > 0 else 0.5
             
-            # BIO-INSPIRED: Add token balance score
-            token_score = 0.5
-            if self.enable_bio_integration and self.token_manager:
-                account = self.token_manager.get_account_summary(f"federation_{participant_id}")
-                if account:
-                    token_score = min(1.0, account.get('balance', 0) / 500.0)
-            
-            # BIO-INSPIRED: Add compartment health score
-            compartment_score = 0.7
-            if self.enable_bio_integration:
-                compartment_score = self._get_compartment_health_for_region(participant_id)
-            
-            renewable_bonus = 1.5 if participant.capabilities.energy_source_renewable else 1.0
+            # Sustainability contribution
+            sustainability_score = participant.sustainability_contribution if hasattr(participant, 'sustainability_contribution') else 0.5
             
             if carbon_zone >= 8:
                 weights = {'carbon': 0.25, 'helium': 0.10, 'data': 0.15,
-                          'network': 0.10, 'reliability': 0.10, 'gradient': 0.15,
-                          'token': 0.10, 'compartment': 0.05}
+                          'intensity': 0.20, 'sustainability': 0.20, 'reliability': 0.10}
             elif helium_scarcity > 0.7:
                 weights = {'helium': 0.30, 'carbon': 0.10, 'data': 0.15,
-                          'network': 0.10, 'reliability': 0.10, 'gradient': 0.10,
-                          'token': 0.10, 'compartment': 0.05}
+                          'intensity': 0.15, 'sustainability': 0.20, 'reliability': 0.10}
             else:
                 weights = {'data': 0.20, 'carbon': 0.15, 'helium': 0.10,
-                          'network': 0.10, 'reliability': 0.10, 'gradient': 0.15,
-                          'token': 0.10, 'compartment': 0.10}
+                          'intensity': 0.20, 'sustainability': 0.25, 'reliability': 0.10}
             
             score = (
                 weights['data'] * data_score +
                 weights['carbon'] * carbon_score +
                 weights['helium'] * helium_score +
-                weights['network'] * network_score +
-                weights['reliability'] * reliability +
-                weights['gradient'] * gradient_score +
-                weights['token'] * token_score +
-                weights['compartment'] * compartment_score
-            ) * renewable_bonus
+                weights['intensity'] * intensity_score +
+                weights['sustainability'] * sustainability_score +
+                weights['reliability'] * 0.8
+            )
             
             scored_participants.append((participant_id, score))
         
@@ -723,26 +1000,27 @@ class CrossRegionFederationOptimizer:
         
         return selected
     
-    async def _collect_update(self, participant_id: str) -> Optional[AsyncUpdate]:
-        """Collect update with bio-inspired metadata"""
+    async def _collect_update(self, participant_id: str, carbon_intensity: float) -> Optional[AsyncUpdate]:
+        """Collect update with enhanced metadata"""
         if participant_id not in self.participants:
             return None
         
         participant = self.participants[participant_id]
         
-        # Create update with bio-inspired metadata
         update = AsyncUpdate(
             update_id=f"update_{participant_id}_{datetime.utcnow().timestamp()}",
             source_region=Region(participant_id) if participant_id in [r.value for r in Region] else Region.US_EAST,
             model_delta=participant.local_model,
-            compression_ratio=1.0,
+            compression_ratio=0.8,
             timestamp=datetime.utcnow(),
-            carbon_intensity_at_update=300,
+            carbon_intensity_at_update=carbon_intensity,
             training_data_size=1000,
             local_accuracy=0.9,
             vector_clock={},
             signature=hashlib.sha256(f"{participant_id}{datetime.utcnow()}".encode()).hexdigest(),
-            tokens_staked=participant.tokens_staked if hasattr(participant, 'tokens_staked') else 0.0
+            tokens_staked=participant.tokens_staked if hasattr(participant, 'tokens_staked') else 0.0,
+            carbon_savings=participant.carbon_footprint * 0.01,
+            sustainability_impact=participant.sustainability_contribution if hasattr(participant, 'sustainability_contribution') else 0.5
         )
         
         return update
@@ -750,16 +1028,18 @@ class CrossRegionFederationOptimizer:
     def _aggregate_updates(
         self, updates: Dict[str, AsyncUpdate], strategy: AggregationStrategy
     ) -> Dict[str, Any]:
-        """Aggregate updates with bio-inspired weighting"""
+        """Aggregate updates with enhanced strategies"""
         if not updates:
             return {}
         
+        update_list = [u.model_delta for u in updates.values()]
+        
         if strategy == AggregationStrategy.TOKEN_WEIGHTED:
             return self._token_weighted_aggregate(updates)
-        elif strategy == AggregationStrategy.GRADIENT_ALIGNED:
-            return self._gradient_aligned_aggregate(updates)
+        elif strategy == AggregationStrategy.SUSTAINABILITY_WEIGHTED:
+            return self._sustainability_weighted_aggregate(updates)
         else:
-            return self._federated_averaging(updates)
+            return self.federated_learner.aggregate_models(update_list, strategy)
     
     def _token_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
         """Aggregate updates weighted by token stake"""
@@ -767,107 +1047,116 @@ class CrossRegionFederationOptimizer:
         total_tokens = sum(u.tokens_staked for u in updates.values())
         
         if total_tokens == 0:
-            return self._federated_averaging(updates)
+            return self.federated_learner._fed_avg_aggregate([u.model_delta for u in updates.values()])
         
         for key in next(iter(updates.values())).model_delta.keys():
-            weighted_sum = None
+            weighted_sum = 0.0
             for update in updates.values():
                 if key in update.model_delta:
                     weight = update.tokens_staked / total_tokens
-                    if weighted_sum is None:
-                        weighted_sum = update.model_delta[key] * weight
-                    else:
-                        weighted_sum += update.model_delta[key] * weight
-            if weighted_sum is not None:
-                aggregated[key] = weighted_sum
+                    weighted_sum += update.model_delta[key] * weight
+            aggregated[key] = weighted_sum
         
         return aggregated
     
-    def _gradient_aligned_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
-        """Aggregate updates weighted by gradient alignment"""
+    def _sustainability_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
+        """Aggregate updates weighted by sustainability impact"""
         aggregated = {}
-        total_alignment = sum(u.gradient_level_at_update for u in updates.values())
+        total_sustainability = sum(u.sustainability_impact for u in updates.values())
         
-        if total_alignment == 0:
-            return self._federated_averaging(updates)
+        if total_sustainability == 0:
+            return self.federated_learner._fed_avg_aggregate([u.model_delta for u in updates.values()])
         
         for key in next(iter(updates.values())).model_delta.keys():
-            weighted_sum = None
+            weighted_sum = 0.0
             for update in updates.values():
                 if key in update.model_delta:
-                    weight = update.gradient_level_at_update / total_alignment
-                    if weighted_sum is None:
-                        weighted_sum = update.model_delta[key] * weight
-                    else:
-                        weighted_sum += update.model_delta[key] * weight
-            if weighted_sum is not None:
-                aggregated[key] = weighted_sum
+                    weight = update.sustainability_impact / total_sustainability
+                    weighted_sum += update.model_delta[key] * weight
+            aggregated[key] = weighted_sum
         
         return aggregated
     
-    def _federated_averaging(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
-        """Standard federated averaging"""
-        aggregated = {}
-        n = len(updates)
+    def _calculate_sustainability_score(
+        self, updates: Dict[str, AsyncUpdate], carbon_intensity: float, helium_scarcity: float
+    ) -> float:
+        """Calculate sustainability score for the federation"""
+        if not updates:
+            return 0.0
         
-        for key in next(iter(updates.values())).model_delta.keys():
-            values = [u.model_delta[key] for u in updates.values() if key in u.model_delta]
-            if values:
-                if isinstance(values[0], np.ndarray):
-                    aggregated[key] = np.mean(values, axis=0)
-                else:
-                    aggregated[key] = sum(values) / n
+        avg_carbon_savings = np.mean([u.carbon_savings for u in updates.values()])
+        avg_sustainability = np.mean([u.sustainability_impact for u in updates.values()])
         
-        return aggregated
+        carbon_factor = 1.0 - (carbon_intensity / 800)
+        helium_factor = 1.0 - helium_scarcity
+        
+        score = (
+            avg_carbon_savings * 0.3 +
+            avg_sustainability * 0.3 +
+            carbon_factor * 0.2 +
+            helium_factor * 0.2
+        )
+        
+        return min(1.0, max(0.0, score))
     
     # ========================================================================
     # Enhanced Statistics
     # ========================================================================
     
     def get_federation_stats(self) -> Dict[str, Any]:
-        """Get comprehensive federation statistics with bio-inspired data"""
+        """Get comprehensive federation statistics"""
         stats = {
             'total_participants': len(self.participants),
             'total_rounds': len(self.aggregation_history),
             'bio_integration_active': self.enable_bio_integration,
-            'bio_modules_available': BIO_INSPIRED_AVAILABLE,
+            'federated_reflexive_active': self.enable_federated_reflexive,
+            'carbon_intensity_active': self.enable_carbon_intensity,
+            'predictive_active': self.enable_predictive,
+            'cross_domain_active': self.enable_cross_domain,
+            'sustainability_scoring_active': self.enable_sustainability_scoring,
             'federation_token_pool': self.federation_token_pool,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'sustainability_score': self.sustainability_score,
             'recent_rounds': self.aggregation_history[-5:] if self.aggregation_history else []
         }
         
         if self.enable_bio_integration:
-            stats['gradient_levels'] = self._get_real_gradient_levels()
+            stats['gradient_levels'] = self._get_real_gradient_levels() if hasattr(self, '_get_real_gradient_levels') else {}
             stats['harvester_quality'] = self._get_harvester_signal_quality()
-            
-            # Regional bio stats
-            stats['regional_bio_stats'] = {
-                region.value: {
-                    'carbon_gradient': profile.local_carbon_gradient,
-                    'trust_gradient': profile.local_trust_gradient,
-                    'token_balance': profile.token_balance,
-                    'compartment_count': profile.compartment_count,
-                    'harvester_vitality': profile.harvester_vitality
-                }
-                for region, profile in self.regional_profiles.items()
-            }
+        
+        if self.enable_federated_reflexive:
+            stats['federated_stats'] = self.federated_learner.get_federated_stats()
+        
+        if self.enable_predictive:
+            stats['predictive_summary'] = self.predictive_analyzer.get_sustainability_summary()
+        
+        if self.enable_cross_domain:
+            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
         
         return stats
     
+    def _get_real_gradient_levels(self) -> Dict[str, float]:
+        """Get gradient levels from bio-inspired system"""
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+    
     def get_regional_profile(self, region: Region) -> Optional[Dict[str, Any]]:
-        """Get regional profile with bio-inspired data"""
+        """Get regional profile with enhanced data"""
         if region not in self.regional_profiles:
             return None
         
         profile = self.regional_profiles[region]
         return {
             'region': region.value,
-            'timezone': profile.timezone_offset,
             'carbon_gradient': profile.local_carbon_gradient,
             'trust_gradient': profile.local_trust_gradient,
             'token_balance': profile.token_balance,
             'compartment_count': profile.compartment_count,
             'harvester_vitality': profile.harvester_vitality,
-            'renewable_mix': profile.renewable_mix
+            'sustainability_score': profile.sustainability_score,
+            'carbon_savings_kg': profile.carbon_savings_kg,
+            'helium_savings_l': profile.helium_savings_l
         }
     
     def register_participant(
@@ -876,9 +1165,10 @@ class CrossRegionFederationOptimizer:
         initial_model: Dict[str, Any],
         capabilities: ClientCapabilities,
         carbon_footprint: float,
-        helium_usage: float
+        helium_usage: float,
+        sustainability_contribution: float = 0.5
     ) -> bool:
-        """Register federation participant with bio-inspired tracking"""
+        """Register federation participant with enhanced tracking"""
         if participant_id in self.participants:
             logger.warning(f"Participant {participant_id} already registered")
             return False
@@ -889,24 +1179,54 @@ class CrossRegionFederationOptimizer:
             data_distribution={},
             capabilities=capabilities,
             carbon_footprint=carbon_footprint,
-            helium_usage=helium_usage
+            helium_usage=helium_usage,
+            sustainability_contribution=sustainability_contribution
         )
         
-        # BIO-INSPIRED: Create token account for participant
-        if self.enable_bio_integration and self.token_manager:
-            self.token_manager.create_account(f"federation_{participant_id}")
-            # Initial token endowment
-            self.token_manager.generate_tokens(
-                account_id=f"federation_{participant_id}",
-                source=EcoATPSource.EFFICIENCY_GAIN,
-                energy_saved_kwh=0.001,
-                num_tokens=10
+        # Register with federated learner
+        if self.enable_federated_reflexive:
+            asyncio.create_task(
+                self.federated_learner.register_participant(participant_id, initial_model)
             )
         
         self.participants[participant_id] = participant
         
         logger.info(f"Registered federation participant: {participant_id}")
         return True
+    
+    def get_sustainability_report(self) -> Dict[str, Any]:
+        """Generate comprehensive sustainability report"""
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'total_helium_savings_l': self.total_helium_savings_l,
+            'federation_token_pool': self.federation_token_pool,
+            'participant_count': len(self.participants),
+            'round_count': self.round_number,
+            'bio_integration_active': self.enable_bio_integration,
+            'predictive_forecast': self.predictive_analyzer.get_sustainability_summary() if self.enable_predictive else {},
+            'recommendations': self._generate_sustainability_recommendations()
+        }
+    
+    def _generate_sustainability_recommendations(self) -> List[str]:
+        """Generate sustainability recommendations"""
+        recommendations = []
+        
+        if self.sustainability_score < 0.5:
+            recommendations.append("Increase federated participation for better sustainability")
+            recommendations.append("Optimize carbon-aware scheduling")
+        
+        if self.total_carbon_savings_kg < 10:
+            recommendations.append("Implement more aggressive carbon reduction strategies")
+        
+        if self.federation_token_pool < 50:
+            recommendations.append("Boost token staking incentives")
+        
+        if self.enable_bio_integration and self._get_harvester_signal_quality() < 0.4:
+            recommendations.append("Improve harvester signal quality for better drift detection")
+        
+        return recommendations or ["Federation sustainability is on track"]
     
     def optimize_federation_round(
         self,
@@ -923,8 +1243,8 @@ class CrossRegionFederationOptimizer:
             'metrics': {}
         }
         
-        # BIO-INSPIRED: Gradient-aligned scheduling
-        if self.enable_bio_integration and self.enable_gradient_scheduling:
+        # Gradient-aligned scheduling
+        if self.enable_bio_integration:
             schedule_delays = {}
             for region in regions:
                 delay = self._get_gradient_aligned_schedule(region)
@@ -932,19 +1252,18 @@ class CrossRegionFederationOptimizer:
             result['gradient_schedule'] = schedule_delays
             result['optimizations_applied'].append('gradient_scheduling')
         
-        # BIO-INSPIRED: Token staking for updates
-        if self.enable_bio_integration and self.enable_token_staking:
-            total_staked = 0.0
-            for region in regions:
-                success, staked = self._stake_tokens_for_update(region.value, 10.0)
-                if success:
-                    total_staked += staked
-            result['tokens_staked'] = total_staked
-            if total_staked > 0:
-                result['optimizations_applied'].append('token_staking')
+        # Token staking
+        total_staked = 0.0
+        for region in regions:
+            success, staked = self._stake_tokens_for_update(region.value, 10.0)
+            if success:
+                total_staked += staked
+        result['tokens_staked'] = total_staked
+        if total_staked > 0:
+            result['optimizations_applied'].append('token_staking')
         
-        # BIO-INSPIRED: Compartment tier mapping
-        if self.enable_bio_integration and self.enable_compartment_tiers:
+        # Compartment tier mapping
+        if self.enable_bio_integration:
             tier_mapping = {}
             for region in regions:
                 tier = self._get_compartment_tier(region.value)
@@ -952,4 +1271,42 @@ class CrossRegionFederationOptimizer:
             result['compartment_tiers'] = tier_mapping
             result['optimizations_applied'].append('compartment_tiers')
         
+        # Cross-domain knowledge transfer
+        if self.enable_cross_domain:
+            for region in regions:
+                self.cross_domain_transfer.transfer_knowledge(
+                    'federation', 'energy',
+                    'scheduling_patterns',
+                    {'region': region.value, 'carbon_intensity': 300}
+                )
+            result['optimizations_applied'].append('cross_domain_transfer')
+        
+        # Predictive sustainability
+        if self.enable_predictive:
+            asyncio.create_task(self.predictive_analyzer.train_forecast_model())
+            result['optimizations_applied'].append('predictive_sustainability')
+        
+        # Federated reflexive learning
+        if self.enable_federated_reflexive:
+            if self.global_model:
+                asyncio.create_task(
+                    self.federated_learner.send_local_update(
+                        'federation_global', global_model
+                    )
+                )
+            result['optimizations_applied'].append('federated_reflexive')
+        
+        result['optimization_count'] = len(result['optimizations_applied'])
+        
         return result
+    
+    # ========================================================================
+    # Async Shutdown
+    # ========================================================================
+    
+    async def shutdown(self):
+        """Graceful shutdown of all components"""
+        logger.info("Shutting down Cross-Region Federation Optimizer")
+        await self.federated_learner.close()
+        await self.carbon_manager.close()
+        logger.info("Cross-Region Federation Optimizer shutdown complete")
