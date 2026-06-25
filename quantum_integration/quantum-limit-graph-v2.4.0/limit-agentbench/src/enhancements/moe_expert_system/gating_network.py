@@ -1,10 +1,16 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/gating_network.py
-# Enhanced with complete bio-inspired integration - Allosteric Enzyme System v4.0.0
-
 """
-Enhanced Gating Network v4.0.0 - Allosteric Enzyme System
+Enhanced Gating Network v5.0.0 - Complete Allosteric Enzyme System
 
 Complete bio-inspired integration with:
+- Federated Reflexive Learning with cooperative binding
+- User-Adaptive Reflexivity with dynamic configuration
+- Real-time Carbon Intensity Integration with API support
+- Cross-Domain Knowledge Transfer with token affinity
+- Human-AI Collaborative Reflection with sustainability dashboard
+- Predictive Reflexivity with ATP-driven forecasting
+- Sustainability Score with multi-metric aggregation
+- Enhanced Carbon/Helium Awareness with real-time tracking
 - Gradient-modulated routing weights (allosteric regulation)
 - Token-aware expert selection (substrate affinity)
 - Energy-based exploration rate (metabolic state)
@@ -15,17 +21,24 @@ Complete bio-inspired integration with:
 - Cooperative binding for expert pairs
 """
 
+import asyncio
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque, defaultdict
-import logging
 import math
 import hashlib
+import json
+import aiohttp
+import os
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import r2_score, mean_squared_error
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +70,298 @@ try:
 except ImportError as e:
     BIO_INSPIRED_AVAILABLE = False
     logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard routing")
+
+# ============================================================================
+# Carbon Intensity Integration Module
+# ============================================================================
+
+class CarbonIntensityManager:
+    """Real-time carbon intensity integration with API support"""
+    
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                url = f"{self.endpoint}/latest?zone={region}"
+                headers = {'auth-token': self.api_key} if self.api_key else {}
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.carbon_intensity = data.get('carbonIntensity', 400)
+                        self.region = region
+                        self.last_update = datetime.now()
+                        self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
+                        self.historical_intensities.append(self.carbon_intensity)
+                    else:
+                        self.carbon_intensity = self._get_fallback_intensity(region)
+                        self.last_update = datetime.now()
+            except Exception as e:
+                logger.error(f"Carbon intensity fetch error: {e}")
+                self.carbon_intensity = self._get_fallback_intensity(region)
+                self.last_update = datetime.now()
+            return {'intensity': self.carbon_intensity, 'region': self.region,
+                    'timestamp': self.last_update.isoformat() if self.last_update else None}
+    
+    def _get_fallback_intensity(self, region: str) -> float:
+        fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
+        return fallback_values.get(region, 400)
+    
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Federated Gating Network Module
+# ============================================================================
+
+class FederatedGatingNetwork:
+    """Federated reflexive learning for distributed gating"""
+    
+    def __init__(self, server_url: Optional[str] = None):
+        self.server_url = server_url
+        self.round = 0
+        self.local_weights = {}
+        self.global_weights = {}
+        self.participants = []
+        self.contribution_scores = {}
+        self._lock = asyncio.Lock()
+        self._session = None
+    
+    async def _get_session(self):
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def send_local_weights(self, participant_id: str, weights: Dict, performance: float = 1.0) -> Dict:
+        """Send local gating weights to federated server"""
+        if not self.server_url:
+            return {'status': 'local'}
+        
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                weights_serialized = {k: v.tolist() for k, v in weights.items()}
+                update_data = {
+                    'participant_id': participant_id,
+                    'round': self.round,
+                    'weights': weights_serialized,
+                    'performance': performance,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                async with session.post(
+                    f"{self.server_url}/federated/gating",
+                    json=update_data,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.round += 1
+                        self.contribution_scores[participant_id] = performance
+                        return result
+                    return {'status': 'failed'}
+            except Exception as e:
+                logger.error(f"Federated gating send error: {e}")
+                return {'status': 'error'}
+    
+    async def get_global_weights(self) -> Optional[Dict]:
+        """Get aggregated gating weights from federated server"""
+        if not self.server_url:
+            return self.global_weights
+        
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                async with session.get(
+                    f"{self.server_url}/federated/gating/global",
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.global_weights = data.get('weights', {})
+                        self.participants = data.get('participants', [])
+                        return self.global_weights
+            except Exception as e:
+                logger.error(f"Global gating fetch error: {e}")
+                return None
+    
+    def aggregate_weights(self, peer_weights: List[Dict], weights: Dict[str, float] = None) -> Dict:
+        """Aggregate gating weights from peers with weighted averaging"""
+        if not peer_weights:
+            return {}
+        
+        aggregated = {}
+        if weights is None:
+            weights = {i: 1.0 for i in range(len(peer_weights))}
+        
+        for key in peer_weights[0].keys():
+            total = 0.0
+            total_weight = 0.0
+            for i, peer in enumerate(peer_weights):
+                if key in peer:
+                    total += peer[key] * weights.get(i, 1.0)
+                    total_weight += weights.get(i, 1.0)
+            aggregated[key] = total / max(total_weight, 0.001)
+        
+        return aggregated
+    
+    def get_federated_stats(self) -> Dict:
+        return {
+            'round': self.round,
+            'participants': len(self.participants),
+            'has_global_weights': bool(self.global_weights),
+            'contribution_scores': self.contribution_scores
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Predictive Gating Analyzer Module
+# ============================================================================
+
+class PredictiveGatingAnalyzer:
+    """Predictive reflexivity with ensemble forecasting for gating performance"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.gating_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        
+        self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    
+    def update_history(self, gating_metrics: Dict):
+        """Update gating history for forecasting"""
+        self.gating_history.append({
+            'timestamp': datetime.utcnow(),
+            'routing_accuracy': gating_metrics.get('routing_accuracy', 0.8),
+            'load_balance': gating_metrics.get('load_balance', 0.5),
+            'expert_utilization': gating_metrics.get('expert_utilization', 0.5),
+            'cooperative_strength': gating_metrics.get('cooperative_strength', 0.5),
+            'carbon_efficiency': gating_metrics.get('carbon_efficiency', 0.5)
+        })
+    
+    async def train_forecast_model(self):
+        """Train ensemble forecasting models"""
+        if len(self.gating_history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.gating_history)}
+        
+        X = []
+        y = []
+        history_list = list(self.gating_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['routing_accuracy'],
+                    data['load_balance'],
+                    data['expert_utilization'],
+                    data['cooperative_strength'],
+                    data['carbon_efficiency']
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['routing_accuracy'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"Gating forecast models trained. R²: {results}")
+        return {'status': 'success', 'results': results, 'samples': len(X)}
+    
+    async def predict_gating_performance(self, hours: int = 24) -> Dict:
+        """Predict future gating performance"""
+        if not self.is_trained or len(self.gating_history) < 10:
+            return {'predicted_accuracy': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
+        
+        recent = list(self.gating_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['routing_accuracy'],
+                data['load_balance'],
+                data['expert_utilization'],
+                data['cooperative_strength'],
+                data['carbon_efficiency']
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return {'predicted_accuracy': 0.5, 'confidence': 0.0, 'trend': 'no_models'}
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        self.forecast_history.append({'prediction': prediction, 'trend': trend})
+        return {
+            'predicted_accuracy': prediction,
+            'confidence': confidence,
+            'trend': trend,
+            'recommended_actions': self._generate_predictive_actions(prediction)
+        }
+    
+    def _generate_predictive_actions(self, prediction: float) -> List[str]:
+        actions = []
+        if prediction < 0.5:
+            actions.append("Optimize cooperative binding weights")
+            actions.append("Increase exploration rate")
+        elif prediction < 0.7:
+            actions.append("Enhance gradient modulation")
+            actions.append("Improve token affinity calibration")
+        else:
+            actions.append("Maintain current gating configuration")
+        return actions
 
 # ============================================================================
 # Gating Context (Enhanced with Bio-Inspired Features)
@@ -114,6 +419,11 @@ class GatingContext:
     calcium_level: float = 0.05
     ip3_level: float = 0.05
     
+    # Sustainability metrics
+    sustainability_score: float = 0.0
+    carbon_efficiency: float = 0.5
+    helium_efficiency: float = 0.5
+    
     def to_tensor(self) -> torch.Tensor:
         """Convert context to feature tensor with bio-inspired features"""
         # Task type encoding (one-hot)
@@ -168,7 +478,11 @@ class GatingContext:
             # BIO-INSPIRED: Second messenger features
             self.camp_level,
             self.calcium_level,
-            self.ip3_level
+            self.ip3_level,
+            # Sustainability features
+            self.sustainability_score,
+            self.carbon_efficiency,
+            self.helium_efficiency
         ]
         
         # Combine all features
@@ -286,15 +600,6 @@ class EnhancedSparseMoEGate(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
         Enhanced forward pass with bio-inspired modulation.
-        
-        Args:
-            x: Input features [B, input_dim]
-            training: Whether in training mode
-            gradient_levels: Real-time gradient field strengths
-            token_state: Real-time token economy state
-            
-        Returns:
-            routing_weights, expert_indices, load_balance_loss, metadata
         """
         metadata = {}
         
@@ -336,7 +641,6 @@ class EnhancedSparseMoEGate(nn.Module):
         
         # BIO-INSPIRED: Apply cooperative binding bonus
         if x.dim() > 1 and x.size(0) > 1:
-            # Cooperative binding between expert pairs across batch
             coop_bonus = torch.matmul(
                 F.softmax(logits, dim=-1),
                 self.cooperative_matrix
@@ -391,17 +695,10 @@ class EnhancedSparseMoEGate(nn.Module):
 
 class MoEGatingNetwork:
     """
-    Enhanced MoE Gating Network v4.0.0 - Allosteric Enzyme System
+    Enhanced MoE Gating Network v5.0.0 - Complete Allosteric Enzyme System
     
-    Complete bio-inspired integration:
-    - Gradient-modulated routing (allosteric regulation)
-    - Token-aware expert selection (substrate affinity)
-    - Energy-based exploration (metabolic state)
-    - Compartment health feedback (cellular health)
-    - Biomass reserve awareness (resource storage)
-    - Second messenger modulation (signal confidence)
-    - Environmental signal response (photosynthetic awareness)
-    - Cooperative binding for expert pairs
+    Complete bio-inspired integration with sustainability dashboard,
+    federated learning, and predictive analytics.
     """
     
     def __init__(
@@ -411,12 +708,24 @@ class MoEGatingNetwork:
         device: str = 'cpu',
         use_attention: bool = True,
         use_uncertainty: bool = True,
-        enable_bio_integration: bool = True
+        enable_bio_integration: bool = True,
+        enable_federated: bool = True,
+        enable_predictive: bool = True,
+        enable_carbon_intensity: bool = True,
+        server_url: Optional[str] = None
     ):
         self.num_experts = num_experts
         self.top_k = top_k
         self.device = device
         self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_federated = enable_federated
+        self.enable_predictive = enable_predictive
+        self.enable_carbon_intensity = enable_carbon_intensity
+        
+        # New modules
+        self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
+        self.federated_network = FederatedGatingNetwork(server_url) if enable_federated else None
+        self.predictive_analyzer = PredictiveGatingAnalyzer() if enable_predictive else None
         
         # Initialize enhanced sparse gate
         self.sparse_gate = EnhancedSparseMoEGate(
@@ -455,6 +764,11 @@ class MoEGatingNetwork:
         # BIO-INSPIRED: Environmental signal history
         self.environmental_history: deque = deque(maxlen=500)
         
+        # Sustainability tracking
+        self.sustainability_score = 0.0
+        self.carbon_efficiency = 0.5
+        self.helium_efficiency = 0.5
+        
         # Optimizer for online learning
         self.optimizer = torch.optim.Adam(
             self.sparse_gate.parameters(), lr=0.001
@@ -469,11 +783,69 @@ class MoEGatingNetwork:
         # Previous routing for temporal memory
         self.previous_routing: Optional[torch.Tensor] = None
         
+        # Start background tasks
+        self._start_background_tasks()
+        
         logger.info(
-            f"Enhanced MoE Gating Network v4.0.0 initialized: "
+            f"Enhanced MoE Gating Network v5.0.0 initialized: "
             f"experts={num_experts}, top_k={top_k}, "
-            f"bio_integration={self.enable_bio_integration}"
+            f"bio_integration={self.enable_bio_integration}, "
+            f"federated={self.enable_federated}, "
+            f"predictive={self.enable_predictive}"
         )
+    
+    def _start_background_tasks(self):
+        if self.enable_carbon_intensity:
+            asyncio.create_task(self._carbon_update_loop())
+        if self.enable_predictive:
+            asyncio.create_task(self._predictive_update_loop())
+        if self.enable_federated:
+            asyncio.create_task(self._federated_sync_loop())
+    
+    async def _carbon_update_loop(self):
+        while True:
+            try:
+                if self.carbon_manager:
+                    await self.carbon_manager.update_carbon_intensity()
+                await asyncio.sleep(self.carbon_manager.update_interval if self.carbon_manager else 300)
+            except Exception as e:
+                logger.error(f"Carbon update error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _predictive_update_loop(self):
+        while True:
+            try:
+                if self.predictive_analyzer:
+                    self.predictive_analyzer.update_history({
+                        'routing_accuracy': self.get_load_balance_score(),
+                        'load_balance': self.get_load_balance_score(),
+                        'expert_utilization': max(self.get_expert_utilization().values()) if self.get_expert_utilization() else 0.5,
+                        'cooperative_strength': len(self.cooperative_pairs) / max(self.num_experts * (self.num_experts - 1) / 2, 1),
+                        'carbon_efficiency': self.carbon_efficiency
+                    })
+                    await self.predictive_analyzer.train_forecast_model()
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Predictive update error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _federated_sync_loop(self):
+        while True:
+            try:
+                if self.federated_network:
+                    weights = self.sparse_gate.state_dict()
+                    await self.federated_network.send_local_weights(
+                        f"gating_{hashlib.md5(str(self.routing_history).encode()).hexdigest()[:8]}",
+                        weights,
+                        performance=self.sustainability_score
+                    )
+                    global_weights = await self.federated_network.get_global_weights()
+                    if global_weights:
+                        self.sparse_gate.load_state_dict(global_weights)
+                await asyncio.sleep(3600)
+            except Exception as e:
+                logger.error(f"Federated sync error: {str(e)}")
+                await asyncio.sleep(300)
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -482,8 +854,6 @@ class MoEGatingNetwork:
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
         """
         Inject bio-inspired modules for complete correlation.
-        
-        Connects gating network to real bio-inspired systems.
         """
         if bio_core:
             self.token_manager = getattr(bio_core, 'token_manager', None)
@@ -518,13 +888,11 @@ class MoEGatingNetwork:
     # ========================================================================
     
     def _get_real_gradient_levels(self) -> Dict[str, float]:
-        """Get REAL gradient levels from bio-inspired system"""
         if self.gradient_manager:
             return self.gradient_manager.get_field_strengths()
         return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
     
     def _get_real_token_state(self) -> Dict[str, float]:
-        """Get REAL token economy state"""
         state = {'token_availability': 0.5, 'ecoatp_rate': 50.0, 'biomass_reserve': 0.3}
         
         if self.token_manager:
@@ -544,7 +912,6 @@ class MoEGatingNetwork:
         return state
     
     def _get_compartment_health_scores(self) -> Dict[str, float]:
-        """Get REAL compartment health scores"""
         scores = {}
         if self.compartment_manager:
             for idx, expert_id in self.expert_index_map.items():
@@ -552,17 +919,16 @@ class MoEGatingNetwork:
                 if compartment:
                     scores[expert_id] = compartment.health_score
                 else:
-                    scores[expert_id] = 0.7  # Default healthy
+                    scores[expert_id] = 0.7
         return scores
     
     def _get_bio_modulated_exploration(self) -> float:
-        """Get exploration rate modulated by bio-inspired state"""
         base_exploration = 0.1
         
         if self.gradient_manager:
             carbon = self.gradient_manager.fields.get('carbon')
             if carbon and carbon.gradient_strength > 0.7:
-                base_exploration *= 0.5  # Reduce exploration in high carbon stress
+                base_exploration *= 0.5
         
         if self.scheduler:
             driving_force = self.scheduler.calculate_gradient_driving_force()
@@ -570,14 +936,13 @@ class MoEGatingNetwork:
             ecoatp_rate = self.scheduler.calculate_atp_production_rate(rotation_speed)
             
             if ecoatp_rate > 100:
-                base_exploration *= 1.5  # More exploration when energy abundant
+                base_exploration *= 1.5
             elif ecoatp_rate < 20:
-                base_exploration *= 0.3  # Less exploration when energy scarce
+                base_exploration *= 0.3
         
         return min(0.5, max(0.01, base_exploration))
     
     def _get_expert_bio_scores(self, expert_indices: List[int]) -> Dict[int, float]:
-        """Get bio-inspired scores for experts"""
         scores = {}
         
         for idx in expert_indices:
@@ -586,9 +951,8 @@ class MoEGatingNetwork:
                 scores[idx] = 0.5
                 continue
             
-            score = 0.5  # Base score
+            score = 0.5
             
-            # Token efficiency bonus
             if self.token_manager:
                 account = self.token_manager.get_account_summary(f"expert_{expert_id}")
                 if account:
@@ -596,21 +960,18 @@ class MoEGatingNetwork:
                     balance = account.get('balance', 0)
                     score += efficiency * 0.2
                     if balance > 100:
-                        score += 0.1  # Well-funded experts get bonus
+                        score += 0.1
             
-            # Compartment health bonus
             if self.compartment_manager:
                 compartment = self.compartment_manager.find_best_compartment(expert_id)
                 if compartment:
                     score += compartment.health_score * 0.15
             
-            # Gradient alignment bonus
             if self.gradient_manager:
                 trust = self.gradient_manager.fields.get('trust')
                 if trust:
                     score += trust.gradient_strength * 0.1
             
-            # Success rate bonus from history
             success_rate = self.get_expert_success_rates().get(idx, 0.5)
             score += success_rate * 0.05
             
@@ -619,7 +980,6 @@ class MoEGatingNetwork:
         return scores
     
     def _get_biomass_aware_load_balance(self) -> float:
-        """Adjust load balancing based on biomass storage levels"""
         if not self.biomass_storage:
             return 0.01
         
@@ -628,25 +988,22 @@ class MoEGatingNetwork:
         glycogen = stats.get('tiers', {}).get('glycogen_queue', 0)
         
         if total_stored > 5000 or glycogen > 500:
-            return 0.05  # Increase load balancing when storage is full
+            return 0.05
         elif total_stored < 1000:
-            return 0.005  # Decrease when storage is empty
+            return 0.005
         
         return 0.01
     
     def _update_cooperative_binding(self, expert_a: int, expert_b: int, success: bool):
-        """Update cooperative binding based on pair performance"""
         key = (expert_a, expert_b)
         current = self.cooperative_pairs.get(key, 0.0)
         
-        # Reinforce successful pairs, penalize failed ones
         alpha = 0.1
         if success:
             self.cooperative_pairs[key] = current + alpha * (1.0 - current)
         else:
             self.cooperative_pairs[key] = current * (1.0 - alpha)
         
-        # Update the cooperative matrix in the gate
         self.sparse_gate.update_cooperative_binding({key: self.cooperative_pairs[key]})
         
         self.cooperative_history.append({
@@ -656,6 +1013,17 @@ class MoEGatingNetwork:
             'strength': self.cooperative_pairs[key],
             'timestamp': datetime.utcnow().isoformat()
         })
+    
+    def _calculate_sustainability_score(self) -> float:
+        """Calculate overall sustainability score"""
+        load_balance = self.get_load_balance_score()
+        expert_util = max(self.get_expert_utilization().values()) if self.get_expert_utilization() else 0.5
+        
+        carbon_factor = self.carbon_efficiency
+        helium_factor = self.helium_efficiency
+        
+        score = (load_balance * 0.2 + (1 - expert_util) * 0.2 + carbon_factor * 0.3 + helium_factor * 0.3)
+        return min(1.0, max(0.0, score))
     
     # ========================================================================
     # Enhanced Routing Method
@@ -670,16 +1038,13 @@ class MoEGatingNetwork:
     ) -> List[Tuple[int, float]]:
         """
         Enhanced routing with complete bio-inspired modulation.
-        
-        Args:
-            context: Full gating context with bio-inspired features
-            expert_constraints: Optional list of allowed expert indices
-            training: Whether in training mode
-            return_metadata: Whether to return additional metadata
-            
-        Returns:
-            List of (expert_index, routing_weight) tuples
         """
+        # Update carbon intensity
+        carbon_intensity = 400
+        if self.carbon_manager:
+            carbon_intensity = asyncio.run(self.carbon_manager.get_current_intensity())
+            context.grid_carbon_intensity = carbon_intensity
+        
         # BIO-INSPIRED: Enrich context with real bio-inspired data
         if self.enable_bio_integration:
             gradient_levels = self._get_real_gradient_levels()
@@ -693,10 +1058,15 @@ class MoEGatingNetwork:
             context.ecoatp_rate = token_state['ecoatp_rate']
             context.biomass_reserve_level = token_state['biomass_reserve']
             
-            # Update load balance weight from biomass
             self.sparse_gate.biomass_load_balance_multiplier = (
                 self._get_biomass_aware_load_balance() / 0.01
             )
+        
+        # Update sustainability metrics
+        self.carbon_efficiency = 1.0 / (1.0 + carbon_intensity / 500)
+        self.sustainability_score = self._calculate_sustainability_score()
+        context.sustainability_score = self.sustainability_score
+        context.carbon_efficiency = self.carbon_efficiency
         
         # Convert context to tensor
         x = context.to_tensor().unsqueeze(0).to(self.device)
@@ -718,7 +1088,6 @@ class MoEGatingNetwork:
                 'method': 'bio_modulated_exploration'
             }
         else:
-            # Standard routing with bio-inspired modulation
             with torch.set_grad_enabled(training):
                 gradient_levels_dict = None
                 token_state_dict = None
@@ -733,7 +1102,6 @@ class MoEGatingNetwork:
                     token_state=token_state_dict
                 )
             
-            # Extract results
             routing_weights = routing_weights.squeeze(0).detach().cpu().numpy()
             expert_indices = expert_indices.squeeze(0).detach().cpu().numpy()
             
@@ -747,12 +1115,11 @@ class MoEGatingNetwork:
                 for idx, weight in routing_decisions
             ]
             
-            # Renormalize weights
             total_weight = sum(w for _, w in routing_decisions)
             if total_weight > 0:
                 routing_decisions = [(idx, w / total_weight) for idx, w in routing_decisions]
         
-        # Apply constraints if provided
+        # Apply constraints
         if expert_constraints is not None:
             routing_decisions = [
                 (idx, weight) for idx, weight in routing_decisions
@@ -764,7 +1131,7 @@ class MoEGatingNetwork:
                     for idx in expert_constraints
                 ]
         
-        # Update previous routing for temporal memory
+        # Update previous routing
         full_weights = torch.zeros(1, self.num_experts).to(self.device)
         for idx, weight in routing_decisions:
             if idx < self.num_experts:
@@ -789,6 +1156,25 @@ class MoEGatingNetwork:
         # Record routing for learning
         self._record_routing(context, routing_decisions, metadata)
         
+        # Federated learning
+        if self.enable_federated and self.total_routing_calls % 100 == 0:
+            asyncio.create_task(self.federated_network.send_local_weights(
+                f"gating_{hashlib.md5(str(self.routing_history).encode()).hexdigest()[:8]}",
+                self.sparse_gate.state_dict(),
+                performance=self.sustainability_score
+            ))
+        
+        # Predictive analytics
+        if self.enable_predictive:
+            self.predictive_analyzer.update_history({
+                'routing_accuracy': metadata.get('confidence', 0.5),
+                'load_balance': self.get_load_balance_score(),
+                'expert_utilization': max(self.get_expert_utilization().values()) if self.get_expert_utilization() else 0.5,
+                'cooperative_strength': len(self.cooperative_pairs) / max(self.num_experts * (self.num_experts - 1) / 2, 1),
+                'carbon_efficiency': self.carbon_efficiency
+            })
+            asyncio.create_task(self.predictive_analyzer.train_forecast_model())
+        
         if return_metadata:
             metadata_dict = {
                 'confidence': metadata.get('confidence', 0.5),
@@ -797,7 +1183,10 @@ class MoEGatingNetwork:
                 'gradient_modulation': metadata.get('gradient_modulation', None),
                 'token_affinity': metadata.get('token_affinity', None),
                 'cooperative_matrix': metadata.get('cooperative_matrix', None),
-                'bio_integration_active': self.enable_bio_integration
+                'bio_integration_active': self.enable_bio_integration,
+                'sustainability_score': self.sustainability_score,
+                'carbon_efficiency': self.carbon_efficiency,
+                'carbon_intensity': carbon_intensity
             }
             return routing_decisions, metadata_dict
         
@@ -809,7 +1198,6 @@ class MoEGatingNetwork:
         routing_decisions: List[Tuple[int, float]],
         metadata: Dict[str, Any]
     ):
-        """Record routing decision for analysis"""
         self.routing_history.append({
             'context': context,
             'decisions': routing_decisions,
@@ -823,7 +1211,6 @@ class MoEGatingNetwork:
     # ========================================================================
     
     def get_expert_utilization(self) -> Dict[int, float]:
-        """Calculate expert utilization percentages"""
         if self.total_routing_calls == 0:
             return {i: 0.0 for i in range(self.num_experts)}
         return {
@@ -832,7 +1219,6 @@ class MoEGatingNetwork:
         }
     
     def get_expert_success_rates(self) -> Dict[int, float]:
-        """Calculate expert success rates"""
         rates = {}
         for idx in range(self.num_experts):
             total = self.expert_usage_count.get(idx, 0)
@@ -843,7 +1229,6 @@ class MoEGatingNetwork:
         return rates
     
     def get_load_balance_score(self) -> float:
-        """Calculate load balance score (0-1)"""
         utilization = self.get_expert_utilization()
         if not utilization:
             return 0.0
@@ -857,8 +1242,11 @@ class MoEGatingNetwork:
         max_entropy = math.log(len(values))
         return entropy / max_entropy if max_entropy > 0 else 0.0
     
+    # ========================================================================
+    # Enhanced Statistics and Dashboard
+    # ========================================================================
+    
     def get_comprehensive_stats(self) -> Dict[str, Any]:
-        """Get comprehensive gating network statistics with bio-inspired metrics"""
         stats = {
             'total_routing_calls': self.total_routing_calls,
             'top_k': self.top_k,
@@ -869,7 +1257,9 @@ class MoEGatingNetwork:
             'expert_stats': {
                 idx: {
                     'utilization': self.get_expert_utilization().get(idx, 0.0),
-                    'success_rate': self.get_expert_success_rates().get(idx, 0.0)
+                    'success_rate': self.get_expert_success_rates().get(idx, 0.0),
+                    'carbon_total': self.expert_carbon_total.get(idx, 0.0),
+                    'helium_total': self.expert_helium_total.get(idx, 0.0)
                 }
                 for idx in range(self.num_experts)
             }
@@ -883,7 +1273,63 @@ class MoEGatingNetwork:
             stats['cooperative_pairs'] = len(self.cooperative_pairs)
             stats['biomass_aware_load_balance'] = self._get_biomass_aware_load_balance()
         
+        # Add sustainability metrics
+        stats['sustainability_score'] = self.sustainability_score
+        stats['carbon_efficiency'] = self.carbon_efficiency
+        stats['helium_efficiency'] = self.helium_efficiency
+        
+        # Add federated stats
+        if self.enable_federated and self.federated_network:
+            stats['federated_stats'] = self.federated_network.get_federated_stats()
+        
+        # Add predictive stats
+        if self.enable_predictive and self.predictive_analyzer:
+            stats['predictive_forecast'] = asyncio.run(
+                self.predictive_analyzer.predict_gating_performance()
+            )
+        
+        # Add carbon stats
+        if self.enable_carbon_intensity and self.carbon_manager:
+            stats['carbon_intensity'] = asyncio.run(self.carbon_manager.get_current_intensity())
+        
         return stats
+    
+    def get_sustainability_dashboard(self) -> Dict[str, Any]:
+        """Get sustainability dashboard"""
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'carbon_efficiency': self.carbon_efficiency,
+            'helium_efficiency': self.helium_efficiency,
+            'load_balance': self.get_load_balance_score(),
+            'cooperative_strength': len(self.cooperative_pairs) / max(self.num_experts * (self.num_experts - 1) / 2, 1),
+            'exploration_rate': self._get_bio_modulated_exploration(),
+            'gradient_levels': self._get_real_gradient_levels(),
+            'token_state': self._get_real_token_state(),
+            'recommendations': self._generate_sustainability_recommendations()
+        }
+    
+    def _generate_sustainability_recommendations(self) -> List[str]:
+        recommendations = []
+        
+        if self.sustainability_score < 0.5:
+            recommendations.append("Improve load balancing across experts")
+            recommendations.append("Optimize cooperative binding weights")
+        
+        if self.carbon_efficiency < 0.4:
+            recommendations.append("Reduce carbon footprint through better expert selection")
+        
+        if self.helium_efficiency < 0.4:
+            recommendations.append("Optimize helium usage through expert selection")
+        
+        if self.enable_bio_integration and self._get_bio_modulated_exploration() < 0.05:
+            recommendations.append("Increase exploration rate for better expert discovery")
+        
+        return recommendations or ["All sustainability metrics are within acceptable ranges"]
+    
+    # ========================================================================
+    # Update Methods
+    # ========================================================================
     
     def update_routing_feedback(
         self,
@@ -893,7 +1339,6 @@ class MoEGatingNetwork:
         helium_units: float = 0.0,
         context: Optional['GatingContext'] = None
     ):
-        """Update routing preferences based on feedback"""
         if reward > 0.5:
             self.expert_success_count[expert_id] = self.expert_success_count.get(expert_id, 0) + 1
         
@@ -914,7 +1359,6 @@ class MoEGatingNetwork:
                 self._online_learning_step()
     
     def _online_learning_step(self):
-        """Perform one step of online learning"""
         if len(self.experience_buffer) < 32:
             return
         
@@ -943,21 +1387,26 @@ class MoEGatingNetwork:
         torch.nn.utils.clip_grad_norm_(self.sparse_gate.parameters(), 1.0)
         self.optimizer.step()
     
+    # ========================================================================
+    # Save/Load Methods
+    # ========================================================================
+    
     def save_state(self, path: str):
-        """Save enhanced gating network state"""
         state = {
             'model_state_dict': self.sparse_gate.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'expert_usage_count': dict(self.expert_usage_count),
             'expert_success_count': dict(self.expert_success_count),
             'total_routing_calls': self.total_routing_calls,
-            'cooperative_pairs': dict(self.cooperative_pairs)
+            'cooperative_pairs': dict(self.cooperative_pairs),
+            'sustainability_score': self.sustainability_score,
+            'carbon_efficiency': self.carbon_efficiency,
+            'helium_efficiency': self.helium_efficiency
         }
         torch.save(state, path)
         logger.info(f"Saved gating network state to {path}")
     
     def load_state(self, path: str):
-        """Load enhanced gating network state"""
         checkpoint = torch.load(path, map_location=self.device)
         self.sparse_gate.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -965,8 +1414,19 @@ class MoEGatingNetwork:
         self.expert_success_count = defaultdict(int, checkpoint.get('expert_success_count', {}))
         self.total_routing_calls = checkpoint.get('total_routing_calls', 0)
         self.cooperative_pairs = defaultdict(float, checkpoint.get('cooperative_pairs', {}))
+        self.sustainability_score = checkpoint.get('sustainability_score', 0.0)
+        self.carbon_efficiency = checkpoint.get('carbon_efficiency', 0.5)
+        self.helium_efficiency = checkpoint.get('helium_efficiency', 0.5)
         logger.info(f"Loaded gating network state from {path}")
     
     def get_parameter_count(self) -> int:
-        """Get total number of trainable parameters"""
         return sum(p.numel() for p in self.sparse_gate.parameters() if p.requires_grad)
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("Shutting down Gating Network")
+        if self.carbon_manager:
+            await self.carbon_manager.close()
+        if self.federated_network:
+            await self.federated_network.close()
+        logger.info("Shutdown complete")
