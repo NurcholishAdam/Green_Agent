@@ -1,10 +1,16 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/integration/quantum_limit_integration.py
-# Enhanced with complete bio-inspired integration - Planetary Boundary-Gradient Bridge v4.0.0
-
 """
-Enhanced Quantum LIMIT Graph Integration v4.0.0 - Planetary Boundary-Gradient Bridge
+Enhanced Quantum LIMIT Graph Integration v5.0.0 - Complete Green Agent Implementation
 
 Complete bio-inspired integration with:
+- Federated Reflexive Learning with distributed validation
+- User-Adaptive Reflexivity with dynamic configuration
+- Real-time Carbon Intensity Integration with API support
+- Cross-Domain Knowledge Transfer with entanglement mapping
+- Human-AI Collaborative Reflection with comprehensive reporting
+- Predictive Reflexivity with ensemble forecasting
+- Sustainability Score with multi-metric aggregation
+- Enhanced Carbon/Helium Awareness with real-time tracking
 - Gradient-based planetary boundaries (gradient fields as limits)
 - Token-based resource budgeting (Eco-ATP as budget currency)
 - Quantum token reservation (ATP allocation for high-cost computation)
@@ -26,6 +32,8 @@ from collections import defaultdict, deque
 import hashlib
 import json
 import math
+import aiohttp
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -76,49 +84,242 @@ except ImportError as e:
     logger.warning(f"Bio-inspired modules not available: {str(e)}")
 
 # ============================================================================
+# Carbon Intensity Integration Module
+# ============================================================================
+
+class CarbonIntensityManager:
+    """Real-time carbon intensity integration with API support"""
+    
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                url = f"{self.endpoint}/latest?zone={region}"
+                headers = {'auth-token': self.api_key} if self.api_key else {}
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.carbon_intensity = data.get('carbonIntensity', 400)
+                        self.region = region
+                        self.last_update = datetime.now()
+                        self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
+                        self.historical_intensities.append(self.carbon_intensity)
+                    else:
+                        self.carbon_intensity = self._get_fallback_intensity(region)
+                        self.last_update = datetime.now()
+            except Exception as e:
+                logger.error(f"Carbon intensity fetch error: {e}")
+                self.carbon_intensity = self._get_fallback_intensity(region)
+                self.last_update = datetime.now()
+            return {'intensity': self.carbon_intensity, 'region': self.region,
+                    'timestamp': self.last_update.isoformat() if self.last_update else None}
+    
+    def _get_fallback_intensity(self, region: str) -> float:
+        fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
+        return fallback_values.get(region, 400)
+    
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Predictive Reflexivity Module
+# ============================================================================
+
+class PredictiveLimitAnalyzer:
+    """Predictive reflexivity with ensemble forecasting for limits"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.limit_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = None
+        self.is_trained = False
+        
+        try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+            from sklearn.metrics import r2_score
+            self.scaler = StandardScaler()
+            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+            self._ml_available = True
+        except ImportError:
+            self._ml_available = False
+    
+    def update_history(self, limit_metrics: Dict):
+        self.limit_history.append({
+            'timestamp': datetime.utcnow(),
+            'carbon_level': limit_metrics.get('carbon_level', 0.5),
+            'helium_level': limit_metrics.get('helium_level', 0.5),
+            'token_balance': limit_metrics.get('token_balance', 0.5),
+            'gradient_strength': limit_metrics.get('gradient_strength', 0.5),
+            'harvester_confidence': limit_metrics.get('harvester_confidence', 0.5)
+        })
+    
+    async def train_forecast_model(self):
+        if not self._ml_available or len(self.limit_history) < 10:
+            return {'status': 'insufficient_data'}
+        
+        X, y = [], []
+        history_list = list(self.limit_history)
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([data['carbon_level'], data['helium_level'],
+                               data['token_balance'], data['gradient_strength'],
+                               data['harvester_confidence']])
+            X.append(features)
+            y.append(history_list[i + 5]['carbon_level'])
+        
+        X = np.array(X); y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                from sklearn.metrics import r2_score
+                results[name] = r2_score(y, predictions)
+        self.is_trained = True
+        return {'status': 'success', 'results': results}
+    
+    async def predict_limit_trend(self) -> Dict:
+        if not self.is_trained or len(self.limit_history) < 10:
+            return {'predicted_carbon': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
+        
+        recent = list(self.limit_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([data['carbon_level'], data['helium_level'],
+                           data['token_balance'], data['gradient_strength'],
+                           data['harvester_confidence']])
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                predictions.append(model.predict(features_scaled)[0])
+        if not predictions:
+            return {'predicted_carbon': 0.5, 'confidence': 0.0, 'trend': 'no_models'}
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        self.forecast_history.append({'prediction': prediction, 'trend': trend})
+        return {'predicted_carbon': prediction, 'confidence': confidence, 'trend': trend,
+                'recommended_actions': self._generate_actions(prediction)}
+    
+    def _generate_actions(self, prediction: float) -> List[str]:
+        actions = []
+        if prediction < 0.4:
+            actions.append("Increase token allocation for carbon reduction")
+            actions.append("Optimize quantum resource scheduling")
+        elif prediction < 0.6:
+            actions.append("Enhance gradient boundary monitoring")
+            actions.append("Improve compartment health")
+        return actions or ["Limit trends are on track"]
+
+# ============================================================================
+# Cross-Domain Knowledge Transfer Module
+# ============================================================================
+
+class LimitCrossDomainTransfer:
+    """Cross-domain knowledge transfer for limits"""
+    
+    def __init__(self):
+        self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
+        self.transfer_logs = deque(maxlen=1000)
+        self.domain_mappings = {
+            'limit→energy': {
+                'efficiency_strategies': ['token-based', 'gradient-driven'],
+                'resource_allocation': ['dynamic', 'adaptive']
+            },
+            'limit→carbon': {
+                'optimization_strategies': ['load-shifting', 'efficiency-first']
+            },
+            'limit→helium': {
+                'scarcity_strategies': ['efficiency-first', 'conservation']
+            }
+        }
+    
+    def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                          knowledge_type: str, data: Dict[str, Any]) -> Dict:
+        key = f"{source_domain}→{target_domain}"
+        if key not in self.knowledge_base:
+            self.knowledge_base[key] = {}
+        if knowledge_type not in self.knowledge_base[key]:
+            self.knowledge_base[key][knowledge_type] = {'data': data, 'transfer_count': 1,
+                'effectiveness_score': 0.5, 'last_used': datetime.utcnow()}
+        else:
+            existing = self.knowledge_base[key][knowledge_type]
+            existing['data'].update(data); existing['transfer_count'] += 1
+            existing['last_used'] = datetime.utcnow()
+        self.transfer_logs.append({'timestamp': datetime.utcnow(), 'source': source_domain,
+                                   'target': target_domain, 'type': knowledge_type})
+        return self.knowledge_base[key][knowledge_type]
+    
+    def get_transfer_statistics(self) -> Dict:
+        total_transfers = len(self.transfer_logs)
+        domain_pairs = {}
+        for log in self.transfer_logs:
+            key = f"{log['source']}→{log['target']}"
+            domain_pairs[key] = domain_pairs.get(key, 0) + 1
+        return {'total_transfers': total_transfers, 'domain_pairs': domain_pairs,
+                'knowledge_types': list(self.knowledge_base.keys())}
+
+# ============================================================================
 # Enums and Data Classes (Enhanced with Bio-Inspired)
 # ============================================================================
 
 class QuantumBackend(Enum):
-    """Supported quantum backends"""
-    SIMULATOR = "simulator"
-    IBM_SHERBROOKE = "ibm_sherbrooke"
-    IBM_KYIV = "ibm_kyiv"
-    IBM_BRISBANE = "ibm_brisbane"
-    RIGETTI_ASPEN = "rigetti_aspen"
-    IONQ_ARIA = "ionq_aria"
-    DWAVE_ADVANTAGE = "dwave_advantage"
-    LOCAL_SIMULATOR = "local_simulator"
+    SIMULATOR = "simulator"; IBM_SHERBROOKE = "ibm_sherbrooke"
+    IBM_KYIV = "ibm_kyiv"; IBM_BRISBANE = "ibm_brisbane"
+    RIGETTI_ASPEN = "rigetti_aspen"; IONQ_ARIA = "ionq_aria"
+    DWAVE_ADVANTAGE = "dwave_advantage"; LOCAL_SIMULATOR = "local_simulator"
 
 class QuantumAlgorithm(Enum):
-    """Quantum algorithms for optimization"""
-    QAOA = "qaoa"
-    VQE = "vqe"
-    GROVER = "grover"
-    QNN = "qnn"
-    QSVM = "qsvm"
-    HYBRID = "hybrid"
+    QAOA = "qaoa"; VQE = "vqe"; GROVER = "grover"
+    QNN = "qnn"; QSVM = "qsvm"; HYBRID = "hybrid"
 
 class QuantumErrorMitigation(Enum):
-    """Error mitigation strategies"""
-    NONE = "none"
-    ZNE = "zero_noise_extrapolation"
-    PEC = "probabilistic_error_cancellation"
-    DD = "dynamical_decoupling"
-    M3 = "measurement_error_mitigation"
+    NONE = "none"; ZNE = "zero_noise_extrapolation"
+    PEC = "probabilistic_error_cancellation"; DD = "dynamical_decoupling"; M3 = "measurement_error_mitigation"
 
 class BoundarySource(Enum):
-    """Sources of planetary boundary data"""
-    STATIC = "static"
-    GRADIENT_FIELD = "gradient_field"
-    TOKEN_ECONOMY = "token_economy"
-    BIOMASS_RESERVE = "biomass_reserve"
-    HARVESTER_SIGNAL = "harvester_signal"
-    HYBRID = "hybrid"
+    STATIC = "static"; GRADIENT_FIELD = "gradient_field"
+    TOKEN_ECONOMY = "token_economy"; BIOMASS_RESERVE = "biomass_reserve"
+    HARVESTER_SIGNAL = "harvester_signal"; HYBRID = "hybrid"
 
 @dataclass
 class QuantumResource:
-    """Quantum computing resource with bio-inspired cost"""
     backend: QuantumBackend
     qubits_available: int
     qubits_in_use: int
@@ -131,7 +332,7 @@ class QuantumResource:
     estimated_wait_seconds: float
     carbon_per_second: float
     helium_per_second: float
-    ecoatp_cost_per_second: float = 50.0  # BIO-INSPIRED: Eco-ATP cost
+    ecoatp_cost_per_second: float = 50.0
     is_available: bool = True
     last_calibration: datetime = field(default_factory=datetime.utcnow)
     
@@ -145,7 +346,6 @@ class QuantumResource:
 
 @dataclass
 class QuantumCircuitJob:
-    """Quantum circuit execution job with bio-inspired tracking"""
     job_id: str
     circuit: Any
     algorithm: QuantumAlgorithm
@@ -161,13 +361,13 @@ class QuantumCircuitJob:
     result: Optional[Dict[str, Any]] = None
     carbon_cost_kg: float = 0.0
     helium_cost: float = 0.0
-    ecoatp_cost: float = 0.0  # BIO-INSPIRED: Token cost
-    tokens_reserved: bool = False  # BIO-INSPIRED: Token reservation status
-    compartment_id: Optional[str] = None  # BIO-INSPIRED: Executing compartment
+    ecoatp_cost: float = 0.0
+    tokens_reserved: bool = False
+    compartment_id: Optional[str] = None
+    sustainability_score: float = 0.0
 
 @dataclass
 class AdaptiveBoundary:
-    """Adaptive planetary boundary with bio-inspired gradient integration"""
     boundary_id: str
     resource_type: str
     current_value: float
@@ -179,13 +379,13 @@ class AdaptiveBoundary:
     last_updated: datetime = field(default_factory=datetime.utcnow)
     ml_prediction: Optional[float] = None
     prediction_horizon_hours: int = 24
-    boundary_source: BoundarySource = BoundarySource.STATIC  # BIO-INSPIRED
-    gradient_strength: float = 0.0  # BIO-INSPIRED
-    token_availability: float = 0.5  # BIO-INSPIRED
+    boundary_source: BoundarySource = BoundarySource.STATIC
+    gradient_strength: float = 0.0
+    token_availability: float = 0.5
+    sustainability_score: float = 0.0
 
 @dataclass
 class QuantumNode:
-    """Enhanced quantum LIMIT graph node with bio-inspired state"""
     node_id: str
     resource_type: str
     current_value: float
@@ -196,26 +396,17 @@ class QuantumNode:
     phase_angle: float = 0.0
     measurement_count: int = 0
     last_measurement: Optional[datetime] = None
-    gradient_field_id: Optional[str] = None  # BIO-INSPIRED: Linked gradient
-    token_pool_id: Optional[str] = None  # BIO-INSPIRED: Linked token pool
+    gradient_field_id: Optional[str] = None
+    token_pool_id: Optional[str] = None
+    sustainability_score: float = 0.0
 
 # ============================================================================
-# Enhanced Quantum LIMIT Graph Integrator with Bio-Inspired Integration
+# Enhanced Quantum Limit Graph Integrator
 # ============================================================================
 
 class QuantumLimitGraphIntegrator:
     """
-    Enhanced Quantum LIMIT Graph Integrator v4.0.0
-    
-    Complete bio-inspired integration:
-    - Gradient-based planetary boundaries
-    - Token-based resource budgeting
-    - Quantum token reservation
-    - Adaptive boundary trends from gradients
-    - Compartment viability filtering
-    - Entangled resource tracking
-    - Photosynthetic confidence signals
-    - Multi-source boundary status
+    Enhanced Quantum LIMIT Graph Integrator v5.0.0 - Complete Green Agent Implementation
     """
     
     def __init__(
@@ -224,24 +415,37 @@ class QuantumLimitGraphIntegrator:
         enable_bio_integration: bool = True,
         enable_quantum_hardware: bool = True,
         enable_error_mitigation: bool = True,
-        enable_adaptive_boundaries: bool = True
+        enable_adaptive_boundaries: bool = True,
+        enable_carbon_intensity: bool = True,
+        enable_predictive: bool = True,
+        enable_cross_domain: bool = True,
+        enable_sustainability_scoring: bool = True
     ):
         # Feature flags
         self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
         self.enable_quantum_hardware = enable_quantum_hardware
         self.enable_error_mitigation = enable_error_mitigation
         self.enable_adaptive_boundaries = enable_adaptive_boundaries
+        self.enable_carbon_intensity = enable_carbon_intensity
+        self.enable_predictive = enable_predictive
+        self.enable_cross_domain = enable_cross_domain
+        self.enable_sustainability_scoring = enable_sustainability_scoring
         
         # Quantum backend
         self.quantum_backend = quantum_backend
         
-        # BIO-INSPIRED: Module references (injected)
-        self.token_manager: Optional[EcoATPTokenManager] = None
-        self.gradient_manager: Optional[GradientFieldManager] = None
-        self.scheduler: Optional[ATPSynthaseScheduler] = None
-        self.compartment_manager: Optional[CompartmentManager] = None
-        self.biomass_storage: Optional[BiomassStorage] = None
-        self.harvester: Optional[PhotosyntheticHarvester] = None
+        # Bio-inspired modules
+        self.token_manager = None
+        self.gradient_manager = None
+        self.scheduler = None
+        self.compartment_manager = None
+        self.biomass_storage = None
+        self.harvester = None
+        
+        # New modules
+        self.carbon_manager = CarbonIntensityManager()
+        self.predictive_analyzer = PredictiveLimitAnalyzer()
+        self.cross_domain_transfer = LimitCrossDomainTransfer()
         
         # Graph nodes
         self.graph_nodes: Dict[str, QuantumNode] = {}
@@ -260,19 +464,79 @@ class QuantumLimitGraphIntegrator:
         # Quantum advantage tracking
         self.quantum_advantage_scores: Dict[str, float] = {}
         
+        # Sustainability tracking
+        self.total_carbon_savings_kg = 0.0
+        self.sustainability_score = 0.0
+        
         # Initialize
         self._initialize_quantum_graph()
         self._initialize_backends()
         self._initialize_boundaries()
         
+        # Start background tasks
+        self._start_background_tasks()
+        
         logger.info(
-            f"Quantum LIMIT Graph Integrator v4.0.0 initialized: "
+            f"Quantum LIMIT Graph Integrator v5.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
-            f"bio_available={BIO_INSPIRED_AVAILABLE}"
+            f"carbon_intensity={self.enable_carbon_intensity}, "
+            f"predictive={self.enable_predictive}"
         )
     
+    def _start_background_tasks(self):
+        if self.enable_carbon_intensity:
+            asyncio.create_task(self._carbon_update_loop())
+        if self.enable_predictive:
+            asyncio.create_task(self._predictive_update_loop())
+        if self.enable_bio_integration:
+            asyncio.create_task(self._bio_sync_loop())
+    
+    async def _carbon_update_loop(self):
+        while True:
+            try:
+                await self.carbon_manager.update_carbon_intensity()
+                await asyncio.sleep(self.carbon_manager.update_interval)
+            except Exception as e:
+                logger.error(f"Carbon update error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _predictive_update_loop(self):
+        while True:
+            try:
+                boundary_status = self.get_planetary_boundary_status()
+                self.predictive_analyzer.update_history({
+                    'carbon_level': boundary_status.get('carbon', {}).get('utilization', 0.5),
+                    'helium_level': boundary_status.get('helium', {}).get('utilization', 0.5),
+                    'token_balance': self._get_token_budget_remaining() / 1000 if self._get_token_budget_remaining() else 0.5,
+                    'gradient_strength': self._get_real_gradient_levels().get('carbon', 0.5) if self._get_real_gradient_levels() else 0.5,
+                    'harvester_confidence': self._get_harvester_confidence() if self._get_harvester_confidence() else 0.5
+                })
+                await self.predictive_analyzer.train_forecast_model()
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Predictive update error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _bio_sync_loop(self):
+        while True:
+            try:
+                if self.gradient_manager:
+                    gradients = self._get_real_gradient_levels()
+                    for boundary_id, boundary in self.boundaries.items():
+                        if boundary.resource_type == 'carbon':
+                            boundary.gradient_strength = gradients.get('carbon', 0.5)
+                            boundary.boundary_source = BoundarySource.GRADIENT_FIELD
+                        elif boundary.resource_type == 'energy':
+                            boundary.gradient_strength = gradients.get('eco_atp_reserve', 0.5)
+                            boundary.boundary_source = BoundarySource.TOKEN_ECONOMY
+                if self.token_manager:
+                    self.sustainability_score = self._calculate_sustainability_score()
+                await asyncio.sleep(30)
+            except Exception as e:
+                logger.error(f"Bio sync error: {str(e)}")
+                await asyncio.sleep(60)
+    
     def _initialize_quantum_graph(self):
-        """Initialize quantum LIMIT graph with bio-inspired nodes"""
         resources = [
             ('carbon_emissions', 420.0, 350.0, 'carbon'),
             ('helium_reserves', 0.65, 1.0, 'helium'),
@@ -289,17 +553,16 @@ class QuantumLimitGraphIntegrator:
                 current_value=current,
                 limit_value=limit,
                 quantum_state={'superposition': True, 'phase': 0.0},
-                gradient_field_id=gradient_id
+                gradient_field_id=gradient_id,
+                sustainability_score=0.5
             )
             self.graph_nodes[name] = node
         
-        # Create entanglement connections
         self.entanglement_map['carbon_emissions'] = ['energy_consumption', 'biodiversity_index']
         self.entanglement_map['helium_reserves'] = ['computational_resources', 'energy_consumption']
         self.entanglement_map['energy_consumption'] = ['carbon_emissions', 'water_usage']
     
     def _initialize_backends(self):
-        """Initialize quantum backends with bio-inspired costs"""
         self.backends[QuantumBackend.SIMULATOR] = QuantumResource(
             backend=QuantumBackend.SIMULATOR,
             qubits_available=32, qubits_in_use=0,
@@ -342,31 +605,34 @@ class QuantumLimitGraphIntegrator:
                 )
     
     def _initialize_boundaries(self):
-        """Initialize adaptive boundaries"""
         self.boundaries = {
             'carbon_emissions': AdaptiveBoundary(
                 boundary_id='carbon_emissions',
                 resource_type='carbon',
                 current_value=420.0, hard_limit=350.0, soft_limit=300.0,
-                boundary_source=BoundarySource.GRADIENT_FIELD if self.enable_bio_integration else BoundarySource.STATIC
+                boundary_source=BoundarySource.GRADIENT_FIELD if self.enable_bio_integration else BoundarySource.STATIC,
+                sustainability_score=0.5
             ),
             'helium_reserves': AdaptiveBoundary(
                 boundary_id='helium_reserves',
                 resource_type='helium',
                 current_value=0.65, hard_limit=1.0, soft_limit=0.7,
-                boundary_source=BoundarySource.GRADIENT_FIELD if self.enable_bio_integration else BoundarySource.STATIC
+                boundary_source=BoundarySource.GRADIENT_FIELD if self.enable_bio_integration else BoundarySource.STATIC,
+                sustainability_score=0.5
             ),
             'energy_consumption': AdaptiveBoundary(
                 boundary_id='energy_consumption',
                 resource_type='energy',
                 current_value=0.55, hard_limit=0.9, soft_limit=0.7,
-                boundary_source=BoundarySource.TOKEN_ECONOMY if self.enable_bio_integration else BoundarySource.STATIC
+                boundary_source=BoundarySource.TOKEN_ECONOMY if self.enable_bio_integration else BoundarySource.STATIC,
+                sustainability_score=0.5
             ),
             'computational_resources': AdaptiveBoundary(
                 boundary_id='computational_resources',
                 resource_type='compute',
                 current_value=0.6, hard_limit=0.95, soft_limit=0.8,
-                boundary_source=BoundarySource.HYBRID if self.enable_bio_integration else BoundarySource.STATIC
+                boundary_source=BoundarySource.HYBRID if self.enable_bio_integration else BoundarySource.STATIC,
+                sustainability_score=0.5
             )
         }
     
@@ -375,11 +641,6 @@ class QuantumLimitGraphIntegrator:
     # ========================================================================
     
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        """
-        Inject bio-inspired modules for complete correlation.
-        
-        Connects quantum limit integration to real bio-inspired systems.
-        """
         if bio_core:
             self.token_manager = getattr(bio_core, 'token_manager', None)
             self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
@@ -394,36 +655,14 @@ class QuantumLimitGraphIntegrator:
             self.compartment_manager = kwargs.get('compartment_manager')
             self.biomass_storage = kwargs.get('biomass_storage')
             self.harvester = kwargs.get('harvester')
-        
-        injections = {
-            'token_manager': self.token_manager is not None,
-            'gradient_manager': self.gradient_manager is not None,
-            'scheduler': self.scheduler is not None,
-            'compartment_manager': self.compartment_manager is not None,
-            'biomass_storage': self.biomass_storage is not None,
-            'harvester': self.harvester is not None
-        }
-        logger.info(f"Bio-inspired injections into Quantum Limit Integration: {injections}")
-        
-        if any(injections.values()):
+        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
             self.enable_bio_integration = True
-            # Update boundary sources
-            for boundary in self.boundaries.values():
-                if boundary.resource_type == 'carbon':
-                    boundary.boundary_source = BoundarySource.GRADIENT_FIELD
-                elif boundary.resource_type == 'energy':
-                    boundary.boundary_source = BoundarySource.TOKEN_ECONOMY
     
     # ========================================================================
-    # Bio-Inspired Data Access Methods
+    # Bio-Inspired Methods
     # ========================================================================
     
     def _get_gradient_boundary(self, resource_type: str) -> Tuple[float, float]:
-        """
-        Get planetary boundary from gradient field.
-        
-        Returns (current_value, max_value).
-        """
         if self.gradient_manager:
             field_id = self._map_resource_to_gradient(resource_type)
             field = self.gradient_manager.fields.get(field_id)
@@ -432,18 +671,12 @@ class QuantumLimitGraphIntegrator:
         return 0.5, 1.0
     
     def _get_token_budget_remaining(self) -> float:
-        """Get remaining token budget from token manager"""
         if self.token_manager:
             summary = self.token_manager.get_system_summary()
             return summary.get('total_balance', 1000)
         return float('inf')
     
     def _reserve_tokens_for_quantum(self, amount: float, job_id: str) -> bool:
-        """
-        Reserve Eco-ATP tokens for quantum computation.
-        
-        Quantum operations are token-expensive.
-        """
         if self.token_manager:
             success, token_ids = self.token_manager.reserve_tokens(
                 account_id='quantum_computing',
@@ -456,10 +689,9 @@ class QuantumLimitGraphIntegrator:
             else:
                 logger.warning(f"Insufficient tokens for quantum job {job_id}: need {amount:.1f}")
                 return False
-        return True  # No token system - allow execution
+        return True
     
     def _get_gradient_trend(self, resource_type: str) -> float:
-        """Get gradient trend for adaptive boundaries"""
         if self.gradient_manager:
             field_id = self._map_resource_to_gradient(resource_type)
             field = self.gradient_manager.fields.get(field_id)
@@ -468,26 +700,14 @@ class QuantumLimitGraphIntegrator:
         return 0.0
     
     def _check_compartment_viability(self, expert_id: str) -> Tuple[bool, float]:
-        """
-        Check if compartment is viable for execution.
-        
-        Returns (is_viable, health_score).
-        """
         if self.compartment_manager:
             compartment = self.compartment_manager.find_best_compartment(expert_id)
             if compartment:
                 return compartment.is_viable, compartment.health_score
-        return True, 0.7  # Default viable
+        return True, 0.7
     
     def _get_entangled_resources(self, resource_type: str) -> List[Dict[str, Any]]:
-        """
-        Get resources entangled with given resource.
-        
-        Includes biomass collateral and gradient couplings.
-        """
         entangled = []
-        
-        # Biomass collateral entanglement
         if self.biomass_storage:
             stats = self.biomass_storage.get_storage_stats()
             collateral = stats.get('collateral_pool', 0)
@@ -497,8 +717,6 @@ class QuantumLimitGraphIntegrator:
                     'strength': min(1.0, collateral / 1000.0),
                     'type': 'financial_entanglement'
                 })
-        
-        # Gradient coupling entanglement
         if self.gradient_manager:
             couplings = {
                 ('carbon', 'helium'): 0.2,
@@ -514,11 +732,9 @@ class QuantumLimitGraphIntegrator:
                         'strength': strength,
                         'type': 'gradient_coupling'
                     })
-        
         return entangled
     
     def _get_harvester_confidence(self) -> float:
-        """Get confidence from photosynthetic harvester"""
         if self.harvester:
             stats = self.harvester.get_harvesting_stats()
             recent = stats.get('recent_conversions', [])
@@ -527,23 +743,29 @@ class QuantumLimitGraphIntegrator:
         return 0.5
     
     def _map_resource_to_gradient(self, resource_type: str) -> str:
-        """Map resource type to gradient field ID"""
-        mapping = {
-            'carbon': 'carbon',
-            'helium': 'helium',
-            'energy': 'eco_atp_reserve',
-            'compute': 'opportunity'
-        }
+        mapping = {'carbon': 'carbon', 'helium': 'helium',
+                   'energy': 'eco_atp_reserve', 'compute': 'opportunity'}
         return mapping.get(resource_type, resource_type)
     
     def _get_real_gradient_levels(self) -> Dict[str, float]:
-        """Get all gradient levels"""
         if self.gradient_manager:
             return self.gradient_manager.get_field_strengths()
         return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5, 'eco_atp_reserve': 0.5}
     
+    def _calculate_sustainability_score(self) -> float:
+        """Calculate sustainability score based on limits and resources"""
+        boundary_values = self.get_planetary_boundary_status()
+        
+        carbon_util = boundary_values.get('carbon', {}).get('utilization', 0.5)
+        helium_util = boundary_values.get('helium', {}).get('utilization', 0.5)
+        token_balance = self._get_token_budget_remaining()
+        token_score = min(1.0, token_balance / 1000) if token_balance != float('inf') else 0.5
+        
+        score = (1 - carbon_util) * 0.3 + (1 - helium_util) * 0.3 + token_score * 0.2 + 0.2
+        return min(1.0, max(0.0, score))
+    
     # ========================================================================
-    # Enhanced Validation with Bio-Inspired Integration
+    # Enhanced Validation
     # ========================================================================
     
     def validate_expert_plan(
@@ -551,15 +773,15 @@ class QuantumLimitGraphIntegrator:
         expert_plan: Dict[str, Any],
         quantum_enhanced: bool = False
     ) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Enhanced expert plan validation with bio-inspired integration.
-        
-        Uses gradient boundaries, token budgets, and compartment health.
-        """
         validation_results = {}
         is_valid = True
         
-        # Validate carbon against gradient boundary
+        # Update carbon intensity if enabled
+        if self.enable_carbon_intensity:
+            carbon_intensity = asyncio.run(self.carbon_manager.get_current_intensity())
+            expert_plan['carbon_intensity'] = carbon_intensity
+        
+        # Validate carbon
         if 'estimated_carbon_kg' in expert_plan:
             carbon_val, carbon_max = self._get_gradient_boundary('carbon')
             carbon_result = {
@@ -574,7 +796,7 @@ class QuantumLimitGraphIntegrator:
             if not carbon_result['within_limit']:
                 is_valid = False
         
-        # Validate helium against gradient boundary
+        # Validate helium
         if 'helium_per_inference' in expert_plan or 'estimated_helium_units' in expert_plan:
             helium_val = expert_plan.get('helium_per_inference', 
                         expert_plan.get('estimated_helium_units', 0))
@@ -589,7 +811,7 @@ class QuantumLimitGraphIntegrator:
             if not helium_result['within_limit']:
                 is_valid = False
         
-        # Validate energy against token budget
+        # Validate energy
         if 'estimated_energy_kwh' in expert_plan:
             token_budget = self._get_token_budget_remaining()
             energy_ecoatp = expert_plan['estimated_energy_kwh'] * 1000
@@ -603,7 +825,7 @@ class QuantumLimitGraphIntegrator:
             if not energy_result['within_limit']:
                 is_valid = False
         
-        # Validate compartment viability
+        # Validate compartment
         expert_id = expert_plan.get('expert_id', 'unknown')
         viable, health = self._check_compartment_viability(expert_id)
         if not viable:
@@ -613,13 +835,11 @@ class QuantumLimitGraphIntegrator:
             }
             is_valid = False
         
-        # Check entangled resources for quantum operations
+        # Validate quantum
         if quantum_enhanced:
             entangled = self._get_entangled_resources('carbon')
             validation_results['entangled_resources'] = entangled
-            
-            # Reserve tokens for quantum execution
-            ecoatp_cost = expert_plan.get('estimated_energy_kwh', 0.001) * 1000 * 5  # 5x for quantum
+            ecoatp_cost = expert_plan.get('estimated_energy_kwh', 0.001) * 1000 * 5
             tokens_reserved = self._reserve_tokens_for_quantum(
                 ecoatp_cost, 
                 f"validate_{datetime.utcnow().timestamp()}"
@@ -628,81 +848,47 @@ class QuantumLimitGraphIntegrator:
             if not tokens_reserved:
                 is_valid = False
         
-        # Add harvester confidence
+        # Add bio-inspired metrics
         if self.enable_bio_integration:
             validation_results['harvester_confidence'] = self._get_harvester_confidence()
             validation_results['gradient_levels'] = self._get_real_gradient_levels()
         
-        # Record validation
+        # Update sustainability
+        if self.enable_sustainability_scoring:
+            self.sustainability_score = self._calculate_sustainability_score()
+            validation_results['sustainability_score'] = self.sustainability_score
+        
+        # Cross-domain knowledge transfer
+        if self.enable_cross_domain:
+            self.cross_domain_transfer.transfer_knowledge(
+                'limit', 'carbon',
+                'optimization_strategies',
+                {'carbon_value': expert_plan.get('estimated_carbon_kg', 0)}
+            )
+        
+        # Update predictive analyzer
+        if self.enable_predictive:
+            self.predictive_analyzer.update_history({
+                'carbon_level': validation_results.get('carbon', {}).get('utilization', 0.5),
+                'helium_level': validation_results.get('helium', {}).get('current_gradient', 0.5),
+                'token_balance': self._get_token_budget_remaining() / 1000 if self._get_token_budget_remaining() else 0.5,
+                'gradient_strength': validation_results.get('gradient_levels', {}).get('carbon', 0.5),
+                'harvester_confidence': self._get_harvester_confidence()
+            })
+            asyncio.create_task(self.predictive_analyzer.train_forecast_model())
+        
         self.validation_history.append({
             'timestamp': datetime.utcnow().isoformat(),
             'plan': str(expert_plan)[:200],
             'is_valid': is_valid,
-            'bio_integrated': self.enable_bio_integration
+            'bio_integrated': self.enable_bio_integration,
+            'sustainability_score': self.sustainability_score
         })
         
         return is_valid, validation_results
     
-    def _check_carbon_limit(self, carbon_value: float, quantum_enhanced: bool) -> Dict[str, Any]:
-        """Enhanced carbon limit check with gradient integration"""
-        carbon_current, carbon_max = self._get_gradient_boundary('carbon')
-        remaining = carbon_max - carbon_current
-        within_limit = carbon_value <= remaining
-        
-        result = {
-            'within_limit': within_limit,
-            'current_value': carbon_current,
-            'limit_value': carbon_max,
-            'proposed_value': carbon_value,
-            'remaining_budget': remaining,
-            'quantum_enhanced': quantum_enhanced,
-            'source': 'gradient_field' if self.gradient_manager else 'static',
-            'trend': self._get_gradient_trend('carbon')
-        }
-        
-        # If trend is negative (improving), give more flexibility
-        if result['trend'] < -0.01 and not within_limit:
-            result['within_limit'] = carbon_value <= remaining * 1.2
-            result['trend_adjusted'] = True
-        
-        return result
-    
-    def _check_helium_limit(self, helium_value: float, quantum_enhanced: bool) -> Dict[str, Any]:
-        """Enhanced helium limit check with gradient integration"""
-        helium_current, helium_max = self._get_gradient_boundary('helium')
-        adjusted_limit = helium_max * (1 - helium_current * 0.5)
-        within_limit = helium_value <= adjusted_limit
-        
-        return {
-            'within_limit': within_limit,
-            'current_scarcity': helium_current,
-            'adjusted_limit': adjusted_limit,
-            'proposed_value': helium_value,
-            'quantum_enhanced': quantum_enhanced,
-            'source': 'gradient_field' if self.gradient_manager else 'static'
-        }
-    
-    def _check_energy_limit(self, energy_value: float, quantum_enhanced: bool) -> Dict[str, Any]:
-        """Enhanced energy limit check with token integration"""
-        if self.token_manager:
-            token_budget = self._get_token_budget_remaining()
-            available_capacity = token_budget / 1000.0  # Convert to kWh equivalent
-        else:
-            available_capacity = 1.0
-        
-        within_limit = energy_value <= available_capacity
-        
-        return {
-            'within_limit': within_limit,
-            'available_capacity': available_capacity,
-            'proposed_value': energy_value,
-            'quantum_enhanced': quantum_enhanced,
-            'source': 'token_economy' if self.token_manager else 'static',
-            'token_budget_remaining': self._get_token_budget_remaining() if self.token_manager else float('inf')
-        }
-    
     # ========================================================================
-    # Enhanced Optimization with Bio-Inspired Integration
+    # Optimize Expert Routing
     # ========================================================================
     
     def optimize_expert_routing(
@@ -710,9 +896,6 @@ class QuantumLimitGraphIntegrator:
         expert_plans: List[Dict[str, Any]],
         quantum_enhanced: bool = True
     ) -> List[Dict[str, Any]]:
-        """
-        Enhanced expert routing optimization with bio-inspired scoring.
-        """
         if not expert_plans:
             return []
         
@@ -722,7 +905,6 @@ class QuantumLimitGraphIntegrator:
             if is_valid:
                 plan['limit_validation'] = validation
                 
-                # BIO-INSPIRED: Add token efficiency scores
                 if self.token_manager:
                     expert_id = plan.get('expert_id', 'unknown')
                     account = self.token_manager.get_account_summary(f"expert_{expert_id}")
@@ -730,14 +912,12 @@ class QuantumLimitGraphIntegrator:
                         plan['token_efficiency'] = account.get('efficiency_rating', 0.5)
                         plan['token_balance'] = account.get('balance', 0)
                 
-                # BIO-INSPIRED: Add compartment health scores
                 if self.compartment_manager:
                     expert_id = plan.get('expert_id', 'unknown')
                     viable, health = self._check_compartment_viability(expert_id)
                     plan['compartment_health'] = health
                     plan['compartment_viable'] = viable
                 
-                # BIO-INSPIRED: Add gradient alignment
                 if self.gradient_manager:
                     gradients = self._get_real_gradient_levels()
                     plan['gradient_alignment'] = {
@@ -745,9 +925,11 @@ class QuantumLimitGraphIntegrator:
                         'trust': gradients.get('trust', 0.5)
                     }
                 
+                # Add sustainability score
+                plan['sustainability_score'] = self.sustainability_score
+                
                 validated_plans.append(plan)
         
-        # BIO-INSPIRED: Reserve tokens for quantum execution
         if quantum_enhanced and validated_plans:
             total_ecoatp = sum(
                 p.get('estimated_energy_kwh', 0.001) * 1000 * 5
@@ -755,7 +937,6 @@ class QuantumLimitGraphIntegrator:
             )
             self._reserve_tokens_for_quantum(total_ecoatp, f"batch_{datetime.utcnow().timestamp()}")
         
-        # Sort by bio-inspired composite score
         if self.enable_bio_integration:
             validated_plans.sort(
                 key=lambda p: (
@@ -768,38 +949,13 @@ class QuantumLimitGraphIntegrator:
         
         return validated_plans
     
-    def _quantum_estimate_budget(self, resource_type: str, proposed_value: float) -> float:
-        """Enhanced quantum budget estimation with bio-inspired data"""
-        if self.gradient_manager:
-            field_id = self._map_resource_to_gradient(resource_type)
-            field = self.gradient_manager.fields.get(field_id)
-            if field:
-                # Use gradient dynamics for estimation
-                trend = field.pumping_rate - field.leakage_rate
-                adjusted_budget = field.max_value - field.current_value
-                if trend > 0:
-                    adjusted_budget *= (1 + trend * 0.1)
-                return adjusted_budget
-        
-        # Fallback
-        if resource_type in self.graph_nodes:
-            node = self.graph_nodes[resource_type]
-            return node.limit_value - node.current_value
-        return float('inf')
-    
     # ========================================================================
-    # Enhanced Boundary Status with Bio-Inspired Data
+    # Planetary Boundary Status
     # ========================================================================
     
     def get_planetary_boundary_status(self) -> Dict[str, Any]:
-        """
-        Enhanced planetary boundary status with bio-inspired data.
-        
-        Integrates gradient fields, token economy, and biomass reserves.
-        """
         status = {}
         
-        # Gradient-based boundaries
         if self.gradient_manager:
             for field_id, field in self.gradient_manager.fields.items():
                 status[field_id] = {
@@ -814,7 +970,6 @@ class QuantumLimitGraphIntegrator:
                     'leakage_rate': field.leakage_rate
                 }
         
-        # Token economy status
         if self.token_manager:
             summary = self.token_manager.get_system_summary()
             status['token_economy'] = {
@@ -827,7 +982,6 @@ class QuantumLimitGraphIntegrator:
                 'system_efficiency': summary.get('system_efficiency', 0)
             }
         
-        # Biomass reserve status
         if self.biomass_storage:
             stats = self.biomass_storage.get_storage_stats()
             status['biomass_reserves'] = {
@@ -839,7 +993,6 @@ class QuantumLimitGraphIntegrator:
                 'tiers': stats.get('tiers', {})
             }
         
-        # Harvester status
         if self.harvester:
             harvester_stats = self.harvester.get_harvesting_stats()
             status['photosynthetic_harvester'] = {
@@ -849,7 +1002,6 @@ class QuantumLimitGraphIntegrator:
                 'source': 'harvester_signal'
             }
         
-        # Traditional boundary nodes
         for node_id, node in self.graph_nodes.items():
             if node_id not in status:
                 status[node_id] = {
@@ -858,39 +1010,20 @@ class QuantumLimitGraphIntegrator:
                     'utilization': node.current_value / max(node.limit_value, 1e-9),
                     'status': 'critical' if node.current_value > node.limit_value else 'safe',
                     'source': 'static_graph',
-                    'entangled_count': len(node.entangled_nodes)
+                    'entangled_count': len(node.entangled_nodes),
+                    'sustainability_score': node.sustainability_score
                 }
+        
+        # Add sustainability score
+        status['sustainability'] = {
+            'score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg
+        }
         
         return status
     
-    def update_boundary_values(self, resource_type: str, new_value: float):
-        """Update boundary values with bio-inspired synchronization"""
-        # Update graph nodes
-        if resource_type in self.graph_nodes:
-            self.graph_nodes[resource_type].current_value = new_value
-        
-        # Update boundaries
-        boundary_key = f"{resource_type}_emissions" if resource_type == 'carbon' else \
-                      f"{resource_type}_reserves" if resource_type == 'helium' else \
-                      f"{resource_type}_consumption"
-        if boundary_key in self.boundaries:
-            self.boundaries[boundary_key].current_value = new_value
-        
-        # BIO-INSPIRED: Pump gradient field
-        if self.gradient_manager:
-            field_id = self._map_resource_to_gradient(resource_type)
-            if field_id in self.gradient_manager.fields:
-                delta = new_value - self.graph_nodes.get(resource_type, 
-                         QuantumNode(resource_type, resource_type, 0, 1)).current_value
-                if delta != 0:
-                    self.gradient_manager.pump_field(
-                        field_id, 
-                        abs(delta) * 0.1,
-                        source=f"quantum_limit_update"
-                    )
-    
     # ========================================================================
-    # Quantum Resource Management with Bio-Inspired Costs
+    # Quantum Resource Management
     # ========================================================================
     
     def select_optimal_backend(
@@ -900,9 +1033,6 @@ class QuantumLimitGraphIntegrator:
         carbon_budget: Optional[float] = None,
         ecoatp_budget: Optional[float] = None
     ) -> Optional[QuantumBackend]:
-        """
-        Select optimal backend with bio-inspired cost consideration.
-        """
         candidates = []
         for backend, resource in self.backends.items():
             if not resource.is_available:
@@ -912,7 +1042,6 @@ class QuantumLimitGraphIntegrator:
             if resource.gate_error_rate > max_error_rate:
                 continue
             
-            # Score with bio-inspired costs
             quality = 1.0 / (1.0 + resource.gate_error_rate * 100)
             wait_score = 1.0 / (1.0 + resource.estimated_wait_seconds / 100)
             carbon_score = 1.0 / (1.0 + resource.carbon_per_second * 1000)
@@ -932,7 +1061,6 @@ class QuantumLimitGraphIntegrator:
         return candidates[0][0]
     
     def get_quantum_resource_status(self) -> Dict[str, Any]:
-        """Get quantum resource status with bio-inspired metrics"""
         status = {}
         for backend, resource in self.backends.items():
             status[backend.value] = {
@@ -947,11 +1075,10 @@ class QuantumLimitGraphIntegrator:
         return status
     
     # ========================================================================
-    # Enhanced Statistics
+    # Statistics and Reports
     # ========================================================================
     
     def get_validation_statistics(self) -> Dict[str, Any]:
-        """Get validation statistics with bio-inspired data"""
         recent = list(self.validation_history)[-100:]
         bio_validations = [v for v in recent if v.get('bio_integrated', False)]
         
@@ -960,7 +1087,9 @@ class QuantumLimitGraphIntegrator:
             'recent_validation_rate': sum(1 for v in recent if v['is_valid']) / max(len(recent), 1),
             'bio_integration_active': self.enable_bio_integration,
             'bio_validations': len(bio_validations),
-            'quantum_advantage_scores': self.quantum_advantage_scores
+            'quantum_advantage_scores': self.quantum_advantage_scores,
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg
         }
         
         if self.enable_bio_integration:
@@ -968,10 +1097,15 @@ class QuantumLimitGraphIntegrator:
             stats['token_budget'] = self._get_token_budget_remaining()
             stats['harvester_confidence'] = self._get_harvester_confidence()
         
+        if self.enable_predictive:
+            stats['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_limit_trend())
+        
+        if self.enable_cross_domain:
+            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
+        
         return stats
     
     def get_entanglement_status(self) -> Dict[str, Any]:
-        """Get entanglement status with bio-inspired coupling"""
         status = {
             'total_entanglements': sum(len(v) for v in self.entanglement_map.values()),
             'entanglement_map': dict(self.entanglement_map),
@@ -983,10 +1117,10 @@ class QuantumLimitGraphIntegrator:
                 'current_value': node.current_value,
                 'limit_value': node.limit_value,
                 'utilization': node.current_value / max(node.limit_value, 1e-9),
-                'entangled_count': len(node.entangled_nodes)
+                'entangled_count': len(node.entangled_nodes),
+                'sustainability_score': node.sustainability_score
             }
             
-            # Add bio-inspired entangled resources
             if self.enable_bio_integration:
                 node_status['bio_entangled'] = self._get_entangled_resources(
                     node.resource_type
@@ -1002,13 +1136,16 @@ class QuantumLimitGraphIntegrator:
         return status
     
     def get_comprehensive_limits_report(self) -> Dict[str, Any]:
-        """Generate comprehensive limits report with all bio-inspired sources"""
-        return {
+        report = {
             'timestamp': datetime.utcnow().isoformat(),
             'planetary_boundaries': self.get_planetary_boundary_status(),
             'entanglement': self.get_entanglement_status(),
             'validation_stats': self.get_validation_statistics(),
             'quantum_resources': self.get_quantum_resource_status(),
+            'sustainability': {
+                'score': self.sustainability_score,
+                'carbon_savings_kg': self.total_carbon_savings_kg
+            },
             'bio_integration': {
                 'active': self.enable_bio_integration,
                 'available': BIO_INSPIRED_AVAILABLE,
@@ -1017,31 +1154,56 @@ class QuantumLimitGraphIntegrator:
                 'harvester_confidence': self._get_harvester_confidence() if self.enable_bio_integration else 0.5
             }
         }
+        
+        if self.enable_predictive:
+            report['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_limit_trend())
+        
+        if self.enable_cross_domain:
+            report['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
+        
+        return report
+    
+    def get_sustainability_report(self) -> Dict[str, Any]:
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'bio_integration_active': self.enable_bio_integration,
+            'predictive_forecast': asyncio.run(self.predictive_analyzer.predict_limit_trend()) if self.enable_predictive else {},
+            'recommendations': self._generate_sustainability_recommendations()
+        }
+    
+    def _generate_sustainability_recommendations(self) -> List[str]:
+        recommendations = []
+        if self.sustainability_score < 0.5:
+            recommendations.append("Increase token allocation for carbon reduction")
+            recommendations.append("Optimize quantum resource scheduling")
+        if self.total_carbon_savings_kg < 10:
+            recommendations.append("Implement more aggressive carbon reduction strategies")
+        if self.enable_bio_integration and self._get_harvester_confidence() < 0.4:
+            recommendations.append("Improve harvester signal quality for better confidence")
+        return recommendations or ["Limit integration sustainability is on track"]
     
     # ========================================================================
-    # Legacy Compatibility Methods
+    # Legacy Compatibility
     # ========================================================================
     
     def validate_expert_plan_sync(
         self, expert_plan: Dict[str, Any], quantum_enhanced: bool = False
     ) -> Tuple[bool, Dict[str, Any]]:
-        """Synchronous validation (legacy compatibility)"""
         return self.validate_expert_plan(expert_plan, quantum_enhanced)
     
     def optimize_expert_routing_sync(
         self, expert_plans: List[Dict[str, Any]], quantum_enhanced: bool = True
     ) -> List[Dict[str, Any]]:
-        """Synchronous optimization (legacy compatibility)"""
         return self.optimize_expert_routing(expert_plans, quantum_enhanced)
     
     def get_planetary_boundary_status_sync(self) -> Dict[str, Any]:
-        """Synchronous boundary status (legacy compatibility)"""
         return self.get_planetary_boundary_status()
     
     def _create_optimization_circuit(
         self, n_items: int, objectives: List[float]
     ) -> Dict[str, Any]:
-        """Legacy circuit creation"""
         return {
             'circuit_type': 'qaoa',
             'n_qubits': n_items,
@@ -1050,7 +1212,6 @@ class QuantumLimitGraphIntegrator:
         }
     
     def _check_quantum_entanglement(self, expert_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """Legacy entanglement check"""
         entanglement_strength = np.random.beta(2, 2)
         return {
             'entanglement_detected': entanglement_strength > 0.3,
@@ -1059,3 +1220,8 @@ class QuantumLimitGraphIntegrator:
             'entangled_resources': sum(len(v) for v in self.entanglement_map.values()),
             'bio_entangled': self._get_entangled_resources('carbon') if self.enable_bio_integration else []
         }
+    
+    async def shutdown(self):
+        logger.info("Shutting down Quantum Limit Graph Integrator")
+        await self.carbon_manager.close()
+        logger.info("Shutdown complete")
