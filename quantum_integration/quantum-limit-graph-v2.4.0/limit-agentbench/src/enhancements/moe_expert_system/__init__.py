@@ -1,8 +1,6 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/__init__.py
-# Enhanced with complete bio-inspired integration - Unified Metabolic Ecosystem v4.0.0
-
 """
-Green Agent MoE Expert System v4.0.0 - Unified Metabolic Ecosystem
+Green Agent MoE Expert System v5.0.0 - Unified Metabolic Ecosystem
 
 Complete integration with bio-inspired modules providing:
 - Eco-ATP currency system for unified resource accounting
@@ -11,6 +9,9 @@ Complete integration with bio-inspired modules providing:
 - Chromatophore compartments for modular expert isolation
 - Biomass storage for deferred computation queuing
 - Photosynthetic harvesting for environmental opportunity detection
+- Unified Sustainability Dashboard
+- Predictive Maintenance Integration
+- Enhanced Bio-Inspired Integration
 
 This module serves as the central nervous system connecting:
 - Expert Registry (Genome Repository)
@@ -18,10 +19,15 @@ This module serves as the central nervous system connecting:
 - Expert Router (Signal Transduction Cascade)
 - All specialized experts (Metabolic Organs)
 - Monitoring system (Metabolic Observatory)
+- Sustainability Dashboard (Ecosystem Health Monitor)
+- Predictive Analytics (Future State Predictor)
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, timedelta
+import asyncio
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -216,14 +222,512 @@ from .monitoring.expert_metrics import (
 )
 
 # ============================================================================
-# Unified Metabolic Ecosystem - Main Entry Point
+# Sustainability Modules (New)
+# ============================================================================
+
+try:
+    from .sustainability.biodiversity_impact import (
+        BiodiversityImpactAssessor,
+        EcosystemType,
+        ImpactCategory,
+        BiodiversityMetric
+    )
+    BIODIVERSITY_AVAILABLE = True
+except ImportError:
+    BIODIVERSITY_AVAILABLE = False
+
+try:
+    from .sustainability.carbon_sequestration import (
+        CarbonSequestrationManager,
+        CarbonCredit
+    )
+    SEQUESTRATION_AVAILABLE = True
+except ImportError:
+    SEQUESTRATION_AVAILABLE = False
+
+try:
+    from .sustainability.circular_computing import (
+        CircularComputingManager,
+        HardwareComponent,
+        HardwareState,
+        MaterialType
+    )
+    CIRCULAR_AVAILABLE = True
+except ImportError:
+    CIRCULAR_AVAILABLE = False
+
+try:
+    from .sustainability.carbon_offset_verification import (
+        AutomatedCarbonOffsetVerification,
+        OffsetRegistry,
+        ProjectType,
+        VerificationStatus
+    )
+    OFFSET_AVAILABLE = True
+except ImportError:
+    OFFSET_AVAILABLE = False
+
+# ============================================================================
+# Enhanced Bio-Inspired Integration (New Module)
+# ============================================================================
+
+class EnhancedBioInspiredIntegrator:
+    """
+    Enhanced Bio-Inspired Integration for sustainability across all components.
+    
+    Features:
+    - Inject sustainability core into all components
+    - Unified bio-inspired state management
+    - Cross-component sustainability coordination
+    """
+    
+    def __init__(self, bio_core=None):
+        self.bio_core = bio_core
+        self.sustainability_core = None
+        self.component_registry = {}
+        self._lock = threading.Lock()
+        
+        logger.info("Enhanced Bio-Inspired Integrator initialized")
+    
+    def inject_sustainability_core(self, sustainability_core: Any):
+        """Inject sustainability core into all components"""
+        self.sustainability_core = sustainability_core
+        with self._lock:
+            for component_name, component in self.component_registry.items():
+                if hasattr(component, 'inject_sustainability_core'):
+                    try:
+                        component.inject_sustainability_core(sustainability_core)
+                        logger.debug(f"Injected sustainability core into {component_name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to inject into {component_name}: {e}")
+    
+    def register_component(self, component_name: str, component: Any):
+        """Register a component for sustainability integration"""
+        with self._lock:
+            self.component_registry[component_name] = component
+            if self.sustainability_core and hasattr(component, 'inject_sustainability_core'):
+                try:
+                    component.inject_sustainability_core(self.sustainability_core)
+                except Exception as e:
+                    logger.warning(f"Failed to inject into {component_name}: {e}")
+    
+    def get_sustainability_status(self) -> Dict[str, Any]:
+        """Get sustainability status from all registered components"""
+        status = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'components': {}
+        }
+        
+        with self._lock:
+            for component_name, component in self.component_registry.items():
+                if hasattr(component, 'get_sustainability_status'):
+                    try:
+                        status['components'][component_name] = component.get_sustainability_status()
+                    except Exception as e:
+                        status['components'][component_name] = {'error': str(e)}
+                elif hasattr(component, 'sustainability_score'):
+                    status['components'][component_name] = {
+                        'sustainability_score': getattr(component, 'sustainability_score', 0.0)
+                    }
+        
+        return status
+
+# ============================================================================
+# Unified Sustainability Dashboard (New Module)
+# ============================================================================
+
+class UnifiedSustainabilityDashboard:
+    """
+    Unified Sustainability Dashboard for the Green Agent Ecosystem.
+    
+    Features:
+    - Carbon position monitoring
+    - Helium position monitoring
+    - Sustainability score aggregation
+    - Circularity score tracking
+    - Ecosystem health monitoring
+    - Recommendation generation
+    """
+    
+    def __init__(self, ecosystem):
+        self.ecosystem = ecosystem
+        self.history = []
+        self.alert_thresholds = {
+            'sustainability_score': 0.5,
+            'carbon_budget_remaining': 0.2,
+            'helium_budget_remaining': 0.2,
+            'circularity_score': 0.4
+        }
+        
+        # Start background monitoring
+        self._running = True
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+        
+        logger.info("Unified Sustainability Dashboard initialized")
+    
+    def _monitor_loop(self):
+        """Background monitoring loop"""
+        while self._running:
+            try:
+                status = self.get_dashboard_status()
+                self.history.append(status)
+                if len(self.history) > 1000:
+                    self.history = self.history[-1000:]
+                
+                # Check alerts
+                self._check_alerts(status)
+                
+                import time
+                time.sleep(60)  # Check every minute
+            except Exception as e:
+                logger.error(f"Monitor loop error: {str(e)}")
+                import time
+                time.sleep(300)
+    
+    def _check_alerts(self, status: Dict[str, Any]):
+        """Check for alerts based on thresholds"""
+        alerts = []
+        
+        # Check sustainability score
+        if status.get('sustainability_score', 0) < self.alert_thresholds['sustainability_score']:
+            alerts.append({
+                'level': 'warning',
+                'message': f"Sustainability score {status['sustainability_score']:.2f} below threshold {self.alert_thresholds['sustainability_score']}"
+            })
+        
+        # Check carbon budget
+        carbon_pos = status.get('carbon_position', {})
+        carbon_remaining_ratio = carbon_pos.get('remaining_budget_ratio', 1.0)
+        if carbon_remaining_ratio < self.alert_thresholds['carbon_budget_remaining']:
+            alerts.append({
+                'level': 'critical',
+                'message': f"Carbon budget remaining {carbon_remaining_ratio:.1%} below threshold"
+            })
+        
+        # Check helium budget
+        helium_pos = status.get('helium_position', {})
+        helium_remaining_ratio = helium_pos.get('remaining_budget_ratio', 1.0)
+        if helium_remaining_ratio < self.alert_thresholds['helium_budget_remaining']:
+            alerts.append({
+                'level': 'critical',
+                'message': f"Helium budget remaining {helium_remaining_ratio:.1%} below threshold"
+            })
+        
+        # Check circularity
+        if status.get('circularity_score', 0) < self.alert_thresholds['circularity_score']:
+            alerts.append({
+                'level': 'warning',
+                'message': f"Circularity score {status['circularity_score']:.2f} below threshold"
+            })
+        
+        if alerts:
+            for alert in alerts:
+                logger.log(
+                    logging.CRITICAL if alert['level'] == 'critical' else logging.WARNING,
+                    f"DASHBOARD ALERT: {alert['message']}"
+                )
+    
+    def get_dashboard_status(self) -> Dict[str, Any]:
+        """Get unified dashboard status"""
+        ecosystem = self.ecosystem
+        
+        # Get carbon position from metrics
+        carbon_position = {}
+        if hasattr(ecosystem, 'metrics'):
+            metrics_summary = ecosystem.metrics.get_metrics_summary()
+            carbon_position = {
+                'total_carbon_kg': metrics_summary.get('resource_consumption', {}).get('total_carbon_kg', 0),
+                'carbon_per_inference': metrics_summary.get('resource_consumption', {}).get('carbon_per_inference', 0),
+                'savings_kg': getattr(ecosystem.metrics, 'total_carbon_savings_kg', 0)
+            }
+            if hasattr(ecosystem.metrics, 'accountant'):
+                carbon_position['remaining_budget_ratio'] = (
+                    ecosystem.metrics.accountant.get_current_position().carbon_budget_remaining_kg /
+                    max(ecosystem.metrics.accountant.carbon_budget_kg, 1)
+                )
+        
+        # Get helium position
+        helium_position = {}
+        if hasattr(ecosystem, 'helium_tracker'):
+            helium_pos = ecosystem.helium_tracker.get_helium_position()
+            helium_position = {
+                'total_usage_l': helium_pos.get('total_usage_l', 0),
+                'total_recovered_l': helium_pos.get('total_recovered_l', 0),
+                'remaining_budget_l': helium_pos.get('remaining_budget_l', 0),
+                'remaining_budget_ratio': helium_pos.get('remaining_budget_l', 0) / max(ecosystem.helium_tracker.helium_budget_l, 1)
+            }
+        
+        # Get sustainability score
+        sustainability_score = 0.5
+        if hasattr(ecosystem, 'sustainability_score'):
+            sustainability_score = ecosystem.sustainability_score
+        elif hasattr(ecosystem, 'metrics') and hasattr(ecosystem.metrics, 'sustainability_score'):
+            sustainability_score = ecosystem.metrics.sustainability_score
+        
+        # Get circularity score
+        circularity_score = 0.0
+        if hasattr(ecosystem, 'circular_manager') and ecosystem.circular_manager:
+            report = ecosystem.circular_manager.get_circularity_report()
+            circularity_score = report.get('circularity_score', 0.0)
+        
+        # Get ecosystem health
+        ecosystem_health = 0.5
+        if hasattr(ecosystem, 'get_ecosystem_health'):
+            ecosystem_health = ecosystem.get_ecosystem_health()
+        
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': sustainability_score,
+            'carbon_position': carbon_position,
+            'helium_position': helium_position,
+            'circularity_score': circularity_score,
+            'ecosystem_health': ecosystem_health,
+            'expert_count': len(ecosystem.experts) if hasattr(ecosystem, 'experts') else 0,
+            'is_healthy': all([
+                sustainability_score > 0.3,
+                carbon_position.get('remaining_budget_ratio', 0) > 0.1,
+                helium_position.get('remaining_budget_ratio', 0) > 0.1
+            ])
+        }
+    
+    def get_recommendations(self) -> List[Dict[str, Any]]:
+        """Get sustainability recommendations"""
+        status = self.get_dashboard_status()
+        recommendations = []
+        
+        if status['sustainability_score'] < 0.5:
+            recommendations.append({
+                'priority': 'high',
+                'category': 'sustainability',
+                'message': 'Improve sustainability score through optimization',
+                'actions': ['Reduce carbon intensity', 'Increase renewable energy usage']
+            })
+        
+        if status['carbon_position'].get('remaining_budget_ratio', 1.0) < 0.2:
+            recommendations.append({
+                'priority': 'critical',
+                'category': 'carbon',
+                'message': 'Carbon budget critically low',
+                'actions': ['Implement immediate carbon reduction', 'Purchase carbon offsets']
+            })
+        
+        if status['helium_position'].get('remaining_budget_ratio', 1.0) < 0.2:
+            recommendations.append({
+                'priority': 'critical',
+                'category': 'helium',
+                'message': 'Helium budget critically low',
+                'actions': ['Implement helium recovery systems', 'Optimize helium usage']
+            })
+        
+        if status['circularity_score'] < 0.4:
+            recommendations.append({
+                'priority': 'medium',
+                'category': 'circularity',
+                'message': 'Improve circularity score',
+                'actions': ['Increase component recycling', 'Extend hardware lifecycle']
+            })
+        
+        return recommendations
+    
+    def generate_report(self) -> Dict[str, Any]:
+        """Generate comprehensive sustainability report"""
+        status = self.get_dashboard_status()
+        recommendations = self.get_recommendations()
+        
+        # Historical trend analysis
+        trend = 'stable'
+        if len(self.history) > 10:
+            recent_scores = [h['sustainability_score'] for h in self.history[-10:]]
+            if recent_scores[-1] > recent_scores[0] * 1.05:
+                trend = 'improving'
+            elif recent_scores[-1] < recent_scores[0] * 0.95:
+                trend = 'declining'
+        
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': status['sustainability_score'],
+            'trend': trend,
+            'carbon_position': status['carbon_position'],
+            'helium_position': status['helium_position'],
+            'circularity_score': status['circularity_score'],
+            'ecosystem_health': status['ecosystem_health'],
+            'recommendations': recommendations,
+            'is_healthy': status['is_healthy'],
+            'generated_by': 'UnifiedSustainabilityDashboard'
+        }
+    
+    def shutdown(self):
+        """Shutdown the dashboard"""
+        self._running = False
+        logger.info("Unified Sustainability Dashboard shut down")
+
+# ============================================================================
+# Predictive Maintenance Integration (New Module)
+# ============================================================================
+
+class PredictiveMaintenanceIntegrator:
+    """
+    Predictive Maintenance Integration for the Green Agent Ecosystem.
+    
+    Features:
+    - Lifecycle predictions from all components
+    - Carbon and helium forecasts
+    - Workload predictions
+    - Anomaly detection alerts
+    """
+    
+    def __init__(self, ecosystem):
+        self.ecosystem = ecosystem
+        self.predictions = {}
+        self.anomaly_history = deque(maxlen=1000)
+        self._lock = threading.Lock()
+        
+        # Start background prediction loop
+        self._running = True
+        self._predict_thread = threading.Thread(target=self._predict_loop, daemon=True)
+        self._predict_thread.start()
+        
+        logger.info("Predictive Maintenance Integrator initialized")
+    
+    def _predict_loop(self):
+        """Background prediction loop"""
+        while self._running:
+            try:
+                insights = self.get_predictive_insights()
+                with self._lock:
+                    self.predictions = insights
+                
+                import time
+                time.sleep(300)  # Predict every 5 minutes
+            except Exception as e:
+                logger.error(f"Prediction loop error: {str(e)}")
+                import time
+                time.sleep(600)
+    
+    def get_predictive_insights(self) -> Dict[str, Any]:
+        """Get predictive insights from all modules"""
+        ecosystem = self.ecosystem
+        insights = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'lifecycle_predictions': {},
+            'carbon_forecast': {},
+            'helium_forecast': {},
+            'workload_predictions': {},
+            'anomaly_detections': []
+        }
+        
+        # Lifecycle predictions
+        if hasattr(ecosystem, 'circular_manager') and ecosystem.circular_manager:
+            if hasattr(ecosystem.circular_manager, 'predictive_analyzer'):
+                analyzer = ecosystem.circular_manager.predictive_analyzer
+                if analyzer and analyzer.is_trained:
+                    for component_id in list(ecosystem.circular_manager.components.keys())[:5]:
+                        prediction = asyncio.run(
+                            analyzer.predict_lifetime({'age_days': 365, 'utilization': 0.5})
+                        )
+                        insights['lifecycle_predictions'][component_id] = prediction
+        
+        # Carbon forecast
+        if hasattr(ecosystem, 'metrics') and ecosystem.metrics:
+            if hasattr(ecosystem.metrics, 'predictive_analyzer'):
+                forecast = asyncio.run(
+                    ecosystem.metrics.predictive_analyzer.predict_metric_trend()
+                )
+                insights['carbon_forecast'] = {
+                    'predicted_health': forecast.get('predicted_health', 0.5),
+                    'confidence': forecast.get('confidence', 0.0),
+                    'trend': forecast.get('trend', 'stable')
+                }
+        
+        # Helium forecast
+        if hasattr(ecosystem, 'helium_tracker'):
+            helium_pos = ecosystem.helium_tracker.get_helium_position()
+            insights['helium_forecast'] = {
+                'current_position_l': helium_pos.get('net_position_l', 0),
+                'remaining_budget_l': helium_pos.get('remaining_budget_l', 0),
+                'days_remaining': helium_pos.get('remaining_budget_l', 0) / max(0.1, abs(helium_pos.get('net_position_l', 0) / 365))
+            }
+        
+        # Workload predictions
+        if hasattr(ecosystem, 'work_integrator'):
+            work_stats = ecosystem.work_integrator.get_work_statistics()
+            insights['workload_predictions'] = {
+                'active_works': work_stats.get('active_works', 0),
+                'queued_works': work_stats.get('queued_works', 0),
+                'success_rate': work_stats.get('success_rate', 0.5),
+                'predicted_bottlenecks': ['energy'] if work_stats.get('active_works', 0) > 10 else []
+            }
+        
+        # Anomaly detections
+        if hasattr(ecosystem, 'metrics') and ecosystem.metrics:
+            if hasattr(ecosystem.metrics, 'anomaly_detector'):
+                detection_stats = ecosystem.metrics.anomaly_detector.get_detection_stats()
+                for detection in detection_stats.get('recent_detections', [])[-10:]:
+                    insights['anomaly_detections'].append({
+                        'metric': detection.get('metric', 'unknown'),
+                        'type': detection.get('type', 'unknown'),
+                        'severity': detection.get('severity', 'info'),
+                        'timestamp': detection.get('timestamp', datetime.utcnow().isoformat())
+                    })
+        
+        return insights
+    
+    def get_anomaly_alerts(self, severity: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get anomaly alerts by severity"""
+        alerts = []
+        with self._lock:
+            for anomaly in self.predictions.get('anomaly_detections', []):
+                if severity is None or anomaly.get('severity') == severity:
+                    alerts.append(anomaly)
+        return alerts
+    
+    def get_lifecycle_recommendations(self) -> List[Dict[str, Any]]:
+        """Get lifecycle-based recommendations"""
+        recommendations = []
+        
+        with self._lock:
+            for component_id, prediction in self.predictions.get('lifecycle_predictions', {}).items():
+                predicted_days = prediction.get('predicted_days', 365)
+                if predicted_days < 30:
+                    recommendations.append({
+                        'component_id': component_id,
+                        'priority': 'critical',
+                        'action': 'Immediate replacement recommended',
+                        'predicted_remaining_days': predicted_days
+                    })
+                elif predicted_days < 90:
+                    recommendations.append({
+                        'component_id': component_id,
+                        'priority': 'high',
+                        'action': 'Plan for replacement soon',
+                        'predicted_remaining_days': predicted_days
+                    })
+                elif predicted_days < 180:
+                    recommendations.append({
+                        'component_id': component_id,
+                        'priority': 'medium',
+                        'action': 'Consider maintenance',
+                        'predicted_remaining_days': predicted_days
+                    })
+        
+        return recommendations
+    
+    def shutdown(self):
+        """Shutdown the integrator"""
+        self._running = False
+        logger.info("Predictive Maintenance Integrator shut down")
+
+# ============================================================================
+# Unified Metabolic Ecosystem - Enhanced Main Entry Point
 # ============================================================================
 
 class UnifiedMetabolicEcosystem:
     """
-    Unified Metabolic Ecosystem v4.0.0
+    Unified Metabolic Ecosystem v5.0.0
     
     Complete integration of MoE Expert System with Bio-Inspired Architecture.
+    Enhanced with sustainability dashboard and predictive maintenance.
     
     This class wires together:
     - Expert Registry (Genome Repository)
@@ -234,6 +738,8 @@ class UnifiedMetabolicEcosystem:
     - Advanced Modules (Self-Evolving Gates, Federated Learning, Cross-Region)
     - Integration Layer (12-Layer Bridge, Work Orchestrator, Quantum Limits)
     - Monitoring (Metabolic Observatory)
+    - Sustainability Dashboard (Ecosystem Health Monitor)
+    - Predictive Maintenance (Future State Predictor)
     """
     
     def __init__(
@@ -244,6 +750,8 @@ class UnifiedMetabolicEcosystem:
         enable_evolving_gates: bool = True,
         enable_federated: bool = False,
         enable_cross_region: bool = False,
+        enable_sustainability_dashboard: bool = True,
+        enable_predictive_maintenance: bool = True,
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -256,13 +764,20 @@ class UnifiedMetabolicEcosystem:
             enable_evolving_gates: Enable self-evolving gates
             enable_federated: Enable federated learning
             enable_cross_region: Enable cross-region federation
+            enable_sustainability_dashboard: Enable sustainability dashboard
+            enable_predictive_maintenance: Enable predictive maintenance
             config: Optional configuration dictionary
         """
         self.config = config or {}
         self.initialization_status: Dict[str, bool] = {}
         
+        # Sustainability tracking
+        self.sustainability_score = 0.0
+        self.helium_tracker = None
+        self.circular_manager = None
+        
         logger.info("=" * 70)
-        logger.info("Initializing Unified Metabolic Ecosystem v4.0.0")
+        logger.info("Initializing Unified Metabolic Ecosystem v5.0.0")
         logger.info("=" * 70)
         
         # ====================================================================
@@ -294,7 +809,6 @@ class UnifiedMetabolicEcosystem:
                 enable_ecosystem=self.bio_available
             )
             
-            # Inject bio-core if available
             if self.bio_available:
                 self.registry.inject_bio_core(self.bio_core)
             
@@ -314,7 +828,6 @@ class UnifiedMetabolicEcosystem:
                 enable_bio_integration=self.bio_available
             )
             
-            # Inject bio-core if available
             if self.bio_available:
                 self.gating_network.inject_bio_core(self.bio_core)
             
@@ -336,10 +849,8 @@ class UnifiedMetabolicEcosystem:
                 enable_metabolic_pathways=self.bio_available
             )
             
-            # Wire gating network to router
             self.router.gating_network = self.gating_network
             
-            # Inject bio-core if available
             if self.bio_available:
                 self.router.inject_bio_core(self.bio_core)
             
@@ -424,12 +935,11 @@ class UnifiedMetabolicEcosystem:
             self.router.experts[expert_id] = expert
             self.router.circuit_breakers[expert_id] = ExpertCircuitBreaker(expert_id=expert_id)
         
-        # Update gating network index map
         for idx, expert_id in self.router.expert_index_map.items():
             self.gating_network.expert_index_map[idx] = expert_id
         
         # ====================================================================
-        # Step 7: Initialize Advanced Modules (Optional)
+        # Step 7: Initialize Advanced Modules
         # ====================================================================
         
         # Self-Evolving Gates
@@ -539,7 +1049,102 @@ class UnifiedMetabolicEcosystem:
             self.initialization_status['metrics'] = False
         
         # ====================================================================
-        # Step 10: Wire Router Metrics
+        # Step 10: Initialize Sustainability Modules
+        # ====================================================================
+        
+        # Carbon Sequestration
+        if SEQUESTRATION_AVAILABLE:
+            try:
+                self.carbon_manager = CarbonSequestrationManager()
+                self.initialization_status['carbon_sequestration'] = True
+                logger.info("[SUSTAINABILITY] Carbon Sequestration Manager initialized")
+            except Exception as e:
+                logger.error(f"[SUSTAINABILITY] Failed to initialize Carbon Sequestration: {str(e)}")
+                self.initialization_status['carbon_sequestration'] = False
+        
+        # Circular Computing
+        if CIRCULAR_AVAILABLE:
+            try:
+                self.circular_manager = CircularComputingManager()
+                self.initialization_status['circular_computing'] = True
+                logger.info("[SUSTAINABILITY] Circular Computing Manager initialized")
+            except Exception as e:
+                logger.error(f"[SUSTAINABILITY] Failed to initialize Circular Computing: {str(e)}")
+                self.initialization_status['circular_computing'] = False
+        
+        # Carbon Offset Verification
+        if OFFSET_AVAILABLE:
+            try:
+                self.offset_verifier = AutomatedCarbonOffsetVerification()
+                self.initialization_status['carbon_offset'] = True
+                logger.info("[SUSTAINABILITY] Carbon Offset Verification initialized")
+            except Exception as e:
+                logger.error(f"[SUSTAINABILITY] Failed to initialize Carbon Offset: {str(e)}")
+                self.initialization_status['carbon_offset'] = False
+        
+        # Biodiversity Impact
+        if BIODIVERSITY_AVAILABLE:
+            try:
+                self.biodiversity = BiodiversityImpactAssessor()
+                self.initialization_status['biodiversity'] = True
+                logger.info("[SUSTAINABILITY] Biodiversity Impact Assessor initialized")
+            except Exception as e:
+                logger.error(f"[SUSTAINABILITY] Failed to initialize Biodiversity: {str(e)}")
+                self.initialization_status['biodiversity'] = False
+        
+        # ====================================================================
+        # Step 11: Initialize Enhanced Bio-Inspired Integration
+        # ====================================================================
+        try:
+            self.bio_integrator = EnhancedBioInspiredIntegrator(self.bio_core)
+            
+            # Register all components
+            components_to_register = [
+                ('registry', self.registry),
+                ('gating_network', self.gating_network),
+                ('router', self.router),
+                ('metrics', self.metrics),
+                ('work_integrator', self.work_integrator),
+                ('layer_integrator', self.layer_integrator),
+            ]
+            for name, component in components_to_register:
+                if component:
+                    self.bio_integrator.register_component(name, component)
+            
+            self.initialization_status['bio_integrator'] = True
+            logger.info("[BIO-INTEGRATOR] Enhanced Bio-Inspired Integrator initialized")
+        except Exception as e:
+            logger.error(f"[BIO-INTEGRATOR] Failed to initialize Bio-Integrator: {str(e)}")
+            self.initialization_status['bio_integrator'] = False
+        
+        # ====================================================================
+        # Step 12: Initialize Sustainability Dashboard
+        # ====================================================================
+        self.sustainability_dashboard = None
+        if enable_sustainability_dashboard:
+            try:
+                self.sustainability_dashboard = UnifiedSustainabilityDashboard(self)
+                self.initialization_status['sustainability_dashboard'] = True
+                logger.info("[DASHBOARD] Unified Sustainability Dashboard initialized")
+            except Exception as e:
+                logger.error(f"[DASHBOARD] Failed to initialize Sustainability Dashboard: {str(e)}")
+                self.initialization_status['sustainability_dashboard'] = False
+        
+        # ====================================================================
+        # Step 13: Initialize Predictive Maintenance
+        # ====================================================================
+        self.predictive_maintenance = None
+        if enable_predictive_maintenance:
+            try:
+                self.predictive_maintenance = PredictiveMaintenanceIntegrator(self)
+                self.initialization_status['predictive_maintenance'] = True
+                logger.info("[PREDICTIVE] Predictive Maintenance Integrator initialized")
+            except Exception as e:
+                logger.error(f"[PREDICTIVE] Failed to initialize Predictive Maintenance: {str(e)}")
+                self.initialization_status['predictive_maintenance'] = False
+        
+        # ====================================================================
+        # Step 14: Wire Router Metrics
         # ====================================================================
         if hasattr(self.router, 'metrics_collector'):
             self.router.metrics_collector = self.metrics
@@ -551,6 +1156,8 @@ class UnifiedMetabolicEcosystem:
         logger.info("Unified Metabolic Ecosystem Initialization Complete")
         logger.info(f"  Bio-Inspired: {self.bio_available}")
         logger.info(f"  Experts: {len(self.experts)}")
+        logger.info(f"  Sustainability Dashboard: {enable_sustainability_dashboard}")
+        logger.info(f"  Predictive Maintenance: {enable_predictive_maintenance}")
         logger.info(f"  Status: {sum(self.initialization_status.values())}/{len(self.initialization_status)} components")
         logger.info("=" * 70)
     
@@ -559,13 +1166,14 @@ class UnifiedMetabolicEcosystem:
     # ========================================================================
     
     def get_ecosystem_status(self) -> Dict[str, Any]:
-        """Get comprehensive ecosystem status"""
+        """Get comprehensive ecosystem status with sustainability"""
         status = {
-            'ecosystem_version': '4.0.0',
+            'ecosystem_version': '5.0.0',
             'bio_inspired_available': self.bio_available,
             'initialization_status': self.initialization_status,
             'expert_count': len(self.experts),
-            'expert_types': list(self.experts.keys())
+            'expert_types': list(self.experts.keys()),
+            'sustainability_score': self.sustainability_score
         }
         
         # Registry stats
@@ -588,12 +1196,50 @@ class UnifiedMetabolicEcosystem:
         if hasattr(self, 'metrics'):
             status['metrics'] = self.metrics.get_metrics_summary()
         
+        # Sustainability dashboard
+        if self.sustainability_dashboard:
+            status['dashboard'] = self.sustainability_dashboard.get_dashboard_status()
+        
+        # Predictive maintenance
+        if self.predictive_maintenance:
+            status['predictive'] = self.predictive_maintenance.get_predictive_insights()
+        
         return status
+    
+    def get_ecosystem_health(self) -> float:
+        """Calculate overall ecosystem health score"""
+        health_scores = []
+        
+        # Registry health
+        if hasattr(self, 'registry'):
+            registry_stats = self.registry.get_registry_stats()
+            health_scores.append(registry_stats.get('health_score', 0.5))
+        
+        # Router health
+        if hasattr(self, 'router'):
+            router_stats = self.router.get_routing_stats()
+            health_scores.append(router_stats.get('health_score', 0.5))
+        
+        # Metrics health
+        if hasattr(self, 'metrics'):
+            metrics_summary = self.metrics.get_metrics_summary()
+            health_scores.append(metrics_summary.get('health_score', 0.5))
+        
+        # Sustainability score
+        health_scores.append(self.sustainability_score)
+        
+        return np.mean(health_scores) if health_scores else 0.5
     
     def process_task(self, task: Dict[str, Any], pipeline_type: str = 'standard') -> Dict[str, Any]:
         """Process a task through the unified metabolic ecosystem"""
         if hasattr(self, 'work_integrator'):
-            return self.work_integrator.process_work(task, pipeline_type)
+            result = self.work_integrator.process_work(task, pipeline_type)
+            
+            # Update sustainability score
+            if result and hasattr(self, 'sustainability_score'):
+                self.sustainability_score = self._update_sustainability_score(result)
+            
+            return result
         elif hasattr(self, 'router'):
             return self.router.route_and_execute(
                 workload_profile=task,
@@ -602,6 +1248,34 @@ class UnifiedMetabolicEcosystem:
             )
         else:
             return {'success': False, 'error': 'No work processor available'}
+    
+    def _update_sustainability_score(self, result: Dict[str, Any]) -> float:
+        """Update sustainability score based on task result"""
+        if hasattr(self, 'metrics') and self.metrics:
+            return self.metrics.sustainability_score
+        return self.sustainability_score
+    
+    def get_sustainability_report(self) -> Dict[str, Any]:
+        """Get comprehensive sustainability report"""
+        if self.sustainability_dashboard:
+            return self.sustainability_dashboard.generate_report()
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'status': 'dashboard_not_enabled'
+        }
+    
+    def get_predictive_insights(self) -> Dict[str, Any]:
+        """Get predictive insights from all modules"""
+        if self.predictive_maintenance:
+            return self.predictive_maintenance.get_predictive_insights()
+        return {'status': 'predictive_maintenance_not_enabled'}
+    
+    def get_sustainability_recommendations(self) -> List[Dict[str, Any]]:
+        """Get sustainability recommendations"""
+        if self.sustainability_dashboard:
+            return self.sustainability_dashboard.get_recommendations()
+        return [{'message': 'Enable sustainability dashboard for recommendations'}]
     
     def get_expert(self, expert_type: str) -> Optional[Any]:
         """Get expert by type"""
@@ -618,6 +1292,10 @@ class UnifiedMetabolicEcosystem:
         
         if hasattr(expert_instance, 'profile'):
             self.registry.register_expert(expert_instance.profile, validate=False)
+        
+        # Register with bio-integrator
+        if hasattr(self, 'bio_integrator'):
+            self.bio_integrator.register_component(f"expert_{expert_type}", expert_instance)
         
         logger.info(f"Dynamic expert registered: {expert_type}")
     
@@ -642,6 +1320,15 @@ class UnifiedMetabolicEcosystem:
     def shutdown(self):
         """Graceful shutdown of the ecosystem"""
         logger.info("Shutting down Unified Metabolic Ecosystem...")
+        
+        # Shutdown dashboard
+        if self.sustainability_dashboard:
+            self.sustainability_dashboard.shutdown()
+        
+        # Shutdown predictive maintenance
+        if self.predictive_maintenance:
+            self.predictive_maintenance.shutdown()
+        
         # Cleanup would go here
         logger.info("Ecosystem shutdown complete")
 
@@ -656,7 +1343,9 @@ def create_metabolic_ecosystem(
     enable_bio: bool = True,
     enable_evolving: bool = True,
     enable_federated: bool = False,
-    enable_cross_region: bool = False
+    enable_cross_region: bool = False,
+    enable_dashboard: bool = True,
+    enable_predictive: bool = True
 ) -> UnifiedMetabolicEcosystem:
     """
     Create a unified metabolic ecosystem with specified features.
@@ -668,6 +1357,8 @@ def create_metabolic_ecosystem(
         enable_evolving: Enable self-evolving gates
         enable_federated: Enable federated learning
         enable_cross_region: Enable cross-region federation
+        enable_dashboard: Enable sustainability dashboard
+        enable_predictive: Enable predictive maintenance
         
     Returns:
         Configured UnifiedMetabolicEcosystem instance
@@ -678,7 +1369,9 @@ def create_metabolic_ecosystem(
         enable_bio_inspired=enable_bio,
         enable_evolving_gates=enable_evolving,
         enable_federated=enable_federated,
-        enable_cross_region=enable_cross_region
+        enable_cross_region=enable_cross_region,
+        enable_sustainability_dashboard=enable_dashboard,
+        enable_predictive_maintenance=enable_predictive
     )
 
 
@@ -690,7 +1383,9 @@ def create_minimal_ecosystem() -> UnifiedMetabolicEcosystem:
         enable_bio_inspired=False,
         enable_evolving_gates=False,
         enable_federated=False,
-        enable_cross_region=False
+        enable_cross_region=False,
+        enable_sustainability_dashboard=False,
+        enable_predictive_maintenance=False
     )
 
 
@@ -702,7 +1397,9 @@ def create_full_ecosystem() -> UnifiedMetabolicEcosystem:
         enable_bio_inspired=BIO_INSPIRED_AVAILABLE,
         enable_evolving_gates=EVOLVING_GATES_AVAILABLE,
         enable_federated=FEDERATED_AVAILABLE,
-        enable_cross_region=CROSS_REGION_AVAILABLE
+        enable_cross_region=CROSS_REGION_AVAILABLE,
+        enable_sustainability_dashboard=True,
+        enable_predictive_maintenance=True
     )
 
 
@@ -799,7 +1496,7 @@ __all__ = [
     'AnomalyEvent',
     'CostAttribution',
     
-    # Advanced (conditionally available)
+    # Advanced
     'EnhancedSelfEvolvingGate',
     'SelfEvolvingGate',
     'EnhancedFederatedOrchestrator',
@@ -809,13 +1506,22 @@ __all__ = [
     'SyncMode',
     'AggregationTier',
     
+    # Sustainability Modules
+    'UnifiedSustainabilityDashboard',
+    'PredictiveMaintenanceIntegrator',
+    'EnhancedBioInspiredIntegrator',
+    
     # Status
     'BIO_INSPIRED_AVAILABLE',
     'QUANTUM_AVAILABLE',
     'HELIUM_AVAILABLE',
     'EVOLVING_GATES_AVAILABLE',
     'FEDERATED_AVAILABLE',
-    'CROSS_REGION_AVAILABLE'
+    'CROSS_REGION_AVAILABLE',
+    'BIODIVERSITY_AVAILABLE',
+    'SEQUESTRATION_AVAILABLE',
+    'CIRCULAR_AVAILABLE',
+    'OFFSET_AVAILABLE'
 ]
 
 
@@ -823,6 +1529,6 @@ __all__ = [
 # Module Version
 # ============================================================================
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 __author__ = "Green Agent Team"
-__description__ = "Unified Metabolic Ecosystem - Bio-Inspired MoE Expert System"
+__description__ = "Unified Metabolic Ecosystem - Bio-Inspired MoE Expert System with Sustainability Dashboard"
