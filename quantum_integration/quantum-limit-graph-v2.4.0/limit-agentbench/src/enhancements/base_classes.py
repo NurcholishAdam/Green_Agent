@@ -2,6 +2,8 @@
 
 """
 Green Agent Base Classes - Version 10.0 (Enterprise Platinum)
+ENHANCED WITH: Carbon Intensity Integration, Helium Tracking, Sustainability Dashboard,
+Predictive Analytics, and Complete Green Agent Capabilities
 
 CRITICAL FIXES OVER v9.0:
 1. FIXED: Memory leak with bounded collections in BaseMLModel
@@ -16,7 +18,11 @@ CRITICAL FIXES OVER v9.0:
 10. ADDED: Prometheus metrics for all operations
 11. ADDED: Size-based cache eviction with LRU
 12. ADDED: Graceful degradation for optional dependencies
-13. FIXED: Graceful shutdown with proper cleanup
+13. ADDED: Carbon Intensity Integration with real-time API support
+14. ADDED: Helium Tracking and Awareness module
+15. ADDED: Sustainability Dashboard with unified reporting
+16. ADDED: Predictive Analytics with ensemble forecasting
+17. ADDED: FIXED: Graceful shutdown with proper cleanup
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from weakref import WeakValueDictionary
 import functools
 import inspect
 import tempfile
+import os
 
 import numpy as np
 
@@ -77,6 +84,8 @@ except ImportError:
 try:
     import sklearn
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -92,6 +101,13 @@ try:
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
+
+# Async HTTP for carbon intensity
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -121,6 +137,13 @@ MODEL_PREDICTION_LATENCY = Histogram('model_prediction_duration_seconds', 'Predi
 CIRCUIT_BREAKER_STATE = Gauge('circuit_breaker_state', 'Circuit breaker state', ['name'], registry=REGISTRY)
 HEALTH_SCORE = Gauge('component_health_score', 'Component health score (0-100)', ['component'], registry=REGISTRY)
 DB_SIZE = Gauge('base_classes_db_size_mb', 'Database size in MB', registry=REGISTRY)
+
+# New sustainability metrics
+CARBON_INTENSITY = Gauge('carbon_intensity_gco2_per_kwh', 'Real-time carbon intensity', registry=REGISTRY)
+HELIUM_EFFICIENCY = Gauge('helium_efficiency_score', 'Helium efficiency (0-1)', registry=REGISTRY)
+SUSTAINABILITY_SCORE = Gauge('sustainability_score', 'Overall sustainability score (0-100)', registry=REGISTRY)
+CARBON_SAVINGS = Counter('carbon_savings_total', 'Total carbon savings', ['source'], registry=REGISTRY)
+HELIUM_SAVINGS = Counter('helium_savings_total', 'Total helium savings', ['source'], registry=REGISTRY)
 
 # Constants
 MAX_PREDICTION_HISTORY = 10000
@@ -181,6 +204,730 @@ class TimeoutError(GreenAgentException):
 class CircuitBreakerOpenError(GreenAgentException):
     """Circuit breaker is open"""
     pass
+
+class CarbonIntensityError(GreenAgentException):
+    """Carbon intensity API errors"""
+    pass
+
+class HeliumTrackingError(GreenAgentException):
+    """Helium tracking errors"""
+    pass
+
+# ============================================================
+# CARBON INTENSITY INTEGRATION MODULE
+# ============================================================
+
+class CarbonIntensityManager:
+    """
+    Real-time carbon intensity integration with API support.
+    
+    Features:
+    - Real-time carbon intensity fetching from electricitymap.org
+    - Historical intensity tracking
+    - Carbon savings calculation
+    - Regional carbon profiles
+    """
+    
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300  # 5 minutes
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+        self.total_carbon_savings_kg = 0.0
+        self.region_profiles = self._initialize_region_profiles()
+        
+        if not AIOHTTP_AVAILABLE:
+            logger.warning("aiohttp not available - carbon intensity API disabled")
+    
+    def _initialize_region_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """Initialize regional carbon profiles"""
+        return {
+            'us-east': {'timezone': -5, 'renewable_pct': 30, 'base_intensity': 420},
+            'us-west': {'timezone': -8, 'renewable_pct': 45, 'base_intensity': 350},
+            'eu-west': {'timezone': 0, 'renewable_pct': 50, 'base_intensity': 280},
+            'eu-north': {'timezone': 0, 'renewable_pct': 60, 'base_intensity': 220},
+            'asia-east': {'timezone': 8, 'renewable_pct': 20, 'base_intensity': 500},
+            'asia-southeast': {'timezone': 7, 'renewable_pct': 25, 'base_intensity': 480},
+            'australia': {'timezone': 10, 'renewable_pct': 35, 'base_intensity': 380},
+            'south-america': {'timezone': -3, 'renewable_pct': 40, 'base_intensity': 320},
+            'africa': {'timezone': 2, 'renewable_pct': 25, 'base_intensity': 450},
+            'middle-east': {'timezone': 3, 'renewable_pct': 15, 'base_intensity': 550}
+        }
+    
+    async def _get_session(self):
+        if self._session is None and AIOHTTP_AVAILABLE:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        """Fetch real-time carbon intensity from API"""
+        async with self._lock:
+            session = await self._get_session()
+            self.region = region
+            
+            try:
+                if session and AIOHTTP_AVAILABLE:
+                    url = f"{self.endpoint}/latest?zone={region}"
+                    headers = {'auth-token': self.api_key} if self.api_key else {}
+                    
+                    async with session.get(url, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self.carbon_intensity = data.get('carbonIntensity', 
+                                self.region_profiles.get(region, {}).get('base_intensity', 400))
+                            self.last_update = datetime.now()
+                            self.cache[region] = {
+                                'intensity': self.carbon_intensity,
+                                'timestamp': self.last_update
+                            }
+                            self.historical_intensities.append(self.carbon_intensity)
+                            
+                            CARBON_INTENSITY.set(self.carbon_intensity)
+                            logger.info(f"Carbon intensity updated: {region} = {self.carbon_intensity} gCO2/kWh")
+                            return {'intensity': self.carbon_intensity, 'region': region}
+                else:
+                    # Use fallback
+                    self.carbon_intensity = self._get_fallback_intensity(region)
+                    self.last_update = datetime.now()
+                    
+            except Exception as e:
+                logger.error(f"Carbon intensity fetch error: {e}")
+                self.carbon_intensity = self._get_fallback_intensity(region)
+                self.last_update = datetime.now()
+            
+            return {'intensity': self.carbon_intensity, 'region': self.region}
+    
+    def _get_fallback_intensity(self, region: str) -> float:
+        """Get fallback carbon intensity based on region"""
+        return self.region_profiles.get(region, {}).get('base_intensity', 400)
+    
+    async def get_current_intensity(self) -> float:
+        """Get current carbon intensity"""
+        if self.last_update is None or \
+           (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+    
+    async def calculate_carbon_savings(self, energy_saved_kwh: float) -> float:
+        """Calculate carbon savings from energy reduction"""
+        intensity = await self.get_current_intensity()
+        savings_kg = energy_saved_kwh * intensity / 1000  # Convert to kg CO2
+        self.total_carbon_savings_kg += savings_kg
+        CARBON_SAVINGS.labels(source='energy_efficiency').inc(savings_kg)
+        return savings_kg
+    
+    async def get_optimal_hours(self, region: str = "us-east", hours: int = 24) -> List[datetime]:
+        """Get optimal hours for low-carbon operations"""
+        current_hour = datetime.now().hour
+        optimal_hours = []
+        for i in range(hours):
+            hour = (current_hour + i) % 24
+            if 22 <= hour or hour <= 4:  # Night hours typically cleaner
+                optimal_hours.append(datetime.now() + timedelta(hours=i))
+        return optimal_hours
+    
+    async def get_carbon_trend(self, hours: int = 24) -> Dict:
+        """Get carbon intensity trend"""
+        if len(self.historical_intensities) < 2:
+            return {'trend': 'stable', 'change': 0}
+        
+        recent = list(self.historical_intensities)[-hours:]
+        if len(recent) > 2:
+            trend = np.polyfit(range(len(recent)), recent, 1)[0]
+        else:
+            trend = 0
+        
+        return {
+            'trend': 'increasing' if trend > 0.5 else 'decreasing' if trend < -0.5 else 'stable',
+            'change': trend,
+            'current': recent[-1] if recent else 0,
+            'average': np.mean(recent) if recent else 0
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================
+# HELIUM TRACKING MODULE
+# ============================================================
+
+class HeliumTracker:
+    """
+    Helium tracking and awareness module.
+    
+    Features:
+    - Helium usage recording
+    - Helium recovery tracking
+    - Efficiency scoring
+    - Budget management
+    - Helium-carbon equivalence
+    """
+    
+    def __init__(self, helium_budget_l: float = 100.0):
+        self.helium_budget_l = helium_budget_l
+        self.helium_usage: Dict[str, float] = defaultdict(float)
+        self.helium_recovered: Dict[str, float] = defaultdict(float)
+        self.helium_efficiency_scores: Dict[str, float] = defaultdict(lambda: 0.5)
+        self.total_usage_l = 0.0
+        self.total_recovered_l = 0.0
+        self._lock = asyncio.Lock()
+        self.history = deque(maxlen=10000)
+        self.component_helium: Dict[str, Dict[str, Any]] = {}
+        
+        # Helium to CO2 equivalence (approximate GWP)
+        self.helium_to_co2_factor = 20.0  # 1 kg helium ≈ 20 kg CO2 equivalent
+        
+        # Recovery rates by component type
+        self.recovery_rates = {
+            'cooling_system': 0.85,
+            'quantum_computer': 0.90,
+            'cryogenic_system': 0.80,
+            'standard_cooling': 0.75,
+            'mri_system': 0.95,
+            'helium_expert': 0.70,
+            'quantum_expert': 0.88,
+            'energy_expert': 0.60
+        }
+        
+        logger.info(f"Helium Tracker initialized: budget={helium_budget_l}L")
+    
+    def register_component_helium(
+        self,
+        component_id: str,
+        helium_content_l: float,
+        component_type: str = 'cooling_system'
+    ):
+        """Register helium content in a component"""
+        self.component_helium[component_id] = {
+            'total_l': helium_content_l,
+            'recovered_l': 0.0,
+            'used_l': 0.0,
+            'type': component_type,
+            'recovery_rate': self.recovery_rates.get(component_type, 0.85),
+            'registered_at': datetime.utcnow()
+        }
+        logger.debug(f"Registered helium content for {component_id}: {helium_content_l}L")
+    
+    async def record_helium_usage(self, component_id: str, amount_l: float, source: str = "unknown"):
+        """Record helium usage"""
+        async with self._lock:
+            self.helium_usage[component_id] += amount_l
+            self.total_usage_l += amount_l
+            
+            if component_id in self.component_helium:
+                self.component_helium[component_id]['used_l'] += amount_l
+            
+            self.history.append({
+                'component_id': component_id,
+                'amount_l': amount_l,
+                'type': 'usage',
+                'source': source,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+            logger.debug(f"Helium usage recorded: {component_id} = {amount_l}L")
+    
+    async def record_helium_recovery(self, component_id: str, amount_l: float, source: str = "unknown"):
+        """Record helium recovery"""
+        async with self._lock:
+            self.helium_recovered[component_id] += amount_l
+            self.total_recovered_l += amount_l
+            
+            if component_id in self.component_helium:
+                self.component_helium[component_id]['recovered_l'] += amount_l
+            
+            self.history.append({
+                'component_id': component_id,
+                'amount_l': amount_l,
+                'type': 'recovery',
+                'source': source,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+            logger.info(f"Helium recovery recorded: {component_id} = {amount_l}L")
+    
+    async def update_efficiency_score(self, component_id: str, score: float):
+        """Update helium efficiency score for a component"""
+        async with self._lock:
+            self.helium_efficiency_scores[component_id] = max(0.0, min(1.0, score))
+            HELIUM_EFFICIENCY.set(score)
+    
+    async def calculate_helium_offset_from_carbon(self, carbon_credit_kg: float) -> float:
+        """Calculate helium offset equivalent from carbon credit"""
+        return carbon_credit_kg * 0.05  # 1 kg CO2 offset allows for 0.05 L helium usage
+    
+    async def optimize_helium_allocation(self, requirements: Dict[str, float]) -> Dict[str, float]:
+        """Optimize helium allocation across components based on efficiency"""
+        async with self._lock:
+            total_required = sum(requirements.values())
+            
+            if total_required <= self.helium_budget_l - self.total_usage_l:
+                return requirements
+            
+            # Allocate based on efficiency scores
+            optimized = {}
+            total_efficiency = sum(self.helium_efficiency_scores.get(cid, 0.5) for cid in requirements)
+            
+            if total_efficiency == 0:
+                ratio = (self.helium_budget_l - self.total_usage_l) / total_required
+                for cid, req in requirements.items():
+                    optimized[cid] = req * ratio
+            else:
+                available = self.helium_budget_l - self.total_usage_l
+                for cid, req in requirements.items():
+                    efficiency_weight = self.helium_efficiency_scores.get(cid, 0.5) / total_efficiency
+                    optimized[cid] = available * efficiency_weight
+            
+            return optimized
+    
+    def get_helium_position(self) -> Dict[str, Any]:
+        """Get current helium position"""
+        net_position = self.total_usage_l - self.total_recovered_l
+        remaining_budget = self.helium_budget_l - net_position
+        
+        return {
+            'budget_l': self.helium_budget_l,
+            'total_usage_l': self.total_usage_l,
+            'total_recovered_l': self.total_recovered_l,
+            'net_position_l': net_position,
+            'remaining_budget_l': remaining_budget,
+            'co2_equivalent_kg': net_position * self.helium_to_co2_factor,
+            'efficiency_scores': dict(self.helium_efficiency_scores),
+            'component_status': {
+                cid: {
+                    'total_l': info['total_l'],
+                    'used_l': info['used_l'],
+                    'recovered_l': info['recovered_l'],
+                    'remaining_l': info['total_l'] - info['used_l'] - info['recovered_l'],
+                    'recovery_rate': info['recovery_rate']
+                }
+                for cid, info in self.component_helium.items()
+            },
+            'status': 'critical' if remaining_budget < 0 else 'warning' if remaining_budget < self.helium_budget_l * 0.2 else 'healthy'
+        }
+    
+    def get_helium_summary(self) -> Dict[str, Any]:
+        """Get helium summary"""
+        return {
+            'total_usage_l': self.total_usage_l,
+            'total_recovered_l': self.total_recovered_l,
+            'recovery_rate': self.total_recovered_l / max(self.total_usage_l, 1),
+            'remaining_budget_l': self.helium_budget_l - (self.total_usage_l - self.total_recovered_l),
+            'component_count': len(self.component_helium),
+            'average_efficiency': np.mean(list(self.helium_efficiency_scores.values())) if self.helium_efficiency_scores else 0.5
+        }
+
+# ============================================================
+# PREDICTIVE ANALYTICS MODULE
+# ============================================================
+
+class PredictiveMetricsAnalyzer:
+    """
+    Predictive analytics with ensemble forecasting.
+    
+    Features:
+    - Failure rate prediction
+    - Resource demand forecasting
+    - Performance trend analysis
+    - Anomaly detection
+    """
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.metric_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+        self.is_trained = False
+        
+        if SKLEARN_AVAILABLE:
+            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+            self._ml_available = True
+        else:
+            self._ml_available = False
+            logger.warning("Scikit-learn not available - predictive analytics limited")
+        
+        logger.info("Predictive Metrics Analyzer initialized")
+    
+    def update_history(self, metrics: Dict):
+        """Update metric history"""
+        self.metric_history.append({
+            'timestamp': datetime.utcnow(),
+            'success_rate': metrics.get('success_rate', 0.8),
+            'error_rate': metrics.get('error_rate', 0.02),
+            'avg_latency_ms': metrics.get('avg_latency_ms', 100),
+            'carbon_intensity': metrics.get('carbon_intensity', 400),
+            'helium_usage': metrics.get('helium_usage', 0.5),
+            'resource_utilization': metrics.get('resource_utilization', 0.5)
+        })
+    
+    async def train_forecast_model(self):
+        """Train ensemble forecasting models"""
+        if not self._ml_available or len(self.metric_history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.metric_history)}
+        
+        X = []
+        y = []
+        history_list = list(self.metric_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['success_rate'],
+                    data['error_rate'],
+                    data['avg_latency_ms'] / 1000,
+                    data['carbon_intensity'] / 100,
+                    data['helium_usage'],
+                    data['resource_utilization']
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['success_rate'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"Forecast models trained. R²: {results}")
+        return {'status': 'success', 'results': results, 'samples': len(X)}
+    
+    async def predict_failure_rate(self, hours: int = 24) -> Dict:
+        """Predict future failure rate"""
+        if not self.is_trained or len(self.metric_history) < 10:
+            return {'predicted': 0.02, 'confidence': 0.0, 'trend': 'insufficient_data'}
+        
+        recent = list(self.metric_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['success_rate'],
+                data['error_rate'],
+                data['avg_latency_ms'] / 1000,
+                data['carbon_intensity'] / 100,
+                data['helium_usage'],
+                data['resource_utilization']
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return {'predicted': 0.02, 'confidence': 0.0, 'trend': 'no_models'}
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        self.forecast_history.append({'prediction': prediction, 'trend': trend})
+        return {
+            'predicted': prediction,
+            'confidence': confidence,
+            'trend': trend,
+            'recommended_actions': self._generate_predictive_actions(prediction)
+        }
+    
+    async def forecast_resource_demand(self) -> Dict:
+        """Forecast resource demand"""
+        if len(self.metric_history) < 10:
+            return {'predicted_utilization': 0.5, 'confidence': 0.0}
+        
+        recent = [h['resource_utilization'] for h in list(self.metric_history)[-20:]]
+        trend = np.polyfit(range(len(recent)), recent, 1)[0] if len(recent) > 2 else 0
+        
+        return {
+            'predicted_utilization': min(1.0, max(0.0, recent[-1] + trend * 10)),
+            'trend': 'increasing' if trend > 0.01 else 'decreasing' if trend < -0.01 else 'stable',
+            'confidence': 0.7 if len(recent) > 20 else 0.5
+        }
+    
+    def _generate_predictive_actions(self, prediction: float) -> List[str]:
+        """Generate recommended actions based on predictions"""
+        actions = []
+        if prediction > 0.1:
+            actions.append("Increase redundancy to handle predicted failures")
+            actions.append("Optimize resource allocation")
+        elif prediction > 0.05:
+            actions.append("Monitor system health closely")
+            actions.append("Prepare fallback strategies")
+        else:
+            actions.append("System is stable - maintain current configuration")
+        return actions
+
+# ============================================================
+# SUSTAINABILITY DASHBOARD MODULE
+# ============================================================
+
+class SustainabilityDashboard:
+    """
+    Unified sustainability dashboard for Green Agent.
+    
+    Features:
+    - Carbon position monitoring
+    - Helium position monitoring
+    - Sustainability score aggregation
+    - Ecosystem health monitoring
+    - Recommendation generation
+    - Historical trends
+    """
+    
+    def __init__(self):
+        self.history = []
+        self.alert_thresholds = {
+            'sustainability_score': 0.5,
+            'carbon_budget_remaining': 0.2,
+            'helium_budget_remaining': 0.2,
+            'carbon_intensity': 500,
+            'helium_efficiency': 0.3
+        }
+        self.carbon_manager: Optional[CarbonIntensityManager] = None
+        self.helium_tracker: Optional[HeliumTracker] = None
+        self.predictive_analyzer: Optional[PredictiveMetricsAnalyzer] = None
+        
+        # Start background monitoring
+        self._running = True
+        self._monitor_task = None
+        self._start_background_monitoring()
+        
+        logger.info("Sustainability Dashboard initialized")
+    
+    def _start_background_monitoring(self):
+        """Start background monitoring"""
+        asyncio.create_task(self._monitor_loop())
+    
+    async def _monitor_loop(self):
+        """Background monitoring loop"""
+        while self._running:
+            try:
+                status = await self.get_dashboard_status()
+                self.history.append(status)
+                if len(self.history) > 1000:
+                    self.history = self.history[-1000:]
+                
+                # Check alerts
+                await self._check_alerts(status)
+                
+                await asyncio.sleep(60)  # Check every minute
+            except Exception as e:
+                logger.error(f"Monitor loop error: {str(e)}")
+                await asyncio.sleep(300)
+    
+    async def _check_alerts(self, status: Dict[str, Any]):
+        """Check for alerts based on thresholds"""
+        alerts = []
+        
+        # Check sustainability score
+        if status.get('sustainability_score', 0) < self.alert_thresholds['sustainability_score']:
+            alerts.append({
+                'level': 'warning',
+                'message': f"Sustainability score {status['sustainability_score']:.2f} below threshold"
+            })
+        
+        # Check carbon intensity
+        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
+            alerts.append({
+                'level': 'warning',
+                'message': f"Carbon intensity {status['carbon_intensity']:.0f} above threshold"
+            })
+        
+        # Check helium budget
+        helium_remaining_ratio = status.get('helium_remaining_budget_ratio', 1.0)
+        if helium_remaining_ratio < self.alert_thresholds['helium_budget_remaining']:
+            alerts.append({
+                'level': 'critical',
+                'message': f"Helium budget remaining {helium_remaining_ratio:.1%} below threshold"
+            })
+        
+        # Check helium efficiency
+        if status.get('helium_efficiency', 1.0) < self.alert_thresholds['helium_efficiency']:
+            alerts.append({
+                'level': 'warning',
+                'message': f"Helium efficiency {status['helium_efficiency']:.2f} below threshold"
+            })
+        
+        if alerts:
+            for alert in alerts:
+                logger.log(
+                    logging.CRITICAL if alert['level'] == 'critical' else logging.WARNING,
+                    f"DASHBOARD ALERT: {alert['message']}"
+                )
+    
+    def register_managers(
+        self,
+        carbon_manager: Optional[CarbonIntensityManager] = None,
+        helium_tracker: Optional[HeliumTracker] = None,
+        predictive_analyzer: Optional[PredictiveMetricsAnalyzer] = None
+    ):
+        """Register managers for dashboard integration"""
+        self.carbon_manager = carbon_manager
+        self.helium_tracker = helium_tracker
+        self.predictive_analyzer = predictive_analyzer
+        
+        if carbon_manager:
+            logger.info("Carbon manager registered with dashboard")
+        if helium_tracker:
+            logger.info("Helium tracker registered with dashboard")
+        if predictive_analyzer:
+            logger.info("Predictive analyzer registered with dashboard")
+    
+    async def get_dashboard_status(self) -> Dict[str, Any]:
+        """Get unified dashboard status"""
+        status = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': 0.5,
+            'carbon_position': {},
+            'helium_position': {},
+            'predictions': {},
+            'is_healthy': True
+        }
+        
+        # Carbon position
+        if self.carbon_manager:
+            carbon_pos = {
+                'current_intensity': await self.carbon_manager.get_current_intensity(),
+                'trend': await self.carbon_manager.get_carbon_trend(),
+                'optimal_hours': await self.carbon_manager.get_optimal_hours('us-east', 8),
+                'total_savings_kg': self.carbon_manager.total_carbon_savings_kg
+            }
+            status['carbon_position'] = carbon_pos
+            status['carbon_intensity'] = carbon_pos['current_intensity']
+            status['carbon_savings_kg'] = carbon_pos['total_savings_kg']
+        
+        # Helium position
+        if self.helium_tracker:
+            helium_pos = self.helium_tracker.get_helium_position()
+            status['helium_position'] = helium_pos
+            status['helium_efficiency'] = helium_pos.get('efficiency_scores', {}).values()
+            status['helium_efficiency'] = np.mean(list(status['helium_efficiency'])) if status['helium_efficiency'] else 0.5
+            status['helium_remaining_budget_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
+            status['helium_summary'] = self.helium_tracker.get_helium_summary()
+        
+        # Predictive analytics
+        if self.predictive_analyzer and self.predictive_analyzer.is_trained:
+            status['predictions'] = {
+                'failure_rate': await self.predictive_analyzer.predict_failure_rate(),
+                'resource_demand': await self.predictive_analyzer.forecast_resource_demand()
+            }
+        
+        # Calculate overall sustainability score
+        score = 0.5
+        if self.carbon_manager:
+            carbon_score = 1.0 - (status.get('carbon_intensity', 400) / 800)
+            score = score * 0.5 + carbon_score * 0.5
+        
+        if self.helium_tracker:
+            helium_score = status.get('helium_efficiency', 0.5)
+            score = score * 0.5 + helium_score * 0.5
+        
+        status['sustainability_score'] = max(0.0, min(1.0, score))
+        SUSTAINABILITY_SCORE.set(status['sustainability_score'] * 100)
+        
+        # Health status
+        status['is_healthy'] = all([
+            status['sustainability_score'] > 0.3,
+            status.get('carbon_intensity', 400) < 600,
+            status.get('helium_remaining_budget_ratio', 1.0) > 0.1
+        ])
+        
+        return status
+    
+    async def get_recommendations(self) -> List[Dict[str, Any]]:
+        """Get sustainability recommendations"""
+        status = await self.get_dashboard_status()
+        recommendations = []
+        
+        if status['sustainability_score'] < 0.5:
+            recommendations.append({
+                'priority': 'high',
+                'category': 'sustainability',
+                'message': 'Improve overall sustainability score',
+                'actions': ['Reduce carbon intensity', 'Optimize helium usage']
+            })
+        
+        if status.get('carbon_intensity', 0) > 500:
+            recommendations.append({
+                'priority': 'high',
+                'category': 'carbon',
+                'message': 'High carbon intensity detected',
+                'actions': ['Shift workloads to low-carbon hours', 'Improve energy efficiency']
+            })
+        
+        if status.get('helium_remaining_budget_ratio', 1.0) < 0.2:
+            recommendations.append({
+                'priority': 'critical',
+                'category': 'helium',
+                'message': 'Helium budget critically low',
+                'actions': ['Implement helium recovery systems', 'Optimize helium usage']
+            })
+        
+        if status.get('helium_efficiency', 0.5) < 0.4:
+            recommendations.append({
+                'priority': 'medium',
+                'category': 'helium',
+                'message': 'Low helium efficiency',
+                'actions': ['Improve helium recovery rates', 'Reduce helium consumption']
+            })
+        
+        return recommendations
+    
+    async def generate_report(self) -> Dict[str, Any]:
+        """Generate comprehensive sustainability report"""
+        status = await self.get_dashboard_status()
+        recommendations = await self.get_recommendations()
+        
+        # Historical trend analysis
+        trend = 'stable'
+        if len(self.history) > 10:
+            recent_scores = [h['sustainability_score'] for h in self.history[-10:]]
+            if recent_scores[-1] > recent_scores[0] * 1.05:
+                trend = 'improving'
+            elif recent_scores[-1] < recent_scores[0] * 0.95:
+                trend = 'declining'
+        
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': status['sustainability_score'],
+            'trend': trend,
+            'carbon_position': status.get('carbon_position', {}),
+            'helium_position': status.get('helium_position', {}),
+            'predictions': status.get('predictions', {}),
+            'recommendations': recommendations,
+            'is_healthy': status['is_healthy'],
+            'generated_by': 'SustainabilityDashboard'
+        }
+    
+    def shutdown(self):
+        """Shutdown the dashboard"""
+        self._running = False
+        logger.info("Sustainability Dashboard shut down")
 
 # ============================================================
 # ENHANCED CIRCUIT BREAKER WITH GRADUAL RECOVERY
@@ -1392,6 +2139,31 @@ class EnhancedBaseWorkflow(ABC):
         }
 
 # ============================================================
+# SINGLETON ACCESSOR FOR SUSTAINABILITY
+# ============================================================
+
+_sustainability_dashboard = None
+_sustainability_lock = asyncio.Lock()
+
+async def get_sustainability_dashboard() -> SustainabilityDashboard:
+    """Get singleton sustainability dashboard"""
+    global _sustainability_dashboard
+    if _sustainability_dashboard is None:
+        async with _sustainability_lock:
+            if _sustainability_dashboard is None:
+                _sustainability_dashboard = SustainabilityDashboard()
+                # Register managers
+                carbon_manager = CarbonIntensityManager()
+                helium_tracker = HeliumTracker()
+                predictive_analyzer = PredictiveMetricsAnalyzer()
+                _sustainability_dashboard.register_managers(
+                    carbon_manager, helium_tracker, predictive_analyzer
+                )
+                # Start background tasks
+                asyncio.create_task(carbon_manager.update_carbon_intensity())
+    return _sustainability_dashboard
+
+# ============================================================
 # EXPORTS
 # ============================================================
 
@@ -1400,6 +2172,11 @@ __all__ = [
     'GreenAgentException', 'ConfigurationError', 'DataValidationError',
     'ModuleNotFoundError', 'QuantumError', 'BlockchainError', 'APIError',
     'ResourceError', 'TimeoutError', 'CircuitBreakerOpenError',
+    'CarbonIntensityError', 'HeliumTrackingError',
+    
+    # Modules
+    'CarbonIntensityManager', 'HeliumTracker', 'PredictiveMetricsAnalyzer',
+    'SustainabilityDashboard', 'get_sustainability_dashboard',
     
     # Circuit Breaker
     'CircuitBreakerState', 'EnhancedCircuitBreaker',
@@ -1419,7 +2196,7 @@ __all__ = [
 ]
 
 # ============================================================
-# SINGLETON ACCESSOR
+# SHARED REGISTRY
 # ============================================================
 
 _shared_registry = REGISTRY
