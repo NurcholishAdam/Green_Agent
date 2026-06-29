@@ -296,6 +296,419 @@ class LimitCrossDomainTransfer:
                 'knowledge_types': list(self.knowledge_base.keys())}
 
 # ============================================================================
+# Federated Reflexive Learning Module - NEW
+# ============================================================================
+
+class FederatedReflexiveLearning:
+    """Federated Reflexive Learning with distributed validation for green agent coordination"""
+    
+    def __init__(self):
+        self.clients: Dict[str, Dict] = {}
+        self.global_model: Dict[str, Any] = {}
+        self.validation_history: deque = deque(maxlen=5000)
+        self.consensus_threshold = 0.75
+        self.federation_id = "green_agent_federation"
+        self.round = 0
+        
+    def register_client(self, client_id: str, capabilities: Dict[str, Any]) -> bool:
+        if client_id not in self.clients:
+            self.clients[client_id] = {
+                'capabilities': capabilities,
+                'local_model': {},
+                'validations': 0,
+                'success_rate': 0.5,
+                'last_active': datetime.utcnow(),
+                'trust_score': 0.5
+            }
+            return True
+        return False
+    
+    def aggregate_validation(self, client_id: str, validation_data: Dict[str, Any]) -> Dict[str, Any]:
+        if client_id not in self.clients:
+            return {'status': 'error', 'message': 'Client not registered'}
+        
+        client = self.clients[client_id]
+        client['validations'] += 1
+        client['last_active'] = datetime.utcnow()
+        
+        # Update local model with validation data
+        local_update = validation_data.get('local_update', {})
+        if local_update:
+            client['local_model'].update(local_update)
+        
+        # Compute consensus
+        consensus = self._compute_consensus(validation_data)
+        
+        # Update trust score
+        if consensus.get('agreement', False):
+            client['success_rate'] = (client['success_rate'] * 0.9 + 0.1)
+        else:
+            client['success_rate'] *= 0.95
+        
+        client['trust_score'] = min(1.0, client['success_rate'] * 0.7 + 0.3)
+        
+        self.validation_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'client_id': client_id,
+            'consensus': consensus,
+            'trust_score': client['trust_score']
+        })
+        
+        return {
+            'status': 'success',
+            'consensus': consensus,
+            'global_update': self._get_global_update()
+        }
+    
+    def _compute_consensus(self, validation_data: Dict) -> Dict:
+        # Simple consensus mechanism based on majority agreement
+        validators = len(self.clients)
+        if validators < 3:
+            return {'agreement': True, 'confidence': 0.5, 'method': 'insufficient_validators'}
+        
+        agreements = sum(1 for c in self.clients.values() if c.get('trust_score', 0) > 0.6)
+        agreement_ratio = agreements / validators
+        
+        return {
+            'agreement': agreement_ratio > self.consensus_threshold,
+            'confidence': agreement_ratio,
+            'method': 'threshold_consensus',
+            'validators_agree': agreements,
+            'total_validators': validators
+        }
+    
+    def _get_global_update(self) -> Dict:
+        # Federated averaging of client models
+        if not self.clients:
+            return {}
+        
+        aggregated = {}
+        for client in self.clients.values():
+            for key, value in client.get('local_model', {}).items():
+                if key not in aggregated:
+                    aggregated[key] = []
+                aggregated[key].append(value * client['trust_score'])
+        
+        # Weighted average
+        global_update = {}
+        for key, values in aggregated.items():
+            if values:
+                total_weight = sum([self.clients[c].get('trust_score', 0.5) 
+                                  for c in self.clients if key in self.clients[c].get('local_model', {})])
+                if total_weight > 0:
+                    global_update[key] = sum(values) / total_weight
+        
+        self.global_model.update(global_update)
+        self.round += 1
+        return global_update
+    
+    def get_federation_status(self) -> Dict:
+        return {
+            'federation_id': self.federation_id,
+            'total_clients': len(self.clients),
+            'active_clients': sum(1 for c in self.clients.values() 
+                                 if (datetime.utcnow() - c['last_active']).seconds < 300),
+            'round': self.round,
+            'global_model_size': len(self.global_model),
+            'validation_history': len(self.validation_history),
+            'clients': {
+                cid: {
+                    'trust_score': client['trust_score'],
+                    'validations': client['validations'],
+                    'success_rate': client['success_rate']
+                } for cid, client in self.clients.items()
+            }
+        }
+
+# ============================================================================
+# User-Adaptive Reflexivity Module - NEW
+# ============================================================================
+
+class UserAdaptiveReflexivity:
+    """User-Adaptive Reflexivity with dynamic configuration and personalization"""
+    
+    def __init__(self):
+        self.user_profiles: Dict[str, Dict] = {}
+        self.preference_weights: Dict[str, float] = {
+            'sustainability': 0.3,
+            'performance': 0.3,
+            'cost': 0.2,
+            'speed': 0.2
+        }
+        self.adaptation_history: deque = deque(maxlen=1000)
+        self.learning_rate = 0.1
+        
+    def update_user_profile(self, user_id: str, interaction_data: Dict) -> Dict:
+        if user_id not in self.user_profiles:
+            self.user_profiles[user_id] = {
+                'preferences': self.preference_weights.copy(),
+                'interaction_count': 0,
+                'last_interaction': datetime.utcnow(),
+                'adaptation_level': 0.5,
+                'satisfaction_score': 0.5
+            }
+        
+        profile = self.user_profiles[user_id]
+        profile['interaction_count'] += 1
+        profile['last_interaction'] = datetime.utcnow()
+        
+        # Update preferences based on feedback
+        feedback = interaction_data.get('feedback', {})
+        if feedback:
+            for pref, value in feedback.items():
+                if pref in profile['preferences']:
+                    # Adjust preference weight based on feedback
+                    adjustment = (value - 0.5) * self.learning_rate
+                    profile['preferences'][pref] = max(0.1, min(0.9, 
+                        profile['preferences'][pref] + adjustment))
+                    # Normalize
+                    total = sum(profile['preferences'].values())
+                    if total > 0:
+                        for key in profile['preferences']:
+                            profile['preferences'][key] /= total
+        
+        # Update adaptation level
+        profile['adaptation_level'] = min(1.0, profile['adaptation_level'] + 0.02)
+        profile['satisfaction_score'] = min(1.0, profile['satisfaction_score'] + 0.01)
+        
+        self.adaptation_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'user_id': user_id,
+            'preferences': profile['preferences'].copy(),
+            'satisfaction': profile['satisfaction_score']
+        })
+        
+        return profile
+    
+    def get_adaptive_config(self, user_id: str, base_config: Dict) -> Dict:
+        if user_id not in self.user_profiles:
+            return base_config
+        
+        profile = self.user_profiles[user_id]
+        preferences = profile['preferences']
+        
+        # Adapt configuration based on user preferences
+        adapted = base_config.copy()
+        
+        # Sustainability weighting
+        if preferences.get('sustainability', 0.3) > 0.5:
+            adapted['carbon_weight'] = min(1.0, adapted.get('carbon_weight', 0.5) + 0.2)
+            adapted['sustainability_mode'] = True
+        else:
+            adapted['sustainability_mode'] = False
+        
+        # Performance weighting
+        if preferences.get('performance', 0.3) > 0.5:
+            adapted['quantum_enhanced'] = True
+            adapted['parallel_processing'] = True
+        
+        # Cost weighting
+        if preferences.get('cost', 0.2) > 0.5:
+            adapted['optimization_level'] = 'conservative'
+            adapted['token_budget'] = adapted.get('token_budget', 1000) * 0.8
+        
+        # Speed weighting
+        if preferences.get('speed', 0.2) > 0.5:
+            adapted['optimization_level'] = 'aggressive'
+            adapted['timeout_seconds'] = max(30, adapted.get('timeout_seconds', 60) - 20)
+        
+        # Add adaptation metadata
+        adapted['user_adapted'] = True
+        adapted['adaptation_level'] = profile['adaptation_level']
+        adapted['preference_signature'] = self._generate_preference_signature(preferences)
+        
+        return adapted
+    
+    def _generate_preference_signature(self, preferences: Dict) -> str:
+        """Generate a unique signature for user preferences"""
+        import hashlib
+        pref_str = json.dumps({k: round(v, 3) for k, v in sorted(preferences.items())})
+        return hashlib.md5(pref_str.encode()).hexdigest()[:8]
+    
+    def get_user_stats(self, user_id: str) -> Dict:
+        if user_id not in self.user_profiles:
+            return {'status': 'user_not_found'}
+        
+        profile = self.user_profiles[user_id]
+        return {
+            'user_id': user_id,
+            'preferences': profile['preferences'],
+            'interaction_count': profile['interaction_count'],
+            'adaptation_level': profile['adaptation_level'],
+            'satisfaction_score': profile['satisfaction_score'],
+            'last_active': profile['last_interaction'].isoformat()
+        }
+
+# ============================================================================
+# Human-AI Collaborative Reflection Module - NEW
+# ============================================================================
+
+class HumanAICollaborativeReflection:
+    """Human-AI Collaborative Reflection with comprehensive reporting and feedback loops"""
+    
+    def __init__(self):
+        self.reflection_logs: deque = deque(maxlen=1000)
+        self.human_feedback: Dict[str, List[Dict]] = defaultdict(list)
+        self.ai_insights: Dict[str, List[Dict]] = defaultdict(list)
+        self.collaboration_sessions: Dict[str, Dict] = {}
+        self.insight_quality_metrics: Dict[str, float] = {}
+        
+    def start_collaboration(self, session_id: str, context: Dict) -> str:
+        self.collaboration_sessions[session_id] = {
+            'started': datetime.utcnow().isoformat(),
+            'context': context,
+            'reflections': [],
+            'status': 'active',
+            'human_input_count': 0,
+            'ai_insight_count': 0
+        }
+        return session_id
+    
+    def add_human_feedback(self, session_id: str, user_id: str, feedback: Dict) -> Dict:
+        if session_id not in self.collaboration_sessions:
+            return {'status': 'error', 'message': 'Session not found'}
+        
+        feedback_entry = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'user_id': user_id,
+            'feedback': feedback,
+            'type': feedback.get('type', 'general')
+        }
+        
+        self.human_feedback[user_id].append(feedback_entry)
+        self.collaboration_sessions[session_id]['human_input_count'] += 1
+        self.collaboration_sessions[session_id]['reflections'].append({
+            'type': 'human',
+            'data': feedback_entry
+        })
+        
+        # Generate AI reflection based on feedback
+        ai_reflection = self._generate_ai_reflection(feedback, session_id)
+        if ai_reflection:
+            self.add_ai_insight(session_id, ai_reflection)
+        
+        return {
+            'status': 'success',
+            'feedback_id': len(self.human_feedback[user_id]) - 1,
+            'ai_reflection': ai_reflection
+        }
+    
+    def add_ai_insight(self, session_id: str, insight: Dict) -> Dict:
+        if session_id not in self.collaboration_sessions:
+            return {'status': 'error', 'message': 'Session not found'}
+        
+        insight_entry = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'insight': insight,
+            'type': insight.get('type', 'analysis')
+        }
+        
+        self.ai_insights[session_id].append(insight_entry)
+        self.collaboration_sessions[session_id]['ai_insight_count'] += 1
+        self.collaboration_sessions[session_id]['reflections'].append({
+            'type': 'ai',
+            'data': insight_entry
+        })
+        
+        return {
+            'status': 'success',
+            'insight_id': len(self.ai_insights[session_id]) - 1
+        }
+    
+    def _generate_ai_reflection(self, feedback: Dict, session_id: str) -> Optional[Dict]:
+        """Generate AI reflection based on human feedback"""
+        feedback_text = feedback.get('text', '').lower()
+        
+        if 'carbon' in feedback_text or 'sustainability' in feedback_text:
+            return {
+                'type': 'sustainability_analysis',
+                'content': 'Analyzing carbon impact of current decisions',
+                'recommendation': 'Consider token-based resource optimization',
+                'confidence': 0.7
+            }
+        elif 'performance' in feedback_text or 'speed' in feedback_text:
+            return {
+                'type': 'performance_analysis',
+                'content': 'Evaluating quantum advantage opportunities',
+                'recommendation': 'Enable parallel quantum processing',
+                'confidence': 0.8
+            }
+        elif 'cost' in feedback_text or 'budget' in feedback_text:
+            return {
+                'type': 'resource_optimization',
+                'content': 'Analyzing Eco-ATP allocation efficiency',
+                'recommendation': 'Implement dynamic token exchange rates',
+                'confidence': 0.75
+            }
+        return None
+    
+    def get_session_reflection(self, session_id: str) -> Dict:
+        if session_id not in self.collaboration_sessions:
+            return {'status': 'error', 'message': 'Session not found'}
+        
+        session = self.collaboration_sessions[session_id]
+        total_reflections = len(session['reflections'])
+        human_count = sum(1 for r in session['reflections'] if r['type'] == 'human')
+        ai_count = total_reflections - human_count
+        
+        return {
+            'session_id': session_id,
+            'duration': (datetime.utcnow() - 
+                        datetime.fromisoformat(session['started'])).total_seconds(),
+            'total_reflections': total_reflections,
+            'human_inputs': human_count,
+            'ai_insights': ai_count,
+            'status': session['status'],
+            'collaboration_ratio': human_count / max(ai_count, 1),
+            'insights': session['reflections'][-10:]  # Last 10 reflections
+        }
+    
+    def generate_comprehensive_report(self, session_id: str) -> Dict:
+        if session_id not in self.collaboration_sessions:
+            return {'status': 'error', 'message': 'Session not found'}
+        
+        session = self.collaboration_sessions[session_id]
+        
+        # Extract key insights
+        key_insights = []
+        for reflection in session['reflections']:
+            if reflection['type'] == 'ai':
+                insight_data = reflection['data'].get('insight', {})
+                if insight_data.get('recommendation'):
+                    key_insights.append(insight_data['recommendation'])
+        
+        return {
+            'session_id': session_id,
+            'summary': {
+                'status': session['status'],
+                'started': session['started'],
+                'total_interactions': len(session['reflections']),
+                'human_to_ai_ratio': session['human_input_count'] / max(session['ai_insight_count'], 1)
+            },
+            'key_insights': key_insights,
+            'context': session['context'],
+            'recommendations': self._generate_recommendations(session),
+            'quality_metrics': self.insight_quality_metrics
+        }
+    
+    def _generate_recommendations(self, session: Dict) -> List[str]:
+        recommendations = []
+        context = session.get('context', {})
+        
+        if context.get('sustainability_focus', False):
+            recommendations.append("Implement gradient-based carbon tracking")
+            recommendations.append("Activate token-based resource budgeting")
+        
+        if context.get('quantum_enabled', False):
+            recommendations.append("Optimize quantum circuit parameters for sustainability")
+            recommendations.append("Use predictive reflexivity for limit forecasting")
+        
+        if session.get('human_input_count', 0) < 3:
+            recommendations.append("Increase human collaboration for better adaptation")
+        
+        return recommendations or ["Continue collaborative optimization"]
+
+# ============================================================================
 # Enums and Data Classes (Enhanced with Bio-Inspired)
 # ============================================================================
 
@@ -407,6 +820,13 @@ class QuantumNode:
 class QuantumLimitGraphIntegrator:
     """
     Enhanced Quantum LIMIT Graph Integrator v5.0.0 - Complete Green Agent Implementation
+    
+    Now enhanced with:
+    - Federated Reflexive Learning
+    - User-Adaptive Reflexivity
+    - Human-AI Collaborative Reflection
+    - Complete bio-inspired integration
+    - Quantum-sustainability synergy
     """
     
     def __init__(
@@ -419,7 +839,10 @@ class QuantumLimitGraphIntegrator:
         enable_carbon_intensity: bool = True,
         enable_predictive: bool = True,
         enable_cross_domain: bool = True,
-        enable_sustainability_scoring: bool = True
+        enable_sustainability_scoring: bool = True,
+        enable_federated_learning: bool = True,
+        enable_user_adaptive: bool = True,
+        enable_human_ai_collab: bool = True
     ):
         # Feature flags
         self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
@@ -430,6 +853,9 @@ class QuantumLimitGraphIntegrator:
         self.enable_predictive = enable_predictive
         self.enable_cross_domain = enable_cross_domain
         self.enable_sustainability_scoring = enable_sustainability_scoring
+        self.enable_federated_learning = enable_federated_learning
+        self.enable_user_adaptive = enable_user_adaptive
+        self.enable_human_ai_collab = enable_human_ai_collab
         
         # Quantum backend
         self.quantum_backend = quantum_backend
@@ -446,6 +872,9 @@ class QuantumLimitGraphIntegrator:
         self.carbon_manager = CarbonIntensityManager()
         self.predictive_analyzer = PredictiveLimitAnalyzer()
         self.cross_domain_transfer = LimitCrossDomainTransfer()
+        self.federated_learning = FederatedReflexiveLearning() if enable_federated_learning else None
+        self.user_adaptive = UserAdaptiveReflexivity() if enable_user_adaptive else None
+        self.human_ai_collab = HumanAICollaborativeReflection() if enable_human_ai_collab else None
         
         # Graph nodes
         self.graph_nodes: Dict[str, QuantumNode] = {}
@@ -480,7 +909,10 @@ class QuantumLimitGraphIntegrator:
             f"Quantum LIMIT Graph Integrator v5.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
-            f"predictive={self.enable_predictive}"
+            f"predictive={self.enable_predictive}, "
+            f"federated={self.enable_federated_learning}, "
+            f"user_adaptive={self.enable_user_adaptive}, "
+            f"human_ai_collab={self.enable_human_ai_collab}"
         )
     
     def _start_background_tasks(self):
@@ -490,6 +922,8 @@ class QuantumLimitGraphIntegrator:
             asyncio.create_task(self._predictive_update_loop())
         if self.enable_bio_integration:
             asyncio.create_task(self._bio_sync_loop())
+        if self.enable_federated_learning:
+            asyncio.create_task(self._federated_learning_loop())
     
     async def _carbon_update_loop(self):
         while True:
@@ -535,6 +969,51 @@ class QuantumLimitGraphIntegrator:
             except Exception as e:
                 logger.error(f"Bio sync error: {str(e)}")
                 await asyncio.sleep(60)
+    
+    async def _federated_learning_loop(self):
+        """Periodic federated learning aggregation and synchronization"""
+        while True:
+            try:
+                if self.federated_learning:
+                    # Aggregate global model updates
+                    global_update = self.federated_learning._get_global_update()
+                    
+                    # Apply updates to local components
+                    if global_update:
+                        self._apply_federated_update(global_update)
+                    
+                    # Cleanup inactive clients
+                    self._cleanup_inactive_clients()
+                
+                await asyncio.sleep(600)  # Every 10 minutes
+            except Exception as e:
+                logger.error(f"Federated learning loop error: {str(e)}")
+                await asyncio.sleep(120)
+    
+    def _apply_federated_update(self, global_update: Dict):
+        """Apply federated learning updates to local components"""
+        if 'carbon_threshold' in global_update:
+            for boundary in self.boundaries.values():
+                if boundary.resource_type == 'carbon':
+                    boundary.hard_limit = global_update['carbon_threshold'] * boundary.hard_limit
+        
+        if 'token_efficiency' in global_update:
+            if self.token_manager:
+                # Adjust token exchange rates based on federated learning
+                pass  # Implementation depends on token manager API
+    
+    def _cleanup_inactive_clients(self):
+        """Remove inactive federated learning clients"""
+        if self.federated_learning:
+            current_time = datetime.utcnow()
+            inactive_clients = []
+            for client_id, client in self.federated_learning.clients.items():
+                if (current_time - client['last_active']).seconds > 3600:  # 1 hour
+                    inactive_clients.append(client_id)
+            
+            for client_id in inactive_clients:
+                del self.federated_learning.clients[client_id]
+                logger.info(f"Removed inactive federated client: {client_id}")
     
     def _initialize_quantum_graph(self):
         resources = [
@@ -659,7 +1138,170 @@ class QuantumLimitGraphIntegrator:
             self.enable_bio_integration = True
     
     # ========================================================================
-    # Bio-Inspired Methods
+    # Enhanced Validation with All Integrations
+    # ========================================================================
+    
+    def validate_expert_plan(
+        self,
+        expert_plan: Dict[str, Any],
+        quantum_enhanced: bool = False,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None
+    ) -> Tuple[bool, Dict[str, Any]]:
+        validation_results = {}
+        is_valid = True
+        
+        # User-adaptive configuration
+        if self.enable_user_adaptive and user_id:
+            adapted_plan = self.user_adaptive.get_adaptive_config(user_id, expert_plan)
+            expert_plan.update(adapted_plan)
+            validation_results['user_adapted'] = True
+            validation_results['adaptation_level'] = self.user_adaptive.user_profiles.get(
+                user_id, {}).get('adaptation_level', 0.5)
+        
+        # Update carbon intensity if enabled
+        if self.enable_carbon_intensity:
+            try:
+                carbon_intensity = asyncio.run(self.carbon_manager.get_current_intensity())
+                expert_plan['carbon_intensity'] = carbon_intensity
+            except:
+                expert_plan['carbon_intensity'] = 400
+        
+        # Validate carbon
+        if 'estimated_carbon_kg' in expert_plan:
+            carbon_val, carbon_max = self._get_gradient_boundary('carbon')
+            carbon_result = {
+                'within_limit': expert_plan['estimated_carbon_kg'] * 1000 <= carbon_max,
+                'limit_source': 'gradient_field' if self.gradient_manager else 'static',
+                'current_gradient': carbon_val,
+                'max_gradient': carbon_max,
+                'trend': self._get_gradient_trend('carbon'),
+                'utilization': carbon_val / max(carbon_max, 1)
+            }
+            validation_results['carbon'] = carbon_result
+            if not carbon_result['within_limit']:
+                is_valid = False
+        
+        # Validate helium
+        if 'helium_per_inference' in expert_plan or 'estimated_helium_units' in expert_plan:
+            helium_val = expert_plan.get('helium_per_inference', 
+                        expert_plan.get('estimated_helium_units', 0))
+            helium_current, helium_max = self._get_gradient_boundary('helium')
+            helium_result = {
+                'within_limit': helium_val <= helium_max,
+                'limit_source': 'gradient_field' if self.gradient_manager else 'static',
+                'current_gradient': helium_current,
+                'max_gradient': helium_max
+            }
+            validation_results['helium'] = helium_result
+            if not helium_result['within_limit']:
+                is_valid = False
+        
+        # Validate energy
+        if 'estimated_energy_kwh' in expert_plan:
+            token_budget = self._get_token_budget_remaining()
+            energy_ecoatp = expert_plan['estimated_energy_kwh'] * 1000
+            energy_result = {
+                'within_limit': energy_ecoatp <= token_budget,
+                'limit_source': 'token_economy' if self.token_manager else 'static',
+                'token_budget_remaining': token_budget,
+                'energy_ecoatp_cost': energy_ecoatp
+            }
+            validation_results['energy'] = energy_result
+            if not energy_result['within_limit']:
+                is_valid = False
+        
+        # Validate compartment
+        expert_id = expert_plan.get('expert_id', 'unknown')
+        viable, health = self._check_compartment_viability(expert_id)
+        if not viable:
+            validation_results['compartment'] = {
+                'viable': False,
+                'health_score': health
+            }
+            is_valid = False
+        
+        # Validate quantum
+        if quantum_enhanced:
+            entangled = self._get_entangled_resources('carbon')
+            validation_results['entangled_resources'] = entangled
+            ecoatp_cost = expert_plan.get('estimated_energy_kwh', 0.001) * 1000 * 5
+            tokens_reserved = self._reserve_tokens_for_quantum(
+                ecoatp_cost, 
+                f"validate_{datetime.utcnow().timestamp()}"
+            )
+            validation_results['quantum_tokens_reserved'] = tokens_reserved
+            if not tokens_reserved:
+                is_valid = False
+        
+        # Add bio-inspired metrics
+        if self.enable_bio_integration:
+            validation_results['harvester_confidence'] = self._get_harvester_confidence()
+            validation_results['gradient_levels'] = self._get_real_gradient_levels()
+        
+        # Update sustainability
+        if self.enable_sustainability_scoring:
+            self.sustainability_score = self._calculate_sustainability_score()
+            validation_results['sustainability_score'] = self.sustainability_score
+        
+        # Cross-domain knowledge transfer
+        if self.enable_cross_domain:
+            self.cross_domain_transfer.transfer_knowledge(
+                'limit', 'carbon',
+                'optimization_strategies',
+                {'carbon_value': expert_plan.get('estimated_carbon_kg', 0)}
+            )
+        
+        # Update predictive analyzer
+        if self.enable_predictive:
+            self.predictive_analyzer.update_history({
+                'carbon_level': validation_results.get('carbon', {}).get('utilization', 0.5),
+                'helium_level': validation_results.get('helium', {}).get('current_gradient', 0.5),
+                'token_balance': self._get_token_budget_remaining() / 1000 if self._get_token_budget_remaining() else 0.5,
+                'gradient_strength': validation_results.get('gradient_levels', {}).get('carbon', 0.5),
+                'harvester_confidence': self._get_harvester_confidence()
+            })
+            asyncio.create_task(self.predictive_analyzer.train_forecast_model())
+        
+        # Federated Learning validation
+        if self.enable_federated_learning and self.federated_learning:
+            client_id = expert_plan.get('expert_id', 'unknown')
+            if self.federated_learning.register_client(client_id, {'capabilities': ['limit_validation']}):
+                federation_result = self.federated_learning.aggregate_validation(
+                    client_id,
+                    {'local_update': validation_results}
+                )
+                validation_results['federated_consensus'] = federation_result
+                validation_results['trust_score'] = self.federated_learning.clients.get(
+                    client_id, {}).get('trust_score', 0.5)
+        
+        # Human-AI Collaboration
+        if self.enable_human_ai_collab and self.human_ai_collab and session_id:
+            collab_result = self.human_ai_collab.add_ai_insight(
+                session_id,
+                {
+                    'type': 'validation_analysis',
+                    'content': f"Validation {'passed' if is_valid else 'failed'}",
+                    'recommendation': 'Optimize resource allocation' if not is_valid else 'Continue monitoring'
+                }
+            )
+            validation_results['collaboration'] = collab_result
+        
+        self.validation_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'plan': str(expert_plan)[:200],
+            'is_valid': is_valid,
+            'bio_integrated': self.enable_bio_integration,
+            'sustainability_score': self.sustainability_score,
+            'federated': self.enable_federated_learning,
+            'user_adaptive': self.enable_user_adaptive,
+            'collaborative': self.enable_human_ai_collab
+        })
+        
+        return is_valid, validation_results
+    
+    # ========================================================================
+    # Bio-Inspired Methods (Keep existing implementations)
     # ========================================================================
     
     def _get_gradient_boundary(self, resource_type: str) -> Tuple[float, float]:
@@ -765,143 +1407,24 @@ class QuantumLimitGraphIntegrator:
         return min(1.0, max(0.0, score))
     
     # ========================================================================
-    # Enhanced Validation
-    # ========================================================================
-    
-    def validate_expert_plan(
-        self,
-        expert_plan: Dict[str, Any],
-        quantum_enhanced: bool = False
-    ) -> Tuple[bool, Dict[str, Any]]:
-        validation_results = {}
-        is_valid = True
-        
-        # Update carbon intensity if enabled
-        if self.enable_carbon_intensity:
-            carbon_intensity = asyncio.run(self.carbon_manager.get_current_intensity())
-            expert_plan['carbon_intensity'] = carbon_intensity
-        
-        # Validate carbon
-        if 'estimated_carbon_kg' in expert_plan:
-            carbon_val, carbon_max = self._get_gradient_boundary('carbon')
-            carbon_result = {
-                'within_limit': expert_plan['estimated_carbon_kg'] * 1000 <= carbon_max,
-                'limit_source': 'gradient_field' if self.gradient_manager else 'static',
-                'current_gradient': carbon_val,
-                'max_gradient': carbon_max,
-                'trend': self._get_gradient_trend('carbon'),
-                'utilization': carbon_val / max(carbon_max, 1)
-            }
-            validation_results['carbon'] = carbon_result
-            if not carbon_result['within_limit']:
-                is_valid = False
-        
-        # Validate helium
-        if 'helium_per_inference' in expert_plan or 'estimated_helium_units' in expert_plan:
-            helium_val = expert_plan.get('helium_per_inference', 
-                        expert_plan.get('estimated_helium_units', 0))
-            helium_current, helium_max = self._get_gradient_boundary('helium')
-            helium_result = {
-                'within_limit': helium_val <= helium_max,
-                'limit_source': 'gradient_field' if self.gradient_manager else 'static',
-                'current_gradient': helium_current,
-                'max_gradient': helium_max
-            }
-            validation_results['helium'] = helium_result
-            if not helium_result['within_limit']:
-                is_valid = False
-        
-        # Validate energy
-        if 'estimated_energy_kwh' in expert_plan:
-            token_budget = self._get_token_budget_remaining()
-            energy_ecoatp = expert_plan['estimated_energy_kwh'] * 1000
-            energy_result = {
-                'within_limit': energy_ecoatp <= token_budget,
-                'limit_source': 'token_economy' if self.token_manager else 'static',
-                'token_budget_remaining': token_budget,
-                'energy_ecoatp_cost': energy_ecoatp
-            }
-            validation_results['energy'] = energy_result
-            if not energy_result['within_limit']:
-                is_valid = False
-        
-        # Validate compartment
-        expert_id = expert_plan.get('expert_id', 'unknown')
-        viable, health = self._check_compartment_viability(expert_id)
-        if not viable:
-            validation_results['compartment'] = {
-                'viable': False,
-                'health_score': health
-            }
-            is_valid = False
-        
-        # Validate quantum
-        if quantum_enhanced:
-            entangled = self._get_entangled_resources('carbon')
-            validation_results['entangled_resources'] = entangled
-            ecoatp_cost = expert_plan.get('estimated_energy_kwh', 0.001) * 1000 * 5
-            tokens_reserved = self._reserve_tokens_for_quantum(
-                ecoatp_cost, 
-                f"validate_{datetime.utcnow().timestamp()}"
-            )
-            validation_results['quantum_tokens_reserved'] = tokens_reserved
-            if not tokens_reserved:
-                is_valid = False
-        
-        # Add bio-inspired metrics
-        if self.enable_bio_integration:
-            validation_results['harvester_confidence'] = self._get_harvester_confidence()
-            validation_results['gradient_levels'] = self._get_real_gradient_levels()
-        
-        # Update sustainability
-        if self.enable_sustainability_scoring:
-            self.sustainability_score = self._calculate_sustainability_score()
-            validation_results['sustainability_score'] = self.sustainability_score
-        
-        # Cross-domain knowledge transfer
-        if self.enable_cross_domain:
-            self.cross_domain_transfer.transfer_knowledge(
-                'limit', 'carbon',
-                'optimization_strategies',
-                {'carbon_value': expert_plan.get('estimated_carbon_kg', 0)}
-            )
-        
-        # Update predictive analyzer
-        if self.enable_predictive:
-            self.predictive_analyzer.update_history({
-                'carbon_level': validation_results.get('carbon', {}).get('utilization', 0.5),
-                'helium_level': validation_results.get('helium', {}).get('current_gradient', 0.5),
-                'token_balance': self._get_token_budget_remaining() / 1000 if self._get_token_budget_remaining() else 0.5,
-                'gradient_strength': validation_results.get('gradient_levels', {}).get('carbon', 0.5),
-                'harvester_confidence': self._get_harvester_confidence()
-            })
-            asyncio.create_task(self.predictive_analyzer.train_forecast_model())
-        
-        self.validation_history.append({
-            'timestamp': datetime.utcnow().isoformat(),
-            'plan': str(expert_plan)[:200],
-            'is_valid': is_valid,
-            'bio_integrated': self.enable_bio_integration,
-            'sustainability_score': self.sustainability_score
-        })
-        
-        return is_valid, validation_results
-    
-    # ========================================================================
-    # Optimize Expert Routing
+    # Optimize Expert Routing (Enhanced)
     # ========================================================================
     
     def optimize_expert_routing(
         self,
         expert_plans: List[Dict[str, Any]],
-        quantum_enhanced: bool = True
+        quantum_enhanced: bool = True,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         if not expert_plans:
             return []
         
         validated_plans = []
         for plan in expert_plans:
-            is_valid, validation = self.validate_expert_plan(plan, quantum_enhanced)
+            is_valid, validation = self.validate_expert_plan(
+                plan, quantum_enhanced, user_id, session_id
+            )
             if is_valid:
                 plan['limit_validation'] = validation
                 
@@ -928,6 +1451,12 @@ class QuantumLimitGraphIntegrator:
                 # Add sustainability score
                 plan['sustainability_score'] = self.sustainability_score
                 
+                # Add federated trust if enabled
+                if self.enable_federated_learning and self.federated_learning:
+                    client_id = plan.get('expert_id', 'unknown')
+                    if client_id in self.federated_learning.clients:
+                        plan['federated_trust'] = self.federated_learning.clients[client_id]['trust_score']
+                
                 validated_plans.append(plan)
         
         if quantum_enhanced and validated_plans:
@@ -950,7 +1479,81 @@ class QuantumLimitGraphIntegrator:
         return validated_plans
     
     # ========================================================================
-    # Planetary Boundary Status
+    # Enhanced Methods for New Features
+    # ========================================================================
+    
+    def get_federation_status(self) -> Dict:
+        """Get status of federated learning system"""
+        if self.enable_federated_learning and self.federated_learning:
+            return self.federated_learning.get_federation_status()
+        return {'status': 'federated_learning_disabled'}
+    
+    def get_user_adaptation_status(self, user_id: str) -> Dict:
+        """Get user adaptation status for a specific user"""
+        if self.enable_user_adaptive and self.user_adaptive:
+            return self.user_adaptive.get_user_stats(user_id)
+        return {'status': 'user_adaptive_disabled'}
+    
+    def get_collaboration_status(self, session_id: str) -> Dict:
+        """Get collaboration session status"""
+        if self.enable_human_ai_collab and self.human_ai_collab:
+            return self.human_ai_collab.get_session_reflection(session_id)
+        return {'status': 'human_ai_collab_disabled'}
+    
+    def generate_comprehensive_limits_report(self) -> Dict[str, Any]:
+        """Generate comprehensive report with all integrations"""
+        report = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'planetary_boundaries': self.get_planetary_boundary_status(),
+            'entanglement': self.get_entanglement_status(),
+            'validation_stats': self.get_validation_statistics(),
+            'quantum_resources': self.get_quantum_resource_status(),
+            'sustainability': {
+                'score': self.sustainability_score,
+                'carbon_savings_kg': self.total_carbon_savings_kg
+            },
+            'bio_integration': {
+                'active': self.enable_bio_integration,
+                'available': BIO_INSPIRED_AVAILABLE,
+                'gradient_levels': self._get_real_gradient_levels() if self.enable_bio_integration else {},
+                'token_budget': self._get_token_budget_remaining() if self.enable_bio_integration else float('inf'),
+                'harvester_confidence': self._get_harvester_confidence() if self.enable_bio_integration else 0.5
+            }
+        }
+        
+        if self.enable_predictive:
+            report['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_limit_trend())
+        
+        if self.enable_cross_domain:
+            report['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
+        
+        if self.enable_federated_learning:
+            report['federated_status'] = self.get_federation_status()
+        
+        if self.enable_human_ai_collab:
+            report['collaboration_summary'] = {
+                'active_sessions': len(self.human_ai_collab.collaboration_sessions),
+                'total_feedback': sum(len(fb) for fb in self.human_ai_collab.human_feedback.values())
+            }
+        
+        return report
+    
+    def start_collaboration_session(self, context: Dict) -> str:
+        """Start a new human-AI collaboration session"""
+        if self.enable_human_ai_collab and self.human_ai_collab:
+            session_id = f"collab_{datetime.utcnow().timestamp()}"
+            self.human_ai_collab.start_collaboration(session_id, context)
+            return session_id
+        return None
+    
+    def add_human_feedback(self, session_id: str, user_id: str, feedback: Dict) -> Dict:
+        """Add human feedback to a collaboration session"""
+        if self.enable_human_ai_collab and self.human_ai_collab:
+            return self.human_ai_collab.add_human_feedback(session_id, user_id, feedback)
+        return {'status': 'human_ai_collab_disabled'}
+    
+    # ========================================================================
+    # Existing Methods (Keep all original functionality)
     # ========================================================================
     
     def get_planetary_boundary_status(self) -> Dict[str, Any]:
@@ -1014,7 +1617,6 @@ class QuantumLimitGraphIntegrator:
                     'sustainability_score': node.sustainability_score
                 }
         
-        # Add sustainability score
         status['sustainability'] = {
             'score': self.sustainability_score,
             'total_carbon_savings_kg': self.total_carbon_savings_kg
@@ -1022,9 +1624,82 @@ class QuantumLimitGraphIntegrator:
         
         return status
     
-    # ========================================================================
-    # Quantum Resource Management
-    # ========================================================================
+    def get_entanglement_status(self) -> Dict[str, Any]:
+        status = {
+            'total_entanglements': sum(len(v) for v in self.entanglement_map.values()),
+            'entanglement_map': dict(self.entanglement_map),
+            'node_states': {}
+        }
+        
+        for node_id, node in self.graph_nodes.items():
+            node_status = {
+                'current_value': node.current_value,
+                'limit_value': node.limit_value,
+                'utilization': node.current_value / max(node.limit_value, 1e-9),
+                'entangled_count': len(node.entangled_nodes),
+                'sustainability_score': node.sustainability_score
+            }
+            
+            if self.enable_bio_integration:
+                node_status['bio_entangled'] = self._get_entangled_resources(
+                    node.resource_type
+                )
+                if node.gradient_field_id:
+                    gradient_level = self._get_real_gradient_levels().get(
+                        node.gradient_field_id, 0.5
+                    )
+                    node_status['gradient_strength'] = gradient_level
+            
+            status['node_states'][node_id] = node_status
+        
+        return status
+    
+    def get_validation_statistics(self) -> Dict[str, Any]:
+        recent = list(self.validation_history)[-100:]
+        bio_validations = [v for v in recent if v.get('bio_integrated', False)]
+        
+        stats = {
+            'total_validations': len(self.validation_history),
+            'recent_validation_rate': sum(1 for v in recent if v['is_valid']) / max(len(recent), 1),
+            'bio_integration_active': self.enable_bio_integration,
+            'bio_validations': len(bio_validations),
+            'quantum_advantage_scores': self.quantum_advantage_scores,
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg
+        }
+        
+        if self.enable_bio_integration:
+            stats['gradient_levels'] = self._get_real_gradient_levels()
+            stats['token_budget'] = self._get_token_budget_remaining()
+            stats['harvester_confidence'] = self._get_harvester_confidence()
+        
+        if self.enable_predictive:
+            stats['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_limit_trend())
+        
+        if self.enable_cross_domain:
+            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
+        
+        if self.enable_federated_learning:
+            stats['federated_clients'] = len(self.federated_learning.clients) if self.federated_learning else 0
+        
+        if self.enable_user_adaptive:
+            stats['user_profiles'] = len(self.user_adaptive.user_profiles) if self.user_adaptive else 0
+        
+        return stats
+    
+    def get_quantum_resource_status(self) -> Dict[str, Any]:
+        status = {}
+        for backend, resource in self.backends.items():
+            status[backend.value] = {
+                'qubits_available': resource.qubits_available,
+                'qubits_in_use': resource.qubits_in_use,
+                'utilization': resource.utilization,
+                'gate_error_rate': resource.gate_error_rate,
+                'ecoatp_cost_per_second': resource.ecoatp_cost_per_second,
+                'carbon_per_second': resource.carbon_per_second,
+                'is_available': resource.is_available
+            }
+        return status
     
     def select_optimal_backend(
         self,
@@ -1060,109 +1735,6 @@ class QuantumLimitGraphIntegrator:
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[0][0]
     
-    def get_quantum_resource_status(self) -> Dict[str, Any]:
-        status = {}
-        for backend, resource in self.backends.items():
-            status[backend.value] = {
-                'qubits_available': resource.qubits_available,
-                'qubits_in_use': resource.qubits_in_use,
-                'utilization': resource.utilization,
-                'gate_error_rate': resource.gate_error_rate,
-                'ecoatp_cost_per_second': resource.ecoatp_cost_per_second,
-                'carbon_per_second': resource.carbon_per_second,
-                'is_available': resource.is_available
-            }
-        return status
-    
-    # ========================================================================
-    # Statistics and Reports
-    # ========================================================================
-    
-    def get_validation_statistics(self) -> Dict[str, Any]:
-        recent = list(self.validation_history)[-100:]
-        bio_validations = [v for v in recent if v.get('bio_integrated', False)]
-        
-        stats = {
-            'total_validations': len(self.validation_history),
-            'recent_validation_rate': sum(1 for v in recent if v['is_valid']) / max(len(recent), 1),
-            'bio_integration_active': self.enable_bio_integration,
-            'bio_validations': len(bio_validations),
-            'quantum_advantage_scores': self.quantum_advantage_scores,
-            'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg
-        }
-        
-        if self.enable_bio_integration:
-            stats['gradient_levels'] = self._get_real_gradient_levels()
-            stats['token_budget'] = self._get_token_budget_remaining()
-            stats['harvester_confidence'] = self._get_harvester_confidence()
-        
-        if self.enable_predictive:
-            stats['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_limit_trend())
-        
-        if self.enable_cross_domain:
-            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
-        
-        return stats
-    
-    def get_entanglement_status(self) -> Dict[str, Any]:
-        status = {
-            'total_entanglements': sum(len(v) for v in self.entanglement_map.values()),
-            'entanglement_map': dict(self.entanglement_map),
-            'node_states': {}
-        }
-        
-        for node_id, node in self.graph_nodes.items():
-            node_status = {
-                'current_value': node.current_value,
-                'limit_value': node.limit_value,
-                'utilization': node.current_value / max(node.limit_value, 1e-9),
-                'entangled_count': len(node.entangled_nodes),
-                'sustainability_score': node.sustainability_score
-            }
-            
-            if self.enable_bio_integration:
-                node_status['bio_entangled'] = self._get_entangled_resources(
-                    node.resource_type
-                )
-                if node.gradient_field_id:
-                    gradient_level = self._get_real_gradient_levels().get(
-                        node.gradient_field_id, 0.5
-                    )
-                    node_status['gradient_strength'] = gradient_level
-            
-            status['node_states'][node_id] = node_status
-        
-        return status
-    
-    def get_comprehensive_limits_report(self) -> Dict[str, Any]:
-        report = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'planetary_boundaries': self.get_planetary_boundary_status(),
-            'entanglement': self.get_entanglement_status(),
-            'validation_stats': self.get_validation_statistics(),
-            'quantum_resources': self.get_quantum_resource_status(),
-            'sustainability': {
-                'score': self.sustainability_score,
-                'carbon_savings_kg': self.total_carbon_savings_kg
-            },
-            'bio_integration': {
-                'active': self.enable_bio_integration,
-                'available': BIO_INSPIRED_AVAILABLE,
-                'gradient_levels': self._get_real_gradient_levels() if self.enable_bio_integration else {},
-                'token_budget': self._get_token_budget_remaining() if self.enable_bio_integration else float('inf'),
-                'harvester_confidence': self._get_harvester_confidence() if self.enable_bio_integration else 0.5
-            }
-        }
-        
-        if self.enable_predictive:
-            report['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_limit_trend())
-        
-        if self.enable_cross_domain:
-            report['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
-        
-        return report
-    
     def get_sustainability_report(self) -> Dict[str, Any]:
         return {
             'timestamp': datetime.utcnow().isoformat(),
@@ -1170,7 +1742,11 @@ class QuantumLimitGraphIntegrator:
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
             'bio_integration_active': self.enable_bio_integration,
             'predictive_forecast': asyncio.run(self.predictive_analyzer.predict_limit_trend()) if self.enable_predictive else {},
-            'recommendations': self._generate_sustainability_recommendations()
+            'recommendations': self._generate_sustainability_recommendations(),
+            'federated_trust': self.get_federation_status() if self.enable_federated_learning else None,
+            'collaboration_status': {
+                'sessions': len(self.human_ai_collab.collaboration_sessions) if self.enable_human_ai_collab else 0
+            }
         }
     
     def _generate_sustainability_recommendations(self) -> List[str]:
@@ -1182,6 +1758,14 @@ class QuantumLimitGraphIntegrator:
             recommendations.append("Implement more aggressive carbon reduction strategies")
         if self.enable_bio_integration and self._get_harvester_confidence() < 0.4:
             recommendations.append("Improve harvester signal quality for better confidence")
+        
+        # Federated learning recommendations
+        if self.enable_federated_learning and self.federated_learning:
+            active_clients = sum(1 for c in self.federated_learning.clients.values() 
+                               if (datetime.utcnow() - c['last_active']).seconds < 300)
+            if active_clients < 2:
+                recommendations.append("Recruit more federated learning participants for better consensus")
+        
         return recommendations or ["Limit integration sustainability is on track"]
     
     # ========================================================================
