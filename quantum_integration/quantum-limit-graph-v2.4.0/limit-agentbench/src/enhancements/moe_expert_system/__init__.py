@@ -1,6 +1,7 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/__init__.py
 """
 Green Agent MoE Expert System v5.0.0 - Unified Metabolic Ecosystem
+ENHANCED WITH: System Digital Twin and Unified Sustainability Engine
 
 Complete integration with bio-inspired modules providing:
 - Eco-ATP currency system for unified resource accounting
@@ -9,9 +10,10 @@ Complete integration with bio-inspired modules providing:
 - Chromatophore compartments for modular expert isolation
 - Biomass storage for deferred computation queuing
 - Photosynthetic harvesting for environmental opportunity detection
-- Unified Sustainability Dashboard
-- Predictive Maintenance Integration
-- Enhanced Bio-Inspired Integration
+- Unified Sustainability Dashboard (Ecosystem Health Monitor)
+- Predictive Maintenance Integration (Future State Predictor)
+- System Digital Twin (Strategic Simulation Engine)
+- Unified Sustainability Engine (Authoritative Global Score)
 
 This module serves as the central nervous system connecting:
 - Expert Registry (Genome Repository)
@@ -21,6 +23,8 @@ This module serves as the central nervous system connecting:
 - Monitoring system (Metabolic Observatory)
 - Sustainability Dashboard (Ecosystem Health Monitor)
 - Predictive Analytics (Future State Predictor)
+- Digital Twin (Strategic Simulator)
+- Sustainability Engine (Valuation Core)
 """
 
 import logging
@@ -28,6 +32,9 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 import asyncio
 import threading
+import numpy as np
+from collections import deque
+import importlib
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,37 @@ try:
     logger.info("Bio-inspired modules available for MoE Expert System integration")
 except ImportError as e:
     logger.info(f"Bio-inspired modules not available: {str(e)} - using standard MoE system")
+
+# ============================================================================
+# Digital Twin and Sustainability Engine Imports
+# ============================================================================
+
+try:
+    from enhancements.advanced.system_digital_twin import (
+        SystemDigitalTwin,
+        DigitalTwinConfig,
+        SimulationResult,
+        SimulationScenario,
+        ResourceProjection
+    )
+    DIGITAL_TWIN_AVAILABLE = True
+    logger.info("System Digital Twin available")
+except ImportError as e:
+    DIGITAL_TWIN_AVAILABLE = False
+    logger.info(f"System Digital Twin not available: {str(e)}")
+
+try:
+    from enhancements.sustainability.unified_sustainability_engine import (
+        UnifiedSustainabilityEngine,
+        UnifiedSustainabilityScore,
+        SustainabilityDimension,
+        SustainabilityThreshold
+    )
+    SUSTAINABILITY_ENGINE_AVAILABLE = True
+    logger.info("Unified Sustainability Engine available")
+except ImportError as e:
+    SUSTAINABILITY_ENGINE_AVAILABLE = False
+    logger.info(f"Unified Sustainability Engine not available: {str(e)}")
 
 # ============================================================================
 # Core MoE Components
@@ -222,7 +260,7 @@ from .monitoring.expert_metrics import (
 )
 
 # ============================================================================
-# Sustainability Modules (New)
+# Sustainability Modules
 # ============================================================================
 
 try:
@@ -268,7 +306,7 @@ except ImportError:
     OFFSET_AVAILABLE = False
 
 # ============================================================================
-# Enhanced Bio-Inspired Integration (New Module)
+# Enhanced Bio-Inspired Integration
 # ============================================================================
 
 class EnhancedBioInspiredIntegrator:
@@ -333,7 +371,7 @@ class EnhancedBioInspiredIntegrator:
         return status
 
 # ============================================================================
-# Unified Sustainability Dashboard (New Module)
+# Unified Sustainability Dashboard
 # ============================================================================
 
 class UnifiedSustainabilityDashboard:
@@ -379,7 +417,7 @@ class UnifiedSustainabilityDashboard:
                 self._check_alerts(status)
                 
                 import time
-                time.sleep(60)  # Check every minute
+                time.sleep(60)
             except Exception as e:
                 logger.error(f"Monitor loop error: {str(e)}")
                 import time
@@ -389,14 +427,12 @@ class UnifiedSustainabilityDashboard:
         """Check for alerts based on thresholds"""
         alerts = []
         
-        # Check sustainability score
         if status.get('sustainability_score', 0) < self.alert_thresholds['sustainability_score']:
             alerts.append({
                 'level': 'warning',
-                'message': f"Sustainability score {status['sustainability_score']:.2f} below threshold {self.alert_thresholds['sustainability_score']}"
+                'message': f"Sustainability score {status['sustainability_score']:.2f} below threshold"
             })
         
-        # Check carbon budget
         carbon_pos = status.get('carbon_position', {})
         carbon_remaining_ratio = carbon_pos.get('remaining_budget_ratio', 1.0)
         if carbon_remaining_ratio < self.alert_thresholds['carbon_budget_remaining']:
@@ -405,7 +441,6 @@ class UnifiedSustainabilityDashboard:
                 'message': f"Carbon budget remaining {carbon_remaining_ratio:.1%} below threshold"
             })
         
-        # Check helium budget
         helium_pos = status.get('helium_position', {})
         helium_remaining_ratio = helium_pos.get('remaining_budget_ratio', 1.0)
         if helium_remaining_ratio < self.alert_thresholds['helium_budget_remaining']:
@@ -414,7 +449,6 @@ class UnifiedSustainabilityDashboard:
                 'message': f"Helium budget remaining {helium_remaining_ratio:.1%} below threshold"
             })
         
-        # Check circularity
         if status.get('circularity_score', 0) < self.alert_thresholds['circularity_score']:
             alerts.append({
                 'level': 'warning',
@@ -432,7 +466,6 @@ class UnifiedSustainabilityDashboard:
         """Get unified dashboard status"""
         ecosystem = self.ecosystem
         
-        # Get carbon position from metrics
         carbon_position = {}
         if hasattr(ecosystem, 'metrics'):
             metrics_summary = ecosystem.metrics.get_metrics_summary()
@@ -447,7 +480,6 @@ class UnifiedSustainabilityDashboard:
                     max(ecosystem.metrics.accountant.carbon_budget_kg, 1)
                 )
         
-        # Get helium position
         helium_position = {}
         if hasattr(ecosystem, 'helium_tracker'):
             helium_pos = ecosystem.helium_tracker.get_helium_position()
@@ -458,20 +490,17 @@ class UnifiedSustainabilityDashboard:
                 'remaining_budget_ratio': helium_pos.get('remaining_budget_l', 0) / max(ecosystem.helium_tracker.helium_budget_l, 1)
             }
         
-        # Get sustainability score
         sustainability_score = 0.5
         if hasattr(ecosystem, 'sustainability_score'):
             sustainability_score = ecosystem.sustainability_score
         elif hasattr(ecosystem, 'metrics') and hasattr(ecosystem.metrics, 'sustainability_score'):
             sustainability_score = ecosystem.metrics.sustainability_score
         
-        # Get circularity score
         circularity_score = 0.0
         if hasattr(ecosystem, 'circular_manager') and ecosystem.circular_manager:
             report = ecosystem.circular_manager.get_circularity_report()
             circularity_score = report.get('circularity_score', 0.0)
         
-        # Get ecosystem health
         ecosystem_health = 0.5
         if hasattr(ecosystem, 'get_ecosystem_health'):
             ecosystem_health = ecosystem.get_ecosystem_health()
@@ -535,7 +564,6 @@ class UnifiedSustainabilityDashboard:
         status = self.get_dashboard_status()
         recommendations = self.get_recommendations()
         
-        # Historical trend analysis
         trend = 'stable'
         if len(self.history) > 10:
             recent_scores = [h['sustainability_score'] for h in self.history[-10:]]
@@ -558,12 +586,11 @@ class UnifiedSustainabilityDashboard:
         }
     
     def shutdown(self):
-        """Shutdown the dashboard"""
         self._running = False
         logger.info("Unified Sustainability Dashboard shut down")
 
 # ============================================================================
-# Predictive Maintenance Integration (New Module)
+# Predictive Maintenance Integration
 # ============================================================================
 
 class PredictiveMaintenanceIntegrator:
@@ -583,7 +610,6 @@ class PredictiveMaintenanceIntegrator:
         self.anomaly_history = deque(maxlen=1000)
         self._lock = threading.Lock()
         
-        # Start background prediction loop
         self._running = True
         self._predict_thread = threading.Thread(target=self._predict_loop, daemon=True)
         self._predict_thread.start()
@@ -599,7 +625,7 @@ class PredictiveMaintenanceIntegrator:
                     self.predictions = insights
                 
                 import time
-                time.sleep(300)  # Predict every 5 minutes
+                time.sleep(300)
             except Exception as e:
                 logger.error(f"Prediction loop error: {str(e)}")
                 import time
@@ -617,7 +643,6 @@ class PredictiveMaintenanceIntegrator:
             'anomaly_detections': []
         }
         
-        # Lifecycle predictions
         if hasattr(ecosystem, 'circular_manager') and ecosystem.circular_manager:
             if hasattr(ecosystem.circular_manager, 'predictive_analyzer'):
                 analyzer = ecosystem.circular_manager.predictive_analyzer
@@ -628,7 +653,6 @@ class PredictiveMaintenanceIntegrator:
                         )
                         insights['lifecycle_predictions'][component_id] = prediction
         
-        # Carbon forecast
         if hasattr(ecosystem, 'metrics') and ecosystem.metrics:
             if hasattr(ecosystem.metrics, 'predictive_analyzer'):
                 forecast = asyncio.run(
@@ -640,7 +664,6 @@ class PredictiveMaintenanceIntegrator:
                     'trend': forecast.get('trend', 'stable')
                 }
         
-        # Helium forecast
         if hasattr(ecosystem, 'helium_tracker'):
             helium_pos = ecosystem.helium_tracker.get_helium_position()
             insights['helium_forecast'] = {
@@ -649,7 +672,6 @@ class PredictiveMaintenanceIntegrator:
                 'days_remaining': helium_pos.get('remaining_budget_l', 0) / max(0.1, abs(helium_pos.get('net_position_l', 0) / 365))
             }
         
-        # Workload predictions
         if hasattr(ecosystem, 'work_integrator'):
             work_stats = ecosystem.work_integrator.get_work_statistics()
             insights['workload_predictions'] = {
@@ -659,7 +681,6 @@ class PredictiveMaintenanceIntegrator:
                 'predicted_bottlenecks': ['energy'] if work_stats.get('active_works', 0) > 10 else []
             }
         
-        # Anomaly detections
         if hasattr(ecosystem, 'metrics') and ecosystem.metrics:
             if hasattr(ecosystem.metrics, 'anomaly_detector'):
                 detection_stats = ecosystem.metrics.anomaly_detector.get_detection_stats()
@@ -714,7 +735,6 @@ class PredictiveMaintenanceIntegrator:
         return recommendations
     
     def shutdown(self):
-        """Shutdown the integrator"""
         self._running = False
         logger.info("Predictive Maintenance Integrator shut down")
 
@@ -724,22 +744,11 @@ class PredictiveMaintenanceIntegrator:
 
 class UnifiedMetabolicEcosystem:
     """
-    Unified Metabolic Ecosystem v5.0.0
+    Unified Metabolic Ecosystem v5.0.0 with Digital Twin and Sustainability Engine.
     
     Complete integration of MoE Expert System with Bio-Inspired Architecture.
-    Enhanced with sustainability dashboard and predictive maintenance.
-    
-    This class wires together:
-    - Expert Registry (Genome Repository)
-    - Gating Network (Allosteric Enzyme)
-    - Expert Router (Signal Transduction Cascade)
-    - All Metabolic Experts (Energy, Data, IoT, Quantum, Helium)
-    - Bio-Inspired Core (Eco-ATP, Gradients, ATP Synthase, Compartments, Biomass, Harvester)
-    - Advanced Modules (Self-Evolving Gates, Federated Learning, Cross-Region)
-    - Integration Layer (12-Layer Bridge, Work Orchestrator, Quantum Limits)
-    - Monitoring (Metabolic Observatory)
-    - Sustainability Dashboard (Ecosystem Health Monitor)
-    - Predictive Maintenance (Future State Predictor)
+    Enhanced with sustainability dashboard, predictive maintenance,
+    system digital twin, and unified sustainability engine.
     """
     
     def __init__(
@@ -752,6 +761,8 @@ class UnifiedMetabolicEcosystem:
         enable_cross_region: bool = False,
         enable_sustainability_dashboard: bool = True,
         enable_predictive_maintenance: bool = True,
+        enable_digital_twin: bool = True,
+        enable_unified_sustainability: bool = True,
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -766,22 +777,34 @@ class UnifiedMetabolicEcosystem:
             enable_cross_region: Enable cross-region federation
             enable_sustainability_dashboard: Enable sustainability dashboard
             enable_predictive_maintenance: Enable predictive maintenance
+            enable_digital_twin: Enable system digital twin
+            enable_unified_sustainability: Enable unified sustainability engine
             config: Optional configuration dictionary
         """
         self.config = config or {}
         self.initialization_status: Dict[str, bool] = {}
+        
+        # Feature flags
+        self.enable_digital_twin = enable_digital_twin and DIGITAL_TWIN_AVAILABLE
+        self.enable_unified_sustainability = enable_unified_sustainability and SUSTAINABILITY_ENGINE_AVAILABLE
         
         # Sustainability tracking
         self.sustainability_score = 0.0
         self.helium_tracker = None
         self.circular_manager = None
         
+        # Digital Twin and Sustainability Engine
+        self.digital_twin = None
+        self.sustainability_engine = None
+        
         logger.info("=" * 70)
         logger.info("Initializing Unified Metabolic Ecosystem v5.0.0")
+        logger.info(f"  Digital Twin: {self.enable_digital_twin}")
+        logger.info(f"  Unified Sustainability: {self.enable_unified_sustainability}")
         logger.info("=" * 70)
         
         # ====================================================================
-        # Step 1: Initialize Bio-Inspired Core (if available)
+        # Step 1: Initialize Bio-Inspired Core
         # ====================================================================
         self.bio_core = None
         self.bio_available = False
@@ -800,7 +823,7 @@ class UnifiedMetabolicEcosystem:
             self.initialization_status['bio_inspired_core'] = False
         
         # ====================================================================
-        # Step 2: Initialize Expert Registry (Genome Repository)
+        # Step 2: Initialize Expert Registry
         # ====================================================================
         try:
             self.registry = ExpertRegistry(
@@ -820,7 +843,7 @@ class UnifiedMetabolicEcosystem:
             raise
         
         # ====================================================================
-        # Step 3: Initialize Gating Network (Allosteric Enzyme)
+        # Step 3: Initialize Gating Network
         # ====================================================================
         try:
             self.gating_network = MoEGatingNetwork(
@@ -839,7 +862,7 @@ class UnifiedMetabolicEcosystem:
             raise
         
         # ====================================================================
-        # Step 4: Initialize Expert Router (Signal Transduction Cascade)
+        # Step 4: Initialize Expert Router
         # ====================================================================
         try:
             self.router = ExpertRouter(
@@ -866,7 +889,7 @@ class UnifiedMetabolicEcosystem:
         # ====================================================================
         self.experts: Dict[str, Any] = {}
         
-        # Energy Expert (Primary Producer)
+        # Energy Expert
         try:
             self.experts['energy'] = EnergyExpert(
                 enable_bio_integration=self.bio_available
@@ -877,7 +900,7 @@ class UnifiedMetabolicEcosystem:
         except Exception as e:
             logger.error(f"[EXPERT] Failed to initialize Energy Expert: {str(e)}")
         
-        # Data Expert (Primary Consumer)
+        # Data Expert
         try:
             self.experts['data'] = DataExpert(
                 enable_bio_integration=self.bio_available
@@ -888,7 +911,7 @@ class UnifiedMetabolicEcosystem:
         except Exception as e:
             logger.error(f"[EXPERT] Failed to initialize Data Expert: {str(e)}")
         
-        # IoT Expert (Decomposer)
+        # IoT Expert
         try:
             self.experts['iot'] = IoTExpert(
                 enable_bio_integration=self.bio_available
@@ -897,9 +920,9 @@ class UnifiedMetabolicEcosystem:
                 self.experts['iot'].inject_bio_core(self.bio_core)
             logger.info("[EXPERT] IoT Expert (Decomposer) initialized")
         except Exception as e:
-            logger.error(f"[EXPERT] Failed to initialize IoT Expert: {str(e)}")
+            logger.error(f("[EXPERT] Failed to initialize IoT Expert: {str(e)}")
         
-        # Quantum Expert (Catalyst) - Optional
+        # Quantum Expert (Optional)
         if enable_quantum and QUANTUM_AVAILABLE:
             try:
                 self.experts['quantum'] = QuantumExpert()
@@ -907,7 +930,7 @@ class UnifiedMetabolicEcosystem:
             except Exception as e:
                 logger.error(f"[EXPERT] Failed to initialize Quantum Expert: {str(e)}")
         
-        # Helium Expert (Homeostatic Regulator) - Optional
+        # Helium Expert (Optional)
         if enable_helium and HELIUM_AVAILABLE:
             try:
                 self.experts['helium'] = HeliumExpert()
@@ -915,7 +938,7 @@ class UnifiedMetabolicEcosystem:
             except Exception as e:
                 logger.error(f"[EXPERT] Failed to initialize Helium Expert: {str(e)}")
         
-        # Register all experts with registry
+        # Register all experts
         for expert_id, expert in self.experts.items():
             try:
                 if hasattr(expert, 'profile'):
@@ -993,7 +1016,7 @@ class UnifiedMetabolicEcosystem:
         # Step 8: Initialize Integration Layer
         # ====================================================================
         
-        # Layer Integrator (12-Layer Bridge)
+        # Layer Integrator
         try:
             self.layer_integrator = EnhancedLayerIntegrator(
                 enable_bio_integration=self.bio_available
@@ -1006,7 +1029,7 @@ class UnifiedMetabolicEcosystem:
             logger.error(f"[LAYER] Failed to initialize Layer Integrator: {str(e)}")
             self.initialization_status['layer_integrator'] = False
         
-        # Enhanced Work Integrator (Metabolic Work Orchestrator)
+        # Enhanced Work Integrator
         try:
             self.work_integrator = EnhancedWorkIntegrator(
                 expert_router=self.router,
@@ -1034,7 +1057,7 @@ class UnifiedMetabolicEcosystem:
             self.initialization_status['quantum_limits'] = False
         
         # ====================================================================
-        # Step 9: Initialize Monitoring (Metabolic Observatory)
+        # Step 9: Initialize Monitoring
         # ====================================================================
         try:
             self.metrics = ExpertMetricsCollector(
@@ -1098,7 +1121,6 @@ class UnifiedMetabolicEcosystem:
         try:
             self.bio_integrator = EnhancedBioInspiredIntegrator(self.bio_core)
             
-            # Register all components
             components_to_register = [
                 ('registry', self.registry),
                 ('gating_network', self.gating_network),
@@ -1144,7 +1166,12 @@ class UnifiedMetabolicEcosystem:
                 self.initialization_status['predictive_maintenance'] = False
         
         # ====================================================================
-        # Step 14: Wire Router Metrics
+        # Step 14: Initialize Digital Twin and Sustainability Engine
+        # ====================================================================
+        await self._init_digital_twin_and_sustainability()
+        
+        # ====================================================================
+        # Step 15: Wire Router Metrics
         # ====================================================================
         if hasattr(self.router, 'metrics_collector'):
             self.router.metrics_collector = self.metrics
@@ -1156,17 +1183,175 @@ class UnifiedMetabolicEcosystem:
         logger.info("Unified Metabolic Ecosystem Initialization Complete")
         logger.info(f"  Bio-Inspired: {self.bio_available}")
         logger.info(f"  Experts: {len(self.experts)}")
-        logger.info(f"  Sustainability Dashboard: {enable_sustainability_dashboard}")
-        logger.info(f"  Predictive Maintenance: {enable_predictive_maintenance}")
+        logger.info(f"  Digital Twin: {self.enable_digital_twin}")
+        logger.info(f"  Unified Sustainability: {self.enable_unified_sustainability}")
         logger.info(f"  Status: {sum(self.initialization_status.values())}/{len(self.initialization_status)} components")
         logger.info("=" * 70)
     
     # ========================================================================
-    # Public API Methods
+    # Digital Twin and Sustainability Engine Initialization
+    # ========================================================================
+    
+    async def _init_digital_twin_and_sustainability(self):
+        """Initialize Digital Twin and Unified Sustainability Engine"""
+        if self.enable_digital_twin:
+            try:
+                # Create Digital Twin with config
+                twin_config = DigitalTwinConfig(
+                    time_horizon_years=self.config.get('twin_time_horizon', 10),
+                    n_simulations=self.config.get('twin_n_simulations', 1000),
+                    confidence_level=self.config.get('twin_confidence', 0.95)
+                )
+                self.digital_twin = SystemDigitalTwin(twin_config)
+                
+                # Inject modules
+                self.digital_twin.inject_modules(
+                    quantum_limits=self.quantum_limits,
+                    biodiversity=self.biodiversity,
+                    expert_registry=self.registry,
+                    circular_manager=self.circular_manager,
+                    carbon_manager=self.carbon_manager if hasattr(self, 'carbon_manager') else None,
+                    helium_tracker=self.helium_tracker if hasattr(self, 'helium_tracker') else None
+                )
+                
+                self.initialization_status['digital_twin'] = True
+                logger.info("[DIGITAL-TWIN] System Digital Twin initialized")
+            except Exception as e:
+                logger.error(f"[DIGITAL-TWIN] Failed to initialize Digital Twin: {str(e)}")
+                self.initialization_status['digital_twin'] = False
+                self.enable_digital_twin = False
+        
+        if self.enable_unified_sustainability:
+            try:
+                # Create Sustainability Engine
+                self.sustainability_engine = UnifiedSustainabilityEngine()
+                
+                # Inject modules
+                self.sustainability_engine.inject_modules(
+                    carbon_manager=self.carbon_manager if hasattr(self, 'carbon_manager') else None,
+                    helium_tracker=self.helium_tracker if hasattr(self, 'helium_tracker') else None,
+                    circular_manager=self.circular_manager,
+                    biodiversity=self.biodiversity,
+                    expert_registry=self.registry,
+                    quantum_limits=self.quantum_limits
+                )
+                
+                self.initialization_status['sustainability_engine'] = True
+                logger.info("[SUSTAINABILITY-ENGINE] Unified Sustainability Engine initialized")
+            except Exception as e:
+                logger.error(f"[SUSTAINABILITY-ENGINE] Failed to initialize Sustainability Engine: {str(e)}")
+                self.initialization_status['sustainability_engine'] = False
+                self.enable_unified_sustainability = False
+        
+        # Update initial sustainability score
+        if self.enable_unified_sustainability and self.sustainability_engine:
+            try:
+                score = await self.sustainability_engine.update_sustainability_score()
+                self.sustainability_score = score.total_score
+                logger.info(f"[SUSTAINABILITY] Initial sustainability score: {self.sustainability_score:.3f}")
+            except Exception as e:
+                logger.error(f"[SUSTAINABILITY] Failed to get initial sustainability score: {str(e)}")
+    
+    # ========================================================================
+    # Digital Twin Public Methods
+    # ========================================================================
+    
+    async def run_sustainability_scenario(
+        self,
+        scenario_type: str,
+        parameters: Dict[str, Any],
+        time_horizon_years: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Run a sustainability scenario on the digital twin.
+        
+        Args:
+            scenario_type: Type of scenario ('policy_change', 'market_shock', 
+                           'resource_depletion', 'technology_adoption', 
+                           'regulatory_change', 'climate_event')
+            parameters: Scenario-specific parameters
+            time_horizon_years: Override default time horizon
+            
+        Returns:
+            Scenario results with projections and recommendations
+        """
+        if not self.enable_digital_twin or not self.digital_twin:
+            return {'status': 'digital_twin_not_enabled'}
+        
+        scenario_map = {
+            'policy_change': SimulationScenario.POLICY_CHANGE,
+            'market_shock': SimulationScenario.MARKET_SHOCK,
+            'resource_depletion': SimulationScenario.RESOURCE_DEPLETION,
+            'technology_adoption': SimulationScenario.TECHNOLOGY_ADOPTION,
+            'regulatory_change': SimulationScenario.REGULATORY_CHANGE,
+            'climate_event': SimulationScenario.CLIMATE_EVENT
+        }
+        
+        scenario_type_enum = scenario_map.get(scenario_type, SimulationScenario.POLICY_CHANGE)
+        
+        result = await self.digital_twin.run_scenario(
+            scenario_type_enum,
+            parameters,
+            time_horizon_years
+        )
+        
+        return {
+            'scenario_id': result.scenario_id,
+            'sustainability_score': result.sustainability_score,
+            'risk_factors': result.risk_factors,
+            'recommendations': result.recommendations,
+            'projections': result.projections,
+            'confidence_intervals': result.confidence_intervals
+        }
+    
+    async def get_twin_projections(self) -> Dict[str, Any]:
+        """Get current resource projections from digital twin"""
+        if not self.enable_digital_twin or not self.digital_twin:
+            return {'status': 'digital_twin_not_enabled'}
+        
+        return await self.digital_twin.export_projections()
+    
+    # ========================================================================
+    # Sustainability Engine Public Methods
+    # ========================================================================
+    
+    async def get_sustainability_status(self) -> Dict[str, Any]:
+        """Get current sustainability status"""
+        if not self.enable_unified_sustainability or not self.sustainability_engine:
+            return {'status': 'sustainability_engine_not_enabled'}
+        
+        return await self.sustainability_engine.get_sustainability_report()
+    
+    async def get_sustainability_score(self) -> float:
+        """Get current unified sustainability score"""
+        if not self.enable_unified_sustainability or not self.sustainability_engine:
+            return self.sustainability_score
+        
+        return await self.sustainability_engine.get_current_score()
+    
+    async def get_sustainability_dimensions(self) -> Dict[str, Any]:
+        """Get all sustainability dimensions"""
+        if not self.enable_unified_sustainability or not self.sustainability_engine:
+            return {'status': 'sustainability_engine_not_enabled'}
+        
+        status = await self.sustainability_engine.get_sustainability_report()
+        return status.get('dimensions', {})
+    
+    async def update_sustainability_score(self) -> float:
+        """Force update of sustainability score"""
+        if not self.enable_unified_sustainability or not self.sustainability_engine:
+            return self.sustainability_score
+        
+        score = await self.sustainability_engine.update_sustainability_score()
+        self.sustainability_score = score.total_score
+        return self.sustainability_score
+    
+    # ========================================================================
+    # Override Existing Methods with Sustainability Integration
     # ========================================================================
     
     def get_ecosystem_status(self) -> Dict[str, Any]:
-        """Get comprehensive ecosystem status with sustainability"""
+        """Get comprehensive ecosystem status with sustainability and twin data"""
         status = {
             'ecosystem_version': '5.0.0',
             'bio_inspired_available': self.bio_available,
@@ -1204,34 +1389,41 @@ class UnifiedMetabolicEcosystem:
         if self.predictive_maintenance:
             status['predictive'] = self.predictive_maintenance.get_predictive_insights()
         
+        # Digital twin
+        if self.enable_digital_twin and self.digital_twin:
+            status['digital_twin'] = self.digital_twin.get_simulation_stats()
+        
+        # Sustainability engine
+        if self.enable_unified_sustainability and self.sustainability_engine:
+            status['sustainability_dimensions'] = asyncio.run(
+                self.sustainability_engine.get_dimension_status()
+            )
+        
         return status
     
-    def get_ecosystem_health(self) -> float:
-        """Calculate overall ecosystem health score"""
-        health_scores = []
+    async def run_sustainability_optimization(self, objective: str = 'maximize') -> Dict[str, Any]:
+        """
+        Run sustainability optimization using the digital twin.
         
-        # Registry health
-        if hasattr(self, 'registry'):
-            registry_stats = self.registry.get_registry_stats()
-            health_scores.append(registry_stats.get('health_score', 0.5))
+        Args:
+            objective: 'maximize' or 'minimize' sustainability impact
+            
+        Returns:
+            Optimization results and recommendations
+        """
+        if not self.enable_digital_twin or not self.digital_twin:
+            return {'status': 'digital_twin_not_enabled'}
         
-        # Router health
-        if hasattr(self, 'router'):
-            router_stats = self.router.get_routing_stats()
-            health_scores.append(router_stats.get('health_score', 0.5))
-        
-        # Metrics health
-        if hasattr(self, 'metrics'):
-            metrics_summary = self.metrics.get_metrics_summary()
-            health_scores.append(metrics_summary.get('health_score', 0.5))
-        
-        # Sustainability score
-        health_scores.append(self.sustainability_score)
-        
-        return np.mean(health_scores) if health_scores else 0.5
+        # This would be expanded with actual optimization logic
+        return {
+            'status': 'optimization_available',
+            'objective': objective,
+            'current_score': self.sustainability_score,
+            'recommendations': await self.get_sustainability_recommendations()
+        }
     
     def process_task(self, task: Dict[str, Any], pipeline_type: str = 'standard') -> Dict[str, Any]:
-        """Process a task through the unified metabolic ecosystem"""
+        """Process a task through the unified metabolic ecosystem with sustainability tracking"""
         if hasattr(self, 'work_integrator'):
             result = self.work_integrator.process_work(task, pipeline_type)
             
@@ -1293,9 +1485,12 @@ class UnifiedMetabolicEcosystem:
         if hasattr(expert_instance, 'profile'):
             self.registry.register_expert(expert_instance.profile, validate=False)
         
-        # Register with bio-integrator
         if hasattr(self, 'bio_integrator'):
             self.bio_integrator.register_component(f"expert_{expert_type}", expert_instance)
+        
+        # Register with sustainability modules
+        if self.enable_unified_sustainability and self.sustainability_engine:
+            asyncio.create_task(self.sustainability_engine.update_sustainability_score())
         
         logger.info(f"Dynamic expert registered: {expert_type}")
     
@@ -1329,7 +1524,14 @@ class UnifiedMetabolicEcosystem:
         if self.predictive_maintenance:
             self.predictive_maintenance.shutdown()
         
-        # Cleanup would go here
+        # Shutdown digital twin
+        if self.enable_digital_twin and self.digital_twin:
+            asyncio.run(self.digital_twin.shutdown())
+        
+        # Shutdown sustainability engine
+        if self.enable_unified_sustainability and self.sustainability_engine:
+            asyncio.run(self.sustainability_engine.shutdown())
+        
         logger.info("Ecosystem shutdown complete")
 
 
@@ -1345,7 +1547,9 @@ def create_metabolic_ecosystem(
     enable_federated: bool = False,
     enable_cross_region: bool = False,
     enable_dashboard: bool = True,
-    enable_predictive: bool = True
+    enable_predictive: bool = True,
+    enable_twin: bool = True,
+    enable_sustainability_engine: bool = True
 ) -> UnifiedMetabolicEcosystem:
     """
     Create a unified metabolic ecosystem with specified features.
@@ -1359,6 +1563,8 @@ def create_metabolic_ecosystem(
         enable_cross_region: Enable cross-region federation
         enable_dashboard: Enable sustainability dashboard
         enable_predictive: Enable predictive maintenance
+        enable_twin: Enable system digital twin
+        enable_sustainability_engine: Enable unified sustainability engine
         
     Returns:
         Configured UnifiedMetabolicEcosystem instance
@@ -1371,7 +1577,9 @@ def create_metabolic_ecosystem(
         enable_federated=enable_federated,
         enable_cross_region=enable_cross_region,
         enable_sustainability_dashboard=enable_dashboard,
-        enable_predictive_maintenance=enable_predictive
+        enable_predictive_maintenance=enable_predictive,
+        enable_digital_twin=enable_twin,
+        enable_unified_sustainability=enable_sustainability_engine
     )
 
 
@@ -1385,7 +1593,9 @@ def create_minimal_ecosystem() -> UnifiedMetabolicEcosystem:
         enable_federated=False,
         enable_cross_region=False,
         enable_sustainability_dashboard=False,
-        enable_predictive_maintenance=False
+        enable_predictive_maintenance=False,
+        enable_digital_twin=False,
+        enable_unified_sustainability=False
     )
 
 
@@ -1399,7 +1609,9 @@ def create_full_ecosystem() -> UnifiedMetabolicEcosystem:
         enable_federated=FEDERATED_AVAILABLE,
         enable_cross_region=CROSS_REGION_AVAILABLE,
         enable_sustainability_dashboard=True,
-        enable_predictive_maintenance=True
+        enable_predictive_maintenance=True,
+        enable_digital_twin=True,
+        enable_unified_sustainability=True
     )
 
 
@@ -1511,6 +1723,17 @@ __all__ = [
     'PredictiveMaintenanceIntegrator',
     'EnhancedBioInspiredIntegrator',
     
+    # New: Digital Twin and Sustainability Engine
+    'SystemDigitalTwin',
+    'DigitalTwinConfig',
+    'SimulationResult',
+    'SimulationScenario',
+    'ResourceProjection',
+    'UnifiedSustainabilityEngine',
+    'UnifiedSustainabilityScore',
+    'SustainabilityDimension',
+    'SustainabilityThreshold',
+    
     # Status
     'BIO_INSPIRED_AVAILABLE',
     'QUANTUM_AVAILABLE',
@@ -1521,7 +1744,9 @@ __all__ = [
     'BIODIVERSITY_AVAILABLE',
     'SEQUESTRATION_AVAILABLE',
     'CIRCULAR_AVAILABLE',
-    'OFFSET_AVAILABLE'
+    'OFFSET_AVAILABLE',
+    'DIGITAL_TWIN_AVAILABLE',
+    'SUSTAINABILITY_ENGINE_AVAILABLE'
 ]
 
 
@@ -1531,4 +1756,4 @@ __all__ = [
 
 __version__ = "5.0.0"
 __author__ = "Green Agent Team"
-__description__ = "Unified Metabolic Ecosystem - Bio-Inspired MoE Expert System with Sustainability Dashboard"
+__description__ = "Unified Metabolic Ecosystem - Bio-Inspired MoE Expert System with Digital Twin and Sustainability Engine"
