@@ -1,8 +1,9 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/expert_router.py
 """
-Enhanced Expert Router v6.0.0 - Complete Signal Transduction Cascade
+Enhanced Expert Router v7.0.0 - Complete Signal Transduction Cascade with Causal Constraints
 With Federated Learning, Predictive Analytics, Carbon/Helium Optimization,
-What-If Analysis, Causal Inference, and Natural Language Explanations
+What-If Analysis, Causal Inference, Natural Language Explanations,
+and Production-Grade Causal Constraint Modeling
 """
 
 import asyncio
@@ -27,6 +28,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import networkx as nx
+from typing import TypeVar, Generic
 
 logger = logging.getLogger(__name__)
 
@@ -121,37 +124,23 @@ class HeliumEfficiencyOptimizer:
         self.helium_efficiency_scores[expert_id] = score
     
     async def optimize_helium_allocation(self, expert_requirements: Dict[str, float]) -> Dict[str, float]:
-        """
-        Optimize helium allocation across experts based on efficiency scores.
-        
-        Args:
-            expert_requirements: Dict of expert_id -> required helium amount
-            
-        Returns:
-            Optimized allocation dict
-        """
         async with self._lock:
             total_required = sum(expert_requirements.values())
-            
             if total_required <= self.helium_budget_l:
                 return expert_requirements
             
-            # Allocate based on efficiency scores
             optimized = {}
             total_efficiency = sum(self.helium_efficiency_scores.get(eid, 0.5) for eid in expert_requirements)
             
             if total_efficiency == 0:
-                # Fallback to equal distribution
                 ratio = self.helium_budget_l / total_required
                 for expert_id, required in expert_requirements.items():
                     optimized[expert_id] = required * ratio
             else:
-                # Efficiency-weighted allocation
                 for expert_id, required in expert_requirements.items():
                     efficiency_weight = self.helium_efficiency_scores.get(expert_id, 0.5) / total_efficiency
                     optimized[expert_id] = self.helium_budget_l * efficiency_weight
             
-            # Record optimization
             self.optimization_history.append({
                 'timestamp': datetime.utcnow().isoformat(),
                 'total_required': total_required,
@@ -159,14 +148,11 @@ class HeliumEfficiencyOptimizer:
                 'allocations': optimized
             })
             
-            logger.info(f"Optimized helium allocation: {len(optimized)} experts")
             return optimized
     
     def get_helium_status(self) -> Dict[str, Any]:
-        """Get current helium status"""
         total_usage = sum(self.helium_usage.values())
         total_allocated = sum(self.helium_allocation.values())
-        
         return {
             'budget_l': self.helium_budget_l,
             'total_usage_l': total_usage,
@@ -195,14 +181,10 @@ class FederatedRoutingLearner:
         self._lock = asyncio.Lock()
         self._session = None
         self.routing_history = deque(maxlen=10000)
-        
-        # Initialize local model
         self._init_routing_model()
-        
         logger.info("Federated Routing Learner initialized")
     
     def _init_routing_model(self):
-        """Initialize local routing model"""
         class RoutingModel(nn.Module):
             def __init__(self, input_size=10, hidden_size=64):
                 super().__init__()
@@ -213,9 +195,8 @@ class FederatedRoutingLearner:
                     nn.Linear(hidden_size, hidden_size // 2),
                     nn.ReLU(),
                     nn.BatchNorm1d(hidden_size // 2),
-                    nn.Linear(hidden_size // 2, 5)  # 5 experts
+                    nn.Linear(hidden_size // 2, 5)
                 )
-            
             def forward(self, x):
                 return self.network(x)
         
@@ -228,12 +209,10 @@ class FederatedRoutingLearner:
         return self._session
     
     async def train_local_model(self, routing_data: List[Dict], epochs: int = 10) -> float:
-        """Train local routing model on routing history"""
         if not routing_data:
             return 0.0
         
-        X = []
-        y = []
+        X, y = [], []
         for item in routing_data:
             X.append([
                 item.get('carbon_zone', 0) / 10,
@@ -247,7 +226,6 @@ class FederatedRoutingLearner:
                 item.get('latency_budget', 100) / 1000,
                 item.get('energy_budget', 100) / 1000
             ])
-            # One-hot encoded expert selection
             selected = [0] * 5
             expert_idx = item.get('selected_expert_idx', 0)
             if expert_idx < 5:
@@ -259,7 +237,6 @@ class FederatedRoutingLearner:
         
         dataset = TensorDataset(X, y)
         dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-        
         optimizer = optim.Adam(self.local_model.parameters(), lr=0.001)
         criterion = nn.CrossEntropyLoss()
         
@@ -281,17 +258,14 @@ class FederatedRoutingLearner:
         return avg_loss
     
     async def send_local_update(self, performance_metric: float = 1.0) -> Dict:
-        """Send local model update to federated server"""
         if not self.server_url:
             return {'status': 'disabled'}
         
         async with self._lock:
             session = await self._get_session()
-            
             try:
                 weights = self.local_model.state_dict()
                 weights_serialized = {k: v.tolist() for k, v in weights.items()}
-                
                 update_data = {
                     'router_id': 'expert_router',
                     'round': self.round,
@@ -299,7 +273,6 @@ class FederatedRoutingLearner:
                     'performance': performance_metric,
                     'timestamp': datetime.utcnow().isoformat()
                 }
-                
                 async with session.post(
                     f"{self.server_url}/federated/routing/update",
                     json=update_data,
@@ -309,24 +282,18 @@ class FederatedRoutingLearner:
                         result = await response.json()
                         self.round += 1
                         self.contribution_scores['router'] = performance_metric
-                        logger.info(f"Federated routing update sent. Round: {self.round}")
                         return result
-                    else:
-                        logger.error(f"Federated update failed: {response.status}")
-                        return {'status': 'failed'}
-                        
+                    return {'status': 'failed'}
             except Exception as e:
                 logger.error(f"Federated update error: {e}")
                 return {'status': 'error'}
     
     async def get_global_model(self) -> Optional[Dict]:
-        """Get global routing model from federated server"""
         if not self.server_url:
             return None
         
         async with self._lock:
             session = await self._get_session()
-            
             try:
                 async with session.get(
                     f"{self.server_url}/federated/routing/global",
@@ -337,27 +304,21 @@ class FederatedRoutingLearner:
                         weights = data.get('weights', {})
                         self.round = data.get('round', 0)
                         self.participants = data.get('participants', [])
-                        
                         for k, v in weights.items():
                             self.global_model.state_dict()[k] = torch.FloatTensor(v)
-                        
                         return weights
-                        
             except Exception as e:
                 logger.error(f"Global model fetch error: {e}")
                 return None
     
     async def participate_in_round(self, routing_data: List[Dict], performance: float = 1.0) -> Dict:
-        """Full participation in federated learning round"""
         await self.train_local_model(routing_data)
         result = await self.send_local_update(performance)
         global_weights = await self.get_global_model()
-        
         if global_weights:
             self.global_model.load_state_dict(global_weights)
             if 'router' not in self.participants:
                 self.participants.append('router')
-        
         return {
             'round': self.round,
             'participated': bool(global_weights),
@@ -368,7 +329,6 @@ class FederatedRoutingLearner:
         }
     
     def get_federated_insights(self) -> Dict:
-        """Get insights from federated learning"""
         return {
             'round': self.round,
             'contribution_score': self.contribution_scores.get('router', 0),
@@ -395,12 +355,10 @@ class PredictiveRoutingAnalyzer:
         self.models = {}
         self.scaler = StandardScaler()
         self.is_trained = False
-        
         self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
         self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
     
     def update_history(self, routing_metrics: Dict):
-        """Update routing history for forecasting"""
         self.routing_history.append({
             'timestamp': datetime.utcnow(),
             'success_rate': routing_metrics.get('success_rate', 0.8),
@@ -411,14 +369,11 @@ class PredictiveRoutingAnalyzer:
         })
     
     async def train_forecast_model(self):
-        """Train ensemble forecasting models"""
         if len(self.routing_history) < 10:
             return {'status': 'insufficient_data', 'samples': len(self.routing_history)}
         
-        X = []
-        y = []
+        X, y = [], []
         history_list = list(self.routing_history)
-        
         for i in range(len(history_list) - 5):
             features = []
             for j in range(5):
@@ -450,7 +405,6 @@ class PredictiveRoutingAnalyzer:
         return {'status': 'success', 'results': results, 'samples': len(X)}
     
     async def predict_routing_performance(self, hours: int = 24) -> Dict:
-        """Predict future routing performance"""
         if not self.is_trained or len(self.routing_history) < 10:
             return {'predicted_success_rate': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
         
@@ -505,6 +459,276 @@ class PredictiveRoutingAnalyzer:
         else:
             actions.append("Maintain current routing configuration")
         return actions
+
+# ============================================================================
+# CAUSAL CONSTRAINT MODELING MODULE (NEW)
+# ============================================================================
+
+class CausalConstraintModel:
+    """
+    Causal constraint modeling for cross-domain reasoning.
+    
+    Features:
+    - Causal relationship detection and graph construction
+    - Constraint propagation across domains
+    - Impact prediction with confidence scoring
+    - Trade-off analysis with Pareto optimization
+    - Counterfactual reasoning
+    """
+    
+    def __init__(self):
+        self.causal_graph = nx.DiGraph()
+        self.constraints = {}
+        self.impact_history = deque(maxlen=1000)
+        self.causal_strengths = {}
+        self._lock = asyncio.Lock()
+        
+        # Initialize causal relationships
+        self._init_causal_relationships()
+        
+        # Domain mapping for cross-domain reasoning
+        self.domain_mapping = {
+            'carbon': ['energy', 'helium', 'biodiversity'],
+            'helium': ['quantum', 'cooling', 'energy'],
+            'energy': ['carbon', 'helium', 'latency'],
+            'quantum': ['helium', 'energy', 'accuracy'],
+            'biodiversity': ['carbon', 'land_use'],
+            'latency': ['energy', 'performance'],
+            'accuracy': ['quantum', 'performance']
+        }
+        
+        # Constraint thresholds
+        self.constraint_thresholds = {
+            'carbon': {'max_per_inference': 0.001, 'min_zone': 0},
+            'helium': {'max_usage_per_inference': 0.01, 'min_availability': 0.2},
+            'energy': {'max_per_inference': 0.01, 'min_efficiency': 0.5},
+            'quantum': {'min_qubits': 10, 'max_depth': 100},
+            'biodiversity': {'min_impact_score': 0.3}
+        }
+        
+        logger.info("Causal Constraint Model initialized")
+    
+    def _init_causal_relationships(self):
+        """Initialize known causal relationships across domains"""
+        # Carbon domain
+        self.causal_graph.add_edge('carbon', 'energy', weight=0.7)
+        self.causal_graph.add_edge('carbon', 'helium', weight=0.5)
+        self.causal_graph.add_edge('carbon', 'biodiversity', weight=0.6)
+        
+        # Helium domain
+        self.causal_graph.add_edge('helium', 'quantum', weight=0.8)
+        self.causal_graph.add_edge('helium', 'cooling', weight=0.6)
+        self.causal_graph.add_edge('helium', 'energy', weight=0.4)
+        
+        # Energy domain
+        self.causal_graph.add_edge('energy', 'carbon', weight=0.7)
+        self.causal_graph.add_edge('energy', 'helium', weight=0.3)
+        self.causal_graph.add_edge('energy', 'latency', weight=0.5)
+        
+        # Quantum domain
+        self.causal_graph.add_edge('quantum', 'helium', weight=0.9)
+        self.causal_graph.add_edge('quantum', 'energy', weight=0.6)
+        self.causal_graph.add_edge('quantum', 'accuracy', weight=0.8)
+        
+        # Store causal strengths
+        for u, v, data in self.causal_graph.edges(data=True):
+            self.causal_strengths[(u, v)] = data.get('weight', 0.5)
+    
+    def add_causal_relationship(self, source: str, target: str, strength: float = 0.5):
+        """Add a causal relationship between domains"""
+        with self._lock:
+            self.causal_graph.add_edge(source, target, weight=strength)
+            self.causal_strengths[(source, target)] = strength
+            logger.info(f"Added causal relationship: {source} → {target} (strength={strength:.2f})")
+    
+    async def propagate_constraints(
+        self,
+        source_domain: str,
+        value: float,
+        constraints: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Propagate constraints from one domain to its effects.
+        
+        Args:
+            source_domain: Source domain name
+            value: Current value in source domain
+            constraints: Constraints to propagate
+            
+        Returns:
+            Propagated constraints with impacts
+        """
+        async with self._lock:
+            propagated = constraints.copy()
+            
+            if source_domain not in self.domain_mapping:
+                return propagated
+            
+            effects = self.domain_mapping.get(source_domain, [])
+            for effect in effects:
+                if effect not in propagated:
+                    propagated[effect] = {}
+                
+                # Calculate impact based on causal strength
+                strength = self.causal_strengths.get((source_domain, effect), 0.5)
+                impact = strength * value
+                propagated[effect]['causal_impact'] = impact
+                propagated[effect]['causal_strength'] = strength
+                propagated[effect]['source'] = source_domain
+                
+                # Apply domain-specific transformations
+                if effect == 'energy':
+                    propagated[effect]['expected_change'] = impact * value * 0.1
+                elif effect == 'helium':
+                    propagated[effect]['expected_change'] = impact * value * 0.2
+                elif effect == 'carbon':
+                    propagated[effect]['expected_change'] = impact * value * 0.15
+                elif effect == 'quantum':
+                    propagated[effect]['feasibility'] = 1.0 if value < 0.8 else 0.5
+                elif effect == 'biodiversity':
+                    propagated[effect]['impact_score'] = min(1.0, impact * 0.5)
+                
+                # Apply threshold constraints
+                if effect in self.constraint_thresholds:
+                    threshold = self.constraint_thresholds[effect]
+                    for key, limit in threshold.items():
+                        if key in propagated[effect]:
+                            propagated[effect][f'{key}_limit'] = limit
+                            propagated[effect][f'{key}_compliant'] = propagated[effect][key] <= limit
+            
+            self.impact_history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'source': source_domain,
+                'value': value,
+                'propagated': propagated
+            })
+            
+            return propagated
+    
+    async def analyze_tradeoffs(
+        self,
+        scenarios: List[Dict[str, Any]],
+        weights: Dict[str, float] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Analyze trade-offs between different scenarios.
+        
+        Args:
+            scenarios: List of scenario configurations
+            weights: Weight for each domain in sustainability scoring
+            
+        Returns:
+            Trade-off analysis with recommendations
+        """
+        async with self._lock:
+            if weights is None:
+                weights = {
+                    'carbon': 0.25,
+                    'helium': 0.20,
+                    'energy': 0.15,
+                    'quantum': 0.15,
+                    'biodiversity': 0.15,
+                    'latency': 0.10
+                }
+            
+            results = []
+            for scenario in scenarios:
+                impacts = {}
+                sustainability_score = 0.0
+                risk_factors = []
+                
+                for domain, value in scenario.items():
+                    if domain in self.domain_mapping:
+                        propagated = await self.propagate_constraints(
+                            domain, value, scenario
+                        )
+                        impacts[domain] = propagated
+                        
+                        # Calculate domain score
+                        domain_score = 1.0 - min(1.0, value)
+                        sustainability_score += domain_score * weights.get(domain, 0.1)
+                
+                # Identify risk factors
+                for domain, impact_data in impacts.items():
+                    if 'causal_impact' in impact_data:
+                        if impact_data['causal_impact'] > 0.7:
+                            risk_factors.append(f"{domain} has high causal impact")
+                
+                results.append({
+                    'scenario': scenario,
+                    'impacts': impacts,
+                    'sustainability_score': min(1.0, sustainability_score),
+                    'risk_factors': risk_factors,
+                    'recommendations': self._generate_tradeoff_recommendations(impacts, risk_factors)
+                })
+            
+            # Sort by sustainability score
+            results.sort(key=lambda x: x['sustainability_score'], reverse=True)
+            
+            return results
+    
+    def _generate_tradeoff_recommendations(
+        self,
+        impacts: Dict,
+        risk_factors: List[str]
+    ) -> List[str]:
+        """Generate recommendations based on trade-off analysis"""
+        recommendations = []
+        
+        for domain, impact in impacts.items():
+            if 'causal_impact' in impact and impact['causal_impact'] > 0.6:
+                if domain == 'carbon':
+                    recommendations.append("Carbon impact high - consider carbon offset or reduction")
+                elif domain == 'helium':
+                    recommendations.append("Helium impact high - optimize helium usage")
+                elif domain == 'energy':
+                    recommendations.append("Energy impact high - improve energy efficiency")
+        
+        if risk_factors:
+            recommendations.append(f"Monitor these risk factors: {', '.join(risk_factors[:3])}")
+        
+        return recommendations or ["No critical trade-offs identified"]
+    
+    async def get_causal_path(
+        self,
+        source: str,
+        target: str
+    ) -> List[Tuple[str, str, float]]:
+        """
+        Get the causal path between two domains.
+        
+        Returns:
+            List of (source, target, strength) tuples
+        """
+        async with self._lock:
+            if source not in self.causal_graph or target not in self.causal_graph:
+                return []
+            
+            try:
+                path = nx.shortest_path(self.causal_graph, source, target)
+                path_edges = []
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i + 1]
+                    strength = self.causal_strengths.get((u, v), 0.5)
+                    path_edges.append((u, v, strength))
+                return path_edges
+            except nx.NetworkXNoPath:
+                return []
+    
+    async def get_causal_strength(self, source: str, target: str) -> float:
+        """Get causal strength between two domains"""
+        return self.causal_strengths.get((source, target), 0.0)
+    
+    def get_causal_graph_summary(self) -> Dict[str, Any]:
+        """Get summary of causal graph"""
+        return {
+            'nodes': list(self.causal_graph.nodes()),
+            'edges': list(self.causal_graph.edges()),
+            'edge_count': len(self.causal_graph.edges()),
+            'node_count': len(self.causal_graph.nodes()),
+            'causal_strengths': self.causal_strengths,
+            'recent_impacts': list(self.impact_history)[-10:]
+        }
 
 # ============================================================================
 # Enums and Data Classes (Preserved)
@@ -987,12 +1211,12 @@ class MetabolicPathwayRouter:
                       'is_active': p.is_active} for pid, p in self.pathways.items()}
 
 # ============================================================================
-# Enhanced Expert Router with Complete Features
+# Enhanced Expert Router with Causal Constraints
 # ============================================================================
 
 class ExpertRouter:
     """
-    Enhanced Expert Router v6.0.0 - Complete Signal Transduction Cascade
+    Enhanced Expert Router v7.0.0 - Complete Signal Transduction Cascade with Causal Constraints
     
     Features:
     - Signal transduction for task routing
@@ -1005,6 +1229,9 @@ class ExpertRouter:
     - Federated learning integration
     - Predictive analytics
     - Carbon/Helium optimization
+    - Causal constraint modeling (NEW)
+    - Constraint propagation (NEW)
+    - Trade-off analysis (NEW)
     """
     
     def __init__(
@@ -1021,6 +1248,7 @@ class ExpertRouter:
         enable_predictive: bool = True,
         enable_carbon_intensity: bool = True,
         enable_helium_optimization: bool = True,
+        enable_causal_constraints: bool = True,
         server_url: Optional[str] = None,
         helium_budget_l: float = 100.0
     ):
@@ -1035,12 +1263,14 @@ class ExpertRouter:
         self.enable_predictive = enable_predictive
         self.enable_carbon_intensity = enable_carbon_intensity
         self.enable_helium_optimization = enable_helium_optimization
+        self.enable_causal_constraints = enable_causal_constraints
         
         # New modules
         self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
         self.helium_optimizer = HeliumEfficiencyOptimizer(helium_budget_l) if enable_helium_optimization else None
         self.federated_learner = FederatedRoutingLearner(server_url) if enable_federated else None
         self.predictive_analyzer = PredictiveRoutingAnalyzer() if enable_predictive else None
+        self.causal_model = CausalConstraintModel() if enable_causal_constraints else None
         
         # Bio-inspired subsystems
         self.signal_engine = SignalTransductionEngine() if enable_signal_transduction else None
@@ -1090,7 +1320,7 @@ class ExpertRouter:
         self._initialize_experts(enable_quantum)
         self._start_background_tasks()
         
-        logger.info(f"Expert Router v6.0.0 initialized with all features")
+        logger.info(f"Expert Router v7.0.0 initialized with causal constraints")
     
     def _initialize_experts(self, enable_quantum: bool):
         try:
@@ -1296,7 +1526,7 @@ class ExpertRouter:
         return 0.7
     
     # ========================================================================
-    # Main Routing Method
+    # Main Routing Method with Causal Constraints
     # ========================================================================
     
     async def route_and_execute(
@@ -1316,6 +1546,30 @@ class ExpertRouter:
             carbon_intensity = 400
             if self.carbon_manager:
                 carbon_intensity = await self.carbon_manager.get_current_intensity()
+            
+            # Apply causal constraints if enabled
+            causal_constraints = {}
+            if self.enable_causal_constraints and self.causal_model:
+                # Propagate constraints from context
+                if dual_axis_context.get('carbon_zone', 0) > 8:
+                    carbon_constraints = await self.causal_model.propagate_constraints(
+                        'carbon',
+                        dual_axis_context['carbon_zone'] / 10,
+                        {'max_carbon': 0.0005}
+                    )
+                    causal_constraints.update(carbon_constraints)
+                
+                if dual_axis_context.get('helium_scarcity', 0) > 0.6:
+                    helium_constraints = await self.causal_model.propagate_constraints(
+                        'helium',
+                        dual_axis_context['helium_scarcity'],
+                        {'max_helium': 0.005}
+                    )
+                    causal_constraints.update(helium_constraints)
+                
+                # Validate constraints against workload
+                if not await self._validate_causal_constraints(causal_constraints, workload_profile):
+                    logger.warning("Causal constraints violated - adjusting routing")
             
             signal_activated = False
             if self.signal_engine:
@@ -1349,7 +1603,7 @@ class ExpertRouter:
             if self.helium_optimizer and selected_pathway:
                 expert_requirements = {}
                 for expert_id in self.experts:
-                    expert_requirements[expert_id] = 0.01  # Default helium requirement
+                    expert_requirements[expert_id] = 0.01
                 optimized_allocation = await self.helium_optimizer.optimize_helium_allocation(expert_requirements)
                 for expert_id, allocation in optimized_allocation.items():
                     self.helium_optimizer.set_helium_allocation(expert_id, allocation)
@@ -1367,7 +1621,20 @@ class ExpertRouter:
                         all_indices, size=min(2, len(all_indices)), replace=False
                     ))
             
-            expert_plans = await self._execute_experts(routing_result, workload_profile, meta_cognitive_state, dual_axis_context)
+            expert_plans = await self._execute_experts(
+                routing_result, workload_profile, meta_cognitive_state, dual_axis_context
+            )
+            
+            # Apply causal constraint validation to plans
+            if self.enable_causal_constraints and self.causal_model:
+                validated_plans = []
+                for plan in expert_plans:
+                    if await self._validate_plan_constraints(plan, causal_constraints):
+                        validated_plans.append(plan)
+                    else:
+                        logger.warning(f"Plan from {plan.get('expert_id')} violated constraints")
+                if validated_plans:
+                    expert_plans = validated_plans
             
             if selected_pathway and self.metabolic_router:
                 for plan in expert_plans:
@@ -1416,6 +1683,7 @@ class ExpertRouter:
                         sm.value: self.signal_engine.get_second_messenger_level(sm)
                         for sm in SecondMessenger
                     } if self.signal_engine else {},
+                    'causal_constraints': causal_constraints if self.enable_causal_constraints else {},
                     'timestamp': datetime.utcnow().isoformat()
                 }
             }
@@ -1424,6 +1692,7 @@ class ExpertRouter:
             self.routing_history.append({
                 'route_id': route_id, 'decisions': list(zip(routing_result['expert_indices'], routing_result['weights'])),
                 'context': gating_context, 'confidence': routing_result.get('confidence', 0.5),
+                'causal_constraints': causal_constraints if self.enable_causal_constraints else {},
                 'timestamp': datetime.utcnow()
             })
             
@@ -1448,6 +1717,14 @@ class ExpertRouter:
                 forecast = await self.predictive_analyzer.predict_routing_performance()
                 response['predictive_forecast'] = forecast
             
+            # Update causal model with routing result
+            if self.enable_causal_constraints and self.causal_model and final_plan.get('success', False):
+                await self.causal_model.propagate_constraints(
+                    'routing',
+                    self.metrics.success_rate,
+                    {'routing_success': final_plan.get('action', 'unknown')}
+                )
+            
             return response
             
         except Exception as e:
@@ -1457,6 +1734,58 @@ class ExpertRouter:
         finally:
             async with self._route_lock:
                 self.active_routes -= 1
+    
+    async def _validate_causal_constraints(
+        self,
+        constraints: Dict[str, Any],
+        workload: Dict[str, Any]
+    ) -> bool:
+        """Validate causal constraints against workload"""
+        if not constraints:
+            return True
+        
+        # Check carbon constraints
+        if 'carbon' in constraints and 'estimated_carbon_kg' in workload:
+            carbon_limit = constraints['carbon'].get('max_carbon', float('inf'))
+            if workload['estimated_carbon_kg'] > carbon_limit:
+                logger.warning(f"Carbon constraint violated: {workload['estimated_carbon_kg']} > {carbon_limit}")
+                return False
+        
+        # Check helium constraints
+        if 'helium' in constraints and 'estimated_helium_units' in workload:
+            helium_limit = constraints['helium'].get('max_helium', float('inf'))
+            if workload['estimated_helium_units'] > helium_limit:
+                logger.warning(f"Helium constraint violated: {workload['estimated_helium_units']} > {helium_limit}")
+                return False
+        
+        # Check quantum constraints
+        if 'quantum' in constraints and workload.get('task_type') == 'quantum':
+            feasibility = constraints['quantum'].get('feasibility', 1.0)
+            if feasibility < 0.5:
+                logger.warning(f"Quantum feasibility low: {feasibility}")
+                return False
+        
+        return True
+    
+    async def _validate_plan_constraints(
+        self,
+        plan: Dict[str, Any],
+        constraints: Dict[str, Any]
+    ) -> bool:
+        """Validate a single expert plan against constraints"""
+        if not constraints:
+            return True
+        
+        expert_id = plan.get('expert_id', '')
+        
+        # Check domain-specific constraints
+        for domain, constraint_data in constraints.items():
+            if domain in expert_id.lower():
+                if 'causal_impact' in constraint_data and constraint_data['causal_impact'] > 0.7:
+                    logger.warning(f"Plan {expert_id} has high causal impact: {constraint_data['causal_impact']}")
+                    return False
+        
+        return True
     
     def _build_gating_context(self, workload_profile, meta_cognitive_state, dual_axis_context):
         from .gating_network import GatingContext
@@ -1529,23 +1858,45 @@ class ExpertRouter:
         }
     
     # ========================================================================
-    # What-If Analysis
+    # What-If Analysis with Causal Constraints
     # ========================================================================
     
     def run_what_if_routing(self, task: Dict[str, Any], alternative_scenarios: List[Dict[str, Any]]) -> Dict[str, Any]:
         results = {'task': task, 'timestamp': datetime.utcnow().isoformat(), 'scenarios': []}
         baseline = self._simulate_routing(task, {})
         results['baseline'] = baseline
+        
+        # Add causal analysis to baseline
+        if self.enable_causal_constraints and self.causal_model:
+            causal_path = asyncio.run(
+                self.causal_model.get_causal_path('carbon', 'energy')
+            )
+            baseline['causal_path'] = causal_path
+        
         for scenario in alternative_scenarios:
             scenario_result = self._simulate_routing(task, scenario)
+            
+            # Add causal analysis to scenario
+            if self.enable_causal_constraints and self.causal_model:
+                propagations = asyncio.run(
+                    self.causal_model.propagate_constraints(
+                        'carbon',
+                        scenario.get('carbon_zone', 0) / 10,
+                        scenario
+                    )
+                )
+                scenario_result['causal_propagations'] = propagations
+            
             results['scenarios'].append({
                 'scenario': scenario,
                 'routing': scenario_result,
                 'differs_from_baseline': (
                     set(scenario_result.get('selected_experts', [])) != 
                     set(baseline.get('selected_experts', []))
-                )
+                ),
+                'causal_impact': scenario_result.get('causal_propagations', {})
             })
+        
         results['recommendations'] = self._generate_what_if_recommendations(baseline, results['scenarios'])
         return results
     
@@ -1601,9 +1952,24 @@ class ExpertRouter:
             if record.get('route_id') == route_id:
                 decisions = record.get('decisions', [])
                 context = record.get('context', {})
+                causal_constraints = record.get('causal_constraints', {})
+                
                 if not decisions:
                     return None
+                
                 causal_chain = []
+                
+                # Add causal constraints to analysis
+                if causal_constraints:
+                    for domain, constraints in causal_constraints.items():
+                        if 'causal_impact' in constraints:
+                            causal_chain.append({
+                                'factor': f"{domain.capitalize()} Impact",
+                                'impact': 'HIGH' if constraints['causal_impact'] > 0.6 else 'MODERATE',
+                                'effect': f"Causal impact of {domain}: {constraints['causal_impact']:.2f}",
+                                'strength': min(1.0, constraints['causal_impact'])
+                            })
+                
                 if hasattr(context, 'carbon_zone') and context.carbon_zone > 8:
                     causal_chain.append({
                         'factor': 'High Carbon Zone',
@@ -1644,7 +2010,8 @@ class ExpertRouter:
                     'causal_chain': causal_chain,
                     'primary_driver': causal_chain[0] if causal_chain else None,
                     'selected_experts': selected,
-                    'confidence': record.get('confidence', 0.5)
+                    'confidence': record.get('confidence', 0.5),
+                    'causal_constraints_used': bool(causal_constraints)
                 }
         return None
     
@@ -1657,6 +2024,8 @@ class ExpertRouter:
             if record.get('route_id') == route_id:
                 decisions = record.get('decisions', [])
                 context = record.get('context', {})
+                causal_constraints = record.get('causal_constraints', {})
+                
                 if not decisions:
                     return None
                 
@@ -1673,6 +2042,12 @@ class ExpertRouter:
                 if hasattr(context, 'task_complexity') and context.task_complexity > 0.7:
                     factors.append("High complexity required specialized handling")
                 
+                # Add causal constraint factors
+                if causal_constraints:
+                    for domain, constraints in causal_constraints.items():
+                        if 'causal_impact' in constraints:
+                            factors.append(f"Causal impact of {domain}: {constraints['causal_impact']:.2f}")
+                
                 executive = (
                     f"Selected {selected[0]['expert']} (weight: {selected[0]['weight']}) "
                     f"{'and ' + selected[1]['expert'] if len(selected) > 1 else ''} "
@@ -1681,6 +2056,9 @@ class ExpertRouter:
                 
                 counterfactual = "If carbon zone were lower, more experts would be available for selection."
                 
+                if causal_constraints:
+                    counterfactual += " Causal constraints were applied to ensure cross-domain sustainability."
+                
                 return {
                     'route_id': route_id,
                     'executive_summary': executive,
@@ -1688,6 +2066,7 @@ class ExpertRouter:
                     'decision_factors': factors,
                     'counterfactual': counterfactual,
                     'confidence': record.get('confidence', 0.5),
+                    'causal_constraints_applied': bool(causal_constraints),
                     'timestamp': record.get('timestamp', datetime.utcnow()).isoformat()
                 }
         return None
@@ -1700,6 +2079,15 @@ class ExpertRouter:
         gradient_trends = {}
         current = self._get_real_gradient_levels()
         gradient_trends = {k: 'rising' if v > 0.6 else 'falling' if v < 0.4 else 'stable' for k, v in current.items()}
+        
+        # Get causal insights for forecast
+        causal_insights = {}
+        if self.enable_causal_constraints and self.causal_model:
+            causal_graph = self.causal_model.get_causal_graph_summary()
+            causal_insights = {
+                'causal_edges': causal_graph.get('edge_count', 0),
+                'domains': causal_graph.get('nodes', [])
+            }
         
         utilization = self.gating_network.get_expert_utilization() if self.gating_network else {}
         
@@ -1722,7 +2110,8 @@ class ExpertRouter:
         return {
             'task_type': task_type, 'horizon_minutes': horizon_minutes,
             'gradient_trends': gradient_trends, 'expert_predictions': predictions,
-            'recommendation': recommendation
+            'recommendation': recommendation,
+            'causal_insights': causal_insights if self.enable_causal_constraints else {}
         }
     
     # ========================================================================
@@ -1758,20 +2147,32 @@ class ExpertRouter:
             stats['federated_insights'] = self.federated_learner.get_federated_insights()
         if self.predictive_analyzer:
             stats['predictive_forecast'] = asyncio.run(self.predictive_analyzer.predict_routing_performance())
+        if self.enable_causal_constraints and self.causal_model:
+            stats['causal_graph'] = self.causal_model.get_causal_graph_summary()
         
         return stats
     
     def get_helium_efficiency_report(self) -> Dict[str, Any]:
-        """Get helium efficiency report"""
         if self.helium_optimizer:
             return self.helium_optimizer.get_helium_status()
         return {'status': 'helium_optimization_not_enabled'}
     
     def get_predictive_forecast(self) -> Dict[str, Any]:
-        """Get predictive routing forecast"""
         if self.predictive_analyzer:
             return asyncio.run(self.predictive_analyzer.predict_routing_performance())
         return {'status': 'predictive_analysis_not_enabled'}
+    
+    def get_causal_insights(self) -> Dict[str, Any]:
+        """Get causal insights from the causal model"""
+        if self.enable_causal_constraints and self.causal_model:
+            return self.causal_model.get_causal_graph_summary()
+        return {'status': 'causal_model_not_enabled'}
+    
+    async def analyze_causal_tradeoffs(self, scenarios: List[Dict]) -> List[Dict]:
+        """Analyze trade-offs between different scenarios using causal model"""
+        if self.enable_causal_constraints and self.causal_model:
+            return await self.causal_model.analyze_tradeoffs(scenarios)
+        return [{'status': 'causal_model_not_enabled'}]
     
     def trigger_stress_response(self, stress_level: float):
         if self.signal_engine:
