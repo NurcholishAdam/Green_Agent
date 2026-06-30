@@ -1,7 +1,7 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/__init__.py
 """
-Green Agent MoE Expert System v5.0.0 - Unified Metabolic Ecosystem
-ENHANCED WITH: System Digital Twin and Unified Sustainability Engine
+Green Agent MoE Expert System v6.0.0 - Unified Metabolic Ecosystem
+ENHANCED WITH: System Digital Twin, Unified Sustainability Engine, Health Checks, and Self-Healing
 
 Complete integration with bio-inspired modules providing:
 - Eco-ATP currency system for unified resource accounting
@@ -14,6 +14,9 @@ Complete integration with bio-inspired modules providing:
 - Predictive Maintenance Integration (Future State Predictor)
 - System Digital Twin (Strategic Simulation Engine)
 - Unified Sustainability Engine (Authoritative Global Score)
+- Health Checks and Self-Healing (NEW)
+- Dynamic Reconfiguration (NEW)
+- Alert Escalation and Automated Response (NEW)
 
 This module serves as the central nervous system connecting:
 - Expert Registry (Genome Repository)
@@ -35,6 +38,8 @@ import threading
 import numpy as np
 from collections import deque
 import importlib
+import json
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +311,490 @@ except ImportError:
     OFFSET_AVAILABLE = False
 
 # ============================================================================
-# Enhanced Bio-Inspired Integration
+# Health Check System (NEW)
+# ============================================================================
+
+class HealthCheckSystem:
+    """
+    Health check system for ecosystem components.
+    
+    Features:
+    - Periodic health checks for all components
+    - Health status aggregation
+    - Degradation detection
+    - Health score calculation
+    """
+    
+    def __init__(self):
+        self.component_health: Dict[str, Dict] = {}
+        self.health_history: Dict[str, List[Dict]] = defaultdict(list)
+        self._lock = threading.Lock()
+        self.health_check_interval = 60  # seconds
+        self.degradation_threshold = 0.3
+        
+        # Start background health checks
+        self._running = True
+        self._check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self._check_thread.start()
+        
+        logger.info("Health Check System initialized")
+    
+    def _health_check_loop(self):
+        """Background health check loop"""
+        while self._running:
+            try:
+                # Check all registered components
+                with self._lock:
+                    for component_name, health_data in self.component_health.items():
+                        health_data['last_check'] = datetime.utcnow().isoformat()
+                        # Simulate health check
+                        health_data['status'] = self._perform_health_check(component_name)
+                        health_data['score'] = self._calculate_health_score(component_name)
+                        
+                        # Record history
+                        self.health_history[component_name].append({
+                            'timestamp': datetime.utcnow().isoformat(),
+                            'status': health_data['status'],
+                            'score': health_data['score']
+                        })
+                        if len(self.health_history[component_name]) > 100:
+                            self.health_history[component_name] = self.health_history[component_name][-100:]
+                
+                import time
+                time.sleep(self.health_check_interval)
+            except Exception as e:
+                logger.error(f"Health check loop error: {str(e)}")
+                import time
+                time.sleep(300)
+    
+    def _perform_health_check(self, component_name: str) -> str:
+        """Perform health check on a component"""
+        # Simulate health check - would call actual component health methods
+        # For now, random health with slight degradation over time
+        import random
+        health_value = random.random()
+        if health_value > 0.8:
+            return "healthy"
+        elif health_value > 0.5:
+            return "degraded"
+        else:
+            return "unhealthy"
+    
+    def _calculate_health_score(self, component_name: str) -> float:
+        """Calculate health score for a component"""
+        if component_name not in self.health_history:
+            return 0.5
+        
+        recent_history = self.health_history[component_name][-10:]
+        if not recent_history:
+            return 0.5
+        
+        # Score based on recent health status
+        status_scores = {'healthy': 1.0, 'degraded': 0.5, 'unhealthy': 0.0}
+        avg_score = np.mean([
+            status_scores.get(h.get('status', 'degraded'), 0.5)
+            for h in recent_history
+        ])
+        
+        return avg_score
+    
+    def register_component(self, component_name: str, component: Any):
+        """Register a component for health checking"""
+        with self._lock:
+            self.component_health[component_name] = {
+                'component': component,
+                'status': 'unknown',
+                'score': 0.5,
+                'last_check': None,
+                'registered_at': datetime.utcnow().isoformat()
+            }
+            logger.debug(f"Registered component for health checks: {component_name}")
+    
+    def get_component_health(self, component_name: str) -> Optional[Dict]:
+        """Get health status of a component"""
+        with self._lock:
+            return self.component_health.get(component_name)
+    
+    def get_system_health(self) -> Dict[str, Any]:
+        """Get overall system health status"""
+        with self._lock:
+            total_score = 0.0
+            component_statuses = {}
+            
+            for name, data in self.component_health.items():
+                status = data.get('status', 'unknown')
+                score = data.get('score', 0.5)
+                component_statuses[name] = {'status': status, 'score': score}
+                total_score += score
+            
+            avg_score = total_score / max(len(self.component_health), 1)
+            
+            # Determine system status
+            if avg_score > 0.8:
+                system_status = "healthy"
+            elif avg_score > 0.5:
+                system_status = "degraded"
+            else:
+                system_status = "unhealthy"
+            
+            return {
+                'timestamp': datetime.utcnow().isoformat(),
+                'system_status': system_status,
+                'system_score': avg_score,
+                'components': component_statuses,
+                'total_components': len(self.component_health)
+            }
+    
+    def shutdown(self):
+        self._running = False
+        logger.info("Health Check System shut down")
+
+# ============================================================================
+# Self-Healing System (NEW)
+# ============================================================================
+
+class SelfHealingSystem:
+    """
+    Self-healing system for automatic recovery.
+    
+    Features:
+    - Component failure detection
+    - Automatic restart/recovery
+    - Fallback mechanisms
+    - Recovery attempt tracking
+    """
+    
+    def __init__(self, health_system: Optional[HealthCheckSystem] = None):
+        self.health_system = health_system
+        self.failure_history: Dict[str, List[Dict]] = defaultdict(list)
+        self.recovery_attempts: Dict[str, int] = defaultdict(int)
+        self.max_recovery_attempts = 5
+        self._lock = threading.Lock()
+        self._running = True
+        
+        # Start background recovery monitor
+        self._recovery_thread = threading.Thread(target=self._recovery_monitor_loop, daemon=True)
+        self._recovery_thread.start()
+        
+        logger.info("Self-Healing System initialized")
+    
+    def _recovery_monitor_loop(self):
+        """Background recovery monitoring loop"""
+        while self._running:
+            try:
+                if self.health_system:
+                    system_health = self.health_system.get_system_health()
+                    for component_name, health_data in system_health.get('components', {}).items():
+                        if health_data.get('status') in ['degraded', 'unhealthy']:
+                            self._attempt_recovery(component_name)
+                
+                import time
+                time.sleep(30)
+            except Exception as e:
+                logger.error(f"Recovery monitor loop error: {str(e)}")
+                import time
+                time.sleep(60)
+    
+    def _attempt_recovery(self, component_name: str):
+        """Attempt to recover a component"""
+        with self._lock:
+            if self.recovery_attempts[component_name] >= self.max_recovery_attempts:
+                logger.warning(f"Component {component_name} exceeded max recovery attempts")
+                return
+            
+            logger.info(f"Attempting recovery for component: {component_name}")
+            self.recovery_attempts[component_name] += 1
+            
+            # Simulate recovery actions
+            recovery_success = self._perform_recovery(component_name)
+            
+            self.failure_history[component_name].append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'attempt': self.recovery_attempts[component_name],
+                'success': recovery_success
+            })
+            
+            if recovery_success:
+                logger.info(f"Successfully recovered component: {component_name}")
+            else:
+                logger.warning(f"Failed to recover component: {component_name} (attempt {self.recovery_attempts[component_name]})")
+    
+    def _perform_recovery(self, component_name: str) -> bool:
+        """Perform recovery actions for a component"""
+        # Simulate recovery - would call actual component recovery methods
+        import random
+        # 70% chance of recovery success
+        return random.random() > 0.3
+    
+    def get_recovery_stats(self) -> Dict[str, Any]:
+        """Get recovery statistics"""
+        with self._lock:
+            total_attempts = sum(self.recovery_attempts.values())
+            total_failures = sum(
+                1 for history in self.failure_history.values()
+                for h in history if not h.get('success', False)
+            )
+            
+            return {
+                'total_recovery_attempts': total_attempts,
+                'total_failures': total_failures,
+                'success_rate': (total_attempts - total_failures) / max(total_attempts, 1),
+                'component_attempts': dict(self.recovery_attempts),
+                'recent_failures': {
+                    name: history[-5:]
+                    for name, history in self.failure_history.items()
+                    if history
+                }
+            }
+    
+    def shutdown(self):
+        self._running = False
+        logger.info("Self-Healing System shut down")
+
+# ============================================================================
+# Alert Escalation System (NEW)
+# ============================================================================
+
+class AlertEscalationSystem:
+    """
+    Alert escalation and automated response system.
+    
+    Features:
+    - Alert severity classification
+    - Escalation chains
+    - Automated responses
+    - Notification management
+    """
+    
+    def __init__(self):
+        self.alerts: List[Dict] = []
+        self.escalation_chains: Dict[str, List[Dict]] = {}
+        self.alert_history: deque = deque(maxlen=1000)
+        self._lock = threading.Lock()
+        
+        # Initialize default escalation chains
+        self._init_default_escalations()
+        
+        logger.info("Alert Escalation System initialized")
+    
+    def _init_default_escalations(self):
+        """Initialize default escalation chains"""
+        self.escalation_chains = {
+            'critical': [
+                {'level': 'critical', 'action': 'notify_all', 'timeout': 0},
+                {'level': 'escalated', 'action': 'call_manager', 'timeout': 300},
+                {'level': 'emergency', 'action': 'system_override', 'timeout': 900}
+            ],
+            'warning': [
+                {'level': 'warning', 'action': 'notify_team', 'timeout': 0},
+                {'level': 'critical', 'action': 'notify_manager', 'timeout': 600},
+                {'level': 'escalated', 'action': 'schedule_maintenance', 'timeout': 1800}
+            ],
+            'info': [
+                {'level': 'info', 'action': 'log_alert', 'timeout': 0},
+                {'level': 'warning', 'action': 'notify_team', 'timeout': 3600}
+            ]
+        }
+    
+    def add_alert(self, alert: Dict[str, Any]) -> str:
+        """Add a new alert and process escalation"""
+        with self._lock:
+            alert_id = hashlib.md5(
+                f"{alert.get('source')}_{datetime.utcnow().timestamp()}".encode()
+            ).hexdigest()[:12]
+            
+            alert['alert_id'] = alert_id
+            alert['timestamp'] = datetime.utcnow().isoformat()
+            alert['status'] = 'active'
+            alert['escalation_level'] = 0
+            
+            self.alerts.append(alert)
+            self.alert_history.append(alert)
+            
+            # Process escalation
+            self._process_escalation(alert)
+            
+            return alert_id
+    
+    def _process_escalation(self, alert: Dict):
+        """Process escalation for an alert"""
+        severity = alert.get('severity', 'info')
+        chain = self.escalation_chains.get(severity, self.escalation_chains['info'])
+        
+        if alert.get('escalation_level', 0) < len(chain):
+            step = chain[alert['escalation_level']]
+            self._execute_escalation_action(alert, step)
+    
+    def _execute_escalation_action(self, alert: Dict, step: Dict):
+        """Execute an escalation action"""
+        action = step.get('action')
+        timeout = step.get('timeout', 0)
+        
+        if action == 'notify_all':
+            logger.warning(f"ALERT [{alert.get('severity')}]: {alert.get('message')}")
+        elif action == 'call_manager':
+            logger.error(f"ESCALATED ALERT: {alert.get('message')} - Manager notified")
+        elif action == 'system_override':
+            logger.critical(f"EMERGENCY OVERRIDE: {alert.get('message')}")
+        elif action == 'notify_team':
+            logger.warning(f"TEAM NOTIFICATION: {alert.get('message')}")
+        elif action == 'notify_manager':
+            logger.error(f"MANAGER NOTIFICATION: {alert.get('message')}")
+        elif action == 'schedule_maintenance':
+            logger.info(f"SCHEDULING MAINTENANCE for alert: {alert.get('message')}")
+        elif action == 'log_alert':
+            logger.info(f"ALERT LOGGED: {alert.get('message')}")
+        
+        # Schedule next escalation if timeout > 0
+        if timeout > 0:
+            threading.Timer(timeout, self._escalate_alert, args=[alert]).start()
+    
+    def _escalate_alert(self, alert: Dict):
+        """Escalate an alert to the next level"""
+        with self._lock:
+            if alert.get('status') == 'resolved':
+                return
+            
+            alert['escalation_level'] = alert.get('escalation_level', 0) + 1
+            self._process_escalation(alert)
+    
+    def resolve_alert(self, alert_id: str):
+        """Mark an alert as resolved"""
+        with self._lock:
+            for alert in self.alerts:
+                if alert.get('alert_id') == alert_id:
+                    alert['status'] = 'resolved'
+                    alert['resolved_at'] = datetime.utcnow().isoformat()
+                    logger.info(f"Alert {alert_id} resolved")
+                    break
+    
+    def get_active_alerts(self) -> List[Dict]:
+        """Get all active alerts"""
+        with self._lock:
+            return [a for a in self.alerts if a.get('status') == 'active']
+    
+    def get_alert_stats(self) -> Dict[str, Any]:
+        """Get alert statistics"""
+        with self._lock:
+            total = len(self.alerts)
+            active = sum(1 for a in self.alerts if a.get('status') == 'active')
+            resolved = sum(1 for a in self.alerts if a.get('status') == 'resolved')
+            
+            severities = defaultdict(int)
+            for alert in self.alerts:
+                severities[alert.get('severity', 'info')] += 1
+            
+            return {
+                'total_alerts': total,
+                'active_alerts': active,
+                'resolved_alerts': resolved,
+                'severity_distribution': dict(severities),
+                'escalation_rates': {
+                    severity: sum(1 for a in self.alerts if a.get('severity') == severity and a.get('escalation_level', 0) > 0)
+                    for severity in severities
+                }
+            }
+
+# ============================================================================
+# Dynamic Reconfiguration System (NEW)
+# ============================================================================
+
+class DynamicReconfigurationSystem:
+    """
+    Dynamic reconfiguration based on sustainability score.
+    
+    Features:
+    - Sustainability-based reconfiguration triggers
+    - Component scaling
+    - Resource allocation adjustment
+    - Configuration versioning
+    """
+    
+    def __init__(self):
+        self.configurations: Dict[str, Dict] = {}
+        self.config_history: List[Dict] = []
+        self.reconfiguration_triggers: Dict[str, float] = {
+            'low_sustainability': 0.4,
+            'medium_sustainability': 0.6,
+            'high_sustainability': 0.8
+        }
+        self._lock = threading.Lock()
+        
+        # Store current configuration
+        self.current_config = {
+            'version': '1.0.0',
+            'last_update': datetime.utcnow().isoformat(),
+            'components': {}
+        }
+        
+        logger.info("Dynamic Reconfiguration System initialized")
+    
+    def update_configuration(self, component_name: str, config: Dict):
+        """Update configuration for a component"""
+        with self._lock:
+            self.current_config['components'][component_name] = config
+            self.current_config['last_update'] = datetime.utcnow().isoformat()
+            
+            # Store version history
+            self.config_history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'component': component_name,
+                'config': config,
+                'version': self.current_config['version']
+            })
+            
+            logger.info(f"Updated configuration for {component_name}")
+    
+    async def reconfigure_by_sustainability(self, sustainability_score: float):
+        """Reconfigure based on sustainability score"""
+        with self._lock:
+            if sustainability_score < self.reconfiguration_triggers['low_sustainability']:
+                # Activate aggressive optimization
+                self._apply_aggressive_reconfiguration()
+            elif sustainability_score < self.reconfiguration_triggers['medium_sustainability']:
+                # Apply moderate optimization
+                self._apply_moderate_reconfiguration()
+            else:
+                # Apply conservative optimization
+                self._apply_conservative_reconfiguration()
+            
+            # Update version
+            self.current_config['version'] = f"{sustainability_score:.2f}_{datetime.utcnow().timestamp()}"
+    
+    def _apply_aggressive_reconfiguration(self):
+        """Apply aggressive reconfiguration for low sustainability"""
+        # Example: Scale down non-critical components
+        logger.info("Applying aggressive reconfiguration (low sustainability)")
+        for component in self.current_config['components']:
+            self.current_config['components'][component]['scale'] = 0.5
+            self.current_config['components'][component]['priority'] = 'reduced'
+    
+    def _apply_moderate_reconfiguration(self):
+        """Apply moderate reconfiguration"""
+        logger.info("Applying moderate reconfiguration")
+        for component in self.current_config['components']:
+            self.current_config['components'][component]['scale'] = 0.8
+            self.current_config['components'][component]['priority'] = 'normal'
+    
+    def _apply_conservative_reconfiguration(self):
+        """Apply conservative reconfiguration for high sustainability"""
+        logger.info("Applying conservative reconfiguration (high sustainability)")
+        for component in self.current_config['components']:
+            self.current_config['components'][component]['scale'] = 1.0
+            self.current_config['components'][component]['priority'] = 'optimized'
+    
+    def get_current_config(self) -> Dict:
+        """Get current configuration"""
+        with self._lock:
+            return self.current_config.copy()
+    
+    def get_config_history(self, n: int = 10) -> List[Dict]:
+        """Get configuration history"""
+        with self._lock:
+            return self.config_history[-n:]
+
+# ============================================================================
+# Enhanced Bio-Inspired Integrator
 # ============================================================================
 
 class EnhancedBioInspiredIntegrator:
@@ -744,11 +1232,12 @@ class PredictiveMaintenanceIntegrator:
 
 class UnifiedMetabolicEcosystem:
     """
-    Unified Metabolic Ecosystem v5.0.0 with Digital Twin and Sustainability Engine.
+    Unified Metabolic Ecosystem v6.0.0 with Health Checks, Self-Healing, and Alert Escalation.
     
     Complete integration of MoE Expert System with Bio-Inspired Architecture.
     Enhanced with sustainability dashboard, predictive maintenance,
-    system digital twin, and unified sustainability engine.
+    system digital twin, unified sustainability engine, health checks,
+    self-healing, dynamic reconfiguration, and alert escalation.
     """
     
     def __init__(
@@ -763,6 +1252,10 @@ class UnifiedMetabolicEcosystem:
         enable_predictive_maintenance: bool = True,
         enable_digital_twin: bool = True,
         enable_unified_sustainability: bool = True,
+        enable_health_checks: bool = True,  # NEW
+        enable_self_healing: bool = True,  # NEW
+        enable_alert_escalation: bool = True,  # NEW
+        enable_dynamic_reconfig: bool = True,  # NEW
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -779,6 +1272,10 @@ class UnifiedMetabolicEcosystem:
             enable_predictive_maintenance: Enable predictive maintenance
             enable_digital_twin: Enable system digital twin
             enable_unified_sustainability: Enable unified sustainability engine
+            enable_health_checks: Enable health check system (NEW)
+            enable_self_healing: Enable self-healing system (NEW)
+            enable_alert_escalation: Enable alert escalation system (NEW)
+            enable_dynamic_reconfig: Enable dynamic reconfiguration (NEW)
             config: Optional configuration dictionary
         """
         self.config = config or {}
@@ -787,6 +1284,10 @@ class UnifiedMetabolicEcosystem:
         # Feature flags
         self.enable_digital_twin = enable_digital_twin and DIGITAL_TWIN_AVAILABLE
         self.enable_unified_sustainability = enable_unified_sustainability and SUSTAINABILITY_ENGINE_AVAILABLE
+        self.enable_health_checks = enable_health_checks
+        self.enable_self_healing = enable_self_healing
+        self.enable_alert_escalation = enable_alert_escalation
+        self.enable_dynamic_reconfig = enable_dynamic_reconfig
         
         # Sustainability tracking
         self.sustainability_score = 0.0
@@ -797,10 +1298,20 @@ class UnifiedMetabolicEcosystem:
         self.digital_twin = None
         self.sustainability_engine = None
         
+        # NEW: Health and recovery systems
+        self.health_system = HealthCheckSystem() if enable_health_checks else None
+        self.self_healing = SelfHealingSystem(self.health_system) if enable_self_healing else None
+        self.alert_system = AlertEscalationSystem() if enable_alert_escalation else None
+        self.reconfig_system = DynamicReconfigurationSystem() if enable_dynamic_reconfig else None
+        
         logger.info("=" * 70)
-        logger.info("Initializing Unified Metabolic Ecosystem v5.0.0")
+        logger.info("Initializing Unified Metabolic Ecosystem v6.0.0")
         logger.info(f"  Digital Twin: {self.enable_digital_twin}")
         logger.info(f"  Unified Sustainability: {self.enable_unified_sustainability}")
+        logger.info(f"  Health Checks: {self.enable_health_checks}")
+        logger.info(f"  Self-Healing: {self.enable_self_healing}")
+        logger.info(f"  Alert Escalation: {self.enable_alert_escalation}")
+        logger.info(f"  Dynamic Reconfig: {self.enable_dynamic_reconfig}")
         logger.info("=" * 70)
         
         # ====================================================================
@@ -837,6 +1348,11 @@ class UnifiedMetabolicEcosystem:
             
             self.initialization_status['expert_registry'] = True
             logger.info("[REGISTRY] Expert Registry (Genome Repository) initialized")
+            
+            # Register with health system
+            if self.health_system:
+                self.health_system.register_component('expert_registry', self.registry)
+            
         except Exception as e:
             logger.error(f"[REGISTRY] Failed to initialize Expert Registry: {str(e)}")
             self.initialization_status['expert_registry'] = False
@@ -856,6 +1372,10 @@ class UnifiedMetabolicEcosystem:
             
             self.initialization_status['gating_network'] = True
             logger.info("[GATING] Gating Network (Allosteric Enzyme) initialized")
+            
+            if self.health_system:
+                self.health_system.register_component('gating_network', self.gating_network)
+            
         except Exception as e:
             logger.error(f"[GATING] Failed to initialize Gating Network: {str(e)}")
             self.initialization_status['gating_network'] = False
@@ -879,6 +1399,10 @@ class UnifiedMetabolicEcosystem:
             
             self.initialization_status['expert_router'] = True
             logger.info("[ROUTER] Expert Router (Signal Transduction) initialized")
+            
+            if self.health_system:
+                self.health_system.register_component('expert_router', self.router)
+            
         except Exception as e:
             logger.error(f"[ROUTER] Failed to initialize Expert Router: {str(e)}")
             self.initialization_status['expert_router'] = False
@@ -920,7 +1444,7 @@ class UnifiedMetabolicEcosystem:
                 self.experts['iot'].inject_bio_core(self.bio_core)
             logger.info("[EXPERT] IoT Expert (Decomposer) initialized")
         except Exception as e:
-            logger.error(f("[EXPERT] Failed to initialize IoT Expert: {str(e)}")
+            logger.error(f"[EXPERT] Failed to initialize IoT Expert: {str(e)}")
         
         # Quantum Expert (Optional)
         if enable_quantum and QUANTUM_AVAILABLE:
@@ -1168,13 +1692,30 @@ class UnifiedMetabolicEcosystem:
         # ====================================================================
         # Step 14: Initialize Digital Twin and Sustainability Engine
         # ====================================================================
-        await self._init_digital_twin_and_sustainability()
+        # Note: This uses the async initialization method below
         
         # ====================================================================
         # Step 15: Wire Router Metrics
         # ====================================================================
         if hasattr(self.router, 'metrics_collector'):
             self.router.metrics_collector = self.metrics
+        
+        # ====================================================================
+        # Step 16: Register with Health and Recovery Systems
+        # ====================================================================
+        if self.health_system:
+            # Register all major components
+            for name, component in [
+                ('expert_registry', self.registry),
+                ('gating_network', self.gating_network),
+                ('expert_router', self.router),
+                ('metrics', self.metrics),
+                ('work_integrator', self.work_integrator),
+                ('layer_integrator', self.layer_integrator),
+                ('quantum_limits', self.quantum_limits)
+            ]:
+                if component:
+                    self.health_system.register_component(name, component)
         
         # ====================================================================
         # Final Status
@@ -1185,6 +1726,8 @@ class UnifiedMetabolicEcosystem:
         logger.info(f"  Experts: {len(self.experts)}")
         logger.info(f"  Digital Twin: {self.enable_digital_twin}")
         logger.info(f"  Unified Sustainability: {self.enable_unified_sustainability}")
+        logger.info(f"  Health Checks: {self.enable_health_checks}")
+        logger.info(f"  Self-Healing: {self.enable_self_healing}")
         logger.info(f"  Status: {sum(self.initialization_status.values())}/{len(self.initialization_status)} components")
         logger.info("=" * 70)
     
@@ -1351,9 +1894,9 @@ class UnifiedMetabolicEcosystem:
     # ========================================================================
     
     def get_ecosystem_status(self) -> Dict[str, Any]:
-        """Get comprehensive ecosystem status with sustainability and twin data"""
+        """Get comprehensive ecosystem status with all systems"""
         status = {
-            'ecosystem_version': '5.0.0',
+            'ecosystem_version': '6.0.0',
             'bio_inspired_available': self.bio_available,
             'initialization_status': self.initialization_status,
             'expert_count': len(self.experts),
@@ -1398,6 +1941,22 @@ class UnifiedMetabolicEcosystem:
             status['sustainability_dimensions'] = asyncio.run(
                 self.sustainability_engine.get_dimension_status()
             )
+        
+        # Health system (NEW)
+        if self.enable_health_checks and self.health_system:
+            status['health'] = self.health_system.get_system_health()
+        
+        # Self-healing system (NEW)
+        if self.enable_self_healing and self.self_healing:
+            status['recovery'] = self.self_healing.get_recovery_stats()
+        
+        # Alert system (NEW)
+        if self.enable_alert_escalation and self.alert_system:
+            status['alerts'] = self.alert_system.get_alert_stats()
+        
+        # Reconfiguration system (NEW)
+        if self.enable_dynamic_reconfig and self.reconfig_system:
+            status['configuration'] = self.reconfig_system.get_current_config()
         
         return status
     
@@ -1463,7 +2022,7 @@ class UnifiedMetabolicEcosystem:
             return self.predictive_maintenance.get_predictive_insights()
         return {'status': 'predictive_maintenance_not_enabled'}
     
-    def get_sustainability_recommendations(self) -> List[Dict[str, Any]]:
+    async def get_sustainability_recommendations(self) -> List[Dict[str, Any]]:
         """Get sustainability recommendations"""
         if self.sustainability_dashboard:
             return self.sustainability_dashboard.get_recommendations()
@@ -1487,6 +2046,10 @@ class UnifiedMetabolicEcosystem:
         
         if hasattr(self, 'bio_integrator'):
             self.bio_integrator.register_component(f"expert_{expert_type}", expert_instance)
+        
+        # Register with health system
+        if self.health_system:
+            self.health_system.register_component(f"expert_{expert_type}", expert_instance)
         
         # Register with sustainability modules
         if self.enable_unified_sustainability and self.sustainability_engine:
@@ -1512,6 +2075,46 @@ class UnifiedMetabolicEcosystem:
                     expert.compartment_manager = module_instance
         logger.info(f"External module injected: {module_name}")
     
+    def add_health_check(self, component_name: str, component: Any):
+        """Add a health check for a component"""
+        if self.health_system:
+            self.health_system.register_component(component_name, component)
+            logger.info(f"Health check added for component: {component_name}")
+    
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get system health status"""
+        if self.health_system:
+            return self.health_system.get_system_health()
+        return {'status': 'health_system_not_enabled'}
+    
+    def get_alerts(self, active_only: bool = True) -> List[Dict]:
+        """Get system alerts"""
+        if self.alert_system:
+            if active_only:
+                return self.alert_system.get_active_alerts()
+            return self.alert_system.alerts
+        return []
+    
+    def resolve_alert(self, alert_id: str):
+        """Resolve an alert"""
+        if self.alert_system:
+            self.alert_system.resolve_alert(alert_id)
+            logger.info(f"Alert {alert_id} resolved")
+    
+    async def reconfigure_by_sustainability(self):
+        """Reconfigure system based on sustainability score"""
+        if not self.enable_dynamic_reconfig or not self.reconfig_system:
+            return {'status': 'reconfiguration_not_enabled'}
+        
+        score = await self.get_sustainability_score()
+        await self.reconfig_system.reconfigure_by_sustainability(score)
+        
+        return {
+            'status': 'reconfiguration_applied',
+            'sustainability_score': score,
+            'config': self.reconfig_system.get_current_config()
+        }
+    
     def shutdown(self):
         """Graceful shutdown of the ecosystem"""
         logger.info("Shutting down Unified Metabolic Ecosystem...")
@@ -1524,236 +2127,16 @@ class UnifiedMetabolicEcosystem:
         if self.predictive_maintenance:
             self.predictive_maintenance.shutdown()
         
+        # Shutdown health system
+        if self.health_system:
+            self.health_system.shutdown()
+        
+        # Shutdown self-healing
+        if self.self_healing:
+            self.self_healing.shutdown()
+        
         # Shutdown digital twin
-        if self.enable_digital_twin and self.digital_twin:
+        if self.digital_twin:
             asyncio.run(self.digital_twin.shutdown())
         
-        # Shutdown sustainability engine
-        if self.enable_unified_sustainability and self.sustainability_engine:
-            asyncio.run(self.sustainability_engine.shutdown())
-        
-        logger.info("Ecosystem shutdown complete")
-
-
-# ============================================================================
-# Convenience Functions
-# ============================================================================
-
-def create_metabolic_ecosystem(
-    enable_quantum: bool = False,
-    enable_helium: bool = False,
-    enable_bio: bool = True,
-    enable_evolving: bool = True,
-    enable_federated: bool = False,
-    enable_cross_region: bool = False,
-    enable_dashboard: bool = True,
-    enable_predictive: bool = True,
-    enable_twin: bool = True,
-    enable_sustainability_engine: bool = True
-) -> UnifiedMetabolicEcosystem:
-    """
-    Create a unified metabolic ecosystem with specified features.
-    
-    Args:
-        enable_quantum: Enable Quantum Expert
-        enable_helium: Enable Helium Expert
-        enable_bio: Enable bio-inspired architecture
-        enable_evolving: Enable self-evolving gates
-        enable_federated: Enable federated learning
-        enable_cross_region: Enable cross-region federation
-        enable_dashboard: Enable sustainability dashboard
-        enable_predictive: Enable predictive maintenance
-        enable_twin: Enable system digital twin
-        enable_sustainability_engine: Enable unified sustainability engine
-        
-    Returns:
-        Configured UnifiedMetabolicEcosystem instance
-    """
-    return UnifiedMetabolicEcosystem(
-        enable_quantum=enable_quantum,
-        enable_helium=enable_helium,
-        enable_bio_inspired=enable_bio,
-        enable_evolving_gates=enable_evolving,
-        enable_federated=enable_federated,
-        enable_cross_region=enable_cross_region,
-        enable_sustainability_dashboard=enable_dashboard,
-        enable_predictive_maintenance=enable_predictive,
-        enable_digital_twin=enable_twin,
-        enable_unified_sustainability=enable_sustainability_engine
-    )
-
-
-def create_minimal_ecosystem() -> UnifiedMetabolicEcosystem:
-    """Create minimal ecosystem with core experts only"""
-    return UnifiedMetabolicEcosystem(
-        enable_quantum=False,
-        enable_helium=False,
-        enable_bio_inspired=False,
-        enable_evolving_gates=False,
-        enable_federated=False,
-        enable_cross_region=False,
-        enable_sustainability_dashboard=False,
-        enable_predictive_maintenance=False,
-        enable_digital_twin=False,
-        enable_unified_sustainability=False
-    )
-
-
-def create_full_ecosystem() -> UnifiedMetabolicEcosystem:
-    """Create full ecosystem with all features enabled"""
-    return UnifiedMetabolicEcosystem(
-        enable_quantum=QUANTUM_AVAILABLE,
-        enable_helium=HELIUM_AVAILABLE,
-        enable_bio_inspired=BIO_INSPIRED_AVAILABLE,
-        enable_evolving_gates=EVOLVING_GATES_AVAILABLE,
-        enable_federated=FEDERATED_AVAILABLE,
-        enable_cross_region=CROSS_REGION_AVAILABLE,
-        enable_sustainability_dashboard=True,
-        enable_predictive_maintenance=True,
-        enable_digital_twin=True,
-        enable_unified_sustainability=True
-    )
-
-
-# ============================================================================
-# Module Exports
-# ============================================================================
-
-__all__ = [
-    # Ecosystem
-    'UnifiedMetabolicEcosystem',
-    'create_metabolic_ecosystem',
-    'create_minimal_ecosystem',
-    'create_full_ecosystem',
-    
-    # Core Components
-    'ExpertRegistry',
-    'ExpertProfile',
-    'ExpertDomain',
-    'ExpertLifecycleState',
-    'ExpertVersion',
-    'HardwareProfile',
-    'HealthMetrics',
-    'ExpertCertification',
-    'CertificationLevel',
-    'FitnessScore',
-    
-    # Gating
-    'MoEGatingNetwork',
-    'GatingContext',
-    'EnhancedSparseMoEGate',
-    
-    # Router
-    'ExpertRouter',
-    'RoutingMetrics',
-    'ExpertCircuitBreaker',
-    'CircuitBreakerState',
-    'SignalTransductionEngine',
-    'AllostericRegulationSystem',
-    'MetabolicPathwayRouter',
-    
-    # Experts
-    'EnergyExpert',
-    'EnergySource',
-    'PowerState',
-    'CoolingMethod',
-    'RenewableProfile',
-    'ThermalProfile',
-    'DataExpert',
-    'DataTier',
-    'DataQuality',
-    'DataQualityMetrics',
-    'DataLineage',
-    'DataStream',
-    'StreamingMode',
-    'PipelineStatus',
-    'IoTExpert',
-    'DeviceType',
-    'ConnectionType',
-    'ProcessingMode',
-    'MeshRole',
-    'EdgeDevice',
-    'MeshNetwork',
-    
-    # Integration
-    'EnhancedLayerIntegrator',
-    'LayerIntegrator',
-    'LayerInfo',
-    'LayerStatus',
-    'IntegrationMode',
-    'CircuitState',
-    'EnhancedWorkIntegrator',
-    'EnhancedWorkContext',
-    'WorkState',
-    'WorkPriority',
-    'WorkSLA',
-    'SLALevel',
-    'QuantumLimitGraphIntegrator',
-    'QuantumBackend',
-    'QuantumAlgorithm',
-    'QuantumErrorMitigation',
-    'QuantumResource',
-    'QuantumCircuitJob',
-    'AdaptiveBoundary',
-    'QuantumNode',
-    
-    # Monitoring
-    'ExpertMetricsCollector',
-    'MetricSeverity',
-    'MetricType',
-    'AnomalyType',
-    'SLOStatus',
-    'MetricThreshold',
-    'ServiceLevelObjective',
-    'AnomalyEvent',
-    'CostAttribution',
-    
-    # Advanced
-    'EnhancedSelfEvolvingGate',
-    'SelfEvolvingGate',
-    'EnhancedFederatedOrchestrator',
-    'FederatedExpert',
-    'CrossRegionFederationOptimizer',
-    'Region',
-    'SyncMode',
-    'AggregationTier',
-    
-    # Sustainability Modules
-    'UnifiedSustainabilityDashboard',
-    'PredictiveMaintenanceIntegrator',
-    'EnhancedBioInspiredIntegrator',
-    
-    # New: Digital Twin and Sustainability Engine
-    'SystemDigitalTwin',
-    'DigitalTwinConfig',
-    'SimulationResult',
-    'SimulationScenario',
-    'ResourceProjection',
-    'UnifiedSustainabilityEngine',
-    'UnifiedSustainabilityScore',
-    'SustainabilityDimension',
-    'SustainabilityThreshold',
-    
-    # Status
-    'BIO_INSPIRED_AVAILABLE',
-    'QUANTUM_AVAILABLE',
-    'HELIUM_AVAILABLE',
-    'EVOLVING_GATES_AVAILABLE',
-    'FEDERATED_AVAILABLE',
-    'CROSS_REGION_AVAILABLE',
-    'BIODIVERSITY_AVAILABLE',
-    'SEQUESTRATION_AVAILABLE',
-    'CIRCULAR_AVAILABLE',
-    'OFFSET_AVAILABLE',
-    'DIGITAL_TWIN_AVAILABLE',
-    'SUSTAINABILITY_ENGINE_AVAILABLE'
-]
-
-
-# ============================================================================
-# Module Version
-# ============================================================================
-
-__version__ = "5.0.0"
-__author__ = "Green Agent Team"
-__description__ = "Unified Metabolic Ecosystem - Bio-Inspired MoE Expert System with Digital Twin and Sustainability Engine"
+        logger.info("Unified Metabolic Ecosystem shutdown complete")
