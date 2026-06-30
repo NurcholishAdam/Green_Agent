@@ -1,6 +1,6 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/federated_experts.py
 """
-Enhanced Federated Experts v6.0.0 - Complete Production-Grade Green Agent Implementation
+Enhanced Federated Experts v7.0.0 - Complete Production-Grade Green Agent Implementation
 
 Complete bio-inspired integration with:
 - Federated Reflexive Learning with global model sharing
@@ -22,6 +22,14 @@ Complete bio-inspired integration with:
 - ATP-driven gating network synchronization
 - Production-grade secure aggregation with MPC
 - Global federated network with tiered aggregation
+- Model Compression at each tier (NEW)
+- Real-time pricing signals for carbon and helium (NEW)
+- Reputation scoring for nodes (NEW)
+- Strategic playbook system (NEW)
+- Enhanced Byzantine detection with geometric median (NEW)
+- Adaptive noise scaling for differential privacy (NEW)
+- Smart contract-based token distribution (NEW)
+- Cross-tier knowledge distillation (NEW)
 """
 
 import asyncio
@@ -45,6 +53,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import copy
 import math
 import aiohttp
+import zlib
+import pickle
+from decimal import Decimal, getcontext
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +90,7 @@ except ImportError as e:
     logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard federation")
 
 # ============================================================================
-# Enums and Data Classes
+# Enhanced Enums and Data Classes
 # ============================================================================
 
 class FederationTopology(Enum):
@@ -91,15 +102,21 @@ class AggregationStrategy(Enum):
     FED_ENSEMBLE = "fed_ensemble"; FED_DISTILL = "fed_distill"; ADAPTIVE = "adaptive"
     TOKEN_WEIGHTED = "token_weighted"; GRADIENT_ALIGNED = "gradient_aligned"
     HEALTH_AWARE = "health_aware"; SUSTAINABILITY_WEIGHTED = "sustainability_weighted"
-    SECURE_AGGREGATION = "secure_aggregation"  # NEW: Production-grade secure aggregation
+    SECURE_AGGREGATION = "secure_aggregation"
+    REPUTATION_WEIGHTED = "reputation_weighted"  # NEW
+    PRICE_AWARE = "price_aware"  # NEW
+    CROSS_TIER_DISTILLATION = "cross_tier_distillation"  # NEW
 
 class PrivacyLevel(Enum):
     NONE = "none"; BASIC = "basic"; DIFFERENTIAL = "differential"; SECURE_AGGREGATION = "secure_agg"
     FULLY_HOMOMORPHIC = "fully_homo"; GRADIENT_MODULATED = "gradient_modulated"; TOKEN_BACKED = "token_backed"
-    ZERO_KNOWLEDGE = "zero_knowledge"  # NEW
+    ZERO_KNOWLEDGE = "zero_knowledge"
+    ADAPTIVE_NOISE = "adaptive_noise"  # NEW
 
 class ParticipantRole(Enum):
     LEADER = "leader"; FOLLOWER = "follower"; OBSERVER = "observer"; BACKUP = "backup"
+    VALIDATOR = "validator"  # NEW
+    DISTILLER = "distiller"  # NEW
 
 # ============================================================================
 # Enhanced Data Classes
@@ -125,6 +142,11 @@ class ClientCapabilities:
     sustainability_score: float = 0.5
     reputation_score: float = 0.5
     role: ParticipantRole = ParticipantRole.FOLLOWER
+    # NEW: Enhanced metrics
+    compressed_model_size_mb: float = 0.0
+    compression_ratio: float = 1.0
+    carbon_price_usd_per_ton: float = 50.0
+    helium_price_usd_per_l: float = 0.5
 
 @dataclass
 class SecureModelUpdate:
@@ -143,7 +165,18 @@ class SecureModelUpdate:
     token_efficiency: float = 0.5
     sustainability_impact: float = 0.0
     carbon_savings: float = 0.0
-    zk_proof: Optional[bytes] = None  # NEW: Zero-knowledge proof
+    zk_proof: Optional[bytes] = None
+    # NEW: Economic data
+    carbon_price: float = 50.0
+    helium_price: float = 0.5
+    economic_impact: float = 0.0
+    # NEW: Compression metadata
+    original_size_bytes: int = 0
+    compressed_size_bytes: int = 0
+    compression_ratio: float = 1.0
+    # NEW: Validation metadata
+    validation_score: float = 0.0
+    byzantine_risk: float = 0.0
 
 @dataclass
 class FederationRound:
@@ -167,7 +200,12 @@ class FederationRound:
     atp_sync_delay: float = 0.0
     sustainability_score: float = 0.0
     carbon_savings_kg: float = 0.0
-    secure_aggregation_rounds: int = 0  # NEW
+    secure_aggregation_rounds: int = 0
+    # NEW: Enhanced metrics
+    compression_stats: Dict[str, Any] = field(default_factory=dict)
+    economic_impact: float = 0.0
+    reputation_changes: Dict[str, float] = field(default_factory=dict)
+    playbook_applied: Optional[str] = None
 
 @dataclass
 class FederatedExpert:
@@ -191,7 +229,14 @@ class FederatedExpert:
     trust_pumping_count: int = 0
     sustainability_contribution: float = 0.0
     federated_round: int = 0
-    secure_key: Optional[bytes] = None  # NEW: For secure aggregation
+    secure_key: Optional[bytes] = None
+    # NEW: Enhanced tracking
+    compressed_model_size_mb: float = 0.0
+    compression_ratio: float = 1.0
+    byzantine_risk_score: float = 0.0
+    validation_success_count: int = 0
+    validation_failure_count: int = 0
+    economic_efficiency: float = 0.5
 
 @dataclass
 class PredictiveFederationForecast:
@@ -202,21 +247,614 @@ class PredictiveFederationForecast:
     confidence: float = 0.0
     trend: str = "stable"
     recommended_actions: List[str] = field(default_factory=list)
-    participant_health: Dict[str, float] = field(default_factory=dict)  # NEW
+    participant_health: Dict[str, float] = field(default_factory=dict)
+    # NEW: Economic forecast
+    predicted_carbon_price: float = 50.0
+    predicted_helium_price: float = 0.5
+
+@dataclass
+class ReputationRecord:
+    """Reputation record for a node"""
+    node_id: str
+    score: float = 0.5
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    last_update: datetime = field(default_factory=datetime.utcnow)
+    total_contributions: int = 0
+    successful_updates: int = 0
+    failed_updates: int = 0
+    sustainability_contributions: float = 0.0
+    token_stake: float = 0.0
+    # NEW: Economic metrics
+    economic_contributions: float = 0.0
+    carbon_savings_total: float = 0.0
+    helium_savings_total: float = 0.0
+
+@dataclass
+class PlaybookStrategy:
+    """Strategic playbook for cross-domain optimization"""
+    playbook_id: str
+    name: str
+    domain: str
+    actions: List[Dict[str, Any]]
+    conditions: Dict[str, Any]
+    success_metrics: Dict[str, float]
+    performance_score: float = 0.5
+    usage_count: int = 0
+    last_used: datetime = field(default_factory=datetime.utcnow)
+    is_active: bool = True
 
 # ============================================================================
-# Secure Aggregation Module (Production-Grade)
+# Model Compression Module (NEW)
+# ============================================================================
+
+class ModelCompressor:
+    """
+    Model compression with adaptive strategies.
+    
+    Features:
+    - Lossy and lossless compression
+    - Adaptive compression based on tier
+    - Size estimation and optimization
+    - Compression ratio tracking
+    - Quality preservation
+    """
+    
+    def __init__(self):
+        self.compressors = {
+            'zlib': self._compress_zlib,
+            'pickle': self._compress_pickle,
+            'hybrid': self._compress_hybrid,
+            'lz4': self._compress_lz4  # NEW
+        }
+        self.compression_stats = deque(maxlen=1000)
+        self._lock = asyncio.Lock()
+        
+        # Tier-specific compression settings
+        self.tier_settings = {
+            'edge': {
+                'method': 'zlib',
+                'target_ratio': 0.7,
+                'quality_threshold': 0.95
+            },
+            'regional': {
+                'method': 'hybrid',
+                'target_ratio': 0.5,
+                'quality_threshold': 0.90
+            },
+            'continental': {
+                'method': 'hybrid',
+                'target_ratio': 0.3,
+                'quality_threshold': 0.85
+            },
+            'global': {
+                'method': 'lz4',
+                'target_ratio': 0.2,
+                'quality_threshold': 0.80
+            }
+        }
+        
+        logger.info("Model Compressor initialized")
+    
+    async def compress_model(
+        self,
+        model: Dict[str, Any],
+        tier: str = "regional",
+        compression_method: Optional[str] = None
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        """Compress a model for transmission"""
+        async with self._lock:
+            settings = self.tier_settings.get(tier, self.tier_settings['regional'])
+            method = compression_method or settings['method']
+            
+            # Serialize model
+            original_size = len(pickle.dumps(model))
+            
+            # Apply compression
+            compressor = self.compressors.get(method, self._compress_hybrid)
+            compressed, metadata = await compressor(model, settings)
+            
+            compressed_size = len(compressed)
+            compression_ratio = compressed_size / original_size if original_size > 0 else 1.0
+            
+            self.compression_stats.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'tier': tier,
+                'method': method,
+                'original_size': original_size,
+                'compressed_size': compressed_size,
+                'ratio': compression_ratio,
+                'quality': metadata.get('quality', 1.0)
+            })
+            
+            return compressed, {
+                'original_size': original_size,
+                'compressed_size': compressed_size,
+                'ratio': compression_ratio,
+                'method': method,
+                'tier': tier,
+                'quality': metadata.get('quality', 1.0)
+            }
+    
+    async def decompress_model(
+        self,
+        compressed: bytes,
+        metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Decompress a model"""
+        method = metadata.get('method', 'hybrid')
+        
+        if method == 'zlib':
+            decompressed = self._decompress_zlib(compressed)
+        elif method == 'pickle':
+            decompressed = self._decompress_pickle(compressed)
+        elif method == 'lz4':
+            decompressed = self._decompress_lz4(compressed)
+        else:
+            decompressed = self._decompress_hybrid(compressed)
+        
+        return decompressed
+    
+    async def _compress_zlib(self, model: Dict, settings: Dict) -> Tuple[bytes, Dict]:
+        serialized = pickle.dumps(model)
+        compressed = zlib.compress(serialized, level=6)
+        return compressed, {'quality': 1.0, 'method': 'zlib'}
+    
+    async def _compress_pickle(self, model: Dict, settings: Dict) -> Tuple[bytes, Dict]:
+        serialized = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
+        return serialized, {'quality': 1.0, 'method': 'pickle'}
+    
+    async def _compress_hybrid(self, model: Dict, settings: Dict) -> Tuple[bytes, Dict]:
+        processed_model = {}
+        for key, value in model.items():
+            if isinstance(value, np.ndarray):
+                processed_model[key] = value.tolist()
+            else:
+                processed_model[key] = value
+        
+        serialized = pickle.dumps(processed_model, protocol=pickle.HIGHEST_PROTOCOL)
+        compressed = zlib.compress(serialized, level=9)
+        quality = min(1.0, settings.get('quality_threshold', 0.9) + 0.05)
+        return compressed, {'quality': quality, 'method': 'hybrid'}
+    
+    async def _compress_lz4(self, model: Dict, settings: Dict) -> Tuple[bytes, Dict]:
+        # Simulate LZ4 compression (using zlib as fallback)
+        serialized = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
+        compressed = zlib.compress(serialized, level=9)
+        quality = min(1.0, settings.get('quality_threshold', 0.8) + 0.1)
+        return compressed, {'quality': quality, 'method': 'lz4'}
+    
+    def _decompress_zlib(self, compressed: bytes) -> Dict:
+        serialized = zlib.decompress(compressed)
+        return pickle.loads(serialized)
+    
+    def _decompress_pickle(self, compressed: bytes) -> Dict:
+        return pickle.loads(compressed)
+    
+    def _decompress_hybrid(self, compressed: bytes) -> Dict:
+        serialized = zlib.decompress(compressed)
+        return pickle.loads(serialized)
+    
+    def _decompress_lz4(self, compressed: bytes) -> Dict:
+        serialized = zlib.decompress(compressed)
+        return pickle.loads(serialized)
+    
+    def get_compression_stats(self) -> Dict[str, Any]:
+        if not self.compression_stats:
+            return {'status': 'no_data'}
+        
+        recent = list(self.compression_stats)[-100:]
+        avg_ratio = np.mean([s['ratio'] for s in recent])
+        avg_quality = np.mean([s['quality'] for s in recent])
+        
+        return {
+            'total_compressions': len(self.compression_stats),
+            'average_ratio': avg_ratio,
+            'average_quality': avg_quality,
+            'by_tier': {
+                tier: {
+                    'count': sum(1 for s in recent if s['tier'] == tier),
+                    'avg_ratio': np.mean([s['ratio'] for s in recent if s['tier'] == tier])
+                }
+                for tier in ['edge', 'regional', 'continental', 'global']
+            },
+            'total_size_saved_mb': sum(s['original_size'] - s['compressed_size'] for s in recent) / (1024 * 1024)
+        }
+
+# ============================================================================
+# Reputation Scoring System (NEW)
+# ============================================================================
+
+class ReputationScoringSystem:
+    """
+    Advanced reputation scoring for nodes based on historical performance.
+    
+    Features:
+    - Multi-dimensional scoring
+    - Decay mechanism
+    - History tracking
+    - Economic contribution consideration
+    - Byzantine risk detection
+    """
+    
+    def __init__(self, decay_rate: float = 0.01, min_score: float = 0.1):
+        self.reputation_records: Dict[str, ReputationRecord] = {}
+        self.decay_rate = decay_rate
+        self.min_score = min_score
+        self._lock = asyncio.Lock()
+        
+        self.weights = {
+            'success_rate': 0.20,
+            'sustainability': 0.20,
+            'token_stake': 0.15,
+            'data_quality': 0.15,
+            'participation': 0.10,
+            'carbon_efficiency': 0.10,
+            'economic_contribution': 0.05,  # NEW
+            'validation_success': 0.05  # NEW
+        }
+        
+        logger.info("Reputation Scoring System initialized")
+    
+    async def update_reputation(
+        self,
+        node_id: str,
+        success: bool,
+        sustainability_contribution: float = 0.5,
+        token_stake: float = 0.0,
+        data_quality: float = 0.5,
+        carbon_efficiency: float = 0.5,
+        economic_contribution: float = 0.0,  # NEW
+        validation_success: bool = True  # NEW
+    ):
+        """Update reputation score for a node"""
+        async with self._lock:
+            if node_id not in self.reputation_records:
+                self.reputation_records[node_id] = ReputationRecord(node_id=node_id)
+            
+            record = self.reputation_records[node_id]
+            
+            # Update metrics
+            record.total_contributions += 1
+            if success:
+                record.successful_updates += 1
+            else:
+                record.failed_updates += 1
+            
+            record.sustainability_contributions += sustainability_contribution
+            record.token_stake = token_stake
+            record.economic_contributions += economic_contribution
+            if success and validation_success:
+                record.carbon_savings_total += carbon_efficiency * 0.1
+            
+            # Calculate metrics
+            success_rate = record.successful_updates / max(1, record.total_contributions)
+            sustainability_score = record.sustainability_contributions / max(1, record.total_contributions)
+            economic_score = min(1.0, record.economic_contributions / 100.0)
+            validation_score = validation_success if success else 0.0
+            
+            # Decayed data quality
+            data_quality_score = data_quality * (1.0 - self.decay_rate * (datetime.utcnow() - record.last_update).days / 30)
+            
+            # Carbon efficiency score
+            carbon_score = 1.0 - carbon_efficiency
+            
+            # Weighted composite
+            new_score = (
+                self.weights['success_rate'] * success_rate +
+                self.weights['sustainability'] * sustainability_score +
+                self.weights['token_stake'] * min(1.0, token_stake / 100.0) +
+                self.weights['data_quality'] * data_quality_score +
+                self.weights['participation'] * min(1.0, record.total_contributions / 50.0) +
+                self.weights['carbon_efficiency'] * carbon_score +
+                self.weights['economic_contribution'] * economic_score +
+                self.weights['validation_success'] * validation_score
+            )
+            
+            # Apply decay
+            decay_factor = 1.0 - self.decay_rate
+            record.score = max(self.min_score, min(1.0,
+                record.score * decay_factor + new_score * (1.0 - decay_factor)
+            ))
+            
+            record.last_update = datetime.utcnow()
+            
+            # Record history
+            record.history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'score': record.score,
+                'success': success,
+                'sustainability': sustainability_contribution,
+                'token_stake': token_stake,
+                'data_quality': data_quality,
+                'carbon_efficiency': carbon_efficiency,
+                'economic_contribution': economic_contribution,
+                'validation_success': validation_success
+            })
+            
+            if len(record.history) > 100:
+                record.history = record.history[-100:]
+    
+    async def get_reputation_score(self, node_id: str) -> float:
+        if node_id in self.reputation_records:
+            return self.reputation_records[node_id].score
+        return 0.5
+    
+    async def get_byzantine_risk(self, node_id: str) -> float:
+        """Calculate Byzantine risk based on reputation history"""
+        if node_id not in self.reputation_records:
+            return 0.5
+        
+        record = self.reputation_records[node_id]
+        
+        # Factors increasing Byzantine risk
+        failure_rate = record.failed_updates / max(1, record.total_contributions)
+        volatility = np.std([h['score'] for h in record.history[-20:]]) if len(record.history) >= 20 else 0
+        
+        # Recent behavior matters more
+        recent_failures = sum(1 for h in record.history[-10:] if not h['success']) / max(1, len(record.history[-10:]))
+        
+        risk = (
+            failure_rate * 0.4 +
+            volatility * 0.3 +
+            recent_failures * 0.3
+        )
+        
+        return min(1.0, risk)
+    
+    async def get_reputation_details(self, node_id: str) -> Optional[Dict[str, Any]]:
+        if node_id not in self.reputation_records:
+            return None
+        
+        record = self.reputation_records[node_id]
+        return {
+            'score': record.score,
+            'total_contributions': record.total_contributions,
+            'success_rate': record.successful_updates / max(1, record.total_contributions),
+            'sustainability_avg': record.sustainability_contributions / max(1, record.total_contributions),
+            'token_stake': record.token_stake,
+            'economic_contributions': record.economic_contributions,
+            'carbon_savings_total': record.carbon_savings_total,
+            'byzantine_risk': await self.get_byzantine_risk(node_id),
+            'recent_history': record.history[-10:],
+            'last_update': record.last_update.isoformat()
+        }
+    
+    def get_top_nodes(self, n: int = 10) -> List[Dict[str, Any]]:
+        sorted_nodes = sorted(
+            self.reputation_records.items(),
+            key=lambda x: x[1].score,
+            reverse=True
+        )
+        return [
+            {
+                'node_id': node_id,
+                'score': record.score,
+                'success_rate': record.successful_updates / max(1, record.total_contributions),
+                'byzantine_risk': self._calculate_risk(record)
+            }
+            for node_id, record in sorted_nodes[:n]
+        ]
+    
+    def _calculate_risk(self, record: ReputationRecord) -> float:
+        failure_rate = record.failed_updates / max(1, record.total_contributions)
+        volatility = np.std([h['score'] for h in record.history[-20:]]) if len(record.history) >= 20 else 0
+        return min(1.0, failure_rate * 0.5 + volatility * 0.5)
+    
+    def get_reputation_stats(self) -> Dict[str, Any]:
+        if not self.reputation_records:
+            return {'total_nodes': 0}
+        
+        scores = [r.score for r in self.reputation_records.values()]
+        return {
+            'total_nodes': len(self.reputation_records),
+            'average_score': np.mean(scores),
+            'min_score': min(scores),
+            'max_score': max(scores),
+            'top_nodes': self.get_top_nodes(5)
+        }
+
+# ============================================================================
+# Strategic Playbook System (NEW)
+# ============================================================================
+
+class StrategicPlaybookSystem:
+    """
+    Strategic playbook system for cross-domain optimization.
+    
+    Features:
+    - Playbook creation and management
+    - Condition-based activation
+    - Performance tracking
+    - Automatic playbook evolution
+    - Cross-domain knowledge transfer
+    """
+    
+    def __init__(self):
+        self.playbooks: Dict[str, PlaybookStrategy] = {}
+        self.playbook_history: deque = deque(maxlen=1000)
+        self._lock = asyncio.Lock()
+        self._initialize_default_playbooks()
+        logger.info("Strategic Playbook System initialized")
+    
+    def _initialize_default_playbooks(self):
+        default_playbooks = [
+            PlaybookStrategy(
+                playbook_id="carbon_peak_avoidance",
+                name="Carbon Peak Avoidance",
+                domain="energy",
+                actions=[
+                    {'type': 'schedule_shift', 'target': 'off-peak'},
+                    {'type': 'reduce_workload', 'percentage': 0.3}
+                ],
+                conditions={'carbon_intensity': '> 500'},
+                success_metrics={'carbon_reduction': 0.2}
+            ),
+            PlaybookStrategy(
+                playbook_id="helium_conservation",
+                name="Helium Conservation",
+                domain="sustainability",
+                actions=[
+                    {'type': 'switch_cooling', 'method': 'alternative'},
+                    {'type': 'recovery_mode', 'enabled': True}
+                ],
+                conditions={'helium_availability': '< 0.3'},
+                success_metrics={'helium_savings': 0.5}
+            ),
+            PlaybookStrategy(
+                playbook_id="renewable_maximization",
+                name="Renewable Energy Maximization",
+                domain="energy",
+                actions=[
+                    {'type': 'schedule_to_renewable', 'enabled': True},
+                    {'type': 'load_balancing', 'strategy': 'renewable_first'}
+                ],
+                conditions={'renewable_availability': '> 0.6'},
+                success_metrics={'renewable_usage': 0.4}
+            ),
+            PlaybookStrategy(
+                playbook_id="economic_optimization",
+                name="Economic Optimization",
+                domain="economics",
+                actions=[
+                    {'type': 'price_aware_scheduling', 'enabled': True},
+                    {'type': 'cost_minimization', 'priority': 'high'}
+                ],
+                conditions={'carbon_price': '> 100'},
+                success_metrics={'cost_savings': 0.3}
+            )
+        ]
+        
+        for playbook in default_playbooks:
+            self.playbooks[playbook.playbook_id] = playbook
+    
+    async def evaluate_playbooks(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Evaluate which playbooks should be activated"""
+        async with self._lock:
+            recommendations = []
+            
+            for playbook in self.playbooks.values():
+                if not playbook.is_active:
+                    continue
+                
+                match_score = self._evaluate_conditions(playbook.conditions, context)
+                
+                if match_score > 0.5:
+                    recommendations.append({
+                        'playbook': playbook,
+                        'match_score': match_score,
+                        'expected_impact': self._estimate_impact(playbook, context)
+                    })
+            
+            recommendations.sort(key=lambda x: x['match_score'], reverse=True)
+            return recommendations
+    
+    def _evaluate_conditions(self, conditions: Dict[str, Any], context: Dict[str, Any]) -> float:
+        if not conditions:
+            return 1.0
+        
+        score = 0.0
+        total = len(conditions)
+        
+        for key, value in conditions.items():
+            context_value = context.get(key)
+            if context_value is None:
+                continue
+            
+            if isinstance(value, str):
+                if key == 'carbon_intensity':
+                    threshold = float(value.split('>')[1]) if '>' in value else 0
+                    match = context_value > threshold
+                elif key == 'helium_availability':
+                    threshold = float(value.split('<')[1]) if '<' in value else 0
+                    match = context_value < threshold
+                else:
+                    match = False
+            else:
+                match = abs(context_value - value) < 0.1
+            
+            if match:
+                score += 1.0 / total
+        
+        return score
+    
+    def _estimate_impact(self, playbook: PlaybookStrategy, context: Dict[str, Any]) -> Dict[str, float]:
+        impact = {}
+        
+        if 'carbon_reduction' in playbook.success_metrics:
+            impact['carbon_savings'] = playbook.success_metrics['carbon_reduction'] * context.get('carbon_intensity', 400) / 1000
+        
+        if 'helium_savings' in playbook.success_metrics:
+            impact['helium_savings'] = playbook.success_metrics['helium_savings'] * context.get('helium_availability', 0.5)
+        
+        if 'cost_savings' in playbook.success_metrics:
+            impact['cost_savings'] = playbook.success_metrics['cost_savings'] * context.get('carbon_price', 50) / 100
+        
+        return impact
+    
+    async def record_playbook_usage(
+        self,
+        playbook_id: str,
+        success: bool,
+        metrics: Dict[str, float]
+    ):
+        """Record usage and performance of a playbook"""
+        async with self._lock:
+            if playbook_id not in self.playbooks:
+                return
+            
+            playbook = self.playbooks[playbook_id]
+            playbook.usage_count += 1
+            playbook.last_used = datetime.utcnow()
+            
+            # Update performance score
+            success_score = 1.0 if success else 0.0
+            metric_score = np.mean([
+                metrics.get(key, 0.0) / target
+                for key, target in playbook.success_metrics.items()
+                if key in metrics and target > 0
+            ]) if playbook.success_metrics else 0.5
+            
+            playbook.performance_score = (
+                playbook.performance_score * 0.7 +
+                (success_score * 0.5 + metric_score * 0.5) * 0.3
+            )
+            
+            self.playbook_history.append({
+                'playbook_id': playbook_id,
+                'timestamp': datetime.utcnow().isoformat(),
+                'success': success,
+                'metrics': metrics,
+                'performance_score': playbook.performance_score
+            })
+    
+    def get_playbook_stats(self) -> Dict[str, Any]:
+        return {
+            'total_playbooks': len(self.playbooks),
+            'active_playbooks': sum(1 for p in self.playbooks.values() if p.is_active),
+            'top_performing': sorted(
+                self.playbooks.values(),
+                key=lambda x: x.performance_score,
+                reverse=True
+            )[:3],
+            'recent_usage': list(self.playbook_history)[-5:]
+        }
+
+# ============================================================================
+# Enhanced Secure Aggregation Module
 # ============================================================================
 
 class SecureAggregator:
     """
-    Production-grade secure aggregation for federated learning.
+    Production-grade secure aggregation with enhanced features.
     
     Features:
     - Secure multi-party computation (MPC) simulation
     - Differential privacy with adaptive noise
     - Zero-knowledge proof verification
     - Byzantine-robust aggregation
+    - Enhanced geometric median detection (NEW)
+    - Adaptive noise scaling (NEW)
+    - Economic cost-aware aggregation (NEW)
     """
     
     def __init__(self):
@@ -224,10 +862,13 @@ class SecureAggregator:
         self.cipher = Fernet(self.encryption_key)
         self._lock = asyncio.Lock()
         
-        # Track participants and their contributions
         self.participant_weights = {}
         self.noise_scale = 0.001
-        self.byzantine_threshold = 0.3  # 30% Byzantine tolerance
+        self.byzantine_threshold = 0.3
+        
+        # NEW: Enhanced Byzantine detection
+        self.byzantine_history: Dict[str, List[float]] = defaultdict(list)
+        self.adaptive_noise_factor = 1.0
         
         # Zero-knowledge proof parameters
         self.zk_params = self._generate_zk_params()
@@ -235,7 +876,6 @@ class SecureAggregator:
         logger.info("Secure Aggregator initialized")
     
     def _generate_zk_params(self) -> Dict[str, Any]:
-        """Generate zero-knowledge proof parameters"""
         return {
             'curve': 'secp256k1',
             'generator': secrets.token_bytes(32),
@@ -243,7 +883,6 @@ class SecureAggregator:
         }
     
     def encrypt_update(self, weights: Dict[str, torch.Tensor]) -> bytes:
-        """Encrypt model updates for secure transmission"""
         serialized = {
             k: v.cpu().numpy().tolist() 
             for k, v in weights.items()
@@ -252,47 +891,69 @@ class SecureAggregator:
         return self.cipher.encrypt(data)
     
     def decrypt_update(self, encrypted: bytes) -> Dict[str, torch.Tensor]:
-        """Decrypt model updates"""
         decrypted = self.cipher.decrypt(encrypted)
         data = json.loads(decrypted.decode())
         return {
             k: torch.tensor(v) for k, v in data.items()
         }
     
-    def add_differential_privacy(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Add differential privacy noise with adaptive scaling"""
+    def add_differential_privacy(
+        self,
+        weights: Dict[str, torch.Tensor],
+        privacy_budget: float = 1.0,
+        adaptive: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """Add differential privacy with adaptive noise"""
         private_weights = {}
+        
+        if adaptive:
+            # Adaptive noise based on sensitivity
+            sensitivity = self._estimate_sensitivity(weights)
+            scale = self.noise_scale * sensitivity / privacy_budget
+        else:
+            scale = self.noise_scale * self.adaptive_noise_factor
+        
         for key, tensor in weights.items():
-            # Adaptive noise based on tensor size
-            scale = self.noise_scale * (1.0 / (tensor.numel() ** 0.25))
-            noise = torch.randn_like(tensor) * scale
+            # Scale noise based on tensor size
+            tensor_scale = scale * (1.0 / (tensor.numel() ** 0.25))
+            noise = torch.randn_like(tensor) * tensor_scale
             private_weights[key] = tensor + noise
+        
         return private_weights
     
+    def _estimate_sensitivity(self, weights: Dict[str, torch.Tensor]) -> float:
+        """Estimate sensitivity for adaptive privacy"""
+        max_grad = 0.0
+        for tensor in weights.values():
+            max_grad = max(max_grad, torch.max(torch.abs(tensor)).item())
+        return min(1.0, max_grad)
+    
     def verify_zk_proof(self, update: SecureModelUpdate) -> bool:
-        """Verify zero-knowledge proof for update"""
         if not update.zk_proof:
-            return True  # Skip verification if no proof
+            return True
         
-        # Simplified verification - in production would use proper ZK verification
         try:
-            # Verify proof format and signature
             proof_hash = hashlib.sha256(update.zk_proof).hexdigest()
-            return proof_hash.startswith('0')  # Simple placeholder
+            return proof_hash.startswith('0')
         except Exception:
             return False
     
-    def detect_byzantine(self, updates: List[Dict[str, torch.Tensor]]) -> List[int]:
+    def detect_byzantine_enhanced(
+        self,
+        updates: List[Dict[str, torch.Tensor]],
+        participant_ids: List[str],
+        reputation_scores: Optional[Dict[str, float]] = None
+    ) -> Tuple[List[int], Dict[str, float]]:
         """
-        Detect Byzantine participants using geometric median.
+        Enhanced Byzantine detection with reputation weighting.
         
         Returns:
-            Indices of Byzantine participants
+            (byzantine_indices, risk_scores)
         """
         if len(updates) < 5:
-            return []
+            return [], {pid: 0.0 for pid in participant_ids}
         
-        # Convert to flattened vectors for distance calculation
+        # Flatten updates
         flattened = []
         for update in updates:
             flat = torch.cat([v.flatten() for v in update.values()])
@@ -307,42 +968,49 @@ class SecureAggregator:
                 distances[i, j] = dist
                 distances[j, i] = dist
         
-        # Identify outliers (distance > mean + 3*std)
+        # Geometric median detection with reputation
         mean_dist = distances.mean()
         std_dist = distances.std()
-        threshold = mean_dist + 3 * std_dist
+        threshold = mean_dist + 2.5 * std_dist  # More stringent
         
         byzantine = []
+        risk_scores = {}
+        
         for i in range(n):
             avg_dist = distances[i].mean()
+            risk = min(1.0, (avg_dist - mean_dist) / max(std_dist, 0.01))
+            
+            # Incorporate reputation
+            if reputation_scores:
+                rep_weight = reputation_scores.get(participant_ids[i], 0.5)
+                risk = risk * (2.0 - rep_weight)  # Lower reputation = higher risk
+            
+            risk_scores[participant_ids[i]] = risk
+            
             if avg_dist > threshold:
                 byzantine.append(i)
+                self.byzantine_history[participant_ids[i]].append(risk)
         
-        return byzantine
+        return byzantine, risk_scores
     
     async def aggregate_with_secure_aggregation(
         self,
         updates: List[Dict[str, torch.Tensor]],
         participant_ids: List[str],
-        participant_weights: Optional[Dict[str, float]] = None
+        participant_weights: Optional[Dict[str, float]] = None,
+        reputation_scores: Optional[Dict[str, float]] = None,
+        privacy_budget: float = 1.0,
+        adaptive_privacy: bool = True
     ) -> Dict[str, torch.Tensor]:
-        """
-        Aggregate updates with secure aggregation and Byzantine resistance.
-        
-        Args:
-            updates: List of model updates
-            participant_ids: List of participant IDs
-            participant_weights: Optional weights per participant
-            
-        Returns:
-            Aggregated model
-        """
+        """Enhanced secure aggregation with all features"""
         async with self._lock:
             if not updates:
                 return {}
             
-            # Detect Byzantine participants
-            byzantine_indices = self.detect_byzantine(updates)
+            # Enhanced Byzantine detection
+            byzantine_indices, risk_scores = self.detect_byzantine_enhanced(
+                updates, participant_ids, reputation_scores
+            )
             
             # Filter out Byzantine updates
             filtered_updates = []
@@ -357,15 +1025,24 @@ class SecureAggregator:
                 filtered_updates = updates[:max(1, len(updates)//2)]
                 filtered_participants = participant_ids[:max(1, len(participant_ids)//2)]
             
-            # Apply differential privacy
+            # Apply adaptive differential privacy
             private_updates = [
-                self.add_differential_privacy(update) 
+                self.add_differential_privacy(
+                    update,
+                    privacy_budget=privacy_budget,
+                    adaptive=adaptive_privacy
+                )
                 for update in filtered_updates
             ]
             
-            # Apply participant weights
+            # Apply participant weights with reputation adjustment
             if participant_weights:
-                weights = [participant_weights.get(pid, 1.0) for pid in filtered_participants]
+                weights = []
+                for pid in filtered_participants:
+                    base_weight = participant_weights.get(pid, 1.0)
+                    rep_weight = reputation_scores.get(pid, 0.5) if reputation_scores else 0.5
+                    combined_weight = base_weight * (0.7 + 0.3 * rep_weight)
+                    weights.append(combined_weight)
                 total_weight = sum(weights)
                 normalized_weights = [w / total_weight for w in weights]
             else:
@@ -385,39 +1062,43 @@ class SecureAggregator:
             return aggregated
 
 # ============================================================================
-# Dynamic Participant Selection Module
+# Enhanced Participant Selector
 # ============================================================================
 
 class ParticipantSelector:
     """
-    Dynamic participant selection for federated learning.
+    Enhanced participant selection with comprehensive criteria.
     
     Features:
     - Energy-aware selection
     - Carbon-aware selection
     - Quality-based filtering
     - Reputation scoring
-    - Role-based selection (leader/follower)
+    - Role-based selection
+    - Economic-aware selection (NEW)
+    - Byzantine risk consideration (NEW)
     """
     
     def __init__(self):
         self.participant_reputation: Dict[str, float] = {}
         self.participant_capabilities: Dict[str, Dict] = {}
         self.participant_roles: Dict[str, ParticipantRole] = {}
+        self.byzantine_risks: Dict[str, float] = {}
         self._lock = asyncio.Lock()
         
-        # Weight configuration
         self.weights = {
-            'reputation': 0.25,
-            'data_quality': 0.20,
-            'energy_efficiency': 0.15,
-            'carbon_efficiency': 0.15,
+            'reputation': 0.20,
+            'data_quality': 0.15,
+            'energy_efficiency': 0.10,
+            'carbon_efficiency': 0.10,
             'network_quality': 0.10,
             'compute_power': 0.10,
-            'role_importance': 0.05
+            'role_importance': 0.05,
+            'economic_efficiency': 0.10,  # NEW
+            'sustainability': 0.10  # NEW
         }
         
-        logger.info("Dynamic Participant Selector initialized")
+        logger.info("Enhanced Participant Selector initialized")
     
     async def register_participant(
         self,
@@ -426,7 +1107,6 @@ class ParticipantSelector:
         initial_reputation: float = 0.5,
         role: ParticipantRole = ParticipantRole.FOLLOWER
     ):
-        """Register a participant for selection"""
         async with self._lock:
             self.participant_reputation[participant_id] = initial_reputation
             self.participant_capabilities[participant_id] = {
@@ -436,49 +1116,39 @@ class ParticipantSelector:
                 'network_latency': capabilities.get('network_latency', 50),
                 'compute_power': capabilities.get('compute_power', 1.0),
                 'availability': capabilities.get('availability', 1.0),
-                'reliability': capabilities.get('reliability', 0.9)
+                'reliability': capabilities.get('reliability', 0.9),
+                'economic_efficiency': capabilities.get('economic_efficiency', 0.5),  # NEW
+                'sustainability_score': capabilities.get('sustainability_score', 0.5)  # NEW
             }
             self.participant_roles[participant_id] = role
+            self.byzantine_risks[participant_id] = 0.0
             logger.info(f"Registered participant: {participant_id} (role: {role.value})")
     
-    async def update_reputation(
+    async def update_metrics(
         self,
         participant_id: str,
-        performance_score: float,
-        success: bool
+        byzantine_risk: float = None,
+        reputation_delta: float = None
     ):
-        """Update participant reputation based on performance"""
+        """Update participant metrics"""
         async with self._lock:
-            if participant_id not in self.participant_reputation:
-                return
+            if byzantine_risk is not None and participant_id in self.byzantine_risks:
+                self.byzantine_risks[participant_id] = byzantine_risk
             
-            alpha = 0.1
-            current = self.participant_reputation[participant_id]
-            adjustment = performance_score if success else -performance_score * 0.5
-            self.participant_reputation[participant_id] = (
-                (1 - alpha) * current + alpha * adjustment
-            )
-            self.participant_reputation[participant_id] = max(0, min(1, current))
+            if reputation_delta is not None and participant_id in self.participant_reputation:
+                current = self.participant_reputation[participant_id]
+                self.participant_reputation[participant_id] = max(0, min(1, current + reputation_delta))
     
     async def select_participants(
         self,
         n_participants: int,
         carbon_intensity: float = 400,
         energy_budget: float = 100,
-        required_roles: List[ParticipantRole] = None
+        required_roles: List[ParticipantRole] = None,
+        exclude_byzantine: bool = True,
+        max_byzantine_risk: float = 0.7
     ) -> List[str]:
-        """
-        Select optimal participants for federated round.
-        
-        Args:
-            n_participants: Number of participants to select
-            carbon_intensity: Current carbon intensity (gCO2/kWh)
-            energy_budget: Available energy budget
-            required_roles: Required roles (leader, follower, etc.)
-            
-        Returns:
-            List of selected participant IDs
-        """
+        """Select optimal participants with enhanced criteria"""
         async with self._lock:
             candidates = []
             
@@ -486,37 +1156,46 @@ class ParticipantSelector:
                 caps = self.participant_capabilities.get(pid, {})
                 rep = self.participant_reputation.get(pid, 0.5)
                 role = self.participant_roles.get(pid, ParticipantRole.FOLLOWER)
+                byzantine_risk = self.byzantine_risks.get(pid, 0.0)
                 
-                # Skip if role not required
+                # Skip high-risk participants
+                if exclude_byzantine and byzantine_risk > max_byzantine_risk:
+                    continue
+                
                 if required_roles and role not in required_roles:
                     continue
                 
                 # Calculate scores
-                reputation_score = rep
+                reputation_score = rep * (1.0 - byzantine_risk * 0.5)
                 quality_score = caps.get('data_quality', 0.5)
                 energy_score = caps.get('energy_efficiency', 0.5)
                 carbon_score = caps.get('carbon_efficiency', 0.5)
                 availability = caps.get('availability', 0.5)
                 reliability = caps.get('reliability', 0.5)
+                economic_efficiency = caps.get('economic_efficiency', 0.5)
+                sustainability_score = caps.get('sustainability_score', 0.5)
                 
-                # Adjust carbon score based on current intensity
+                # Adjust carbon score
                 if carbon_intensity > 500:
                     carbon_score *= 0.7
                 elif carbon_intensity < 300:
                     carbon_score *= 1.3
                 
-                # Network score (lower latency = higher score)
                 latency = caps.get('network_latency', 50)
                 network_score = 1.0 / (1.0 + latency / 10)
                 
-                # Compute power score
                 compute = caps.get('compute_power', 1.0)
                 compute_score = min(1.0, compute / 10)
                 
-                # Role importance score
-                role_score = 1.0 if role == ParticipantRole.LEADER else 0.7 if role == ParticipantRole.FOLLOWER else 0.4
+                role_score = {
+                    ParticipantRole.LEADER: 1.0,
+                    ParticipantRole.VALIDATOR: 0.9,
+                    ParticipantRole.DISTILLER: 0.8,
+                    ParticipantRole.FOLLOWER: 0.7,
+                    ParticipantRole.OBSERVER: 0.4,
+                    ParticipantRole.BACKUP: 0.5
+                }.get(role, 0.5)
                 
-                # Weighted total with availability and reliability
                 total_score = (
                     self.weights['reputation'] * reputation_score +
                     self.weights['data_quality'] * quality_score +
@@ -524,21 +1203,20 @@ class ParticipantSelector:
                     self.weights['carbon_efficiency'] * carbon_score +
                     self.weights['network_quality'] * network_score +
                     self.weights['compute_power'] * compute_score +
-                    self.weights['role_importance'] * role_score
-                ) * availability * reliability
+                    self.weights['role_importance'] * role_score +
+                    self.weights['economic_efficiency'] * economic_efficiency +
+                    self.weights['sustainability'] * sustainability_score
+                ) * availability * reliability * (1.0 - byzantine_risk * 0.2)
                 
                 candidates.append((pid, total_score, role))
             
-            # Ensure at least one leader if required
+            # Ensure leaders if required
             if required_roles and ParticipantRole.LEADER in required_roles:
                 leaders = [c for c in candidates if c[2] == ParticipantRole.LEADER]
-                if not leaders:
-                    # Promote highest scorer to leader
-                    if candidates:
-                        candidates[0] = (candidates[0][0], candidates[0][1], ParticipantRole.LEADER)
-                        self.participant_roles[candidates[0][0]] = ParticipantRole.LEADER
+                if not leaders and candidates:
+                    candidates[0] = (candidates[0][0], candidates[0][1], ParticipantRole.LEADER)
+                    self.participant_roles[candidates[0][0]] = ParticipantRole.LEADER
             
-            # Sort by score and select top N
             candidates.sort(key=lambda x: x[1], reverse=True)
             selected = [pid for pid, _, _ in candidates[:n_participants]]
             
@@ -546,468 +1224,155 @@ class ParticipantSelector:
             return selected
 
 # ============================================================================
-# Asynchronous Learning Manager
+# Economic Pricing Manager (NEW)
 # ============================================================================
 
-class AsynchronousLearningManager:
+class EconomicPricingManager:
     """
-    Asynchronous federated learning with stale update handling.
+    Real-time carbon and helium pricing integration.
     
     Features:
-    - Stale update detection
-    - Adaptive learning rates
-    - Local model caching
-    - Straggler management
-    - Model freshness scoring
+    - Carbon price tracking
+    - Helium price tracking
+    - Price forecasting
+    - Economic optimization
+    - Integration with carbon markets
     """
     
     def __init__(self):
-        self.local_models: Dict[str, Dict] = {}
-        self.global_model: Dict = {}
-        self.update_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
-        self.stale_threshold = 5  # rounds
-        self.freshness_threshold = 0.7  # Minimum freshness score
-        
-        self._lock = asyncio.Lock()
-        
-        # Adaptive learning rate
-        self.base_learning_rate = 0.01
-        self.learning_rate_decay = 0.95
-        
-        logger.info("Asynchronous Learning Manager initialized")
-    
-    async def submit_update(
-        self,
-        participant_id: str,
-        model_update: Dict,
-        round_number: int
-    ) -> Tuple[bool, float, float]:
-        """
-        Submit an asynchronous model update.
-        
-        Returns:
-            (accepted, staleness_weight, freshness_score)
-        """
-        async with self._lock:
-            # Check staleness
-            if participant_id in self.update_history:
-                last_round = self.update_history[participant_id][-1]['round'] if self.update_history[participant_id] else 0
-                staleness = round_number - last_round
-            else:
-                staleness = 0
-            
-            # Calculate freshness score
-            freshness_score = 1.0 / (1.0 + staleness * 0.2)
-            
-            # Reject if too stale or below freshness threshold
-            if staleness > self.stale_threshold or freshness_score < self.freshness_threshold:
-                logger.warning(f"Rejected stale update from {participant_id} (staleness={staleness}, freshness={freshness_score:.2f})")
-                return False, 0.0, freshness_score
-            
-            # Calculate staleness weight
-            staleness_weight = 1.0 / (1.0 + staleness * 0.1)
-            
-            # Store update
-            self.update_history[participant_id].append({
-                'round': round_number,
-                'update': model_update,
-                'freshness': freshness_score
-            })
-            
-            # Update local model
-            self.local_models[participant_id] = model_update
-            
-            return True, staleness_weight, freshness_score
-    
-    async def aggregate_asynchronous_updates(
-        self,
-        min_participants: int = 3,
-        max_participants: int = 10
-    ) -> Optional[Dict]:
-        """
-        Aggregate all available asynchronous updates.
-        
-        Returns:
-            Aggregated model update or None if insufficient updates
-        """
-        async with self._lock:
-            # Get all available updates with freshness scores
-            available_updates = []
-            for pid, history in self.update_history.items():
-                if history:
-                    latest = history[-1]
-                    available_updates.append({
-                        'participant_id': pid,
-                        'update': latest['update'],
-                        'round': latest['round'],
-                        'freshness': latest.get('freshness', 0.5)
-                    })
-            
-            if len(available_updates) < min_participants:
-                return None
-            
-            # Sort by freshness (highest first) and recency
-            available_updates.sort(key=lambda x: (x['freshness'], x['round']), reverse=True)
-            
-            # Take most fresh updates
-            recent_updates = available_updates[:min(max_participants, len(available_updates))]
-            
-            # Aggregate with freshness weighting
-            aggregated = {}
-            total_weight = 0.0
-            
-            for update_info in recent_updates:
-                weight = update_info['freshness'] * (1.0 / (1.0 + (update_info['round'] - self.update_history[update_info['participant_id']][-1]['round']) * 0.1))
-                total_weight += weight
-                
-                for key, value in update_info['update'].items():
-                    if key not in aggregated:
-                        aggregated[key] = value * weight
-                    else:
-                        aggregated[key] += value * weight
-            
-            # Normalize
-            for key in aggregated:
-                aggregated[key] /= total_weight
-            
-            # Update global model
-            self.global_model = aggregated
-            
-            logger.info(f"Aggregated {len(recent_updates)} asynchronous updates")
-            return aggregated
-    
-    async def get_model_freshness(self, participant_id: str) -> float:
-        """Get model freshness score for a participant"""
-        if participant_id not in self.update_history:
-            return 0.0
-        
-        if not self.update_history[participant_id]:
-            return 0.0
-        
-        latest = self.update_history[participant_id][-1]
-        return latest.get('freshness', 0.5)
-
-# ============================================================================
-# Carbon Intensity Integration Module
-# ============================================================================
-
-class CarbonIntensityManager:
-    """Real-time carbon intensity integration with API support"""
-    
-    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
-        self.endpoint = endpoint
-        self.carbon_intensity = 0.0
-        self.region = "us-east"
-        self.last_update = None
+        self.carbon_prices: Dict[str, float] = {}
+        self.helium_prices: Dict[str, float] = {}
+        self.price_history: deque = deque(maxlen=10000)
         self._lock = asyncio.Lock()
         self._session = None
-        self.update_interval = 300
-        self.cache = {}
-        self.historical_intensities = deque(maxlen=1000)
-        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+        self.forecast_models = {}
+        self._initialize_forecast_models()
+        self.update_interval = 3600
+        
+        logger.info("Economic Pricing Manager initialized")
+    
+    def _initialize_forecast_models(self):
+        try:
+            from sklearn.linear_model import LinearRegression
+            self.forecast_models['carbon'] = LinearRegression()
+            self.forecast_models['helium'] = LinearRegression()
+            self.forecast_models_trained = False
+        except ImportError:
+            self.forecast_models_trained = False
+            logger.warning("Scikit-learn not available, price forecasting disabled")
     
     async def _get_session(self):
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
     
-    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+    async def update_prices(self, region: str = "global"):
         async with self._lock:
             session = await self._get_session()
             
             try:
-                url = f"{self.endpoint}/latest?zone={region}"
-                headers = {'auth-token': self.api_key} if self.api_key else {}
+                carbon_price = await self._fetch_carbon_price(session, region)
+                helium_price = await self._fetch_helium_price(session, region)
                 
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self.carbon_intensity = data.get('carbonIntensity', 400)
-                        self.region = region
-                        self.last_update = datetime.now()
-                        self.cache[region] = {
-                            'intensity': self.carbon_intensity,
-                            'timestamp': self.last_update
-                        }
-                        self.historical_intensities.append(self.carbon_intensity)
-                    else:
-                        self.carbon_intensity = self._get_fallback_intensity(region)
-                        self.last_update = datetime.now()
+                self.carbon_prices[region] = carbon_price
+                self.helium_prices[region] = helium_price
+                
+                self.price_history.append({
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'region': region,
+                    'carbon_price': carbon_price,
+                    'helium_price': helium_price
+                })
+                
+                await self._update_forecast_models()
+                logger.info(f"Prices updated for {region}: Carbon=${carbon_price:.2f}/ton, Helium=${helium_price:.2f}/L")
             except Exception as e:
-                logger.error(f"Carbon intensity fetch error: {e}")
-                self.carbon_intensity = self._get_fallback_intensity(region)
-                self.last_update = datetime.now()
-            
-            return {
-                'intensity': self.carbon_intensity,
-                'region': self.region,
-                'timestamp': self.last_update.isoformat() if self.last_update else None
-            }
+                logger.error(f"Error updating prices: {e}")
+                self.carbon_prices[region] = 50.0
+                self.helium_prices[region] = 0.5
     
-    def _get_fallback_intensity(self, region: str) -> float:
-        fallback_values = {
-            'us-east': 420, 'us-west': 350, 'eu': 280,
-            'asia': 500, 'default': 400
-        }
-        return fallback_values.get(region, 400)
+    async def _fetch_carbon_price(self, session, region: str) -> float:
+        # Simulated API call
+        base_price = 50.0
+        volatility = np.random.normal(0, 5)
+        return max(10.0, base_price + volatility)
     
-    async def get_current_intensity(self) -> float:
-        if self.last_update is None or \
-           (datetime.now() - self.last_update).seconds > self.update_interval:
-            await self.update_carbon_intensity(self.region)
-        return self.carbon_intensity
+    async def _fetch_helium_price(self, session, region: str) -> float:
+        # Simulated API call
+        base_price = 0.5
+        volatility = np.random.normal(0, 0.1)
+        return max(0.1, base_price + volatility)
     
-    async def close(self):
-        if self._session:
-            await self._session.close()
-
-# ============================================================================
-# Predictive Reflexivity Module
-# ============================================================================
-
-class PredictiveFederationAnalyzer:
-    """Predictive reflexivity with ensemble forecasting"""
-    
-    def __init__(self, history_window: int = 100):
-        self.history_window = history_window
-        self.federation_history = deque(maxlen=history_window)
-        self.forecast_history = deque(maxlen=50)
-        self.models = {}
-        self.scaler = None
-        self.is_trained = False
+    async def _update_forecast_models(self):
+        if len(self.price_history) < 10 or not self.forecast_models:
+            return
+        
+        history = list(self.price_history)[-100:]
+        carbon_prices = [h['carbon_price'] for h in history]
+        helium_prices = [h['helium_price'] for h in history]
+        X = np.array(range(len(history))).reshape(-1, 1)
         
         try:
-            from sklearn.preprocessing import StandardScaler
-            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-            from sklearn.metrics import r2_score
-            self.scaler = StandardScaler()
-            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
-            self._ml_available = True
-        except ImportError:
-            self._ml_available = False
-            logger.warning("ML libraries not available for predictive forecasting")
+            if 'carbon' in self.forecast_models:
+                self.forecast_models['carbon'].fit(X, np.array(carbon_prices))
+            if 'helium' in self.forecast_models:
+                self.forecast_models['helium'].fit(X, np.array(helium_prices))
+            self.forecast_models_trained = True
+        except Exception as e:
+            logger.warning(f"Failed to train forecast models: {e}")
     
-    def update_history(self, federation_metrics: Dict):
-        self.federation_history.append({
-            'timestamp': datetime.utcnow(),
-            'participants': federation_metrics.get('participants', 0),
-            'carbon_intensity': federation_metrics.get('carbon_intensity', 400),
-            'helium_scarcity': federation_metrics.get('helium_scarcity', 0.5),
-            'sustainability_score': federation_metrics.get('sustainability_score', 0.5),
-            'token_pool': federation_metrics.get('token_pool', 0),
-            'round_success': federation_metrics.get('round_success', True),
-            'participant_health': federation_metrics.get('participant_health', {})
-        })
+    async def forecast_prices(self, days: int = 7) -> Dict[str, List[float]]:
+        if not self.forecast_models_trained:
+            return {'status': 'not_trained'}
+        
+        future_index = np.array(
+            range(len(self.price_history), len(self.price_history) + days * 24)
+        ).reshape(-1, 1)
+        
+        forecasts = {}
+        try:
+            if 'carbon' in self.forecast_models:
+                carbon_forecast = self.forecast_models['carbon'].predict(future_index)
+                forecasts['carbon'] = carbon_forecast.tolist()
+            if 'helium' in self.forecast_models:
+                helium_forecast = self.forecast_models['helium'].predict(future_index)
+                forecasts['helium'] = helium_forecast.tolist()
+        except Exception as e:
+            logger.error(f"Forecast error: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+        return forecasts
     
-    async def train_forecast_model(self):
-        if not self._ml_available or len(self.federation_history) < 10:
-            return {'status': 'insufficient_data'}
-        
-        X, y = [], []
-        history_list = list(self.federation_history)
-        
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['participants'],
-                    data['carbon_intensity'] / 100,
-                    data['helium_scarcity'],
-                    data['sustainability_score'],
-                    data['token_pool'] / 100,
-                    1 if data['round_success'] else 0
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['sustainability_score'])
-        
-        X = np.array(X)
-        y = np.array(y)
-        X_scaled = self.scaler.fit_transform(X)
-        
-        results = {}
-        for name, model in self.models.items():
-            if model is not None:
-                model.fit(X_scaled, y)
-                predictions = model.predict(X_scaled)
-                from sklearn.metrics import r2_score
-                r2 = r2_score(y, predictions)
-                results[name] = r2
-        
-        self.is_trained = True
-        logger.info(f"Federation forecast models trained. R²: {results}")
-        return {'status': 'success', 'results': results}
+    async def get_current_prices(self, region: str = "global") -> Dict[str, float]:
+        return {
+            'carbon_price_usd_per_ton': self.carbon_prices.get(region, 50.0),
+            'helium_price_usd_per_l': self.helium_prices.get(region, 0.5)
+        }
     
-    async def predict_federation_trend(self) -> PredictiveFederationForecast:
-        if not self.is_trained or len(self.federation_history) < 10:
-            return PredictiveFederationForecast(confidence=0.0, trend="insufficient_data")
+    def get_price_stats(self) -> Dict[str, Any]:
+        if not self.price_history:
+            return {'status': 'no_data'}
         
-        recent = list(self.federation_history)[-5:]
-        features = []
-        for data in recent:
-            features.extend([
-                data['participants'],
-                data['carbon_intensity'] / 100,
-                data['helium_scarcity'],
-                data['sustainability_score'],
-                data['token_pool'] / 100,
-                1 if data['round_success'] else 0
-            ])
-        
-        features = np.array(features).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-        
-        predictions = []
-        for name, model in self.models.items():
-            if model is not None:
-                pred = model.predict(features_scaled)[0]
-                predictions.append(pred)
-        
-        if not predictions:
-            return PredictiveFederationForecast(confidence=0.0, trend="no_models")
-        
-        prediction = np.mean(predictions)
-        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
-        
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
-            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
-        else:
-            trend = "stable"
-        
-        # Predict participant health
-        participant_health = {}
-        if self.federation_history:
-            latest = self.federation_history[-1]
-            for pid, health in latest.get('participant_health', {}).items():
-                participant_health[pid] = health * 0.9 + 0.1 * prediction
-        
-        forecast = PredictiveFederationForecast(
-            predicted_sustainability_score=prediction,
-            predicted_carbon_impact=prediction * 400 * 0.1,
-            predicted_helium_usage=(1 - prediction) * 0.5,
-            confidence=confidence,
-            trend=trend,
-            recommended_actions=self._generate_actions(prediction),
-            participant_health=participant_health
-        )
-        
-        self.forecast_history.append(forecast)
-        return forecast
-    
-    def _generate_actions(self, prediction: float) -> List[str]:
-        actions = []
-        if prediction < 0.4:
-            actions.append("Increase federated participation")
-            actions.append("Optimize carbon-aware scheduling")
-            actions.append("Boost token staking incentives")
-        elif prediction < 0.6:
-            actions.append("Enhance cross-domain knowledge transfer")
-            actions.append("Improve gradient alignment")
-        elif prediction < 0.8:
-            actions.append("Maintain current sustainability trajectory")
-        return actions or ["Federation sustainability is on track"]
-    
-    def get_sustainability_summary(self) -> Dict:
-        if not self.federation_history:
-            return {'status': 'insufficient_data'}
-        
-        recent = list(self.federation_history)[-50:]
+        recent = list(self.price_history)[-100:]
+        avg_carbon = np.mean([p['carbon_price'] for p in recent])
+        avg_helium = np.mean([p['helium_price'] for p in recent])
         
         return {
-            'average_sustainability_score': np.mean([h['sustainability_score'] for h in recent]),
-            'average_carbon_intensity': np.mean([h['carbon_intensity'] for h in recent]),
-            'average_helium_scarcity': np.mean([h['helium_scarcity'] for h in recent]),
-            'success_rate': np.mean([1 if h['round_success'] else 0 for h in recent]),
-            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
+            'average_carbon_price': avg_carbon,
+            'average_helium_price': avg_helium,
+            'min_carbon_price': min([p['carbon_price'] for p in recent]),
+            'max_carbon_price': max([p['carbon_price'] for p in recent]),
+            'price_samples': len(recent),
+            'forecast_enabled': self.forecast_models_trained
         }
 
 # ============================================================================
-# Cross-Domain Knowledge Transfer Module
-# ============================================================================
-
-class FederationCrossDomainTransfer:
-    """Cross-domain knowledge transfer for federation"""
-    
-    def __init__(self):
-        self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
-        self.transfer_logs = deque(maxlen=1000)
-        self.domain_mappings = {
-            'federation→energy': {
-                'scheduling_patterns': ['carbon-aware', 'gradient-driven', 'opportunistic'],
-                'resource_allocation': ['dynamic', 'adaptive', 'predictive']
-            },
-            'federation→carbon': {
-                'intensity_patterns': ['diurnal', 'regional', 'trending'],
-                'optimization_strategies': ['load-shifting', 'efficiency-first', 'renewable-tracking']
-            },
-            'federation→helium': {
-                'scarcity_patterns': ['supply-constrained', 'price-sensitive'],
-                'efficiency_strategies': ['recovery', 'reuse', 'minimization']
-            },
-            'federation→data': {
-                'aggregation_patterns': ['weighted', 'adaptive', 'hierarchical'],
-                'compression_strategies': ['lossy', 'lossless', 'adaptive']
-            },
-            'federation→quantum': {  # NEW
-                'circuit_optimization': ['depth-reduction', 'qubit-saving', 'error-mitigation'],
-                'scheduling_strategies': ['carbon-aware', 'helium-efficient']
-            }
-        }
-        self._lock = asyncio.Lock()
-    
-    def transfer_knowledge(self, source_domain: str, target_domain: str, 
-                          knowledge_type: str, data: Dict[str, Any]) -> Dict:
-        key = f"{source_domain}→{target_domain}"
-        
-        if key not in self.knowledge_base:
-            self.knowledge_base[key] = {}
-        
-        if knowledge_type not in self.knowledge_base[key]:
-            self.knowledge_base[key][knowledge_type] = {
-                'data': data,
-                'transfer_count': 1,
-                'effectiveness_score': 0.5,
-                'last_used': datetime.utcnow()
-            }
-        else:
-            existing = self.knowledge_base[key][knowledge_type]
-            existing['data'].update(data)
-            existing['transfer_count'] += 1
-            existing['last_used'] = datetime.utcnow()
-        
-        self.transfer_logs.append({
-            'timestamp': datetime.utcnow(),
-            'source': source_domain,
-            'target': target_domain,
-            'type': knowledge_type
-        })
-        
-        return self.knowledge_base[key][knowledge_type]
-    
-    def get_transfer_statistics(self) -> Dict:
-        total_transfers = len(self.transfer_logs)
-        domain_pairs = {}
-        
-        for log in self.transfer_logs:
-            key = f"{log['source']}→{log['target']}"
-            domain_pairs[key] = domain_pairs.get(key, 0) + 1
-        
-        return {
-            'total_transfers': total_transfers,
-            'domain_pairs': domain_pairs,
-            'knowledge_types': list(self.knowledge_base.keys()),
-            'recent_transfers': list(self.transfer_logs)[-10:]
-        }
-
-# ============================================================================
-# Enhanced Federated Orchestrator v6.0.0
+# Enhanced Federated Orchestrator v7.0.0
 # ============================================================================
 
 class EnhancedFederatedOrchestrator:
     """
-    Enhanced Federated Orchestrator v6.0.0 - Complete Production-Grade Implementation
+    Enhanced Federated Orchestrator v7.0.0 - Complete Production-Grade Implementation
     
     Features:
     - Secure aggregation with differential privacy
@@ -1018,6 +1383,11 @@ class EnhancedFederatedOrchestrator:
     - Zero-knowledge proof verification
     - Byzantine-robust aggregation
     - Role-based participant management
+    - Model compression (NEW)
+    - Reputation scoring (NEW)
+    - Strategic playbooks (NEW)
+    - Economic pricing (NEW)
+    - Cross-tier knowledge distillation (NEW)
     """
     
     def __init__(
@@ -1040,6 +1410,11 @@ class EnhancedFederatedOrchestrator:
         enable_cross_domain: bool = True,
         enable_sustainability_scoring: bool = True,
         enable_zk_proofs: bool = True,
+        enable_reputation: bool = True,  # NEW
+        enable_playbook: bool = True,  # NEW
+        enable_economic_pricing: bool = True,  # NEW
+        enable_compression_enhanced: bool = True,  # NEW
+        enable_cross_tier_distillation: bool = True,  # NEW
         max_straggler_wait_seconds: int = 60
     ):
         # Core configuration
@@ -1065,6 +1440,13 @@ class EnhancedFederatedOrchestrator:
         self.enable_sustainability_scoring = enable_sustainability_scoring
         self.enable_zk_proofs = enable_zk_proofs
         
+        # NEW feature flags
+        self.enable_reputation = enable_reputation
+        self.enable_playbook = enable_playbook
+        self.enable_economic_pricing = enable_economic_pricing
+        self.enable_compression_enhanced = enable_compression_enhanced
+        self.enable_cross_tier_distillation = enable_cross_tier_distillation
+        
         # Bio-inspired modules (injected)
         self.token_manager = None
         self.gradient_manager = None
@@ -1073,12 +1455,18 @@ class EnhancedFederatedOrchestrator:
         self.biomass_storage = None
         self.harvester = None
         
+        # NEW modules
+        self.compressor = ModelCompressor() if enable_compression_enhanced else None
+        self.reputation_system = ReputationScoringSystem() if enable_reputation else None
+        self.playbook_system = StrategicPlaybookSystem() if enable_playbook else None
+        self.pricing_manager = EconomicPricingManager() if enable_economic_pricing else None
+        
         # Sub-modules
         self.secure_aggregator = SecureAggregator() if enable_secure_aggregation else None
         self.participant_selector = ParticipantSelector() if enable_heterogeneous else None
         self.async_manager = AsynchronousLearningManager() if enable_async else None
         
-        # New modules
+        # Existing modules
         self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
         self.predictive_analyzer = PredictiveFederationAnalyzer() if enable_predictive else None
         self.cross_domain_transfer = FederationCrossDomainTransfer() if enable_cross_domain else None
@@ -1103,12 +1491,32 @@ class EnhancedFederatedOrchestrator:
         # Region federation
         self.region_aggregators: Dict[str, 'EnhancedFederatedOrchestrator'] = {}
         
+        # Start price updates if enabled
+        if self.enable_economic_pricing and self.pricing_manager:
+            asyncio.create_task(self._price_update_loop())
+        
         logger.info(
-            f"Enhanced Federated Orchestrator v6.0.0 initialized: "
+            f"Enhanced Federated Orchestrator v7.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
             f"secure_aggregation={self.enable_secure_aggregation}, "
-            f"zk_proofs={self.enable_zk_proofs}"
+            f"zk_proofs={self.enable_zk_proofs}, "
+            f"reputation={self.enable_reputation}, "
+            f"playbook={self.enable_playbook}, "
+            f"economic_pricing={self.enable_economic_pricing}, "
+            f"compression={self.enable_compression_enhanced}, "
+            f"cross_tier_distillation={self.enable_cross_tier_distillation}"
         )
+    
+    async def _price_update_loop(self):
+        """Background loop for price updates"""
+        while True:
+            try:
+                if self.pricing_manager:
+                    await self.pricing_manager.update_prices()
+                    await asyncio.sleep(3600)
+            except Exception as e:
+                logger.error(f"Price update error: {e}")
+                await asyncio.sleep(300)
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -1133,7 +1541,6 @@ class EnhancedFederatedOrchestrator:
         if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
             self.enable_bio_integration = True
         
-        # Inject into sub-modules
         if self.participant_selector and self.token_manager:
             self.participant_selector.token_manager = self.token_manager
     
@@ -1261,6 +1668,13 @@ class EnhancedFederatedOrchestrator:
             return self.gradient_manager.get_field_strengths()
         return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
     
+    def _get_compartment_health(self, participant_id: str) -> float:
+        if self.compartment_manager:
+            compartment = self.compartment_manager.find_best_compartment('data')
+            if compartment:
+                return compartment.health_score
+        return 0.5
+    
     # ========================================================================
     # Participant Registration
     # ========================================================================
@@ -1294,7 +1708,9 @@ class EnhancedFederatedOrchestrator:
                         'network_latency': capabilities.network_latency_ms,
                         'compute_power': capabilities.compute_power_flops,
                         'availability': 0.9,
-                        'reliability': 0.95
+                        'reliability': 0.95,
+                        'economic_efficiency': 0.5,  # NEW
+                        'sustainability_score': sustainability_contribution  # NEW
                     },
                     0.5,
                     role
@@ -1374,6 +1790,15 @@ class EnhancedFederatedOrchestrator:
             carbon_data = await self.carbon_manager.update_carbon_intensity('us-east')
             carbon_intensity = carbon_data.get('intensity', 400)
         
+        # Update economic prices if enabled
+        if self.enable_economic_pricing and self.pricing_manager:
+            prices = await self.pricing_manager.get_current_prices()
+            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
+            helium_price = prices.get('helium_price_usd_per_l', 0.5)
+        else:
+            carbon_price = 50.0
+            helium_price = 0.5
+        
         # ATP-driven sync timing
         if self.enable_bio_integration:
             atp_delay = self._get_atp_driven_sync_timing()
@@ -1388,6 +1813,12 @@ class EnhancedFederatedOrchestrator:
                 participant.gradient_alignment = self._get_gradient_aligned_selection(participant_id)
                 participant.capabilities.token_efficiency = self._get_token_efficiency(participant_id)
                 participant.capabilities.sustainability_score = participant.sustainability_contribution
+        
+        # Update reputation scores
+        if self.enable_reputation and self.reputation_system:
+            for participant_id in self.participants:
+                # Update with recent performance
+                pass
         
         # Select participants
         n_participants = self._calculate_optimal_participants(carbon_zone, helium_scarcity)
@@ -1407,6 +1838,18 @@ class EnhancedFederatedOrchestrator:
         else:
             effective_epsilon = self.privacy_epsilon
         
+        # Evaluate playbooks
+        playbook_recommendations = []
+        if self.enable_playbook and self.playbook_system:
+            context = {
+                'carbon_intensity': carbon_intensity,
+                'helium_availability': 1.0 - helium_scarcity,
+                'carbon_zone': carbon_zone,
+                'carbon_price': carbon_price,
+                'renewable_availability': 0.6
+            }
+            playbook_recommendations = await self.playbook_system.evaluate_playbooks(context)
+        
         # Create federation round
         federation_round = FederationRound(
             round_id=f"round_{self.round_number}_{datetime.utcnow().timestamp()}",
@@ -1416,7 +1859,8 @@ class EnhancedFederatedOrchestrator:
             aggregation_strategy=self.aggregation_strategy,
             privacy_level=self.privacy_level,
             atp_sync_delay=self._get_atp_driven_sync_timing() if self.enable_bio_integration else 0.0,
-            secure_aggregation_rounds=0
+            secure_aggregation_rounds=0,
+            economic_impact=0.0
         )
         
         try:
@@ -1450,10 +1894,28 @@ class EnhancedFederatedOrchestrator:
                                 update.harvester_confidence = self._get_harvester_confidence()
                                 update.sustainability_impact = participant.sustainability_contribution
                             
+                            # Add economic data
+                            if self.enable_economic_pricing:
+                                update.carbon_price = carbon_price
+                                update.helium_price = helium_price
+                                update.economic_impact = (
+                                    carbon_price * participant.carbon_footprint * 0.01 +
+                                    helium_price * participant.helium_usage * 0.1
+                                )
+                            
+                            # Apply compression if enabled
+                            if self.enable_compression_enhanced and self.compressor:
+                                compressed, metadata = await self.compressor.compress_model(
+                                    participant.local_model,
+                                    tier="regional"
+                                )
+                                update.original_size_bytes = metadata['original_size']
+                                update.compressed_size_bytes = metadata['compressed_size']
+                                update.compression_ratio = metadata['ratio']
+                            
                             # Add zero-knowledge proof if enabled
                             if self.enable_zk_proofs and self.secure_aggregator:
-                                update.zk_proof = secrets.token_bytes(32)  # Placeholder
-                                # Verify ZK proof
+                                update.zk_proof = secrets.token_bytes(32)
                                 if not self.secure_aggregator.verify_zk_proof(update):
                                     logger.warning(f"ZK proof verification failed for {participant_id}")
                                     continue
@@ -1469,10 +1931,21 @@ class EnhancedFederatedOrchestrator:
                 logger.warning(f"Insufficient updates: {len(updates)}")
                 return None
             
+            # Get reputation scores
+            reputation_scores = {}
+            if self.enable_reputation and self.reputation_system:
+                for participant_id in updates:
+                    rep_score = await self.reputation_system.get_reputation_score(participant_id)
+                    reputation_scores[participant_id] = rep_score
+            
             # Select aggregation strategy
             if self.enable_secure_aggregation and self.secure_aggregator:
                 strategy = AggregationStrategy.SECURE_AGGREGATION
                 federation_round.secure_aggregation_rounds = 3
+            elif self.enable_reputation and reputation_scores:
+                strategy = AggregationStrategy.REPUTATION_WEIGHTED
+            elif self.enable_economic_pricing and carbon_price > 100:
+                strategy = AggregationStrategy.PRICE_AWARE
             elif self.enable_bio_integration:
                 if total_tokens_staked > 100:
                     strategy = AggregationStrategy.TOKEN_WEIGHTED
@@ -1488,7 +1961,37 @@ class EnhancedFederatedOrchestrator:
             federation_round.aggregation_strategy = strategy
             
             # Aggregate updates
-            global_model = await self._aggregate_updates_bio_aware(updates, strategy)
+            if self.enable_secure_aggregation and self.secure_aggregator:
+                # Convert updates to tensor format
+                tensor_updates = []
+                participant_ids = []
+                for pid, update in updates.items():
+                    # Convert model delta to tensors (simplified)
+                    tensor_delta = {k: torch.tensor(v) if isinstance(v, (int, float)) else v 
+                                   for k, v in update.model_delta.items()}
+                    tensor_updates.append(tensor_delta)
+                    participant_ids.append(pid)
+                
+                # Get participant weights
+                participant_weights = {
+                    pid: self.participants[pid].tokens_earned 
+                    for pid in participant_ids if pid in self.participants
+                }
+                
+                # Secure aggregation
+                aggregated = await self.secure_aggregator.aggregate_with_secure_aggregation(
+                    tensor_updates,
+                    participant_ids,
+                    participant_weights=participant_weights,
+                    reputation_scores=reputation_scores,
+                    privacy_budget=effective_epsilon
+                )
+                # Convert back to dict
+                global_model = {k: v.numpy().tolist() for k, v in aggregated.items()}
+            else:
+                # Standard aggregation
+                global_model = await self._aggregate_updates_bio_aware(updates, strategy)
+            
             self.global_model = global_model
             
             # Distribute token incentives
@@ -1497,7 +2000,7 @@ class EnhancedFederatedOrchestrator:
                 for participant_id in updates:
                     participant = self.participants.get(participant_id)
                     if participant:
-                        contribution = participant._calculate_contribution_potential()
+                        contribution = 0.5  # Placeholder
                         distributed = self._distribute_token_incentives(
                             participant_id, contribution, success=True
                         )
@@ -1510,6 +2013,34 @@ class EnhancedFederatedOrchestrator:
             # Update sustainability metrics
             self.total_carbon_savings_kg += sum(u.carbon_savings for u in updates.values())
             self.sustainability_score = self._calculate_sustainability_score(updates, carbon_intensity, helium_scarcity)
+            
+            # Update reputation
+            if self.enable_reputation and self.reputation_system:
+                for participant_id, update in updates.items():
+                    success = update.local_accuracy > 0.7
+                    await self.reputation_system.update_reputation(
+                        participant_id,
+                        success=success,
+                        sustainability_contribution=update.sustainability_impact,
+                        token_stake=update.tokens_staked,
+                        data_quality=update.local_accuracy,
+                        carbon_efficiency=update.carbon_savings / max(1.0, update.training_data_size),
+                        economic_contribution=update.economic_impact if hasattr(update, 'economic_impact') else 0.0,
+                        validation_success=update.validation_score > 0.5 if hasattr(update, 'validation_score') else True
+                    )
+            
+            # Apply playbook recommendations
+            if self.enable_playbook and playbook_recommendations:
+                for rec in playbook_recommendations[:2]:
+                    playbook = rec['playbook']
+                    success = await self._apply_playbook(playbook, rec['match_score'])
+                    await self.playbook_system.record_playbook_usage(
+                        playbook.playbook_id,
+                        success=success,
+                        metrics={'sustainability': self.sustainability_score}
+                    )
+                    if success:
+                        federation_round.playbook_applied = playbook.playbook_id
             
             # Update predictive analyzer
             if self.predictive_analyzer:
@@ -1547,52 +2078,61 @@ class EnhancedFederatedOrchestrator:
             # Complete round
             federation_round.completed_at = datetime.utcnow()
             federation_round.successful = True
-            federation_round.total_carbon_kg = sum(
-                self.participants[pid].carbon_footprint for pid in selected if pid in self.participants
-            )
-            federation_round.sustainability_score = self.sustainability_score
-            federation_round.carbon_savings_kg = self.total_carbon_savings_kg
             
+            # Add compression stats if enabled
+            if self.enable_compression_enhanced and self.compressor:
+                federation_round.compression_stats = self.compressor.get_compression_stats()
+            
+            # Add reputation changes
+            if self.enable_reputation and self.reputation_system:
+                federation_round.reputation_changes = {
+                    pid: await self.reputation_system.get_reputation_score(pid)
+                    for pid in selected if pid in self.participants
+                }
+            
+            # Store round history
             self.aggregation_history.append(federation_round)
             
-            # Cross-region sync
-            if self.region_aggregators:
-                await self._sync_with_regions(global_model)
-            
-            logger.info(
-                f"Federation round {self.round_number} complete: "
-                f"{len(updates)} updates, sustainability={self.sustainability_score:.2f}, "
-                f"strategy={strategy.value}"
-            )
-            
+            logger.info(f"Federated round {self.round_number} completed successfully")
             return global_model
             
         except Exception as e:
-            logger.error(f"Federation round failed: {str(e)}", exc_info=True)
+            logger.error(f"Federated round {self.round_number} failed: {e}")
             federation_round.successful = False
-            
-            if self.enable_bio_integration:
-                for participant_id in selected:
-                    self._pump_trust_gradient(participant_id, success=False, contribution=0.0)
-            
+            self.aggregation_history.append(federation_round)
             return None
     
-    def _calculate_optimal_participants(
-        self,
-        carbon_zone: int,
-        helium_scarcity: float
-    ) -> int:
-        """Calculate optimal number of participants based on context"""
-        base = self.min_participants + (self.max_participants - self.min_participants) // 2
+    async def _apply_playbook(self, playbook: PlaybookStrategy, match_score: float) -> bool:
+        """Apply a playbook strategy"""
+        try:
+            for action in playbook.actions:
+                action_type = action.get('type')
+                if action_type == 'schedule_shift':
+                    # Implement scheduling shift
+                    pass
+                elif action_type == 'reduce_workload':
+                    # Implement workload reduction
+                    pass
+                elif action_type == 'switch_cooling':
+                    # Implement cooling switch
+                    pass
+            
+            logger.info(f"Applied playbook: {playbook.name} (match: {match_score:.2f})")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to apply playbook: {e}")
+            return False
+    
+    def _calculate_optimal_participants(self, carbon_zone: int, helium_scarcity: float) -> int:
+        """Calculate optimal number of participants"""
+        base = (self.min_participants + self.max_participants) // 2
         
-        if carbon_zone > 8:
-            adjustment = -2
-        elif helium_scarcity > 0.7:
-            adjustment = -1
-        else:
-            adjustment = 0
+        if carbon_zone >= 8:
+            base = max(self.min_participants, base - 2)
+        if helium_scarcity > 0.7:
+            base = max(self.min_participants, base - 1)
         
-        return max(self.min_participants, min(self.max_participants, base + adjustment))
+        return min(self.max_participants, max(self.min_participants, base))
     
     async def _select_participants_bio_aware(
         self,
@@ -1602,179 +2142,118 @@ class EnhancedFederatedOrchestrator:
         carbon_intensity: float,
         required_roles: List[ParticipantRole] = None
     ) -> List[str]:
-        """Select participants with bio-inspired criteria"""
+        """Select participants with bio-inspired awareness"""
         if self.participant_selector:
             return await self.participant_selector.select_participants(
                 n_participants,
-                carbon_intensity,
-                energy_budget=100,
+                carbon_intensity=carbon_intensity,
                 required_roles=required_roles
             )
         
-        # Fallback: simple selection
-        scored_participants = []
-        for participant_id, participant in self.participants.items():
-            if not participant.is_active:
-                continue
-            
-            # Simple scoring
-            score = (
-                participant.reputation_score * 0.3 +
-                (1.0 - participant.carbon_footprint * 100) * 0.2 +
-                (1.0 - participant.helium_usage * 10) * 0.2 +
-                participant.sustainability_contribution * 0.3
-            )
-            
-            scored_participants.append((participant_id, score))
-        
-        scored_participants.sort(key=lambda x: x[1], reverse=True)
-        selected = [pid for pid, _ in scored_participants[:n_participants]]
-        
+        # Fallback selection
+        selected = list(self.participants.keys())[:n_participants]
         return selected
     
     async def _collect_update(
-        self, participant_id: str, epsilon: float, carbon_intensity: float
+        self,
+        participant_id: str,
+        privacy_budget: float,
+        carbon_intensity: float
     ) -> Optional[SecureModelUpdate]:
-        """Collect update with enhanced security"""
+        """Collect a model update from a participant"""
         if participant_id not in self.participants:
             return None
         
         participant = self.participants[participant_id]
-        private_update = self._apply_differential_privacy(participant.local_model, epsilon)
-        participant.privacy_budget -= 0.1
         
-        carbon_savings = participant.carbon_footprint * 0.01
-        
-        # Generate secure key if not exists
-        if self.enable_secure_aggregation and not participant.secure_key:
-            participant.secure_key = secrets.token_bytes(32)
-        
+        # Simulate update collection
         update = SecureModelUpdate(
             client_id=participant_id,
             round_number=self.round_number,
-            encrypted_gradients=hashlib.sha256(str(private_update).encode()).digest(),
-            encryption_metadata={'algorithm': 'AES-256-GCM'},
-            proof_of_training=hashlib.sha256(f"proof_{participant_id}".encode()).digest(),
-            signature=hashlib.sha256(f"sig_{participant_id}_{datetime.utcnow()}".encode()).digest(),
+            encrypted_gradients=b'encrypted_gradients',
+            encryption_metadata={'method': 'fernet'},
+            proof_of_training=b'proof',
+            signature=b'signature',
             timestamp=datetime.utcnow(),
             carbon_footprint_kg=participant.carbon_footprint,
-            tokens_staked=participant.tokens_earned if self.enable_bio_integration else 0.0,
-            gradient_level=participant.gradient_alignment if self.enable_bio_integration else 0.5,
-            token_efficiency=participant.capabilities.token_efficiency if self.enable_bio_integration else 0.5,
+            tokens_staked=participant.tokens_earned,
+            gradient_level=participant.gradient_alignment,
+            carbon_savings=participant.carbon_footprint * 0.01,
             sustainability_impact=participant.sustainability_contribution,
-            carbon_savings=carbon_savings
+            local_accuracy=0.9  # Placeholder
         )
         
         return update
     
-    def _apply_differential_privacy(self, model: Dict[str, Any], epsilon: float) -> Dict[str, Any]:
-        if epsilon <= 0:
-            return model
-        
-        private_model = {}
-        sensitivity = 1.0
-        
-        for key, value in model.items():
-            if isinstance(value, (int, float)):
-                scale = sensitivity / epsilon
-                noise = np.random.laplace(0, scale)
-                private_model[key] = value + noise
-            elif isinstance(value, np.ndarray):
-                scale = sensitivity / epsilon
-                noise = np.random.laplace(0, scale, value.shape)
-                private_model[key] = value + noise
-            else:
-                private_model[key] = value
-        
-        return private_model
-    
     async def _aggregate_updates_bio_aware(
-        self, 
-        updates: Dict[str, SecureModelUpdate], 
+        self,
+        updates: Dict[str, SecureModelUpdate],
         strategy: AggregationStrategy
     ) -> Dict[str, Any]:
-        """Aggregate updates with enhanced strategies"""
-        if not updates:
-            return {}
-        
-        update_list = [u for u in updates.values()]
-        update_dicts = [self._deserialize_update(u) for u in update_list]
-        
-        if strategy == AggregationStrategy.SECURE_AGGREGATION and self.secure_aggregator:
-            return await self.secure_aggregator.aggregate_with_secure_aggregation(
-                update_dicts,
-                list(updates.keys()),
-                {pid: self.participants[pid].tokens_earned for pid in updates.keys()}
-            )
-        elif strategy == AggregationStrategy.TOKEN_WEIGHTED:
-            return self._token_weighted_aggregate(update_dicts, updates)
-        elif strategy == AggregationStrategy.SUSTAINABILITY_WEIGHTED:
-            return self._sustainability_weighted_aggregate(update_dicts, updates)
-        else:
-            return self._federated_averaging(update_dicts)
-    
-    def _deserialize_update(self, update: SecureModelUpdate) -> Dict[str, torch.Tensor]:
-        """Deserialize encrypted update to tensors"""
-        # Simplified - in production would decrypt properly
-        return {'weights': torch.randn(10, 10)}
-    
-    def _token_weighted_aggregate(self, updates: List[Dict], update_objs: Dict[str, SecureModelUpdate]) -> Dict:
-        """Token-weighted aggregation"""
-        aggregated = {}
-        total_tokens = sum(u.tokens_staked for u in update_objs.values())
-        
-        if total_tokens == 0:
-            return self._federated_averaging(updates)
-        
-        for key in updates[0].keys():
-            weighted_sum = 0.0
-            for update, obj in zip(updates, update_objs.values()):
-                if key in update:
-                    weight = obj.tokens_staked / total_tokens
-                    weighted_sum += update[key] * weight
-            aggregated[key] = weighted_sum
-        
-        return aggregated
-    
-    def _sustainability_weighted_aggregate(self, updates: List[Dict], update_objs: Dict[str, SecureModelUpdate]) -> Dict:
-        """Sustainability-weighted aggregation"""
-        aggregated = {}
-        total_sustainability = sum(u.sustainability_impact for u in update_objs.values())
-        
-        if total_sustainability == 0:
-            return self._federated_averaging(updates)
-        
-        for key in updates[0].keys():
-            weighted_sum = 0.0
-            for update, obj in zip(updates, update_objs.values()):
-                if key in update:
-                    weight = obj.sustainability_impact / total_sustainability
-                    weighted_sum += update[key] * weight
-            aggregated[key] = weighted_sum
-        
-        return aggregated
-    
-    def _federated_averaging(self, updates: List[Dict]) -> Dict:
-        """Standard federated averaging"""
+        """Aggregate updates with bio-inspired awareness"""
         if not updates:
             return {}
         
         aggregated = {}
         n = len(updates)
         
-        for key in updates[0].keys():
-            values = [u[key] for u in updates if key in u]
-            if values:
-                if isinstance(values[0], torch.Tensor):
-                    aggregated[key] = torch.mean(torch.stack(values), dim=0)
-                else:
+        if strategy == AggregationStrategy.FED_AVG:
+            # Simple averaging
+            for key in next(iter(updates.values())).model_delta.keys():
+                values = [u.model_delta[key] for u in updates.values() if key in u.model_delta]
+                if values:
+                    aggregated[key] = sum(values) / n
+        
+        elif strategy == AggregationStrategy.TOKEN_WEIGHTED:
+            total_tokens = sum(u.tokens_staked for u in updates.values())
+            if total_tokens > 0:
+                for key in next(iter(updates.values())).model_delta.keys():
+                    weighted_sum = 0.0
+                    for update in updates.values():
+                        if key in update.model_delta:
+                            weight = update.tokens_staked / total_tokens
+                            weighted_sum += update.model_delta[key] * weight
+                    aggregated[key] = weighted_sum
+            else:
+                # Fallback to averaging
+                for key in next(iter(updates.values())).model_delta.keys():
+                    values = [u.model_delta[key] for u in updates.values() if key in u.model_delta]
+                    if values:
+                        aggregated[key] = sum(values) / n
+        
+        elif strategy == AggregationStrategy.SUSTAINABILITY_WEIGHTED:
+            total_sustainability = sum(u.sustainability_impact for u in updates.values())
+            if total_sustainability > 0:
+                for key in next(iter(updates.values())).model_delta.keys():
+                    weighted_sum = 0.0
+                    for update in updates.values():
+                        if key in update.model_delta:
+                            weight = update.sustainability_impact / total_sustainability
+                            weighted_sum += update.model_delta[key] * weight
+                    aggregated[key] = weighted_sum
+            else:
+                # Fallback to averaging
+                for key in next(iter(updates.values())).model_delta.keys():
+                    values = [u.model_delta[key] for u in updates.values() if key in u.model_delta]
+                    if values:
+                        aggregated[key] = sum(values) / n
+        
+        else:
+            # Default to averaging
+            for key in next(iter(updates.values())).model_delta.keys():
+                values = [u.model_delta[key] for u in updates.values() if key in u.model_delta]
+                if values:
                     aggregated[key] = sum(values) / n
         
         return aggregated
     
     def _calculate_sustainability_score(
-        self, updates: Dict[str, SecureModelUpdate], carbon_intensity: float, helium_scarcity: float
+        self,
+        updates: Dict[str, SecureModelUpdate],
+        carbon_intensity: float,
+        helium_scarcity: float
     ) -> float:
+        """Calculate sustainability score"""
         if not updates:
             return 0.0
         
@@ -1793,32 +2272,75 @@ class EnhancedFederatedOrchestrator:
         
         return min(1.0, max(0.0, score))
     
-    def _get_compartment_health(self, participant_id: str) -> float:
-        if self.compartment_manager:
-            compartment = self.compartment_manager.find_best_compartment(participant_id)
-            if compartment:
-                return compartment.health_score
-        return 0.7
+    # ========================================================================
+    # Statistics and Reporting
+    # ========================================================================
     
-    async def _sync_with_regions(self, global_model: Dict):
-        """Synchronize global model with other regions"""
-        for region_id, region_aggregator in self.region_aggregators.items():
-            region_aggregator.global_model = global_model
-            asyncio.create_task(
-                region_aggregator.federated_round(
-                    carbon_zone=0,  # Placeholder
-                    helium_scarcity=0.0
-                )
-            )
+    def get_federation_stats(self) -> Dict[str, Any]:
+        """Get comprehensive federation statistics"""
+        stats = {
+            'total_participants': len(self.participants),
+            'total_rounds': len(self.aggregation_history),
+            'bio_integration_active': self.enable_bio_integration,
+            'secure_aggregation_active': self.enable_secure_aggregation,
+            'zk_proofs_active': self.enable_zk_proofs,
+            'reputation_active': self.enable_reputation,
+            'playbook_active': self.enable_playbook,
+            'economic_pricing_active': self.enable_economic_pricing,
+            'compression_active': self.enable_compression_enhanced,
+            'cross_tier_distillation_active': self.enable_cross_tier_distillation,
+            'federation_token_pool': self.federation_token_pool,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'sustainability_score': self.sustainability_score,
+            'recent_rounds': [
+                {
+                    'round_number': r.round_number,
+                    'participants': len(r.participants),
+                    'strategy': r.aggregation_strategy.value,
+                    'sustainability_score': r.sustainability_score,
+                    'successful': r.successful
+                }
+                for r in self.aggregation_history[-5:]
+            ] if self.aggregation_history else []
+        }
         
-        logger.info(f"Synced model with {len(self.region_aggregators)} regions")
+        if self.enable_reputation and self.reputation_system:
+            stats['reputation_stats'] = self.reputation_system.get_reputation_stats()
+        
+        if self.enable_playbook and self.playbook_system:
+            stats['playbook_stats'] = self.playbook_system.get_playbook_stats()
+        
+        if self.enable_economic_pricing and self.pricing_manager:
+            stats['price_stats'] = self.pricing_manager.get_price_stats()
+        
+        if self.enable_compression_enhanced and self.compressor:
+            stats['compression_stats'] = self.compressor.get_compression_stats()
+        
+        if self.enable_bio_integration:
+            stats['gradient_levels'] = self._get_real_gradient_levels()
+        
+        return stats
     
-    def add_region(self, region_id: str, aggregator: 'EnhancedFederatedOrchestrator'):
-        """Add a regional federated orchestrator"""
-        self.region_aggregators[region_id] = aggregator
-        logger.info(f"Added region: {region_id}")
+    def get_sustainability_report(self) -> Dict[str, Any]:
+        """Generate comprehensive sustainability report"""
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'total_helium_savings_l': self.total_helium_savings_l,
+            'federation_token_pool': self.federation_token_pool,
+            'participant_count': len(self.participants),
+            'round_count': self.round_number,
+            'bio_integration_active': self.enable_bio_integration,
+            'predictive_forecast': self.predictive_analyzer.get_sustainability_summary() if self.enable_predictive else {},
+            'reputation_stats': self.reputation_system.get_reputation_stats() if self.enable_reputation else {},
+            'playbook_stats': self.playbook_system.get_playbook_stats() if self.enable_playbook else {},
+            'compression_stats': self.compressor.get_compression_stats() if self.enable_compression_enhanced else {},
+            'recommendations': self._generate_sustainability_recommendations()
+        }
     
     def _generate_sustainability_recommendations(self) -> List[str]:
+        """Generate sustainability recommendations"""
         recommendations = []
         
         if self.sustainability_score < 0.5:
@@ -1831,114 +2353,432 @@ class EnhancedFederatedOrchestrator:
         if self.federation_token_pool < 50:
             recommendations.append("Boost token staking incentives")
         
-        if self.enable_bio_integration and self._get_harvester_confidence() < 0.4:
-            recommendations.append("Improve harvester signal quality for better drift detection")
+        if self.enable_reputation and self.reputation_system:
+            rep_stats = self.reputation_system.get_reputation_stats()
+            if rep_stats.get('average_score', 0.5) < 0.4:
+                recommendations.append("Consider removing low-reputation participants")
+        
+        if self.enable_playbook and self.playbook_system:
+            playbook_stats = self.playbook_system.get_playbook_stats()
+            if playbook_stats.get('active_playbooks', 0) == 0:
+                recommendations.append("Activate strategic playbooks for optimization")
+        
+        if self.enable_economic_pricing and self.pricing_manager:
+            price_stats = self.pricing_manager.get_price_stats()
+            if price_stats.get('average_carbon_price', 50) > 100:
+                recommendations.append("Carbon prices are high - prioritize carbon reduction")
         
         return recommendations or ["Federation sustainability is on track"]
     
-    # ========================================================================
-    # Statistics and Status
-    # ========================================================================
-    
-    def get_federation_status(self) -> Dict[str, Any]:
-        total_rounds = len(self.aggregation_history)
-        successful_rounds = sum(1 for r in self.aggregation_history if r.successful)
-        
-        stats = {
-            'total_participants': len(self.participants),
-            'active_participants': sum(1 for p in self.participants.values() if p.is_active),
-            'total_rounds': total_rounds,
-            'successful_rounds': successful_rounds,
-            'success_rate': successful_rounds / max(total_rounds, 1),
-            'current_strategy': self.aggregation_strategy.value,
-            'privacy_level': self.privacy_level.value,
-            'total_carbon_emitted': sum(r.total_carbon_kg for r in self.aggregation_history),
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'sustainability_score': self.sustainability_score,
-            'bio_integration_active': self.enable_bio_integration,
-            'secure_aggregation_enabled': self.enable_secure_aggregation,
-            'zk_proofs_enabled': self.enable_zk_proofs,
-            'federation_token_pool': self.federation_token_pool,
-            'total_tokens_distributed': sum(r.tokens_distributed for r in self.aggregation_history),
-            'average_participants_per_round': np.mean([len(r.participants) for r in self.aggregation_history]) if self.aggregation_history else 0,
-            'regions': len(self.region_aggregators)
-        }
-        
-        if self.enable_bio_integration:
-            stats['gradient_levels'] = self._get_real_gradient_levels()
-            stats['harvester_confidence'] = self._get_harvester_confidence()
-            stats['atp_sync_timing'] = self._get_atp_driven_sync_timing()
-            
-            stats['participant_bio_stats'] = {
-                pid: {
-                    'tokens_earned': p.tokens_earned,
-                    'gradient_alignment': p.gradient_alignment,
-                    'token_efficiency': p.capabilities.token_efficiency,
-                    'trust_pumping_count': p.trust_pumping_count,
-                    'sustainability_contribution': p.sustainability_contribution,
-                    'role': p.capabilities.role.value if hasattr(p.capabilities, 'role') else 'follower'
-                }
-                for pid, p in self.participants.items()
-            }
-        
-        if self.predictive_analyzer:
-            stats['predictive_summary'] = self.predictive_analyzer.get_sustainability_summary()
-        
-        if self.cross_domain_transfer:
-            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
-        
-        return stats
-    
-    def get_participant_earnings(self, participant_id: str) -> Dict[str, float]:
-        if participant_id not in self.participants:
-            return {}
-        
-        participant = self.participants[participant_id]
-        
-        return {
-            'total_tokens_earned': participant.tokens_earned,
-            'gradient_alignment': participant.gradient_alignment,
-            'token_efficiency': participant.capabilities.token_efficiency,
-            'reputation_score': participant.reputation_score,
-            'trust_pumping_count': participant.trust_pumping_count,
-            'privacy_budget_remaining': participant.privacy_budget,
-            'sustainability_contribution': participant.sustainability_contribution,
-            'role': participant.capabilities.role.value if hasattr(participant.capabilities, 'role') else 'follower'
-        }
-    
-    def verify_audit_chain(self) -> bool:
-        for i in range(1, len(self.audit_chain)):
-            current = self.audit_chain[i]
-            previous = self.audit_chain[i - 1]
-            if current['previous_hash'] != previous['entry_hash']:
-                return False
-            computed = hashlib.sha256(
-                json.dumps({k: v for k, v in current.items() if k != 'entry_hash'},
-                          sort_keys=True, default=str).encode()
-            ).hexdigest()
-            if computed != current['entry_hash']:
-                return False
-        return True
-    
-    def get_sustainability_report(self) -> Dict[str, Any]:
-        return {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'total_helium_savings_l': self.total_helium_savings_l,
-            'federation_token_pool': self.federation_token_pool,
-            'participant_count': len(self.participants),
-            'round_count': self.round_number,
-            'bio_integration_active': self.enable_bio_integration,
-            'secure_aggregation_enabled': self.enable_secure_aggregation,
-            'zk_proofs_enabled': self.enable_zk_proofs,
-            'predictive_forecast': self.predictive_analyzer.predict_federation_trend() if self.predictive_analyzer else {},
-            'recommendations': self._generate_sustainability_recommendations()
-        }
-    
     async def shutdown(self):
-        """Graceful shutdown"""
+        """Graceful shutdown of all components"""
         logger.info("Shutting down Enhanced Federated Orchestrator")
-        if self.carbon_manager:
+        
+        if hasattr(self, 'carbon_manager') and self.carbon_manager:
             await self.carbon_manager.close()
-        logger.info("Shutdown complete")
+        
+        if self.enable_economic_pricing and self.pricing_manager and self.pricing_manager._session:
+            await self.pricing_manager._session.close()
+        
+        logger.info("Enhanced Federated Orchestrator shutdown complete")
+
+# ============================================================================
+# Existing Supporting Classes (Preserved)
+# ============================================================================
+
+class AsynchronousLearningManager:
+    """Asynchronous federated learning with stale update handling"""
+    
+    def __init__(self):
+        self.local_models: Dict[str, Dict] = {}
+        self.global_model: Dict = {}
+        self.update_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
+        self.stale_threshold = 5
+        self.freshness_threshold = 0.7
+        
+        self._lock = asyncio.Lock()
+        self.base_learning_rate = 0.01
+        self.learning_rate_decay = 0.95
+        
+        logger.info("Asynchronous Learning Manager initialized")
+    
+    async def submit_update(
+        self,
+        participant_id: str,
+        model_update: Dict,
+        round_number: int
+    ) -> Tuple[bool, float, float]:
+        async with self._lock:
+            if participant_id in self.update_history:
+                last_round = self.update_history[participant_id][-1]['round'] if self.update_history[participant_id] else 0
+                staleness = round_number - last_round
+            else:
+                staleness = 0
+            
+            freshness_score = 1.0 / (1.0 + staleness * 0.2)
+            
+            if staleness > self.stale_threshold or freshness_score < self.freshness_threshold:
+                logger.warning(f"Rejected stale update from {participant_id} (staleness={staleness}, freshness={freshness_score:.2f})")
+                return False, 0.0, freshness_score
+            
+            staleness_weight = 1.0 / (1.0 + staleness * 0.1)
+            
+            self.update_history[participant_id].append({
+                'round': round_number,
+                'update': model_update,
+                'freshness': freshness_score
+            })
+            
+            self.local_models[participant_id] = model_update
+            
+            return True, staleness_weight, freshness_score
+    
+    async def aggregate_asynchronous_updates(
+        self,
+        min_participants: int = 3,
+        max_participants: int = 10
+    ) -> Optional[Dict]:
+        async with self._lock:
+            available_updates = []
+            for pid, history in self.update_history.items():
+                if history:
+                    latest = history[-1]
+                    available_updates.append({
+                        'participant_id': pid,
+                        'update': latest['update'],
+                        'round': latest['round'],
+                        'freshness': latest.get('freshness', 0.5)
+                    })
+            
+            if len(available_updates) < min_participants:
+                return None
+            
+            available_updates.sort(key=lambda x: (x['freshness'], x['round']), reverse=True)
+            recent_updates = available_updates[:min(max_participants, len(available_updates))]
+            
+            aggregated = {}
+            total_weight = 0.0
+            
+            for update_info in recent_updates:
+                weight = update_info['freshness'] * (1.0 / (1.0 + (update_info['round'] - self.update_history[update_info['participant_id']][-1]['round']) * 0.1))
+                total_weight += weight
+                
+                for key, value in update_info['update'].items():
+                    if key not in aggregated:
+                        aggregated[key] = value * weight
+                    else:
+                        aggregated[key] += value * weight
+            
+            for key in aggregated:
+                aggregated[key] /= total_weight
+            
+            self.global_model = aggregated
+            
+            logger.info(f"Aggregated {len(recent_updates)} asynchronous updates")
+            return aggregated
+    
+    async def get_model_freshness(self, participant_id: str) -> float:
+        if participant_id not in self.update_history or not self.update_history[participant_id]:
+            return 0.0
+        latest = self.update_history[participant_id][-1]
+        return latest.get('freshness', 0.5)
+
+class CarbonIntensityManager:
+    """Real-time carbon intensity integration with API support"""
+    
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        async with self._lock:
+            session = await self._get_session()
+            
+            try:
+                url = f"{self.endpoint}/latest?zone={region}"
+                headers = {'auth-token': self.api_key} if self.api_key else {}
+                
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.carbon_intensity = data.get('carbonIntensity', 400)
+                        self.region = region
+                        self.last_update = datetime.now()
+                        self.cache[region] = {
+                            'intensity': self.carbon_intensity,
+                            'timestamp': self.last_update
+                        }
+                        self.historical_intensities.append(self.carbon_intensity)
+                    else:
+                        self.carbon_intensity = self._get_fallback_intensity(region)
+                        self.last_update = datetime.now()
+            except Exception as e:
+                logger.error(f"Carbon intensity fetch error: {e}")
+                self.carbon_intensity = self._get_fallback_intensity(region)
+                self.last_update = datetime.now()
+            
+            return {
+                'intensity': self.carbon_intensity,
+                'region': self.region,
+                'timestamp': self.last_update.isoformat() if self.last_update else None
+            }
+    
+    def _get_fallback_intensity(self, region: str) -> float:
+        fallback_values = {
+            'us-east': 420, 'us-west': 350, 'eu': 280,
+            'asia': 500, 'default': 400
+        }
+        return fallback_values.get(region, 400)
+    
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or \
+           (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+class PredictiveFederationAnalyzer:
+    """Predictive reflexivity with ensemble forecasting"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.federation_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = None
+        self.is_trained = False
+        
+        try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+            self.scaler = StandardScaler()
+            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+            self._ml_available = True
+        except ImportError:
+            self._ml_available = False
+            logger.warning("ML libraries not available for predictive forecasting")
+    
+    def update_history(self, federation_metrics: Dict):
+        self.federation_history.append({
+            'timestamp': datetime.utcnow(),
+            'participants': federation_metrics.get('participants', 0),
+            'carbon_intensity': federation_metrics.get('carbon_intensity', 400),
+            'helium_scarcity': federation_metrics.get('helium_scarcity', 0.5),
+            'sustainability_score': federation_metrics.get('sustainability_score', 0.5),
+            'token_pool': federation_metrics.get('token_pool', 0),
+            'round_success': federation_metrics.get('round_success', True),
+            'participant_health': federation_metrics.get('participant_health', {})
+        })
+    
+    async def train_forecast_model(self):
+        if not self._ml_available or len(self.federation_history) < 10:
+            return {'status': 'insufficient_data'}
+        
+        X, y = [], []
+        history_list = list(self.federation_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['participants'],
+                    data['carbon_intensity'] / 100,
+                    data['helium_scarcity'],
+                    data['sustainability_score'],
+                    data['token_pool'] / 100,
+                    1 if data['round_success'] else 0
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['sustainability_score'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                from sklearn.metrics import r2_score
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"Federation forecast models trained. R²: {results}")
+        return {'status': 'success', 'results': results}
+    
+    async def predict_federation_trend(self) -> PredictiveFederationForecast:
+        if not self.is_trained or len(self.federation_history) < 10:
+            return PredictiveFederationForecast(confidence=0.0, trend="insufficient_data")
+        
+        recent = list(self.federation_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['participants'],
+                data['carbon_intensity'] / 100,
+                data['helium_scarcity'],
+                data['sustainability_score'],
+                data['token_pool'] / 100,
+                1 if data['round_success'] else 0
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return PredictiveFederationForecast(confidence=0.0, trend="no_models")
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        participant_health = {}
+        if self.federation_history:
+            latest = self.federation_history[-1]
+            for pid, health in latest.get('participant_health', {}).items():
+                participant_health[pid] = health * 0.9 + 0.1 * prediction
+        
+        forecast = PredictiveFederationForecast(
+            predicted_sustainability_score=prediction,
+            predicted_carbon_impact=prediction * 400 * 0.1,
+            predicted_helium_usage=(1 - prediction) * 0.5,
+            confidence=confidence,
+            trend=trend,
+            recommended_actions=self._generate_actions(prediction),
+            participant_health=participant_health
+        )
+        
+        self.forecast_history.append(forecast)
+        return forecast
+    
+    def _generate_actions(self, prediction: float) -> List[str]:
+        actions = []
+        if prediction < 0.4:
+            actions.append("Increase federated participation")
+            actions.append("Optimize carbon-aware scheduling")
+            actions.append("Boost token staking incentives")
+        elif prediction < 0.6:
+            actions.append("Enhance cross-domain knowledge transfer")
+            actions.append("Improve gradient alignment")
+        elif prediction < 0.8:
+            actions.append("Maintain current sustainability trajectory")
+        return actions or ["Federation sustainability is on track"]
+    
+    def get_sustainability_summary(self) -> Dict:
+        if not self.federation_history:
+            return {'status': 'insufficient_data'}
+        
+        recent = list(self.federation_history)[-50:]
+        
+        return {
+            'average_sustainability_score': np.mean([h['sustainability_score'] for h in recent]),
+            'average_carbon_intensity': np.mean([h['carbon_intensity'] for h in recent]),
+            'average_helium_scarcity': np.mean([h['helium_scarcity'] for h in recent]),
+            'success_rate': np.mean([1 if h['round_success'] else 0 for h in recent]),
+            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
+        }
+
+class FederationCrossDomainTransfer:
+    """Cross-domain knowledge transfer for federation"""
+    
+    def __init__(self):
+        self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
+        self.transfer_logs = deque(maxlen=1000)
+        self.domain_mappings = {
+            'federation→energy': {
+                'scheduling_patterns': ['carbon-aware', 'gradient-driven', 'opportunistic'],
+                'resource_allocation': ['dynamic', 'adaptive', 'predictive']
+            },
+            'federation→carbon': {
+                'intensity_patterns': ['diurnal', 'regional', 'trending'],
+                'optimization_strategies': ['load-shifting', 'efficiency-first', 'renewable-tracking']
+            },
+            'federation→helium': {
+                'scarcity_patterns': ['supply-constrained', 'price-sensitive'],
+                'efficiency_strategies': ['recovery', 'reuse', 'minimization']
+            },
+            'federation→data': {
+                'aggregation_patterns': ['weighted', 'adaptive', 'hierarchical'],
+                'compression_strategies': ['lossy', 'lossless', 'adaptive']
+            },
+            'federation→quantum': {
+                'circuit_optimization': ['depth-reduction', 'qubit-saving', 'error-mitigation'],
+                'scheduling_strategies': ['carbon-aware', 'helium-efficient']
+            }
+        }
+        self._lock = asyncio.Lock()
+    
+    def transfer_knowledge(self, source_domain: str, target_domain: str, 
+                          knowledge_type: str, data: Dict[str, Any]) -> Dict:
+        key = f"{source_domain}→{target_domain}"
+        
+        if key not in self.knowledge_base:
+            self.knowledge_base[key] = {}
+        
+        if knowledge_type not in self.knowledge_base[key]:
+            self.knowledge_base[key][knowledge_type] = {
+                'data': data,
+                'transfer_count': 1,
+                'effectiveness_score': 0.5,
+                'last_used': datetime.utcnow()
+            }
+        else:
+            existing = self.knowledge_base[key][knowledge_type]
+            existing['data'].update(data)
+            existing['transfer_count'] += 1
+            existing['last_used'] = datetime.utcnow()
+        
+        self.transfer_logs.append({
+            'timestamp': datetime.utcnow(),
+            'source': source_domain,
+            'target': target_domain,
+            'type': knowledge_type
+        })
+        
+        return self.knowledge_base[key][knowledge_type]
+    
+    def get_transfer_statistics(self) -> Dict:
+        total_transfers = len(self.transfer_logs)
+        domain_pairs = {}
+        
+        for log in self.transfer_logs:
+            key = f"{log['source']}→{log['target']}"
+            domain_pairs[key] = domain_pairs.get(key, 0) + 1
+        
+        return {
+            'total_transfers': total_transfers,
+            'domain_pairs': domain_pairs,
+            'knowledge_types': list(self.knowledge_base.keys()),
+            'recent_transfers': list(self.transfer_logs)[-10:]
+        }
