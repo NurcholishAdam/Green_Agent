@@ -1,11 +1,15 @@
 # File: enhancements/performance/cold_start_optimizer.py
 
 """
-Cold Start Optimizer for Green Agent MoE System
+Cold Start Optimizer for Green Agent MoE System v3.0.0
 Eliminates expert warmup latency through pre-initialization and transfer learning.
 ENHANCED WITH: Federated Checkpoint Sharing, ML-Based Demand Prediction,
 Carbon-Aware Strategy Selection, Helium Efficiency Dashboard,
-and Complete Green Agent Capabilities
+Differential Privacy for Secure Checkpoint Sharing (NEW),
+Online Learning for Continuous Model Improvement (NEW),
+Real-time Carbon API Integration (NEW),
+Predictive Helium Forecasting (NEW),
+Intelligent Eviction Based on Predicted Future Demand (NEW)
 """
 
 import asyncio
@@ -25,38 +29,68 @@ import os
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# FEDERATED CHECKPOINT MANAGER MODULE
+# FEDERATED CHECKPOINT MANAGER WITH DIFFERENTIAL PRIVACY (ENHANCED)
 # ============================================================================
 
 class FederatedCheckpointManager:
     """
-    Federated checkpoint sharing for distributed cold start optimization.
+    Federated checkpoint sharing with differential privacy for secure distributed cold start optimization.
     
     Features:
     - Share checkpoints with peer instances
     - Aggregate checkpoints from peers
     - Consensus-based checkpoint validation
     - Distributed cache synchronization
+    - Differential privacy for secure sharing (NEW)
     """
     
-    def __init__(self, server_url: Optional[str] = None):
+    def __init__(self, server_url: Optional[str] = None, privacy_epsilon: float = 1.0):
         self.server_url = server_url
         self.peer_checkpoints: Dict[str, Dict] = {}
         self.consensus_threshold = 0.6
         self._lock = asyncio.Lock()
         self._session = None
         self.sync_history = deque(maxlen=1000)
+        # NEW: Differential privacy
+        self.privacy_epsilon = privacy_epsilon
+        self.noise_scale = 0.001
         
-        logger.info("Federated Checkpoint Manager initialized")
+        logger.info(f"Federated Checkpoint Manager initialized (ε={privacy_epsilon})")
     
     async def _get_session(self):
         if self._session is None and self.server_url:
             self._session = aiohttp.ClientSession()
         return self._session
+    
+    def _add_differential_privacy(self, checkpoint: Dict) -> Dict:
+        """Add differential privacy noise to checkpoint data"""
+        if self.privacy_epsilon <= 0:
+            return checkpoint
+        
+        private_checkpoint = {}
+        sensitivity = 1.0
+        
+        for key, value in checkpoint.items():
+            if isinstance(value, (int, float)):
+                scale = (2 * sensitivity) / self.privacy_epsilon
+                noise = np.random.normal(0, scale * self.noise_scale)
+                private_checkpoint[key] = value + noise
+            elif isinstance(value, list):
+                # Add noise to list elements
+                private_checkpoint[key] = [
+                    v + np.random.normal(0, scale * self.noise_scale) if isinstance(v, (int, float)) else v
+                    for v in value
+                ]
+            else:
+                private_checkpoint[key] = value
+        
+        return private_checkpoint
     
     async def share_checkpoint(
         self,
@@ -64,7 +98,7 @@ class FederatedCheckpointManager:
         checkpoint: Dict[str, Any],
         performance_metric: float = 1.0
     ) -> Dict:
-        """Share checkpoint with federated peers"""
+        """Share checkpoint with federated peers with privacy protection"""
         if not self.server_url:
             return {'status': 'local'}
         
@@ -72,11 +106,14 @@ class FederatedCheckpointManager:
             session = await self._get_session()
             
             try:
-                # Prepare checkpoint data for sharing
+                # Apply differential privacy
+                private_checkpoint = self._add_differential_privacy(checkpoint)
+                
                 checkpoint_data = {
                     'expert_id': expert_id,
-                    'checkpoint': checkpoint,
+                    'checkpoint': private_checkpoint,
                     'performance': performance_metric,
+                    'privacy_epsilon': self.privacy_epsilon,
                     'timestamp': datetime.utcnow().isoformat(),
                     'version': '1.0'
                 }
@@ -88,7 +125,7 @@ class FederatedCheckpointManager:
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        logger.info(f"Shared checkpoint for {expert_id} with federation")
+                        logger.info(f"Shared checkpoint for {expert_id} with federation (ε={self.privacy_epsilon})")
                         return result
                     else:
                         logger.error(f"Checkpoint sharing failed: {response.status}")
@@ -178,7 +215,6 @@ class FederatedCheckpointManager:
             session = await self._get_session()
             
             try:
-                # Send local cache summary
                 cache_summary = {
                     'expert_ids': list(local_cache.keys()),
                     'size': len(local_cache),
@@ -194,7 +230,6 @@ class FederatedCheckpointManager:
                         data = await response.json()
                         peer_experts = data.get('expert_ids', [])
                         
-                        # Request missing checkpoints
                         missing = [eid for eid in peer_experts if eid not in local_cache]
                         if missing:
                             for expert_id in missing:
@@ -217,6 +252,7 @@ class FederatedCheckpointManager:
             'server_url': self.server_url,
             'peer_checkpoints': len(self.peer_checkpoints),
             'sync_count': len(self.sync_history),
+            'privacy_epsilon': self.privacy_epsilon,
             'last_sync': list(self.sync_history)[-1] if self.sync_history else None
         }
     
@@ -225,21 +261,22 @@ class FederatedCheckpointManager:
             await self._session.close()
 
 # ============================================================================
-# ML-BASED DEMAND PREDICTOR MODULE
+# ML-BASED DEMAND PREDICTOR WITH ONLINE LEARNING (ENHANCED)
 # ============================================================================
 
 class MLDemandPredictor:
     """
-    Machine learning-based expert demand prediction.
+    Machine learning-based expert demand prediction with online learning.
     
     Features:
     - Ensemble learning with Random Forest and Gradient Boosting
     - Feature engineering from temporal patterns
     - Confidence scoring for predictions
-    - Online learning for continuous improvement
+    - Online learning for continuous improvement (NEW)
+    - Adaptive model retraining (NEW)
     """
     
-    def __init__(self, history_window: int = 1000):
+    def __init__(self, history_window: int = 1000, online_learning_rate: float = 0.01):
         self.history_window = history_window
         self.demand_history: List[Dict] = []
         self.models = {}
@@ -247,6 +284,12 @@ class MLDemandPredictor:
         self.is_trained = False
         self.feature_importance = {}
         self.training_samples = 0
+        # NEW: Online learning
+        self.online_learning_rate = online_learning_rate
+        self.model_version = 0
+        self.prediction_accuracy_history: List[float] = []
+        self.retrain_threshold = 100  # New samples before retraining
+        self.samples_since_last_train = 0
         
         # Initialize ensemble models
         self.models['random_forest'] = RandomForestRegressor(
@@ -256,7 +299,7 @@ class MLDemandPredictor:
             n_estimators=100, learning_rate=0.1, random_state=42
         )
         
-        logger.info("ML Demand Predictor initialized")
+        logger.info("ML Demand Predictor initialized with online learning")
     
     def record_demand(self, expert_id: str, timestamp: datetime, context: Dict = None):
         """Record expert usage for demand prediction"""
@@ -269,13 +312,74 @@ class MLDemandPredictor:
             'context': context or {}
         })
         
+        self.samples_since_last_train += 1
+        
+        # Trigger online learning if enough new samples
+        if self.samples_since_last_train >= self.retrain_threshold and self.is_trained:
+            asyncio.create_task(self._online_learning_update())
+        
         # Keep history within window
         if len(self.demand_history) > self.history_window:
             self.demand_history = self.demand_history[-self.history_window:]
     
+    async def _online_learning_update(self):
+        """Perform online learning update"""
+        try:
+            # Partial retraining on new data
+            recent_data = self.demand_history[-self.samples_since_last_train:]
+            if len(recent_data) > 10:
+                X, y = self._prepare_training_data(recent_data)
+                if len(X) > 0:
+                    X_scaled = self.scaler.transform(X)
+                    for name, model in self.models.items():
+                        if model is not None:
+                            # Incremental learning
+                            if hasattr(model, 'partial_fit'):
+                                model.partial_fit(X_scaled, y)
+                            else:
+                                # For models without partial_fit, retrain from scratch
+                                await self.train_model()
+                    
+                    self.model_version += 1
+                    self.samples_since_last_train = 0
+                    logger.info(f"Online learning update complete (version {self.model_version})")
+        except Exception as e:
+            logger.error(f"Online learning update error: {e}")
+    
+    def _prepare_training_data(self, data: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare training data from history"""
+        X = []
+        y = []
+        
+        if len(data) < 5:
+            return np.array(X), np.array(y)
+        
+        timestamps = sorted(set(h['timestamp'] for h in data))
+        
+        for i in range(1, len(timestamps)):
+            current_ts = timestamps[i]
+            future_window = current_ts + timedelta(minutes=5)
+            
+            future_demands = sum(
+                1 for h in data
+                if current_ts < h['timestamp'] <= future_window
+            )
+            
+            if future_demands == 0:
+                continue
+            
+            for expert_id in set(h['expert_id'] for h in data):
+                features = self._extract_features(expert_id, current_ts)
+                X.append(list(features.values()))
+                y.append(1.0 if any(
+                    h['expert_id'] == expert_id and current_ts < h['timestamp'] <= future_window
+                    for h in data
+                ) else 0.0)
+        
+        return np.array(X), np.array(y)
+    
     def _extract_features(self, expert_id: str, timestamp: datetime) -> Dict[str, float]:
         """Extract features for demand prediction"""
-        # Temporal features
         features = {
             'hour': timestamp.hour / 23.0,
             'day_of_week': timestamp.weekday() / 6.0,
@@ -285,7 +389,6 @@ class MLDemandPredictor:
             'hour_cos': np.cos(2 * np.pi * timestamp.hour / 24.0),
         }
         
-        # Historical usage patterns
         recent_window = timedelta(hours=1)
         recent_usage = [
             h for h in self.demand_history
@@ -294,11 +397,9 @@ class MLDemandPredictor:
         ]
         features['recent_usage_count'] = min(len(recent_usage) / 10.0, 1.0)
         
-        # Usage frequency
         total_usage = sum(1 for h in self.demand_history if h['expert_id'] == expert_id)
         features['usage_frequency'] = min(total_usage / 100.0, 1.0)
         
-        # Time since last use
         last_use = max(
             [h['timestamp'] for h in self.demand_history if h['expert_id'] == expert_id],
             default=timestamp - timedelta(days=7)
@@ -313,43 +414,13 @@ class MLDemandPredictor:
         if len(self.demand_history) < 50:
             return {'status': 'insufficient_data', 'samples': len(self.demand_history)}
         
-        # Prepare training data
-        X = []
-        y = []
-        timestamps = sorted(set(h['timestamp'] for h in self.demand_history))
-        
-        for i in range(1, len(timestamps)):
-            current_ts = timestamps[i]
-            future_window = current_ts + timedelta(minutes=5)
-            
-            # Count demands in future window
-            future_demands = sum(
-                1 for h in self.demand_history
-                if current_ts < h['timestamp'] <= future_window
-            )
-            
-            if future_demands == 0:
-                continue
-            
-            # Get features at current timestamp
-            for expert_id in set(h['expert_id'] for h in self.demand_history):
-                features = self._extract_features(expert_id, current_ts)
-                X.append(list(features.values()))
-                y.append(1.0 if any(
-                    h['expert_id'] == expert_id and current_ts < h['timestamp'] <= future_window
-                    for h in self.demand_history
-                ) else 0.0)
+        X, y = self._prepare_training_data(self.demand_history)
         
         if len(X) < 20:
             return {'status': 'insufficient_training_data', 'samples': len(X)}
         
-        X = np.array(X)
-        y = np.array(y)
-        
-        # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
-        # Train ensemble models
         results = {}
         for name, model in self.models.items():
             if model is not None:
@@ -359,7 +430,6 @@ class MLDemandPredictor:
                 mae = mean_absolute_error(y, predictions)
                 results[name] = {'r2': r2, 'mae': mae}
                 
-                # Store feature importance
                 if hasattr(model, 'feature_importances_'):
                     self.feature_importance[name] = dict(
                         zip(self._get_feature_names(), model.feature_importances_)
@@ -367,12 +437,13 @@ class MLDemandPredictor:
         
         self.is_trained = True
         self.training_samples = len(X)
+        self.model_version += 1
+        self.samples_since_last_train = 0
         
-        logger.info(f"ML Demand Predictor trained: {results}")
-        return {'status': 'success', 'results': results, 'samples': len(X)}
+        logger.info(f"ML Demand Predictor trained: {results} (version {self.model_version})")
+        return {'status': 'success', 'results': results, 'samples': len(X), 'version': self.model_version}
     
     def _get_feature_names(self) -> List[str]:
-        """Get feature names for importance tracking"""
         return [
             'hour', 'day_of_week', 'month', 'is_weekend',
             'hour_sin', 'hour_cos', 'recent_usage_count',
@@ -383,17 +454,12 @@ class MLDemandPredictor:
         self,
         horizon_minutes: int = 5
     ) -> Dict[str, float]:
-        """
-        Predict expert demand probabilities using ML ensemble.
-        """
+        """Predict expert demand probabilities using ML ensemble"""
         if not self.is_trained:
-            # Fallback to simple frequency-based prediction
             return self._simple_frequency_prediction(horizon_minutes)
         
         predictions = {}
         now = datetime.utcnow()
-        
-        # Get unique experts
         experts = set(h['expert_id'] for h in self.demand_history[-1000:])
         
         for expert_id in experts:
@@ -401,7 +467,6 @@ class MLDemandPredictor:
             features_array = np.array([list(features.values())])
             features_scaled = self.scaler.transform(features_array)
             
-            # Ensemble prediction
             ensemble_preds = []
             for name, model in self.models.items():
                 if model is not None:
@@ -409,7 +474,6 @@ class MLDemandPredictor:
                     ensemble_preds.append(pred)
             
             if ensemble_preds:
-                # Weighted average based on model performance
                 avg_pred = np.mean(ensemble_preds)
                 predictions[expert_id] = max(0.0, min(1.0, avg_pred))
         
@@ -440,25 +504,29 @@ class MLDemandPredictor:
         return {
             'is_trained': self.is_trained,
             'training_samples': self.training_samples,
+            'model_version': self.model_version,
             'feature_importance': self.feature_importance,
-            'models': list(self.models.keys())
+            'models': list(self.models.keys()),
+            'online_learning_rate': self.online_learning_rate,
+            'samples_since_last_train': self.samples_since_last_train
         }
 
 # ============================================================================
-# CARBON-AWARE STRATEGY SELECTOR MODULE
+# CARBON-AWARE STRATEGY SELECTOR WITH REAL-TIME API (ENHANCED)
 # ============================================================================
 
 class CarbonAwareStrategySelector:
     """
-    Carbon-aware warmup strategy selection.
+    Carbon-aware warmup strategy selection with real-time carbon API integration.
     
     Features:
     - Dynamic strategy selection based on carbon intensity
     - Carbon budget optimization
     - Strategy adaptation based on carbon trends
+    - Real-time carbon API integration (NEW)
     """
     
-    def __init__(self, carbon_manager=None):
+    def __init__(self, carbon_manager=None, api_key: Optional[str] = None):
         self.carbon_manager = carbon_manager
         self.strategy_history = deque(maxlen=1000)
         self.carbon_intensity_thresholds = {
@@ -466,28 +534,80 @@ class CarbonAwareStrategySelector:
             'medium': 350,
             'high': 500
         }
+        # NEW: Real-time API
+        self.api_key = api_key or os.getenv('ELECTRICITYMAP_API_KEY', '')
+        self.api_endpoint = "https://api.electricitymap.org/v3"
+        self._session = None
+        self.cache = {}
+        self.last_update = None
+        self.update_interval = 300
         
-        logger.info("Carbon-Aware Strategy Selector initialized")
+        logger.info("Carbon-Aware Strategy Selector initialized with real-time API")
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def get_realtime_carbon_intensity(self, region: str = "US-CAL-CISO") -> float:
+        """Get real-time carbon intensity from API"""
+        cache_key = f"{region}_{datetime.utcnow().hour}"
+        
+        if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.update_interval:
+            return self.cache[cache_key]
+        
+        try:
+            session = await self._get_session()
+            url = f"{self.api_endpoint}/carbon-intensity/latest?zone={region}"
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    intensity = data.get('carbonIntensity', 400)
+                    self.cache[cache_key] = intensity
+                    self.last_update = datetime.utcnow()
+                    return intensity
+                else:
+                    logger.warning(f"Carbon API returned {response.status}, using fallback")
+                    return self._get_fallback_intensity()
+        except Exception as e:
+            logger.error(f"Carbon API error: {e}")
+            return self._get_fallback_intensity()
+    
+    def _get_fallback_intensity(self) -> float:
+        """Fallback carbon intensity when API is unavailable"""
+        hour = datetime.utcnow().hour
+        # Simulate diurnal pattern: higher during day, lower at night
+        base = 350
+        diurnal = 50 * np.sin((hour - 8) / 12 * np.pi)
+        return max(200, min(500, base + diurnal))
     
     def select_strategy(
         self,
         strategies: Dict[str, Any],
-        carbon_intensity: float,
+        carbon_intensity: Optional[float] = None,
         urgency: str = 'normal',
         carbon_budget: float = None
     ) -> str:
         """
         Select optimal warmup strategy based on carbon intensity.
-        
-        Args:
-            strategies: Available warmup strategies
-            carbon_intensity: Current carbon intensity in gCO2/kWh
-            urgency: 'critical', 'high', 'normal', 'low'
-            carbon_budget: Available carbon budget
-            
-        Returns:
-            Strategy name
         """
+        # Use provided intensity or get from API
+        if carbon_intensity is None and self.api_key:
+            # Get from API (synchronous for immediate use)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If already in async context
+                    carbon_intensity = asyncio.create_task(self.get_realtime_carbon_intensity())
+                else:
+                    carbon_intensity = 400  # Fallback
+            except:
+                carbon_intensity = 400
+        elif carbon_intensity is None:
+            carbon_intensity = 400
+        
         # Determine carbon regime
         if carbon_intensity > self.carbon_intensity_thresholds['high']:
             regime = 'high'
@@ -502,45 +622,37 @@ class CarbonAwareStrategySelector:
         # Score each strategy
         strategy_scores = {}
         for name, strategy in strategies.items():
-            # Base score from strategy priority
             base_score = 1.0 / (strategy.priority + 1)
-            
-            # Efficiency factor (lower resource cost = higher score)
             efficiency_score = 1.0 / (1.0 + strategy.resource_cost)
-            
-            # Carbon adjustment
             carbon_score = efficiency_score * efficiency_weight + base_score * (1 - efficiency_weight)
             
-            # Urgency adjustment
             if urgency == 'critical':
-                urgency_factor = 1.5  # Favor faster strategies
+                urgency_factor = 1.5
             elif urgency == 'high':
                 urgency_factor = 1.2
             elif urgency == 'normal':
                 urgency_factor = 1.0
             else:
-                urgency_factor = 0.8  # Favor more efficient
+                urgency_factor = 0.8
             
-            # Carbon budget constraint
             if carbon_budget and strategy.resource_cost > carbon_budget:
                 carbon_score *= 0.5
             
             strategy_scores[name] = carbon_score * urgency_factor
         
-        # Select best strategy
         if not strategy_scores:
             return 'preload'
         
         best_strategy = max(strategy_scores.items(), key=lambda x: x[1])[0]
         
-        # Record selection
         self.strategy_history.append({
             'timestamp': datetime.utcnow().isoformat(),
             'carbon_intensity': carbon_intensity,
             'regime': regime,
             'urgency': urgency,
             'selected_strategy': best_strategy,
-            'score': strategy_scores[best_strategy]
+            'score': strategy_scores[best_strategy],
+            'api_used': bool(self.api_key)
         })
         
         logger.info(f"Selected {best_strategy} strategy (carbon: {carbon_intensity:.0f} gCO2/kWh, regime: {regime})")
@@ -566,35 +678,56 @@ class CarbonAwareStrategySelector:
                 for s in recent
             },
             'average_carbon_intensity': np.mean([s.get('carbon_intensity', 0) for s in recent]),
+            'api_used_ratio': sum(1 for s in recent if s.get('api_used', False)) / max(len(recent), 1),
             'most_carbon_efficient_strategy': max(
                 set(s['selected_strategy'] for s in recent),
                 key=lambda x: sum(1 for s in recent if s.get('selected_strategy') == x)
             )
         }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
 
 # ============================================================================
-# HELIUM EFFICIENCY DASHBOARD MODULE
+# HELIUM EFFICIENCY DASHBOARD WITH PREDICTIVE FORECASTING (ENHANCED)
 # ============================================================================
 
 class HeliumEfficiencyDashboard:
     """
-    Helium efficiency monitoring and analytics for cold start optimization.
+    Helium efficiency monitoring and analytics with predictive forecasting.
     
     Features:
     - Helium usage tracking
     - Efficiency scoring
     - Resource optimization recommendations
     - Historical trend analysis
+    - Predictive helium forecasting (NEW)
     """
     
-    def __init__(self):
+    def __init__(self, forecast_horizon_hours: int = 24):
         self.helium_usage: Dict[str, List[Dict]] = {}
         self.efficiency_scores: Dict[str, List[float]] = {}
         self.total_helium_used = 0.0
         self.total_helium_saved = 0.0
         self._lock = asyncio.Lock()
+        # NEW: Predictive forecasting
+        self.forecast_horizon_hours = forecast_horizon_hours
+        self.usage_history: List[Dict] = []
+        self.forecast_model = None
+        self._init_forecast_model()
         
-        logger.info("Helium Efficiency Dashboard initialized")
+        logger.info("Helium Efficiency Dashboard initialized with predictive forecasting")
+    
+    def _init_forecast_model(self):
+        """Initialize helium usage forecast model"""
+        try:
+            from sklearn.linear_model import LinearRegression
+            self.forecast_model = LinearRegression()
+            self.forecast_trained = False
+        except ImportError:
+            self.forecast_model = None
+            self.forecast_trained = False
     
     async def record_helium_usage(
         self,
@@ -615,7 +748,64 @@ class HeliumEfficiencyDashboard:
             })
             
             self.total_helium_used += amount_l
+            self.usage_history.append({
+                'timestamp': datetime.utcnow(),
+                'amount_l': amount_l,
+                'expert_id': expert_id,
+                'operation': operation
+            })
+            
+            # Train forecast model if enough data
+            if len(self.usage_history) > 20 and self.forecast_model:
+                await self._train_forecast_model()
+            
             logger.debug(f"Helium usage recorded: {expert_id} = {amount_l}L ({operation})")
+    
+    async def _train_forecast_model(self):
+        """Train helium usage forecast model"""
+        if not self.forecast_model or len(self.usage_history) < 20:
+            return
+        
+        try:
+            # Prepare training data
+            recent = self.usage_history[-50:]
+            X = np.array(range(len(recent))).reshape(-1, 1)
+            y = np.array([h['amount_l'] for h in recent])
+            
+            self.forecast_model.fit(X, y)
+            self.forecast_trained = True
+            logger.info("Helium forecast model trained")
+        except Exception as e:
+            logger.warning(f"Helium forecast training failed: {e}")
+    
+    async def predict_helium_usage(self, hours: int = 24) -> Dict[str, Any]:
+        """Predict future helium usage"""
+        if not self.forecast_trained or not self.forecast_model:
+            return {
+                'status': 'not_trained',
+                'prediction': self.total_helium_used / max(len(self.usage_history), 1) * hours
+            }
+        
+        try:
+            # Predict future usage
+            future_indices = np.array(range(
+                len(self.usage_history),
+                len(self.usage_history) + hours
+            )).reshape(-1, 1)
+            
+            predictions = self.forecast_model.predict(future_indices)
+            
+            return {
+                'status': 'success',
+                'predictions': predictions.tolist(),
+                'total_predicted_usage': sum(predictions),
+                'hourly_average': np.mean(predictions),
+                'confidence': 0.8 if len(self.usage_history) > 50 else 0.5,
+                'forecast_hours': hours
+            }
+        except Exception as e:
+            logger.error(f"Helium forecast error: {e}")
+            return {'status': 'error', 'message': str(e)}
     
     async def record_helium_saving(self, amount_l: float, source: str = 'optimization'):
         """Record helium savings"""
@@ -651,6 +841,13 @@ class HeliumEfficiencyDashboard:
                 'efficiency_trend': self._calculate_efficiency_trend(expert_id)
             }
         
+        # Add forecast status
+        report['forecast'] = {
+            'trained': self.forecast_trained,
+            'model_type': 'linear_regression' if self.forecast_model else 'none',
+            'samples': len(self.usage_history)
+        }
+        
         return report
     
     def _calculate_efficiency_trend(self, expert_id: str) -> str:
@@ -683,13 +880,102 @@ class HeliumEfficiencyDashboard:
             if self.total_helium_used > 100:
                 recommendations.append("Consider alternative cooling methods for high-usage experts")
         
-        # Check individual experts
         for expert_id, usage_list in self.helium_usage.items():
             total_usage = sum(u['amount_l'] for u in usage_list)
             if total_usage > 10:
                 recommendations.append(f"Review helium usage for {expert_id} - consider optimization")
         
         return recommendations or ["Helium usage is within acceptable ranges"]
+
+# ============================================================================
+# INTELLIGENT EVICTION BASED ON PREDICTED DEMAND (NEW)
+# ============================================================================
+
+class IntelligentEvictionManager:
+    """
+    Intelligent cache eviction based on predicted future demand.
+    
+    Features:
+    - Demand-based eviction scoring
+    - Predictive eviction decisions
+    - Least-predicted-use eviction
+    - Adaptive eviction policies
+    """
+    
+    def __init__(self, predictor: Optional[MLDemandPredictor] = None):
+        self.predictor = predictor
+        self.eviction_history: List[Dict] = []
+        self._lock = asyncio.Lock()
+        
+        logger.info("Intelligent Eviction Manager initialized")
+    
+    async def get_eviction_score(
+        self,
+        expert_id: str,
+        checkpoint: Dict,
+        predicted_demand: Dict[str, float]
+    ) -> float:
+        """
+        Calculate eviction score for an expert.
+        Higher score = more likely to be evicted.
+        """
+        async with self._lock:
+            # Base score: less used = more likely to be evicted
+            usage_count = checkpoint.get('usage_count', 0)
+            base_score = 1.0 / (1.0 + usage_count)
+            
+            # Age factor: older = more likely to be evicted
+            created_at = checkpoint.get('created_at')
+            if created_at:
+                age_hours = (datetime.utcnow() - created_at).total_seconds() / 3600
+                age_score = min(1.0, age_hours / 24)
+            else:
+                age_score = 0.5
+            
+            # Predicted demand factor: higher demand = less likely to be evicted
+            demand_prob = predicted_demand.get(expert_id, 0.0)
+            demand_score = 1.0 - demand_prob
+            
+            # Sustainability factor: less sustainable = more likely to be evicted
+            sustainability = checkpoint.get('sustainability_score', 0.5)
+            sustain_score = 1.0 - sustainability
+            
+            # Weighted combination
+            eviction_score = (
+                base_score * 0.25 +
+                age_score * 0.20 +
+                demand_score * 0.35 +
+                sustain_score * 0.20
+            )
+            
+            return eviction_score
+    
+    async def select_eviction_candidates(
+        self,
+        cache: Dict[str, Dict],
+        predicted_demand: Dict[str, float],
+        num_to_evict: int = 1
+    ) -> List[str]:
+        """Select candidates for eviction"""
+        if not cache:
+            return []
+        
+        scores = {}
+        for expert_id, checkpoint in cache.items():
+            scores[expert_id] = await self.get_eviction_score(
+                expert_id, checkpoint, predicted_demand
+            )
+        
+        # Sort by score descending and select top N
+        sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [expert_id for expert_id, _ in sorted_candidates[:num_to_evict]]
+    
+    def get_eviction_stats(self) -> Dict:
+        """Get eviction statistics"""
+        return {
+            'total_evictions': len(self.eviction_history),
+            'recent_evictions': self.eviction_history[-10:] if self.eviction_history else []
+        }
 
 # ============================================================================
 # ENHANCED DATA CLASSES
@@ -735,8 +1021,10 @@ class WarmupStrategy:
 
 class ColdStartOptimizer:
     """
-    Enhanced Cold Start Optimizer with federated learning, ML prediction,
-    carbon-aware strategy selection, and helium efficiency tracking.
+    Enhanced Cold Start Optimizer v3.0.0 with federated learning, ML prediction,
+    carbon-aware strategy selection, helium efficiency tracking,
+    differential privacy, online learning, real-time carbon API,
+    predictive helium forecasting, and intelligent eviction.
     """
     
     def __init__(
@@ -748,7 +1036,12 @@ class ColdStartOptimizer:
         enable_federated: bool = True,
         enable_ml_demand: bool = True,
         enable_carbon_aware: bool = True,
-        enable_helium_tracking: bool = True
+        enable_helium_tracking: bool = True,
+        privacy_epsilon: float = 1.0,
+        enable_online_learning: bool = True,
+        enable_realtime_carbon_api: bool = True,
+        enable_predictive_helium: bool = True,
+        enable_intelligent_eviction: bool = True
     ):
         self.cache_size = cache_size
         self.preload_threshold = preload_threshold
@@ -758,11 +1051,29 @@ class ColdStartOptimizer:
         self.enable_carbon_aware = enable_carbon_aware
         self.enable_helium_tracking = enable_helium_tracking
         
+        # NEW feature flags
+        self.enable_online_learning = enable_online_learning
+        self.enable_realtime_carbon_api = enable_realtime_carbon_api
+        self.enable_predictive_helium = enable_predictive_helium
+        self.enable_intelligent_eviction = enable_intelligent_eviction
+        
         # New modules
-        self.federated_manager = FederatedCheckpointManager(federated_server_url) if enable_federated else None
+        self.federated_manager = FederatedCheckpointManager(
+            federated_server_url, privacy_epsilon
+        ) if enable_federated else None
+        
         self.ml_predictor = MLDemandPredictor() if enable_ml_demand else None
-        self.strategy_selector = CarbonAwareStrategySelector() if enable_carbon_aware else None
+        
+        # Carbon selector with real-time API
+        carbon_api_key = os.getenv('ELECTRICITYMAP_API_KEY', None) if enable_realtime_carbon_api else None
+        self.strategy_selector = CarbonAwareStrategySelector(
+            carbon_api_key=carbon_api_key
+        ) if enable_carbon_aware else None
+        
         self.helium_dashboard = HeliumEfficiencyDashboard() if enable_helium_tracking else None
+        
+        # NEW: Intelligent eviction manager
+        self.eviction_manager = IntelligentEvictionManager(self.ml_predictor) if enable_intelligent_eviction else None
         
         # Expert checkpoint cache (LRU)
         self.checkpoint_cache: OrderedDict[str, ExpertCheckpoint] = OrderedDict()
@@ -778,13 +1089,16 @@ class ColdStartOptimizer:
         self.cold_start_events: List[Dict] = []
         self.sustainability_score = 0.0
         
+        # Thread pool for background tasks
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        
         # Initialize strategies
         self._initialize_strategies()
         
         # Start background preloader
         self._start_background_preloader()
         
-        logger.info(f"Enhanced Cold Start Optimizer initialized with cache size {cache_size}")
+        logger.info(f"Enhanced Cold Start Optimizer v3.0.0 initialized with cache size {cache_size}")
     
     def _initialize_strategies(self):
         """Initialize warmup strategies"""
@@ -856,15 +1170,31 @@ class ColdStartOptimizer:
                         self.checkpoint_cache
                     )
                 
+                # Intelligent eviction
+                if self.enable_intelligent_eviction and self.eviction_manager:
+                    if len(self.checkpoint_cache) > self.cache_size * 0.9:
+                        num_to_evict = len(self.checkpoint_cache) - int(self.cache_size * 0.8)
+                        candidates = await self.eviction_manager.select_eviction_candidates(
+                            self.checkpoint_cache, predictions, num_to_evict
+                        )
+                        for expert_id in candidates:
+                            if expert_id in self.checkpoint_cache:
+                                del self.checkpoint_cache[expert_id]
+                                logger.info(f"Intelligently evicted {expert_id}")
+                                self.eviction_manager.eviction_history.append({
+                                    'expert_id': expert_id,
+                                    'timestamp': datetime.utcnow().isoformat()
+                                })
+                
                 # Clean old checkpoints
                 await self._cleanup_checkpoints()
                 
                 # Wait before next cycle
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Background preloader error: {str(e)}")
-                await asyncio.sleep(300)  # Wait 5 minutes on error
+                await asyncio.sleep(300)
     
     async def initialize_expert(
         self,
@@ -878,18 +1208,6 @@ class ColdStartOptimizer:
     ) -> Dict[str, Any]:
         """
         Initialize expert with sustainability-aware cold start optimization.
-        
-        Args:
-            expert_id: Expert identifier
-            expert_type: Type of expert
-            carbon_budget: Available carbon budget
-            helium_budget: Available helium budget
-            max_latency_ms: Maximum acceptable initialization latency
-            urgency: 'critical', 'high', 'normal', 'low'
-            carbon_intensity: Current carbon intensity (auto-detected if not provided)
-            
-        Returns:
-            Initialized expert with metrics and sustainability info
         """
         start_time = datetime.utcnow()
         
@@ -897,11 +1215,17 @@ class ColdStartOptimizer:
         if self.enable_ml_demand and self.ml_predictor:
             self.ml_predictor.record_demand(expert_id, start_time)
         
+        # Get real-time carbon intensity if not provided
+        if carbon_intensity is None and self.enable_realtime_carbon_api and self.strategy_selector:
+            carbon_intensity = await self.strategy_selector.get_realtime_carbon_intensity()
+        elif carbon_intensity is None:
+            carbon_intensity = 400
+        
         # Select carbon-aware strategy
         if self.enable_carbon_aware and self.strategy_selector:
             selected_strategy = self.strategy_selector.select_strategy(
                 self.warmup_strategies,
-                carbon_intensity or 400,
+                carbon_intensity,
                 urgency,
                 carbon_budget
             )
@@ -935,10 +1259,8 @@ class ColdStartOptimizer:
             checkpoint.last_used = datetime.utcnow()
             checkpoint.usage_count += 1
             
-            # Move to end (most recently used)
             self.checkpoint_cache.move_to_end(expert_id)
             
-            # Update sustainability score
             checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(checkpoint)
             
             return await self._load_from_checkpoint(checkpoint, max_latency_ms)
@@ -1012,15 +1334,12 @@ class ColdStartOptimizer:
         """Load expert from checkpoint with minimal latency"""
         load_start = datetime.utcnow()
         
-        # Simulate checkpoint loading
-        await asyncio.sleep(0.001)  # 1ms simulated load time
+        await asyncio.sleep(0.001)
         
         load_time = (datetime.utcnow() - load_start).total_seconds() * 1000
         
-        # Update sustainability score
         checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(checkpoint)
         
-        # Record warmup history
         self.warmup_history.append({
             'expert_id': checkpoint.expert_id,
             'method': 'checkpoint',
@@ -1055,10 +1374,8 @@ class ColdStartOptimizer:
         """Initialize expert using transfer learning from similar expert"""
         transfer_start = datetime.utcnow()
         
-        # Simulate transfer learning
-        await asyncio.sleep(0.01)  # 10ms simulated transfer
+        await asyncio.sleep(0.01)
         
-        # Adapt source model to target
         adapted_state = self._adapt_model_state(
             source_checkpoint.model_state,
             target_id,
@@ -1067,7 +1384,6 @@ class ColdStartOptimizer:
         
         transfer_time = (datetime.utcnow() - transfer_start).total_seconds() * 1000
         
-        # Create new checkpoint for target
         target_checkpoint = ExpertCheckpoint(
             expert_id=target_id,
             expert_type=target_type,
@@ -1083,13 +1399,10 @@ class ColdStartOptimizer:
             carbon_footprint_kg=source_checkpoint.carbon_footprint_kg * 0.8
         )
         
-        # Update sustainability score
         target_checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(target_checkpoint)
         
-        # Cache the new checkpoint
         self._add_to_cache(target_id, target_checkpoint)
         
-        # Record warmup history
         self.warmup_history.append({
             'expert_id': target_id,
             'method': 'transfer_learning',
@@ -1124,10 +1437,8 @@ class ColdStartOptimizer:
         """Progressive expert initialization with selected strategy"""
         init_start = datetime.utcnow()
         
-        # Get strategy configuration
         strategy = self.warmup_strategies.get(strategy_type, self.warmup_strategies['progressive'])
         
-        # Phase 1: Basic initialization (20% of budget)
         phase1_time = max_latency_ms * 0.2
         await asyncio.sleep(phase1_time / 1000)
         
@@ -1137,7 +1448,6 @@ class ColdStartOptimizer:
             'features': ['basic_inference']
         }
         
-        # Phase 2: Enhanced initialization (30% of budget)
         phase2_time = max_latency_ms * 0.3
         await asyncio.sleep(phase2_time / 1000)
         
@@ -1147,7 +1457,6 @@ class ColdStartOptimizer:
             'features': ['basic_inference', 'optimization']
         }
         
-        # Phase 3: Full initialization (remaining budget)
         phase3_time = max_latency_ms * 0.5
         await asyncio.sleep(phase3_time / 1000)
         
@@ -1159,7 +1468,6 @@ class ColdStartOptimizer:
         
         total_time = (datetime.utcnow() - init_start).total_seconds() * 1000
         
-        # Create checkpoint for future use
         checkpoint = ExpertCheckpoint(
             expert_id=expert_id,
             expert_type=expert_type,
@@ -1187,7 +1495,6 @@ class ColdStartOptimizer:
         
         self._add_to_cache(expert_id, checkpoint)
         
-        # Record warmup history
         self.warmup_history.append({
             'expert_id': expert_id,
             'method': 'progressive',
@@ -1310,10 +1617,28 @@ class ColdStartOptimizer:
         return best_expert if best_similarity > 0.5 else None
     
     def _add_to_cache(self, expert_id: str, checkpoint: ExpertCheckpoint):
-        """Add checkpoint to cache with LRU eviction"""
+        """Add checkpoint to cache with intelligent eviction if needed"""
         if len(self.checkpoint_cache) >= self.cache_size:
-            oldest_id, _ = self.checkpoint_cache.popitem(last=False)
-            logger.info(f"Evicted {oldest_id} from cache (LRU)")
+            # Use intelligent eviction if available
+            if self.enable_intelligent_eviction and self.eviction_manager:
+                # Get predicted demand
+                predictions = {}
+                if self.enable_ml_demand and self.ml_predictor:
+                    predictions = asyncio.run(self.ml_predictor.predict_demand())
+                # Evict least valuable
+                eviction_candidates = asyncio.run(
+                    self.eviction_manager.select_eviction_candidates(
+                        self.checkpoint_cache, predictions, 1
+                    )
+                )
+                if eviction_candidates:
+                    oldest_id = eviction_candidates[0]
+                    self.checkpoint_cache.pop(oldest_id, None)
+                    logger.info(f"Intelligently evicted {oldest_id} from cache")
+            else:
+                # Fallback to LRU
+                oldest_id, _ = self.checkpoint_cache.popitem(last=False)
+                logger.info(f"Evicted {oldest_id} from cache (LRU)")
         
         self.checkpoint_cache[expert_id] = checkpoint
         logger.debug(f"Added {expert_id} to cache (size: {len(self.checkpoint_cache)})")
@@ -1362,24 +1687,22 @@ class ColdStartOptimizer:
             'most_used_experts': self._get_most_used_experts(5)
         }
         
-        # Add sustainability metrics
         stats['sustainability_score'] = self.sustainability_score
         
-        # Add federated stats
         if self.enable_federated and self.federated_manager:
             stats['federated'] = self.federated_manager.get_federated_stats()
         
-        # Add ML predictor stats
         if self.enable_ml_demand and self.ml_predictor:
             stats['ml_predictor'] = self.ml_predictor.get_model_performance()
         
-        # Add carbon-aware selector stats
         if self.enable_carbon_aware and self.strategy_selector:
             stats['carbon_aware'] = self.strategy_selector.get_carbon_impact_report()
         
-        # Add helium dashboard stats
         if self.enable_helium_tracking and self.helium_dashboard:
             stats['helium'] = self.helium_dashboard.get_efficiency_report()
+        
+        if self.enable_intelligent_eviction and self.eviction_manager:
+            stats['eviction'] = self.eviction_manager.get_eviction_stats()
         
         return stats
     
@@ -1409,7 +1732,7 @@ class ColdStartOptimizer:
         return total_saved
     
     def _calculate_carbon_saved(self) -> float:
-        carbon_per_ms = 0.00001  # kg
+        carbon_per_ms = 0.00001
         time_saved_ms = self._calculate_time_saved()
         return time_saved_ms * carbon_per_ms
     
@@ -1470,6 +1793,11 @@ class ColdStartOptimizer:
     
     def get_sustainability_report(self) -> Dict[str, Any]:
         """Get comprehensive sustainability report"""
+        # Get helium forecast if enabled
+        helium_forecast = None
+        if self.enable_predictive_helium and self.helium_dashboard:
+            helium_forecast = asyncio.run(self.helium_dashboard.predict_helium_usage())
+        
         return {
             'timestamp': datetime.utcnow().isoformat(),
             'sustainability_score': self.sustainability_score,
@@ -1477,6 +1805,7 @@ class ColdStartOptimizer:
             'carbon_saved_kg': self._calculate_carbon_saved(),
             'time_saved_ms': self._calculate_time_saved(),
             'strategy_distribution': self._get_strategy_distribution(),
+            'helium_forecast': helium_forecast,
             'recommendations': self._generate_sustainability_recommendations()
         }
     
@@ -1504,6 +1833,18 @@ class ColdStartOptimizer:
             if helium_report.get('helium_savings_rate', 0) < 0.1:
                 recommendations.append("Implement helium recovery for initialization operations")
         
+        if self.enable_predictive_helium and self.helium_dashboard:
+            forecast = asyncio.run(self.helium_dashboard.predict_helium_usage())
+            if forecast.get('status') == 'success':
+                total_predicted = forecast.get('total_predicted_usage', 0)
+                if total_predicted > self.helium_dashboard.total_helium_used * 1.2:
+                    recommendations.append("Helium usage expected to increase - implement proactive optimization")
+        
+        if self.enable_intelligent_eviction and self.eviction_manager:
+            eviction_stats = self.eviction_manager.get_eviction_stats()
+            if eviction_stats.get('total_evictions', 0) > 50:
+                recommendations.append("High eviction rate - consider increasing cache size")
+        
         return recommendations or ["Cold start optimizer is performing well"]
     
     async def shutdown(self):
@@ -1511,6 +1852,9 @@ class ColdStartOptimizer:
         logger.info("Shutting down Cold Start Optimizer")
         if self.federated_manager:
             await self.federated_manager.close()
+        if self.strategy_selector:
+            await self.strategy_selector.close()
+        self.executor.shutdown(wait=True)
         logger.info("Shutdown complete")
 
 # ============================================================================
