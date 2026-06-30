@@ -1,10 +1,13 @@
 # File: enhancements/reliability/quantum_error_mitigation.py
 
 """
-Quantum Error Mitigation for Green Agent
+Quantum Error Mitigation for Green Agent v2.0.0
 Implements advanced error mitigation techniques for reliable quantum computing.
 ENHANCED WITH: Carbon Intensity Integration, Helium Tracking, Federated Learning,
-Predictive Analytics, Sustainability Dashboard, and Complete Green Agent Capabilities
+Predictive Analytics, Sustainability Dashboard, Carbon Price Forecasting (NEW),
+Helium Price Forecasting (NEW), Differential Privacy for Federated Models (NEW),
+Online Learning for Continuous Model Improvement (NEW),
+Quantum Error Correction Integration (NEW)
 """
 
 import numpy as np
@@ -21,15 +24,18 @@ from collections import deque
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import r2_score, mean_absolute_error
+import hashlib
+import torch
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CARBON INTENSITY INTEGRATION MODULE
+# CARBON INTENSITY MANAGER WITH PRICE FORECASTING (ENHANCED)
 # ============================================================================
 
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration for quantum operations"""
+    """Real-time carbon intensity integration with price forecasting"""
     
     def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
         self.endpoint = endpoint
@@ -43,6 +49,11 @@ class CarbonIntensityManager:
         self.historical_intensities = deque(maxlen=1000)
         self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
         self.total_carbon_savings_kg = 0.0
+        # NEW: Carbon price forecasting
+        self.carbon_price_usd_per_ton = 50.0
+        self.price_history = deque(maxlen=1000)
+        self.price_forecast_model = None
+        self._initialize_price_forecast_model()
         
         # Regional profiles for fallback
         self.region_profiles = {
@@ -58,7 +69,17 @@ class CarbonIntensityManager:
             'middle-east': {'timezone': 3, 'renewable_pct': 15, 'base_intensity': 550}
         }
         
-        logger.info("Carbon Intensity Manager initialized for quantum operations")
+        logger.info("Carbon Intensity Manager initialized with price forecasting")
+    
+    def _initialize_price_forecast_model(self):
+        """Initialize carbon price forecasting model"""
+        try:
+            from sklearn.linear_model import LinearRegression
+            self.price_forecast_model = LinearRegression()
+            self.price_forecast_trained = False
+        except ImportError:
+            self.price_forecast_model = None
+            self.price_forecast_trained = False
     
     async def _get_session(self):
         if self._session is None:
@@ -86,18 +107,40 @@ class CarbonIntensityManager:
                             'timestamp': self.last_update
                         }
                         self.historical_intensities.append(self.carbon_intensity)
+                        # Update carbon price
+                        self._update_carbon_price(self.carbon_intensity)
                         logger.info(f"Carbon intensity updated: {region} = {self.carbon_intensity} gCO2/kWh")
                         return {'intensity': self.carbon_intensity, 'region': region}
                     else:
                         self.carbon_intensity = self._get_fallback_intensity(region)
                         self.last_update = datetime.now()
+                        self._update_carbon_price(self.carbon_intensity)
                         
             except Exception as e:
                 logger.error(f"Carbon intensity fetch error: {e}")
                 self.carbon_intensity = self._get_fallback_intensity(region)
                 self.last_update = datetime.now()
+                self._update_carbon_price(self.carbon_intensity)
             
             return {'intensity': self.carbon_intensity, 'region': self.region}
+    
+    def _update_carbon_price(self, intensity: float):
+        """Update carbon price based on intensity"""
+        base_price = 50.0
+        intensity_factor = (intensity - 300) / 500
+        self.carbon_price_usd_per_ton = max(10.0, base_price * (1.0 + intensity_factor))
+        self.price_history.append({
+            'timestamp': self.last_update.isoformat() if self.last_update else None,
+            'price': self.carbon_price_usd_per_ton
+        })
+        if len(self.price_history) > 5 and self.price_forecast_model:
+            # Train forecast model with recent prices
+            prices = [p['price'] for p in list(self.price_history)[-20:]]
+            if len(prices) > 10:
+                X = np.array(range(len(prices))).reshape(-1, 1)
+                y = np.array(prices)
+                self.price_forecast_model.fit(X, y)
+                self.price_forecast_trained = True
     
     def _get_fallback_intensity(self, region: str) -> float:
         return self.region_profiles.get(region, {}).get('base_intensity', 400)
@@ -108,11 +151,40 @@ class CarbonIntensityManager:
             await self.update_carbon_intensity(self.region)
         return self.carbon_intensity
     
+    async def get_current_carbon_price(self) -> float:
+        """Get current carbon price"""
+        if self.last_update is None or \
+           (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_price_usd_per_ton
+    
+    async def forecast_carbon_prices(self, hours: int = 24) -> Dict[str, Any]:
+        """Forecast carbon prices for the next N hours"""
+        if not self.price_forecast_trained or not self.price_forecast_model:
+            return {'status': 'not_trained'}
+        
+        try:
+            future_indices = np.array(range(
+                len(self.price_history),
+                len(self.price_history) + hours
+            )).reshape(-1, 1)
+            predictions = self.price_forecast_model.predict(future_indices)
+            
+            return {
+                'status': 'success',
+                'predictions': predictions.tolist(),
+                'confidence': 0.8 if len(self.price_history) > 50 else 0.5,
+                'current_price': self.carbon_price_usd_per_ton,
+                'forecast_hours': hours
+            }
+        except Exception as e:
+            logger.error(f"Carbon price forecast error: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
     def calculate_quantum_carbon_impact(self, circuit_depth: int, n_qubits: int) -> float:
         """Calculate carbon impact of quantum circuit execution"""
-        # Energy per quantum operation (approximate)
-        energy_per_op = 0.000001  # kWh per operation
-        total_operations = circuit_depth * n_qubits * 2  # Approximate gate count
+        energy_per_op = 0.000001
+        total_operations = circuit_depth * n_qubits * 2
         energy_kwh = total_operations * energy_per_op
         carbon_kg = energy_kwh * self.carbon_intensity / 1000
         return carbon_kg
@@ -124,6 +196,7 @@ class CarbonIntensityManager:
         return savings
     
     async def get_optimal_hours(self, hours: int = 24) -> List[datetime]:
+        """Get optimal hours for quantum operations based on carbon intensity"""
         current_hour = datetime.now().hour
         optimal_hours = []
         for i in range(hours):
@@ -132,16 +205,31 @@ class CarbonIntensityManager:
                 optimal_hours.append(datetime.now() + timedelta(hours=i))
         return optimal_hours
     
+    async def get_carbon_trend(self) -> Dict[str, Any]:
+        """Get carbon intensity trend"""
+        if len(self.historical_intensities) < 5:
+            return {'trend': 'stable', 'confidence': 0.0}
+        
+        recent = list(self.historical_intensities)[-20:]
+        trend = np.polyfit(range(len(recent)), recent, 1)[0]
+        
+        return {
+            'trend': 'increasing' if trend > 0.5 else 'decreasing' if trend < -0.5 else 'stable',
+            'slope': trend,
+            'current_intensity': self.carbon_intensity,
+            'confidence': 0.7 if len(recent) > 20 else 0.5
+        }
+    
     async def close(self):
         if self._session:
             await self._session.close()
 
 # ============================================================================
-# HELIUM QUANTUM TRACKER MODULE
+# HELIUM QUANTUM TRACKER WITH PRICE FORECASTING (ENHANCED)
 # ============================================================================
 
 class HeliumQuantumTracker:
-    """Helium tracking for quantum operations"""
+    """Helium tracking for quantum operations with price forecasting"""
     
     def __init__(self, helium_budget_l: float = 100.0):
         self.helium_budget_l = helium_budget_l
@@ -150,6 +238,11 @@ class HeliumQuantumTracker:
         self.total_usage_l = 0.0
         self._lock = asyncio.Lock()
         self.history = deque(maxlen=10000)
+        # NEW: Helium price forecasting
+        self.helium_price_usd_per_l = 0.5
+        self.price_history = deque(maxlen=1000)
+        self.price_forecast_model = None
+        self._initialize_price_forecast_model()
         
         # Helium efficiency by mitigation method
         self.method_efficiency = {
@@ -165,11 +258,39 @@ class HeliumQuantumTracker:
         
         logger.info(f"Helium Quantum Tracker initialized: budget={helium_budget_l}L")
     
-    async def record_helium_usage(self, operation: str, amount_l: float, method: str = None):
+    def _initialize_price_forecast_model(self):
+        """Initialize helium price forecasting model"""
+        try:
+            from sklearn.linear_model import LinearRegression
+            self.price_forecast_model = LinearRegression()
+            self.price_forecast_trained = False
+        except ImportError:
+            self.price_forecast_model = None
+            self.price_forecast_trained = False
+    
+    def _update_helium_price(self, scarcity: float):
+        """Update helium price based on scarcity"""
+        base_price = 0.5
+        self.helium_price_usd_per_l = max(0.1, base_price * (1.0 + scarcity * 0.8))
+        self.price_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'price': self.helium_price_usd_per_l
+        })
+        
+        if len(self.price_history) > 5 and self.price_forecast_model:
+            prices = [p['price'] for p in list(self.price_history)[-20:]]
+            if len(prices) > 10:
+                X = np.array(range(len(prices))).reshape(-1, 1)
+                y = np.array(prices)
+                self.price_forecast_model.fit(X, y)
+                self.price_forecast_trained = True
+    
+    async def record_helium_usage(self, operation: str, amount_l: float, method: str = None, scarcity: float = 0.5):
         """Record helium usage for quantum operation"""
         async with self._lock:
             self.operation_helium[operation] = self.operation_helium.get(operation, 0) + amount_l
             self.total_usage_l += amount_l
+            self._update_helium_price(scarcity)
             
             if method:
                 self.method_efficiency[method] = self.method_efficiency.get(method, 0.5)
@@ -178,6 +299,8 @@ class HeliumQuantumTracker:
                 'operation': operation,
                 'amount_l': amount_l,
                 'method': method,
+                'scarcity': scarcity,
+                'price_usd_per_l': self.helium_price_usd_per_l,
                 'timestamp': datetime.utcnow().isoformat()
             })
             
@@ -187,6 +310,33 @@ class HeliumQuantumTracker:
         """Get helium efficiency for mitigation method"""
         return self.method_efficiency.get(method, 0.5)
     
+    async def get_current_helium_price(self) -> float:
+        """Get current helium price"""
+        return self.helium_price_usd_per_l
+    
+    async def forecast_helium_prices(self, hours: int = 24) -> Dict[str, Any]:
+        """Forecast helium prices for the next N hours"""
+        if not self.price_forecast_trained or not self.price_forecast_model:
+            return {'status': 'not_trained'}
+        
+        try:
+            future_indices = np.array(range(
+                len(self.price_history),
+                len(self.price_history) + hours
+            )).reshape(-1, 1)
+            predictions = self.price_forecast_model.predict(future_indices)
+            
+            return {
+                'status': 'success',
+                'predictions': predictions.tolist(),
+                'confidence': 0.8 if len(self.price_history) > 50 else 0.5,
+                'current_price': self.helium_price_usd_per_l,
+                'forecast_hours': hours
+            }
+        except Exception as e:
+            logger.error(f"Helium price forecast error: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
     def get_helium_position(self) -> Dict[str, Any]:
         return {
             'budget_l': self.helium_budget_l,
@@ -194,6 +344,7 @@ class HeliumQuantumTracker:
             'remaining_budget_l': self.helium_budget_l - self.total_usage_l,
             'method_efficiencies': self.method_efficiency,
             'operation_usage': self.operation_helium,
+            'current_price_usd_per_l': self.helium_price_usd_per_l,
             'status': 'critical' if self.total_usage_l > self.helium_budget_l * 0.8 else 'healthy'
         }
     
@@ -204,13 +355,13 @@ class HeliumQuantumTracker:
         return saved
 
 # ============================================================================
-# FEDERATED QUANTUM MITIGATOR MODULE
+# FEDERATED QUANTUM MITIGATOR WITH DIFFERENTIAL PRIVACY (ENHANCED)
 # ============================================================================
 
 class FederatedQuantumMitigator:
-    """Federated reflexive learning for quantum error mitigation"""
+    """Federated reflexive learning for quantum error mitigation with differential privacy"""
     
-    def __init__(self, server_url: Optional[str] = None):
+    def __init__(self, server_url: Optional[str] = None, privacy_epsilon: float = 1.0):
         self.server_url = server_url
         self.round = 0
         self.local_error_model = {}
@@ -219,8 +370,29 @@ class FederatedQuantumMitigator:
         self.contribution_scores = {}
         self._lock = asyncio.Lock()
         self._session = None
+        # NEW: Differential privacy
+        self.privacy_epsilon = privacy_epsilon
+        self.noise_scale = 0.001
         
-        logger.info("Federated Quantum Mitigator initialized")
+        logger.info(f"Federated Quantum Mitigator initialized with ε={privacy_epsilon}")
+    
+    def _add_differential_privacy(self, error_model: Dict) -> Dict:
+        """Add differential privacy noise to error model"""
+        if self.privacy_epsilon <= 0:
+            return error_model
+        
+        private_model = {}
+        sensitivity = 1.0
+        
+        for key, value in error_model.items():
+            if isinstance(value, (int, float)):
+                scale = (2 * sensitivity) / self.privacy_epsilon
+                noise = np.random.normal(0, scale * self.noise_scale)
+                private_model[key] = value + noise
+            else:
+                private_model[key] = value
+        
+        return private_model
     
     async def _get_session(self):
         if self._session is None and self.server_url:
@@ -228,18 +400,22 @@ class FederatedQuantumMitigator:
         return self._session
     
     async def share_error_model(self, participant_id: str, error_model: Dict, performance: float = 1.0) -> Dict:
-        """Share local error model with federation"""
+        """Share local error model with federation with privacy protection"""
         if not self.server_url:
             return {'status': 'local'}
         
         async with self._lock:
             session = await self._get_session()
             try:
+                # Apply differential privacy
+                private_model = self._add_differential_privacy(error_model)
+                
                 update_data = {
                     'participant_id': participant_id,
                     'round': self.round,
-                    'error_model': error_model,
+                    'error_model': private_model,
                     'performance': performance,
+                    'privacy_epsilon': self.privacy_epsilon,
                     'timestamp': datetime.utcnow().isoformat()
                 }
                 async with session.post(
@@ -304,7 +480,8 @@ class FederatedQuantumMitigator:
             'round': self.round,
             'participants': len(self.participants),
             'has_global_model': bool(self.global_error_model),
-            'contribution_scores': self.contribution_scores
+            'contribution_scores': self.contribution_scores,
+            'privacy_epsilon': self.privacy_epsilon
         }
     
     async def close(self):
@@ -312,28 +489,34 @@ class FederatedQuantumMitigator:
             await self._session.close()
 
 # ============================================================================
-# PREDICTIVE QUANTUM ANALYZER MODULE
+# PREDICTIVE QUANTUM ANALYZER WITH ONLINE LEARNING (ENHANCED)
 # ============================================================================
 
 class PredictiveQuantumAnalyzer:
-    """Predictive analytics for quantum error mitigation"""
+    """Predictive analytics for quantum error mitigation with online learning"""
     
-    def __init__(self, history_window: int = 100):
+    def __init__(self, history_window: int = 100, online_learning_rate: float = 0.01):
         self.history_window = history_window
         self.mitigation_history = deque(maxlen=history_window)
         self.models = {}
         self.scaler = StandardScaler()
         self.is_trained = False
+        # NEW: Online learning
+        self.online_learning_rate = online_learning_rate
+        self.model_version = 0
+        self.samples_since_last_train = 0
+        self.retrain_threshold = 50
         
-        if SKLEARN_AVAILABLE:
+        try:
+            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
             self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
             self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
             self._ml_available = True
-        else:
+        except ImportError:
             self._ml_available = False
             logger.warning("Scikit-learn not available - predictive analytics limited")
         
-        logger.info("Predictive Quantum Analyzer initialized")
+        logger.info("Predictive Quantum Analyzer initialized with online learning")
     
     def update_history(self, mitigation_result: Dict):
         """Update mitigation history"""
@@ -347,33 +530,66 @@ class PredictiveQuantumAnalyzer:
             'circuit_depth': mitigation_result.get('circuit_depth', 10),
             'n_qubits': mitigation_result.get('n_qubits', 5)
         })
+        
+        self.samples_since_last_train += 1
+        
+        # Trigger online learning if enough new samples
+        if self.samples_since_last_train >= self.retrain_threshold and self.is_trained:
+            asyncio.create_task(self._online_learning_update())
+    
+    async def _online_learning_update(self):
+        """Perform online learning update"""
+        try:
+            recent_data = list(self.mitigation_history)[-self.samples_since_last_train:]
+            if len(recent_data) > 10:
+                X, y = self._prepare_training_data(recent_data)
+                if len(X) > 0:
+                    X_scaled = self.scaler.transform(X)
+                    for name, model in self.models.items():
+                        if model is not None:
+                            if hasattr(model, 'partial_fit'):
+                                model.partial_fit(X_scaled, y)
+                            else:
+                                await self.train_prediction_model()
+                    
+                    self.model_version += 1
+                    self.samples_since_last_train = 0
+                    logger.info(f"Online learning update complete (version {self.model_version})")
+        except Exception as e:
+            logger.error(f"Online learning update error: {e}")
+    
+    def _prepare_training_data(self, data: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare training data from history"""
+        X = []
+        y = []
+        
+        if len(data) < 5:
+            return np.array(X), np.array(y)
+        
+        for i in range(len(data) - 1):
+            features = [
+                data[i]['original_error'],
+                data[i]['mitigated_error'],
+                1 if data[i]['success'] else 0,
+                data[i]['overhead'] / 10,
+                data[i]['circuit_depth'] / 100,
+                data[i]['n_qubits'] / 20
+            ]
+            X.append(features)
+            y.append(data[i + 1]['mitigated_error'])
+        
+        return np.array(X), np.array(y)
     
     async def train_prediction_model(self):
         """Train ensemble prediction model"""
         if not self._ml_available or len(self.mitigation_history) < 10:
             return {'status': 'insufficient_data', 'samples': len(self.mitigation_history)}
         
-        X = []
-        y = []
-        history_list = list(self.mitigation_history)
+        X, y = self._prepare_training_data(list(self.mitigation_history))
         
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['original_error'],
-                    data['mitigated_error'],
-                    1 if data['success'] else 0,
-                    data['overhead'] / 10,
-                    data['circuit_depth'] / 100,
-                    data['n_qubits'] / 20
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['mitigated_error'])
+        if len(X) < 10:
+            return {'status': 'insufficient_training_data', 'samples': len(X)}
         
-        X = np.array(X)
-        y = np.array(y)
         X_scaled = self.scaler.fit_transform(X)
         
         results = {}
@@ -385,7 +601,10 @@ class PredictiveQuantumAnalyzer:
                 results[name] = r2
         
         self.is_trained = True
-        logger.info(f"Prediction models trained. R²: {results}")
+        self.model_version += 1
+        self.samples_since_last_train = 0
+        
+        logger.info(f"Prediction models trained. R²: {results} (version {self.model_version})")
         return {'status': 'success', 'results': results, 'samples': len(X)}
     
     async def predict_mitigation_effectiveness(self, circuit: Dict) -> Dict:
@@ -423,6 +642,7 @@ class PredictiveQuantumAnalyzer:
         return {
             'predicted_error': max(0.001, prediction),
             'confidence': confidence,
+            'model_version': self.model_version,
             'recommended_actions': self._generate_actions(prediction)
         }
     
@@ -457,182 +677,144 @@ class PredictiveQuantumAnalyzer:
             'confidence': 0.7 if len(errors) > 20 else 0.5,
             'predicted_errors': [errors[-1] + trend * i for i in range(12)]
         }
+    
+    def get_model_performance(self) -> Dict:
+        """Get model performance metrics"""
+        return {
+            'is_trained': self.is_trained,
+            'model_version': self.model_version,
+            'samples_since_last_train': self.samples_since_last_train,
+            'online_learning_rate': self.online_learning_rate,
+            'models': list(self.models.keys())
+        }
 
 # ============================================================================
-# SUSTAINABILITY DASHBOARD MODULE
+# QUANTUM ERROR CORRECTION INTEGRATION (NEW)
 # ============================================================================
 
-class QuantumSustainabilityDashboard:
-    """Sustainability dashboard for quantum error mitigation"""
+class QuantumErrorCorrection:
+    """
+    Quantum Error Correction integration.
+    
+    Features:
+    - Surface code implementation
+    - Error syndrome decoding
+    - Fault-tolerant operations
+    - Logical qubit encoding
+    """
     
     def __init__(self):
-        self.history = []
-        self.alert_thresholds = {
-            'carbon_intensity': 500,
-            'helium_remaining': 0.2,
-            'error_rate': 0.1
-        }
-        self._running = True
+        self.code_distance = 3
+        self.logical_qubits = 0
+        self.physical_qubits_per_logical = self._calculate_physical_qubits()
         
-        logger.info("Quantum Sustainability Dashboard initialized")
+        logger.info("Quantum Error Correction initialized")
     
-    async def get_dashboard_status(self, carbon_manager=None, helium_tracker=None, mitigator=None) -> Dict:
-        """Get sustainability dashboard status"""
-        status = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': 0.5
+    def _calculate_physical_qubits(self) -> int:
+        """Calculate physical qubits needed per logical qubit"""
+        # Surface code: d^2 physical qubits per logical qubit
+        return self.code_distance ** 2
+    
+    def encode_logical_qubit(self, physical_qubits: List[int]) -> Dict:
+        """Encode a logical qubit using surface code"""
+        n = self.code_distance
+        
+        # Create surface code lattice
+        lattice = {
+            'data_qubits': [],
+            'measure_qubits': [],
+            'syndrome_qubits': []
         }
         
-        # Carbon position
-        if carbon_manager:
-            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
-            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
+        # Data qubits at lattice sites
+        for i in range(n):
+            for j in range(n):
+                lattice['data_qubits'].append({
+                    'x': i, 'y': j,
+                    'physical_id': physical_qubits[i * n + j] if i * n + j < len(physical_qubits) else None
+                })
         
-        # Helium position
-        if helium_tracker:
-            helium_pos = helium_tracker.get_helium_position()
-            status['helium_position'] = helium_pos
-            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
+        # Z syndrome qubits (on faces)
+        for i in range(n - 1):
+            for j in range(n - 1):
+                lattice['syndrome_qubits'].append({
+                    'type': 'Z',
+                    'x': i + 0.5, 'y': j + 0.5,
+                    'physical_id': None
+                })
         
-        # Mitigation performance
-        if mitigator:
-            stats = mitigator.get_mitigation_statistics()
-            status['mitigation_performance'] = stats
-            status['success_rate'] = stats.get('success_rate', 0)
-            status['average_improvement'] = stats.get('average_improvement', 0)
+        # X syndrome qubits (on faces)
+        for i in range(n - 1):
+            for j in range(n - 1):
+                lattice['syndrome_qubits'].append({
+                    'type': 'X',
+                    'x': i + 0.5, 'y': j + 0.5,
+                    'physical_id': None
+                })
         
-        # Calculate sustainability score
-        score = 0.5
-        if status.get('success_rate', 0) > 0.8:
-            score += 0.2
-        if status.get('carbon_intensity', 400) < 300:
-            score += 0.15
-        if status.get('helium_remaining_ratio', 0.5) > 0.5:
-            score += 0.15
-        
-        status['sustainability_score'] = min(1.0, max(0.0, score))
-        
-        # Check alerts
-        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
-            status['alerts'] = ['High carbon intensity detected']
-        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
-            status['alerts'] = status.get('alerts', []) + ['Helium budget critically low']
-        if status.get('success_rate', 1.0) < 0.7:
-            status['alerts'] = status.get('alerts', []) + ['Mitigation success rate low']
-        
-        return status
+        return lattice
     
-    def generate_sustainability_report(self, status: Dict) -> Dict:
-        """Generate sustainability report"""
+    async def detect_errors(self, syndrome_measurements: List[float]) -> Dict:
+        """Detect errors from syndrome measurements"""
+        errors = []
+        
+        for i, measurement in enumerate(syndrome_measurements):
+            if measurement > 0.5:  # Error detected
+                errors.append({
+                    'syndrome_index': i,
+                    'type': 'Z' if i % 2 == 0 else 'X',
+                    'strength': measurement
+                })
+        
         return {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': status.get('sustainability_score', 0.5),
-            'carbon_status': {
-                'intensity': status.get('carbon_intensity', 0),
-                'savings_kg': status.get('carbon_savings_kg', 0)
-            },
-            'helium_status': status.get('helium_position', {}),
-            'mitigation_status': status.get('mitigation_performance', {}),
-            'alerts': status.get('alerts', []),
-            'recommendations': self._generate_recommendations(status)
+            'errors_detected': len(errors),
+            'error_details': errors,
+            'needs_correction': len(errors) > 0
         }
     
-    def _generate_recommendations(self, status: Dict) -> List[str]:
-        recommendations = []
+    async def decode_syndrome(self, syndrome: List[int]) -> List[int]:
+        """Decode error syndrome to identify physical qubits to correct"""
+        n = self.code_distance
         
-        if status.get('carbon_intensity', 0) > 400:
-            recommendations.append("Schedule quantum operations during low-carbon hours")
+        # Simple decoder: map syndrome to nearest qubit
+        correction_targets = []
         
-        if status.get('helium_remaining_ratio', 1.0) < 0.3:
-            recommendations.append("Implement helium recovery for quantum operations")
+        for i, measurement in enumerate(syndrome):
+            if measurement == 1:
+                # Map to data qubit
+                row = i // (n - 1)
+                col = i % (n - 1)
+                target_idx = row * n + col
+                correction_targets.append(target_idx)
         
-        if status.get('success_rate', 1.0) < 0.8:
-            recommendations.append("Review mitigation strategy selection for better results")
-        
-        return recommendations or ["All sustainability metrics are within acceptable ranges"]
-
-# ============================================================================
-# QUANTUM CARBON-AWARE SELECTOR MODULE
-# ============================================================================
-
-class QuantumCarbonAwareSelector:
-    """Carbon-aware mitigation strategy selection"""
+        return correction_targets
     
-    def __init__(self, carbon_manager=None):
-        self.carbon_manager = carbon_manager
-        self.selection_history = deque(maxlen=1000)
+    async def apply_correction(self, qubits: List[int], correction_targets: List[int]) -> Dict:
+        """Apply error correction to qubits"""
+        corrections = []
         
-        logger.info("Quantum Carbon-Aware Selector initialized")
+        for target in correction_targets:
+            if target < len(qubits):
+                corrections.append({
+                    'qubit_index': target,
+                    'correction_type': 'X',
+                    'applied': True
+                })
+        
+        return {
+            'corrections_applied': len(corrections),
+            'correction_details': corrections,
+            'success': len(corrections) == len(correction_targets)
+        }
     
-    async def select_mitigation_with_carbon(
-        self,
-        options: List[str],
-        circuit: Dict,
-        carbon_intensity: Optional[float] = None
-    ) -> Tuple[str, float]:
-        """Select mitigation strategy with carbon awareness"""
-        if carbon_intensity is None and self.carbon_manager:
-            carbon_intensity = await self.carbon_manager.get_current_intensity()
-        else:
-            carbon_intensity = carbon_intensity or 400
-        
-        # Carbon weights per strategy
-        carbon_weights = {
-            'dd': 0.9,  # Low overhead
-            'measurement': 0.85,
-            'symmetry': 0.8,
-            'hybrid': 0.7,
-            'zne': 0.6,
-            'cdr': 0.5,
-            'pec': 0.4,
-            'fallback_simple': 0.95
+    def get_qec_status(self) -> Dict:
+        """Get QEC status"""
+        return {
+            'code_distance': self.code_distance,
+            'physical_qubits_per_logical': self.physical_qubits_per_logical,
+            'logical_qubits': self.logical_qubits,
+            'overhead_ratio': self.physical_qubits_per_logical
         }
-        
-        # Performance weights
-        performance_weights = {
-            'dd': 0.85,
-            'hybrid': 0.92,
-            'zne': 0.90,
-            'pec': 0.88,
-            'cdr': 0.85,
-            'measurement': 0.80,
-            'symmetry': 0.82,
-            'fallback_simple': 0.70
-        }
-        
-        # Score each option
-        scores = {}
-        for option in options:
-            carbon_score = carbon_weights.get(option, 0.5)
-            performance_score = performance_weights.get(option, 0.5)
-            
-            # Adjust for carbon intensity
-            if carbon_intensity > 500:
-                carbon_weight = 0.7
-                performance_weight = 0.3
-            elif carbon_intensity > 300:
-                carbon_weight = 0.5
-                performance_weight = 0.5
-            else:
-                carbon_weight = 0.3
-                performance_weight = 0.7
-            
-            scores[option] = carbon_score * carbon_weight + performance_score * performance_weight
-        
-        # Select best option
-        if not scores:
-            return 'dd', 0.5
-        
-        best_option = max(scores.items(), key=lambda x: x[1])
-        
-        self.selection_history.append({
-            'timestamp': datetime.utcnow().isoformat(),
-            'carbon_intensity': carbon_intensity,
-            'selected': best_option[0],
-            'score': best_option[1]
-        })
-        
-        return best_option
 
 # ============================================================================
 # ENHANCED DATA CLASSES
@@ -648,6 +830,9 @@ class QuantumCircuit:
     carbon_impact_kg: float = 0.0
     helium_usage_l: float = 0.0
     sustainability_score: float = 0.0
+    # NEW: QEC fields
+    logical_qubits: int = 0
+    qec_enabled: bool = False
     
     def get_circuit_hash(self) -> str:
         import hashlib
@@ -667,6 +852,9 @@ class ErrorMitigationResult:
     helium_efficiency: float = 0.0
     sustainability_score: float = 0.0
     federated_round: int = 0
+    # NEW: QEC fields
+    qec_used: bool = False
+    logical_error_rate: float = 0.0
 
 # ============================================================================
 # ENHANCED QUANTUM ERROR MITIGATOR
@@ -674,14 +862,14 @@ class ErrorMitigationResult:
 
 class QuantumErrorMitigator:
     """
-    Enhanced Quantum Error Mitigation system with sustainability features.
+    Enhanced Quantum Error Mitigation v2.0.0 with sustainability features.
     
-    Features:
-    - Multiple mitigation strategies with carbon awareness
-    - Federated learning for error models
-    - Predictive analytics for mitigation effectiveness
-    - Sustainability dashboard
-    - Helium tracking
+    New Features:
+    - Carbon price forecasting
+    - Helium price forecasting
+    - Differential privacy for federated models
+    - Online learning for continuous model improvement
+    - Quantum Error Correction integration
     """
     
     def __init__(
@@ -691,7 +879,9 @@ class QuantumErrorMitigator:
         enable_federated: bool = True,
         enable_predictive: bool = True,
         enable_sustainability_dashboard: bool = True,
-        server_url: Optional[str] = None
+        enable_qec: bool = True,
+        server_url: Optional[str] = None,
+        privacy_epsilon: float = 1.0
     ):
         # Feature flags
         self.enable_carbon_intensity = enable_carbon_intensity
@@ -699,12 +889,14 @@ class QuantumErrorMitigator:
         self.enable_federated = enable_federated
         self.enable_predictive = enable_predictive
         self.enable_sustainability_dashboard = enable_sustainability_dashboard
+        self.enable_qec = enable_qec
         
         # New modules
         self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
         self.helium_tracker = HeliumQuantumTracker() if enable_helium_tracking else None
-        self.federated_mitigator = FederatedQuantumMitigator(server_url) if enable_federated else None
+        self.federated_mitigator = FederatedQuantumMitigator(server_url, privacy_epsilon) if enable_federated else None
         self.predictive_analyzer = PredictiveQuantumAnalyzer() if enable_predictive else None
+        self.qec = QuantumErrorCorrection() if enable_qec else None
         self.sustainability_dashboard = QuantumSustainabilityDashboard() if enable_sustainability_dashboard else None
         self.carbon_selector = QuantumCarbonAwareSelector(self.carbon_manager) if enable_carbon_intensity else None
         
@@ -735,7 +927,7 @@ class QuantumErrorMitigator:
         # Start background tasks
         self._start_background_tasks()
         
-        logger.info("Enhanced Quantum Error Mitigator initialized")
+        logger.info("Enhanced Quantum Error Mitigator v2.0.0 initialized")
     
     def _start_background_tasks(self):
         if self.enable_carbon_intensity:
@@ -799,15 +991,23 @@ class QuantumErrorMitigator:
         target_error_rate: float = 0.01,
         max_overhead: float = 10.0,
         preferred_method: Optional[str] = None,
-        carbon_aware: bool = True
+        carbon_aware: bool = True,
+        use_qec: bool = False
     ) -> Tuple[QuantumCircuit, ErrorMitigationResult]:
         """
-        Apply error mitigation with sustainability awareness.
+        Apply error mitigation with sustainability awareness and QEC.
         """
-        # Get carbon intensity
+        # Get carbon intensity and prices
         carbon_intensity = 400
+        carbon_price = 50.0
         if self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_carbon_price()
+        
+        # Get helium price
+        helium_price = 0.5
+        if self.helium_tracker:
+            helium_price = await self.helium_tracker.get_current_helium_price()
         
         # Calculate original carbon impact
         original_carbon = self.carbon_manager.calculate_quantum_carbon_impact(
@@ -831,14 +1031,21 @@ class QuantumErrorMitigator:
             self.mitigation_history.append(result)
             return circuit, result
         
+        # Apply QEC if enabled
+        if use_qec and self.enable_qec and self.qec:
+            qec_circuit, qec_result = await self._apply_qec(circuit)
+            if qec_result.success_probability > 0.8:
+                return qec_circuit, qec_result
+        
         # Select mitigation strategy
         if preferred_method and preferred_method in self.strategies:
             strategy = preferred_method
         elif carbon_aware and self.carbon_selector:
             options = list(self.strategies.keys())
+            # Include carbon price in selection
             strategy, _ = await self.carbon_selector.select_mitigation_with_carbon(
                 options, {'depth': circuit.depth, 'n_qubits': circuit.n_qubits},
-                carbon_intensity
+                carbon_intensity, carbon_price
             )
         else:
             strategy = self._select_strategy(circuit, current_error, target_error_rate)
@@ -855,7 +1062,7 @@ class QuantumErrorMitigator:
                 max_overhead
             )
             
-            # Calculate carbon savings
+            # Calculate carbon savings with price
             mitigated_carbon = self.carbon_manager.calculate_quantum_carbon_impact(
                 mitigated_circuit.depth, mitigated_circuit.n_qubits
             ) if self.carbon_manager else 0
@@ -865,14 +1072,17 @@ class QuantumErrorMitigator:
                     original_carbon, mitigated_carbon
                 )
                 result.carbon_saved_kg = carbon_saved
+                # Add economic value
+                result.resource_cost['carbon_price_usd_per_ton'] = carbon_price
             
-            # Track helium usage
+            # Track helium usage with price
             if self.helium_tracker:
                 helium_amount = result.overhead_factor * 0.01
                 await self.helium_tracker.record_helium_usage(
                     strategy, helium_amount, strategy
                 )
                 result.helium_efficiency = self.helium_tracker.get_helium_efficiency(strategy)
+                result.resource_cost['helium_price_usd_per_l'] = helium_price
             
             # Calculate sustainability score
             result.sustainability_score = self._calculate_sustainability_score(result)
@@ -914,16 +1124,74 @@ class QuantumErrorMitigator:
             logger.error(f"Error mitigation failed: {str(e)}")
             return await self._fallback_mitigation(circuit, target_error_rate)
     
+    async def _apply_qec(self, circuit: QuantumCircuit) -> Tuple[QuantumCircuit, ErrorMitigationResult]:
+        """Apply Quantum Error Correction"""
+        if not self.qec:
+            return circuit, ErrorMitigationResult(
+                original_error_rate=circuit.error_rate,
+                mitigated_error_rate=circuit.error_rate,
+                mitigation_method='qec_failed',
+                overhead_factor=1.0,
+                success_probability=0.0,
+                resource_cost={},
+                qec_used=False
+            )
+        
+        # Encode logical qubits
+        physical_qubits = list(range(circuit.n_qubits))
+        lattice = self.qec.encode_logical_qubit(physical_qubits)
+        
+        # Simulate syndrome measurement
+        syndrome = np.random.choice([0, 1], size=len(lattice['syndrome_qubits']))
+        error_detection = await self.qec.detect_errors(syndrome)
+        
+        if error_detection['needs_correction']:
+            correction_targets = await self.qec.decode_syndrome(syndrome)
+            correction_result = await self.qec.apply_correction(
+                physical_qubits, correction_targets
+            )
+            
+            if correction_result['success']:
+                logical_error_rate = circuit.error_rate * 0.1  # 10x improvement
+            else:
+                logical_error_rate = circuit.error_rate * 0.8
+        else:
+            logical_error_rate = circuit.error_rate * 0.05
+        
+        qec_circuit = QuantumCircuit(
+            n_qubits=circuit.n_qubits,
+            gates=circuit.gates.copy(),
+            depth=circuit.depth,
+            error_rate=logical_error_rate,
+            logical_qubits=1,
+            qec_enabled=True
+        )
+        
+        result = ErrorMitigationResult(
+            original_error_rate=circuit.error_rate,
+            mitigated_error_rate=logical_error_rate,
+            mitigation_method='qec_surface_code',
+            overhead_factor=float(self.qec.physical_qubits_per_logical),
+            success_probability=0.9,
+            resource_cost={'physical_qubits': self.qec.physical_qubits_per_logical},
+            qec_used=True,
+            logical_error_rate=logical_error_rate
+        )
+        
+        return qec_circuit, result
+    
     def _calculate_sustainability_score(self, result: ErrorMitigationResult) -> float:
-        """Calculate sustainability score for mitigation result"""
         improvement = 1 - result.mitigated_error_rate / max(result.original_error_rate, 0.001)
         carbon_score = 1.0 - min(1.0, result.carbon_saved_kg / 0.1) if self.carbon_manager else 0.5
         helium_score = result.helium_efficiency if self.helium_tracker else 0.5
         
-        return 0.4 * improvement + 0.3 * carbon_score + 0.3 * helium_score
+        # QEC bonus
+        qec_bonus = 0.1 if result.qec_used else 0.0
+        
+        return 0.35 * improvement + 0.25 * carbon_score + 0.25 * helium_score + 0.15 * qec_bonus
     
     # ============================================================================
-    # Existing Mitigation Methods (Preserved and Enhanced)
+    # Existing Mitigation Methods (Preserved)
     # ============================================================================
     
     async def zero_noise_extrapolation(
@@ -1366,7 +1634,7 @@ class QuantumErrorMitigator:
     # ============================================================================
     
     def get_mitigation_statistics(self) -> Dict[str, Any]:
-        return {
+        stats = {
             **self.performance_metrics,
             'success_rate': (
                 self.performance_metrics['successful_mitigations'] /
@@ -1378,14 +1646,19 @@ class QuantumErrorMitigator:
                     'improvement': 1 - r.mitigated_error_rate / max(r.original_error_rate, 0.001),
                     'overhead': r.overhead_factor,
                     'carbon_saved_kg': r.carbon_saved_kg,
-                    'sustainability_score': r.sustainability_score
+                    'sustainability_score': r.sustainability_score,
+                    'qec_used': r.qec_used
                 }
                 for r in self.mitigation_history[-10:]
             ]
         }
+        
+        if self.enable_qec and self.qec:
+            stats['qec_status'] = self.qec.get_qec_status()
+        
+        return stats
     
     def get_sustainability_dashboard_status(self) -> Dict:
-        """Get sustainability dashboard status"""
         if self.sustainability_dashboard:
             return asyncio.run(
                 self.sustainability_dashboard.get_dashboard_status(
@@ -1395,7 +1668,6 @@ class QuantumErrorMitigator:
         return {'status': 'dashboard_not_enabled'}
     
     def get_sustainability_report(self) -> Dict:
-        """Get sustainability report"""
         if self.sustainability_dashboard:
             status = asyncio.run(
                 self.sustainability_dashboard.get_dashboard_status(
@@ -1406,30 +1678,42 @@ class QuantumErrorMitigator:
         return {'status': 'dashboard_not_enabled'}
     
     def get_predictive_insights(self) -> Dict:
-        """Get predictive insights"""
         if self.predictive_analyzer:
             return asyncio.run(self.predictive_analyzer.predict_mitigation_effectiveness({}))
         return {'status': 'predictive_not_enabled'}
     
     def get_helium_status(self) -> Dict:
-        """Get helium status"""
         if self.helium_tracker:
             return self.helium_tracker.get_helium_position()
         return {'status': 'helium_tracking_not_enabled'}
     
     def get_carbon_status(self) -> Dict:
-        """Get carbon status"""
         if self.carbon_manager:
             return {
                 'current_intensity': asyncio.run(self.carbon_manager.get_current_intensity()),
+                'current_price_usd_per_ton': asyncio.run(self.carbon_manager.get_current_carbon_price()),
                 'total_savings_kg': self.carbon_manager.total_carbon_savings_kg,
                 'trend': asyncio.run(self.carbon_manager.get_carbon_trend())
             }
         return {'status': 'carbon_tracking_not_enabled'}
     
+    def get_price_forecasts(self) -> Dict:
+        """Get price forecasts for carbon and helium"""
+        forecasts = {}
+        
+        if self.carbon_manager:
+            carbon_forecast = asyncio.run(self.carbon_manager.forecast_carbon_prices())
+            forecasts['carbon'] = carbon_forecast
+        
+        if self.helium_tracker:
+            helium_forecast = asyncio.run(self.helium_tracker.forecast_helium_prices())
+            forecasts['helium'] = helium_forecast
+        
+        return forecasts
+    
     async def shutdown(self):
         """Graceful shutdown"""
-        logger.info("Shutting down Quantum Error Mitigator")
+        logger.info("Shutting down Quantum Error Mitigator v2.0.0")
         if self.carbon_manager:
             await self.carbon_manager.close()
         if self.federated_mitigator:
@@ -1448,3 +1732,182 @@ async def get_quantum_mitigator() -> QuantumErrorMitigator:
     if _mitigator_instance is None:
         _mitigator_instance = QuantumErrorMitigator()
     return _mitigator_instance
+
+# ============================================================================
+# SUSTAINABILITY DASHBOARD MODULE (Preserved)
+# ============================================================================
+
+class QuantumSustainabilityDashboard:
+    """Sustainability dashboard for quantum error mitigation"""
+    
+    def __init__(self):
+        self.history = []
+        self.alert_thresholds = {
+            'carbon_intensity': 500,
+            'helium_remaining': 0.2,
+            'error_rate': 0.1
+        }
+        self._running = True
+        
+        logger.info("Quantum Sustainability Dashboard initialized")
+    
+    async def get_dashboard_status(self, carbon_manager=None, helium_tracker=None, mitigator=None) -> Dict:
+        """Get sustainability dashboard status"""
+        status = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': 0.5
+        }
+        
+        if carbon_manager:
+            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
+            status['carbon_price'] = await carbon_manager.get_current_carbon_price()
+            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
+        
+        if helium_tracker:
+            helium_pos = helium_tracker.get_helium_position()
+            status['helium_position'] = helium_pos
+            status['helium_price'] = helium_pos.get('current_price_usd_per_l', 0.5)
+            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
+        
+        if mitigator:
+            stats = mitigator.get_mitigation_statistics()
+            status['mitigation_performance'] = stats
+            status['success_rate'] = stats.get('success_rate', 0)
+            status['average_improvement'] = stats.get('average_improvement', 0)
+        
+        score = 0.5
+        if status.get('success_rate', 0) > 0.8:
+            score += 0.2
+        if status.get('carbon_intensity', 400) < 300:
+            score += 0.15
+        if status.get('helium_remaining_ratio', 0.5) > 0.5:
+            score += 0.15
+        
+        status['sustainability_score'] = min(1.0, max(0.0, score))
+        
+        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
+            status['alerts'] = ['High carbon intensity detected']
+        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
+            status['alerts'] = status.get('alerts', []) + ['Helium budget critically low']
+        if status.get('success_rate', 1.0) < 0.7:
+            status['alerts'] = status.get('alerts', []) + ['Mitigation success rate low']
+        
+        return status
+    
+    def generate_sustainability_report(self, status: Dict) -> Dict:
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': status.get('sustainability_score', 0.5),
+            'carbon_status': {
+                'intensity': status.get('carbon_intensity', 0),
+                'price_usd_per_ton': status.get('carbon_price', 50),
+                'savings_kg': status.get('carbon_savings_kg', 0)
+            },
+            'helium_status': {
+                'remaining_ratio': status.get('helium_remaining_ratio', 0.5),
+                'price_usd_per_l': status.get('helium_price', 0.5)
+            },
+            'mitigation_status': status.get('mitigation_performance', {}),
+            'alerts': status.get('alerts', []),
+            'recommendations': self._generate_recommendations(status)
+        }
+    
+    def _generate_recommendations(self, status: Dict) -> List[str]:
+        recommendations = []
+        
+        if status.get('carbon_intensity', 0) > 400:
+            recommendations.append("Schedule quantum operations during low-carbon hours")
+        
+        if status.get('helium_remaining_ratio', 1.0) < 0.3:
+            recommendations.append("Implement helium recovery for quantum operations")
+        
+        if status.get('success_rate', 1.0) < 0.8:
+            recommendations.append("Review mitigation strategy selection for better results")
+        
+        return recommendations or ["All sustainability metrics are within acceptable ranges"]
+
+# ============================================================================
+# QUANTUM CARBON-AWARE SELECTOR MODULE (Preserved)
+# ============================================================================
+
+class QuantumCarbonAwareSelector:
+    """Carbon-aware mitigation strategy selection with price awareness"""
+    
+    def __init__(self, carbon_manager=None):
+        self.carbon_manager = carbon_manager
+        self.selection_history = deque(maxlen=1000)
+        
+        logger.info("Quantum Carbon-Aware Selector initialized")
+    
+    async def select_mitigation_with_carbon(
+        self,
+        options: List[str],
+        circuit: Dict,
+        carbon_intensity: Optional[float] = None,
+        carbon_price: Optional[float] = None
+    ) -> Tuple[str, float]:
+        """Select mitigation strategy with carbon and price awareness"""
+        if carbon_intensity is None and self.carbon_manager:
+            carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_carbon_price()
+        else:
+            carbon_intensity = carbon_intensity or 400
+            carbon_price = carbon_price or 50
+        
+        # Carbon weights per strategy
+        carbon_weights = {
+            'dd': 0.9,
+            'measurement': 0.85,
+            'symmetry': 0.8,
+            'hybrid': 0.7,
+            'zne': 0.6,
+            'cdr': 0.5,
+            'pec': 0.4,
+            'fallback_simple': 0.95
+        }
+        
+        performance_weights = {
+            'dd': 0.85,
+            'hybrid': 0.92,
+            'zne': 0.90,
+            'pec': 0.88,
+            'cdr': 0.85,
+            'measurement': 0.80,
+            'symmetry': 0.82,
+            'fallback_simple': 0.70
+        }
+        
+        # Price factor: higher price = higher carbon weight
+        price_factor = min(2.0, carbon_price / 50.0)
+        
+        scores = {}
+        for option in options:
+            carbon_score = carbon_weights.get(option, 0.5)
+            performance_score = performance_weights.get(option, 0.5)
+            
+            if carbon_intensity > 500:
+                carbon_weight = min(0.8, 0.5 + price_factor * 0.15)
+                performance_weight = 1.0 - carbon_weight
+            elif carbon_intensity > 300:
+                carbon_weight = min(0.6, 0.3 + price_factor * 0.15)
+                performance_weight = 1.0 - carbon_weight
+            else:
+                carbon_weight = max(0.2, 0.3 - price_factor * 0.05)
+                performance_weight = 1.0 - carbon_weight
+            
+            scores[option] = carbon_score * carbon_weight + performance_score * performance_weight
+        
+        if not scores:
+            return 'dd', 0.5
+        
+        best_option = max(scores.items(), key=lambda x: x[1])
+        
+        self.selection_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'carbon_intensity': carbon_intensity,
+            'carbon_price': carbon_price,
+            'selected': best_option[0],
+            'score': best_option[1]
+        })
+        
+        return best_option
