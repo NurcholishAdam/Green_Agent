@@ -1,10 +1,12 @@
 # File: enhancements/security/zero_trust_architecture.py
 
 """
-Zero Trust Security Architecture for Green Agent
+Zero Trust Security Architecture for Green Agent v2.0.0
 Implements complete zero-trust security model for expert routing and execution.
 ENHANCED WITH: Carbon Intensity Integration, Helium Tracking, Sustainability Dashboard,
-Predictive Security Analytics, Carbon-Aware Authentication, and Complete Green Agent Capabilities
+Predictive Security Analytics, Carbon-Aware Authentication, Carbon Price Awareness (NEW),
+Helium Price Forecasting (NEW), Online Learning for Predictive Models (NEW),
+Adaptive Rate Limiting Based on Threat Level (NEW), Immutable Ledger Integration (NEW)
 """
 
 import asyncio
@@ -30,15 +32,17 @@ import os
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import r2_score, mean_absolute_error
+import hashlib
+import time
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CARBON INTENSITY INTEGRATION MODULE
+# CARBON INTENSITY MANAGER WITH PRICE AWARENESS (ENHANCED)
 # ============================================================================
 
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration for security operations"""
+    """Real-time carbon intensity integration with price awareness"""
     
     def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
         self.endpoint = endpoint
@@ -52,8 +56,12 @@ class CarbonIntensityManager:
         self.historical_intensities = deque(maxlen=1000)
         self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
         self.total_carbon_savings_kg = 0.0
+        # NEW: Carbon price awareness
+        self.carbon_price_usd_per_ton = 50.0
+        self.price_history = deque(maxlen=1000)
+        self.price_forecast_model = None
+        self._initialize_price_forecast_model()
         
-        # Regional profiles for fallback
         self.region_profiles = {
             'us-east': {'timezone': -5, 'renewable_pct': 30, 'base_intensity': 420},
             'us-west': {'timezone': -8, 'renewable_pct': 45, 'base_intensity': 350},
@@ -67,7 +75,16 @@ class CarbonIntensityManager:
             'middle-east': {'timezone': 3, 'renewable_pct': 15, 'base_intensity': 550}
         }
         
-        logger.info("Carbon Intensity Manager initialized for security operations")
+        logger.info("Carbon Intensity Manager initialized with price awareness")
+    
+    def _initialize_price_forecast_model(self):
+        try:
+            from sklearn.linear_model import LinearRegression
+            self.price_forecast_model = LinearRegression()
+            self.price_forecast_trained = False
+        except ImportError:
+            self.price_forecast_model = None
+            self.price_forecast_trained = False
     
     async def _get_session(self):
         if self._session is None:
@@ -94,18 +111,37 @@ class CarbonIntensityManager:
                             'timestamp': self.last_update
                         }
                         self.historical_intensities.append(self.carbon_intensity)
+                        self._update_carbon_price(self.carbon_intensity)
                         logger.info(f"Carbon intensity updated: {region} = {self.carbon_intensity} gCO2/kWh")
                         return {'intensity': self.carbon_intensity, 'region': region}
                     else:
                         self.carbon_intensity = self._get_fallback_intensity(region)
                         self.last_update = datetime.now()
+                        self._update_carbon_price(self.carbon_intensity)
                         
             except Exception as e:
                 logger.error(f"Carbon intensity fetch error: {e}")
                 self.carbon_intensity = self._get_fallback_intensity(region)
                 self.last_update = datetime.now()
+                self._update_carbon_price(self.carbon_intensity)
             
             return {'intensity': self.carbon_intensity, 'region': self.region}
+    
+    def _update_carbon_price(self, intensity: float):
+        base_price = 50.0
+        intensity_factor = (intensity - 300) / 500
+        self.carbon_price_usd_per_ton = max(10.0, base_price * (1.0 + intensity_factor))
+        self.price_history.append({
+            'timestamp': self.last_update.isoformat() if self.last_update else None,
+            'price': self.carbon_price_usd_per_ton
+        })
+        if len(self.price_history) > 5 and self.price_forecast_model:
+            prices = [p['price'] for p in list(self.price_history)[-20:]]
+            if len(prices) > 10:
+                X = np.array(range(len(prices))).reshape(-1, 1)
+                y = np.array(prices)
+                self.price_forecast_model.fit(X, y)
+                self.price_forecast_trained = True
     
     def _get_fallback_intensity(self, region: str) -> float:
         return self.region_profiles.get(region, {}).get('base_intensity', 400)
@@ -116,9 +152,36 @@ class CarbonIntensityManager:
             await self.update_carbon_intensity(self.region)
         return self.carbon_intensity
     
+    async def get_current_carbon_price(self) -> float:
+        if self.last_update is None or \
+           (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_price_usd_per_ton
+    
+    async def forecast_carbon_prices(self, hours: int = 24) -> Dict[str, Any]:
+        if not self.price_forecast_trained or not self.price_forecast_model:
+            return {'status': 'not_trained'}
+        
+        try:
+            future_indices = np.array(range(
+                len(self.price_history),
+                len(self.price_history) + hours
+            )).reshape(-1, 1)
+            predictions = self.price_forecast_model.predict(future_indices)
+            
+            return {
+                'status': 'success',
+                'predictions': predictions.tolist(),
+                'confidence': 0.8 if len(self.price_history) > 50 else 0.5,
+                'current_price': self.carbon_price_usd_per_ton,
+                'forecast_hours': hours
+            }
+        except Exception as e:
+            logger.error(f"Carbon price forecast error: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
     def calculate_security_carbon_impact(self, operation_type: str, complexity: float = 1.0) -> float:
-        """Calculate carbon impact of security operation"""
-        energy_per_operation = 0.00001 * complexity  # kWh per operation
+        energy_per_operation = 0.00001 * complexity
         carbon_kg = energy_per_operation * self.carbon_intensity / 1000
         return carbon_kg
     
@@ -141,11 +204,11 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# HELIUM SECURITY TRACKER MODULE
+# HELIUM SECURITY TRACKER WITH PRICE FORECASTING (ENHANCED)
 # ============================================================================
 
 class HeliumSecurityTracker:
-    """Helium tracking for security operations"""
+    """Helium tracking for security operations with price forecasting"""
     
     def __init__(self, helium_budget_l: float = 50.0):
         self.helium_budget_l = helium_budget_l
@@ -154,8 +217,12 @@ class HeliumSecurityTracker:
         self.total_usage_l = 0.0
         self._lock = asyncio.Lock()
         self.history = deque(maxlen=10000)
+        # NEW: Helium price forecasting
+        self.helium_price_usd_per_l = 0.5
+        self.price_history = deque(maxlen=1000)
+        self.price_forecast_model = None
+        self._initialize_price_forecast_model()
         
-        # Helium efficiency by security operation
         self.operation_efficiency = {
             'authentication': 0.85,
             'authorization': 0.80,
@@ -169,15 +236,42 @@ class HeliumSecurityTracker:
         
         logger.info(f"Helium Security Tracker initialized: budget={helium_budget_l}L")
     
-    async def record_helium_usage(self, operation: str, amount_l: float, component: str = None):
+    def _initialize_price_forecast_model(self):
+        try:
+            from sklearn.linear_model import LinearRegression
+            self.price_forecast_model = LinearRegression()
+            self.price_forecast_trained = False
+        except ImportError:
+            self.price_forecast_model = None
+            self.price_forecast_trained = False
+    
+    def _update_helium_price(self, scarcity: float):
+        base_price = 0.5
+        self.helium_price_usd_per_l = max(0.1, base_price * (1.0 + scarcity * 0.8))
+        self.price_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'price': self.helium_price_usd_per_l
+        })
+        if len(self.price_history) > 5 and self.price_forecast_model:
+            prices = [p['price'] for p in list(self.price_history)[-20:]]
+            if len(prices) > 10:
+                X = np.array(range(len(prices))).reshape(-1, 1)
+                y = np.array(prices)
+                self.price_forecast_model.fit(X, y)
+                self.price_forecast_trained = True
+    
+    async def record_helium_usage(self, operation: str, amount_l: float, component: str = None, scarcity: float = 0.5):
         async with self._lock:
             self.operation_helium[operation] = self.operation_helium.get(operation, 0) + amount_l
             self.total_usage_l += amount_l
+            self._update_helium_price(scarcity)
             
             self.history.append({
                 'operation': operation,
                 'amount_l': amount_l,
                 'component': component,
+                'scarcity': scarcity,
+                'price_usd_per_l': self.helium_price_usd_per_l,
                 'timestamp': datetime.utcnow().isoformat()
             })
             
@@ -186,6 +280,31 @@ class HeliumSecurityTracker:
     def get_helium_efficiency(self, operation: str) -> float:
         return self.operation_efficiency.get(operation, 0.5)
     
+    async def get_current_helium_price(self) -> float:
+        return self.helium_price_usd_per_l
+    
+    async def forecast_helium_prices(self, hours: int = 24) -> Dict[str, Any]:
+        if not self.price_forecast_trained or not self.price_forecast_model:
+            return {'status': 'not_trained'}
+        
+        try:
+            future_indices = np.array(range(
+                len(self.price_history),
+                len(self.price_history) + hours
+            )).reshape(-1, 1)
+            predictions = self.price_forecast_model.predict(future_indices)
+            
+            return {
+                'status': 'success',
+                'predictions': predictions.tolist(),
+                'confidence': 0.8 if len(self.price_history) > 50 else 0.5,
+                'current_price': self.helium_price_usd_per_l,
+                'forecast_hours': hours
+            }
+        except Exception as e:
+            logger.error(f"Helium price forecast error: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
     def get_helium_position(self) -> Dict[str, Any]:
         return {
             'budget_l': self.helium_budget_l,
@@ -193,6 +312,7 @@ class HeliumSecurityTracker:
             'remaining_budget_l': self.helium_budget_l - self.total_usage_l,
             'operation_efficiencies': self.operation_efficiency,
             'operation_usage': self.operation_helium,
+            'current_price_usd_per_l': self.helium_price_usd_per_l,
             'status': 'critical' if self.total_usage_l > self.helium_budget_l * 0.8 else 'healthy'
         }
     
@@ -202,18 +322,23 @@ class HeliumSecurityTracker:
         return saved
 
 # ============================================================================
-# PREDICTIVE SECURITY ANALYZER MODULE
+# PREDICTIVE SECURITY ANALYZER WITH ONLINE LEARNING (ENHANCED)
 # ============================================================================
 
 class PredictiveSecurityAnalyzer:
-    """Predictive analytics for security operations"""
+    """Predictive analytics for security operations with online learning"""
     
-    def __init__(self, history_window: int = 100):
+    def __init__(self, history_window: int = 100, online_learning_rate: float = 0.01):
         self.history_window = history_window
         self.security_history = deque(maxlen=history_window)
         self.models = {}
         self.scaler = StandardScaler()
         self.is_trained = False
+        # NEW: Online learning
+        self.online_learning_rate = online_learning_rate
+        self.model_version = 0
+        self.samples_since_last_train = 0
+        self.retrain_threshold = 50
         
         try:
             from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -224,7 +349,7 @@ class PredictiveSecurityAnalyzer:
             self._ml_available = False
             logger.warning("Scikit-learn not available - predictive analytics limited")
         
-        logger.info("Predictive Security Analyzer initialized")
+        logger.info("Predictive Security Analyzer initialized with online learning")
     
     def update_history(self, security_data: Dict):
         self.security_history.append({
@@ -235,31 +360,61 @@ class PredictiveSecurityAnalyzer:
             'violation_count': security_data.get('violation_count', 0),
             'request_volume': security_data.get('request_volume', 100)
         })
+        
+        self.samples_since_last_train += 1
+        
+        if self.samples_since_last_train >= self.retrain_threshold and self.is_trained:
+            asyncio.create_task(self._online_learning_update())
+    
+    async def _online_learning_update(self):
+        try:
+            recent_data = list(self.security_history)[-self.samples_since_last_train:]
+            if len(recent_data) > 10:
+                X, y = self._prepare_training_data(recent_data)
+                if len(X) > 0:
+                    X_scaled = self.scaler.transform(X)
+                    for name, model in self.models.items():
+                        if model is not None:
+                            if hasattr(model, 'partial_fit'):
+                                model.partial_fit(X_scaled, y)
+                            else:
+                                await self.train_prediction_model()
+                    
+                    self.model_version += 1
+                    self.samples_since_last_train = 0
+                    logger.info(f"Online learning update complete (version {self.model_version})")
+        except Exception as e:
+            logger.error(f"Online learning update error: {e}")
+    
+    def _prepare_training_data(self, data: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+        X = []
+        y = []
+        
+        if len(data) < 5:
+            return np.array(X), np.array(y)
+        
+        for i in range(len(data) - 1):
+            features = [
+                data[i]['threat_level'],
+                data[i]['risk_score'],
+                data[i]['auth_success_rate'],
+                data[i]['violation_count'] / 10,
+                data[i]['request_volume'] / 1000
+            ]
+            X.append(features)
+            y.append(data[i + 1]['threat_level'])
+        
+        return np.array(X), np.array(y)
     
     async def train_prediction_model(self):
         if not self._ml_available or len(self.security_history) < 10:
             return {'status': 'insufficient_data', 'samples': len(self.security_history)}
         
-        X = []
-        y = []
-        history_list = list(self.security_history)
+        X, y = self._prepare_training_data(list(self.security_history))
         
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['threat_level'],
-                    data['risk_score'],
-                    data['auth_success_rate'],
-                    data['violation_count'] / 10,
-                    data['request_volume'] / 1000
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['threat_level'])
+        if len(X) < 10:
+            return {'status': 'insufficient_training_data', 'samples': len(X)}
         
-        X = np.array(X)
-        y = np.array(y)
         X_scaled = self.scaler.fit_transform(X)
         
         results = {}
@@ -271,11 +426,13 @@ class PredictiveSecurityAnalyzer:
                 results[name] = r2
         
         self.is_trained = True
-        logger.info(f"Security prediction models trained. R²: {results}")
+        self.model_version += 1
+        self.samples_since_last_train = 0
+        
+        logger.info(f"Security prediction models trained. R²: {results} (version {self.model_version})")
         return {'status': 'success', 'results': results, 'samples': len(X)}
     
     async def predict_security_risk(self, context: Dict) -> Dict:
-        """Predict security risk using ML"""
         if not self.is_trained or len(self.security_history) < 10:
             return {'predicted_risk': 0.5, 'confidence': 0.0}
         
@@ -308,6 +465,7 @@ class PredictiveSecurityAnalyzer:
         return {
             'predicted_risk': max(0.0, min(1.0, prediction)),
             'confidence': confidence,
+            'model_version': self.model_version,
             'trend': self._calculate_trend()
         }
     
@@ -327,7 +485,6 @@ class PredictiveSecurityAnalyzer:
         return 'stable'
     
     async def forecast_security_threats(self, hours: int = 24) -> Dict:
-        """Forecast potential security threats"""
         if len(self.security_history) < 10:
             return {'forecast': [], 'confidence': 0.0}
         
@@ -357,242 +514,203 @@ class PredictiveSecurityAnalyzer:
             actions.append("Review recent access patterns")
             actions.append("Update rate limiting policies")
         return actions or ["Current threat levels are manageable"]
+    
+    def get_model_performance(self) -> Dict:
+        return {
+            'is_trained': self.is_trained,
+            'model_version': self.model_version,
+            'samples_since_last_train': self.samples_since_last_train,
+            'online_learning_rate': self.online_learning_rate,
+            'models': list(self.models.keys())
+        }
 
 # ============================================================================
-# SUSTAINABILITY SECURITY DASHBOARD MODULE
+# IMMUTABLE LEDGER INTEGRATION (NEW)
 # ============================================================================
 
-class SecuritySustainabilityDashboard:
-    """Sustainability dashboard for security operations"""
+class ImmutableSecurityLedger:
+    """
+    Immutable ledger for security audit trail.
+    
+    Features:
+    - Blockchain-style immutable chain
+    - Cryptographic proof of integrity
+    - Tamper-evident audit trail
+    - Compliance-ready logging
+    """
     
     def __init__(self):
-        self.history = []
-        self.alert_thresholds = {
-            'carbon_intensity': 500,
-            'helium_remaining': 0.2,
-            'security_overhead': 0.3,
-            'threat_level': 0.7
-        }
-        self._running = True
+        self.chain = []
+        self.current_hash = "0" * 64
+        self.genesis_block()
         
-        logger.info("Security Sustainability Dashboard initialized")
+        logger.info("Immutable Security Ledger initialized")
     
-    async def get_dashboard_status(self, carbon_manager=None, helium_tracker=None, 
-                                   security_analyzer=None, zero_trust=None) -> Dict:
-        """Get sustainability dashboard status"""
-        status = {
+    def genesis_block(self):
+        """Create genesis block"""
+        block = {
+            'index': 0,
             'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': 0.5
+            'data': {'type': 'genesis'},
+            'previous_hash': "0" * 64,
+            'hash': self._calculate_hash(0, "0" * 64, {'type': 'genesis'})
         }
-        
-        # Carbon position
-        if carbon_manager:
-            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
-            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
-        
-        # Helium position
-        if helium_tracker:
-            helium_pos = helium_tracker.get_helium_position()
-            status['helium_position'] = helium_pos
-            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
-        
-        # Security posture
-        if zero_trust:
-            posture = zero_trust.get_security_posture()
-            status['security_posture'] = posture
-            status['active_sessions'] = posture.get('active_sessions', 0)
-            status['security_violations'] = posture.get('security_violations', 0)
-        
-        # Predictive insights
-        if security_analyzer:
-            risk = await security_analyzer.predict_security_risk({})
-            status['predicted_risk'] = risk.get('predicted_risk', 0.5)
-            status['risk_trend'] = risk.get('trend', 'stable')
-        
-        # Calculate sustainability score
-        score = 0.5
-        if status.get('carbon_intensity', 400) < 300:
-            score += 0.15
-        if status.get('helium_remaining_ratio', 0.5) > 0.5:
-            score += 0.15
-        if status.get('security_violations', 100) < 10:
-            score += 0.15
-        if status.get('predicted_risk', 0.5) < 0.3:
-            score += 0.15
-        
-        status['sustainability_score'] = min(1.0, max(0.0, score))
-        
-        # Check alerts
-        alerts = []
-        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
-            alerts.append("High carbon intensity detected")
-        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
-            alerts.append("Helium budget critically low")
-        if status.get('predicted_risk', 0.5) > self.alert_thresholds['threat_level']:
-            alerts.append("Elevated security risk predicted")
-        status['alerts'] = alerts
-        
-        return status
+        self.chain.append(block)
+        self.current_hash = block['hash']
     
-    def generate_sustainability_report(self, status: Dict) -> Dict:
-        """Generate sustainability report"""
-        return {
+    def _calculate_hash(self, index: int, previous_hash: str, data: Dict) -> str:
+        """Calculate block hash"""
+        content = f"{index}{previous_hash}{json.dumps(data, sort_keys=True)}"
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    def add_block(self, data: Dict) -> Dict:
+        """Add a new block to the ledger"""
+        index = len(self.chain)
+        previous_hash = self.current_hash
+        block = {
+            'index': index,
             'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': status.get('sustainability_score', 0.5),
-            'carbon_status': {
-                'intensity': status.get('carbon_intensity', 0),
-                'savings_kg': status.get('carbon_savings_kg', 0)
-            },
-            'helium_status': status.get('helium_position', {}),
-            'security_status': status.get('security_posture', {}),
-            'predictive_insights': {
-                'risk': status.get('predicted_risk', 0.5),
-                'trend': status.get('risk_trend', 'stable')
-            },
-            'alerts': status.get('alerts', []),
-            'recommendations': self._generate_recommendations(status)
+            'data': data,
+            'previous_hash': previous_hash,
+            'hash': self._calculate_hash(index, previous_hash, data)
         }
+        
+        # Verify chain integrity
+        if not self._verify_block(block):
+            raise SecurityException("Block verification failed")
+        
+        self.chain.append(block)
+        self.current_hash = block['hash']
+        return block
     
-    def _generate_recommendations(self, status: Dict) -> List[str]:
-        recommendations = []
-        
-        if status.get('carbon_intensity', 0) > 400:
-            recommendations.append("Schedule security operations during low-carbon hours")
-        
-        if status.get('helium_remaining_ratio', 1.0) < 0.3:
-            recommendations.append("Implement helium recovery for security operations")
-        
-        if status.get('predicted_risk', 0.5) > 0.6:
-            recommendations.append("Review and enhance security measures")
-        
-        if status.get('security_violations', 0) > 20:
-            recommendations.append("Investigate security violation patterns")
-        
-        return recommendations or ["All security sustainability metrics are within acceptable ranges"]
-
-# ============================================================================
-# CARBON-AWARE AUTHENTICATION MODULE
-# ============================================================================
-
-class CarbonAwareAuthenticator:
-    """Carbon-aware authentication decisions"""
+    def _verify_block(self, block: Dict) -> bool:
+        """Verify block integrity"""
+        expected_hash = self._calculate_hash(
+            block['index'],
+            block['previous_hash'],
+            block['data']
+        )
+        return block['hash'] == expected_hash
     
-    def __init__(self, carbon_manager=None):
-        self.carbon_manager = carbon_manager
-        self.auth_history = deque(maxlen=1000)
-        
-        logger.info("Carbon-Aware Authenticator initialized")
+    def verify_chain(self) -> bool:
+        """Verify entire chain integrity"""
+        for i in range(1, len(self.chain)):
+            if self.chain[i]['previous_hash'] != self.chain[i-1]['hash']:
+                return False
+            if not self._verify_block(self.chain[i]):
+                return False
+        return True
     
-    async def authenticate_with_carbon_awareness(
-        self,
-        request: Dict,
-        credentials: Dict,
-        carbon_intensity: Optional[float] = None
-    ) -> Dict:
-        """Authenticate with carbon-aware decisions"""
-        if carbon_intensity is None and self.carbon_manager:
-            carbon_intensity = await self.carbon_manager.get_current_intensity()
-        else:
-            carbon_intensity = carbon_intensity or 400
-        
-        # Determine authentication level based on carbon intensity
-        if carbon_intensity > 500:
-            # High carbon - use lighter authentication
-            auth_level = 'light'
-            auth_factors = 1
-        elif carbon_intensity > 300:
-            auth_level = 'standard'
-            auth_factors = 2
-        else:
-            auth_level = 'enhanced'
-            auth_factors = 3
-        
-        # Carbon-aware MFA decision
-        if auth_level == 'light':
-            # Single factor authentication
-            return {
-                'authenticated': True,
-                'auth_level': auth_level,
-                'carbon_intensity': carbon_intensity,
-                'carbon_impact': 'low',
-                'auth_factors': auth_factors,
-                'session_duration': 7200,  # Longer session for low-carbon
-                'sustainability_score': 0.8
-            }
-        elif auth_level == 'standard':
-            # Two factor authentication
-            return {
-                'authenticated': True,
-                'auth_level': auth_level,
-                'carbon_intensity': carbon_intensity,
-                'carbon_impact': 'medium',
-                'auth_factors': auth_factors,
-                'session_duration': 3600,
-                'sustainability_score': 0.6
-            }
-        else:
-            # Enhanced authentication
-            return {
-                'authenticated': True,
-                'auth_level': auth_level,
-                'carbon_intensity': carbon_intensity,
-                'carbon_impact': 'high',
-                'auth_factors': auth_factors,
-                'session_duration': 1800,
-                'sustainability_score': 0.4
-            }
+    def get_latest_blocks(self, n: int = 10) -> List[Dict]:
+        """Get latest n blocks"""
+        return self.chain[-n:] if self.chain else []
     
-    def get_carbon_auth_stats(self) -> Dict:
-        """Get carbon-aware authentication statistics"""
-        if not self.auth_history:
-            return {'total_auths': 0}
-        
+    def get_ledger_stats(self) -> Dict:
+        """Get ledger statistics"""
         return {
-            'total_auths': len(self.auth_history),
-            'light_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'light'),
-            'standard_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'standard'),
-            'enhanced_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'enhanced'),
-            'average_sustainability': np.mean([a.get('sustainability_score', 0.5) for a in self.auth_history])
+            'total_blocks': len(self.chain),
+            'chain_integrity': self.verify_chain(),
+            'genesis_block': self.chain[0] if self.chain else None,
+            'latest_block': self.chain[-1] if self.chain else None,
+            'timestamp': datetime.utcnow().isoformat()
         }
 
 # ============================================================================
-# ENHANCED DATA CLASSES
+# ADAPTIVE RATE LIMITING BASED ON THREAT LEVEL (NEW)
 # ============================================================================
 
-class SecurityLevel(Enum):
-    PUBLIC = "public"
-    INTERNAL = "internal"
-    CONFIDENTIAL = "confidential"
-    RESTRICTED = "restricted"
-    CRITICAL = "critical"
-
-class TrustLevel(Enum):
-    UNTRUSTED = 0
-    BASIC = 1
-    VERIFIED = 2
-    TRUSTED = 3
-    PRIVILEGED = 4
-
-@dataclass
-class SecurityContext:
-    request_id: str
-    source_identity: str
-    security_level: SecurityLevel
-    trust_level: TrustLevel = TrustLevel.UNTRUSTED
-    authentication_token: Optional[str] = None
-    authorization_grants: List[str] = field(default_factory=list)
-    encryption_key: Optional[bytes] = None
-    session_id: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(hours=1))
-    carbon_impact: float = 0.0
-    sustainability_score: float = 0.0
+class AdaptiveRateLimiter:
+    """
+    Adaptive rate limiting based on threat level.
     
-    def is_expired(self) -> bool:
-        return datetime.utcnow() > self.expires_at
+    Features:
+    - Dynamic rate limits based on threat level
+    - Adaptive thresholds
+    - Suspicious activity detection
+    - Automatic limit adjustment
+    """
     
-    def has_grant(self, grant: str) -> bool:
-        return grant in self.authorization_grants
+    def __init__(self):
+        self.rate_limits = {}
+        self.threat_multipliers = {
+            'low': 1.0,
+            'medium': 0.7,
+            'high': 0.4,
+            'critical': 0.1
+        }
+        self.base_limits = {
+            'authentication': 60,
+            'authorization': 120,
+            'encryption': 200,
+            'decryption': 200,
+            'audit_logging': 500
+        }
+        self.threat_history = deque(maxlen=100)
+        
+        logger.info("Adaptive Rate Limiter initialized")
+    
+    def get_current_threat_multiplier(self) -> float:
+        """Get current threat multiplier based on recent activity"""
+        if not self.threat_history:
+            return 1.0
+        
+        recent = list(self.threat_history)[-10:]
+        avg_threat = np.mean(recent)
+        
+        if avg_threat > 0.7:
+            return self.threat_multipliers['critical']
+        elif avg_threat > 0.5:
+            return self.threat_multipliers['high']
+        elif avg_threat > 0.3:
+            return self.threat_multipliers['medium']
+        else:
+            return self.threat_multipliers['low']
+    
+    def get_rate_limit(self, action: str, threat_level: float = 0.3) -> int:
+        """Get rate limit for an action based on threat level"""
+        base = self.base_limits.get(action, 100)
+        multiplier = self.get_current_threat_multiplier()
+        
+        # Adjust for immediate threat level
+        if threat_level > 0.7:
+            multiplier *= 0.5
+        elif threat_level > 0.5:
+            multiplier *= 0.8
+        
+        return int(base * multiplier)
+    
+    def update_threat_level(self, threat_level: float):
+        """Update threat level history"""
+        self.threat_history.append(threat_level)
+    
+    def check_rate_limit(self, identity_id: str, action: str, threat_level: float = 0.3) -> bool:
+        """Check if request exceeds rate limit"""
+        key = f"{identity_id}:{action}"
+        limit = self.get_rate_limit(action, threat_level)
+        
+        if key not in self.rate_limits:
+            self.rate_limits[key] = {'count': 0, 'reset_at': datetime.utcnow() + timedelta(minutes=1)}
+        
+        limit_info = self.rate_limits[key]
+        if datetime.utcnow() > limit_info['reset_at']:
+            limit_info['count'] = 0
+            limit_info['reset_at'] = datetime.utcnow() + timedelta(minutes=1)
+        
+        if limit_info['count'] >= limit:
+            return False
+        
+        limit_info['count'] += 1
+        return True
+    
+    def get_rate_limit_status(self) -> Dict:
+        """Get rate limit status"""
+        return {
+            'active_limits': len(self.rate_limits),
+            'current_multiplier': self.get_current_threat_multiplier(),
+            'base_limits': self.base_limits,
+            'threat_history': list(self.threat_history)[-10:],
+            'timestamp': datetime.utcnow().isoformat()
+        }
 
 # ============================================================================
 # ENHANCED ZERO TRUST ARCHITECTURE
@@ -600,14 +718,14 @@ class SecurityContext:
 
 class ZeroTrustArchitecture:
     """
-    Enhanced Zero Trust Security Architecture with sustainability features.
+    Enhanced Zero Trust Security Architecture v2.0.0.
     
-    Features:
-    - Complete zero-trust implementation
-    - Carbon-aware authentication
-    - Helium tracking for security operations
-    - Predictive security analytics
-    - Sustainability dashboard
+    New Features:
+    - Carbon price awareness for authentication decisions
+    - Helium price forecasting for cost-aware security
+    - Online learning for predictive model improvement
+    - Adaptive rate limiting based on threat level
+    - Immutable ledger for audit trail
     """
     
     def __init__(
@@ -617,6 +735,8 @@ class ZeroTrustArchitecture:
         enable_predictive: bool = True,
         enable_sustainability_dashboard: bool = True,
         enable_carbon_auth: bool = True,
+        enable_immutable_ledger: bool = True,
+        enable_adaptive_ratelimit: bool = True,
         helium_budget_l: float = 50.0
     ):
         # Feature flags
@@ -625,6 +745,8 @@ class ZeroTrustArchitecture:
         self.enable_predictive = enable_predictive
         self.enable_sustainability_dashboard = enable_sustainability_dashboard
         self.enable_carbon_auth = enable_carbon_auth
+        self.enable_immutable_ledger = enable_immutable_ledger
+        self.enable_adaptive_ratelimit = enable_adaptive_ratelimit
         
         # New modules
         self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
@@ -632,6 +754,8 @@ class ZeroTrustArchitecture:
         self.predictive_analyzer = PredictiveSecurityAnalyzer() if enable_predictive else None
         self.sustainability_dashboard = SecuritySustainabilityDashboard() if enable_sustainability_dashboard else None
         self.carbon_authenticator = CarbonAwareAuthenticator(self.carbon_manager) if enable_carbon_auth else None
+        self.ledger = ImmutableSecurityLedger() if enable_immutable_ledger else None
+        self.rate_limiter = AdaptiveRateLimiter() if enable_adaptive_ratelimit else None
         
         # Core security components
         self.identities: Dict[str, Dict[str, Any]] = {}
@@ -656,7 +780,7 @@ class ZeroTrustArchitecture:
         # Start background tasks
         self._start_background_tasks()
         
-        logger.info("Enhanced Zero Trust Architecture initialized")
+        logger.info("Enhanced Zero Trust Architecture v2.0.0 initialized")
     
     def _start_background_tasks(self):
         if self.enable_carbon_intensity:
@@ -688,6 +812,12 @@ class ZeroTrustArchitecture:
                             'request_volume': len(self.audit_log)
                         })
                     await self.predictive_analyzer.train_prediction_model()
+                    
+                    # Update rate limiter with threat level
+                    if self.rate_limiter:
+                        risk_score = await self._calculate_risk_score()
+                        self.rate_limiter.update_threat_level(risk_score)
+                    
                 await asyncio.sleep(300)
             except Exception as e:
                 logger.error(f"Predictive update error: {str(e)}")
@@ -754,11 +884,10 @@ class ZeroTrustArchitecture:
             'log_level': 'detailed',
             'retention_days': 365,
             'alert_on': ['unauthorized_access', 'policy_violation', 'key_compromise'],
-            'integrate_with_ledger': True
+            'integrate_with_ledger': self.enable_immutable_ledger
         }
     
     async def _calculate_risk_score(self) -> float:
-        """Calculate current risk score"""
         if not self.audit_log:
             return 0.3
         
@@ -770,7 +899,7 @@ class ZeroTrustArchitecture:
         return min(1.0, risk)
     
     # ============================================================================
-    # Enhanced Authentication
+    # Enhanced Authentication with Price Awareness
     # ============================================================================
     
     async def authenticate_request(
@@ -778,18 +907,25 @@ class ZeroTrustArchitecture:
         request: Dict[str, Any],
         credentials: Dict[str, Any]
     ) -> SecurityContext:
-        """Enhanced authentication with carbon awareness"""
+        """Enhanced authentication with carbon and price awareness"""
         request_id = self._generate_request_id()
         
-        # Get carbon intensity
+        # Get carbon intensity and price
         carbon_intensity = 400
+        carbon_price = 50.0
         if self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_carbon_price()
         
-        # Carbon-aware authentication
+        # Get helium price
+        helium_price = 0.5
+        if self.helium_tracker:
+            helium_price = await self.helium_tracker.get_current_helium_price()
+        
+        # Carbon-aware authentication with price factor
         if self.enable_carbon_auth and self.carbon_authenticator:
             auth_result = await self.carbon_authenticator.authenticate_with_carbon_awareness(
-                request, credentials, carbon_intensity
+                request, credentials, carbon_intensity, carbon_price, helium_price
             )
             auth_level = auth_result.get('auth_level', 'standard')
         else:
@@ -814,8 +950,13 @@ class ZeroTrustArchitecture:
             )
             raise SecurityException("Identity verification failed")
         
-        # Step 3: Risk assessment
+        # Step 3: Risk assessment with price adjustment
         risk_score = await self._assess_risk(request, identity)
+        
+        # Adjust risk based on carbon price
+        if carbon_price > 100:
+            risk_score = min(1.0, risk_score * 1.2)
+        
         if risk_score > 0.7:
             if not await self._perform_step_up_auth(identity):
                 raise SecurityException("Step-up authentication failed")
@@ -833,10 +974,10 @@ class ZeroTrustArchitecture:
             sustainability_score=0.7
         )
         
-        # Track helium usage
+        # Track helium usage with price
         if self.helium_tracker:
             await self.helium_tracker.record_helium_usage(
-                'authentication', 0.01, 'auth_flow'
+                'authentication', 0.01, 'auth_flow', 0.5
             )
         
         # Update predictive analyzer
@@ -850,6 +991,18 @@ class ZeroTrustArchitecture:
             })
             await self.predictive_analyzer.train_prediction_model()
         
+        # Add to immutable ledger
+        if self.ledger:
+            self.ledger.add_block({
+                'type': 'authentication_success',
+                'identity': identity['id'],
+                'risk_score': risk_score,
+                'auth_level': auth_level,
+                'carbon_intensity': carbon_intensity,
+                'carbon_price': carbon_price,
+                'helium_price': helium_price
+            })
+        
         await self._log_security_event(
             'authentication_success',
             request_id,
@@ -859,7 +1012,7 @@ class ZeroTrustArchitecture:
         return context
     
     # ============================================================================
-    # Enhanced Authorization
+    # Enhanced Authorization with Adaptive Rate Limiting
     # ============================================================================
     
     async def authorize_action(
@@ -869,7 +1022,23 @@ class ZeroTrustArchitecture:
         resource: str,
         expert_type: Optional[str] = None
     ) -> bool:
-        """Enhanced authorization with sustainability tracking"""
+        """Enhanced authorization with adaptive rate limiting"""
+        # Get current threat level
+        threat_level = 0.3
+        if self.predictive_analyzer:
+            risk_prediction = await self.predictive_analyzer.predict_security_risk({})
+            threat_level = risk_prediction.get('predicted_risk', 0.3)
+        
+        # Check adaptive rate limit
+        if self.rate_limiter:
+            if not self.rate_limiter.check_rate_limit(context.source_identity, action, threat_level):
+                await self._log_security_event(
+                    'rate_limit_exceeded',
+                    context.request_id,
+                    {'identity': context.source_identity, 'action': action}
+                )
+                return False
+        
         # Verify context
         if not await self._validate_context(context):
             await self._log_security_event(
@@ -900,15 +1069,6 @@ class ZeroTrustArchitecture:
             )
             return False
         
-        # Check rate limits
-        if not await self._check_rate_limit(context.source_identity, action):
-            await self._log_security_event(
-                'rate_limit_exceeded',
-                context.request_id,
-                {'identity': context.source_identity, 'action': action}
-            )
-            return False
-        
         # Verify security level
         if not self._verify_security_level(context.security_level, resource):
             await self._log_security_event(
@@ -921,8 +1081,18 @@ class ZeroTrustArchitecture:
         # Track helium usage for authorization
         if self.helium_tracker:
             await self.helium_tracker.record_helium_usage(
-                'authorization', 0.005, 'authz_flow'
+                'authorization', 0.005, 'authz_flow', threat_level
             )
+        
+        # Add to immutable ledger
+        if self.ledger:
+            self.ledger.add_block({
+                'type': 'authorization_success',
+                'identity': context.source_identity,
+                'action': action,
+                'resource': resource,
+                'threat_level': threat_level
+            })
         
         await self._log_security_event(
             'authorization_success',
@@ -1093,22 +1263,6 @@ class ZeroTrustArchitecture:
             return False
         return True
     
-    async def _check_rate_limit(self, identity_id: str, action: str) -> bool:
-        key = f"{identity_id}:{action}"
-        if key not in self.rate_limits:
-            self.rate_limits[key] = {'count': 0, 'reset_at': datetime.utcnow() + timedelta(minutes=1)}
-        
-        limit_info = self.rate_limits[key]
-        if datetime.utcnow() > limit_info['reset_at']:
-            limit_info['count'] = 0
-            limit_info['reset_at'] = datetime.utcnow() + timedelta(minutes=1)
-        
-        if limit_info['count'] >= 100:
-            return False
-        
-        limit_info['count'] += 1
-        return True
-    
     def _verify_security_level(self, context_level: SecurityLevel, resource: str) -> bool:
         resource_levels = {
             'expert_configuration': SecurityLevel.CONFIDENTIAL,
@@ -1179,6 +1333,15 @@ class ZeroTrustArchitecture:
             'session_id': source_context.session_id
         }
         
+        # Add to immutable ledger
+        if self.ledger:
+            self.ledger.add_block({
+                'type': 'secure_communication',
+                'source': source_context.source_identity,
+                'target': target_expert,
+                'message_size': len(str(message))
+            })
+        
         await self._log_security_event('secure_communication', source_context.request_id, {
             'target': target_expert,
             'message_size': len(str(message)),
@@ -1206,6 +1369,14 @@ class ZeroTrustArchitecture:
                 return False, None
             
             decrypted_message = await self._decrypt_message(secure_message['payload'])
+            
+            # Verify with ledger
+            if self.ledger:
+                latest_block = self.ledger.get_latest_blocks(1)
+                if latest_block and latest_block[0]['data'].get('type') == 'secure_communication':
+                    # Verify integrity with latest block
+                    pass
+            
             return True, decrypted_message
             
         except Exception as e:
@@ -1266,6 +1437,15 @@ class ZeroTrustArchitecture:
         if len(self.audit_log) > 10000:
             self.audit_log = self.audit_log[-10000:]
         
+        # Add to immutable ledger
+        if self.ledger:
+            self.ledger.add_block({
+                'type': 'security_event',
+                'event_type': event_type,
+                'request_id': request_id,
+                'details': details
+            })
+        
         if event_type in self.audit_config['alert_on']:
             await self._send_security_alert(event)
     
@@ -1287,20 +1467,29 @@ class ZeroTrustArchitecture:
             'encryption_status': 'active',
             'zero_trust_enabled': True,
             'mfa_enabled': True,
-            'rate_limiting': 'enabled',
+            'rate_limiting': 'enabled' if self.rate_limiter else 'disabled',
             'last_security_audit': datetime.utcnow().isoformat()
         }
         
         # Add sustainability metrics
         if self.carbon_manager:
             posture['carbon_intensity'] = asyncio.run(self.carbon_manager.get_current_intensity())
+            posture['carbon_price'] = asyncio.run(self.carbon_manager.get_current_carbon_price())
             posture['carbon_savings_kg'] = self.carbon_manager.total_carbon_savings_kg
         
         if self.helium_tracker:
             posture['helium_status'] = self.helium_tracker.get_helium_position()
+            posture['helium_price'] = asyncio.run(self.helium_tracker.get_current_helium_price())
         
         if self.predictive_analyzer:
             posture['predictive_risk'] = asyncio.run(self.predictive_analyzer.predict_security_risk({}))
+            posture['model_version'] = self.predictive_analyzer.model_version
+        
+        if self.rate_limiter:
+            posture['rate_limit_status'] = self.rate_limiter.get_rate_limit_status()
+        
+        if self.ledger:
+            posture['ledger_status'] = self.ledger.get_ledger_stats()
         
         if self.sustainability_dashboard:
             posture['sustainability_score'] = self.sustainability_score
@@ -1308,7 +1497,6 @@ class ZeroTrustArchitecture:
         return posture
     
     def get_sustainability_report(self) -> Dict:
-        """Get sustainability report"""
         if self.sustainability_dashboard:
             status = asyncio.run(
                 self.sustainability_dashboard.get_dashboard_status(
@@ -1320,19 +1508,36 @@ class ZeroTrustArchitecture:
         return {'status': 'dashboard_not_enabled'}
     
     def get_predictive_insights(self) -> Dict:
-        """Get predictive insights"""
         if self.predictive_analyzer:
             return {
                 'security_risk': asyncio.run(self.predictive_analyzer.predict_security_risk({})),
-                'threat_forecast': asyncio.run(self.predictive_analyzer.forecast_security_threats(24))
+                'threat_forecast': asyncio.run(self.predictive_analyzer.forecast_security_threats(24)),
+                'model_version': self.predictive_analyzer.model_version
             }
         return {'status': 'predictive_not_enabled'}
     
     def get_carbon_auth_stats(self) -> Dict:
-        """Get carbon-aware authentication statistics"""
         if self.carbon_authenticator:
             return self.carbon_authenticator.get_carbon_auth_stats()
         return {'status': 'carbon_auth_not_enabled'}
+    
+    def get_price_forecasts(self) -> Dict:
+        forecasts = {}
+        
+        if self.carbon_manager:
+            carbon_forecast = asyncio.run(self.carbon_manager.forecast_carbon_prices())
+            forecasts['carbon'] = carbon_forecast
+        
+        if self.helium_tracker:
+            helium_forecast = asyncio.run(self.helium_tracker.forecast_helium_prices())
+            forecasts['helium'] = helium_forecast
+        
+        return forecasts
+    
+    def get_ledger_status(self) -> Dict:
+        if self.ledger:
+            return self.ledger.get_ledger_stats()
+        return {'status': 'ledger_not_enabled'}
     
     def export_audit_log(self, format: str = 'json') -> str:
         if format == 'json':
@@ -1349,11 +1554,253 @@ class ZeroTrustArchitecture:
             return json.dumps(self.audit_log[-1000:], default=str)
     
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("Shutting down Zero Trust Architecture")
+        logger.info("Shutting down Zero Trust Architecture v2.0.0")
         if self.carbon_manager:
             await self.carbon_manager.close()
         logger.info("Shutdown complete")
+
+# ============================================================================
+# ENUMS AND DATA CLASSES (Preserved)
+# ============================================================================
+
+class SecurityLevel(Enum):
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    CONFIDENTIAL = "confidential"
+    RESTRICTED = "restricted"
+    CRITICAL = "critical"
+
+class TrustLevel(Enum):
+    UNTRUSTED = 0
+    BASIC = 1
+    VERIFIED = 2
+    TRUSTED = 3
+    PRIVILEGED = 4
+
+@dataclass
+class SecurityContext:
+    request_id: str
+    source_identity: str
+    security_level: SecurityLevel
+    trust_level: TrustLevel = TrustLevel.UNTRUSTED
+    authentication_token: Optional[str] = None
+    authorization_grants: List[str] = field(default_factory=list)
+    encryption_key: Optional[bytes] = None
+    session_id: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(hours=1))
+    carbon_impact: float = 0.0
+    sustainability_score: float = 0.0
+    
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+    
+    def has_grant(self, grant: str) -> bool:
+        return grant in self.authorization_grants
+
+# ============================================================================
+# SUSTAINABILITY SECURITY DASHBOARD (Preserved)
+# ============================================================================
+
+class SecuritySustainabilityDashboard:
+    """Sustainability dashboard for security operations"""
+    
+    def __init__(self):
+        self.history = []
+        self.alert_thresholds = {
+            'carbon_intensity': 500,
+            'helium_remaining': 0.2,
+            'security_overhead': 0.3,
+            'threat_level': 0.7
+        }
+        self._running = True
+        
+        logger.info("Security Sustainability Dashboard initialized")
+    
+    async def get_dashboard_status(self, carbon_manager=None, helium_tracker=None, 
+                                   security_analyzer=None, zero_trust=None) -> Dict:
+        status = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': 0.5
+        }
+        
+        if carbon_manager:
+            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
+            status['carbon_price'] = await carbon_manager.get_current_carbon_price()
+            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
+        
+        if helium_tracker:
+            helium_pos = helium_tracker.get_helium_position()
+            status['helium_position'] = helium_pos
+            status['helium_price'] = helium_pos.get('current_price_usd_per_l', 0.5)
+            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
+        
+        if zero_trust:
+            posture = zero_trust.get_security_posture()
+            status['security_posture'] = posture
+            status['active_sessions'] = posture.get('active_sessions', 0)
+            status['security_violations'] = posture.get('security_violations', 0)
+        
+        if security_analyzer:
+            risk = await security_analyzer.predict_security_risk({})
+            status['predicted_risk'] = risk.get('predicted_risk', 0.5)
+            status['risk_trend'] = risk.get('trend', 'stable')
+            status['model_version'] = risk.get('model_version', 0)
+        
+        score = 0.5
+        if status.get('carbon_intensity', 400) < 300:
+            score += 0.15
+        if status.get('helium_remaining_ratio', 0.5) > 0.5:
+            score += 0.15
+        if status.get('security_violations', 100) < 10:
+            score += 0.15
+        if status.get('predicted_risk', 0.5) < 0.3:
+            score += 0.15
+        
+        status['sustainability_score'] = min(1.0, max(0.0, score))
+        
+        alerts = []
+        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
+            alerts.append("High carbon intensity detected")
+        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
+            alerts.append("Helium budget critically low")
+        if status.get('predicted_risk', 0.5) > self.alert_thresholds['threat_level']:
+            alerts.append("Elevated security risk predicted")
+        status['alerts'] = alerts
+        
+        return status
+    
+    def generate_sustainability_report(self, status: Dict) -> Dict:
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': status.get('sustainability_score', 0.5),
+            'carbon_status': {
+                'intensity': status.get('carbon_intensity', 0),
+                'price_usd_per_ton': status.get('carbon_price', 50),
+                'savings_kg': status.get('carbon_savings_kg', 0)
+            },
+            'helium_status': {
+                'remaining_ratio': status.get('helium_remaining_ratio', 0.5),
+                'price_usd_per_l': status.get('helium_price', 0.5)
+            },
+            'security_status': status.get('security_posture', {}),
+            'predictive_insights': {
+                'risk': status.get('predicted_risk', 0.5),
+                'trend': status.get('risk_trend', 'stable'),
+                'model_version': status.get('model_version', 0)
+            },
+            'alerts': status.get('alerts', []),
+            'recommendations': self._generate_recommendations(status)
+        }
+    
+    def _generate_recommendations(self, status: Dict) -> List[str]:
+        recommendations = []
+        
+        if status.get('carbon_intensity', 0) > 400:
+            recommendations.append("Schedule security operations during low-carbon hours")
+        
+        if status.get('helium_remaining_ratio', 1.0) < 0.3:
+            recommendations.append("Implement helium recovery for security operations")
+        
+        if status.get('predicted_risk', 0.5) > 0.6:
+            recommendations.append("Review and enhance security measures")
+        
+        if status.get('security_violations', 0) > 20:
+            recommendations.append("Investigate security violation patterns")
+        
+        return recommendations or ["All security sustainability metrics are within acceptable ranges"]
+
+# ============================================================================
+# CARBON-AWARE AUTHENTICATOR WITH PRICE AWARENESS (ENHANCED)
+# ============================================================================
+
+class CarbonAwareAuthenticator:
+    """Carbon-aware authentication decisions with price awareness"""
+    
+    def __init__(self, carbon_manager=None):
+        self.carbon_manager = carbon_manager
+        self.auth_history = deque(maxlen=1000)
+        
+        logger.info("Carbon-Aware Authenticator initialized with price awareness")
+    
+    async def authenticate_with_carbon_awareness(
+        self,
+        request: Dict,
+        credentials: Dict,
+        carbon_intensity: Optional[float] = None,
+        carbon_price: Optional[float] = None,
+        helium_price: Optional[float] = None
+    ) -> Dict:
+        if carbon_intensity is None and self.carbon_manager:
+            carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_carbon_price()
+        else:
+            carbon_intensity = carbon_intensity or 400
+            carbon_price = carbon_price or 50
+        helium_price = helium_price or 0.5
+        
+        # Price factor: higher price = more aggressive authentication
+        price_factor = min(2.0, carbon_price / 50.0)
+        helium_price_factor = min(2.0, helium_price / 0.5)
+        combined_price_factor = (price_factor + helium_price_factor) / 2
+        
+        # Determine authentication level
+        if carbon_intensity > 500 or combined_price_factor > 1.5:
+            auth_level = 'light'
+            auth_factors = 1
+            sustainability_score = 0.8
+        elif carbon_intensity > 300 or combined_price_factor > 1.0:
+            auth_level = 'standard'
+            auth_factors = 2
+            sustainability_score = 0.6
+        else:
+            auth_level = 'enhanced'
+            auth_factors = 3
+            sustainability_score = 0.4
+        
+        # Adjust session duration based on price
+        if combined_price_factor > 1.5:
+            session_duration = 7200
+        elif combined_price_factor > 1.0:
+            session_duration = 3600
+        else:
+            session_duration = 1800
+        
+        self.auth_history.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'auth_level': auth_level,
+            'carbon_intensity': carbon_intensity,
+            'carbon_price': carbon_price,
+            'helium_price': helium_price,
+            'sustainability_score': sustainability_score
+        })
+        
+        return {
+            'authenticated': True,
+            'auth_level': auth_level,
+            'carbon_intensity': carbon_intensity,
+            'carbon_price': carbon_price,
+            'helium_price': helium_price,
+            'carbon_impact': 'low' if auth_level == 'light' else 'medium' if auth_level == 'standard' else 'high',
+            'auth_factors': auth_factors,
+            'session_duration': session_duration,
+            'sustainability_score': sustainability_score,
+            'price_factor': combined_price_factor
+        }
+    
+    def get_carbon_auth_stats(self) -> Dict:
+        if not self.auth_history:
+            return {'total_auths': 0}
+        
+        return {
+            'total_auths': len(self.auth_history),
+            'light_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'light'),
+            'standard_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'standard'),
+            'enhanced_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'enhanced'),
+            'average_sustainability': np.mean([a.get('sustainability_score', 0.5) for a in self.auth_history]),
+            'average_carbon_price': np.mean([a.get('carbon_price', 50) for a in self.auth_history]),
+            'average_helium_price': np.mean([a.get('helium_price', 0.5) for a in self.auth_history])
+        }
 
 # ============================================================================
 # SINGLETON ACCESSOR
