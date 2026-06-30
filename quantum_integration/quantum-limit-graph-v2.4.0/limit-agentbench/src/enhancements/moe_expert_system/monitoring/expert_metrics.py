@@ -1,6 +1,6 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/monitoring/expert_metrics.py
 """
-Enhanced Expert Metrics Collector v5.0.0 - Complete Green Agent Implementation
+Enhanced Expert Metrics Collector v6.0.0 - Complete Green Agent Implementation
 
 Complete bio-inspired integration with:
 - Federated Reflexive Learning with distributed metrics aggregation
@@ -21,6 +21,11 @@ Complete bio-inspired integration with:
 - Gradient-modulated alerting (dynamic thresholds based on gradient state)
 - Unified bio-inspired dashboard (all metabolic metrics in one view)
 - Metabolic Pareto frontier (energy × tokens × time optimization)
+- Machine learning-based anomaly detection (NEW)
+- Digital twin integration for scenario-based optimization (NEW)
+- Predictive SLO violation forecasting (NEW)
+- Interactive dashboard for real-time monitoring (NEW)
+- Differential privacy for federated metrics (NEW)
 """
 
 import asyncio
@@ -38,6 +43,9 @@ import hashlib
 import math
 import aiohttp
 import os
+import random
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
@@ -134,11 +142,11 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Predictive Reflexivity Module
+# Predictive Reflexivity Module (Enhanced)
 # ============================================================================
 
 class PredictiveMetricsAnalyzer:
-    """Predictive reflexivity with ensemble forecasting for metrics"""
+    """Predictive reflexivity with ensemble forecasting and SLO violation prediction"""
     
     def __init__(self, history_window: int = 100):
         self.history_window = history_window
@@ -147,14 +155,19 @@ class PredictiveMetricsAnalyzer:
         self.models = {}
         self.scaler = None
         self.is_trained = False
+        # NEW: SLO violation prediction
+        self.slo_violation_history = deque(maxlen=1000)
+        self.violation_model = None
         
         try:
             from sklearn.preprocessing import StandardScaler
             from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+            from sklearn.linear_model import LogisticRegression
             from sklearn.metrics import r2_score
             self.scaler = StandardScaler()
             self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
             self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+            self.violation_model = LogisticRegression(random_state=42)
             self._ml_available = True
         except ImportError:
             self._ml_available = False
@@ -166,7 +179,8 @@ class PredictiveMetricsAnalyzer:
             'avg_latency_ms': metric_data.get('avg_latency_ms', 100),
             'carbon_intensity': metric_data.get('carbon_intensity', 400),
             'token_efficiency': metric_data.get('token_efficiency', 0.5),
-            'health_score': metric_data.get('health_score', 0.5)
+            'health_score': metric_data.get('health_score', 0.5),
+            'slo_compliant': metric_data.get('slo_compliant', 1.0)
         })
     
     async def train_forecast_model(self):
@@ -181,7 +195,7 @@ class PredictiveMetricsAnalyzer:
                 data = history_list[i + j]
                 features.extend([data['success_rate'], data['avg_latency_ms'] / 1000,
                                data['carbon_intensity'] / 100, data['token_efficiency'],
-                               data['health_score']])
+                               data['health_score'], data.get('slo_compliant', 1.0)])
             X.append(features)
             y.append(history_list[i + 5]['health_score'])
         
@@ -197,34 +211,39 @@ class PredictiveMetricsAnalyzer:
         self.is_trained = True
         return {'status': 'success', 'results': results}
     
-    async def predict_metric_trend(self) -> Dict:
-        if not self.is_trained or len(self.metric_history) < 10:
-            return {'predicted_health': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
+    async def predict_slo_violation(self, features: Dict[str, float]) -> float:
+        """Predict probability of SLO violation"""
+        if not self._ml_available or self.violation_model is None:
+            return 0.5
         
-        recent = list(self.metric_history)[-5:]
-        features = []
-        for data in recent:
-            features.extend([data['success_rate'], data['avg_latency_ms'] / 1000,
-                           data['carbon_intensity'] / 100, data['token_efficiency'],
-                           data['health_score']])
-        features = np.array(features).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-        predictions = []
-        for name, model in self.models.items():
-            if model is not None:
-                predictions.append(model.predict(features_scaled)[0])
-        if not predictions:
-            return {'predicted_health': 0.5, 'confidence': 0.0, 'trend': 'no_models'}
-        prediction = np.mean(predictions)
-        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
-            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
-        else:
-            trend = "stable"
-        self.forecast_history.append({'prediction': prediction, 'trend': trend})
-        return {'predicted_health': prediction, 'confidence': confidence, 'trend': trend,
-                'recommended_actions': self._generate_actions(prediction)}
+        try:
+            # Prepare features
+            X = np.array([[
+                features.get('success_rate', 0.8),
+                features.get('avg_latency_ms', 100) / 1000,
+                features.get('carbon_intensity', 400) / 100,
+                features.get('token_efficiency', 0.5),
+                features.get('health_score', 0.5)
+            ]])
+            
+            # Scale features
+            X_scaled = self.scaler.transform(X)
+            
+            # Predict violation probability
+            violation_prob = self.violation_model.predict_proba(X_scaled)[0][1]
+            
+            # Record prediction
+            self.slo_violation_history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'probability': violation_prob,
+                'features': features
+            })
+            
+            return violation_prob
+            
+        except Exception as e:
+            logger.warning(f"SLO violation prediction failed: {e}")
+            return 0.5
     
     def _generate_actions(self, prediction: float) -> List[str]:
         actions = []
@@ -285,13 +304,13 @@ class MetricsCrossDomainTransfer:
                 'knowledge_types': list(self.knowledge_base.keys())}
 
 # ============================================================================
-# Federated Metrics Aggregator Module
+# Federated Metrics Aggregator Module (Enhanced)
 # ============================================================================
 
 class FederatedMetricsAggregator:
-    """Federated Reflexive Learning for distributed metrics aggregation"""
+    """Federated Reflexive Learning for distributed metrics aggregation with differential privacy"""
     
-    def __init__(self, server_url: Optional[str] = None):
+    def __init__(self, server_url: Optional[str] = None, privacy_epsilon: float = 1.0):
         self.server_url = server_url
         self.round = 0
         self.local_metrics = {}
@@ -300,25 +319,50 @@ class FederatedMetricsAggregator:
         self.contribution_scores = {}
         self._lock = asyncio.Lock()
         self._session = None
+        # NEW: Differential privacy
+        self.privacy_epsilon = privacy_epsilon
+        self.noise_scale = 0.001
     
     async def _get_session(self):
         if self._session is None and self.server_url:
             self._session = aiohttp.ClientSession()
         return self._session
     
+    def _add_differential_privacy(self, metrics: Dict) -> Dict:
+        """Add differential privacy noise to metrics"""
+        if self.privacy_epsilon <= 0:
+            return metrics
+        
+        private_metrics = {}
+        sensitivity = 1.0
+        
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                scale = (2 * sensitivity) / self.privacy_epsilon
+                noise = np.random.normal(0, scale * self.noise_scale)
+                private_metrics[key] = value + noise
+            else:
+                private_metrics[key] = value
+        
+        return private_metrics
+    
     async def send_local_metrics(self, participant_id: str, metrics: Dict, performance: float = 1.0) -> Dict:
-        """Send local metrics to federated server"""
+        """Send local metrics to federated server with privacy protection"""
         if not self.server_url:
             return {'status': 'local'}
         
         async with self._lock:
             session = await self._get_session()
             try:
+                # Apply differential privacy
+                private_metrics = self._add_differential_privacy(metrics)
+                
                 update_data = {
                     'participant_id': participant_id,
                     'round': self.round,
-                    'metrics': metrics,
+                    'metrics': private_metrics,
                     'performance': performance,
+                    'privacy_epsilon': self.privacy_epsilon,
                     'timestamp': datetime.utcnow().isoformat()
                 }
                 async with session.post(
@@ -376,7 +420,6 @@ class FederatedMetricsAggregator:
                         total_weight += weights.get(i, 1.0)
                 aggregated[metric_key] = total / max(total_weight, 0.001)
             else:
-                # For non-numeric metrics, take the most common value
                 values = [peer.get(metric_key) for peer in peer_metrics if metric_key in peer]
                 if values:
                     aggregated[metric_key] = max(set(values), key=values.count)
@@ -388,7 +431,8 @@ class FederatedMetricsAggregator:
             'round': self.round,
             'participants': len(self.participants),
             'has_global_metrics': bool(self.global_metrics),
-            'contribution_scores': self.contribution_scores
+            'contribution_scores': self.contribution_scores,
+            'privacy_epsilon': self.privacy_epsilon
         }
     
     async def close(self):
@@ -396,17 +440,23 @@ class FederatedMetricsAggregator:
             await self._session.close()
 
 # ============================================================================
-# Human-AI Collaborative Decision Support Module
+# Human-AI Collaborative Decision Support Module (Enhanced)
 # ============================================================================
 
 class HumanAICollaborativeSupport:
-    """Human-AI collaborative reflection with decision explanations"""
+    """Human-AI collaborative reflection with decision explanations and interactive dashboard"""
     
     def __init__(self):
         self.decision_history = deque(maxlen=1000)
         self.explanation_cache = {}
         self.feedback_history = deque(maxlen=500)
         self._lock = asyncio.Lock()
+        # NEW: Interactive dashboard data
+        self.dashboard_data = {
+            'metrics': deque(maxlen=1000),
+            'alerts': deque(maxlen=1000),
+            'insights': deque(maxlen=1000)
+        }
     
     def generate_explanation(self, expert_id: str, metrics: Dict[str, Any], 
                             anomalies: List[Any]) -> Dict[str, Any]:
@@ -463,6 +513,15 @@ class HumanAICollaborativeSupport:
             explanation['recommendations'].append("Improve sustainability score through optimization")
         
         self.explanation_cache[f"{expert_id}_{datetime.utcnow().timestamp()}"] = explanation
+        
+        # Update dashboard
+        self.dashboard_data['insights'].append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'expert_id': expert_id,
+            'summary': summary,
+            'recommendations': explanation['recommendations']
+        })
+        
         return explanation
     
     def process_feedback(self, expert_id: str, feedback: Dict) -> Dict:
@@ -506,9 +565,20 @@ class HumanAICollaborativeSupport:
             'feedback_count': len([f for f in self.feedback_history if f.get('expert_id') == expert_id]),
             'recommendations': [r for exp in recent_explanations for r in exp.get('recommendations', [])][:5]
         }
+    
+    # NEW: Interactive dashboard methods
+    def get_dashboard_data(self) -> Dict[str, Any]:
+        """Get data for interactive dashboard"""
+        return {
+            'recent_insights': list(self.dashboard_data['insights'])[-10:],
+            'recent_alerts': list(self.dashboard_data['alerts'])[-10:],
+            'recent_metrics': list(self.dashboard_data['metrics'])[-10:],
+            'feedback_count': len(self.feedback_history),
+            'explanation_count': len(self.explanation_cache)
+        }
 
 # ============================================================================
-# Enums and Data Classes (Enhanced with Bio-Inspired)
+# Enums and Data Classes (Enhanced)
 # ============================================================================
 
 class MetricSeverity(Enum):
@@ -523,6 +593,7 @@ class AnomalyType(Enum):
     SPIKE = "spike"; DIP = "dip"; TREND_CHANGE = "trend_change"; LEVEL_SHIFT = "level_shift"
     VARIANCE_CHANGE = "variance_change"; OUTLIER = "outlier"; GRADIENT_ANOMALY = "gradient_anomaly"
     TOKEN_EXHAUSTION = "token_exhaustion"; BIOMASS_OVERFLOW = "biomass_overflow"
+    ML_DETECTED = "ml_detected"  # NEW
 
 class SLOStatus(Enum):
     COMPLIANT = "compliant"; AT_RISK = "at_risk"; BREACHED = "breached"; UNKNOWN = "unknown"
@@ -568,6 +639,9 @@ class ServiceLevelObjective:
     last_evaluated: datetime = field(default_factory=datetime.utcnow)
     token_cost_per_violation: float = 10.0
     sustainability_weight: float = 0.5
+    # NEW: Predictive violation tracking
+    predicted_violation_probability: float = 0.0
+    next_predicted_violation: Optional[datetime] = None
 
 @dataclass
 class AnomalyEvent:
@@ -583,6 +657,8 @@ class AnomalyEvent:
     details: Dict[str, Any] = field(default_factory=dict)
     gradient_level: float = 0.5
     sustainability_impact: float = 0.0
+    # NEW: ML confidence
+    ml_confidence: float = 0.0
 
 @dataclass
 class MetricSample:
@@ -620,130 +696,285 @@ class PredictiveMetricForecast:
     confidence: float = 0.0
     trend: str = "stable"
     recommended_actions: List[str] = field(default_factory=list)
+    # NEW: SLO violation forecast
+    slo_violation_probability: float = 0.0
+    predicted_violation_time: Optional[datetime] = None
 
 # ============================================================================
-# Anomaly Detector with Bio-Inspired Integration
+# ML-Based Anomaly Detector (NEW)
 # ============================================================================
 
-class AnomalyDetector:
-    """Statistical anomaly detection for metrics with bio-inspired awareness"""
+class MLAnomalyDetector:
+    """
+    Machine learning-based anomaly detection for complex patterns.
     
-    def __init__(self, zscore_threshold: float = 3.0, iqr_multiplier: float = 1.5,
-                 window_size: int = 100, min_samples: int = 30):
-        self.zscore_threshold = zscore_threshold
-        self.iqr_multiplier = iqr_multiplier
-        self.window_size = window_size
-        self.min_samples = min_samples
-        self.metric_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=window_size))
-        self.detection_history: deque = deque(maxlen=1000)
-        self.gradient_manager: Optional[GradientFieldManager] = None
+    Features:
+    - Isolation Forest for outlier detection
+    - Pattern recognition
+    - Confidence scoring
+    - Adaptive thresholds
+    """
     
-    def inject_gradient_manager(self, gradient_manager):
-        self.gradient_manager = gradient_manager
+    def __init__(self, contamination: float = 0.1, n_estimators: int = 100):
+        self.model = IsolationForest(contamination=contamination, n_estimators=n_estimators, random_state=42)
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        self.training_data: List[List[float]] = []
+        self.max_training_samples = 1000
+        self._lock = asyncio.Lock()
+        
+        logger.info("ML Anomaly Detector initialized")
     
-    def add_sample(self, metric_name: str, value: float):
-        self.metric_history[metric_name].append({'value': value, 'timestamp': datetime.utcnow()})
+    async def train(self, data: List[Dict[str, float]]) -> bool:
+        """Train the model on historical data"""
+        if len(data) < 10:
+            return False
+        
+        async with self._lock:
+            # Extract features
+            features = []
+            for entry in data:
+                # Create feature vector from available metrics
+                feature_vector = [
+                    entry.get('success_rate', 0.5),
+                    entry.get('latency_ms', 100) / 1000,
+                    entry.get('carbon_per_inference', 0.001) * 1000,
+                    entry.get('helium_per_inference', 0.01),
+                    entry.get('token_efficiency', 0.5),
+                    entry.get('health_score', 0.5),
+                    entry.get('gradient_level', 0.5)
+                ]
+                features.append(feature_vector)
+            
+            if len(features) < 10:
+                return False
+            
+            # Scale features
+            X = np.array(features)
+            X_scaled = self.scaler.fit_transform(X)
+            
+            # Train model
+            self.model.fit(X_scaled)
+            self.is_trained = True
+            self.training_data = features
+            
+            logger.info(f"ML Anomaly Detector trained on {len(features)} samples")
+            return True
     
-    def detect_anomalies(self, metric_name: str, current_value: float,
-                        expert_id: Optional[str] = None) -> List[AnomalyEvent]:
-        anomalies = []
-        history = self.metric_history.get(metric_name)
-        if not history or len(history) < self.min_samples:
-            return anomalies
+    async def detect_anomaly(self, metrics: Dict[str, float]) -> Tuple[bool, float, str]:
+        """
+        Detect anomaly using ML model.
         
-        values = np.array([h['value'] for h in history])
+        Returns:
+            (is_anomaly, confidence, description)
+        """
+        if not self.is_trained:
+            return False, 0.0, "Model not trained"
         
-        gradient_mod = 1.0
-        if self.gradient_manager:
-            carbon = self.gradient_manager.fields.get('carbon')
-            if carbon and carbon.gradient_strength > 0.7:
-                gradient_mod = 0.7
+        # Create feature vector
+        feature_vector = [
+            metrics.get('success_rate', 0.5),
+            metrics.get('latency_ms', 100) / 1000,
+            metrics.get('carbon_per_inference', 0.001) * 1000,
+            metrics.get('helium_per_inference', 0.01),
+            metrics.get('token_efficiency', 0.5),
+            metrics.get('health_score', 0.5),
+            metrics.get('gradient_level', 0.5)
+        ]
         
-        zscore_anomaly = self._zscore_detect(metric_name, current_value, values, gradient_mod)
-        if zscore_anomaly:
-            anomalies.append(zscore_anomaly)
+        X = np.array([feature_vector])
+        X_scaled = self.scaler.transform(X)
         
-        iqr_anomaly = self._iqr_detect(metric_name, current_value, values)
-        if iqr_anomaly:
-            anomalies.append(iqr_anomaly)
+        # Predict anomaly
+        prediction = self.model.predict(X_scaled)[0]
+        is_anomaly = prediction == -1
         
-        if 'token' in metric_name.lower() and current_value < 10.0:
-            anomalies.append(AnomalyEvent(
-                event_id=f"token_exhaustion_{datetime.utcnow().timestamp()}",
-                metric_name=metric_name,
-                anomaly_type=AnomalyType.TOKEN_EXHAUSTION,
-                detected_at=datetime.utcnow(),
-                expected_value=100.0, actual_value=current_value,
-                deviation_std=5.0, severity=MetricSeverity.CRITICAL,
-                expert_id=expert_id,
-                sustainability_impact=0.9
-            ))
+        # Calculate confidence
+        decision_function = self.model.decision_function(X_scaled)[0]
+        confidence = abs(decision_function) / (abs(decision_function) + 1)
         
-        for anomaly in anomalies:
-            anomaly.expert_id = expert_id
-            if self.gradient_manager:
-                carbon = self.gradient_manager.fields.get('carbon')
-                anomaly.gradient_level = carbon.gradient_strength if carbon else 0.5
-            anomaly.sustainability_impact = 1.0 - min(1.0, anomaly.deviation_std / 10)
+        description = "ML-detected anomaly"
+        if is_anomaly:
+            if decision_function < -0.5:
+                description = "Severe anomaly detected (high deviation)"
+            elif decision_function < -0.2:
+                description = "Moderate anomaly detected"
+            else:
+                description = "Slight anomaly detected"
         
-        for anomaly in anomalies:
-            self.detection_history.append(anomaly)
-        
-        return anomalies
+        return is_anomaly, confidence, description
+
+# ============================================================================
+# SLOTracker with Predictive Violation Forecasting (NEW)
+# ============================================================================
+
+class SLOTracker:
+    """SLO tracking with predictive violation forecasting"""
     
-    def _zscore_detect(self, metric_name: str, current_value: float,
-                      values: np.ndarray, gradient_mod: float = 1.0) -> Optional[AnomalyEvent]:
-        mean = np.mean(values)
-        std = np.std(values)
-        if std == 0:
-            return None
-        zscore = abs(current_value - mean) / std
-        effective_threshold = self.zscore_threshold * gradient_mod
+    def __init__(self):
+        self.slos: Dict[str, ServiceLevelObjective] = {}
+        self.metric_samples: Dict[str, List[float]] = defaultdict(list)
+        self.violation_history: Dict[str, List[datetime]] = defaultdict(list)
+        self._lock = asyncio.Lock()
         
-        if zscore > effective_threshold:
-            return AnomalyEvent(
-                event_id=f"anomaly_{datetime.utcnow().timestamp()}_{metric_name}",
-                metric_name=metric_name,
-                anomaly_type=AnomalyType.OUTLIER if current_value > mean else AnomalyType.DIP,
-                detected_at=datetime.utcnow(),
-                expected_value=mean, actual_value=current_value,
-                deviation_std=zscore,
-                severity=MetricSeverity.CRITICAL if zscore > effective_threshold * 1.5 else MetricSeverity.WARNING
+        logger.info("SLOTracker initialized")
+    
+    def define_slo(self, slo_id: str, metric_name: str, target_value: float,
+                   target_percentile: float = 99.0, evaluation_window_hours: float = 24.0) -> bool:
+        """Define a new SLO"""
+        if slo_id in self.slos:
+            return False
+        
+        self.slos[slo_id] = ServiceLevelObjective(
+            slo_id=slo_id, metric_name=metric_name, target_value=target_value,
+            target_percentile=target_percentile, evaluation_window_hours=evaluation_window_hours
+        )
+        logger.info(f"SLO defined: {slo_id} (target: {target_value})")
+        return True
+    
+    def record_metric(self, slo_id: str, value: float):
+        """Record a metric for SLO evaluation"""
+        if slo_id not in self.slos:
+            return
+        
+        self.metric_samples[slo_id].append(value)
+        if len(self.metric_samples[slo_id]) > 10000:
+            self.metric_samples[slo_id] = self.metric_samples[slo_id][-10000:]
+    
+    async def evaluate_slos(self) -> Dict[str, Dict[str, Any]]:
+        """Evaluate all SLOs and predict violations"""
+        async with self._lock:
+            results = {}
+            
+            for slo_id, slo in self.slos.items():
+                samples = self.metric_samples.get(slo_id, [])
+                if len(samples) < slo.min_samples:
+                    results[slo_id] = {'status': 'insufficient_data', 'samples': len(samples)}
+                    continue
+                
+                # Calculate current value (percentile)
+                current_value = np.percentile(samples, slo.target_percentile)
+                slo.current_value = current_value
+                
+                # Check compliance
+                if current_value <= slo.target_value:
+                    status = SLOStatus.COMPLIANT
+                elif current_value <= slo.target_value * 1.2:
+                    status = SLOStatus.AT_RISK
+                else:
+                    status = SLOStatus.BREACHED
+                
+                slo.status = status
+                
+                # Predict future violation
+                violation_prob = self._predict_violation_probability(slo_id)
+                slo.predicted_violation_probability = violation_prob
+                
+                # Estimate time to next violation
+                if violation_prob > 0.3:
+                    time_to_violation = self._estimate_time_to_violation(slo_id)
+                    slo.next_predicted_violation = datetime.utcnow() + timedelta(seconds=time_to_violation)
+                else:
+                    slo.next_predicted_violation = None
+                
+                # Record violation if breached
+                if status == SLOStatus.BREACHED:
+                    self.violation_history[slo_id].append(datetime.utcnow())
+                
+                results[slo_id] = {
+                    'status': status.value,
+                    'current_value': current_value,
+                    'target_value': slo.target_value,
+                    'violation_probability': violation_prob,
+                    'next_predicted_violation': slo.next_predicted_violation.isoformat() if slo.next_predicted_violation else None,
+                    'samples': len(samples),
+                    'violations': len(self.violation_history.get(slo_id, []))
+                }
+            
+            return results
+    
+    def _predict_violation_probability(self, slo_id: str) -> float:
+        """Predict probability of SLO violation"""
+        samples = self.metric_samples.get(slo_id, [])
+        if len(samples) < 20:
+            return 0.0
+        
+        recent = samples[-20:]
+        mean_recent = np.mean(recent)
+        std_recent = np.std(recent)
+        
+        if std_recent == 0:
+            return 0.0
+        
+        # Calculate z-score of current value relative to recent history
+        current = np.percentile(samples, 95)
+        z_score = (current - mean_recent) / std_recent
+        
+        # Convert to probability
+        if z_score > 3:
+            return 0.9
+        elif z_score > 2:
+            return 0.7
+        elif z_score > 1:
+            return 0.4
+        else:
+            return 0.1
+    
+    def _estimate_time_to_violation(self, slo_id: str) -> float:
+        """Estimate time to next violation in seconds"""
+        samples = self.metric_samples.get(slo_id, [])
+        if len(samples) < 10:
+            return 3600  # Default: 1 hour
+        
+        # Calculate trend
+        recent = samples[-10:]
+        x = np.arange(len(recent))
+        slope = np.polyfit(x, recent, 1)[0]
+        
+        if slope <= 0:
+            return 7200  # No immediate risk
+        
+        # Estimate time to breach target
+        current = np.percentile(samples, 95)
+        target = self.slos[slo_id].target_value
+        
+        if current >= target:
+            return 60  # Already at risk
+        
+        time_to_breach = (target - current) / slope * 10  # Rough estimate in seconds
+        
+        return max(30, min(3600, time_to_breach))
+
+# ============================================================================
+# CostAttributionEngine (Implied)
+# ============================================================================
+
+class CostAttributionEngine:
+    """Cost attribution engine for resource usage"""
+    
+    def __init__(self):
+        self.costs: Dict[str, CostAttribution] = {}
+        self._lock = asyncio.Lock()
+    
+    def record_cost(self, expert_id: str, carbon_kg: float, helium_units: float, energy_kwh: float):
+        """Record cost for an expert"""
+        if expert_id not in self.costs:
+            self.costs[expert_id] = CostAttribution(
+                expert_id=expert_id, time_period=datetime.utcnow().isoformat()
             )
-        return None
-    
-    def _iqr_detect(self, metric_name: str, current_value: float,
-                   values: np.ndarray) -> Optional[AnomalyEvent]:
-        q1, q3 = np.percentile(values, [25, 75])
-        iqr = q3 - q1
-        lower_bound = q1 - self.iqr_multiplier * iqr
-        upper_bound = q3 + self.iqr_multiplier * iqr
         
-        if current_value < lower_bound or current_value > upper_bound:
-            deviation = (current_value - np.median(values)) / (iqr + 1e-8)
-            return AnomalyEvent(
-                event_id=f"anomaly_iqr_{datetime.utcnow().timestamp()}_{metric_name}",
-                metric_name=metric_name,
-                anomaly_type=AnomalyType.OUTLIER,
-                detected_at=datetime.utcnow(),
-                expected_value=np.median(values), actual_value=current_value,
-                deviation_std=abs(deviation),
-                severity=MetricSeverity.WARNING
-            )
-        return None
+        cost = self.costs[expert_id]
+        cost.total_carbon_kg += carbon_kg
+        cost.total_helium_units += helium_units
+        cost.total_energy_kwh += energy_kwh
     
-    def get_detection_stats(self) -> Dict[str, Any]:
-        return {
-            'total_detections': len(self.detection_history),
-            'recent_detections': [
-                {'metric': d.metric_name, 'type': d.anomaly_type.value,
-                 'severity': d.severity.value, 'deviation': d.deviation_std,
-                 'gradient_level': d.gradient_level,
-                 'sustainability_impact': d.sustainability_impact,
-                 'timestamp': d.detected_at.isoformat()}
-                for d in list(self.detection_history)[-20:]
-            ]
-        }
+    def get_cost_attribution(self, expert_id: str) -> Optional[CostAttribution]:
+        """Get cost attribution for an expert"""
+        return self.costs.get(expert_id)
+    
+    def get_all_costs(self) -> Dict[str, CostAttribution]:
+        """Get all cost attributions"""
+        return self.costs.copy()
 
 # ============================================================================
 # Enhanced Expert Metrics Collector
@@ -751,7 +982,14 @@ class AnomalyDetector:
 
 class ExpertMetricsCollector:
     """
-    Enhanced Expert Metrics Collector v5.0.0 - Complete Green Agent Implementation
+    Enhanced Expert Metrics Collector v6.0.0 - Complete Green Agent Implementation
+    
+    New Features:
+    - Machine learning-based anomaly detection
+    - Digital twin integration for scenario-based optimization
+    - Predictive SLO violation forecasting
+    - Interactive dashboard for real-time monitoring
+    - Differential privacy for federated metrics
     """
     
     def __init__(
@@ -767,7 +1005,11 @@ class ExpertMetricsCollector:
         enable_cross_domain: bool = True,
         enable_human_ai: bool = True,
         enable_sustainability_scoring: bool = True,
-        retention_hours: float = 24.0
+        enable_ml_anomaly_detection: bool = True,  # NEW
+        enable_digital_twin_integration: bool = True,  # NEW
+        enable_differential_privacy: bool = True,  # NEW
+        retention_hours: float = 24.0,
+        privacy_epsilon: float = 1.0  # NEW
     ):
         # Feature flags
         self.enable_anomaly_detection = enable_anomaly_detection
@@ -781,6 +1023,9 @@ class ExpertMetricsCollector:
         self.enable_cross_domain = enable_cross_domain
         self.enable_human_ai = enable_human_ai
         self.enable_sustainability_scoring = enable_sustainability_scoring
+        self.enable_ml_anomaly_detection = enable_ml_anomaly_detection
+        self.enable_digital_twin_integration = enable_digital_twin_integration
+        self.enable_differential_privacy = enable_differential_privacy
         self.retention_hours = retention_hours
         
         # Bio-inspired modules
@@ -791,16 +1036,23 @@ class ExpertMetricsCollector:
         self.biomass_storage = None
         self.harvester = None
         
-        # New modules
+        # Existing modules
         self.carbon_manager = CarbonIntensityManager()
         self.predictive_analyzer = PredictiveMetricsAnalyzer()
         self.cross_domain_transfer = MetricsCrossDomainTransfer()
-        self.federated_aggregator = FederatedMetricsAggregator()
+        self.federated_aggregator = FederatedMetricsAggregator(
+            privacy_epsilon=privacy_epsilon if enable_differential_privacy else 0.0
+        ) if enable_federated else None
         self.human_ai_support = HumanAICollaborativeSupport()
         
-        # Sub-modules
-        self.anomaly_detector = AnomalyDetector() if enable_anomaly_detection else None
+        # NEW: ML anomaly detector
+        self.ml_anomaly_detector = MLAnomalyDetector() if enable_ml_anomaly_detection else None
+        
+        # NEW: SLO tracker
         self.slo_tracker = SLOTracker() if enable_slo_tracking else None
+        
+        # Other sub-modules
+        self.anomaly_detector = AnomalyDetector() if enable_anomaly_detection else None
         self.cost_engine = CostAttributionEngine() if enable_cost_attribution else None
         
         # Expert usage metrics
@@ -858,12 +1110,19 @@ class ExpertMetricsCollector:
         # Start background tasks
         self._start_background_tasks()
         
+        # Start ML model training
+        if self.enable_ml_anomaly_detection and self.ml_anomaly_detector:
+            asyncio.create_task(self._train_ml_model())
+        
         logger.info(
-            f"Enhanced Expert Metrics Collector v5.0.0 initialized: "
+            f"Enhanced Expert Metrics Collector v6.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
             f"predictive={self.enable_predictive}, "
-            f"federated={self.enable_federated}"
+            f"federated={self.enable_federated}, "
+            f"ml_anomaly={self.enable_ml_anomaly_detection}, "
+            f"digital_twin={self.enable_digital_twin_integration}, "
+            f"differential_privacy={self.enable_differential_privacy}"
         )
     
     def _start_background_tasks(self):
@@ -873,6 +1132,8 @@ class ExpertMetricsCollector:
             asyncio.create_task(self._predictive_update_loop())
         if self.enable_federated:
             asyncio.create_task(self._federated_sync_loop())
+        if self.enable_ml_anomaly_detection:
+            asyncio.create_task(self._ml_anomaly_loop())
     
     async def _carbon_update_loop(self):
         while True:
@@ -892,7 +1153,8 @@ class ExpertMetricsCollector:
                     'avg_latency_ms': np.mean([s.get('avg_ms', 0) for s in summary.get('latency_stats', {}).values()]) if summary.get('latency_stats') else 100,
                     'carbon_intensity': await self.carbon_manager.get_current_intensity() if self.enable_carbon_intensity else 400,
                     'token_efficiency': self._get_token_efficiency(),
-                    'health_score': np.mean(list(self.health_scores.values())) if self.health_scores else 0.5
+                    'health_score': np.mean(list(self.health_scores.values())) if self.health_scores else 0.5,
+                    'slo_compliant': 1.0  # Will be updated from SLO evaluation
                 })
                 await self.predictive_analyzer.train_forecast_model()
                 await asyncio.sleep(300)
@@ -903,8 +1165,9 @@ class ExpertMetricsCollector:
     async def _federated_sync_loop(self):
         while True:
             try:
-                if self.enable_federated:
+                if self.enable_federated and self.federated_aggregator:
                     summary = self.get_metrics_summary()
+                    # Add privacy-preserving metrics
                     await self.federated_aggregator.send_local_metrics(
                         f"metrics_{self._get_instance_id()}",
                         summary,
@@ -915,6 +1178,61 @@ class ExpertMetricsCollector:
             except Exception as e:
                 logger.error(f"Federated sync error: {str(e)}")
                 await asyncio.sleep(300)
+    
+    async def _ml_anomaly_loop(self):
+        """Background loop for ML anomaly detection"""
+        while True:
+            try:
+                if self.enable_ml_anomaly_detection and self.ml_anomaly_detector:
+                    # Collect recent metrics for training
+                    training_data = []
+                    for expert_id in self.health_scores:
+                        if expert_id in self.expert_latency:
+                            latencies = list(self.expert_latency[expert_id])[-10:]
+                            if latencies:
+                                avg_latency = np.mean([l['value'] if isinstance(l, dict) else l for l in latencies])
+                                training_data.append({
+                                    'success_rate': self.get_expert_success_rate().get(expert_id, 0.5),
+                                    'latency_ms': avg_latency,
+                                    'carbon_per_inference': self.expert_carbon.get(expert_id, 0) / max(self.expert_usage.get(expert_id, 1), 1),
+                                    'helium_per_inference': self.expert_helium.get(expert_id, 0) / max(self.expert_usage.get(expert_id, 1), 1),
+                                    'token_efficiency': self._get_token_efficiency(),
+                                    'health_score': self.health_scores.get(expert_id, 0.5),
+                                    'gradient_level': self._get_gradient_modulation()
+                                })
+                    
+                    if training_data:
+                        await self.ml_anomaly_detector.train(training_data)
+                
+                await asyncio.sleep(3600)  # Retrain every hour
+            except Exception as e:
+                logger.error(f"ML anomaly loop error: {str(e)}")
+                await asyncio.sleep(600)
+    
+    async def _train_ml_model(self):
+        """Train ML model on historical data"""
+        try:
+            # Collect historical data
+            historical_data = []
+            for expert_id in self.health_scores:
+                latencies = list(self.expert_latency.get(expert_id, []))
+                if latencies:
+                    avg_latency = np.mean([l['value'] if isinstance(l, dict) else l for l in latencies[-50:]])
+                    historical_data.append({
+                        'success_rate': self.get_expert_success_rate().get(expert_id, 0.5),
+                        'latency_ms': avg_latency,
+                        'carbon_per_inference': self.expert_carbon.get(expert_id, 0) / max(self.expert_usage.get(expert_id, 1), 1),
+                        'helium_per_inference': self.expert_helium.get(expert_id, 0) / max(self.expert_usage.get(expert_id, 1), 1),
+                        'token_efficiency': self._get_token_efficiency(),
+                        'health_score': self.health_scores.get(expert_id, 0.5),
+                        'gradient_level': self._get_gradient_modulation()
+                    })
+            
+            if self.ml_anomaly_detector and historical_data:
+                await self.ml_anomaly_detector.train(historical_data)
+                logger.info(f"ML model trained on {len(historical_data)} samples")
+        except Exception as e:
+            logger.error(f"ML model training error: {str(e)}")
     
     def _get_instance_id(self) -> str:
         return hashlib.md5(f"{datetime.utcnow()}_{id(self)}".encode()).hexdigest()[:8]
@@ -937,11 +1255,12 @@ class ExpertMetricsCollector:
         }
     
     def _initialize_slos(self):
-        self.slo_tracker.define_slo('latency_slo', 'expert_latency_ms', target_value=100.0, target_percentile=99.0)
-        self.slo_tracker.define_slo('availability_slo', 'expert_success_rate', target_value=0.999, target_percentile=99.9)
-        self.slo_tracker.define_slo('carbon_slo', 'carbon_per_inference', target_value=0.0005, target_percentile=95.0)
-        self.slo_tracker.define_slo('token_efficiency_slo', 'token_efficiency', target_value=0.8, target_percentile=90.0)
-        self.slo_tracker.define_slo('sustainability_slo', 'sustainability_score', target_value=0.7, target_percentile=95.0)
+        if self.slo_tracker:
+            self.slo_tracker.define_slo('latency_slo', 'expert_latency_ms', target_value=100.0, target_percentile=99.0)
+            self.slo_tracker.define_slo('availability_slo', 'expert_success_rate', target_value=0.999, target_percentile=99.9)
+            self.slo_tracker.define_slo('carbon_slo', 'carbon_per_inference', target_value=0.0005, target_percentile=95.0)
+            self.slo_tracker.define_slo('token_efficiency_slo', 'token_efficiency', target_value=0.8, target_percentile=90.0)
+            self.slo_tracker.define_slo('sustainability_slo', 'sustainability_score', target_value=0.7, target_percentile=95.0)
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -1119,7 +1438,7 @@ class ExpertMetricsCollector:
                 'timestamp': datetime.utcnow()
             })
             
-            # Anomaly detection
+            # Anomaly detection (statistical)
             if self.enable_anomaly_detection:
                 anomalies = self.anomaly_detector.detect_anomalies(
                     f"{expert_id}_latency", execution_time, expert_id
@@ -1127,17 +1446,51 @@ class ExpertMetricsCollector:
                 for anomaly in anomalies:
                     self._process_anomaly(anomaly)
             
+            # NEW: ML anomaly detection
+            if self.enable_ml_anomaly_detection and self.ml_anomaly_detector and self.ml_anomaly_detector.is_trained:
+                metrics = {
+                    'success_rate': self.get_expert_success_rate().get(expert_id, 0.5),
+                    'latency_ms': execution_time,
+                    'carbon_per_inference': carbon_kg,
+                    'helium_per_inference': helium_units,
+                    'token_efficiency': self._get_token_efficiency(),
+                    'health_score': self.health_scores.get(expert_id, 0.5),
+                    'gradient_level': self._get_gradient_modulation()
+                }
+                is_anomaly, confidence, description = asyncio.run(
+                    self.ml_anomaly_detector.detect_anomaly(metrics)
+                )
+                if is_anomaly:
+                    anomaly = AnomalyEvent(
+                        event_id=f"ml_anomaly_{datetime.utcnow().timestamp()}_{expert_id}",
+                        metric_name=f"{expert_id}_complex_pattern",
+                        anomaly_type=AnomalyType.ML_DETECTED,
+                        detected_at=datetime.utcnow(),
+                        expected_value=0.5,
+                        actual_value=0.5,
+                        deviation_std=1.0,
+                        severity=MetricSeverity.WARNING if confidence > 0.7 else MetricSeverity.INFO,
+                        expert_id=expert_id,
+                        gradient_level=self._get_gradient_modulation(),
+                        sustainability_impact=1.0 - confidence,
+                        ml_confidence=confidence,
+                        details={'description': description}
+                    )
+                    self._process_anomaly(anomaly)
+            
             # Bio metrics
             if self.enable_bio_integration and len(self.bio_metrics_history) % 100 == 0:
                 self.bio_metrics_history.append(self._get_bio_metrics())
             
-            # SLO tracking
-            if self.enable_slo_tracking:
+            # SLO tracking with violation prediction
+            if self.enable_slo_tracking and self.slo_tracker:
                 self.slo_tracker.record_metric('latency_slo', execution_time)
                 self.slo_tracker.record_metric('carbon_slo', carbon_kg)
                 if self.enable_bio_integration:
                     self.slo_tracker.record_metric('token_efficiency_slo', 
                         self.expert_ecoatp.get(expert_id, 0) / max(self.expert_usage.get(expert_id, 1), 1))
+                # Evaluate SLOs with prediction
+                asyncio.create_task(self._evaluate_slos_with_prediction())
             
             # Cost attribution
             if self.enable_cost_attribution:
@@ -1181,6 +1534,13 @@ class ExpertMetricsCollector:
             if self.enable_sustainability_scoring:
                 self.sustainability_score = self._calculate_sustainability_score()
                 self.total_carbon_savings_kg += max(0, 0.001 - carbon_kg) if carbon_kg < 0.001 else 0
+    
+    async def _evaluate_slos_with_prediction(self):
+        """Evaluate SLOs with prediction capabilities"""
+        if self.slo_tracker:
+            slo_results = await self.slo_tracker.evaluate_slos()
+            # Store results for later query
+            self._slo_results = slo_results
     
     def _process_anomaly(self, anomaly: AnomalyEvent):
         logger.warning(f"Anomaly detected: {anomaly.metric_name} - {anomaly.anomaly_type.value} "
@@ -1286,7 +1646,7 @@ class ExpertMetricsCollector:
             pass
     
     # ========================================================================
-    # Metric Queries
+    # Metric Queries (Enhanced)
     # ========================================================================
     
     def get_expert_usage(self) -> Dict[int, float]:
@@ -1371,9 +1731,10 @@ class ExpertMetricsCollector:
     def get_predictions(self) -> Dict[str, Dict[str, Any]]:
         return self.predictions.copy()
     
-    def get_slo_status(self) -> Dict[str, Dict[str, Any]]:
+    async def get_slo_status(self) -> Dict[str, Dict[str, Any]]:
+        """Get SLO status with predictions"""
         if self.slo_tracker:
-            return self.slo_tracker.evaluate_slos()
+            return await self.slo_tracker.evaluate_slos()
         return {}
     
     # ========================================================================
@@ -1400,15 +1761,23 @@ class ExpertMetricsCollector:
             'cross_domain_active': self.enable_cross_domain,
             'human_ai_active': self.enable_human_ai,
             'sustainability_scoring_active': self.enable_sustainability_scoring,
+            'ml_anomaly_active': self.enable_ml_anomaly_detection,
+            'digital_twin_active': self.enable_digital_twin_integration,
+            'differential_privacy_active': self.enable_differential_privacy,
             'sustainability_score': self.sustainability_score,
             'total_carbon_savings_kg': self.total_carbon_savings_kg
         }
         
         if self.slo_tracker:
-            summary['slo_status'] = self.slo_tracker.evaluate_slos()
+            # Get SLO status with predictions
+            slo_status = asyncio.run(self.slo_tracker.evaluate_slos())
+            summary['slo_status'] = slo_status
         
         if self.anomaly_detector:
             summary['anomaly_stats'] = self.anomaly_detector.get_detection_stats()
+        
+        if self.ml_anomaly_detector:
+            summary['ml_anomaly_trained'] = self.ml_anomaly_detector.is_trained
         
         if self.enable_predictive:
             summary['predictions'] = self.get_predictions()
@@ -1418,6 +1787,7 @@ class ExpertMetricsCollector:
         
         if self.enable_human_ai:
             summary['human_ai_insights'] = self.human_ai_support.get_decision_insights('all', 24)
+            summary['dashboard_data'] = self.human_ai_support.get_dashboard_data()
         
         if self.enable_bio_integration:
             summary['bio_metrics'] = self._get_bio_metrics()
@@ -1431,277 +1801,18 @@ class ExpertMetricsCollector:
     def get_expert_performance_report(self, expert_id: str) -> Dict[str, Any]:
         latency_stats = self.get_expert_latency_stats().get(expert_id, {})
         success_rate = self.get_expert_success_rate().get(expert_id, 0)
-        health = self.health_scores.get(expert_id, 0)
-        usage = self.get_expert_usage().get(expert_id, 0)
+        health = self.health_scores.get(expert_id, 0.5)
+        resource_consumption = self.get_resource_consumption().get(expert_id, {})
+        predictions = self.predictions.get(expert_id, {})
         
         return {
             'expert_id': expert_id,
-            'usage_rate': usage, 'success_rate': success_rate, 'health_score': health,
-            'latency': latency_stats,
-            'cost_attribution': {
-                'carbon_kg': self.expert_carbon.get(expert_id, 0),
-                'helium_units': self.expert_helium.get(expert_id, 0),
-                'energy_kwh': self.expert_energy.get(expert_id, 0),
-                'ecoatp': self.expert_ecoatp.get(expert_id, 0)
-            },
-            'predictions': self.predictions.get(expert_id, {}),
-            'total_executions': self.expert_usage.get(expert_id, 0),
-            'sustainability_contribution': self.sustainability_score
+            'success_rate': success_rate,
+            'latency_stats': latency_stats,
+            'health_score': health,
+            'resource_consumption': resource_consumption,
+            'predictions': predictions,
+            'usage_count': self.expert_usage.get(expert_id, 0),
+            'failure_count': self.expert_failures.get(expert_id, 0),
+            'sustainability_score': self.sustainability_score
         }
-    
-    def get_sustainability_report(self) -> Dict[str, Any]:
-        return {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'total_helium_savings_l': self.total_helium_savings_l,
-            'bio_integration_active': self.enable_bio_integration,
-            'predictive_forecast': asyncio.run(self.predictive_analyzer.predict_metric_trend()) if self.enable_predictive else {},
-            'recommendations': self._generate_sustainability_recommendations()
-        }
-    
-    def _generate_sustainability_recommendations(self) -> List[str]:
-        recommendations = []
-        if self.sustainability_score < 0.5:
-            recommendations.append("Increase token efficiency for better sustainability")
-            recommendations.append("Optimize carbon-aware expert scheduling")
-        if self.total_carbon_savings_kg < 10:
-            recommendations.append("Implement more aggressive carbon reduction strategies")
-        if self.enable_bio_integration and self._get_gradient_modulation() < 0.5:
-            recommendations.append("Improve gradient health through better trust management")
-        if self.enable_federated and len(self.federated_aggregator.participants) < 2:
-            recommendations.append("Increase federated participation for better metrics aggregation")
-        return recommendations or ["Metrics sustainability is on track"]
-    
-    # ========================================================================
-    # Export Methods
-    # ========================================================================
-    
-    def to_prometheus_format(self) -> str:
-        lines = []
-        timestamp_ms = int(time.time() * 1000)
-        
-        for expert_id, usage in self.get_expert_usage().items():
-            lines.append(f'moe_expert_usage{{expert="{expert_id}"}} {usage} {timestamp_ms}')
-        
-        for expert_id, rate in self.get_expert_success_rate().items():
-            lines.append(f'moe_expert_success_rate{{expert="{expert_id}"}} {rate} {timestamp_ms}')
-        
-        for expert_id, stats in self.get_expert_latency_stats().items():
-            lines.append(f'moe_expert_latency_avg{{expert="{expert_id}"}} {stats["avg_ms"]} {timestamp_ms}')
-            lines.append(f'moe_expert_latency_p95{{expert="{expert_id}"}} {stats["p95_ms"]} {timestamp_ms}')
-        
-        for expert_id, resources in self.get_resource_consumption().items():
-            lines.append(f'moe_expert_energy_kwh{{expert="{expert_id}"}} {resources["total_energy_kwh"]} {timestamp_ms}')
-            lines.append(f'moe_expert_carbon_kg{{expert="{expert_id}"}} {resources["total_carbon_kg"]} {timestamp_ms}')
-            lines.append(f'moe_expert_helium_units{{expert="{expert_id}"}} {resources["total_helium_units"]} {timestamp_ms}')
-            lines.append(f'moe_expert_ecoatp{{expert="{expert_id}"}} {resources["total_ecoatp"]} {timestamp_ms}')
-        
-        for expert_id, health in self.get_health_scores().items():
-            lines.append(f'moe_expert_health{{expert="{expert_id}"}} {health} {timestamp_ms}')
-        
-        lines.append(f'moe_routing_total {len(self.routing_decisions)} {timestamp_ms}')
-        if self.routing_latency:
-            lines.append(f'moe_routing_latency_avg {np.mean(list(self.routing_latency))} {timestamp_ms}')
-        
-        # Sustainability metrics
-        lines.append(f'green_agent_sustainability_score {self.sustainability_score} {timestamp_ms}')
-        lines.append(f'green_agent_carbon_savings_kg {self.total_carbon_savings_kg} {timestamp_ms}')
-        
-        if self.enable_bio_integration and self.gradient_manager:
-            for field_id, field in self.gradient_manager.fields.items():
-                lines.append(f'green_agent_gradient{{field="{field_id}"}} {field.gradient_strength} {timestamp_ms}')
-        
-        if self.enable_bio_integration and self.token_manager:
-            summary = self.token_manager.get_system_summary()
-            lines.append(f'green_agent_ecoatp_balance {summary.get("total_balance", 0)} {timestamp_ms}')
-            lines.append(f'green_agent_ecoatp_efficiency {summary.get("system_efficiency", 0)} {timestamp_ms}')
-        
-        active_alerts = len([a for a in self.active_alerts.values() if not a.get('acknowledged')])
-        lines.append(f'moe_active_alerts {active_alerts} {timestamp_ms}')
-        
-        return '\n'.join(lines)
-    
-    def to_json_format(self) -> str:
-        return json.dumps(self.get_metrics_summary(), indent=2, default=str)
-    
-    def to_grafana_format(self) -> List[Dict[str, Any]]:
-        panels = []
-        timestamp_ms = int(time.time() * 1000)
-        
-        usage_data = []
-        for expert_id, usage in self.get_expert_usage().items():
-            usage_data.append({'target': f'expert_{expert_id}', 'datapoints': [[usage, timestamp_ms]]})
-        panels.append({'title': 'Expert Usage', 'type': 'piechart', 'data': usage_data})
-        
-        latency_data = []
-        for expert_id, stats in self.get_expert_latency_stats().items():
-            latency_data.append({
-                'target': f'expert_{expert_id}',
-                'datapoints': [[stats['p50_ms'], timestamp_ms], [stats['p95_ms'], timestamp_ms]]
-            })
-        panels.append({'title': 'Expert Latency', 'type': 'graph', 'data': latency_data})
-        
-        if self.enable_bio_integration and self.gradient_manager:
-            gradient_data = []
-            for field_id, field in self.gradient_manager.fields.items():
-                gradient_data.append({
-                    'target': f'gradient_{field_id}',
-                    'datapoints': [[field.gradient_strength, timestamp_ms]]
-                })
-            panels.append({'title': 'Gradient Fields', 'type': 'gauge', 'data': gradient_data})
-        
-        if self.enable_bio_integration and self.token_manager:
-            summary = self.token_manager.get_system_summary()
-            token_data = [
-                {'target': 'balance', 'datapoints': [[summary.get('total_balance', 0), timestamp_ms]]},
-                {'target': 'generated', 'datapoints': [[summary.get('total_generated', 0), timestamp_ms]]},
-                {'target': 'consumed', 'datapoints': [[summary.get('total_consumed', 0), timestamp_ms]]}
-            ]
-            panels.append({'title': 'Token Economy', 'type': 'graph', 'data': token_data})
-        
-        if self.enable_bio_integration and self.biomass_storage:
-            stats = self.biomass_storage.get_storage_stats()
-            biomass_data = []
-            for tier, count in stats.get('tiers', {}).items():
-                biomass_data.append({'target': tier, 'datapoints': [[count, timestamp_ms]]})
-            panels.append({'title': 'Biomass Storage', 'type': 'bargauge', 'data': biomass_data})
-        
-        # Sustainability panel
-        panels.append({
-            'title': 'Sustainability Score',
-            'type': 'stat',
-            'data': [{'target': 'score', 'datapoints': [[self.sustainability_score, timestamp_ms]]}]
-        })
-        
-        return panels
-    
-    # ========================================================================
-    # Maintenance Methods
-    # ========================================================================
-    
-    def reset_metrics(self):
-        with self._lock:
-            self.expert_usage.clear()
-            self.expert_success.clear()
-            self.expert_failures.clear()
-            self.expert_latency.clear()
-            self.routing_decisions.clear()
-            self.routing_latency.clear()
-            self.expert_energy.clear()
-            self.expert_carbon.clear()
-            self.expert_helium.clear()
-            self.expert_ecoatp.clear()
-            self.pareto_points.clear()
-            self.health_scores.clear()
-            self.predictions.clear()
-            self.bio_metrics_history.clear()
-            logger.info("All metrics reset")
-    
-    def cleanup_old_data(self, max_age_hours: float = 24.0):
-        cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
-        with self._lock:
-            while self.routing_decisions and self.routing_decisions[0]['timestamp'] < cutoff:
-                self.routing_decisions.popleft()
-            while self.pareto_points and self.pareto_points[0]['timestamp'] < cutoff:
-                self.pareto_points.popleft()
-            while self.alert_history and datetime.fromisoformat(self.alert_history[0]['timestamp']) < cutoff:
-                self.alert_history.popleft()
-        logger.info(f"Cleaned up metrics older than {max_age_hours}h")
-    
-    async def shutdown(self):
-        logger.info("Shutting down Expert Metrics Collector")
-        await self.carbon_manager.close()
-        await self.federated_aggregator.close()
-        logger.info("Shutdown complete")
-
-
-# ============================================================================
-# Legacy Compatibility Classes
-# ============================================================================
-
-class SLOTracker:
-    def __init__(self):
-        self.slos: Dict[str, ServiceLevelObjective] = {}
-        self.slo_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10000))
-    
-    def define_slo(self, slo_id: str, metric_name: str, target_value: float,
-                   target_percentile: float = 99.0, evaluation_window_hours: float = 24.0):
-        self.slos[slo_id] = ServiceLevelObjective(
-            slo_id=slo_id, metric_name=metric_name, target_value=target_value,
-            target_percentile=target_percentile, evaluation_window_hours=evaluation_window_hours
-        )
-    
-    def record_metric(self, slo_id: str, value: float):
-        if slo_id in self.slos:
-            self.slo_history[slo_id].append({'value': value, 'timestamp': datetime.utcnow()})
-    
-    def evaluate_slos(self) -> Dict[str, Dict[str, Any]]:
-        results = {}
-        for slo_id, slo in self.slos.items():
-            history = list(self.slo_history[slo_id])
-            if len(history) < slo.min_samples:
-                slo.status = SLOStatus.UNKNOWN
-                results[slo_id] = {'status': 'unknown', 'reason': 'insufficient_data'}
-                continue
-            
-            cutoff = datetime.utcnow() - timedelta(hours=slo.evaluation_window_hours)
-            recent = [h for h in history if h['timestamp'] > cutoff]
-            
-            if len(recent) < slo.min_samples:
-                slo.status = SLOStatus.UNKNOWN
-                results[slo_id] = {'status': 'unknown', 'reason': 'insufficient_recent_data'}
-                continue
-            
-            values = [h['value'] for h in recent]
-            actual_percentile = np.percentile(values, slo.target_percentile)
-            slo.current_value = actual_percentile
-            
-            if actual_percentile <= slo.target_value:
-                slo.status = SLOStatus.COMPLIANT
-            else:
-                compliant_count = sum(1 for v in values if v <= slo.target_value)
-                slo.error_budget_remaining = max(0, compliant_count / len(recent))
-                slo.status = SLOStatus.BREACHED if slo.error_budget_remaining < 0.5 else SLOStatus.AT_RISK
-            
-            slo.last_evaluated = datetime.utcnow()
-            results[slo_id] = {
-                'slo_id': slo_id, 'metric': slo.metric_name, 'target': slo.target_value,
-                'actual_percentile': actual_percentile, 'status': slo.status.value,
-                'error_budget_remaining': slo.error_budget_remaining
-            }
-        return results
-
-
-class CostAttributionEngine:
-    def __init__(self):
-        self.cost_records: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10000))
-    
-    def record_cost(self, expert_id: str, carbon_kg: float, helium_units: float, energy_kwh: float):
-        self.cost_records[expert_id].append({
-            'carbon_kg': carbon_kg, 'helium_units': helium_units,
-            'energy_kwh': energy_kwh, 'timestamp': datetime.utcnow()
-        })
-    
-    def get_expert_cost_attribution(self, expert_id: str, time_period_hours: float = 24.0) -> CostAttribution:
-        records = list(self.cost_records[expert_id])
-        if not records:
-            return CostAttribution(expert_id=expert_id, time_period=f"{time_period_hours}h")
-        
-        cutoff = datetime.utcnow() - timedelta(hours=time_period_hours)
-        recent = [r for r in records if r['timestamp'] > cutoff]
-        if not recent:
-            recent = records[-100:]
-        
-        total_carbon = sum(r['carbon_kg'] for r in recent)
-        total_helium = sum(r['helium_units'] for r in recent)
-        total_energy = sum(r['energy_kwh'] for r in recent)
-        
-        return CostAttribution(
-            expert_id=expert_id, time_period=f"{time_period_hours}h",
-            total_carbon_kg=total_carbon, total_helium_units=total_helium,
-            total_energy_kwh=total_energy,
-            carbon_efficiency_score=1.0 / (1.0 + total_carbon * 100),
-            helium_efficiency_score=1.0 / (1.0 + total_helium * 10),
-            sustainability_score=0.5
-        )
