@@ -1,19 +1,24 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/expert_registry.py
 """
-Enhanced Expert Registry v5.0.0 - Complete Bio-Inspired Genome Repository
+Enhanced Expert Registry v6.0.0 - Complete Bio-Inspired Genome Repository
 
 Full correlation with bio-inspired modules:
-- Eco-ATP efficiency filtering
-- Species population tracking from compartments
-- Natural selection based on fitness scores
-- Gradient-based fitness updates
-- Biomass storage integration for expert history
-- Token economy integration for expert accounting
-- Compartment lifecycle ↔ Registry lifecycle mapping
-- Evolutionary lineage tracking
+- Eco-ATP efficiency filtering for expert selection
+- Species population tracking from chromatophore compartments
+- Natural selection based on multi-dimensional fitness scores
+- Gradient-based fitness updates from proton gradient fields
+- Biomass storage integration for expert performance history
+- Token economy integration for expert resource accounting
+- Compartment lifecycle ↔ Registry lifecycle bidirectional mapping
+- Evolutionary lineage tracking across generations
 - Unified Sustainability Dashboard
 - Predictive Evolution Forecasting
 - Cross-Region Registry Synchronization
+- Quantum efficiency as fitness dimension (NEW)
+- Predictive alerts for upcoming extinctions (NEW)
+- External climate model integration (NEW)
+- Conflict resolution with voting mechanisms (NEW)
+- Reproductive strategies for high-fitness experts (NEW)
 """
 
 import asyncio
@@ -32,6 +37,7 @@ import math
 import copy
 import aiohttp
 import os
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +130,10 @@ class CertificationLevel(Enum):
     THIRD_PARTY = "third_party"
     ISO_COMPLIANT = "iso_compliant"
 
+# ============================================================================
+# Enhanced Data Classes with Quantum Efficiency
+# ============================================================================
+
 @dataclass
 class ExpertVersion:
     major: int
@@ -187,25 +197,34 @@ class HealthMetrics:
     last_heartbeat: datetime = field(default_factory=datetime.utcnow)
     degradation_score: float = 0.0
     sustainability_score: float = 0.0
+    # NEW: Quantum efficiency
+    quantum_efficiency: float = 0.0
+    quantum_advantage_score: float = 0.0
     
     def calculate_health_score(self) -> float:
-        weights = {'success_rate': 0.30, 'availability': 0.25, 'error_rate': 0.20,
-                   'carbon_efficiency': 0.10, 'helium_efficiency': 0.10, 'degradation_score': 0.05}
+        weights = {'success_rate': 0.25, 'availability': 0.20, 'error_rate': 0.15,
+                   'carbon_efficiency': 0.10, 'helium_efficiency': 0.10, 
+                   'degradation_score': 0.05, 'quantum_efficiency': 0.10,
+                   'quantum_advantage_score': 0.05}
         score = (weights['success_rate'] * self.success_rate +
                  weights['availability'] * self.availability +
                  weights['error_rate'] * (1 - self.error_rate) +
                  weights['carbon_efficiency'] * self.carbon_efficiency +
                  weights['helium_efficiency'] * self.helium_efficiency +
-                 weights['degradation_score'] * (1 - self.degradation_score))
+                 weights['degradation_score'] * (1 - self.degradation_score) +
+                 weights['quantum_efficiency'] * self.quantum_efficiency +
+                 weights['quantum_advantage_score'] * self.quantum_advantage_score)
         heartbeat_age = (datetime.utcnow() - self.last_heartbeat).total_seconds()
         if heartbeat_age > 300: score *= 0.5
         return max(0.0, min(1.0, score))
     
     def calculate_sustainability_score(self) -> float:
-        """Calculate sustainability score from health metrics"""
-        return (self.carbon_efficiency * 0.4 + 
-                self.helium_efficiency * 0.3 + 
-                (1 - self.error_rate) * 0.3)
+        """Calculate sustainability score from health metrics with quantum awareness"""
+        return (self.carbon_efficiency * 0.35 + 
+                self.helium_efficiency * 0.25 + 
+                (1 - self.error_rate) * 0.20 +
+                self.quantum_efficiency * 0.10 +
+                self.quantum_advantage_score * 0.10)
 
 @dataclass
 class ExpertLineage:
@@ -219,6 +238,9 @@ class ExpertLineage:
     hyperparameters: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.utcnow)
     fitness_history: List[float] = field(default_factory=list)
+    # NEW: Reproductive metadata
+    reproductive_offspring: List[str] = field(default_factory=list)
+    mutation_count: int = 0
 
 @dataclass
 class ExpertProfile:
@@ -258,6 +280,10 @@ class ExpertProfile:
     capabilities: List[str] = field(default_factory=list)
     is_active: bool = True
     sustainability_score: float = 0.0
+    # NEW: Quantum capabilities
+    quantum_capable: bool = False
+    quantum_backend: Optional[str] = None
+    quantum_qubits: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -274,6 +300,8 @@ class ExpertProfile:
             'efficiency_score': self.efficiency_score,
             'health_score': self.health.calculate_health_score(),
             'sustainability_score': self.sustainability_score,
+            'quantum_capable': self.quantum_capable,
+            'quantum_qubits': self.quantum_qubits,
             'is_active': self.is_active and self.lifecycle_state.is_available(),
             'tags': self.tags, 'capabilities': self.capabilities,
             'supports_task_types': self.supported_task_types,
@@ -299,12 +327,12 @@ class ExpertProfile:
         return max(levels, key=lambda l: level_order.index(l))
 
 # ============================================================================
-# Fitness Score for Natural Selection
+# Fitness Score with Quantum Efficiency (Enhanced)
 # ============================================================================
 
 @dataclass
 class FitnessScore:
-    """Multi-dimensional fitness scoring for natural selection"""
+    """Multi-dimensional fitness scoring for natural selection with quantum awareness"""
     expert_id: str
     overall_fitness: float = 0.5
     resource_efficiency: float = 0.5
@@ -315,36 +343,45 @@ class FitnessScore:
     reproductive_success: int = 0
     ecoatp_efficiency: float = 0.5
     sustainability_score: float = 0.5
+    # NEW: Quantum fitness dimensions
+    quantum_efficiency: float = 0.5
+    quantum_advantage: float = 0.0
+    helium_savings: float = 0.5
     
     def calculate_overall(self):
         self.overall_fitness = (
-            self.resource_efficiency * 0.25 +
-            self.resilience_score * 0.20 +
-            self.adaptation_speed * 0.15 +
-            self.cooperation_score * 0.15 +
-            self.ecoatp_efficiency * 0.15 +
-            self.sustainability_score * 0.10
+            self.resource_efficiency * 0.20 +
+            self.resilience_score * 0.15 +
+            self.adaptation_speed * 0.10 +
+            self.cooperation_score * 0.10 +
+            self.ecoatp_efficiency * 0.10 +
+            self.sustainability_score * 0.15 +
+            self.quantum_efficiency * 0.10 +
+            self.quantum_advantage * 0.05 +
+            self.helium_savings * 0.05
         )
 
 # ============================================================================
-# Unified Sustainability Dashboard Module (New)
+# Registry Sustainability Dashboard (Enhanced)
 # ============================================================================
 
 class RegistrySustainabilityDashboard:
     """
-    Unified Sustainability Dashboard for Expert Registry.
+    Unified Sustainability Dashboard for Expert Registry with predictive alerts.
     
     Features:
     - Carbon and helium health monitoring
     - Sustainability score aggregation
     - Fitness distribution tracking
     - Evolutionary trend analysis
+    - Predictive alerts for upcoming extinctions (NEW)
     """
     
     def __init__(self, registry):
         self.registry = registry
         self.history = []
         self._running = True
+        self._alert_history = deque(maxlen=100)
         
         logger.info("Registry Sustainability Dashboard initialized")
     
@@ -359,10 +396,14 @@ class RegistrySustainabilityDashboard:
         # Calculate average metrics
         avg_carbon_efficiency = np.mean([e.health.carbon_efficiency for e in active_experts]) if active_experts else 0.5
         avg_helium_efficiency = np.mean([e.health.helium_efficiency for e in active_experts]) if active_experts else 0.5
+        avg_quantum_efficiency = np.mean([e.health.quantum_efficiency for e in active_experts]) if active_experts else 0.0
         avg_sustainability = np.mean([e.sustainability_score for e in active_experts]) if active_experts else 0.5
         
         # Fitness distribution
         fitnesses = [f.overall_fitness for f in registry.fitness_scores.values()] if registry.fitness_scores else [0.5]
+        
+        # Generate alerts
+        alerts = self._generate_predictive_alerts()
         
         return {
             'timestamp': datetime.utcnow().isoformat(),
@@ -370,6 +411,7 @@ class RegistrySustainabilityDashboard:
             'active_experts': len(active_experts),
             'avg_carbon_efficiency': avg_carbon_efficiency,
             'avg_helium_efficiency': avg_helium_efficiency,
+            'avg_quantum_efficiency': avg_quantum_efficiency,
             'avg_sustainability_score': avg_sustainability,
             'fitness_distribution': {
                 'mean': np.mean(fitnesses),
@@ -387,8 +429,80 @@ class RegistrySustainabilityDashboard:
                 avg_sustainability > 0.3,
                 avg_carbon_efficiency > 0.3,
                 len(active_experts) > 2
-            ])
+            ]),
+            'predictive_alerts': alerts,
+            'alert_count': len(alerts)
         }
+    
+    def _generate_predictive_alerts(self) -> List[Dict[str, Any]]:
+        """Generate predictive alerts for upcoming extinctions"""
+        registry = self.registry
+        alerts = []
+        
+        # Check for experts at risk of extinction
+        for expert_id, fitness in registry.fitness_scores.items():
+            if expert_id not in registry._experts:
+                continue
+            
+            # Predict extinction risk
+            if fitness.overall_fitness < 0.2:
+                alerts.append({
+                    'level': 'critical',
+                    'expert_id': expert_id,
+                    'message': f"Expert {expert_id} at high risk of extinction (fitness: {fitness.overall_fitness:.2f})",
+                    'timeframe_hours': 24,
+                    'recommendation': 'Immediate intervention recommended'
+                })
+            elif fitness.overall_fitness < 0.3:
+                alerts.append({
+                    'level': 'warning',
+                    'expert_id': expert_id,
+                    'message': f"Expert {expert_id} showing declining fitness (fitness: {fitness.overall_fitness:.2f})",
+                    'timeframe_hours': 72,
+                    'recommendation': 'Monitor and consider intervention'
+                })
+            
+            # Check quantum efficiency
+            if fitness.quantum_efficiency < 0.2 and registry._experts[expert_id].quantum_capable:
+                alerts.append({
+                    'level': 'warning',
+                    'expert_id': expert_id,
+                    'message': f"Quantum expert {expert_id} has low quantum efficiency",
+                    'timeframe_hours': 48,
+                    'recommendation': 'Optimize quantum circuit parameters'
+                })
+        
+        # Check species diversity
+        species_counts = registry._get_species_populations()
+        for species, count in species_counts.items():
+            if count == 0:
+                alerts.append({
+                    'level': 'critical',
+                    'species': species,
+                    'message': f"Species {species} has gone extinct",
+                    'timeframe_hours': 0,
+                    'recommendation': 'Consider introducing new experts in this domain'
+                })
+            elif count < 2:
+                alerts.append({
+                    'level': 'warning',
+                    'species': species,
+                    'message': f"Species {species} is critically endangered (population: {count})",
+                    'timeframe_hours': 72,
+                    'recommendation': 'Promote reproduction or introduce new experts'
+                })
+        
+        # Store alerts
+        self._alert_history.extend(alerts)
+        
+        return alerts
+    
+    def get_predictive_alerts(self, level: Optional[str] = None) -> List[Dict]:
+        """Get predictive alerts by severity level"""
+        alerts = list(self._alert_history)
+        if level:
+            return [a for a in alerts if a.get('level') == level]
+        return alerts
     
     def generate_report(self) -> Dict[str, Any]:
         """Generate comprehensive sustainability report"""
@@ -397,6 +511,7 @@ class RegistrySustainabilityDashboard:
         return {
             'timestamp': datetime.utcnow().isoformat(),
             'dashboard': status,
+            'predictive_alerts': self.get_predictive_alerts(),
             'recommendations': self._generate_recommendations(status),
             'generated_by': 'RegistrySustainabilityDashboard'
         }
@@ -409,7 +524,7 @@ class RegistrySustainabilityDashboard:
                 'priority': 'high',
                 'category': 'sustainability',
                 'message': 'Overall sustainability score is low',
-                'actions': ['Review expert carbon/heluim efficiency', 'Optimize resource usage']
+                'actions': ['Review expert carbon/helium efficiency', 'Optimize resource usage']
             })
         
         if status['avg_carbon_efficiency'] < 0.4:
@@ -428,40 +543,69 @@ class RegistrySustainabilityDashboard:
                 'actions': ['Filter experts by helium efficiency', 'Optimize helium usage']
             })
         
-        if len(status['species_populations']) < 3:
+        if status['avg_quantum_efficiency'] < 0.3:
             recommendations.append({
                 'priority': 'medium',
-                'category': 'diversity',
-                'message': 'Species diversity is low',
-                'actions': ['Register experts from diverse domains', 'Promote cross-domain knowledge']
+                'category': 'quantum',
+                'message': 'Quantum efficiency is low',
+                'actions': ['Optimize quantum circuit parameters', 'Consider quantum error mitigation']
             })
         
         return recommendations
 
 # ============================================================================
-# Predictive Evolution Forecasting Module (New)
+# Predictive Evolution Forecaster (Enhanced)
 # ============================================================================
 
 class PredictiveEvolutionForecaster:
     """
-    Predictive Evolution Forecasting for Expert Registry.
+    Predictive Evolution Forecasting for Expert Registry with external climate model integration.
     
     Features:
     - Extinction prediction
     - Speciation prediction
     - Fitness trajectory analysis
     - Evolutionary trend forecasting
+    - External climate model integration (NEW)
     """
     
     def __init__(self, registry):
         self.registry = registry
         self.forecast_history = deque(maxlen=1000)
+        self._climate_models = {}
+        self._initialize_climate_models()
         
         logger.info("Predictive Evolution Forecaster initialized")
     
+    def _initialize_climate_models(self):
+        """Initialize external climate models for forecasting"""
+        # Simplified climate models for carbon and helium
+        self._climate_models = {
+            'carbon': {
+                'current_intensity': 400,
+                'trend': 0.02,  # increasing 2% per year
+                'volatility': 0.05
+            },
+            'helium': {
+                'current_scarcity': 0.5,
+                'trend': 0.03,  # increasing 3% per year
+                'volatility': 0.08
+            }
+        }
+    
+    def update_climate_model(self, model_type: str, data: Dict[str, float]):
+        """Update climate model with external data"""
+        if model_type in self._climate_models:
+            self._climate_models[model_type].update(data)
+            logger.info(f"Updated climate model for {model_type}")
+    
     async def forecast_evolutionary_trend(self, hours: int = 24) -> Dict[str, Any]:
-        """Forecast evolutionary trends"""
+        """Forecast evolutionary trends with climate integration"""
         registry = self.registry
+        
+        # Get climate projections
+        carbon_projection = self._project_climate('carbon', hours)
+        helium_projection = self._project_climate('helium', hours)
         
         # Get historical fitness data
         fitness_history = []
@@ -471,11 +615,15 @@ class PredictiveEvolutionForecaster:
                 if hasattr(expert.lineage, 'fitness_history') and expert.lineage.fitness_history:
                     fitness_history.extend(expert.lineage.fitness_history)
         
-        # Predict extinctions
-        predicted_extinctions = self._forecast_extinctions()
+        # Predict extinctions with climate adjustment
+        predicted_extinctions = self._forecast_extinctions_with_climate(
+            carbon_projection, helium_projection
+        )
         
-        # Predict speciation
-        predicted_speciation = self._forecast_speciation()
+        # Predict speciation with climate adjustment
+        predicted_speciation = self._forecast_speciation_with_climate(
+            carbon_projection, helium_projection
+        )
         
         # Calculate fitness trajectory
         fitness_trajectory = self._calculate_fitness_trajectory(fitness_history)
@@ -483,67 +631,125 @@ class PredictiveEvolutionForecaster:
         forecast = {
             'timestamp': datetime.utcnow().isoformat(),
             'forecast_horizon_hours': hours,
+            'climate_projections': {
+                'carbon': carbon_projection,
+                'helium': helium_projection
+            },
             'predicted_extinctions': predicted_extinctions,
             'predicted_speciation': predicted_speciation,
             'fitness_trajectory': fitness_trajectory,
-            'recommended_actions': self._generate_forecast_actions(predicted_extinctions, predicted_speciation),
+            'recommended_actions': self._generate_forecast_actions(
+                predicted_extinctions, predicted_speciation, carbon_projection, helium_projection
+            ),
             'confidence': self._calculate_forecast_confidence()
         }
         
         self.forecast_history.append(forecast)
         return forecast
     
-    def _forecast_extinctions(self) -> Dict[str, Any]:
-        """Forecast which experts are likely to be deprecated"""
+    def _project_climate(self, model_type: str, hours: int) -> Dict[str, float]:
+        """Project climate conditions forward in time"""
+        if model_type not in self._climate_models:
+            return {'current': 0.5, 'projected': 0.5, 'trend': 0.0}
+        
+        model = self._climate_models[model_type]
+        current = model.get('current', 0.5)
+        trend = model.get('trend', 0.0)
+        volatility = model.get('volatility', 0.05)
+        
+        # Project forward
+        projected = current * (1 + trend * hours / (24 * 365))
+        projected += np.random.normal(0, volatility * hours / 24)
+        
+        return {
+            'current': current,
+            'projected': max(0.0, min(1.0, projected)),
+            'trend': trend,
+            'volatility': volatility,
+            'hours': hours
+        }
+    
+    def _forecast_extinctions_with_climate(
+        self,
+        carbon_projection: Dict,
+        helium_projection: Dict
+    ) -> Dict[str, Any]:
+        """Forecast extinctions with climate adjustment"""
         registry = self.registry
         at_risk = []
+        
+        carbon_stress = carbon_projection['projected'] / 500  # Normalized carbon stress
+        helium_stress = helium_projection['projected']  # Direct scarcity
         
         for expert_id, fitness in registry.fitness_scores.items():
             if expert_id not in registry._experts:
                 continue
             
-            # At risk if fitness is low and health is declining
-            if fitness.overall_fitness < 0.3:
+            # Adjust fitness with climate stress
+            climate_adjustment = 1.0 - (carbon_stress * 0.2 + helium_stress * 0.3)
+            adjusted_fitness = fitness.overall_fitness * climate_adjustment
+            
+            if adjusted_fitness < 0.25:
                 at_risk.append({
                     'expert_id': expert_id,
                     'current_fitness': fitness.overall_fitness,
+                    'adjusted_fitness': adjusted_fitness,
                     'risk_level': 'high',
-                    'time_to_extinction_weeks': self._estimate_extinction_time(fitness)
+                    'climate_stress': {'carbon': carbon_stress, 'helium': helium_stress}
                 })
-            elif fitness.overall_fitness < 0.5:
+            elif adjusted_fitness < 0.4:
                 at_risk.append({
                     'expert_id': expert_id,
                     'current_fitness': fitness.overall_fitness,
+                    'adjusted_fitness': adjusted_fitness,
                     'risk_level': 'medium',
-                    'time_to_extinction_weeks': self._estimate_extinction_time(fitness)
+                    'climate_stress': {'carbon': carbon_stress, 'helium': helium_stress}
                 })
         
         return {
             'at_risk_count': len(at_risk),
             'at_risk_details': at_risk,
-            'extinction_rate': len(at_risk) / max(len(registry._experts), 1)
+            'extinction_rate': len(at_risk) / max(len(registry._experts), 1),
+            'carbon_stress': carbon_stress,
+            'helium_stress': helium_stress
         }
     
-    def _forecast_speciation(self) -> Dict[str, Any]:
-        """Forecast new expert registrations (speciation)"""
+    def _forecast_speciation_with_climate(
+        self,
+        carbon_projection: Dict,
+        helium_projection: Dict
+    ) -> Dict[str, Any]:
+        """Forecast speciation with climate adjustment"""
         registry = self.registry
         
-        # High fitness experts are candidates for reproduction
+        # Climate opportunities: when stress is high, speciation increases
+        carbon_opportunity = max(0, 1.0 - carbon_projection['projected'] / 500)
+        helium_opportunity = max(0, 1.0 - helium_projection['projected'])
+        
         candidates = []
         for expert_id, fitness in registry.fitness_scores.items():
             if expert_id not in registry._experts:
                 continue
-            if fitness.overall_fitness > 0.7:
+            
+            # Climate-adjusted fitness
+            climate_bonus = (carbon_opportunity * 0.2 + helium_opportunity * 0.3)
+            adjusted_fitness = fitness.overall_fitness + climate_bonus * 0.3
+            
+            if adjusted_fitness > 0.7:
                 candidates.append({
                     'expert_id': expert_id,
                     'fitness': fitness.overall_fitness,
-                    'speciation_potential': min(1.0, fitness.reproductive_success / 5)
+                    'adjusted_fitness': adjusted_fitness,
+                    'speciation_potential': min(1.0, fitness.reproductive_success / 3 + climate_bonus),
+                    'climate_opportunity': {'carbon': carbon_opportunity, 'helium': helium_opportunity}
                 })
         
         return {
             'speciation_candidates': len(candidates),
             'candidate_details': candidates,
-            'predicted_new_species': len([c for c in candidates if c['speciation_potential'] > 0.5])
+            'predicted_new_species': len([c for c in candidates if c['speciation_potential'] > 0.5]),
+            'carbon_opportunity': carbon_opportunity,
+            'helium_opportunity': helium_opportunity
         }
     
     def _calculate_fitness_trajectory(self, fitness_history: List[float]) -> Dict[str, Any]:
@@ -551,7 +757,7 @@ class PredictiveEvolutionForecaster:
         if len(fitness_history) < 10:
             return {'trend': 'stable', 'confidence': 0.3, 'average': np.mean(fitness_history) if fitness_history else 0.5}
         
-        # Linear trend analysis
+        # Linear trend analysis with climate adjustment
         x = np.arange(len(fitness_history))
         slope = np.polyfit(x, fitness_history, 1)[0]
         
@@ -565,26 +771,24 @@ class PredictiveEvolutionForecaster:
             trend = 'stable'
             confidence = 0.6
         
+        # Predict future fitness
+        predicted_fitness = np.mean(fitness_history[-10:]) + slope * 10
+        
         return {
             'trend': trend,
             'confidence': confidence,
             'average': np.mean(fitness_history),
             'slope': slope,
-            'predicted_fitness': np.mean(fitness_history[-10:]) + slope * 10
+            'predicted_fitness': max(0.0, min(1.0, predicted_fitness))
         }
     
-    def _estimate_extinction_time(self, fitness: FitnessScore) -> float:
-        """Estimate time to extinction in weeks"""
-        if fitness.overall_fitness < 0.1:
-            return 1.0
-        elif fitness.overall_fitness < 0.2:
-            return 2.0
-        elif fitness.overall_fitness < 0.3:
-            return 4.0
-        else:
-            return 8.0
-    
-    def _generate_forecast_actions(self, extinctions: Dict, speciation: Dict) -> List[str]:
+    def _generate_forecast_actions(
+        self,
+        extinctions: Dict,
+        speciation: Dict,
+        carbon_projection: Dict,
+        helium_projection: Dict
+    ) -> List[str]:
         """Generate actions based on forecast"""
         actions = []
         
@@ -592,6 +796,14 @@ class PredictiveEvolutionForecaster:
             actions.append(f"Review {extinctions['at_risk_count']} experts at risk of extinction")
             for risk in extinctions['at_risk_details'][:3]:
                 actions.append(f"Consider intervention for {risk['expert_id']} (risk: {risk['risk_level']})")
+        
+        if carbon_projection['projected'] > 500:
+            actions.append("Carbon stress increasing - prioritize carbon-efficient experts")
+            actions.append("Implement carbon-aware scheduling")
+        
+        if helium_projection['projected'] > 0.6:
+            actions.append("Helium scarcity increasing - prioritize helium-efficient experts")
+            actions.append("Implement helium recovery systems")
         
         if speciation['speciation_candidates'] > 0:
             actions.append(f"Encourage reproduction from {speciation['speciation_candidates']} high-fitness experts")
@@ -606,26 +818,30 @@ class PredictiveEvolutionForecaster:
         elif len(registry.fitness_scores) < 30:
             return 0.5
         else:
-            return 0.7
+            # Include climate model confidence
+            climate_confidence = 0.7
+            return min(0.9, 0.7 + 0.1 * len(registry.fitness_scores) / 50 * climate_confidence)
 
 # ============================================================================
-# Cross-Region Registry Synchronization Module (New)
+# Cross-Region Registry Synchronizer (Enhanced)
 # ============================================================================
 
 class CrossRegionRegistrySynchronizer:
     """
-    Cross-Region Registry Synchronization for Expert Registry.
+    Cross-Region Registry Synchronization for Expert Registry with conflict resolution.
     
     Features:
     - Remote registry synchronization
-    - Conflict resolution
+    - Conflict resolution with voting mechanisms (NEW)
     - Federated expert discovery
+    - Consensus-based conflict resolution (NEW)
     """
     
     def __init__(self, registry):
         self.registry = registry
         self._session = None
         self.sync_history = deque(maxlen=1000)
+        self.voting_weights: Dict[str, float] = {}  # Registry ID -> trust weight
         
         logger.info("Cross-Region Registry Synchronizer initialized")
     
@@ -638,15 +854,17 @@ class CrossRegionRegistrySynchronizer:
         self,
         registry_url: str,
         registry_id: str,
-        sync_mode: str = 'pull'
+        sync_mode: str = 'pull',
+        resolve_conflicts: bool = True  # NEW
     ) -> Dict[str, Any]:
         """
-        Synchronize with remote registry.
+        Synchronize with remote registry with conflict resolution.
         
         Args:
             registry_url: URL of remote registry
             registry_id: Remote registry identifier
             sync_mode: 'pull', 'push', or 'both'
+            resolve_conflicts: Whether to resolve conflicts with voting
             
         Returns:
             Sync results
@@ -657,6 +875,7 @@ class CrossRegionRegistrySynchronizer:
             'sync_mode': sync_mode,
             'synced_experts': 0,
             'conflicts': [],
+            'resolved_conflicts': [],
             'status': 'unknown'
         }
         
@@ -668,9 +887,12 @@ class CrossRegionRegistrySynchronizer:
                 async with session.get(f"{registry_url}/api/experts", timeout=30) as response:
                     if response.status == 200:
                         remote_experts = await response.json()
-                        synced, conflicts = self._merge_remote_experts(remote_experts, registry_id)
+                        synced, conflicts, resolved = await self._merge_remote_experts_with_voting(
+                            remote_experts, registry_id, resolve_conflicts
+                        )
                         result['synced_experts'] = synced
                         result['conflicts'] = conflicts
+                        result['resolved_conflicts'] = resolved
                     else:
                         result['status'] = f'failed: {response.status}'
                         return result
@@ -690,13 +912,15 @@ class CrossRegionRegistrySynchronizer:
             
             # Update remote registry tracking
             self.registry._remote_registries[registry_id] = registry_url
+            self.voting_weights[registry_id] = 0.5  # Initialize trust
             
             # Record sync
             self.sync_history.append({
                 'timestamp': datetime.utcnow().isoformat(),
                 'registry_id': registry_id,
                 'synced_count': result['synced_experts'],
-                'conflicts': len(result['conflicts'])
+                'conflicts': len(result['conflicts']),
+                'resolved': len(result['resolved_conflicts'])
             })
             
         except Exception as e:
@@ -705,27 +929,42 @@ class CrossRegionRegistrySynchronizer:
         
         return result
     
-    def _merge_remote_experts(self, remote_experts: List[Dict], registry_id: str) -> Tuple[int, List[Dict]]:
-        """Merge remote experts into local registry"""
+    async def _merge_remote_experts_with_voting(
+        self,
+        remote_experts: List[Dict],
+        registry_id: str,
+        resolve_conflicts: bool
+    ) -> Tuple[int, List[Dict], List[Dict]]:
+        """Merge remote experts with voting-based conflict resolution"""
         synced = 0
         conflicts = []
+        resolved = []
         
         for remote_data in remote_experts:
             expert_id = remote_data.get('expert_id')
             remote_version = ExpertVersion.from_string(remote_data.get('version', '1.0.0'))
             
             if expert_id in self.registry._experts:
-                # Check for conflict
                 local_expert = self.registry._experts[expert_id]
                 local_version = local_expert.version
                 
                 if remote_version.is_newer_than(local_version):
-                    conflicts.append({
+                    conflict = {
                         'expert_id': expert_id,
                         'local_version': local_version.to_string(),
                         'remote_version': remote_version.to_string(),
                         'action': 'remote_newer'
-                    })
+                    }
+                    conflicts.append(conflict)
+                    
+                    if resolve_conflicts:
+                        # Use voting mechanism to resolve
+                        resolution = await self._resolve_conflict_with_voting(
+                            expert_id, local_expert, remote_data, registry_id
+                        )
+                        if resolution:
+                            resolved.append(resolution)
+                            synced += 1
                 elif local_version.is_newer_than(remote_version):
                     conflicts.append({
                         'expert_id': expert_id,
@@ -743,7 +982,96 @@ class CrossRegionRegistrySynchronizer:
                 except Exception as e:
                     logger.error(f"Failed to create expert from remote: {str(e)}")
         
-        return synced, conflicts
+        return synced, conflicts, resolved
+    
+    async def _resolve_conflict_with_voting(
+        self,
+        expert_id: str,
+        local_expert: ExpertProfile,
+        remote_data: Dict,
+        remote_registry_id: str
+    ) -> Optional[Dict]:
+        """Resolve conflict using voting mechanism"""
+        # Collect votes from all known registries
+        votes = []
+        
+        # Local vote
+        local_trust = self.voting_weights.get(self.registry.registry_id, 0.5)
+        local_vote = {
+            'registry': self.registry.registry_id,
+            'version': local_expert.version.to_string(),
+            'trust': local_trust,
+            'decision': 'local'
+        }
+        votes.append(local_vote)
+        
+        # Remote vote
+        remote_trust = self.voting_weights.get(remote_registry_id, 0.5)
+        remote_vote = {
+            'registry': remote_registry_id,
+            'version': remote_data.get('version', '1.0.0'),
+            'trust': remote_trust,
+            'decision': 'remote'
+        }
+        votes.append(remote_vote)
+        
+        # If there are other registries, ask them
+        for other_id, other_url in self.registry._remote_registries.items():
+            if other_id not in [self.registry.registry_id, remote_registry_id]:
+                try:
+                    session = await self._get_session()
+                    async with session.get(
+                        f"{other_url}/api/experts/{expert_id}",
+                        timeout=10
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            other_version = data.get('version', '1.0.0')
+                            other_trust = self.voting_weights.get(other_id, 0.3)
+                            votes.append({
+                                'registry': other_id,
+                                'version': other_version,
+                                'trust': other_trust,
+                                'decision': 'other'
+                            })
+                except Exception as e:
+                    logger.warning(f"Failed to get vote from {other_id}: {str(e)}")
+        
+        # Weighted voting
+        version_scores = {}
+        for vote in votes:
+            version = vote['version']
+            weight = vote['trust']
+            if version not in version_scores:
+                version_scores[version] = 0
+            version_scores[version] += weight
+        
+        if version_scores:
+            winner_version = max(version_scores.items(), key=lambda x: x[1])[0]
+            
+            # Update local expert if remote wins
+            if winner_version != local_expert.version.to_string():
+                self.registry._experts[expert_id].version = ExpertVersion.from_string(winner_version)
+                logger.info(f"Conflict resolved: {expert_id} updated to {winner_version}")
+                
+                return {
+                    'expert_id': expert_id,
+                    'winner_version': winner_version,
+                    'vote_scores': version_scores,
+                    'votes': votes
+                }
+        
+        return None
+    
+    def update_trust_weight(self, registry_id: str, success: bool):
+        """Update trust weight for a registry based on sync success"""
+        if registry_id not in self.voting_weights:
+            self.voting_weights[registry_id] = 0.5
+        
+        if success:
+            self.voting_weights[registry_id] = min(1.0, self.voting_weights[registry_id] + 0.05)
+        else:
+            self.voting_weights[registry_id] = max(0.0, self.voting_weights[registry_id] - 0.1)
     
     def _create_profile_from_remote(self, remote_data: Dict, registry_id: str) -> ExpertProfile:
         """Create expert profile from remote data"""
@@ -762,7 +1090,8 @@ class CrossRegionRegistrySynchronizer:
         health = HealthMetrics(
             success_rate=remote_data.get('health_score', 0.9),
             carbon_efficiency=remote_data.get('carbon_efficiency', 0.5),
-            helium_efficiency=remote_data.get('helium_efficiency', 0.5)
+            helium_efficiency=remote_data.get('helium_efficiency', 0.5),
+            quantum_efficiency=remote_data.get('quantum_efficiency', 0.0)
         )
         
         return ExpertProfile(
@@ -780,6 +1109,8 @@ class CrossRegionRegistrySynchronizer:
             is_remote=True,
             remote_endpoint=remote_data.get('remote_endpoint'),
             origin_region=remote_data.get('origin_region', registry_id),
+            quantum_capable=remote_data.get('quantum_capable', False),
+            quantum_qubits=remote_data.get('quantum_qubits', 0),
             health=health
         )
     
@@ -797,7 +1128,9 @@ class CrossRegionRegistrySynchronizer:
             'remote_registries': self.registry._remote_registries,
             'federated_experts': len(self.registry._federated_experts),
             'last_sync': list(self.sync_history)[-5:] if self.sync_history else [],
-            'total_syncs': len(self.sync_history)
+            'total_syncs': len(self.sync_history),
+            'voting_weights': self.voting_weights,
+            'conflict_resolutions': sum(1 for h in self.sync_history if h.get('resolved', 0) > 0)
         }
 
 # ============================================================================
@@ -806,20 +1139,14 @@ class CrossRegionRegistrySynchronizer:
 
 class ExpertRegistry:
     """
-    Enhanced Expert Registry v5.0.0 - Complete Bio-Inspired Genome Repository
+    Enhanced Expert Registry v6.0.0 - Complete Bio-Inspired Genome Repository
     
-    Full correlation with bio-inspired modules:
-    - Eco-ATP efficiency filtering for expert selection
-    - Species population tracking from chromatophore compartments
-    - Natural selection based on multi-dimensional fitness scores
-    - Gradient-based fitness updates from proton gradient fields
-    - Biomass storage integration for expert performance history
-    - Token economy integration for expert resource accounting
-    - Compartment lifecycle ↔ Registry lifecycle bidirectional mapping
-    - Evolutionary lineage tracking across generations
-    - Unified Sustainability Dashboard
-    - Predictive Evolution Forecasting
-    - Cross-Region Registry Synchronization
+    New Features:
+    - Quantum efficiency as fitness dimension
+    - Predictive alerts for upcoming extinctions
+    - External climate model integration
+    - Conflict resolution with voting mechanisms
+    - Reproductive strategies for high-fitness experts
     """
     
     def __init__(
@@ -831,7 +1158,10 @@ class ExpertRegistry:
         enable_population_tracking: bool = True,
         enable_sustainability_dashboard: bool = True,
         enable_predictive_forecasting: bool = True,
-        enable_cross_region_sync: bool = True
+        enable_cross_region_sync: bool = True,
+        enable_quantum_efficiency: bool = True,  # NEW
+        enable_reproductive_strategies: bool = True,  # NEW
+        enable_climate_integration: bool = True  # NEW
     ):
         self.registry_id = registry_id
         
@@ -843,6 +1173,9 @@ class ExpertRegistry:
         self.enable_sustainability_dashboard = enable_sustainability_dashboard
         self.enable_predictive_forecasting = enable_predictive_forecasting
         self.enable_cross_region_sync = enable_cross_region_sync
+        self.enable_quantum_efficiency = enable_quantum_efficiency
+        self.enable_reproductive_strategies = enable_reproductive_strategies
+        self.enable_climate_integration = enable_climate_integration
         
         # Bio-inspired module references (injected)
         self.token_manager: Optional[EcoATPTokenManager] = None
@@ -890,6 +1223,7 @@ class ExpertRegistry:
         self.speciation_count: int = 0
         self.extinction_count: int = 0
         self.total_generations: int = 0
+        self.reproductive_events: int = 0  # NEW
         
         # Statistics
         self._stats = {
@@ -906,12 +1240,15 @@ class ExpertRegistry:
         self._start_background_tasks()
         
         logger.info(
-            f"Expert Registry v5.0.0 initialized: "
+            f"Expert Registry v6.0.0 initialized: "
             f"bio_correlation={self.enable_bio_correlation}, "
             f"natural_selection={self.enable_natural_selection}, "
             f"sustainability_dashboard={self.enable_sustainability_dashboard}, "
             f"predictive_forecasting={self.enable_predictive_forecasting}, "
             f"cross_region_sync={self.enable_cross_region_sync}, "
+            f"quantum_efficiency={self.enable_quantum_efficiency}, "
+            f"reproductive_strategies={self.enable_reproductive_strategies}, "
+            f"climate_integration={self.enable_climate_integration}, "
             f"bio_available={BIO_INSPIRED_AVAILABLE}"
         )
     
@@ -933,6 +1270,8 @@ class ExpertRegistry:
             asyncio.create_task(self._predictive_forecast_loop())
         if self.enable_cross_region_sync:
             asyncio.create_task(self._cross_region_sync_loop())
+        if self.enable_reproductive_strategies:
+            asyncio.create_task(self._reproductive_strategy_loop())
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -997,6 +1336,11 @@ class ExpertRegistry:
         return len([e for e in self._experts.values()
                    if hasattr(e, 'domain') and species_id in str(e.domain).lower()])
     
+    def _get_species_populations(self) -> Dict[str, int]:
+        """Get populations for all species"""
+        species = ['energy', 'data', 'iot', 'quantum', 'helium', 'general']
+        return {s: self._get_species_population(s) for s in species}
+    
     def _get_total_compartment_population(self) -> int:
         if self.compartment_manager:
             return len([c for c in self.compartment_manager.compartments.values() if c.is_viable])
@@ -1012,7 +1356,7 @@ class ExpertRegistry:
         return 'general'
     
     # ========================================================================
-    # Expert Registration with Bio-Inspired Correlation
+    # Expert Registration with Bio-Inspired Correlation (Enhanced)
     # ========================================================================
     
     def register_expert(
@@ -1024,7 +1368,7 @@ class ExpertRegistry:
         register_compartment: bool = True
     ) -> Tuple[bool, str]:
         """
-        Register expert with bio-inspired correlation.
+        Register expert with bio-inspired correlation and quantum efficiency.
         
         Creates Eco-ATP account and optionally a chromatophore compartment.
         """
@@ -1053,7 +1397,8 @@ class ExpertRegistry:
         else:
             profile.lifecycle_state = ExpertLifecycleState.REGISTERED
         
-        # Calculate sustainability score
+        # Calculate sustainability score with quantum efficiency
+        profile.health.quantum_efficiency = self._calculate_quantum_efficiency(profile)
         profile.sustainability_score = profile.health.calculate_sustainability_score()
         
         # Store expert
@@ -1084,7 +1429,7 @@ class ExpertRegistry:
             )
             logger.info(f"Created chromatophore compartment for {profile.expert_id}")
         
-        # Initialize fitness score
+        # Initialize fitness score with quantum dimensions
         if self.enable_fitness_tracking:
             self.fitness_scores[profile.expert_id] = FitnessScore(
                 expert_id=profile.expert_id,
@@ -1093,7 +1438,10 @@ class ExpertRegistry:
                 adaptation_speed=0.5,
                 cooperation_score=0.5,
                 ecoatp_efficiency=profile.efficiency_score,
-                sustainability_score=profile.sustainability_score
+                sustainability_score=profile.sustainability_score,
+                quantum_efficiency=profile.health.quantum_efficiency,
+                quantum_advantage=self._calculate_quantum_advantage(profile),
+                helium_savings=1.0 - profile.helium_per_inference / max(profile.helium_per_inference, 1)
             )
             self.fitness_scores[profile.expert_id].calculate_overall()
         
@@ -1109,16 +1457,20 @@ class ExpertRegistry:
             'expert_id': profile.expert_id,
             'species': self._get_species_id(profile),
             'generation': self.total_generations,
+            'quantum_capable': profile.quantum_capable,
             'timestamp': datetime.utcnow().isoformat()
         })
         self.speciation_count += 1
         
         logger.info(f"Registered expert: {profile.expert_id} v{profile.version.to_string()} "
-                   f"(species: {self._get_species_id(profile)}, generation: {self.total_generations})")
+                   f"(species: {self._get_species_id(profile)}, "
+                   f"quantum: {profile.quantum_capable}, "
+                   f"generation: {self.total_generations})")
         
         return True, f"Expert {profile.expert_id} registered successfully"
     
     def _validate_profile(self, profile: ExpertProfile) -> Tuple[bool, str]:
+        """Validate profile with quantum constraints"""
         errors = []
         if not profile.expert_id: errors.append("expert_id is required")
         if not profile.expert_name: errors.append("expert_name is required")
@@ -1137,8 +1489,40 @@ class ExpertRegistry:
         for incompatible_id in profile.incompatible_with:
             if incompatible_id == profile.expert_id:
                 errors.append("Cannot be incompatible with self")
+        # NEW: Quantum validation
+        if profile.quantum_capable and profile.quantum_qubits < 1:
+            errors.append("Quantum capable experts must have at least 1 qubit")
+        if profile.quantum_capable and not profile.quantum_backend:
+            errors.append("Quantum capable experts must specify a quantum backend")
         if errors: return False, "; ".join(errors)
         return True, "Profile valid"
+    
+    def _calculate_quantum_efficiency(self, profile: ExpertProfile) -> float:
+        """Calculate quantum efficiency for an expert"""
+        if not profile.quantum_capable:
+            return 0.0
+        
+        # Base efficiency from qubits and accuracy
+        qubit_efficiency = min(1.0, profile.quantum_qubits / 50)
+        accuracy_efficiency = profile.accuracy_score
+        
+        # Helium efficiency for quantum
+        helium_efficiency = 1.0 / (1.0 + profile.helium_per_inference * 10)
+        
+        return (qubit_efficiency * 0.3 + accuracy_efficiency * 0.4 + helium_efficiency * 0.3)
+    
+    def _calculate_quantum_advantage(self, profile: ExpertProfile) -> float:
+        """Calculate quantum advantage score"""
+        if not profile.quantum_capable:
+            return 0.0
+        
+        # Simulate quantum advantage based on qubits and accuracy
+        qubits = profile.quantum_qubits
+        accuracy = profile.accuracy_score
+        
+        # More qubits and higher accuracy = greater advantage
+        advantage = min(1.0, (qubits / 100) * 0.5 + accuracy * 0.5)
+        return advantage
     
     def _update_indexes(self, profile: ExpertProfile):
         self._domain_index[profile.domain].add(profile.expert_id)
@@ -1151,14 +1535,15 @@ class ExpertRegistry:
     
     def _update_dependency_graph(self, profile: ExpertProfile):
         self._dependency_graph.add_node(profile.expert_id, name=profile.expert_name,
-                                        version=profile.version.to_string())
+                                        version=profile.version.to_string(),
+                                        quantum=profile.quantum_capable)
         for dep in profile.dependencies:
             self._dependency_graph.add_edge(profile.expert_id, dep.dependency_id,
                                            optional=dep.is_optional,
                                            version_req=dep.version_requirement)
     
     # ========================================================================
-    # Bio-Inspired Filtering Methods
+    # Bio-Inspired Filtering Methods (Enhanced)
     # ========================================================================
     
     def filter_by_ecoatp_efficiency(
@@ -1212,6 +1597,19 @@ class ExpertRegistry:
                 qualified.append(expert)
         return qualified
     
+    def filter_by_quantum_efficiency(
+        self,
+        min_quantum_efficiency: float = 0.3
+    ) -> List[ExpertProfile]:
+        """Filter experts by quantum efficiency"""
+        qualified = []
+        for expert in self._experts.values():
+            if not expert.lifecycle_state.is_available():
+                continue
+            if expert.health.quantum_efficiency >= min_quantum_efficiency:
+                qualified.append(expert)
+        return qualified
+    
     def filter_by_gradient_alignment(
         self,
         carbon_threshold: float = 0.3,
@@ -1239,7 +1637,7 @@ class ExpertRegistry:
         return self.get_all_active_experts()
     
     # ========================================================================
-    # Natural Selection and Evolution
+    # Natural Selection and Evolution (Enhanced)
     # ========================================================================
     
     def update_fitness_from_gradients(self):
@@ -1269,7 +1667,11 @@ class ExpertRegistry:
                 if compartment:
                     fitness.cooperation_score = fitness.cooperation_score * 0.8 + compartment.health_score * 0.2
             
-            # Update sustainability score
+            # Update quantum fitness
+            fitness.quantum_efficiency = expert.health.quantum_efficiency
+            fitness.quantum_advantage = self._calculate_quantum_advantage(expert)
+            fitness.helium_savings = 1.0 - expert.helium_per_inference / max(expert.helium_per_inference, 1)
+            
             fitness.sustainability_score = expert.health.calculate_sustainability_score()
             
             fitness.calculate_overall()
@@ -1315,6 +1717,7 @@ class ExpertRegistry:
                     'type': 'extinction',
                     'expert_id': expert_id,
                     'fitness': fitness.overall_fitness,
+                    'quantum_efficiency': fitness.quantum_efficiency,
                     'reason': 'natural_selection',
                     'timestamp': datetime.utcnow().isoformat()
                 })
@@ -1330,6 +1733,98 @@ class ExpertRegistry:
         if deprecated_count > 0 or reproducer_count > 0:
             logger.info(f"Natural selection: {deprecated_count} deprecated, "
                        f"{reproducer_count} marked for reproduction")
+    
+    # ========================================================================
+    # Reproductive Strategies (NEW)
+    # ========================================================================
+    
+    async def _reproductive_strategy_loop(self):
+        """Background loop for implementing reproductive strategies"""
+        while True:
+            try:
+                if self.enable_reproductive_strategies:
+                    # Find high-fitness experts
+                    candidates = []
+                    for expert_id, fitness in self.fitness_scores.items():
+                        if expert_id not in self._experts:
+                            continue
+                        if (fitness.overall_fitness > 0.7 and 
+                            fitness.reproductive_success > 0 and
+                            self._experts[expert_id].lifecycle_state.is_available()):
+                            candidates.append((expert_id, fitness))
+                    
+                    # Apply reproductive strategies
+                    for expert_id, fitness in candidates[:5]:  # Top 5 candidates
+                        await self._reproduce_expert(expert_id, fitness)
+                
+                await asyncio.sleep(3600)  # Every hour
+            except Exception as e:
+                logger.error(f"Reproductive strategy loop error: {str(e)}")
+                await asyncio.sleep(600)
+    
+    async def _reproduce_expert(self, expert_id: str, fitness: FitnessScore):
+        """Create a new expert from a high-fitness parent"""
+        parent = self._experts[expert_id]
+        
+        # Create offspring with mutations
+        offspring_id = f"{expert_id}_offspring_{self.reproductive_events}"
+        offspring_version = ExpertVersion(
+            major=parent.version.major,
+            minor=parent.version.minor,
+            patch=parent.version.patch + 1
+        )
+        
+        # Mutate attributes
+        mutation_rate = 0.1
+        offspring_accuracy = min(1.0, parent.accuracy_score + np.random.normal(0, 0.05))
+        offspring_efficiency = min(1.0, parent.efficiency_score + np.random.normal(0, 0.05))
+        offspring_quantum_qubits = max(1, parent.quantum_qubits + np.random.randint(-2, 3))
+        
+        # Create offspring profile
+        offspring = ExpertProfile(
+            expert_id=offspring_id,
+            expert_name=f"{parent.expert_name}_offspring",
+            version=offspring_version,
+            domain=parent.domain,
+            hardware_profile=parent.hardware_profile,
+            accuracy_score=offspring_accuracy,
+            efficiency_score=offspring_efficiency,
+            helium_per_inference=parent.helium_per_inference * (0.9 + np.random.random() * 0.2),
+            carbon_per_inference=parent.carbon_per_inference * (0.9 + np.random.random() * 0.2),
+            energy_per_inference=parent.energy_per_inference * (0.9 + np.random.random() * 0.2),
+            quantum_capable=parent.quantum_capable,
+            quantum_qubits=offspring_quantum_qubits,
+            quantum_backend=parent.quantum_backend,
+            sustainability_score=parent.sustainability_score,
+            health=HealthMetrics(
+                success_rate=parent.health.success_rate,
+                quantum_efficiency=parent.health.quantum_efficiency * (0.9 + np.random.random() * 0.2)
+            )
+        )
+        
+        # Register offspring
+        success, msg = self.register_expert(offspring, validate=False, auto_certify=True)
+        
+        if success:
+            # Update parent lineage
+            if parent.lineage is None:
+                parent.lineage = ExpertLineage(
+                    lineage_id=f"lineage_{parent.expert_id}",
+                    parent_expert_id=None
+                )
+            parent.lineage.reproductive_offspring.append(offspring_id)
+            parent.lineage.mutation_count += 1
+            
+            # Update fitness reproductive success
+            fitness.reproductive_success += 1
+            
+            self.reproductive_events += 1
+            
+            logger.info(f"Reproduced expert {offspring_id} from {expert_id} (mutation rate: {mutation_rate:.2f})")
+    
+    # ========================================================================
+    # Deprecation and Activation
+    # ========================================================================
     
     def deprecate_expert(
         self,
@@ -1372,7 +1867,7 @@ class ExpertRegistry:
         return True, f"Expert {expert_id} activated"
     
     # ========================================================================
-    # Performance Tracking with Bio-Inspired Integration
+    # Performance Tracking with Bio-Inspired Integration (Enhanced)
     # ========================================================================
     
     def update_performance(
@@ -1404,6 +1899,10 @@ class ExpertRegistry:
             expert.health.carbon_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 1000)
         if 'helium_units' in metrics:
             expert.health.helium_efficiency = 1.0 / (1.0 + metrics['helium_units'] * 100)
+        if 'quantum_accuracy' in metrics:
+            expert.health.quantum_efficiency = metrics['quantum_accuracy']
+        if 'quantum_advantage' in metrics:
+            expert.health.quantum_advantage_score = metrics['quantum_advantage']
         
         expert.health.last_heartbeat = datetime.utcnow()
         
@@ -1425,6 +1924,9 @@ class ExpertRegistry:
             
             if 'ecoatp_efficiency' in metrics:
                 fitness.ecoatp_efficiency = metrics['ecoatp_efficiency']
+            
+            if 'quantum_accuracy' in metrics:
+                fitness.quantum_efficiency = metrics['quantum_accuracy']
             
             fitness.sustainability_score = expert.sustainability_score
             
@@ -1460,7 +1962,7 @@ class ExpertRegistry:
                     
                     if self.compartment_manager and self.enable_population_tracking:
                         for species_id in ['energy', 'data', 'iot', 'quantum', 'helium']:
-                            population = self._get_species_population(species_id)
+                            self._get_species_population(species_id)
                 
                 await asyncio.sleep(300)
                 
@@ -1512,14 +2014,18 @@ class ExpertRegistry:
             'bio_correlation_enabled': self.enable_bio_correlation,
             'bio_modules_available': BIO_INSPIRED_AVAILABLE,
             'sustainability_score': np.mean([e.sustainability_score for e in self._experts.values()]) if self._experts else 0,
+            'quantum_experts': sum(1 for e in self._experts.values() if e.quantum_capable),
+            'avg_quantum_efficiency': np.mean([e.health.quantum_efficiency for e in self._experts.values() if e.quantum_capable]) if self._experts else 0,
             'evolution': {
                 'total_generations': self.total_generations,
                 'speciation_events': self.speciation_count,
                 'extinction_events': self.extinction_count,
+                'reproductive_events': self.reproductive_events,
                 'natural_selections': self._stats['total_natural_selections'],
                 'last_selection': self._stats['last_selection'].isoformat() if self._stats['last_selection'] else None,
                 'average_fitness': np.mean([f.overall_fitness for f in self.fitness_scores.values()]) if self.fitness_scores else 0,
-                'top_fitness': max([f.overall_fitness for f in self.fitness_scores.values()]) if self.fitness_scores else 0
+                'top_fitness': max([f.overall_fitness for f in self.fitness_scores.values()]) if self.fitness_scores else 0,
+                'top_quantum_fitness': max([f.quantum_efficiency for f in self.fitness_scores.values()]) if self.fitness_scores else 0
             }
         }
         
@@ -1528,136 +2034,18 @@ class ExpertRegistry:
                 species: self._get_species_population(species)
                 for species in ['energy', 'data', 'iot', 'quantum', 'helium']
             }
-            stats['total_population'] = self._get_total_compartment_population()
         
-        if self.token_manager:
-            stats['token_economy'] = self.token_manager.get_system_summary()
-        
-        if self.gradient_manager:
-            stats['gradient_health'] = self.gradient_manager.get_field_strengths()
-        
-        if self.fitness_scores:
-            fitnesses = [f.overall_fitness for f in self.fitness_scores.values()]
-            stats['fitness_distribution'] = {
-                'mean': np.mean(fitnesses),
-                'median': np.median(fitnesses),
-                'std': np.std(fitnesses),
-                'min': np.min(fitnesses),
-                'max': np.max(fitnesses),
-                'q25': np.percentile(fitnesses, 25),
-                'q75': np.percentile(fitnesses, 75)
-            }
-        
-        # Add dashboard status
-        if self.sustainability_dashboard:
+        if self.enable_sustainability_dashboard and self.sustainability_dashboard:
             stats['dashboard'] = self.sustainability_dashboard.get_dashboard_status()
+            stats['predictive_alerts'] = self.sustainability_dashboard.get_predictive_alerts()
+        
+        if self.enable_predictive_forecasting and self.predictive_forecaster:
+            stats['forecast'] = self.predictive_forecaster.forecast_history[-1] if self.predictive_forecaster.forecast_history else None
+        
+        if self.enable_cross_region_sync and self.cross_region_sync:
+            stats['sync'] = self.cross_region_sync.get_sync_status()
         
         return stats
     
-    def get_sustainability_dashboard(self) -> Dict[str, Any]:
-        """Get sustainability dashboard status"""
-        if self.sustainability_dashboard:
-            return self.sustainability_dashboard.get_dashboard_status()
-        return {'status': 'dashboard_not_enabled'}
-    
-    def get_predictive_forecast(self) -> Dict[str, Any]:
-        """Get predictive evolutionary forecast"""
-        if self.predictive_forecaster and self.enable_predictive_forecasting:
-            return asyncio.run(self.predictive_forecaster.forecast_evolutionary_trend())
-        return {'status': 'forecasting_not_enabled'}
-    
-    def get_sync_status(self) -> Dict[str, Any]:
-        """Get cross-region sync status"""
-        if self.cross_region_sync:
-            return self.cross_region_sync.get_sync_status()
-        return {'status': 'sync_not_enabled'}
-    
-    def get_expert_performance(self, expert_id: str) -> List[Dict]:
-        return self._performance_history.get(expert_id, [])
-    
     def get_all_active_experts(self) -> List[ExpertProfile]:
-        return [e for e in self._experts.values()
-                if e.is_active and e.lifecycle_state.is_available()]
-    
-    def get_expert(self, expert_id: str) -> Optional[ExpertProfile]:
-        return self._experts.get(expert_id)
-    
-    def get_experts_by_domain(self, domain: ExpertDomain) -> List[ExpertProfile]:
-        expert_ids = self._domain_index.get(domain, set())
-        return [self._experts[eid] for eid in expert_ids if eid in self._experts]
-    
-    def get_experts_by_lifecycle(self, state: ExpertLifecycleState) -> List[ExpertProfile]:
-        expert_ids = self._lifecycle_index.get(state, set())
-        return [self._experts[eid] for eid in expert_ids if eid in self._experts]
-    
-    def get_fitness_score(self, expert_id: str) -> Optional[FitnessScore]:
-        return self.fitness_scores.get(expert_id)
-    
-    def get_top_fitness_experts(self, n: int = 5) -> List[Tuple[str, float]]:
-        sorted_fitness = sorted(self.fitness_scores.items(),
-                               key=lambda x: x[1].overall_fitness, reverse=True)
-        return [(eid, f.overall_fitness) for eid, f in sorted_fitness[:n]]
-    
-    def get_ecosystem_health_report(self) -> Dict[str, Any]:
-        return {
-            'timestamp': datetime.utcnow().isoformat(),
-            'total_species': len(set(self._get_species_id(e) for e in self._experts.values())),
-            'total_population': self._get_total_compartment_population(),
-            'genetic_diversity': len(self._experts),
-            'fitness_scores': {eid: f.overall_fitness for eid, f in self.fitness_scores.items()},
-            'top_performers': self.get_top_fitness_experts(5),
-            'gradient_health': self.gradient_manager.get_field_strengths() if self.gradient_manager else {},
-            'token_economy': self.token_manager.get_system_summary() if self.token_manager else {},
-            'biomass_reserves': self.biomass_storage.get_storage_stats() if self.biomass_storage else {},
-            'evolutionary_events': list(self.evolutionary_events)[-10:],
-            'sustainability_score': np.mean([e.sustainability_score for e in self._experts.values()]) if self._experts else 0,
-            'dashboard': self.sustainability_dashboard.get_dashboard_status() if self.sustainability_dashboard else {}
-        }
-    
-    def cleanup_deprecated(self, max_age_days: int = 90) -> int:
-        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-        retired_count = 0
-        
-        for expert_id in list(self._experts.keys()):
-            profile = self._experts[expert_id]
-            if (profile.lifecycle_state == ExpertLifecycleState.DEPRECATED and
-                profile.retired_at is None):
-                if expert_id in self._migration_paths:
-                    profile.lifecycle_state = ExpertLifecycleState.RETIRED
-                    profile.retired_at = datetime.utcnow()
-                    retired_count += 1
-        
-        self._stats['last_cleanup'] = datetime.utcnow()
-        logger.info(f"Cleanup: retired {retired_count} deprecated experts")
-        return retired_count
-    
-    async def sync_with_remote(self, registry_url: str, registry_id: str, sync_mode: str = 'pull'):
-        """Synchronize with remote registry"""
-        if self.cross_region_sync:
-            return await self.cross_region_sync.sync_with_remote_registry(
-                registry_url, registry_id, sync_mode
-            )
-        return {'status': 'sync_not_enabled'}
-
-# ============================================================================
-# Module Exports
-# ============================================================================
-
-__all__ = [
-    'ExpertRegistry',
-    'ExpertProfile',
-    'ExpertDomain',
-    'ExpertVersion',
-    'ExpertLifecycleState',
-    'HardwareProfile',
-    'HealthMetrics',
-    'ExpertDependency',
-    'ExpertCertification',
-    'CertificationLevel',
-    'FitnessScore',
-    'ExpertLineage',
-    'RegistrySustainabilityDashboard',
-    'PredictiveEvolutionForecaster',
-    'CrossRegionRegistrySynchronizer',
-    'BIO_INSPIRED_AVAILABLE'
-]
+        return [e for e in self._experts.values() if e.lifecycle_state.is_available() and e.is_active]
