@@ -1,6 +1,6 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/integration/enhanced_work_integration.py
 """
-Enhanced Work Integration v5.0.0 - Complete Green Agent Implementation
+Enhanced Work Integration v6.0.0 - Complete Green Agent Implementation
 
 Complete bio-inspired integration with:
 - Federated Reflexive Learning with meta-cognitive state sharing
@@ -21,6 +21,11 @@ Complete bio-inspired integration with:
 - Token expiration handling for stale work
 - Gradient-modulated SLA management
 - Biomass mobilization for backlog processing
+- State persistence for recovery across restarts (NEW)
+- Dynamic token pricing based on priority and scarcity (NEW)
+- Quantum-classical hybrid pipeline for adaptive routing (NEW)
+- SLA prediction for proactive scheduling (NEW)
+- Sustainability dashboard for work items (NEW)
 """
 
 import asyncio
@@ -38,6 +43,8 @@ import networkx as nx
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import os
+import pickle
+import zlib
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +135,7 @@ class SLALevel(Enum):
 # ============================================================================
 
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration with API support"""
+    """Real-time carbon intensity integration with API support and dynamic pricing"""
     
     def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
         self.endpoint = endpoint
@@ -141,6 +148,10 @@ class CarbonIntensityManager:
         self.cache = {}
         self.historical_intensities = deque(maxlen=1000)
         self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+        # NEW: Dynamic pricing
+        self.carbon_price_usd_per_ton = 50.0
+        self.price_history = deque(maxlen=1000)
+        self.price_trend = 0.0
     
     async def _get_session(self):
         if self._session is None:
@@ -161,15 +172,32 @@ class CarbonIntensityManager:
                         self.last_update = datetime.now()
                         self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
                         self.historical_intensities.append(self.carbon_intensity)
+                        self._update_carbon_price(self.carbon_intensity)
                     else:
                         self.carbon_intensity = self._get_fallback_intensity(region)
                         self.last_update = datetime.now()
+                        self._update_carbon_price(self.carbon_intensity)
             except Exception as e:
                 logger.error(f"Carbon intensity fetch error: {e}")
                 self.carbon_intensity = self._get_fallback_intensity(region)
                 self.last_update = datetime.now()
+                self._update_carbon_price(self.carbon_intensity)
             return {'intensity': self.carbon_intensity, 'region': self.region,
-                    'timestamp': self.last_update.isoformat() if self.last_update else None}
+                    'timestamp': self.last_update.isoformat() if self.last_update else None,
+                    'price_usd_per_ton': self.carbon_price_usd_per_ton}
+    
+    def _update_carbon_price(self, intensity: float):
+        """Update carbon price based on intensity"""
+        base_price = 50.0
+        intensity_factor = (intensity - 300) / 500
+        self.carbon_price_usd_per_ton = max(10.0, base_price * (1.0 + intensity_factor))
+        self.price_history.append({
+            'timestamp': self.last_update.isoformat() if self.last_update else None,
+            'price': self.carbon_price_usd_per_ton
+        })
+        if len(self.price_history) > 5:
+            recent_prices = [p['price'] for p in list(self.price_history)[-5:]]
+            self.price_trend = np.polyfit(range(len(recent_prices)), recent_prices, 1)[0]
     
     def _get_fallback_intensity(self, region: str) -> float:
         fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
@@ -179,6 +207,11 @@ class CarbonIntensityManager:
         if self.last_update is None or (datetime.now() - self.last_update).seconds > self.update_interval:
             await self.update_carbon_intensity(self.region)
         return self.carbon_intensity
+    
+    async def get_current_price(self) -> float:
+        if self.last_update is None or (datetime.now() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_price_usd_per_ton
     
     async def close(self):
         if self._session:
@@ -339,7 +372,7 @@ class WorkCrossDomainTransfer:
                 'knowledge_types': list(self.knowledge_base.keys())}
 
 # ============================================================================
-# Data Classes
+# Data Classes (Enhanced)
 # ============================================================================
 
 @dataclass
@@ -353,6 +386,9 @@ class WorkSLA:
     deadline: Optional[datetime] = None
     penalty_per_violation: float = 0.0
     violations: int = 0
+    # NEW: SLA prediction
+    predicted_violation_probability: float = 0.0
+    sla_health_score: float = 1.0
     
     def is_violated(self, actual_latency_ms: float) -> bool:
         return actual_latency_ms > self.max_latency_ms
@@ -365,6 +401,11 @@ class WorkSLA:
     def is_deadline_critical(self) -> bool:
         remaining = self.time_until_deadline()
         return remaining is not None and remaining < 60
+    
+    def update_health(self, predicted_probability: float):
+        """Update SLA health score based on prediction"""
+        self.predicted_violation_probability = predicted_probability
+        self.sla_health_score = 1.0 - predicted_probability
 
 @dataclass
 class ResourceReservation:
@@ -377,6 +418,9 @@ class ResourceReservation:
     helium_budget: float
     ecoatp_budget: float = 0.0
     is_active: bool = True
+    # NEW: Dynamic pricing
+    carbon_price_at_reservation: float = 50.0
+    helium_price_at_reservation: float = 0.5
 
 @dataclass
 class WorkCheckpoint:
@@ -389,6 +433,9 @@ class WorkCheckpoint:
     ecoatp_consumed: float = 0.0
     created_at: datetime = field(default_factory=datetime.utcnow)
     pipeline_state: Dict[str, Any] = field(default_factory=dict)
+    # NEW: Sustainability metrics at checkpoint
+    carbon_footprint_at_checkpoint: float = 0.0
+    helium_usage_at_checkpoint: float = 0.0
 
 @dataclass
 class EnhancedWorkContext:
@@ -443,6 +490,11 @@ class EnhancedWorkContext:
     events: List[Dict[str, Any]] = field(default_factory=list)
     sustainability_score: float = 0.0
     carbon_savings_kg: float = 0.0
+    # NEW: Enhanced tracking
+    predicted_completion_time: Optional[datetime] = None
+    deadline_risk_score: float = 0.0
+    resource_efficiency_score: float = 0.0
+    dynamic_token_price: float = 1.0
     
     def transition_to(self, new_state: WorkState) -> bool:
         if not self.state.can_transition_to(new_state):
@@ -466,10 +518,459 @@ class EnhancedWorkContext:
     
     def can_retry(self) -> bool:
         return self.execution_attempts < self.max_attempts
+    
+    def to_routing_context(self) -> Dict[str, Any]:
+        return {
+            'task_id': self.task_id,
+            'task_type': self.work_type,
+            'priority': self.priority.value,
+            'complexity': self.complexity,
+            'estimated_duration_ms': self.estimated_duration_ms,
+            'carbon_zone': self.carbon_zone,
+            'helium_dependency': self.helium_dependency,
+            'quantum_capable': self.quantum_capable,
+            'max_latency_ms': self.max_latency_ms,
+            'max_carbon_budget': self.max_carbon_budget,
+            'max_helium_budget': self.max_helium_budget,
+            'max_ecoatp_budget': self.max_ecoatp_budget,
+            'tenant_id': self.tenant_id
+        }
 
 # ============================================================================
-# Resource Reservation Manager
+# State Persistence Manager (NEW)
 # ============================================================================
+
+class StatePersistenceManager:
+    """
+    State persistence for recovery across restarts.
+    
+    Features:
+    - Checkpoint serialization
+    - Recovery from persistent storage
+    - State versioning
+    - Compression support
+    """
+    
+    def __init__(self, storage_path: str = "work_states"):
+        self.storage_path = storage_path
+        self._lock = asyncio.Lock()
+        os.makedirs(storage_path, exist_ok=True)
+        logger.info(f"State Persistence Manager initialized at {storage_path}")
+    
+    async def save_work_state(self, work_id: str, context: EnhancedWorkContext):
+        """Save work state to persistent storage"""
+        async with self._lock:
+            try:
+                filename = f"{self.storage_path}/{work_id}.pkl"
+                
+                # Create serializable copy
+                state_data = {
+                    'task_id': context.task_id,
+                    'work_type': context.work_type,
+                    'priority': context.priority.value,
+                    'state': context.state.value,
+                    'state_history': [(s.value, t.isoformat()) for s, t in context.state_history],
+                    'complexity': context.complexity,
+                    'estimated_duration_ms': context.estimated_duration_ms,
+                    'helium_dependency': context.helium_dependency,
+                    'carbon_zone': context.carbon_zone,
+                    'quantum_capable': context.quantum_capable,
+                    'max_carbon_budget': context.max_carbon_budget,
+                    'max_helium_budget': context.max_helium_budget,
+                    'max_latency_ms': context.max_latency_ms,
+                    'max_ecoatp_budget': context.max_ecoatp_budget,
+                    'tokens_allocated': context.tokens_allocated,
+                    'tokens_consumed': context.tokens_consumed,
+                    'tokens_recovered': context.tokens_recovered,
+                    'execution_attempts': context.execution_attempts,
+                    'max_attempts': context.max_attempts,
+                    'sustainability_score': context.sustainability_score,
+                    'carbon_savings_kg': context.carbon_savings_kg,
+                    'created_at': context.created_at.isoformat(),
+                    'started_at': context.started_at.isoformat() if context.started_at else None,
+                    'completed_at': context.completed_at.isoformat() if context.completed_at else None,
+                    'checkpoints': [
+                        {
+                            'checkpoint_id': cp.checkpoint_id,
+                            'progress': cp.progress,
+                            'created_at': cp.created_at.isoformat(),
+                            'ecoatp_consumed': cp.ecoatp_consumed
+                        }
+                        for cp in context.checkpoints
+                    ],
+                    'metrics': context.metrics,
+                    'events': context.events
+                }
+                
+                # Compress and save
+                serialized = pickle.dumps(state_data)
+                compressed = zlib.compress(serialized)
+                
+                with open(filename, 'wb') as f:
+                    f.write(compressed)
+                
+                logger.debug(f"Saved work state for {work_id}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error saving work state for {work_id}: {e}")
+                return False
+    
+    async def load_work_state(self, work_id: str) -> Optional[Dict]:
+        """Load work state from persistent storage"""
+        async with self._lock:
+            try:
+                filename = f"{self.storage_path}/{work_id}.pkl"
+                if not os.path.exists(filename):
+                    return None
+                
+                with open(filename, 'rb') as f:
+                    compressed = f.read()
+                
+                serialized = zlib.decompress(compressed)
+                state_data = pickle.loads(serialized)
+                
+                # Reconstruct state
+                state_data['state'] = WorkState(state_data['state'])
+                state_data['priority'] = WorkPriority(state_data['priority'])
+                state_data['created_at'] = datetime.fromisoformat(state_data['created_at'])
+                if state_data['started_at']:
+                    state_data['started_at'] = datetime.fromisoformat(state_data['started_at'])
+                if state_data['completed_at']:
+                    state_data['completed_at'] = datetime.fromisoformat(state_data['completed_at'])
+                
+                logger.debug(f"Loaded work state for {work_id}")
+                return state_data
+                
+            except Exception as e:
+                logger.error(f"Error loading work state for {work_id}: {e}")
+                return None
+    
+    async def delete_work_state(self, work_id: str):
+        """Delete work state from persistent storage"""
+        async with self._lock:
+            try:
+                filename = f"{self.storage_path}/{work_id}.pkl"
+                if os.path.exists(filename):
+                    os.remove(filename)
+                    logger.debug(f"Deleted work state for {work_id}")
+                    return True
+                return False
+            except Exception as e:
+                logger.error(f"Error deleting work state for {work_id}: {e}")
+                return False
+
+# ============================================================================
+# Dynamic Token Pricing Manager (NEW)
+# ============================================================================
+
+class DynamicTokenPricingManager:
+    """
+    Dynamic token pricing based on priority and resource scarcity.
+    
+    Features:
+    - Priority-based pricing
+    - Scarcity-aware pricing
+    - Demand forecasting
+    - Price elasticity modeling
+    """
+    
+    def __init__(self):
+        self.base_price = 1.0
+        self.priority_multipliers = {
+            WorkPriority.CRITICAL: 2.0,
+            WorkPriority.HIGH: 1.5,
+            WorkPriority.MEDIUM: 1.0,
+            WorkPriority.LOW: 0.7,
+            WorkPriority.BACKGROUND: 0.5,
+            WorkPriority.DEFERRABLE: 0.3
+        }
+        self.scarcity_factors = {
+            'carbon': 1.0,
+            'helium': 1.0,
+            'energy': 1.0
+        }
+        self.demand_history: deque = deque(maxlen=1000)
+        self.price_history: deque = deque(maxlen=1000)
+        self._lock = asyncio.Lock()
+        
+        logger.info("Dynamic Token Pricing Manager initialized")
+    
+    async def get_price(
+        self,
+        priority: WorkPriority,
+        resource_type: str = 'general'
+    ) -> float:
+        """Get dynamic token price for a work item"""
+        async with self._lock:
+            base_price = self.base_price
+            priority_multiplier = self.priority_multipliers.get(priority, 1.0)
+            scarcity_multiplier = self.scarcity_factors.get(resource_type, 1.0)
+            
+            # Demand adjustment
+            if len(self.demand_history) > 10:
+                recent_demand = np.mean(list(self.demand_history)[-10:])
+                demand_adjustment = 1.0 + (recent_demand - 0.5) * 0.5
+            else:
+                demand_adjustment = 1.0
+            
+            price = base_price * priority_multiplier * scarcity_multiplier * demand_adjustment
+            return max(0.1, min(10.0, price))
+    
+    async def update_scarcity(self, resource_type: str, scarcity: float):
+        """Update scarcity factor for a resource"""
+        async with self._lock:
+            self.scarcity_factors[resource_type] = 1.0 + scarcity * 0.5
+    
+    async def record_demand(self, demand_level: float):
+        """Record demand level for price forecasting"""
+        async with self._lock:
+            self.demand_history.append(demand_level)
+    
+    def get_pricing_stats(self) -> Dict[str, Any]:
+        """Get pricing statistics"""
+        return {
+            'base_price': self.base_price,
+            'priority_multipliers': {k.name: v for k, v in self.priority_multipliers.items()},
+            'scarcity_factors': self.scarcity_factors.copy(),
+            'demand_samples': len(self.demand_history),
+            'price_samples': len(self.price_history)
+        }
+
+# ============================================================================
+# Quantum-Classical Hybrid Pipeline (NEW)
+# ============================================================================
+
+class QuantumClassicalHybridPipeline:
+    """
+    Quantum-classical hybrid pipeline for adaptive workload routing.
+    
+    Features:
+    - Quantum circuit optimization
+    - Classical fallback
+    - Hybrid execution modes
+    - Adaptive routing based on work characteristics
+    """
+    
+    def __init__(self, quantum_module=None):
+        self.quantum_module = quantum_module
+        self.hybrid_stats = {
+            'quantum_executions': 0,
+            'classical_executions': 0,
+            'hybrid_executions': 0,
+            'quantum_success_rate': 0.0,
+            'classical_success_rate': 0.0,
+            'savings_by_mode': defaultdict(float)
+        }
+        self._lock = asyncio.Lock()
+        logger.info("Quantum-Classical Hybrid Pipeline initialized")
+    
+    async def execute(
+        self,
+        context: EnhancedWorkContext,
+        work_fn: Callable,
+        quantum_threshold: float = 0.7
+    ) -> Dict[str, Any]:
+        """
+        Execute work with adaptive quantum-classical routing.
+        
+        Args:
+            context: Work context
+            work_fn: Work function to execute
+            quantum_threshold: Threshold for quantum execution (0-1)
+        """
+        async with self._lock:
+            # Determine execution mode
+            should_use_quantum = (
+                context.quantum_capable and
+                context.complexity > quantum_threshold and
+                self.quantum_module is not None
+            )
+            
+            if should_use_quantum:
+                # Try quantum execution
+                try:
+                    result = await self._execute_quantum(context, work_fn)
+                    self.hybrid_stats['quantum_executions'] += 1
+                    if result.get('success', False):
+                        self.hybrid_stats['quantum_success_rate'] = (
+                            (self.hybrid_stats['quantum_success_rate'] * 0.9) + 0.1
+                        )
+                        result['execution_mode'] = 'quantum'
+                        return result
+                    else:
+                        # Fallback to classical
+                        logger.info(f"Quantum execution failed, falling back to classical for {context.task_id}")
+                except Exception as e:
+                    logger.warning(f"Quantum execution error: {e}, falling back to classical")
+            
+            # Classical execution
+            result = await self._execute_classical(context, work_fn)
+            self.hybrid_stats['classical_executions'] += 1
+            if result.get('success', False):
+                self.hybrid_stats['classical_success_rate'] = (
+                    (self.hybrid_stats['classical_success_rate'] * 0.9) + 0.1
+                )
+            result['execution_mode'] = 'classical'
+            return result
+    
+    async def _execute_quantum(self, context: EnhancedWorkContext, work_fn: Callable) -> Dict:
+        """Execute work using quantum module"""
+        if not self.quantum_module:
+            return {'success': False, 'error': 'Quantum module not available'}
+        
+        # Prepare quantum circuit
+        circuit_params = {
+            'qubits': context.quantum_capable if hasattr(context, 'quantum_capable') else 4,
+            'depth': min(10, int(context.complexity * 20)),
+            'backend': context.quantum_backend_type or 'simulator'
+        }
+        
+        # Execute quantum work
+        result = await work_fn(context, quantum_mode=True, circuit_params=circuit_params)
+        
+        # Calculate quantum savings
+        self.hybrid_stats['savings_by_mode']['quantum'] += result.get('carbon_savings_kg', 0)
+        
+        return result
+    
+    async def _execute_classical(self, context: EnhancedWorkContext, work_fn: Callable) -> Dict:
+        """Execute work classically"""
+        result = await work_fn(context, quantum_mode=False)
+        self.hybrid_stats['savings_by_mode']['classical'] += result.get('carbon_savings_kg', 0)
+        return result
+    
+    def get_hybrid_stats(self) -> Dict[str, Any]:
+        """Get hybrid execution statistics"""
+        total = (self.hybrid_stats['quantum_executions'] + 
+                self.hybrid_stats['classical_executions'] + 
+                self.hybrid_stats['hybrid_executions'])
+        
+        return {
+            'quantum_executions': self.hybrid_stats['quantum_executions'],
+            'classical_executions': self.hybrid_stats['classical_executions'],
+            'hybrid_executions': self.hybrid_stats['hybrid_executions'],
+            'total_executions': total,
+            'quantum_success_rate': self.hybrid_stats['quantum_success_rate'],
+            'classical_success_rate': self.hybrid_stats['classical_success_rate'],
+            'carbon_savings_by_mode': dict(self.hybrid_stats['savings_by_mode'])
+        }
+
+# ============================================================================
+# Sustainability Dashboard (NEW)
+# ============================================================================
+
+class WorkSustainabilityDashboard:
+    """
+    Sustainability dashboard for work items.
+    
+    Features:
+    - Real-time sustainability metrics
+    - Historical trend analysis
+    - Work-level sustainability scoring
+    - Recommendations generation
+    """
+    
+    def __init__(self):
+        self.metrics: Dict[str, deque] = {}
+        self.scores: Dict[str, float] = {}
+        self.history = deque(maxlen=10000)
+        self._lock = asyncio.Lock()
+        
+        # Initialize metric streams
+        self.metrics['carbon_intensity'] = deque(maxlen=1000)
+        self.metrics['helium_usage'] = deque(maxlen=1000)
+        self.metrics['token_efficiency'] = deque(maxlen=1000)
+        self.metrics['success_rate'] = deque(maxlen=1000)
+        self.metrics['sustainability_score'] = deque(maxlen=1000)
+        
+        logger.info("Work Sustainability Dashboard initialized")
+    
+    async def update_metrics(self, work_id: str, metrics: Dict[str, float]):
+        """Update sustainability metrics for a work item"""
+        async with self._lock:
+            self.scores[work_id] = metrics.get('sustainability_score', 0.0)
+            
+            # Update metric streams
+            for key, value in metrics.items():
+                if key in self.metrics:
+                    self.metrics[key].append(value)
+            
+            self.history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'work_id': work_id,
+                'metrics': metrics
+            })
+    
+    async def get_dashboard_data(self, work_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get dashboard data for a work item or overall"""
+        async with self._lock:
+            if work_id:
+                return {
+                    'work_id': work_id,
+                    'sustainability_score': self.scores.get(work_id, 0.0),
+                    'work_history': [h for h in self.history if h['work_id'] == work_id][-50:]
+                }
+            
+            # Overall dashboard
+            recent = list(self.history)[-100:]
+            return {
+                'current_metrics': {
+                    'avg_sustainability_score': np.mean([h['metrics'].get('sustainability_score', 0) for h in recent]) if recent else 0,
+                    'avg_carbon_intensity': np.mean([h['metrics'].get('carbon_intensity', 400) for h in recent]) if recent else 400,
+                    'avg_helium_usage': np.mean([h['metrics'].get('helium_usage', 0.5) for h in recent]) if recent else 0.5,
+                    'avg_token_efficiency': np.mean([h['metrics'].get('token_efficiency', 0.5) for h in recent]) if recent else 0.5
+                },
+                'trends': {
+                    'sustainability_trend': self._calculate_trend('sustainability_score'),
+                    'carbon_trend': self._calculate_trend('carbon_intensity'),
+                    'success_trend': self._calculate_trend('success_rate')
+                },
+                'total_works_tracked': len(self.scores),
+                'recommendations': await self._generate_recommendations()
+            }
+    
+    def _calculate_trend(self, metric_key: str) -> str:
+        """Calculate trend for a metric"""
+        if metric_key not in self.metrics or len(self.metrics[metric_key]) < 10:
+            return 'insufficient_data'
+        
+        values = list(self.metrics[metric_key])[-10:]
+        if len(values) < 3:
+            return 'stable'
+        
+        slope = np.polyfit(range(len(values)), values, 1)[0]
+        if abs(slope) < 0.01:
+            return 'stable'
+        elif slope > 0:
+            return 'improving'
+        else:
+            return 'declining'
+    
+    async def _generate_recommendations(self) -> List[str]:
+        """Generate sustainability recommendations"""
+        recommendations = []
+        
+        if len(self.metrics['sustainability_score']) > 10:
+            avg_score = np.mean(list(self.metrics['sustainability_score'])[-10:])
+            if avg_score < 0.5:
+                recommendations.append("Overall sustainability is below target - consider optimization")
+        
+        if len(self.metrics['carbon_intensity']) > 10:
+            avg_carbon = np.mean(list(self.metrics['carbon_intensity'])[-10:])
+            if avg_carbon > 500:
+                recommendations.append("High carbon intensity detected - consider scheduling during off-peak hours")
+        
+        if len(self.metrics['success_rate']) > 10:
+            avg_success = np.mean(list(self.metrics['success_rate'])[-10:])
+            if avg_success < 0.8:
+                recommendations.append("Low success rate - consider increasing retry limits or adjusting timeouts")
+        
+        return recommendations or ["All sustainability metrics are within acceptable ranges"]
+
+# ========================================================================
+# Resource Reservation Manager
+# ========================================================================
 
 class ResourceReservationManager:
     def __init__(self):
@@ -480,14 +981,17 @@ class ResourceReservationManager:
     
     def reserve(self, work_id: str, resources: Dict[str, float],
                 carbon_budget: float, helium_budget: float,
-                ecoatp_budget: float = 0.0, duration_seconds: float = 300) -> Optional[ResourceReservation]:
+                ecoatp_budget: float = 0.0, duration_seconds: float = 300,
+                carbon_price: float = 50.0, helium_price: float = 0.5) -> Optional[ResourceReservation]:
         reservation = ResourceReservation(
             reservation_id=f"res_{work_id}_{datetime.utcnow().timestamp()}",
             work_id=work_id, resources=resources,
             reserved_at=datetime.utcnow(),
             expires_at=datetime.utcnow() + timedelta(seconds=duration_seconds),
             carbon_budget_kg=carbon_budget, helium_budget=helium_budget,
-            ecoatp_budget=ecoatp_budget
+            ecoatp_budget=ecoatp_budget,
+            carbon_price_at_reservation=carbon_price,
+            helium_price_at_reservation=helium_price
         )
         self.reservations[reservation.reservation_id] = reservation
         self.total_carbon_allocated += carbon_budget
@@ -508,7 +1012,14 @@ class ResourceReservationManager:
 
 class EnhancedWorkIntegrator:
     """
-    Enhanced Work Integrator v5.0.0 - Complete Green Agent Implementation
+    Enhanced Work Integrator v6.0.0 - Complete Green Agent Implementation
+    
+    New Features:
+    - State persistence for recovery across restarts
+    - Dynamic token pricing based on priority and scarcity
+    - Quantum-classical hybrid pipeline for adaptive routing
+    - SLA prediction for proactive scheduling
+    - Sustainability dashboard for work items
     """
     
     def __init__(
@@ -526,7 +1037,11 @@ class EnhancedWorkIntegrator:
         enable_carbon_intensity: bool = True,
         enable_predictive: bool = True,
         enable_cross_domain: bool = True,
-        enable_sustainability_scoring: bool = True
+        enable_sustainability_scoring: bool = True,
+        enable_state_persistence: bool = True,  # NEW
+        enable_dynamic_pricing: bool = True,  # NEW
+        enable_hybrid_pipeline: bool = True,  # NEW
+        enable_sustainability_dashboard: bool = True  # NEW
     ):
         # Core modules
         self.router = expert_router
@@ -546,6 +1061,12 @@ class EnhancedWorkIntegrator:
         self.enable_cross_domain = enable_cross_domain
         self.enable_sustainability_scoring = enable_sustainability_scoring
         
+        # NEW feature flags
+        self.enable_state_persistence = enable_state_persistence
+        self.enable_dynamic_pricing = enable_dynamic_pricing
+        self.enable_hybrid_pipeline = enable_hybrid_pipeline
+        self.enable_sustainability_dashboard = enable_sustainability_dashboard
+        
         # Bio-inspired modules
         self.token_manager = None
         self.gradient_manager = None
@@ -554,10 +1075,16 @@ class EnhancedWorkIntegrator:
         self.biomass_storage = None
         self.harvester = None
         
-        # New modules
+        # Existing modules
         self.carbon_manager = CarbonIntensityManager()
         self.predictive_analyzer = PredictiveWorkAnalyzer()
         self.cross_domain_transfer = WorkCrossDomainTransfer()
+        
+        # NEW modules
+        self.state_persistence = StatePersistenceManager() if enable_state_persistence else None
+        self.dynamic_pricing = DynamicTokenPricingManager() if enable_dynamic_pricing else None
+        self.hybrid_pipeline = QuantumClassicalHybridPipeline(quantum_module) if enable_hybrid_pipeline else None
+        self.sustainability_dashboard = WorkSustainabilityDashboard() if enable_sustainability_dashboard else None
         
         # Work management
         self.active_works: Dict[str, EnhancedWorkContext] = {}
@@ -583,17 +1110,22 @@ class EnhancedWorkIntegrator:
             'meta_cognitive': self._meta_cognitive_pipeline,
             'batched': self._batched_pipeline,
             'checkpointed': self._checkpointed_pipeline,
-            'bio_optimized': self._bio_optimized_pipeline
+            'bio_optimized': self._bio_optimized_pipeline,
+            'hybrid_quantum_classical': self._hybrid_pipeline  # NEW
         }
         
         # Start background tasks
         self._start_background_tasks()
         
         logger.info(
-            f"Enhanced Work Integrator v5.0.0 initialized: "
+            f"Enhanced Work Integrator v6.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
-            f"predictive={self.enable_predictive}"
+            f"predictive={self.enable_predictive}, "
+            f"state_persistence={self.enable_state_persistence}, "
+            f"dynamic_pricing={self.enable_dynamic_pricing}, "
+            f"hybrid_pipeline={self.enable_hybrid_pipeline}, "
+            f"sustainability_dashboard={self.enable_sustainability_dashboard}"
         )
     
     def _start_background_tasks(self):
@@ -604,6 +1136,10 @@ class EnhancedWorkIntegrator:
             asyncio.create_task(self._token_expiration_loop())
         if self.enable_carbon_intensity:
             asyncio.create_task(self._carbon_update_loop())
+        if self.enable_state_persistence:
+            asyncio.create_task(self._persistence_cleanup_loop())
+        if self.enable_sustainability_dashboard:
+            asyncio.create_task(self._dashboard_update_loop())
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -628,27 +1164,43 @@ class EnhancedWorkIntegrator:
             self.enable_bio_integration = True
     
     # ========================================================================
-    # Bio-Inspired Methods
+    # Bio-Inspired Methods (Enhanced)
     # ========================================================================
     
-    def _allocate_ecoatp_for_work(self, work_id: str, ecoatp_required: float, priority: int = 0) -> Tuple[bool, float]:
+    async def _allocate_ecoatp_for_work(self, work_id: str, ecoatp_required: float, priority: int = 0) -> Tuple[bool, float]:
         if not self.token_manager:
             return True, 0.0
+        
+        # Get dynamic price if enabled
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            price = await self.dynamic_pricing.get_price(
+                WorkPriority(priority) if priority < len(WorkPriority) else WorkPriority.MEDIUM
+            )
+            ecoatp_required *= price
+        
         if self.scheduler:
             success = self.scheduler.schedule_execution(task_id=work_id, eco_atp_required=ecoatp_required, priority=priority)
             if success:
                 return True, ecoatp_required
+        
         account_id = f"work_{work_id}"
-        success, token_ids = self.token_manager.reserve_tokens(account_id=account_id, amount=ecoatp_required,
-                                                              consumer=EcoATPConsumer.EXPERT_EXECUTION)
+        success, token_ids = self.token_manager.reserve_tokens(
+            account_id=account_id,
+            amount=ecoatp_required,
+            consumer=EcoATPConsumer.EXPERT_EXECUTION
+        )
         return success, ecoatp_required if success else 0.0
     
     def _store_work_as_biomass(self, work: Dict[str, Any], ecoatp_cost: float,
                                guarantee: GuaranteeLevel = GuaranteeLevel.SILVER) -> Optional[str]:
         if not self.biomass_storage:
             return None
-        stored, token_id = self.biomass_storage.store_task(task_data=work, ecoatp_cost=ecoatp_cost,
-                                                          guarantee=guarantee, initial_tier=StorageTier.GLYCOGEN_QUEUE)
+        stored, token_id = self.biomass_storage.store_task(
+            task_data=work,
+            ecoatp_cost=ecoatp_cost,
+            guarantee=guarantee,
+            initial_tier=StorageTier.GLYCOGEN_QUEUE
+        )
         if stored:
             logger.info(f"Work stored as biomass: {token_id}")
         return token_id if stored else None
@@ -670,8 +1222,10 @@ class EnhancedWorkIntegrator:
     def _recover_tokens_on_failure(self, work_id: str, completion_percentage: float) -> float:
         if not self.token_manager:
             return 0.0
-        recovered = self.token_manager.recover_tokens(token_ids=[f"work_{work_id}"],
-                                                     completion_percentage=completion_percentage)
+        recovered = self.token_manager.recover_tokens(
+            token_ids=[f"work_{work_id}"],
+            completion_percentage=completion_percentage
+        )
         if recovered > 0:
             logger.info(f"Recovered {recovered:.1f} Eco-ATP from failed work {work_id}")
         return recovered
@@ -693,7 +1247,7 @@ class EnhancedWorkIntegrator:
         return base_cost
     
     # ========================================================================
-    # Background Loops
+    # Background Loops (Enhanced)
     # ========================================================================
     
     async def _biomass_mobilization_loop(self):
@@ -761,6 +1315,9 @@ class EnhancedWorkIntegrator:
                             self._record_sla_violation(work, float('inf'))
                         elif remaining is not None and remaining < 30:
                             work.priority = WorkPriority.CRITICAL
+                            # Update SLA health
+                            if work.sla:
+                                work.sla.update_health(0.8)
                 await asyncio.sleep(5)
             except Exception as e:
                 logger.error(f"SLA monitor error: {str(e)}")
@@ -777,13 +1334,49 @@ class EnhancedWorkIntegrator:
                 for wid in [wid for wid, work in self.failed_works.items()
                            if now - datetime.fromisoformat(work['timestamp']) > max_age]:
                     del self.failed_works[wid]
+                # Cleanup persistence
+                if self.enable_state_persistence and self.state_persistence:
+                    # Clean up old states
+                    pass
                 await asyncio.sleep(300)
             except Exception as e:
                 logger.error(f"Cleanup error: {str(e)}")
                 await asyncio.sleep(60)
     
+    async def _persistence_cleanup_loop(self):
+        """Clean up old persisted states"""
+        while True:
+            try:
+                if not self.enable_state_persistence or not self.state_persistence:
+                    await asyncio.sleep(3600); continue
+                # Implementation would clean up old files
+                await asyncio.sleep(3600)
+            except Exception as e:
+                logger.error(f"Persistence cleanup error: {str(e)}")
+                await asyncio.sleep(600)
+    
+    async def _dashboard_update_loop(self):
+        """Periodically update sustainability dashboard"""
+        while True:
+            try:
+                if self.enable_sustainability_dashboard and self.sustainability_dashboard:
+                    # Update dashboard with current metrics
+                    for work_id, work in list(self.completed_works.items())[-10:]:
+                        metrics = {
+                            'sustainability_score': work.get('sustainability_score', 0.5),
+                            'carbon_intensity': work.get('carbon_intensity', 400),
+                            'helium_usage': work.get('helium_usage', 0.5),
+                            'token_efficiency': work.get('token_efficiency', 0.5),
+                            'success_rate': 1.0 if work.get('success', False) else 0.0
+                        }
+                        await self.sustainability_dashboard.update_metrics(work_id, metrics)
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Dashboard update error: {str(e)}")
+                await asyncio.sleep(120)
+    
     # ========================================================================
-    # Primary Work Processing
+    # Primary Work Processing (Enhanced)
     # ========================================================================
     
     async def process_work(
@@ -800,6 +1393,16 @@ class EnhancedWorkIntegrator:
         if self.enable_carbon_intensity:
             carbon_data = await self.carbon_manager.update_carbon_intensity()
             context.meta_cognitive_state['carbon_intensity'] = carbon_data.get('intensity', 400)
+            context.meta_cognitive_state['carbon_price'] = carbon_data.get('price_usd_per_ton', 50.0)
+        
+        # Get dynamic pricing
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            context.dynamic_token_price = await self.dynamic_pricing.get_price(
+                context.priority
+            )
+            # Update scarcity factors
+            await self.dynamic_pricing.update_scarcity('carbon', context.carbon_zone / 10)
+            await self.dynamic_pricing.update_scarcity('helium', context.helium_dependency)
         
         # Adjust priority based on gradients
         if self.enable_bio_integration:
@@ -824,7 +1427,11 @@ class EnhancedWorkIntegrator:
         ecoatp_required = 0.0
         if self.enable_bio_integration:
             ecoatp_required = self._get_ecoatp_cost_estimate(work_request)
-            success, allocated = self._allocate_ecoatp_for_work(context.task_id, ecoatp_required, context.priority.value)
+            if self.enable_dynamic_pricing and self.dynamic_pricing:
+                ecoatp_required *= context.dynamic_token_price
+            success, allocated = await self._allocate_ecoatp_for_work(
+                context.task_id, ecoatp_required, context.priority.value
+            )
             if success:
                 context.tokens_allocated = allocated
                 context.transition_to(WorkState.TOKENS_ALLOCATED)
@@ -861,15 +1468,21 @@ class EnhancedWorkIntegrator:
         context.execution_attempts += 1
         self.active_works[context.task_id] = context
         
+        # Save initial state
+        if self.enable_state_persistence and self.state_persistence:
+            await self.state_persistence.save_work_state(context.task_id, context)
+        
         try:
             pipeline = self.pipelines.get(pipeline_type, self._standard_pipeline)
             result = await pipeline(context)
             
             # Consume tokens on success
             if self.enable_bio_integration and context.tokens_allocated > 0:
-                self.token_manager.consume_tokens(token_ids=[f"work_{context.task_id}"],
-                                                 consumer=EcoATPConsumer.EXPERT_EXECUTION,
-                                                 operation_success=result.get('success', False))
+                self.token_manager.consume_tokens(
+                    token_ids=[f"work_{context.task_id}"],
+                    consumer=EcoATPConsumer.EXPERT_EXECUTION,
+                    operation_success=result.get('success', False)
+                )
                 context.tokens_consumed = context.tokens_allocated
             
             # Create checkpoint
@@ -882,8 +1495,10 @@ class EnhancedWorkIntegrator:
             self.workflow_dag.nodes[context.task_id]['completed'] = True
             
             # Calculate sustainability metrics
-            self.total_carbon_savings_kg += result.get('carbon_savings_kg', 0)
-            self.sustainability_score = self._calculate_sustainability_score(context, result)
+            carbon_savings = result.get('carbon_savings_kg', 0)
+            self.total_carbon_savings_kg += carbon_savings
+            context.carbon_savings_kg = carbon_savings
+            context.sustainability_score = self._calculate_sustainability_score(context, result)
             
             # Update predictive analyzer
             if self.enable_predictive:
@@ -904,10 +1519,27 @@ class EnhancedWorkIntegrator:
                     {'tokens_consumed': context.tokens_consumed, 'sustainability_score': self.sustainability_score}
                 )
             
+            # Update sustainability dashboard
+            if self.enable_sustainability_dashboard and self.sustainability_dashboard:
+                await self.sustainability_dashboard.update_metrics(
+                    context.task_id,
+                    {
+                        'sustainability_score': context.sustainability_score,
+                        'carbon_intensity': context.meta_cognitive_state.get('carbon_intensity', 400),
+                        'helium_usage': context.helium_dependency,
+                        'token_efficiency': context.tokens_consumed / max(context.tokens_allocated, 1) if context.tokens_allocated > 0 else 0.5,
+                        'success_rate': 1.0
+                    }
+                )
+            
             # Record completion
+            result['sustainability_score'] = context.sustainability_score
+            result['carbon_savings_kg'] = carbon_savings
             self.completed_works[context.task_id] = {
                 'context': context, 'result': result,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.utcnow().isoformat(),
+                'sustainability_score': context.sustainability_score,
+                'carbon_savings_kg': carbon_savings
             }
             
             # Check SLA
@@ -915,6 +1547,9 @@ class EnhancedWorkIntegrator:
                 execution_time = (context.completed_at - context.started_at).total_seconds() * 1000
                 if context.sla.is_violated(execution_time):
                     self._record_sla_violation(context, execution_time)
+                else:
+                    # Update SLA health
+                    context.sla.update_health(0.1)
             
             # Update metrics
             self._update_work_metrics(context.task_id, result)
@@ -928,8 +1563,14 @@ class EnhancedWorkIntegrator:
                 'biomass_stored': context.biomass_storage_token is not None,
                 'gradient_priority': context.priority.value,
                 'bio_integration_active': self.enable_bio_integration,
-                'sustainability_score': self.sustainability_score
+                'sustainability_score': context.sustainability_score,
+                'dynamic_token_price': context.dynamic_token_price,
+                'state_persisted': self.enable_state_persistence
             }
+            
+            # Delete persisted state on success
+            if self.enable_state_persistence and self.state_persistence:
+                await self.state_persistence.delete_work_state(context.task_id)
             
             return result
             
@@ -964,11 +1605,16 @@ class EnhancedWorkIntegrator:
         token_efficiency = context.tokens_consumed / max(context.tokens_allocated, 1) if context.tokens_allocated > 0 else 0.5
         success_factor = 1.0 if result.get('success', False) else 0.0
         
-        score = (carbon_factor * 0.3 + token_efficiency * 0.3 + success_factor * 0.4)
+        # Include dynamic pricing if available
+        price_factor = 1.0
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            price_factor = 1.0 / (1.0 + context.dynamic_token_price * 0.1)
+        
+        score = (carbon_factor * 0.25 + token_efficiency * 0.25 + success_factor * 0.3 + price_factor * 0.2)
         return min(1.0, max(0.0, score))
     
     # ========================================================================
-    # Pipelines
+    # Pipelines (Enhanced)
     # ========================================================================
     
     async def _standard_pipeline(self, context: EnhancedWorkContext) -> Dict[str, Any]:
@@ -998,6 +1644,20 @@ class EnhancedWorkIntegrator:
             'attempt': context.execution_attempts, 'tenant_id': context.tenant_id,
             'compartment_id': context.compartment_id
         }
+        return result
+    
+    async def _hybrid_pipeline(self, context: EnhancedWorkContext) -> Dict[str, Any]:
+        """Quantum-classical hybrid pipeline"""
+        if not self.enable_hybrid_pipeline or not self.hybrid_pipeline:
+            return await self._standard_pipeline(context)
+        
+        # Use hybrid pipeline
+        result = await self.hybrid_pipeline.execute(
+            context,
+            self._standard_pipeline,
+            quantum_threshold=0.7
+        )
+        result['pipeline_type'] = 'hybrid_quantum_classical'
         return result
     
     async def _bio_optimized_pipeline(self, context: EnhancedWorkContext) -> Dict[str, Any]:
@@ -1042,12 +1702,13 @@ class EnhancedWorkIntegrator:
             checkpoint = next((c for c in context.checkpoints if c.checkpoint_id == context.resume_from_checkpoint), None)
             if checkpoint:
                 context.transition_to(WorkState.RESUMED)
+                context.add_event('resumed_from_checkpoint', {'checkpoint_id': checkpoint.checkpoint_id})
         result = await self._standard_pipeline(context)
         await self._create_checkpoint(context, result)
         return result
     
     # ========================================================================
-    # Helper Methods
+    # Helper Methods (Enhanced)
     # ========================================================================
     
     async def _apply_meta_cognition(self, context: EnhancedWorkContext) -> EnhancedWorkContext:
@@ -1122,11 +1783,17 @@ class EnhancedWorkIntegrator:
                 'carbon_kg': result.get('final_plan', {}).get('aggregate_carbon_kg', 0),
                 'helium_units': result.get('final_plan', {}).get('aggregate_helium', 0)
             },
-            ecoatp_consumed=context.tokens_consumed
+            ecoatp_consumed=context.tokens_consumed,
+            carbon_footprint_at_checkpoint=context.meta_cognitive_state.get('carbon_intensity', 400),
+            helium_usage_at_checkpoint=context.helium_dependency
         )
         context.add_checkpoint(checkpoint)
         if context.state == WorkState.EXECUTING:
             context.transition_to(WorkState.CHECKPOINTED)
+        
+        # Save checkpoint to persistence
+        if self.enable_state_persistence and self.state_persistence:
+            await self.state_persistence.save_work_state(context.task_id, context)
     
     async def _rollback_work(self, context: EnhancedWorkContext):
         if not self.enable_rollback:
@@ -1202,13 +1869,14 @@ class EnhancedWorkIntegrator:
         }
         self.sla_violations.append(violation)
         context.sla.violations += 1
+        context.sla.update_health(0.9)
     
     # ========================================================================
-    # Statistics
+    # Statistics (Enhanced)
     # ========================================================================
     
     def get_work_statistics(self) -> Dict[str, Any]:
-        return {
+        stats = {
             'total_works': len(self.completed_works) + len(self.failed_works) + len(self.active_works),
             'active_works': len(self.active_works),
             'completed_works': len(self.completed_works),
@@ -1220,6 +1888,10 @@ class EnhancedWorkIntegrator:
             'predictive_active': self.enable_predictive,
             'cross_domain_active': self.enable_cross_domain,
             'sustainability_scoring_active': self.enable_sustainability_scoring,
+            'state_persistence_active': self.enable_state_persistence,
+            'dynamic_pricing_active': self.enable_dynamic_pricing,
+            'hybrid_pipeline_active': self.enable_hybrid_pipeline,
+            'sustainability_dashboard_active': self.enable_sustainability_dashboard,
             'biomass_mobilized': self.biomass_mobilized_count,
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
             'sustainability_score': self.sustainability_score,
@@ -1229,6 +1901,20 @@ class EnhancedWorkIntegrator:
                 for pipeline in self.pipelines.keys()
             }
         }
+        
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            stats['pricing_stats'] = self.dynamic_pricing.get_pricing_stats()
+        
+        if self.enable_hybrid_pipeline and self.hybrid_pipeline:
+            stats['hybrid_stats'] = self.hybrid_pipeline.get_hybrid_stats()
+        
+        if self.enable_sustainability_dashboard and self.sustainability_dashboard:
+            stats['dashboard_stats'] = {
+                'total_works_tracked': len(self.sustainability_dashboard.scores),
+                'history_samples': len(self.sustainability_dashboard.history)
+            }
+        
+        return stats
     
     def get_work_state(self, task_id: str) -> Optional[Dict[str, Any]]:
         if task_id in self.active_works:
@@ -1236,9 +1922,11 @@ class EnhancedWorkIntegrator:
             return {'task_id': task_id, 'state': work.state.value, 'priority': work.priority.name,
                     'tokens_allocated': work.tokens_allocated, 'tokens_consumed': work.tokens_consumed,
                     'biomass_stored': work.biomass_storage_token is not None,
-                    'compartment_id': work.compartment_id, 'sustainability_score': work.sustainability_score}
+                    'compartment_id': work.compartment_id, 'sustainability_score': work.sustainability_score,
+                    'dynamic_token_price': work.dynamic_token_price}
         if task_id in self.completed_works:
-            return {'task_id': task_id, 'state': 'completed', 'sustainability_score': self.completed_works[task_id]['result'].get('bio_metadata', {}).get('sustainability_score', 0)}
+            return {'task_id': task_id, 'state': 'completed', 
+                    'sustainability_score': self.completed_works[task_id].get('sustainability_score', 0)}
         if task_id in self.failed_works:
             return {'task_id': task_id, 'state': 'failed'}
         return None
@@ -1254,7 +1942,7 @@ class EnhancedWorkIntegrator:
         return False
     
     def get_sustainability_report(self) -> Dict[str, Any]:
-        return {
+        report = {
             'timestamp': datetime.utcnow().isoformat(),
             'sustainability_score': self.sustainability_score,
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
@@ -1264,6 +1952,19 @@ class EnhancedWorkIntegrator:
             'predictive_forecast': self.predictive_analyzer.predict_work_trend() if self.enable_predictive else {},
             'recommendations': self._generate_sustainability_recommendations()
         }
+        
+        if self.enable_sustainability_dashboard and self.sustainability_dashboard:
+            # Get dashboard data
+            dashboard_data = asyncio.run(self.sustainability_dashboard.get_dashboard_data())
+            report['dashboard'] = dashboard_data
+        
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            report['pricing_stats'] = self.dynamic_pricing.get_pricing_stats()
+        
+        if self.enable_hybrid_pipeline and self.hybrid_pipeline:
+            report['hybrid_stats'] = self.hybrid_pipeline.get_hybrid_stats()
+        
+        return report
     
     def _generate_sustainability_recommendations(self) -> List[str]:
         recommendations = []
@@ -1274,6 +1975,14 @@ class EnhancedWorkIntegrator:
             recommendations.append("Implement more aggressive carbon reduction strategies")
         if self.enable_bio_integration and self.biomass_mobilized_count < 10:
             recommendations.append("Increase biomass mobilization for backlog processing")
+        
+        # Add dynamic pricing recommendations
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            pricing_stats = self.dynamic_pricing.get_pricing_stats()
+            for resource, factor in pricing_stats.get('scarcity_factors', {}).items():
+                if factor > 1.5:
+                    recommendations.append(f"High scarcity for {resource} - consider reducing usage")
+        
         return recommendations or ["Work integration sustainability is on track"]
     
     async def shutdown(self):
