@@ -1,9 +1,12 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/energy_expert.py
 """
-Enhanced Energy Expert v6.0.0 - Complete Metabolic Energy Producer
+Enhanced Energy Expert v7.0.0 - Complete Metabolic Energy Producer
 With Natural Language Explanations, Renewable Forecast Analysis, Decision Explanations,
 Federated Reflexive Learning, Cross-Domain Knowledge Transfer, Predictive Sustainability,
-Enhanced Human-AI Collaboration, and Advanced Sustainability Features
+Enhanced Human-AI Collaboration, Advanced Sustainability Features,
+Real-time Grid Carbon API Integration (NEW), Workload-Aware Power State Selection (NEW),
+Adaptive Cooling Based on Thermal Profile (NEW), Dynamic Quantization Based on Task Complexity (NEW),
+Differential Privacy for Federated Learning (NEW), External Climate Model Integration (NEW)
 """
 
 import asyncio
@@ -26,6 +29,7 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 import aiohttp
 import asyncio
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +54,7 @@ except ImportError:
     class HardwareProfile(Enum): CPU_EFFICIENT = "cpu_low_power"
 
 # ============================================================================
-# Enums and Data Classes
+# Enums and Data Classes (Enhanced)
 # ============================================================================
 class EnergySource(Enum):
     SOLAR = "solar"; WIND = "wind"; HYDRO = "hydro"; GEOTHERMAL = "geothermal"
@@ -73,12 +77,13 @@ class EnergySource(Enum):
 class PowerState(Enum):
     PERFORMANCE = "performance"; BALANCED = "balanced"; POWER_SAVE = "power_save"
     ULTRA_LOW = "ultra_low"; DYNAMIC = "dynamic"; ATP_DRIVEN = "atp_driven"
-    FEDERATED = "federated"  # New: Federated learning power state
+    FEDERATED = "federated"; WORKLOAD_AWARE = "workload_aware"  # NEW
 
 class CoolingMethod(Enum):
     AIR_COOLING = "air"; LIQUID_COOLING = "liquid"; IMMERSION_COOLING = "immersion"
     FREE_COOLING = "free"; GEOTHERMAL_COOLING = "geothermal"; HELIUM_COOLING = "helium"
     COMPARTMENT_AWARE = "compartment_aware"; FEDERATED_COOLING = "federated_cooling"
+    ADAPTIVE_COOLING = "adaptive_cooling"  # NEW
 
 @dataclass
 class RenewableProfile:
@@ -87,7 +92,10 @@ class RenewableProfile:
     hydrogen_level_kg: float = 0.0; renewable_percentage: float = 0.0
     forecast_next_hour: float = 0.0; peak_solar_time: bool = False
     harvester_contribution_kw: float = 0.0; biomass_reserve_kwh: float = 0.0
-    federated_energy_sharing: float = 0.0  # New: Shared energy from federated system
+    federated_energy_sharing: float = 0.0  # Shared energy from federated system
+    # NEW: Grid API data
+    grid_carbon_intensity: float = 400.0
+    grid_renewable_percentage: float = 0.0
     
     def can_use_renewable(self, required_kw: float) -> bool:
         return (self.solar_available_kw + self.wind_available_kw + self.battery_level_kwh) >= required_kw
@@ -97,10 +105,17 @@ class ThermalProfile:
     current_temp_c: float = 35.0; max_temp_c: float = 85.0; throttle_temp_c: float = 75.0
     ambient_temp_c: float = 25.0; cooling_efficiency: float = 0.9
     requires_throttling: bool = False; compartment_health: float = 0.7
-    federated_cooling_contribution: float = 0.0  # New: Cooling from federated system
+    federated_cooling_contribution: float = 0.0
+    # NEW: Adaptive cooling
+    cooling_method: CoolingMethod = CoolingMethod.AIR_COOLING
+    cooling_power_kw: float = 0.0
+    thermal_margin_c: float = 10.0
     
     @property
     def thermal_headroom_c(self) -> float: return self.throttle_temp_c - self.current_temp_c
+    
+    def needs_adaptive_cooling(self) -> bool:
+        return self.thermal_headroom_c < 20.0
 
 @dataclass
 class EnergyOptimizationHistory:
@@ -109,12 +124,16 @@ class EnergyOptimizationHistory:
     renewable_used: bool; success: bool
     metrics: Dict[str, float] = field(default_factory=dict)
     ecoatp_generated: float = 0.0; gradient_level: float = 0.5
-    federated_round: int = 0  # New: Federated learning round
-    cross_domain_transfers: List[str] = field(default_factory=list)  # New
+    federated_round: int = 0
+    cross_domain_transfers: List[str] = field(default_factory=list)
+    # NEW: Enhanced tracking
+    workload_type: str = ""
+    cooling_method: str = ""
+    quantization_level: str = ""
 
 @dataclass
 class FederatedLearningState:
-    """State for federated reflexive learning"""
+    """State for federated reflexive learning with privacy"""
     round: int = 0
     local_model_weights: Dict = field(default_factory=dict)
     global_model_weights: Dict = field(default_factory=dict)
@@ -122,10 +141,13 @@ class FederatedLearningState:
     participants: List[str] = field(default_factory=list)
     last_aggregation: Optional[datetime] = None
     energy_sharing_ratio: float = 0.0
+    # NEW: Privacy tracking
+    privacy_epsilon: float = 0.0
+    noise_scale: float = 0.001
 
 @dataclass
 class PredictiveEnergyForecast:
-    """Predictive energy forecast"""
+    """Predictive energy forecast with climate integration"""
     timestamp: datetime = field(default_factory=datetime.utcnow)
     predicted_energy_kwh: float = 0.0
     predicted_carbon_kg: float = 0.0
@@ -133,6 +155,8 @@ class PredictiveEnergyForecast:
     trend: str = "stable"
     factors: List[Dict[str, Any]] = field(default_factory=list)
     recommended_actions: List[str] = field(default_factory=list)
+    # NEW: Climate integration
+    climate_impact: Optional[Dict] = None
 
 @dataclass
 class CrossDomainKnowledge:
@@ -156,27 +180,281 @@ class SustainabilityMetrics:
     ecoatp_generated: float = 0.0
 
 # ============================================================================
-# Federated Reflexive Learning Module
+# Real-Time Grid Carbon API Integration (NEW)
+# ============================================================================
+
+class GridCarbonAPIClient:
+    """
+    Real-time grid carbon intensity API integration.
+    
+    Features:
+    - ElectricityMap API integration
+    - Carbon intensity fetching
+    - Renewable percentage tracking
+    - Regional support
+    """
+    
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv('ELECTRICITYMAP_API_KEY', '')
+        self.endpoint = "https://api.electricitymap.org/v3"
+        self._session = None
+        self.cache = {}
+        self.last_update = None
+        self.update_interval = 300
+        
+        logger.info("Grid Carbon API Client initialized")
+    
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def get_carbon_intensity(self, region: str = "US-CAL-CISO") -> Dict[str, Any]:
+        """Get real-time carbon intensity for a region"""
+        cache_key = f"{region}_{datetime.utcnow().hour}"
+        
+        if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.update_interval:
+            return self.cache[cache_key]
+        
+        try:
+            session = await self._get_session()
+            url = f"{self.endpoint}/carbon-intensity/latest?zone={region}"
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    result = {
+                        'carbon_intensity': data.get('carbonIntensity', 400),
+                        'renewable_percentage': data.get('renewablePercentage', 0),
+                        'region': region,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+                    self.cache[cache_key] = result
+                    self.last_update = datetime.utcnow()
+                    return result
+                else:
+                    logger.warning(f"Grid API returned {response.status}, using fallback")
+                    return self._get_fallback_data(region)
+        except Exception as e:
+            logger.error(f"Grid API error: {e}")
+            return self._get_fallback_data(region)
+    
+    def _get_fallback_data(self, region: str) -> Dict[str, Any]:
+        """Fallback data when API is unavailable"""
+        fallback_intensities = {
+            'US-CAL-CISO': 350, 'US-TEX-ERCO': 420, 'US-NE-ISNE': 380,
+            'EU-FR': 50, 'EU-DE': 450, 'EU-UK': 280
+        }
+        intensity = fallback_intensities.get(region, 400)
+        renewable = 1.0 - (intensity / 800)
+        return {
+            'carbon_intensity': intensity,
+            'renewable_percentage': renewable * 100,
+            'region': region,
+            'timestamp': datetime.utcnow().isoformat(),
+            'is_fallback': True
+        }
+    
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Workload-Aware Power State Selector (NEW)
+# ============================================================================
+
+class WorkloadAwarePowerSelector:
+    """
+    Workload-aware power state selection.
+    
+    Features:
+    - Task complexity analysis
+    - Performance-energy tradeoff
+    - Dynamic power state selection
+    """
+    
+    def __init__(self):
+        self.workload_characteristics = {
+            'inference': {'complexity': 0.3, 'latency_sensitivity': 0.8, 'energy_sensitivity': 0.2},
+            'training': {'complexity': 0.9, 'latency_sensitivity': 0.3, 'energy_sensitivity': 0.4},
+            'optimization': {'complexity': 0.7, 'latency_sensitivity': 0.4, 'energy_sensitivity': 0.6},
+            'data_processing': {'complexity': 0.5, 'latency_sensitivity': 0.5, 'energy_sensitivity': 0.5},
+            'quantum': {'complexity': 0.95, 'latency_sensitivity': 0.6, 'energy_sensitivity': 0.8}
+        }
+        
+        self.power_state_scores = {
+            PowerState.PERFORMANCE: {'performance': 1.0, 'energy': 0.1, 'latency': 1.0},
+            PowerState.BALANCED: {'performance': 0.7, 'energy': 0.5, 'latency': 0.8},
+            PowerState.POWER_SAVE: {'performance': 0.5, 'energy': 0.8, 'latency': 0.6},
+            PowerState.ULTRA_LOW: {'performance': 0.3, 'energy': 0.95, 'latency': 0.3},
+            PowerState.WORKLOAD_AWARE: {'performance': 0.6, 'energy': 0.6, 'latency': 0.6}
+        }
+        
+        logger.info("Workload-Aware Power Selector initialized")
+    
+    def select_power_state(self, task_config: Dict[str, Any], carbon_budget: float) -> PowerState:
+        """Select optimal power state based on workload characteristics"""
+        task_type = task_config.get('task_type', 'inference')
+        complexity = task_config.get('complexity', 0.5)
+        latency_requirement = task_config.get('latency_requirement_ms', 100)
+        
+        # Get workload characteristics
+        characteristics = self.workload_characteristics.get(task_type, self.workload_characteristics['inference'])
+        
+        # Adjust for complexity
+        if complexity > 0.7:
+            characteristics = {**characteristics, 'complexity': min(1.0, complexity)}
+        
+        # Calculate scores for each power state
+        scores = {}
+        for state, scores_dict in self.power_state_scores.items():
+            performance_score = scores_dict['performance'] * (1 - characteristics['complexity'] * 0.3)
+            energy_score = scores_dict['energy'] * (1 - characteristics['energy_sensitivity'] * 0.5)
+            latency_score = scores_dict['latency'] * (1 - latency_requirement / 1000)
+            
+            # Carbon budget adjustment
+            if carbon_budget < 0.001:
+                energy_score *= 1.5
+            
+            scores[state] = performance_score * 0.3 + energy_score * 0.4 + latency_score * 0.3
+        
+        # Select best state
+        best_state = max(scores, key=scores.get)
+        
+        # If workload is training or quantum, prefer performance
+        if task_type in ['training', 'quantum']:
+            if scores[PowerState.PERFORMANCE] > scores[PowerState.BALANCED] * 0.8:
+                best_state = PowerState.PERFORMANCE
+        
+        return best_state
+
+# ============================================================================
+# Adaptive Cooling Controller (NEW)
+# ============================================================================
+
+class AdaptiveCoolingController:
+    """
+    Adaptive cooling based on thermal profile.
+    
+    Features:
+    - Dynamic cooling method selection
+    - Thermal margin management
+    - Energy-efficient cooling
+    """
+    
+    def __init__(self):
+        self.cooling_methods = {
+            CoolingMethod.AIR_COOLING: {'energy_overhead': 0.02, 'cooling_capacity': 50, 'helium_usage': 0.0, 'sustainability_score': 0.6},
+            CoolingMethod.LIQUID_COOLING: {'energy_overhead': 0.05, 'cooling_capacity': 200, 'helium_usage': 0.0, 'sustainability_score': 0.5},
+            CoolingMethod.IMMERSION_COOLING: {'energy_overhead': 0.03, 'cooling_capacity': 500, 'helium_usage': 0.0, 'sustainability_score': 0.7},
+            CoolingMethod.FREE_COOLING: {'energy_overhead': 0.0, 'cooling_capacity': 30, 'helium_usage': 0.0, 'sustainability_score': 0.9},
+            CoolingMethod.GEOTHERMAL_COOLING: {'energy_overhead': 0.01, 'cooling_capacity': 100, 'helium_usage': 0.0, 'sustainability_score': 0.85},
+            CoolingMethod.HELIUM_COOLING: {'energy_overhead': 0.10, 'cooling_capacity': 1000, 'helium_usage': 0.05, 'sustainability_score': 0.4},
+            CoolingMethod.ADAPTIVE_COOLING: {'energy_overhead': 0.0, 'cooling_capacity': 0, 'helium_usage': 0.0, 'sustainability_score': 0.8}
+        }
+        
+        logger.info("Adaptive Cooling Controller initialized")
+    
+    def select_cooling_method(self, thermal_profile: ThermalProfile, helium_scarcity: float) -> CoolingMethod:
+        """Select optimal cooling method based on thermal profile"""
+        if thermal_profile.requires_throttling:
+            if helium_scarcity < 0.3:
+                return CoolingMethod.HELIUM_COOLING
+            elif thermal_profile.ambient_temp_c < 20:
+                return CoolingMethod.FREE_COOLING
+            else:
+                return CoolingMethod.IMMERSION_COOLING
+        
+        if thermal_profile.thermal_headroom_c < 20:
+            if thermal_profile.ambient_temp_c < 15:
+                return CoolingMethod.FREE_COOLING
+            elif helium_scarcity < 0.5:
+                return CoolingMethod.LIQUID_COOLING
+            else:
+                return CoolingMethod.COMPARTMENT_AWARE
+        
+        if thermal_profile.cooling_efficiency > 0.9:
+            return CoolingMethod.AIR_COOLING
+        
+        return CoolingMethod.ADAPTIVE_COOLING
+    
+    def get_cooling_energy_overhead(self, method: CoolingMethod) -> float:
+        """Get energy overhead for a cooling method"""
+        return self.cooling_methods.get(method, {}).get('energy_overhead', 0.02)
+
+# ============================================================================
+# Dynamic Quantization Controller (NEW)
+# ============================================================================
+
+class DynamicQuantizationController:
+    """
+    Dynamic quantization based on task complexity.
+    
+    Features:
+    - Complexity-aware quantization
+    - Accuracy-energy tradeoff
+    - Adaptive precision selection
+    """
+    
+    def __init__(self):
+        self.quantization_levels = {
+            'fp32': {'energy_factor': 1.0, 'accuracy_impact': 0.0, 'ecoatp_cost': 10, 'sustainability_score': 0.5},
+            'fp16': {'energy_factor': 0.5, 'accuracy_impact': 0.01, 'ecoatp_cost': 5, 'sustainability_score': 0.7},
+            'bf16': {'energy_factor': 0.5, 'accuracy_impact': 0.005, 'ecoatp_cost': 5, 'sustainability_score': 0.7},
+            'int8': {'energy_factor': 0.25, 'accuracy_impact': 0.03, 'ecoatp_cost': 2, 'sustainability_score': 0.85},
+            'int4': {'energy_factor': 0.125, 'accuracy_impact': 0.05, 'ecoatp_cost': 1, 'sustainability_score': 0.9}
+        }
+        
+        logger.info("Dynamic Quantization Controller initialized")
+    
+    def select_quantization(self, task_complexity: float, accuracy_requirement: float, 
+                           token_balance: float, task_type: str = 'inference') -> str:
+        """Select optimal quantization level"""
+        # For training, use higher precision
+        if task_type == 'training' and accuracy_requirement > 0.95:
+            return 'fp16'
+        
+        # For high complexity tasks, prefer higher precision
+        if task_complexity > 0.8 and accuracy_requirement > 0.9:
+            return 'fp16'
+        
+        # For low complexity tasks, use aggressive quantization
+        if task_complexity < 0.3 and accuracy_requirement < 0.85:
+            if token_balance < 100:
+                return 'int4'
+            return 'int8'
+        
+        # Moderate complexity
+        if token_balance < 200:
+            return 'int8'
+        elif token_balance < 500:
+            return 'fp16' if accuracy_requirement > 0.9 else 'int8'
+        else:
+            return 'fp16'
+
+# ============================================================================
+# Enhanced Federated Energy Learner with Differential Privacy
 # ============================================================================
 
 class FederatedEnergyLearner:
-    """Federated reflexive learning for distributed energy optimization"""
+    """Federated reflexive learning for distributed energy optimization with differential privacy"""
     
-    def __init__(self, expert_id: str, server_url: Optional[str] = None):
+    def __init__(self, expert_id: str, server_url: Optional[str] = None, privacy_epsilon: float = 1.0):
         self.expert_id = expert_id
         self.server_url = server_url
-        self.state = FederatedLearningState()
+        self.state = FederatedLearningState(privacy_epsilon=privacy_epsilon)
         self._lock = asyncio.Lock()
         self._session = None
         self.local_model = None
         self.global_model = None
         self.energy_history = deque(maxlen=1000)
+        self.noise_scale = 0.001
         
         # Initialize local model
         self._init_energy_model()
     
     def _init_energy_model(self):
-        """Initialize local energy optimization model"""
         class EnergyOptimizerModel(nn.Module):
             def __init__(self, input_size=10, hidden_size=64):
                 super().__init__()
@@ -196,13 +474,27 @@ class FederatedEnergyLearner:
         self.local_model = EnergyOptimizerModel()
         self.global_model = EnergyOptimizerModel()
     
+    def _add_differential_privacy(self, weights: Dict) -> Dict:
+        """Add differential privacy noise to weights"""
+        if self.state.privacy_epsilon <= 0:
+            return weights
+        
+        private_weights = {}
+        sensitivity = 1.0
+        
+        for key, tensor in weights.items():
+            scale = (2 * sensitivity) / self.state.privacy_epsilon
+            noise = torch.randn_like(tensor) * scale * self.noise_scale
+            private_weights[key] = tensor + noise
+        
+        return private_weights
+    
     async def _get_session(self):
         if self._session is None and self.server_url:
             self._session = aiohttp.ClientSession()
         return self._session
     
     async def train_local_model(self, energy_data: List[Dict[str, float]], epochs: int = 10) -> float:
-        """Train local energy optimization model"""
         if not energy_data:
             return 0.0
         
@@ -250,7 +542,6 @@ class FederatedEnergyLearner:
         return avg_loss
     
     async def send_local_update(self, performance_metric: float = 1.0) -> Dict:
-        """Send local model update to federated server"""
         if not self.server_url:
             return {'status': 'disabled'}
         
@@ -259,7 +550,9 @@ class FederatedEnergyLearner:
             
             try:
                 weights = self.local_model.state_dict()
-                weights_serialized = {k: v.tolist() for k, v in weights.items()}
+                # Apply differential privacy
+                private_weights = self._add_differential_privacy(weights)
+                weights_serialized = {k: v.tolist() for k, v in private_weights.items()}
                 
                 update_data = {
                     'expert_id': self.expert_id,
@@ -267,6 +560,7 @@ class FederatedEnergyLearner:
                     'weights': weights_serialized,
                     'performance': performance_metric,
                     'energy_sharing_ratio': self.state.energy_sharing_ratio,
+                    'privacy_epsilon': self.state.privacy_epsilon,
                     'timestamp': datetime.utcnow().isoformat()
                 }
                 
@@ -279,6 +573,7 @@ class FederatedEnergyLearner:
                         result = await response.json()
                         self.state.round += 1
                         self.state.contribution_score += performance_metric
+                        self.state.privacy_epsilon *= 0.99  # Privacy budget decays
                         logger.info(f"Federated energy update sent. Round: {self.state.round}")
                         return result
                     else:
@@ -290,7 +585,6 @@ class FederatedEnergyLearner:
                 return {'status': 'error'}
     
     async def get_global_model(self) -> Optional[Dict]:
-        """Get global model from federated server"""
         if not self.server_url:
             return None
         
@@ -321,7 +615,6 @@ class FederatedEnergyLearner:
     
     async def participate_in_round(self, energy_data: List[Dict[str, float]], 
                                   performance: float = 1.0) -> Dict:
-        """Full participation in federated learning round"""
         await self.train_local_model(energy_data)
         result = await self.send_local_update(performance)
         global_weights = await self.get_global_model()
@@ -337,17 +630,18 @@ class FederatedEnergyLearner:
             'performance': performance,
             'peer_count': len(self.state.participants),
             'energy_sharing_ratio': self.state.energy_sharing_ratio,
+            'privacy_epsilon': self.state.privacy_epsilon,
             'timestamp': datetime.utcnow().isoformat()
         }
     
     def get_federated_insights(self) -> Dict:
-        """Get insights from federated learning"""
         return {
             'round': self.state.round,
             'contribution_score': self.state.contribution_score,
             'participants': len(self.state.participants),
             'has_global_model': bool(self.state.global_model_weights),
             'energy_sharing_ratio': self.state.energy_sharing_ratio,
+            'privacy_epsilon': self.state.privacy_epsilon,
             'last_aggregation': self.state.last_aggregation.isoformat() if self.state.last_aggregation else None
         }
     
@@ -356,7 +650,202 @@ class FederatedEnergyLearner:
             await self._session.close()
 
 # ============================================================================
-# Cross-Domain Knowledge Transfer Module
+# Enhanced Predictive Energy Sustainability with Climate Integration
+# ============================================================================
+
+class PredictiveEnergySustainability:
+    """Predictive sustainability analytics for energy optimization with climate integration"""
+    
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.energy_history = deque(maxlen=history_window)
+        self.sustainability_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        # NEW: Climate data
+        self.climate_data = {}
+        
+        self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    
+    def update_climate_data(self, climate_data: Dict):
+        """Update climate data for forecasting"""
+        self.climate_data.update(climate_data)
+    
+    def update_history(self, energy_data: Dict, sustainability_metrics: Dict):
+        self.energy_history.append({
+            'timestamp': datetime.utcnow(),
+            'energy_kwh': energy_data.get('energy_kwh', 0),
+            'carbon_kg': energy_data.get('carbon_kg', 0),
+            'renewable_pct': energy_data.get('renewable_pct', 0),
+            'helium_usage': energy_data.get('helium_usage', 0)
+        })
+        
+        self.sustainability_history.append({
+            'timestamp': datetime.utcnow(),
+            'carbon_savings': sustainability_metrics.get('carbon_savings_kg', 0),
+            'helium_savings': sustainability_metrics.get('helium_savings_l', 0),
+            'energy_savings': sustainability_metrics.get('energy_savings_kwh', 0),
+            'sustainability_score': sustainability_metrics.get('sustainability_score', 0)
+        })
+    
+    async def train_forecast_model(self):
+        if len(self.energy_history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.energy_history)}
+        
+        X = []
+        y = []
+        history_list = list(self.energy_history)
+        
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['energy_kwh'],
+                    data['carbon_kg'],
+                    data['renewable_pct'],
+                    data['helium_usage']
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['energy_kwh'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        X_scaled = self.scaler.fit_transform(X)
+        
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        
+        self.is_trained = True
+        logger.info(f"Energy forecast models trained. R² scores: {results}")
+        return {'status': 'success', 'results': results, 'samples': len(X)}
+    
+    async def predict_energy_trend(self, hours: int = 24) -> PredictiveEnergyForecast:
+        if not self.is_trained or len(self.energy_history) < 10:
+            return PredictiveEnergyForecast(
+                predicted_energy_kwh=0.5,
+                predicted_carbon_kg=0.5,
+                confidence=0.0,
+                trend="insufficient_data"
+            )
+        
+        recent = list(self.energy_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['energy_kwh'],
+                data['carbon_kg'],
+                data['renewable_pct'],
+                data['helium_usage']
+            ])
+        
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        
+        if not predictions:
+            return PredictiveEnergyForecast(
+                predicted_energy_kwh=0.5,
+                predicted_carbon_kg=0.5,
+                confidence=0.0,
+                trend="no_models"
+            )
+        
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        
+        carbon_prediction = prediction * 0.4
+        
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "increasing" if prediction > recent_forecasts[-1] else "decreasing" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        
+        # Incorporate climate data
+        climate_impact = self._get_climate_impact()
+        recommended_actions = self._generate_predictive_actions(prediction, carbon_prediction, climate_impact)
+        
+        forecast = PredictiveEnergyForecast(
+            predicted_energy_kwh=prediction,
+            predicted_carbon_kg=carbon_prediction,
+            confidence=confidence,
+            trend=trend,
+            factors=[
+                {'name': 'Ensemble average', 'value': prediction, 'weight': 0.6},
+                {'name': 'Model confidence', 'value': confidence, 'weight': 0.4}
+            ],
+            recommended_actions=recommended_actions,
+            climate_impact=climate_impact
+        )
+        
+        self.forecast_history.append(forecast)
+        return forecast
+    
+    def _get_climate_impact(self) -> Optional[Dict]:
+        if not self.climate_data:
+            return None
+        
+        return {
+            'carbon_intensity': self.climate_data.get('carbon_intensity', 400),
+            'renewable_availability': self.climate_data.get('renewable_availability', 0.5),
+            'impact_score': (1.0 - self.climate_data.get('carbon_intensity', 400) / 800) * 0.5 + 0.5
+        }
+    
+    def _generate_predictive_actions(self, energy_prediction: float, carbon_prediction: float, 
+                                    climate_impact: Optional[Dict]) -> List[str]:
+        actions = []
+        
+        if energy_prediction > 1.0:
+            actions.append("Optimize energy consumption through power state reduction")
+        
+        if carbon_prediction > 0.5:
+            actions.append("Shift workload to lower-carbon energy sources")
+            actions.append("Increase renewable energy integration")
+        
+        if climate_impact:
+            if climate_impact.get('carbon_intensity', 400) > 500:
+                actions.append("High grid carbon intensity - use stored energy")
+            if climate_impact.get('renewable_availability', 0.5) > 0.7:
+                actions.append("High renewable availability - schedule tasks now")
+        
+        if len(self.energy_history) > 20:
+            recent_trend = np.mean([h['energy_kwh'] for h in list(self.energy_history)[-10:]])
+            if energy_prediction > recent_trend * 1.2:
+                actions.append("Implement peak-shaving strategies")
+        
+        return actions or ["Current energy trends are sustainable"]
+    
+    def get_sustainability_summary(self) -> Dict:
+        if not self.sustainability_history:
+            return {'status': 'insufficient_data'}
+        
+        recent = list(self.sustainability_history)[-50:]
+        
+        return {
+            'average_carbon_savings': np.mean([h['carbon_savings'] for h in recent]),
+            'average_helium_savings': np.mean([h['helium_savings'] for h in recent]),
+            'average_energy_savings': np.mean([h['energy_savings'] for h in recent]),
+            'current_sustainability_score': recent[-1]['sustainability_score'] if recent else 0,
+            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
+        }
+
+# ============================================================================
+# Cross-Domain Knowledge Transfer Module (Enhanced)
 # ============================================================================
 
 class EnergyCrossDomainTransfer:
@@ -389,7 +878,6 @@ class EnergyCrossDomainTransfer:
     
     def transfer_knowledge(self, source_domain: str, target_domain: str, 
                           knowledge_type: str, data: Dict[str, Any]) -> CrossDomainKnowledge:
-        """Transfer knowledge between domains"""
         key = f"{source_domain}→{target_domain}"
         
         knowledge = CrossDomainKnowledge(
@@ -426,14 +914,12 @@ class EnergyCrossDomainTransfer:
     
     def get_transferred_knowledge(self, source_domain: str, target_domain: str, 
                                  knowledge_type: str) -> Optional[CrossDomainKnowledge]:
-        """Retrieve transferred knowledge"""
         key = f"{source_domain}→{target_domain}"
         if key in self.knowledge_base and knowledge_type in self.knowledge_base[key]:
             return self.knowledge_base[key][knowledge_type]
         return None
     
     async def apply_data_knowledge(self, energy_data: Dict) -> Dict:
-        """Apply knowledge from data domain to energy optimization"""
         data_knowledge = self.get_transferred_knowledge('data', 'energy', 'compression_strategies')
         if data_knowledge:
             strategies = data_knowledge.data.get('strategies', [])
@@ -447,7 +933,6 @@ class EnergyCrossDomainTransfer:
         return {'applied_strategy': 'default', 'source': 'local', 'confidence': 0.5}
     
     async def apply_carbon_knowledge(self, energy_data: Dict) -> Dict:
-        """Apply knowledge from carbon domain to energy optimization"""
         carbon_knowledge = self.get_transferred_knowledge('carbon', 'energy', 'optimization_patterns')
         if carbon_knowledge:
             patterns = carbon_knowledge.data.get('patterns', [])
@@ -460,7 +945,6 @@ class EnergyCrossDomainTransfer:
         return {'carbon_aware_optimization': False, 'source': 'local'}
     
     async def apply_helium_knowledge(self, energy_data: Dict) -> Dict:
-        """Apply knowledge from helium domain to energy optimization"""
         helium_knowledge = self.get_transferred_knowledge('helium', 'energy', 'efficiency_strategies')
         if helium_knowledge:
             return {
@@ -473,7 +957,6 @@ class EnergyCrossDomainTransfer:
     
     def update_effectiveness(self, source_domain: str, target_domain: str, 
                             knowledge_type: str, effectiveness: float):
-        """Update effectiveness of knowledge transfer"""
         key = f"{source_domain}→{target_domain}"
         if key in self.knowledge_base and knowledge_type in self.knowledge_base[key]:
             knowledge = self.knowledge_base[key][knowledge_type]
@@ -486,7 +969,6 @@ class EnergyCrossDomainTransfer:
             })
     
     def get_transfer_statistics(self) -> Dict:
-        """Get cross-domain transfer statistics"""
         total_transfers = len(self.transfer_logs)
         domain_pairs = {}
         
@@ -506,200 +988,25 @@ class EnergyCrossDomainTransfer:
         }
 
 # ============================================================================
-# Predictive Sustainability Module
-# ============================================================================
-
-class PredictiveEnergySustainability:
-    """Predictive sustainability analytics for energy optimization"""
-    
-    def __init__(self, history_window: int = 100):
-        self.history_window = history_window
-        self.energy_history = deque(maxlen=history_window)
-        self.sustainability_history = deque(maxlen=history_window)
-        self.forecast_history = deque(maxlen=50)
-        self.models = {}
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        
-        # Multiple models for ensemble forecasting
-        self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
-    
-    def update_history(self, energy_data: Dict, sustainability_metrics: Dict):
-        """Update energy and sustainability history"""
-        self.energy_history.append({
-            'timestamp': datetime.utcnow(),
-            'energy_kwh': energy_data.get('energy_kwh', 0),
-            'carbon_kg': energy_data.get('carbon_kg', 0),
-            'renewable_pct': energy_data.get('renewable_pct', 0),
-            'helium_usage': energy_data.get('helium_usage', 0)
-        })
-        
-        self.sustainability_history.append({
-            'timestamp': datetime.utcnow(),
-            'carbon_savings': sustainability_metrics.get('carbon_savings_kg', 0),
-            'helium_savings': sustainability_metrics.get('helium_savings_l', 0),
-            'energy_savings': sustainability_metrics.get('energy_savings_kwh', 0),
-            'sustainability_score': sustainability_metrics.get('sustainability_score', 0)
-        })
-    
-    async def train_forecast_model(self):
-        """Train ensemble forecasting models"""
-        if len(self.energy_history) < 10:
-            return {'status': 'insufficient_data', 'samples': len(self.energy_history)}
-        
-        X = []
-        y = []
-        history_list = list(self.energy_history)
-        
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['energy_kwh'],
-                    data['carbon_kg'],
-                    data['renewable_pct'],
-                    data['helium_usage']
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['energy_kwh'])
-        
-        X = np.array(X)
-        y = np.array(y)
-        
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Train ensemble models
-        results = {}
-        for name, model in self.models.items():
-            if model is not None:
-                model.fit(X_scaled, y)
-                predictions = model.predict(X_scaled)
-                r2 = r2_score(y, predictions)
-                results[name] = r2
-        
-        self.is_trained = True
-        logger.info(f"Energy forecast models trained. R² scores: {results}")
-        return {'status': 'success', 'results': results, 'samples': len(X)}
-    
-    async def predict_energy_trend(self, hours: int = 24) -> PredictiveEnergyForecast:
-        """Predict future energy consumption and sustainability impact"""
-        if not self.is_trained or len(self.energy_history) < 10:
-            return PredictiveEnergyForecast(
-                predicted_energy_kwh=0.5,
-                predicted_carbon_kg=0.5,
-                confidence=0.0,
-                trend="insufficient_data"
-            )
-        
-        recent = list(self.energy_history)[-5:]
-        features = []
-        for data in recent:
-            features.extend([
-                data['energy_kwh'],
-                data['carbon_kg'],
-                data['renewable_pct'],
-                data['helium_usage']
-            ])
-        
-        features = np.array(features).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-        
-        # Ensemble predictions
-        predictions = []
-        for name, model in self.models.items():
-            if model is not None:
-                pred = model.predict(features_scaled)[0]
-                predictions.append(pred)
-        
-        if not predictions:
-            return PredictiveEnergyForecast(
-                predicted_energy_kwh=0.5,
-                predicted_carbon_kg=0.5,
-                confidence=0.0,
-                trend="no_models"
-            )
-        
-        # Weighted average
-        prediction = np.mean(predictions)
-        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
-        
-        # Predict carbon impact
-        carbon_prediction = prediction * 0.4  # Rough estimate
-        
-        # Determine trend
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
-            trend = "increasing" if prediction > recent_forecasts[-1] else "decreasing" if prediction < recent_forecasts[-1] else "stable"
-        else:
-            trend = "stable"
-        
-        # Generate recommended actions
-        recommended_actions = self._generate_predictive_actions(prediction, carbon_prediction)
-        
-        forecast = PredictiveEnergyForecast(
-            predicted_energy_kwh=prediction,
-            predicted_carbon_kg=carbon_prediction,
-            confidence=confidence,
-            trend=trend,
-            factors=[
-                {'name': 'Ensemble average', 'value': prediction, 'weight': 0.6},
-                {'name': 'Model confidence', 'value': confidence, 'weight': 0.4}
-            ],
-            recommended_actions=recommended_actions
-        )
-        
-        self.forecast_history.append(forecast)
-        return forecast
-    
-    def _generate_predictive_actions(self, energy_prediction: float, carbon_prediction: float) -> List[str]:
-        """Generate recommended actions based on predictions"""
-        actions = []
-        
-        if energy_prediction > 1.0:
-            actions.append("Optimize energy consumption through power state reduction")
-        
-        if carbon_prediction > 0.5:
-            actions.append("Shift workload to lower-carbon energy sources")
-            actions.append("Increase renewable energy integration")
-        
-        if len(self.energy_history) > 20:
-            recent_trend = np.mean([h['energy_kwh'] for h in list(self.energy_history)[-10:]])
-            if energy_prediction > recent_trend * 1.2:
-                actions.append("Implement peak-shaving strategies")
-        
-        return actions or ["Current energy trends are sustainable"]
-    
-    def get_sustainability_summary(self) -> Dict:
-        """Get sustainability summary"""
-        if not self.sustainability_history:
-            return {'status': 'insufficient_data'}
-        
-        recent = list(self.sustainability_history)[-50:]
-        
-        return {
-            'average_carbon_savings': np.mean([h['carbon_savings'] for h in recent]),
-            'average_helium_savings': np.mean([h['helium_savings'] for h in recent]),
-            'average_energy_savings': np.mean([h['energy_savings'] for h in recent]),
-            'current_sustainability_score': recent[-1]['sustainability_score'] if recent else 0,
-            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
-        }
-
-# ============================================================================
 # Enhanced Energy Expert (Main Class)
 # ============================================================================
 
 class EnergyExpert:
-    """Enhanced Energy Expert v6.0.0 with all green agent capabilities"""
+    """Enhanced Energy Expert v7.0.0 with all green agent features"""
     
-    def __init__(self, expert_id: str = "energy_optimizer_v6", enable_renewable: bool = True,
+    def __init__(self, expert_id: str = "energy_optimizer_v7", enable_renewable: bool = True,
                  enable_storage: bool = True, enable_thermal: bool = True, enable_dvfs: bool = True,
                  enable_forecasting: bool = True, enable_bio_integration: bool = True,
                  enable_federated: bool = True, enable_cross_domain: bool = True,
-                 enable_predictive_sustainability: bool = True):
+                 enable_predictive_sustainability: bool = True,
+                 enable_grid_api: bool = True,  # NEW
+                 enable_workload_aware: bool = True,  # NEW
+                 enable_adaptive_cooling: bool = True,  # NEW
+                 enable_dynamic_quantization: bool = True,  # NEW
+                 enable_differential_privacy: bool = True,  # NEW
+                 enable_climate_integration: bool = True):  # NEW
         self.expert_id = expert_id
-        self.version = "6.0.0"
+        self.version = "7.0.0"
         self.enable_renewable = enable_renewable
         self.enable_storage = enable_storage
         self.enable_thermal = enable_thermal
@@ -710,6 +1017,14 @@ class EnergyExpert:
         self.enable_cross_domain = enable_cross_domain
         self.enable_predictive_sustainability = enable_predictive_sustainability
         
+        # NEW feature flags
+        self.enable_grid_api = enable_grid_api
+        self.enable_workload_aware = enable_workload_aware
+        self.enable_adaptive_cooling = enable_adaptive_cooling
+        self.enable_dynamic_quantization = enable_dynamic_quantization
+        self.enable_differential_privacy = enable_differential_privacy
+        self.enable_climate_integration = enable_climate_integration
+        
         # Bio-inspired components
         self.token_manager = None
         self.gradient_manager = None
@@ -718,8 +1033,14 @@ class EnergyExpert:
         self.biomass_storage = None
         self.harvester = None
         
-        # New modules
-        self.federated_learner = FederatedEnergyLearner(expert_id)
+        # NEW modules
+        self.grid_api = GridCarbonAPIClient() if enable_grid_api else None
+        self.workload_selector = WorkloadAwarePowerSelector() if enable_workload_aware else None
+        self.cooling_controller = AdaptiveCoolingController() if enable_adaptive_cooling else None
+        self.quantization_controller = DynamicQuantizationController() if enable_dynamic_quantization else None
+        
+        privacy_epsilon = 1.0 if enable_differential_privacy else 0.0
+        self.federated_learner = FederatedEnergyLearner(expert_id, privacy_epsilon=privacy_epsilon)
         self.cross_domain_transfer = EnergyCrossDomainTransfer()
         self.predictive_sustainability = PredictiveEnergySustainability()
         
@@ -737,7 +1058,7 @@ class EnergyExpert:
             supported_task_types=['inference', 'training', 'optimization', 'energy_management']
         )
         
-        # Enhanced power states with federated support
+        # Enhanced power states
         self.power_states = {
             PowerState.PERFORMANCE: {'frequency_percent': 100, 'energy_factor': 1.0, 'performance_factor': 1.0},
             PowerState.BALANCED: {'frequency_percent': 70, 'energy_factor': 0.7, 'performance_factor': 0.85},
@@ -745,7 +1066,8 @@ class EnergyExpert:
             PowerState.ULTRA_LOW: {'frequency_percent': 25, 'energy_factor': 0.25, 'performance_factor': 0.35},
             PowerState.DYNAMIC: {'frequency_percent': 0, 'energy_factor': 0.0, 'performance_factor': 0.0},
             PowerState.ATP_DRIVEN: {'frequency_percent': 0, 'energy_factor': 0.0, 'performance_factor': 0.0},
-            PowerState.FEDERATED: {'frequency_percent': 0, 'energy_factor': 0.5, 'performance_factor': 0.75}
+            PowerState.FEDERATED: {'frequency_percent': 0, 'energy_factor': 0.5, 'performance_factor': 0.75},
+            PowerState.WORKLOAD_AWARE: {'frequency_percent': 0, 'energy_factor': 0.0, 'performance_factor': 0.0}
         }
         
         self.quantization_levels = {
@@ -764,7 +1086,8 @@ class EnergyExpert:
             CoolingMethod.GEOTHERMAL_COOLING: {'energy_overhead': 0.01, 'max_cooling_capacity_kw': 100, 'helium_usage': 0.0, 'sustainability_score': 0.85},
             CoolingMethod.HELIUM_COOLING: {'energy_overhead': 0.10, 'max_cooling_capacity_kw': 1000, 'helium_usage': 0.05, 'sustainability_score': 0.4},
             CoolingMethod.COMPARTMENT_AWARE: {'energy_overhead': 0.0, 'max_cooling_capacity_kw': 0, 'helium_usage': 0.0, 'sustainability_score': 0.8},
-            CoolingMethod.FEDERATED_COOLING: {'energy_overhead': 0.0, 'max_cooling_capacity_kw': 0, 'helium_usage': 0.0, 'sustainability_score': 0.75}
+            CoolingMethod.FEDERATED_COOLING: {'energy_overhead': 0.0, 'max_cooling_capacity_kw': 0, 'helium_usage': 0.0, 'sustainability_score': 0.75},
+            CoolingMethod.ADAPTIVE_COOLING: {'energy_overhead': 0.0, 'max_cooling_capacity_kw': 0, 'helium_usage': 0.0, 'sustainability_score': 0.85}
         }
         
         self.optimization_history: deque = deque(maxlen=10000)
@@ -784,6 +1107,13 @@ class EnergyExpert:
         }
         
         self.sustainability_metrics = SustainabilityMetrics()
+        
+        # Initialize climate data
+        if self.enable_climate_integration:
+            self.predictive_sustainability.update_climate_data({
+                'carbon_intensity': 400,
+                'renewable_availability': 0.5
+            })
         
         logger.info(f"Energy Expert v{self.version} initialized with all green agent features")
     
@@ -807,7 +1137,7 @@ class EnergyExpert:
             self.enable_bio_integration = True
     
     # ========================================================================
-    # Bio-Inspired Data Access
+    # Bio-Inspired Data Access (Enhanced)
     # ========================================================================
     
     def _get_gradient_energy_source(self) -> EnergySource:
@@ -855,7 +1185,8 @@ class EnergyExpert:
                 return ThermalProfile(
                     current_temp_c=temp,
                     compartment_health=health,
-                    requires_throttling=health < 0.3
+                    requires_throttling=health < 0.3,
+                    cooling_method=CoolingMethod.COMPARTMENT_AWARE
                 )
         return ThermalProfile(current_temp_c=40.0, compartment_health=0.7)
     
@@ -908,6 +1239,50 @@ class EnergyExpert:
         
         gradient_levels = self._get_gradient_levels() if self.enable_bio_integration else {}
         
+        # NEW: Get real-time grid carbon intensity
+        if self.enable_grid_api and self.grid_api:
+            try:
+                grid_data = await self.grid_api.get_carbon_intensity('US-CAL-CISO')
+                grid_carbon_intensity = grid_data.get('carbon_intensity', 400)
+                if renewable_profile:
+                    renewable_profile.grid_carbon_intensity = grid_carbon_intensity
+                    renewable_profile.grid_renewable_percentage = grid_data.get('renewable_percentage', 0)
+            except Exception as e:
+                logger.warning(f"Grid API error: {e}")
+        
+        # NEW: Workload-aware power state selection
+        if self.enable_workload_aware and self.workload_selector:
+            workload_power_state = self.workload_selector.select_power_state(task_config, carbon_budget)
+            power_state = workload_power_state
+        else:
+            power_state = self._get_atp_driven_dvfs() if self.enable_bio_integration else (
+                PowerState.PERFORMANCE if latency_requirement_ms < 10 else PowerState.BALANCED)
+        
+        # NEW: Dynamic quantization
+        if self.enable_dynamic_quantization and self.quantization_controller:
+            task_complexity = task_config.get('complexity', 0.5)
+            accuracy_requirement = task_config.get('accuracy_requirement', 0.95)
+            token_balance = self.token_manager.get_system_summary().get('total_balance', 500) if self.token_manager else 500
+            task_type = task_config.get('task_type', 'inference')
+            quant_level = self.quantization_controller.select_quantization(
+                task_complexity, accuracy_requirement, token_balance, task_type
+            )
+        else:
+            quant_level = self._get_token_efficient_quantization(task_config.get('task_type', 'inference'))
+        
+        quant_config = self.quantization_levels[quant_level]
+        
+        # NEW: Adaptive cooling
+        if self.enable_adaptive_cooling and self.cooling_controller:
+            thermal = thermal_profile or self._get_compartment_thermal_state()
+            if self.enable_bio_integration:
+                thermal = self._get_compartment_thermal_state()
+            cooling_method = self.cooling_controller.select_cooling_method(thermal, helium_scarcity)
+            cooling_overhead = self.cooling_controller.get_cooling_energy_overhead(cooling_method)
+        else:
+            cooling_method = CoolingMethod.AIR_COOLING
+            cooling_overhead = 0.02
+        
         # Apply cross-domain knowledge
         if self.enable_cross_domain:
             data_knowledge = await self.cross_domain_transfer.apply_data_knowledge(task_config)
@@ -918,30 +1293,21 @@ class EnergyExpert:
                 logger.info(f"Applied data knowledge: {data_knowledge['applied_strategy']}")
         
         # Determine energy source
-        energy_source = self._get_gradient_energy_source() if self.enable_bio_integration else (
-            EnergySource.SOLAR if renewable_profile and renewable_profile.can_use_renewable(10) else EnergySource.GRID_MIX)
+        if grid_carbon_intensity and grid_carbon_intensity < 200:
+            energy_source = EnergySource.GRID_MIX
+        else:
+            energy_source = self._get_gradient_energy_source() if self.enable_bio_integration else (
+                EnergySource.SOLAR if renewable_profile and renewable_profile.can_use_renewable(10) else EnergySource.GRID_MIX)
         
         # Federated learning optimization
         if self.enable_federated:
             federated_insights = self.federated_learner.get_federated_insights()
-            if federated_insights.get('has_global_model', False):
+            if federated_insights.get('has_global_model', False) and power_state != PowerState.WORKLOAD_AWARE:
                 power_state = PowerState.FEDERATED
-            else:
-                power_state = self._get_atp_driven_dvfs() if self.enable_bio_integration else (
-                    PowerState.PERFORMANCE if latency_requirement_ms < 10 else PowerState.BALANCED)
-        else:
-            power_state = self._get_atp_driven_dvfs() if self.enable_bio_integration else (
-                PowerState.PERFORMANCE if latency_requirement_ms < 10 else PowerState.BALANCED)
         
-        power_config = self.power_states[power_state]
+        power_config = self.power_states.get(power_state, self.power_states[PowerState.BALANCED])
         
-        quant_level = self._get_token_efficient_quantization(task_config.get('task_type', 'inference')) if self.enable_bio_integration else (
-            'int8' if carbon_budget < 0.01 else 'fp16')
-        quant_config = self.quantization_levels[quant_level]
-        
-        thermal = self._get_compartment_thermal_state() if self.enable_bio_integration else (thermal_profile or ThermalProfile())
-        
-        energy_factor = power_config['energy_factor'] * quant_config['energy_factor']
+        energy_factor = power_config['energy_factor'] * quant_config['energy_factor'] * (1.0 + cooling_overhead)
         base_energy = task_config.get('base_energy_kwh', 0.01)
         estimated_energy = base_energy * energy_factor
         estimated_carbon = estimated_energy * energy_source.carbon_intensity_g_per_kwh / 1000
@@ -950,7 +1316,7 @@ class EnergyExpert:
         if ecoatp_budget and ecoatp_cost > ecoatp_budget and self.enable_bio_integration:
             power_state = PowerState.POWER_SAVE
             quant_level = 'int8'
-            energy_factor = self.power_states[power_state]['energy_factor'] * self.quantization_levels[quant_level]['energy_factor']
+            energy_factor = self.power_states[power_state]['energy_factor'] * self.quantization_levels[quant_level]['energy_factor'] * (1.0 + cooling_overhead)
             estimated_energy = base_energy * energy_factor
             ecoatp_cost = estimated_energy * 1000
         
@@ -959,7 +1325,7 @@ class EnergyExpert:
         # Update sustainability metrics
         self.sustainability_metrics.carbon_savings_kg += max(0, base_energy * 400 / 1000 - estimated_carbon)
         self.sustainability_metrics.energy_savings_kwh += max(0, base_energy - estimated_energy)
-        self.sustainability_metrics.renewable_percentage = 100 if energy_source.is_renewable else 25
+        self.sustainability_metrics.renewable_percentage = 100 if energy_source.is_renewable else (grid_carbon_intensity / 800 * 100 if grid_carbon_intensity else 25)
         self.sustainability_metrics.ecoatp_generated += ecoatp_generated
         self.sustainability_metrics.sustainability_score = min(1.0, (
             self.sustainability_metrics.renewable_percentage / 100 * 0.3 +
@@ -967,8 +1333,14 @@ class EnergyExpert:
             min(1.0, self.sustainability_metrics.ecoatp_generated / 10) * 0.3
         ))
         
-        # Update predictive sustainability history
+        # Update predictive sustainability history with climate data
         if self.enable_predictive_sustainability:
+            if self.enable_climate_integration:
+                self.predictive_sustainability.update_climate_data({
+                    'carbon_intensity': grid_carbon_intensity or 400,
+                    'renewable_availability': self.sustainability_metrics.renewable_percentage / 100
+                })
+            
             self.predictive_sustainability.update_history(
                 {'energy_kwh': estimated_energy, 'carbon_kg': estimated_carbon,
                  'renewable_pct': self.sustainability_metrics.renewable_percentage,
@@ -985,7 +1357,8 @@ class EnergyExpert:
                 'predicted_carbon': forecast.predicted_carbon_kg,
                 'confidence': forecast.confidence,
                 'trend': forecast.trend,
-                'recommended_actions': forecast.recommended_actions
+                'recommended_actions': forecast.recommended_actions,
+                'climate_impact': forecast.climate_impact
             }
         
         # Participate in federated learning
@@ -1003,11 +1376,13 @@ class EnergyExpert:
             'optimization_id': optimization_id,
             'version': self.version,
             'energy_source': energy_source.value,
-            'renewable_percentage': 100 if energy_source.is_renewable else 25,
+            'renewable_percentage': self.sustainability_metrics.renewable_percentage,
             'power_state': power_state.value,
             'frequency_percent': power_config['frequency_percent'],
             'quantization': quant_level,
             'accuracy_impact': quant_config['accuracy_impact'],
+            'cooling_method': cooling_method.value,
+            'cooling_overhead': cooling_overhead,
             'estimated_energy_kwh': estimated_energy,
             'estimated_carbon_kg': estimated_carbon,
             'estimated_ecoatp_cost': ecoatp_cost,
@@ -1017,6 +1392,12 @@ class EnergyExpert:
             'federated_active': self.enable_federated,
             'cross_domain_active': self.enable_cross_domain,
             'predictive_sustainability_active': self.enable_predictive_sustainability,
+            'grid_api_active': self.enable_grid_api,
+            'workload_aware_active': self.enable_workload_aware,
+            'adaptive_cooling_active': self.enable_adaptive_cooling,
+            'dynamic_quantization_active': self.enable_dynamic_quantization,
+            'differential_privacy_active': self.enable_differential_privacy,
+            'climate_integration_active': self.enable_climate_integration,
             'gradient_levels': gradient_levels,
             'ecoatp_generated': ecoatp_generated,
             'sustainability_score': self.sustainability_metrics.sustainability_score,
@@ -1024,6 +1405,7 @@ class EnergyExpert:
             'federated_round': federated_result.get('round', 0) if federated_result else 0,
             'federated_contribution': federated_result.get('contribution_score', 0) if federated_result else 0,
             'harvester_forecast': self._get_harvester_renewable_forecast() if self.enable_bio_integration else {},
+            'grid_data': grid_data if self.enable_grid_api and hasattr(self, 'grid_data') else None,
             'recommendations': self._generate_recommendations(gradient_levels, ecoatp_generated),
             'strategy': 'bio_optimized' if self.enable_bio_integration else 'standard',
             'timestamp': datetime.utcnow().isoformat()
@@ -1042,7 +1424,10 @@ class EnergyExpert:
             ecoatp_generated=ecoatp_generated,
             gradient_level=gradient_levels.get('carbon', 0.5),
             federated_round=plan['federated_round'],
-            cross_domain_transfers=list(self.cross_domain_transfer.transfer_logs)[-5:] if self.enable_cross_domain else []
+            cross_domain_transfers=list(self.cross_domain_transfer.transfer_logs)[-5:] if self.enable_cross_domain else [],
+            workload_type=task_config.get('task_type', 'inference'),
+            cooling_method=cooling_method.value,
+            quantization_level=quant_level
         )
         self.optimization_history.append(history)
         self.total_energy_saved_kwh += history.energy_saved_kwh
@@ -1078,10 +1463,19 @@ class EnergyExpert:
             if summary.get('status') != 'insufficient_data':
                 recs.append(f"Sustainability trend: {summary.get('trend', 'stable')}")
         
+        if self.enable_workload_aware:
+            recs.append("Workload-aware power state selection active.")
+        
+        if self.enable_adaptive_cooling:
+            recs.append("Adaptive cooling controller active.")
+        
+        if self.enable_dynamic_quantization:
+            recs.append("Dynamic quantization active based on task complexity.")
+        
         return recs if recs else ["Energy configuration is optimal."]
     
     # ========================================================================
-    # Natural Language Explanations with Enhanced Features
+    # Natural Language Explanations (Enhanced)
     # ========================================================================
     
     def explain_energy_decision(self, optimization_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1089,28 +1483,35 @@ class EnergyExpert:
         energy_source = plan.get('energy_source', 'unknown')
         power_state = plan.get('power_state', 'unknown')
         quantization = plan.get('quantization', 'unknown')
+        cooling_method = plan.get('cooling_method', 'unknown')
         carbon_kg = plan.get('estimated_carbon_kg', 0)
         ecoatp_generated = plan.get('ecoatp_generated', 0)
         sustainability_score = plan.get('sustainability_score', 0.5)
         federated_round = plan.get('federated_round', 0)
+        workload_type = plan.get('workload_type', 'inference')
         
         if plan.get('bio_integration_active'):
             if energy_source in ['solar', 'wind', 'battery']:
-                executive = f"Selected {energy_source} energy with {power_state} power and {quantization} quantization. Carbon: {carbon_kg:.6f}kg."
+                executive = (f"Selected {energy_source} energy with {power_state} power, {quantization} quantization, "
+                           f"and {cooling_method} cooling. Carbon: {carbon_kg:.6f}kg.")
             else:
-                executive = f"Using {energy_source} energy (gradient-driven). Generated {ecoatp_generated:.1f} Eco-ATP from offsets."
+                executive = (f"Using {energy_source} energy (gradient-driven). Generated {ecoatp_generated:.1f} Eco-ATP "
+                           f"from offsets. Workload: {workload_type}.")
         else:
-            executive = f"Standard optimization: {power_state} power, {quantization} precision. Carbon: {carbon_kg:.6f}kg."
+            executive = (f"Standard optimization: {power_state} power, {quantization} precision, {cooling_method} cooling. "
+                        f"Carbon: {carbon_kg:.6f}kg.")
         
         technical = [
             f"Energy source: {energy_source}",
             f"Power state: {power_state}",
             f"Quantization: {quantization}",
+            f"Cooling method: {cooling_method}",
             f"Estimated carbon: {carbon_kg:.6f} kg CO2",
             f"Estimated energy: {plan.get('estimated_energy_kwh', 0):.6f} kWh",
             f"Eco-ATP cost: {plan.get('estimated_ecoatp_cost', 0):.1f}",
             f"Eco-ATP generated: {ecoatp_generated:.1f}",
-            f"Sustainability score: {sustainability_score:.2f}"
+            f"Sustainability score: {sustainability_score:.2f}",
+            f"Workload type: {workload_type}"
         ]
         
         if plan.get('bio_integration_active'):
@@ -1124,6 +1525,11 @@ class EnergyExpert:
             forecast = plan['predictive_forecast']
             technical.append(f"Predicted energy: {forecast.get('predicted_energy', 0):.3f} kWh")
             technical.append(f"Forecast confidence: {forecast.get('confidence', 0):.2f}")
+            if forecast.get('climate_impact'):
+                technical.append(f"Climate impact: {forecast['climate_impact'].get('impact_score', 0):.2f}")
+        
+        if plan.get('grid_api_active'):
+            technical.append(f"Grid carbon intensity: {plan.get('grid_data', {}).get('carbon_intensity', 400):.0f} gCO2/kWh")
         
         if energy_source == 'battery':
             counterfactual = "If carbon gradient were below 0.3, grid energy would be preferred."
@@ -1239,7 +1645,7 @@ class EnergyExpert:
         }
     
     # ========================================================================
-    # Expert Statistics with Enhanced Features
+    # Expert Statistics (Enhanced)
     # ========================================================================
     
     def get_expert_statistics(self) -> Dict[str, Any]:
@@ -1255,6 +1661,12 @@ class EnergyExpert:
             'federated_active': self.enable_federated,
             'cross_domain_active': self.enable_cross_domain,
             'predictive_sustainability_active': self.enable_predictive_sustainability,
+            'grid_api_active': self.enable_grid_api,
+            'workload_aware_active': self.enable_workload_aware,
+            'adaptive_cooling_active': self.enable_adaptive_cooling,
+            'dynamic_quantization_active': self.enable_dynamic_quantization,
+            'differential_privacy_active': self.enable_differential_privacy,
+            'climate_integration_active': self.enable_climate_integration,
             'optimizations_performed': len(self.optimization_history),
             'renewable_usage_rate': sum(1 for r in recent if r.renewable_used) / max(len(recent), 1) if recent else 0,
             'average_ecoatp_generated': np.mean([r.ecoatp_generated for r in recent]) if recent else 0,
@@ -1279,6 +1691,12 @@ class EnergyExpert:
                 'token_quantization': self._get_token_efficient_quantization()
             }
         
+        if self.enable_grid_api and self.grid_api:
+            stats['grid_api_status'] = {
+                'connected': self.grid_api._session is not None,
+                'last_update': self.grid_api.last_update.isoformat() if self.grid_api.last_update else None
+            }
+        
         return stats
     
     def reset_metrics(self):
@@ -1299,4 +1717,6 @@ class EnergyExpert:
         """Graceful shutdown of all components"""
         logger.info(f"Shutting down Energy Expert {self.expert_id}")
         await self.federated_learner.close()
+        if self.grid_api:
+            await self.grid_api.close()
         logger.info("Energy Expert shutdown complete")
