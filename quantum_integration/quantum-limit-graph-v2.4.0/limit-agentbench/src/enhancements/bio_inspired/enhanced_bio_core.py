@@ -1,10 +1,12 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/enhanced_bio_core.py
-# Complete enhanced file v5.0.0 with all improvements
+# Complete enhanced file v6.0.0 with all improvements
 
 """
-Enhanced Bio-Inspired Core v5.0.0
+Enhanced Bio-Inspired Core v6.0.0
 Complete implementation with graceful shutdown, module registry, lifecycle management,
-health dashboard, configuration validation, and module isolation.
+health dashboard, configuration validation, module isolation, dynamic module loading (NEW),
+predictive health forecasting (NEW), configuration versioning (NEW),
+anomaly detection in performance metrics (NEW), and event-driven communication between services (NEW).
 """
 
 import asyncio
@@ -19,11 +21,15 @@ import numpy as np
 from collections import defaultdict, deque
 import json
 import os
+import importlib
+import hashlib
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Service Protocols
+# Service Protocols (Enhanced)
 # ============================================================================
 
 class TokenServiceProtocol(Protocol):
@@ -75,10 +81,11 @@ class LifecyclePhase(Enum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
+    LOADING = "loading"  # NEW: For dynamic module loading
 
 @dataclass
 class ModuleEntry:
-    """Module registry entry with lifecycle management"""
+    """Module registry entry with lifecycle management (Enhanced)"""
     name: str
     module: Any = None
     phase: LifecyclePhase = LifecyclePhase.REGISTERED
@@ -95,15 +102,456 @@ class ModuleEntry:
     failure_count: int = 0
     last_failure: Optional[datetime] = None
     metrics: Dict[str, Any] = field(default_factory=dict)
+    # NEW: Dynamic loading
+    module_path: Optional[str] = None
+    version: str = "1.0.0"
+    loaded_at: Optional[datetime] = None
+    # NEW: Predictive health
+    predicted_health: Optional[float] = None
+    failure_probability: float = 0.0
+    health_trend: str = "stable"
 
 # ============================================================================
-# Module Registry
+# Event Bus for Event-Driven Communication (NEW)
+# ============================================================================
+
+@dataclass
+class CoreEvent:
+    """Event for event-driven communication between services"""
+    event_type: str
+    source: str
+    payload: Dict[str, Any]
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    correlation_id: Optional[str] = None
+
+class CoreEventBus:
+    """
+    Event bus for event-driven communication between bio-inspired services.
+    
+    Features:
+    - Publish/subscribe pattern
+    - Event filtering
+    - Priority queuing
+    - Event correlation
+    """
+    
+    def __init__(self):
+        self.subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self.event_history: deque = deque(maxlen=10000)
+        self.event_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._lock = asyncio.Lock()
+        self._running = True
+        self._processor_task = None
+        
+        # Start event processing
+        self._processor_task = asyncio.create_task(self._process_events())
+        
+        logger.info("Core Event Bus initialized")
+    
+    def subscribe(self, event_type: str, callback: Callable):
+        """Subscribe to an event type"""
+        self.subscribers[event_type].append(callback)
+        logger.debug(f"Subscribed to {event_type}")
+    
+    def unsubscribe(self, event_type: str, callback: Callable):
+        """Unsubscribe from an event type"""
+        if event_type in self.subscribers:
+            self.subscribers[event_type].remove(callback)
+    
+    async def publish(self, event: CoreEvent):
+        """Publish an event"""
+        async with self._lock:
+            await self.event_queue.put((0, event))
+            self.event_history.append(event)
+            logger.debug(f"Event published: {event.event_type} from {event.source}")
+    
+    async def _process_events(self):
+        """Process events from the queue"""
+        while self._running:
+            try:
+                priority, event = await self.event_queue.get()
+                
+                if event.event_type in self.subscribers:
+                    for callback in self.subscribers[event.event_type]:
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback(event)
+                            else:
+                                callback(event)
+                        except Exception as e:
+                            logger.error(f"Event callback error: {str(e)}")
+                
+                self.event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Event processing error: {str(e)}")
+    
+    def shutdown(self):
+        """Shutdown the event bus"""
+        self._running = False
+        if self._processor_task:
+            self._processor_task.cancel()
+        logger.info("Core Event Bus shutdown")
+    
+    def get_event_stats(self) -> Dict[str, Any]:
+        """Get event bus statistics"""
+        return {
+            'total_events': len(self.event_history),
+            'subscribers': {k: len(v) for k, v in self.subscribers.items()},
+            'queue_size': self.event_queue.qsize(),
+            'is_running': self._running
+        }
+
+# ============================================================================
+# Predictive Health Forecasting (NEW)
+# ============================================================================
+
+class PredictiveHealthForecaster:
+    """
+    Predictive health forecasting for proactive intervention.
+    
+    Features:
+    - ML-based health prediction
+    - Failure probability estimation
+    - Trend analysis
+    - Confidence scoring
+    """
+    
+    def __init__(self):
+        self.model = IsolationForest(contamination=0.1, random_state=42)
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        self.history: List[Dict] = []
+        self.predictions: Dict[str, Dict] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info("Predictive Health Forecaster initialized")
+    
+    def record_health_data(self, module_name: str, metrics: Dict[str, float]):
+        """Record health data for training"""
+        self.history.append({
+            'module': module_name,
+            'timestamp': datetime.utcnow(),
+            **metrics
+        })
+        if len(self.history) > 1000:
+            self.history = self.history[-1000:]
+    
+    async def train(self):
+        """Train the health prediction model"""
+        if len(self.history) < 50:
+            return {'status': 'insufficient_data', 'samples': len(self.history)}
+        
+        async with self._lock:
+            # Prepare features
+            X = []
+            for i in range(10, len(self.history) - 1):
+                features = []
+                for j in range(10):
+                    data = self.history[i - j]
+                    features.extend([
+                        data.get('health_score', 0.5),
+                        data.get('success_rate', 0.5),
+                        data.get('token_balance', 500) / 1000,
+                        data.get('error_rate', 0.01)
+                    ])
+                X.append(features)
+            
+            if len(X) < 20:
+                return {'status': 'insufficient_training_data', 'samples': len(X)}
+            
+            X = np.array(X)
+            X_scaled = self.scaler.fit_transform(X)
+            
+            self.model.fit(X_scaled)
+            self.is_trained = True
+            
+            logger.info(f"Health forecaster trained on {len(X)} samples")
+            return {'status': 'success', 'samples': len(X)}
+    
+    async def predict_health(self, current_metrics: Dict[str, float]) -> Dict[str, Any]:
+        """Predict future health"""
+        if not self.is_trained:
+            return {'predicted_health': 0.5, 'failure_probability': 0.0, 'confidence': 0.0}
+        
+        async with self._lock:
+            # Prepare features
+            features = []
+            for key in ['health_score', 'success_rate', 'token_balance', 'error_rate']:
+                if key in current_metrics:
+                    features.append(current_metrics[key])
+                else:
+                    features.append(0.5)
+            
+            # Ensure correct feature count
+            while len(features) < 4:
+                features.append(0.5)
+            
+            features_array = np.array([features])
+            features_scaled = self.scaler.transform(features_array)
+            
+            # Predict anomaly
+            prediction = self.model.predict(features_scaled)[0]
+            is_anomalous = prediction == -1
+            
+            # Calculate confidence
+            decision_function = self.model.decision_function(features_scaled)[0]
+            confidence = abs(decision_function) / (abs(decision_function) + 1)
+            
+            # Determine trend
+            if len(self.history) > 20:
+                recent_health = [h.get('health_score', 0.5) for h in self.history[-20:]]
+                trend_slope = np.polyfit(range(len(recent_health)), recent_health, 1)[0]
+                trend = 'improving' if trend_slope > 0.01 else 'declining' if trend_slope < -0.01 else 'stable'
+            else:
+                trend = 'stable'
+            
+            result = {
+                'predicted_health': 0.3 if is_anomalous else 0.7,
+                'failure_probability': 0.8 if is_anomalous else 0.2,
+                'trend': trend,
+                'confidence': confidence,
+                'is_anomalous': is_anomalous
+            }
+            
+            self.predictions[str(datetime.utcnow().timestamp())] = result
+            return result
+
+# ============================================================================
+# Configuration Version Manager (NEW)
+# ============================================================================
+
+class ConfigurationVersionManager:
+    """
+    Configuration versioning for rollback capability.
+    
+    Features:
+    - Version tracking
+    - Rollback to previous versions
+    - Configuration history
+    - Diff capability
+    """
+    
+    def __init__(self, storage_dir: str = "./config_versions"):
+        self.storage_dir = storage_dir
+        self.versions: List[Dict] = []
+        self.current_version: Optional[str] = None
+        self._lock = asyncio.Lock()
+        
+        os.makedirs(storage_dir, exist_ok=True)
+        self._load_version_history()
+        
+        logger.info("Configuration Version Manager initialized")
+    
+    def _load_version_history(self):
+        """Load version history from disk"""
+        history_path = os.path.join(self.storage_dir, "version_history.json")
+        if os.path.exists(history_path):
+            try:
+                with open(history_path, 'r') as f:
+                    data = json.load(f)
+                    self.versions = data.get('versions', [])
+                    self.current_version = data.get('current_version')
+                logger.info(f"Loaded {len(self.versions)} configuration versions")
+            except Exception as e:
+                logger.warning(f"Failed to load version history: {e}")
+    
+    def _save_version_history(self):
+        """Save version history to disk"""
+        history_path = os.path.join(self.storage_dir, "version_history.json")
+        try:
+            with open(history_path, 'w') as f:
+                json.dump({
+                    'versions': self.versions,
+                    'current_version': self.current_version
+                }, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save version history: {e}")
+    
+    def save_version(self, config: Dict[str, Any], description: str = "") -> str:
+        """Save a new configuration version"""
+        version_id = hashlib.md5(
+            f"{datetime.utcnow().timestamp()}".encode()
+        ).hexdigest()[:12]
+        
+        version_data = {
+            'version_id': version_id,
+            'timestamp': datetime.utcnow().isoformat(),
+            'config': config,
+            'description': description,
+            'parent': self.current_version
+        }
+        
+        # Save to file
+        version_path = os.path.join(self.storage_dir, f"config_{version_id}.json")
+        with open(version_path, 'w') as f:
+            json.dump(version_data, f, indent=2)
+        
+        self.versions.append({
+            'version_id': version_id,
+            'timestamp': version_data['timestamp'],
+            'description': description,
+            'parent': self.current_version
+        })
+        
+        self.current_version = version_id
+        self._save_version_history()
+        
+        logger.info(f"Configuration version saved: {version_id}")
+        return version_id
+    
+    def rollback_to_version(self, version_id: str) -> Optional[Dict[str, Any]]:
+        """Rollback to a specific configuration version"""
+        version_path = os.path.join(self.storage_dir, f"config_{version_id}.json")
+        if not os.path.exists(version_path):
+            logger.error(f"Version {version_id} not found")
+            return None
+        
+        try:
+            with open(version_path, 'r') as f:
+                version_data = json.load(f)
+            
+            self.current_version = version_id
+            self._save_version_history()
+            
+            logger.info(f"Rolled back to configuration version: {version_id}")
+            return version_data.get('config')
+            
+        except Exception as e:
+            logger.error(f"Failed to rollback to version {version_id}: {e}")
+            return None
+    
+    def get_version_history(self, limit: int = 10) -> List[Dict]:
+        """Get version history"""
+        return self.versions[-limit:]
+    
+    def get_version_diff(self, version_a: str, version_b: str) -> Dict[str, Any]:
+        """Get diff between two versions"""
+        config_a = self._load_version_data(version_a)
+        config_b = self._load_version_data(version_b)
+        
+        if not config_a or not config_b:
+            return {'error': 'Version not found'}
+        
+        diff = {
+            'added': {},
+            'removed': {},
+            'changed': {}
+        }
+        
+        all_keys = set(config_a.keys()) | set(config_b.keys())
+        
+        for key in all_keys:
+            if key not in config_a:
+                diff['added'][key] = config_b[key]
+            elif key not in config_b:
+                diff['removed'][key] = config_a[key]
+            elif config_a[key] != config_b[key]:
+                diff['changed'][key] = {'from': config_a[key], 'to': config_b[key]}
+        
+        return diff
+    
+    def _load_version_data(self, version_id: str) -> Optional[Dict]:
+        """Load version data from disk"""
+        version_path = os.path.join(self.storage_dir, f"config_{version_id}.json")
+        if os.path.exists(version_path):
+            try:
+                with open(version_path, 'r') as f:
+                    data = json.load(f)
+                    return data.get('config')
+            except Exception:
+                return None
+        return None
+
+# ============================================================================
+# Anomaly Detection in Performance Metrics (NEW)
+# ============================================================================
+
+class PerformanceAnomalyDetector:
+    """
+    Anomaly detection in performance metrics.
+    
+    Features:
+    - Statistical anomaly detection
+    - Trend-based anomaly detection
+    - Alert generation
+    - Historical analysis
+    """
+    
+    def __init__(self):
+        self.metric_history: Dict[str, List[float]] = defaultdict(list)
+        self.anomalies: List[Dict] = []
+        self._lock = asyncio.Lock()
+        self.zscore_threshold = 3.0
+        self.trend_threshold = 0.2
+        
+        logger.info("Performance Anomaly Detector initialized")
+    
+    def record_metric(self, metric_name: str, value: float):
+        """Record a metric value"""
+        self.metric_history[metric_name].append(value)
+        if len(self.metric_history[metric_name]) > 1000:
+            self.metric_history[metric_name] = self.metric_history[metric_name][-1000:]
+    
+    async def detect_anomalies(self, metric_name: str) -> List[Dict]:
+        """Detect anomalies in a metric"""
+        if metric_name not in self.metric_history or len(self.metric_history[metric_name]) < 10:
+            return []
+        
+        values = self.metric_history[metric_name][-50:]
+        
+        # Z-score detection
+        mean = np.mean(values)
+        std = np.std(values)
+        anomalies = []
+        
+        if std > 0:
+            z_scores = [(v - mean) / std for v in values[-10:]]
+            for i, zscore in enumerate(z_scores):
+                if abs(zscore) > self.zscore_threshold:
+                    anomalies.append({
+                        'metric': metric_name,
+                        'value': values[-10 + i],
+                        'zscore': zscore,
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'type': 'zscore'
+                    })
+        
+        # Trend detection
+        if len(values) > 20:
+            recent = values[-20:]
+            slope = np.polyfit(range(len(recent)), recent, 1)[0]
+            if abs(slope) > self.trend_threshold:
+                anomalies.append({
+                    'metric': metric_name,
+                    'slope': slope,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'type': 'trend',
+                    'direction': 'increasing' if slope > 0 else 'decreasing'
+                })
+        
+        return anomalies
+    
+    async def get_anomaly_report(self) -> Dict[str, Any]:
+        """Get anomaly detection report"""
+        report = {'timestamp': datetime.utcnow().isoformat(), 'anomalies': []}
+        
+        for metric_name in self.metric_history:
+            anomalies = await self.detect_anomalies(metric_name)
+            if anomalies:
+                report['anomalies'].extend(anomalies)
+        
+        return report
+
+# ============================================================================
+# Module Registry (Enhanced)
 # ============================================================================
 
 class ModuleRegistry:
     """
     Dynamic module registry with lifecycle management, health checking,
-    and circuit breaker protection.
+    circuit breaker protection, and dynamic loading (NEW).
     """
     
     def __init__(self):
@@ -113,11 +561,19 @@ class ModuleRegistry:
         self._initialized = False
         self._init_lock = asyncio.Lock()
         
+        # NEW: Dynamic loading
+        self.loaded_modules: Set[str] = set()
+        self.module_paths: Dict[str, str] = {}
+        
+        # NEW: Predictive health
+        self.health_forecaster = PredictiveHealthForecaster()
+        
         logger.info("Module Registry initialized")
     
     def register(self, name: str, module: Any = None, dependencies: List[str] = None,
                 health_check: Callable = None, init_timeout: float = 30.0,
-                shutdown_timeout: float = 10.0) -> 'ModuleEntry':
+                shutdown_timeout: float = 10.0,
+                module_path: Optional[str] = None) -> 'ModuleEntry':
         """Register a module with the registry"""
         if name in self.modules:
             logger.warning(f"Module {name} already registered, updating")
@@ -128,7 +584,8 @@ class ModuleRegistry:
             dependencies=dependencies or [],
             health_check=health_check,
             init_timeout=init_timeout,
-            shutdown_timeout=shutdown_timeout
+            shutdown_timeout=shutdown_timeout,
+            module_path=module_path
         )
         
         self.modules[name] = entry
@@ -141,24 +598,66 @@ class ModuleRegistry:
         logger.info(f"Module registered: {name} (deps: {entry.dependencies})")
         return entry
     
-    def unregister(self, name: str) -> bool:
-        """Unregister a module"""
-        if name in self.modules:
-            # Check if other modules depend on this
-            if self.modules[name].dependents:
-                logger.warning(f"Cannot unregister {name}: depended on by {self.modules[name].dependents}")
+    # NEW: Dynamic module loading
+    async def load_module(self, name: str, module_path: str) -> bool:
+        """Dynamically load a module at runtime"""
+        if name in self.loaded_modules:
+            logger.warning(f"Module {name} already loaded")
+            return True
+        
+        try:
+            # Import module dynamically
+            spec = importlib.util.spec_from_file_location(name, module_path)
+            if not spec or not spec.loader:
+                logger.error(f"Failed to load module {name}: invalid spec")
                 return False
             
-            del self.modules[name]
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
             
-            # Remove from dependency lists
-            for module in self.modules.values():
-                if name in module.dependencies:
-                    module.dependencies.remove(name)
+            # Register module
+            entry = self.register(name, module, module_path=module_path)
+            entry.phase = LifecyclePhase.LOADING
+            entry.loaded_at = datetime.utcnow()
             
-            logger.info(f"Module unregistered: {name}")
+            # Initialize if has initialize method
+            if hasattr(module, 'initialize'):
+                await module.initialize()
+            
+            entry.phase = LifecyclePhase.INITIALIZED
+            self.loaded_modules.add(name)
+            self.module_paths[name] = module_path
+            
+            logger.info(f"Dynamic module loaded: {name}")
             return True
-        return False
+            
+        except Exception as e:
+            logger.error(f"Failed to load module {name}: {str(e)}")
+            return False
+    
+    def unload_module(self, name: str) -> bool:
+        """Unload a dynamically loaded module"""
+        if name not in self.loaded_modules:
+            logger.warning(f"Module {name} not loaded")
+            return False
+        
+        try:
+            entry = self.modules.get(name)
+            if entry:
+                if hasattr(entry.module, 'shutdown'):
+                    asyncio.run(entry.module.shutdown())
+                
+                entry.phase = LifecyclePhase.STOPPED
+                self.loaded_modules.remove(name)
+                del self.module_paths[name]
+                del self.modules[name]
+                
+                logger.info(f"Dynamic module unloaded: {name}")
+                return True
+            
+        except Exception as e:
+            logger.error(f"Failed to unload module {name}: {str(e)}")
+            return False
     
     def get(self, name: str) -> Optional[Any]:
         """Get module instance by name"""
@@ -229,7 +728,6 @@ class ModuleRegistry:
                     entry.phase = LifecyclePhase.INITIALIZING
                     entry.init_started = datetime.utcnow()
                     
-                    # Initialize with timeout
                     if hasattr(entry.module, 'initialize'):
                         await asyncio.wait_for(
                             entry.module.initialize(),
@@ -239,7 +737,6 @@ class ModuleRegistry:
                     entry.phase = LifecyclePhase.INITIALIZED
                     entry.init_completed = datetime.utcnow()
                     
-                    # Run health check
                     if entry.health_check:
                         try:
                             is_healthy = entry.health_check()
@@ -262,7 +759,6 @@ class ModuleRegistry:
                     results[name] = False
                     logger.error(f"Module {name} initialization failed: {str(e)}")
             
-            # Verify all critical modules initialized
             all_ok = all(results.values())
             if all_ok:
                 self._initialized = True
@@ -288,7 +784,6 @@ class ModuleRegistry:
             try:
                 entry.phase = LifecyclePhase.STOPPING
                 
-                # Shutdown with timeout
                 if hasattr(entry.module, 'shutdown'):
                     await asyncio.wait_for(
                         entry.module.shutdown(),
@@ -332,7 +827,10 @@ class ModuleRegistry:
                 'phase': entry.phase.value,
                 'error': entry.error_message,
                 'circuit_breaker': entry.circuit_breaker_state,
-                'uptime': (datetime.utcnow() - entry.init_completed).total_seconds() if entry.init_completed else 0
+                'uptime': (datetime.utcnow() - entry.init_completed).total_seconds() if entry.init_completed else 0,
+                'predicted_health': entry.predicted_health,
+                'failure_probability': entry.failure_probability,
+                'health_trend': entry.health_trend
             }
         
         return results
@@ -361,6 +859,21 @@ class ModuleRegistry:
             entry.failure_count = 0
             logger.info(f"Circuit breaker CLOSED for module {name}")
     
+    def update_predictive_health(self, name: str, metrics: Dict[str, float]):
+        """Update predictive health for a module"""
+        entry = self.modules.get(name)
+        if not entry:
+            return
+        
+        # Record health data
+        self.health_forecaster.record_health_data(name, metrics)
+        
+        # Get prediction
+        prediction = asyncio.run(self.health_forecaster.predict_health(metrics))
+        entry.predicted_health = prediction.get('predicted_health', 0.5)
+        entry.failure_probability = prediction.get('failure_probability', 0.0)
+        entry.health_trend = prediction.get('trend', 'stable')
+    
     def get_registry_stats(self) -> Dict[str, Any]:
         """Get registry statistics"""
         return {
@@ -369,25 +882,29 @@ class ModuleRegistry:
             'running': sum(1 for m in self.modules.values() if m.phase == LifecyclePhase.RUNNING),
             'error': sum(1 for m in self.modules.values() if m.phase == LifecyclePhase.ERROR),
             'circuit_breakers_open': sum(1 for m in self.modules.values() if m.circuit_breaker_state == "open"),
+            'loaded_modules': len(self.loaded_modules),
             'modules': {
                 name: {
                     'phase': entry.phase.value,
                     'health': entry.health_status,
                     'circuit_breaker': entry.circuit_breaker_state,
                     'dependencies': entry.dependencies,
-                    'dependents': entry.dependents
+                    'dependents': entry.dependents,
+                    'predicted_health': entry.predicted_health,
+                    'failure_probability': entry.failure_probability,
+                    'health_trend': entry.health_trend
                 }
                 for name, entry in self.modules.items()
             }
         }
 
 # ============================================================================
-# Configuration Manager
+# Configuration Manager (Enhanced)
 # ============================================================================
 
 @dataclass
 class CoreConfig:
-    """Core configuration with validation"""
+    """Core configuration with validation (Enhanced)"""
     # Token economy
     token_base_generation_rate: float = 150.0
     token_hoarding_threshold: float = 2.0
@@ -428,6 +945,10 @@ class CoreConfig:
     
     # Health checks
     health_check_interval_seconds: int = 30
+    
+    # NEW: Versioning
+    version: str = "1.0.0"
+    version_description: str = ""
     
     def validate(self) -> Tuple[bool, List[str]]:
         """Validate configuration and return (is_valid, issues)"""
@@ -475,7 +996,9 @@ class CoreConfig:
             'enable_state_persistence': self.enable_state_persistence,
             'state_save_interval_seconds': self.state_save_interval_seconds,
             'state_directory': self.state_directory,
-            'health_check_interval_seconds': self.health_check_interval_seconds
+            'health_check_interval_seconds': self.health_check_interval_seconds,
+            'version': self.version,
+            'version_description': self.version_description
         }
     
     @classmethod
@@ -503,15 +1026,14 @@ class CoreConfig:
 
 class EnhancedBioInspiredCore:
     """
-    Enhanced Bio-Inspired Core v5.0.0
+    Enhanced Bio-Inspired Core v6.0.0
     
-    Complete implementation with:
-    - Graceful shutdown and lifecycle management
-    - Module registry with dependency management
-    - Health dashboard and performance monitoring
-    - Configuration validation and hot-reload
-    - Module isolation with circuit breakers
-    - Protocol-based dependency injection
+    New Features:
+    - Dynamic module loading for runtime extensibility
+    - Predictive health forecasting for proactive intervention
+    - Configuration versioning for rollback capability
+    - Anomaly detection in performance metrics
+    - Event-driven communication between services
     """
     
     def __init__(self, config: Optional[CoreConfig] = None, config_path: Optional[str] = None):
@@ -541,7 +1063,16 @@ class EnhancedBioInspiredCore:
         self._knowledge_transfer = None
         self._degradation_manager = None
         self._api = None
-        self._event_bus = None
+        
+        # NEW: Event bus
+        self._event_bus = CoreEventBus()
+        
+        # NEW: Configuration version manager
+        self._version_manager = ConfigurationVersionManager()
+        self._save_initial_config()
+        
+        # NEW: Performance anomaly detector
+        self._anomaly_detector = PerformanceAnomalyDetector()
         
         # Exchange rate
         self.exchange_rate = None
@@ -557,10 +1088,17 @@ class EnhancedBioInspiredCore:
         # Register signal handlers
         self._register_signal_handlers()
         
-        logger.info("Enhanced Bio-Inspired Core v5.0.0 created")
+        logger.info("Enhanced Bio-Inspired Core v6.0.0 created")
+    
+    def _save_initial_config(self):
+        """Save initial configuration version"""
+        self._version_manager.save_version(
+            self.config.to_dict(),
+            description="Initial configuration"
+        )
     
     # ========================================================================
-    # Lifecycle Management
+    # Lifecycle Management (Enhanced)
     # ========================================================================
     
     async def initialize(self) -> bool:
@@ -689,6 +1227,8 @@ class EnhancedBioInspiredCore:
             # Step 14: Start background monitoring
             asyncio.create_task(self._health_monitoring_loop())
             asyncio.create_task(self._performance_monitoring_loop())
+            asyncio.create_task(self._predictive_health_loop())
+            asyncio.create_task(self._anomaly_detection_loop())
             
             self._lifecycle_phase = LifecyclePhase.RUNNING
             
@@ -715,6 +1255,9 @@ class EnhancedBioInspiredCore:
         # Save state if enabled
         if self.config.enable_state_persistence:
             self._save_state()
+        
+        # Shutdown event bus
+        self._event_bus.shutdown()
         
         # Shutdown all modules in reverse order
         results = await self.registry.shutdown_all()
@@ -767,7 +1310,7 @@ class EnhancedBioInspiredCore:
             logger.warning("Signal handlers not supported on this platform")
     
     # ========================================================================
-    # Health Monitoring
+    # Monitoring Loops (Enhanced)
     # ========================================================================
     
     async def _health_monitoring_loop(self):
@@ -811,23 +1354,72 @@ class EnhancedBioInspiredCore:
                     summary = self._token_manager.get_system_summary()
                     self._perf_metrics['token_balance'].append(summary.get('total_balance', 0))
                     self._perf_metrics['token_efficiency'].append(summary.get('system_efficiency', 0))
+                    self._anomaly_detector.record_metric('token_balance', summary.get('total_balance', 0))
                 
                 # Record gradient metrics
                 if self._gradient_manager:
                     strengths = self._gradient_manager.get_field_strengths()
                     for field_id, strength in strengths.items():
                         self._perf_metrics[f'gradient_{field_id}'].append(strength)
+                        self._anomaly_detector.record_metric(f'gradient_{field_id}', strength)
                 
                 # Record compartment metrics
                 if self._compartment_manager:
                     stats = self._compartment_manager.get_ecosystem_stats()
                     self._perf_metrics['viable_compartments'].append(stats.get('viable_compartments', 0))
+                    self._anomaly_detector.record_metric('viable_compartments', stats.get('viable_compartments', 0))
                 
                 await asyncio.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Performance monitoring error: {str(e)}")
                 await asyncio.sleep(60)
+    
+    async def _predictive_health_loop(self):
+        """Predictive health forecasting loop"""
+        while self._lifecycle_phase == LifecyclePhase.RUNNING:
+            try:
+                # Collect health data for all modules
+                for name, entry in self.registry.modules.items():
+                    metrics = {
+                        'health_score': 0.5 if entry.health_status == 'unknown' else 0.8 if entry.health_status == 'healthy' else 0.3,
+                        'success_rate': 1.0 - (entry.failure_count / max(1, entry.failure_count + 1)),
+                        'token_balance': self._token_manager.get_system_summary().get('total_balance', 500) / 1000 if self._token_manager else 0.5,
+                        'error_rate': 0.01
+                    }
+                    self.registry.update_predictive_health(name, metrics)
+                
+                # Train health forecaster
+                await self.registry.health_forecaster.train()
+                
+                await asyncio.sleep(300)  # 5 minutes
+                
+            except Exception as e:
+                logger.error(f"Predictive health loop error: {str(e)}")
+                await asyncio.sleep(60)
+    
+    async def _anomaly_detection_loop(self):
+        """Anomaly detection loop for performance metrics"""
+        while self._lifecycle_phase == LifecyclePhase.RUNNING:
+            try:
+                report = await self._anomaly_detector.get_anomaly_report()
+                if report['anomalies']:
+                    logger.warning(f"Performance anomalies detected: {report['anomalies']}")
+                    
+                    # Publish anomaly event
+                    if self._event_bus:
+                        for anomaly in report['anomalies']:
+                            await self._event_bus.publish(CoreEvent(
+                                event_type='performance_anomaly',
+                                source='anomaly_detector',
+                                payload=anomaly
+                            ))
+                
+                await asyncio.sleep(60)
+                
+            except Exception as e:
+                logger.error(f"Anomaly detection loop error: {str(e)}")
+                await asyncio.sleep(120)
     
     def _get_avg_compartment_health(self) -> float:
         """Get average compartment health"""
@@ -858,7 +1450,19 @@ class EnhancedBioInspiredCore:
     def biomass_service(self) -> Optional[BiomassServiceProtocol]:
         return self._biomass_storage
     
-    # Legacy accessors (backward compatibility)
+    @property
+    def event_bus(self) -> CoreEventBus:
+        return self._event_bus
+    
+    @property
+    def version_manager(self) -> ConfigurationVersionManager:
+        return self._version_manager
+    
+    @property
+    def anomaly_detector(self) -> PerformanceAnomalyDetector:
+        return self._anomaly_detector
+    
+    # Legacy accessors
     @property
     def token_manager(self): return self._token_manager
     @property
@@ -881,7 +1485,54 @@ class EnhancedBioInspiredCore:
     def degradation_manager(self): return self._degradation_manager
     
     # ========================================================================
-    # System Status and Reporting
+    # Dynamic Module Loading (NEW)
+    # ========================================================================
+    
+    async def load_module(self, name: str, module_path: str) -> bool:
+        """Dynamically load a module at runtime"""
+        return await self.registry.load_module(name, module_path)
+    
+    def unload_module(self, name: str) -> bool:
+        """Unload a dynamically loaded module"""
+        return self.registry.unload_module(name)
+    
+    def get_loaded_modules(self) -> List[str]:
+        """Get list of dynamically loaded modules"""
+        return list(self.registry.loaded_modules)
+    
+    # ========================================================================
+    # Configuration Versioning (NEW)
+    # ========================================================================
+    
+    def save_configuration_version(self, description: str = "") -> str:
+        """Save current configuration as a new version"""
+        return self._version_manager.save_version(
+            self.config.to_dict(),
+            description=description
+        )
+    
+    def rollback_configuration(self, version_id: str) -> bool:
+        """Rollback to a configuration version"""
+        config_data = self._version_manager.rollback_to_version(version_id)
+        if config_data:
+            # Apply configuration
+            for key, value in config_data.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+            logger.info(f"Configuration rolled back to version: {version_id}")
+            return True
+        return False
+    
+    def get_config_version_history(self, limit: int = 10) -> List[Dict]:
+        """Get configuration version history"""
+        return self._version_manager.get_version_history(limit)
+    
+    def get_config_version_diff(self, version_a: str, version_b: str) -> Dict[str, Any]:
+        """Get diff between two configuration versions"""
+        return self._version_manager.get_version_diff(version_a, version_b)
+    
+    # ========================================================================
+    # System Status and Reporting (Enhanced)
     # ========================================================================
     
     def get_system_status(self) -> Dict[str, Any]:
@@ -891,7 +1542,10 @@ class EnhancedBioInspiredCore:
             'uptime_seconds': (datetime.utcnow() - self._start_time).total_seconds() if self._start_time else 0,
             'timestamp': datetime.utcnow().isoformat(),
             'config': self.config.to_dict(),
-            'modules': self.registry.get_registry_stats()
+            'modules': self.registry.get_registry_stats(),
+            'event_bus': self._event_bus.get_event_stats(),
+            'config_version': self._version_manager.current_version,
+            'loaded_modules': self.get_loaded_modules()
         }
         
         # Module-specific status
@@ -933,6 +1587,9 @@ class EnhancedBioInspiredCore:
             for name, values in self._perf_metrics.items()
         }
         
+        # Anomaly report
+        status['anomalies'] = asyncio.run(self._anomaly_detector.get_anomaly_report())
+        
         return status
     
     def get_health_dashboard(self) -> Dict[str, Any]:
@@ -950,6 +1607,14 @@ class EnhancedBioInspiredCore:
             'modules': health,
             'circuit_breakers': {
                 name: entry.circuit_breaker_state
+                for name, entry in self.registry.modules.items()
+            },
+            'predictive_health': {
+                name: {
+                    'predicted_health': entry.predicted_health,
+                    'failure_probability': entry.failure_probability,
+                    'trend': entry.health_trend
+                }
                 for name, entry in self.registry.modules.items()
             },
             'dependency_graph': self.registry.get_dependency_graph(),
@@ -997,7 +1662,7 @@ class EnhancedBioInspiredCore:
         return report
     
     def get_performance_report(self) -> Dict[str, Any]:
-        """Get performance metrics report"""
+        """Get performance metrics report with anomaly detection"""
         report = {'timestamp': datetime.utcnow().isoformat()}
         
         for name, values in self._perf_metrics.items():
@@ -1012,14 +1677,17 @@ class EnhancedBioInspiredCore:
                     'trend': 'improving' if len(arr) >= 10 and arr[-1] > np.mean(arr[-10:-5]) else 'stable'
                 }
         
+        # Add anomaly report
+        report['anomalies'] = asyncio.run(self._anomaly_detector.get_anomaly_report())
+        
         return report
     
     # ========================================================================
-    # Configuration Management
+    # Configuration Management (Enhanced)
     # ========================================================================
     
-    def update_configuration(self, updates: Dict[str, Any]) -> Tuple[bool, str]:
-        """Update configuration with validation"""
+    def update_configuration(self, updates: Dict[str, Any], description: str = "") -> Tuple[bool, str]:
+        """Update configuration with validation and versioning"""
         # Create temporary config with updates
         temp_config = CoreConfig.from_dict({**self.config.to_dict(), **updates})
         
@@ -1033,11 +1701,14 @@ class EnhancedBioInspiredCore:
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
         
+        # Save version
+        self.save_configuration_version(description or f"Updated: {', '.join(updates.keys())}")
+        
         logger.info(f"Configuration updated: {list(updates.keys())}")
         return True, "Configuration updated successfully"
     
     def reload_configuration(self, path: str) -> Tuple[bool, str]:
-        """Reload configuration from file"""
+        """Reload configuration from file with versioning"""
         try:
             new_config = CoreConfig.from_file(path)
             is_valid, issues = new_config.validate()
@@ -1045,7 +1716,14 @@ class EnhancedBioInspiredCore:
             if not is_valid:
                 return False, f"Invalid configuration: {'; '.join(issues)}"
             
+            # Save current version before reload
+            self.save_configuration_version(f"Before reload from {path}")
+            
             self.config = new_config
+            
+            # Save new version
+            self.save_configuration_version(f"Reloaded from {path}")
+            
             logger.info(f"Configuration reloaded from {path}")
             return True, "Configuration reloaded successfully"
             
@@ -1053,15 +1731,22 @@ class EnhancedBioInspiredCore:
             return False, f"Failed to reload configuration: {str(e)}"
     
     # ========================================================================
-    # Task Processing
+    # Task Processing (Enhanced)
     # ========================================================================
     
     def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a task through the bio-inspired system"""
+        """Process a task through the bio-inspired system with event publishing"""
         if self._lifecycle_phase != LifecyclePhase.RUNNING:
             return {'success': False, 'reason': f'System not running (phase: {self._lifecycle_phase.value})'}
         
         ecoatp_required = task.get('complexity', 0.5) * 10
+        
+        # Publish task received event
+        asyncio.create_task(self._event_bus.publish(CoreEvent(
+            event_type='task_received',
+            source='core',
+            payload={'task_id': task.get('task_id'), 'complexity': task.get('complexity', 0.5)}
+        )))
         
         # Try token pre-allocation first
         if self._token_allocator:
@@ -1081,9 +1766,20 @@ class EnhancedBioInspiredCore:
                 stored, token_id = self._biomass_storage.store_task(
                     task_data=task, ecoatp_cost=ecoatp_required
                 )
+                asyncio.create_task(self._event_bus.publish(CoreEvent(
+                    event_type='task_stored',
+                    source='core',
+                    payload={'task_id': task.get('task_id'), 'biomass_token': token_id}
+                )))
                 return {'success': True, 'status': 'stored', 'biomass_token': token_id}
             
             return {'success': False, 'reason': 'Insufficient tokens'}
+        
+        asyncio.create_task(self._event_bus.publish(CoreEvent(
+            event_type='task_processed',
+            source='core',
+            payload={'task_id': task.get('task_id'), 'ecoatp_cost': ecoatp_required}
+        )))
         
         return {'success': True, 'task_id': task.get('task_id', 'unknown'), 'ecoatp_cost': ecoatp_required}
     
@@ -1113,7 +1809,9 @@ class EnhancedBioInspiredCore:
             'uptime_seconds': (datetime.utcnow() - self._start_time).total_seconds() if self._start_time else 0,
             'start_time': self._start_time.isoformat() if self._start_time else None,
             'shutdown_requested': self._shutdown_requested,
-            'module_count': len(self.registry.modules)
+            'module_count': len(self.registry.modules),
+            'loaded_modules_count': len(self.registry.loaded_modules),
+            'config_version': self._version_manager.current_version
         }
 
 # ============================================================================
