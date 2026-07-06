@@ -1,10 +1,12 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/api.py
-# Complete enhanced file v5.0.0 with all improvements
+# Complete enhanced file v6.0.0 with all improvements
 
 """
-Enhanced Bio-Inspired API v5.0.0
+Enhanced Bio-Inspired API v6.0.0
 Complete RESTful API with authentication, rate limiting, versioning,
-complete module coverage, operational endpoints, pagination, and webhook support.
+complete module coverage, operational endpoints, pagination, webhook support,
+OAuth2/JWT support (NEW), Adaptive rate limiting (NEW), Webhook retry with exponential backoff (NEW),
+Histogram metrics for latency distribution (NEW), Swagger UI endpoint (NEW)
 """
 
 import asyncio
@@ -17,6 +19,9 @@ import hmac
 import json
 import time
 from collections import defaultdict, deque
+import jwt
+import secrets
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +33,409 @@ API_VERSION = "v1"
 API_PREFIX = f"/api/{API_VERSION}"
 
 # ============================================================================
-# Authentication and Rate Limiting
+# OAuth2/JWT Support (NEW)
+# ============================================================================
+
+@dataclass
+class OAuth2Config:
+    """OAuth2/JWT configuration"""
+    issuer: str = "green-agent"
+    audience: str = "green-agent-api"
+    secret_key: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    access_token_expiry_minutes: int = 60
+    refresh_token_expiry_days: int = 7
+    algorithm: str = "HS256"
+
+class OAuth2Manager:
+    """
+    OAuth2/JWT authentication manager.
+    
+    Features:
+    - JWT token generation and validation
+    - Access and refresh tokens
+    - Token revocation
+    - Client credentials flow
+    """
+    
+    def __init__(self, config: Optional[OAuth2Config] = None):
+        self.config = config or OAuth2Config()
+        self.revoked_tokens: set = set()
+        self.refresh_tokens: Dict[str, Dict] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info("OAuth2 Manager initialized")
+    
+    def create_access_token(self, client_id: str, scopes: List[str] = None) -> str:
+        """Create a JWT access token"""
+        now = datetime.utcnow()
+        payload = {
+            'sub': client_id,
+            'iss': self.config.issuer,
+            'aud': self.config.audience,
+            'iat': now,
+            'exp': now + timedelta(minutes=self.config.access_token_expiry_minutes),
+            'scopes': scopes or ['read'],
+            'jti': secrets.token_hex(16)
+        }
+        return jwt.encode(payload, self.config.secret_key, algorithm=self.config.algorithm)
+    
+    def create_refresh_token(self, client_id: str) -> str:
+        """Create a refresh token"""
+        token = secrets.token_urlsafe(32)
+        self.refresh_tokens[token] = {
+            'client_id': client_id,
+            'created_at': datetime.utcnow(),
+            'expires_at': datetime.utcnow() + timedelta(days=self.config.refresh_token_expiry_days)
+        }
+        return token
+    
+    def validate_token(self, token: str) -> Optional[Dict]:
+        """Validate a JWT token"""
+        if token in self.revoked_tokens:
+            return None
+        
+        try:
+            payload = jwt.decode(
+                token,
+                self.config.secret_key,
+                algorithms=[self.config.algorithm],
+                audience=self.config.audience,
+                issuer=self.config.issuer
+            )
+            return payload
+        except jwt.ExpiredSignatureError:
+            logger.warning("Token expired")
+            return None
+        except jwt.InvalidTokenError as e:
+            logger.warning(f"Invalid token: {e}")
+            return None
+    
+    def revoke_token(self, token: str) -> bool:
+        """Revoke a token"""
+        self.revoked_tokens.add(token)
+        return True
+    
+    def refresh_access_token(self, refresh_token: str) -> Optional[str]:
+        """Refresh an access token using a refresh token"""
+        if refresh_token not in self.refresh_tokens:
+            return None
+        
+        token_data = self.refresh_tokens[refresh_token]
+        if datetime.utcnow() > token_data['expires_at']:
+            return None
+        
+        # Revoke old refresh token
+        del self.refresh_tokens[refresh_token]
+        
+        # Create new tokens
+        new_access = self.create_access_token(token_data['client_id'])
+        new_refresh = self.create_refresh_token(token_data['client_id'])
+        
+        return {
+            'access_token': new_access,
+            'refresh_token': new_refresh,
+            'expires_in': self.config.access_token_expiry_minutes * 60
+        }
+    
+    def get_oauth_config(self) -> Dict:
+        """Get OAuth2 configuration for clients"""
+        return {
+            'issuer': self.config.issuer,
+            'audience': self.config.audience,
+            'token_endpoint': f"{API_PREFIX}/oauth/token",
+            'revocation_endpoint': f"{API_PREFIX}/oauth/revoke",
+            'grant_types': ['client_credentials', 'refresh_token']
+        }
+
+# ============================================================================
+# Enhanced Rate Limiter with Adaptive Limits (NEW)
+# ============================================================================
+
+class AdaptiveRateLimiter:
+    """
+    Adaptive rate limiting based on system load.
+    
+    Features:
+    - Dynamic rate limits based on system load
+    - Adaptive thresholds
+    - Load-based adjustment
+    - Historical tracking
+    """
+    
+    def __init__(self):
+        self.base_limits: Dict[str, int] = {
+            'read': 100,
+            'write': 50,
+            'admin': 20
+        }
+        self.current_multiplier = 1.0
+        self.load_history: deque = deque(maxlen=100)
+        self.rate_records: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self._lock = asyncio.Lock()
+        
+        logger.info("Adaptive Rate Limiter initialized")
+    
+    def update_system_load(self, load: float):
+        """Update system load for adaptive rate limiting"""
+        self.load_history.append(load)
+        
+        # Calculate average load
+        if len(self.load_history) > 10:
+            avg_load = sum(self.load_history) / len(self.load_history)
+            if avg_load > 0.8:
+                self.current_multiplier = 0.5
+            elif avg_load > 0.6:
+                self.current_multiplier = 0.75
+            elif avg_load < 0.3:
+                self.current_multiplier = 1.5
+            else:
+                self.current_multiplier = 1.0
+    
+    def get_rate_limit(self, scope: str) -> int:
+        """Get rate limit for a scope"""
+        base = self.base_limits.get(scope, 50)
+        return int(base * self.current_multiplier)
+    
+    def check_rate_limit(self, key: str, scope: str) -> Tuple[bool, Dict]:
+        """Check if request is within rate limit"""
+        limit = self.get_rate_limit(scope)
+        
+        now = datetime.utcnow()
+        minute_ago = now - timedelta(minutes=1)
+        
+        recent = [t for t in self.rate_records[key] if t > minute_ago]
+        self.rate_records[key] = deque(recent, maxlen=1000)
+        
+        if len(recent) >= limit:
+            retry_after = 60 - (now - recent[0]).total_seconds()
+            return False, {
+                'error': 'Rate limit exceeded',
+                'retry_after_seconds': max(0, int(retry_after)),
+                'limit': limit,
+                'current_usage': len(recent),
+                'system_load': self.load_history[-1] if self.load_history else 0.5
+            }
+        
+        self.rate_records[key].append(now)
+        
+        return True, {
+            'limit': limit,
+            'remaining': limit - len(recent) - 1,
+            'reset_seconds': 60 - (now - (recent[0] if recent else now)).total_seconds()
+        }
+    
+    def get_limiter_stats(self) -> Dict:
+        """Get rate limiter statistics"""
+        return {
+            'current_multiplier': self.current_multiplier,
+            'base_limits': self.base_limits,
+            'avg_load': sum(self.load_history) / len(self.load_history) if self.load_history else 0.5,
+            'active_scopes': list(self.rate_records.keys())
+        }
+
+# ============================================================================
+# Enhanced Webhook Manager with Retry (NEW)
+# ============================================================================
+
+@dataclass
+class WebhookSubscription:
+    """Webhook subscription with retry configuration"""
+    subscription_id: str
+    event_type: str
+    callback_url: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    retry_count: int = 0
+    max_retries: int = 5
+    last_delivery: Optional[datetime] = None
+    last_error: Optional[str] = None
+    status: str = "active"  # active, paused, failed
+
+class WebhookManager:
+    """
+    Webhook manager with retry mechanism.
+    
+    Features:
+    - Exponential backoff retry
+    - Delivery tracking
+    - Failure handling
+    - Status monitoring
+    """
+    
+    def __init__(self, event_broker=None, session=None):
+        self.event_broker = event_broker
+        self.session = session
+        self.subscriptions: Dict[str, WebhookSubscription] = {}
+        self.delivery_queue: deque = deque(maxlen=10000)
+        self._lock = asyncio.Lock()
+        self._processing = False
+        
+        logger.info("Webhook Manager initialized")
+    
+    async def subscribe(self, event_type: str, callback_url: str) -> str:
+        """Subscribe a webhook to an event type"""
+        subscription_id = hashlib.sha256(
+            f"{event_type}{callback_url}{datetime.utcnow().timestamp()}".encode()
+        ).hexdigest()[:16]
+        
+        subscription = WebhookSubscription(
+            subscription_id=subscription_id,
+            event_type=event_type,
+            callback_url=callback_url
+        )
+        
+        async with self._lock:
+            self.subscriptions[subscription_id] = subscription
+            
+            # Register with event broker
+            if self.event_broker:
+                async def webhook_callback(event):
+                    await self._enqueue_delivery(subscription_id, event)
+                self.event_broker.subscribe(event_type, webhook_callback)
+        
+        logger.info(f"Webhook subscribed: {subscription_id} → {event_type}")
+        return subscription_id
+    
+    async def unsubscribe(self, subscription_id: str) -> bool:
+        """Unsubscribe a webhook"""
+        async with self._lock:
+            if subscription_id not in self.subscriptions:
+                return False
+            
+            subscription = self.subscriptions[subscription_id]
+            subscription.status = "cancelled"
+            
+            # Unsubscribe from event broker
+            if self.event_broker:
+                # Find and remove callback
+                callbacks = self.event_broker.subscribers.get(subscription.event_type, [])
+                self.event_broker.subscribers[subscription.event_type] = [
+                    c for c in callbacks 
+                    if not (hasattr(c, '__name__') and c.__name__ == f"webhook_callback_{subscription_id}")
+                ]
+            
+            logger.info(f"Webhook unsubscribed: {subscription_id}")
+            return True
+    
+    async def _enqueue_delivery(self, subscription_id: str, event):
+        """Queue a webhook delivery"""
+        subscription = self.subscriptions.get(subscription_id)
+        if not subscription or subscription.status != "active":
+            return
+        
+        self.delivery_queue.append({
+            'subscription_id': subscription_id,
+            'event': event,
+            'attempts': 0,
+            'next_attempt': datetime.utcnow()
+        })
+        
+        if not self._processing:
+            await self._process_deliveries()
+    
+    async def _process_deliveries(self):
+        """Process queued webhook deliveries with retry"""
+        if self._processing:
+            return
+        
+        self._processing = True
+        
+        try:
+            while self.delivery_queue:
+                delivery = self.delivery_queue[0]
+                
+                # Check if it's time to retry
+                if datetime.utcnow() < delivery['next_attempt']:
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Get subscription
+                subscription = self.subscriptions.get(delivery['subscription_id'])
+                if not subscription or subscription.status != "active":
+                    self.delivery_queue.popleft()
+                    continue
+                
+                # Attempt delivery with exponential backoff
+                try:
+                    success = await self._deliver_webhook(
+                        subscription.callback_url,
+                        delivery['event']
+                    )
+                    
+                    if success:
+                        subscription.last_delivery = datetime.utcnow()
+                        delivery['attempts'] = 0
+                        self.delivery_queue.popleft()
+                        logger.debug(f"Webhook delivered: {subscription.subscription_id}")
+                    else:
+                        delivery['attempts'] += 1
+                        
+                        # Calculate backoff: 2^attempts * 1 second
+                        backoff = min(60, 2 ** delivery['attempts'])
+                        delivery['next_attempt'] = datetime.utcnow() + timedelta(seconds=backoff)
+                        
+                        if delivery['attempts'] >= subscription.max_retries:
+                            subscription.status = "failed"
+                            subscription.last_error = "Max retries exceeded"
+                            self.delivery_queue.popleft()
+                            logger.warning(f"Webhook failed: {subscription.subscription_id}")
+                
+                except Exception as e:
+                    logger.error(f"Webhook delivery error: {e}")
+                    delivery['attempts'] += 1
+                    backoff = min(60, 2 ** delivery['attempts'])
+                    delivery['next_attempt'] = datetime.utcnow() + timedelta(seconds=backoff)
+                
+                await asyncio.sleep(0.1)
+        
+        finally:
+            self._processing = False
+    
+    async def _deliver_webhook(self, callback_url: str, event) -> bool:
+        """Deliver a webhook payload"""
+        if not self.session:
+            # Simulate delivery for testing
+            logger.info(f"Webhook would deliver to: {callback_url}")
+            return True
+        
+        try:
+            async with self.session.post(
+                callback_url,
+                json={
+                    'event_type': event.event_type,
+                    'timestamp': event.timestamp.isoformat(),
+                    'data': event.data,
+                    'correlation_id': event.correlation_id
+                },
+                timeout=10
+            ) as response:
+                return response.status in [200, 201, 202, 204]
+        except Exception:
+            return False
+    
+    def get_webhook_stats(self) -> Dict:
+        """Get webhook statistics"""
+        active = [s for s in self.subscriptions.values() if s.status == "active"]
+        failed = [s for s in self.subscriptions.values() if s.status == "failed"]
+        
+        return {
+            'total_subscriptions': len(self.subscriptions),
+            'active_subscriptions': len(active),
+            'failed_subscriptions': len(failed),
+            'queue_size': len(self.delivery_queue),
+            'subscriptions': [
+                {
+                    'id': s.subscription_id,
+                    'event_type': s.event_type,
+                    'status': s.status,
+                    'last_delivery': s.last_delivery.isoformat() if s.last_delivery else None,
+                    'last_error': s.last_error
+                }
+                for s in list(self.subscriptions.values())[-10:]
+            ]
+        }
+
+# ============================================================================
+# Authentication and Rate Limiting (Enhanced)
 # ============================================================================
 
 class APIKeyManager:
@@ -137,17 +544,30 @@ class APIKeyManager:
         }
 
 # ============================================================================
-# Decorators
+# Decorators (Enhanced)
 # ============================================================================
 
 def require_auth(func):
     """Decorator to require API key authentication"""
     @wraps(func)
     async def wrapper(self, request_data: Dict[str, Any], *args, **kwargs):
+        # Check OAuth2 token first
+        auth_header = request_data.get('headers', {}).get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            if hasattr(self, 'oauth2_manager') and self.oauth2_manager:
+                payload = self.oauth2_manager.validate_token(token)
+                if payload:
+                    request_data['oauth_payload'] = payload
+                    request_data['auth_type'] = 'oauth2'
+                    return await func(self, request_data, *args, **kwargs)
+        
+        # Fallback to API key
         api_key = request_data.get('headers', {}).get('X-API-Key', '')
         
         if not api_key:
-            return {'status': 401, 'error': 'API key required', 'message': 'Provide X-API-Key header'}
+            return {'status': 401, 'error': 'Authentication required', 
+                    'message': 'Provide X-API-Key header or Bearer token'}
         
         key_data = self.api_key_manager.validate_key(api_key)
         if not key_data:
@@ -161,6 +581,7 @@ def require_auth(func):
         # Add key info to request
         request_data['api_key_info'] = key_data
         request_data['rate_info'] = rate_info
+        request_data['auth_type'] = 'api_key'
         
         return await func(self, request_data, *args, **kwargs)
     return wrapper
@@ -170,6 +591,14 @@ def require_role(role: str):
     def decorator(func):
         @wraps(func)
         async def wrapper(self, request_data: Dict[str, Any], *args, **kwargs):
+            # Check OAuth2 scopes
+            oauth_payload = request_data.get('oauth_payload', {})
+            if oauth_payload:
+                scopes = oauth_payload.get('scopes', [])
+                if role in scopes or 'admin' in scopes:
+                    return await func(self, request_data, *args, **kwargs)
+            
+            # Check API key role
             key_data = request_data.get('api_key_info', {})
             if key_data.get('role') != role and key_data.get('role') != 'admin':
                 return {'status': 403, 'error': f'Role {role} required'}
@@ -178,7 +607,7 @@ def require_role(role: str):
     return decorator
 
 # ============================================================================
-# Pagination Helper
+# Pagination Helper (Enhanced)
 # ============================================================================
 
 def paginate(items: List[Any], page: int = 1, limit: int = 20) -> Dict[str, Any]:
@@ -208,7 +637,7 @@ def paginate(items: List[Any], page: int = 1, limit: int = 20) -> Dict[str, Any]
 
 class BioInspiredAPI:
     """
-    Enhanced Bio-Inspired API v5.0.0
+    Enhanced Bio-Inspired API v6.0.0
     
     Complete RESTful API with:
     - Authentication and rate limiting
@@ -218,6 +647,11 @@ class BioInspiredAPI:
     - Pagination and filtering
     - Webhook support
     - Response caching headers
+    - OAuth2/JWT support (NEW)
+    - Adaptive rate limiting (NEW)
+    - Webhook retry with exponential backoff (NEW)
+    - Histogram metrics for latency (NEW)
+    - Swagger UI endpoint (NEW)
     """
     
     def __init__(self, bio_core=None):
@@ -234,24 +668,34 @@ class BioInspiredAPI:
         self.knowledge_transfer = getattr(bio_core, 'knowledge_transfer', None) if bio_core else None
         self.supply_manager = getattr(bio_core, 'supply_manager', None) if bio_core else None
         self.token_allocator = getattr(bio_core, 'token_allocator', None) if bio_core else None
-        self.event_bus = getattr(bio_core, 'event_bus', None) if bio_core else None
+        self.event_bus = getattr(bio_core, 'event_broker', None) if bio_core else None
         self.health_manager = getattr(bio_core, 'health_manager', None) if bio_core else None
         self.state_manager = getattr(bio_core, 'state_manager', None) if bio_core else None
+        
+        # NEW: OAuth2 Manager
+        self.oauth2_manager = OAuth2Manager()
+        
+        # NEW: Adaptive Rate Limiter
+        self.adaptive_limiter = AdaptiveRateLimiter()
         
         # API key manager
         self.api_key_manager = APIKeyManager()
         
-        # Webhook subscriptions
-        self.webhooks: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # NEW: Webhook Manager
+        self.webhook_manager = WebhookManager(self.event_bus)
         
-        # Request history
+        # Request history with latency tracking
         self.request_history: deque = deque(maxlen=10000)
+        self.latency_histogram: Dict[str, List[float]] = defaultdict(list)
         
         # Route registry
         self.routes: Dict[str, Callable] = {}
         self._register_routes()
         
-        logger.info(f"Enhanced Bio-Inspired API v5.0.0 initialized ({len(self.routes)} routes)")
+        # Start webhook processing
+        asyncio.create_task(self.webhook_manager._process_deliveries())
+        
+        logger.info(f"Enhanced Bio-Inspired API v6.0.0 initialized ({len(self.routes)} routes)")
     
     def _register_routes(self):
         """Register all API routes"""
@@ -262,6 +706,15 @@ class BioInspiredAPI:
         self.routes[f"{API_PREFIX}/health/status"] = self.get_health_status
         self.routes[f"{API_PREFIX}/config"] = self.get_config
         self.routes[f"{API_PREFIX}/config"] = self.update_config  # PUT handled separately
+        
+        # OAuth2 (NEW)
+        self.routes[f"{API_PREFIX}/oauth/token"] = self.oauth_token
+        self.routes[f"{API_PREFIX}/oauth/revoke"] = self.oauth_revoke
+        self.routes[f"{API_PREFIX}/oauth/config"] = self.oauth_config
+        
+        # Swagger UI (NEW)
+        self.routes[f"{API_PREFIX}/docs"] = self.get_swagger_ui
+        self.routes[f"{API_PREFIX}/openapi.json"] = self.get_openapi_spec
         
         # Token Economy
         self.routes[f"{API_PREFIX}/tokens/summary"] = self.get_token_summary
@@ -310,13 +763,16 @@ class BioInspiredAPI:
         self.routes[f"{API_PREFIX}/system/overview"] = self.get_system_overview
         self.routes[f"{API_PREFIX}/system/recommendations"] = self.get_system_recommendations
         self.routes[f"{API_PREFIX}/system/what-if"] = self.run_what_if_analysis
+        self.routes[f"{API_PREFIX}/system/load"] = self.get_system_load
         
         # Webhooks
         self.routes[f"{API_PREFIX}/webhooks/subscribe"] = self.subscribe_webhook
         self.routes[f"{API_PREFIX}/webhooks/unsubscribe"] = self.unsubscribe_webhook
+        self.routes[f"{API_PREFIX}/webhooks/stats"] = self.get_webhook_stats
         
         # Metrics
         self.routes[f"{API_PREFIX}/metrics"] = self.get_metrics
+        self.routes[f"{API_PREFIX}/metrics/histograms"] = self.get_metric_histograms
         
         # API Keys (admin only)
         self.routes[f"{API_PREFIX}/admin/keys"] = self.get_api_keys
@@ -324,14 +780,230 @@ class BioInspiredAPI:
         self.routes[f"{API_PREFIX}/admin/keys/revoke"] = self.revoke_api_key
     
     # ========================================================================
-    # Route Handler
+    # OAuth2 Endpoints (NEW)
+    # ========================================================================
+    
+    async def oauth_token(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/v1/oauth/token - OAuth2 token endpoint"""
+        body = request_data.get('body', {})
+        grant_type = body.get('grant_type', 'client_credentials')
+        client_id = body.get('client_id', 'default')
+        scopes = body.get('scope', 'read').split()
+        
+        if grant_type == 'client_credentials':
+            access_token = self.oauth2_manager.create_access_token(client_id, scopes)
+            refresh_token = self.oauth2_manager.create_refresh_token(client_id)
+            
+            return {
+                'access_token': access_token,
+                'refresh_token': refresh_token,
+                'token_type': 'Bearer',
+                'expires_in': self.oauth2_manager.config.access_token_expiry_minutes * 60,
+                'scope': ' '.join(scopes)
+            }
+        
+        elif grant_type == 'refresh_token':
+            refresh_token = body.get('refresh_token', '')
+            result = self.oauth2_manager.refresh_access_token(refresh_token)
+            if result:
+                return result
+            return {'error': 'invalid_grant', 'error_description': 'Invalid refresh token'}
+        
+        return {'error': 'unsupported_grant_type', 'error_description': 'Grant type not supported'}
+    
+    async def oauth_revoke(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/v1/oauth/revoke - OAuth2 token revocation"""
+        body = request_data.get('body', {})
+        token = body.get('token', '')
+        
+        if token:
+            self.oauth2_manager.revoke_token(token)
+            return {'success': True}
+        
+        return {'error': 'invalid_token', 'error_description': 'Token required'}
+    
+    async def oauth_config(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """GET /api/v1/oauth/config - OAuth2 configuration"""
+        return self.oauth2_manager.get_oauth_config()
+    
+    # ========================================================================
+    # Swagger UI Endpoints (NEW)
+    # ========================================================================
+    
+    async def get_swagger_ui(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """GET /api/v1/docs - Swagger UI"""
+        return {
+            'html': self._generate_swagger_html(),
+            'content_type': 'text/html'
+        }
+    
+    async def get_openapi_spec(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """GET /api/v1/openapi.json - OpenAPI specification"""
+        return self._generate_openapi_spec()
+    
+    def _generate_swagger_html(self) -> str:
+        """Generate Swagger UI HTML"""
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Green Agent Bio-Inspired API - Swagger UI</title>
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+        </head>
+        <body>
+            <div id="swagger-ui"></div>
+            <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+            <script>
+                window.onload = function() {{
+                    const ui = SwaggerUIBundle({{
+                        url: "{API_PREFIX}/openapi.json",
+                        dom_id: '#swagger-ui',
+                        presets: [
+                            SwaggerUIBundle.presets.apis,
+                            SwaggerUIBundle.SwaggerUIStandalonePreset
+                        ],
+                        layout: "BaseLayout",
+                        deepLinking: true
+                    }});
+                    window.ui = ui;
+                }};
+            </script>
+        </body>
+        </html>
+        """
+    
+    def _generate_openapi_spec(self) -> Dict[str, Any]:
+        """Generate OpenAPI 3.0 specification"""
+        return {
+            "openapi": "3.0.0",
+            "info": {
+                "title": "Green Agent Bio-Inspired API",
+                "version": API_VERSION,
+                "description": "RESTful API for the Green Agent metabolic ecosystem"
+            },
+            "servers": [
+                {"url": f"/api/{API_VERSION}", "description": "Production server"}
+            ],
+            "paths": {
+                "/health/live": {
+                    "get": {
+                        "summary": "Liveness probe",
+                        "responses": {"200": {"description": "Alive"}}
+                    }
+                },
+                "/health/ready": {
+                    "get": {
+                        "summary": "Readiness probe",
+                        "responses": {"200": {"description": "Ready"}}
+                    }
+                },
+                "/oauth/token": {
+                    "post": {
+                        "summary": "OAuth2 token endpoint",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "grant_type": {"type": "string"},
+                                            "client_id": {"type": "string"},
+                                            "scope": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "Token response"}}
+                    }
+                },
+                "/tokens/summary": {
+                    "get": {
+                        "summary": "Token economy summary",
+                        "security": [{"ApiKeyAuth": []}, {"OAuth2": []}],
+                        "responses": {"200": {"description": "Token summary"}}
+                    }
+                },
+                "/tokens/generate": {
+                    "post": {
+                        "summary": "Generate Eco-ATP tokens",
+                        "security": [{"ApiKeyAuth": []}, {"OAuth2": []}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "account_id": {"type": "string"},
+                                            "carbon_saved_kg": {"type": "number"},
+                                            "energy_saved_kwh": {"type": "number"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "Tokens generated"}}
+                    }
+                },
+                "/gradients/summary": {
+                    "get": {
+                        "summary": "Gradient field summary",
+                        "responses": {"200": {"description": "Gradient summary"}}
+                    }
+                },
+                "/system/load": {
+                    "get": {
+                        "summary": "System load status",
+                        "responses": {"200": {"description": "System load"}}
+                    }
+                },
+                "/webhooks/stats": {
+                    "get": {
+                        "summary": "Webhook statistics",
+                        "security": [{"ApiKeyAuth": []}, {"OAuth2": []}],
+                        "responses": {"200": {"description": "Webhook stats"}}
+                    }
+                },
+                "/metrics/histograms": {
+                    "get": {
+                        "summary": "Histogram metrics for latency distribution",
+                        "responses": {"200": {"description": "Histogram metrics"}}
+                    }
+                }
+            },
+            "components": {
+                "securitySchemes": {
+                    "ApiKeyAuth": {
+                        "type": "apiKey",
+                        "in": "header",
+                        "name": "X-API-Key"
+                    },
+                    "OAuth2": {
+                        "type": "oauth2",
+                        "flows": {
+                            "clientCredentials": {
+                                "tokenUrl": f"{API_PREFIX}/oauth/token",
+                                "scopes": {
+                                    "read": "Read access",
+                                    "write": "Write access",
+                                    "admin": "Admin access"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+    # ========================================================================
+    # Route Handler (Enhanced)
     # ========================================================================
     
     async def handle_request(self, method: str, path: str, 
                             headers: Dict[str, str] = None,
                             body: Dict[str, Any] = None,
                             query_params: Dict[str, str] = None) -> Dict[str, Any]:
-        """Handle an API request"""
+        """Handle an API request with latency tracking"""
         start_time = time.time()
         
         request_data = {
@@ -342,6 +1014,12 @@ class BioInspiredAPI:
             'query_params': query_params or {},
             'timestamp': datetime.utcnow()
         }
+        
+        # Update adaptive rate limiter
+        if self.bio_core and hasattr(self.bio_core, 'get_system_status'):
+            status = self.bio_core.get_system_status()
+            load = status.get('token_economy', {}).get('utilization', 0.5)
+            self.adaptive_limiter.update_system_load(load)
         
         # Find route
         handler = self.routes.get(path)
@@ -362,11 +1040,18 @@ class BioInspiredAPI:
             if isinstance(result, dict) and 'status' not in result:
                 result['status'] = 200
             
+            latency_ms = (time.time() - start_time) * 1000
+            
             result['meta'] = {
                 'api_version': API_VERSION,
                 'timestamp': datetime.utcnow().isoformat(),
-                'response_time_ms': (time.time() - start_time) * 1000
+                'response_time_ms': latency_ms
             }
+            
+            # Track latency in histogram
+            self.latency_histogram[path].append(latency_ms)
+            if len(self.latency_histogram[path]) > 1000:
+                self.latency_histogram[path] = self.latency_histogram[path][-1000:]
             
             # Add rate limit info if available
             if 'rate_info' in request_data:
@@ -377,6 +1062,7 @@ class BioInspiredAPI:
                 'method': method,
                 'path': path,
                 'status': result.get('status', 200),
+                'latency_ms': latency_ms,
                 'timestamp': datetime.utcnow().isoformat()
             })
             
@@ -384,6 +1070,9 @@ class BioInspiredAPI:
             
         except Exception as e:
             logger.error(f"API error: {str(e)}", exc_info=True)
+            latency_ms = (time.time() - start_time) * 1000
+            self.latency_histogram[f"{path}_error"].append(latency_ms)
+            
             return {
                 'status': 500,
                 'error': 'Internal server error',
@@ -395,23 +1084,99 @@ class BioInspiredAPI:
             }
     
     # ========================================================================
-    # Health and Operational Endpoints
+    # New Endpoint: System Load
     # ========================================================================
     
+    async def get_system_load(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """GET /api/v1/system/load - System load status"""
+        return {
+            'system_load': self.adaptive_limiter.load_history[-1] if self.adaptive_limiter.load_history else 0.5,
+            'rate_multiplier': self.adaptive_limiter.current_multiplier,
+            'active_scopes': list(self.adaptive_limiter.rate_records.keys()),
+            'rate_limits': self.adaptive_limiter.base_limits
+        }
+    
+    # ========================================================================
+    # New Endpoint: Histogram Metrics
+    # ========================================================================
+    
+    async def get_metric_histograms(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """GET /api/v1/metrics/histograms - Histogram metrics for latency distribution"""
+        histograms = {}
+        
+        for path, latencies in self.latency_histogram.items():
+            if len(latencies) > 0:
+                histograms[path] = {
+                    'p50': np.percentile(latencies, 50),
+                    'p90': np.percentile(latencies, 90),
+                    'p95': np.percentile(latencies, 95),
+                    'p99': np.percentile(latencies, 99),
+                    'min': min(latencies),
+                    'max': max(latencies),
+                    'mean': sum(latencies) / len(latencies),
+                    'samples': len(latencies)
+                }
+        
+        return {
+            'histograms': histograms,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+    
+    # ========================================================================
+    # Enhanced Webhook Endpoints
+    # ========================================================================
+    
+    @require_auth
+    async def subscribe_webhook(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/v1/webhooks/subscribe"""
+        body = request_data.get('body', {})
+        event_type = body.get('event_type', '')
+        callback_url = body.get('callback_url', '')
+        max_retries = body.get('max_retries', 5)
+        
+        if not event_type or not callback_url:
+            return {'error': 'event_type and callback_url required'}
+        
+        subscription_id = await self.webhook_manager.subscribe(event_type, callback_url)
+        
+        # Update max retries if provided
+        if subscription_id in self.webhook_manager.subscriptions:
+            self.webhook_manager.subscriptions[subscription_id].max_retries = max_retries
+        
+        return {
+            'success': True,
+            'subscription_id': subscription_id,
+            'event_type': event_type,
+            'max_retries': max_retries
+        }
+    
+    @require_auth
+    async def unsubscribe_webhook(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/v1/webhooks/unsubscribe"""
+        body = request_data.get('body', {})
+        subscription_id = body.get('subscription_id', '')
+        
+        success = await self.webhook_manager.unsubscribe(subscription_id)
+        
+        return {'success': success, 'subscription_id': subscription_id}
+    
+    async def get_webhook_stats(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """GET /api/v1/webhooks/stats"""
+        return self.webhook_manager.get_webhook_stats()
+    
+    # ========================================================================
+    # Existing Endpoints (Preserved)
+    # ========================================================================
+    
+    # Health and Operational
     async def get_live(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Liveness probe"""
         return {'status': 'alive', 'timestamp': datetime.utcnow().isoformat()}
     
     async def get_ready(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Readiness probe"""
         if self.health_manager:
             ready = self.health_manager.is_ready()
-            return {
-                'status': 'ready' if ready else 'not_ready',
-                'timestamp': datetime.utcnow().isoformat()
-            }
+            return {'status': 'ready' if ready else 'not_ready', 'timestamp': datetime.utcnow().isoformat()}
         
-        # Check basic readiness
         modules_ready = all([
             self.token_manager is not None,
             self.gradient_manager is not None,
@@ -428,16 +1193,13 @@ class BioInspiredAPI:
         }
     
     async def get_health_status(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Detailed health status"""
         if self.health_manager:
             return self.health_manager.check_all(self.bio_core) if self.bio_core else {}
-        
         return {'status': 'health_manager_not_available'}
     
     @require_auth
     @require_role('admin')
     async def get_config(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Get current configuration"""
         if self.bio_core and hasattr(self.bio_core, 'config'):
             return {'config': self.bio_core.config.to_dict()}
         return {'error': 'Configuration not available'}
@@ -445,26 +1207,20 @@ class BioInspiredAPI:
     @require_auth
     @require_role('admin')
     async def update_config(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Update configuration"""
         updates = request_data.get('body', {})
         if self.bio_core and hasattr(self.bio_core, 'update_configuration'):
             self.bio_core.update_configuration(updates)
             return {'status': 'updated', 'changes': list(updates.keys())}
         return {'error': 'Configuration update not available'}
     
-    # ========================================================================
-    # Token Economy Endpoints
-    # ========================================================================
-    
+    # Token Economy
     async def get_token_summary(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/tokens/summary"""
         if not self.token_manager:
             return {'error': 'Token manager not available'}
         return self.token_manager.get_system_summary()
     
     @require_auth
     async def get_token_accounts(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/tokens/accounts"""
         if not self.token_manager:
             return {'error': 'Token manager not available'}
         
@@ -483,7 +1239,6 @@ class BioInspiredAPI:
     
     @require_auth
     async def generate_tokens(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/tokens/generate"""
         if not self.token_manager:
             return {'error': 'Token manager not available'}
         
@@ -513,7 +1268,6 @@ class BioInspiredAPI:
     
     @require_auth
     async def reserve_tokens(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/tokens/reserve"""
         if not self.token_manager:
             return {'error': 'Token manager not available'}
         
@@ -534,17 +1288,12 @@ class BioInspiredAPI:
         }
     
     async def get_economic_indicators(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/tokens/economic"""
         if not self.supply_manager:
             return {'error': 'Supply manager not available'}
         return self.supply_manager.get_economic_indicators()
     
-    # ========================================================================
-    # Gradient Field Endpoints
-    # ========================================================================
-    
+    # Gradient Fields
     async def get_gradient_summary(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/gradients/summary"""
         if not self.gradient_manager:
             return {'error': 'Gradient manager not available'}
         return {
@@ -554,122 +1303,85 @@ class BioInspiredAPI:
         }
     
     async def get_gradient_forecasts(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/gradients/forecasts"""
         if not self.gradient_manager:
             return {'error': 'Gradient manager not available'}
-        
         if hasattr(self.gradient_manager, 'get_forecast_summary'):
             return self.gradient_manager.get_forecast_summary()
-        
         return {'error': 'Forecasting not available'}
     
     async def get_causal_analysis(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/gradients/causal"""
         if not self.gradient_manager:
             return {'error': 'Gradient manager not available'}
-        
         field_id = request_data.get('query_params', {}).get('field', 'carbon')
-        
         if hasattr(self.gradient_manager, 'find_root_cause'):
             return self.gradient_manager.find_root_cause(field_id)
-        
         return {'error': 'Causal analysis not available'}
     
     @require_auth
     async def pump_gradient(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/gradients/pump"""
         if not self.gradient_manager:
             return {'error': 'Gradient manager not available'}
-        
         body = request_data.get('body', {})
         field_id = body.get('field_id', 'carbon')
         amount = body.get('amount', 0.1)
-        
         self.gradient_manager.pump_field(field_id, amount, source='api')
-        
         return {'success': True, 'field_id': field_id, 'amount': amount}
     
-    # ========================================================================
-    # ATP Synthase Endpoints
-    # ========================================================================
-    
+    # ATP Synthase
     async def get_atp_status(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/atp-synthase/status"""
         if not self.scheduler:
             return {'error': 'ATP synthase not available'}
         return self.scheduler.get_scheduler_stats()
     
     async def get_atp_efficiency(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/atp-synthase/efficiency"""
         if not self.scheduler:
             return {'error': 'ATP synthase not available'}
-        
         if hasattr(self.scheduler, 'get_efficiency_report'):
             return self.scheduler.get_efficiency_report()
-        
         return {'error': 'Efficiency report not available'}
     
-    # ========================================================================
-    # Compartment Endpoints
-    # ========================================================================
-    
+    # Compartments
     async def get_compartment_summary(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/compartments/summary"""
         if not self.compartment_manager:
             return {'error': 'Compartment manager not available'}
         return self.compartment_manager.get_ecosystem_stats()
     
     async def get_compartment_regions(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/compartments/regions"""
         if not self.compartment_manager:
             return {'error': 'Compartment manager not available'}
-        
         region_id = request_data.get('query_params', {}).get('region', None)
-        
         if hasattr(self.compartment_manager, 'get_region_stats'):
             if region_id:
                 return self.compartment_manager.get_region_stats(region_id) or {}
-            
             regions = {}
             for rid in self.compartment_manager.regions:
                 regions[rid] = self.compartment_manager.get_region_stats(rid)
             return {'regions': regions}
-        
         return {'error': 'Region stats not available'}
     
     @require_auth
     async def create_compartment(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/compartments/create"""
         if not self.compartment_manager:
             return {'error': 'Compartment manager not available'}
-        
         body = request_data.get('body', {})
         expert_type = body.get('expert_type', 'data')
-        
         compartment = self.compartment_manager.create_compartment(expert_type)
-        
         return {
             'success': True,
             'compartment_id': compartment.compartment_id,
             'expert_type': expert_type
         }
     
-    # ========================================================================
-    # Biomass Storage Endpoints
-    # ========================================================================
-    
+    # Biomass Storage
     async def get_biomass_summary(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/biomass/summary"""
         if not self.biomass_storage:
             return {'error': 'Biomass storage not available'}
         return self.biomass_storage.get_storage_stats()
     
     @require_auth
     async def store_task(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/biomass/store"""
         if not self.biomass_storage:
             return {'error': 'Biomass storage not available'}
-        
         body = request_data.get('body', {})
         task_data = body.get('task_data', {})
         ecoatp_cost = body.get('ecoatp_cost', 10.0)
@@ -688,46 +1400,31 @@ class BioInspiredAPI:
     
     @require_auth
     async def retrieve_task(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/biomass/retrieve"""
         if not self.biomass_storage:
             return {'error': 'Biomass storage not available'}
-        
         body = request_data.get('body', {})
         token_id = body.get('token_id', '')
-        
         task_data, cost = self.biomass_storage.retrieve_task(token_id)
-        
-        return {
-            'success': task_data is not None,
-            'task_data': task_data,
-            'retrieval_cost': cost
-        }
+        return {'success': task_data is not None, 'task_data': task_data, 'retrieval_cost': cost}
     
     async def get_biomass_analytics(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/biomass/analytics"""
         if not self.biomass_storage:
             return {'error': 'Biomass storage not available'}
-        
         if hasattr(self.biomass_storage, 'generate_analytics'):
             analytics = self.biomass_storage.generate_analytics()
             recommendations = self.biomass_storage.get_optimization_recommendations()
             return {'analytics': asdict(analytics) if hasattr(analytics, '__dataclass_fields__') else analytics,
                     'recommendations': recommendations}
-        
         return {'error': 'Analytics not available'}
     
     async def get_biomass_forecast(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/biomass/forecast"""
         if not self.biomass_storage:
             return {'error': 'Biomass storage not available'}
-        
         tier_name = request_data.get('query_params', {}).get('tier', 'glycogen_queue')
-        
         try:
             tier = StorageTier(tier_name)
         except ValueError:
             tier = StorageTier.GLYCOGEN_QUEUE
-        
         if hasattr(self.biomass_storage, 'forecast_storage'):
             forecast = self.biomass_storage.forecast_storage(tier)
             return {
@@ -739,25 +1436,18 @@ class BioInspiredAPI:
                 'predicted_full_time': forecast.predicted_full_time.isoformat() if forecast.predicted_full_time else None,
                 'confidence': forecast.confidence
             }
-        
         return {'error': 'Forecasting not available'}
     
-    # ========================================================================
-    # Harvester Endpoints
-    # ========================================================================
-    
+    # Harvester
     async def get_harvester_summary(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/harvester/summary"""
         if not self.harvester:
             return {'error': 'Harvester not available'}
         return self.harvester.get_harvesting_stats()
     
     @require_auth
     async def harvest_cycle(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/harvester/cycle"""
         if not self.harvester:
             return {'error': 'Harvester not available'}
-        
         body = request_data.get('body', {})
         env_data = body.get('environmental_data', {
             'renewable_availability': 0.5,
@@ -765,9 +1455,7 @@ class BioInspiredAPI:
             'waste_heat': 0.2,
             'edge_availability': 0.3
         })
-        
         result = await self.harvester.harvest_cycle(env_data)
-        
         return {
             'success': True,
             'eco_atp_generated': result.get('eco_atp_generated', 0),
@@ -776,81 +1464,51 @@ class BioInspiredAPI:
         }
     
     async def get_circadian_report(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/harvester/circadian"""
         if not self.harvester:
             return {'error': 'Harvester not available'}
-        
         if hasattr(self.harvester, 'get_circadian_report'):
             return self.harvester.get_circadian_report()
-        
         return {'error': 'Circadian report not available'}
     
-    # ========================================================================
-    # Degradation Manager Endpoints
-    # ========================================================================
-    
+    # Degradation Manager
     async def get_degradation_status(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/degradation/status"""
         if not self.degradation_manager:
             return {'error': 'Degradation manager not available'}
         return self.degradation_manager.get_tier_status()
     
     async def get_degradation_history(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/degradation/history"""
         if not self.degradation_manager:
             return {'error': 'Degradation manager not available'}
-        return {
-            'history': list(self.degradation_manager.tier_history)[-50:]
-        }
+        return {'history': list(self.degradation_manager.tier_history)[-50:]}
     
     async def get_chaos_report(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/degradation/chaos"""
         if not self.degradation_manager:
             return {'error': 'Degradation manager not available'}
-        
         if hasattr(self.degradation_manager, 'get_chaos_report'):
             return self.degradation_manager.get_chaos_report()
-        
         return {'error': 'Chaos engineering not available'}
     
-    # ========================================================================
-    # Knowledge Transfer Endpoints
-    # ========================================================================
-    
+    # Knowledge Transfer
     async def get_knowledge_packages(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/knowledge/packages"""
         if not self.knowledge_transfer:
             return {'error': 'Knowledge transfer not available'}
         return self.knowledge_transfer.get_knowledge_summary()
     
     @require_auth
     async def transfer_knowledge(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/knowledge/transfer"""
         if not self.knowledge_transfer:
             return {'error': 'Knowledge transfer not available'}
-        
-        body = request_data.get('body', {})
-        source_package_id = body.get('source_package_id', '')
-        # Target expert would need to be provided
-        
         return {'status': 'not_implemented', 'message': 'Requires target expert instance'}
     
-    # ========================================================================
-    # System Endpoints
-    # ========================================================================
-    
+    # System
     async def get_system_overview(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/system/overview"""
         if not self.bio_core:
             return {'error': 'Bio-core not available'}
-        
         return self.bio_core.get_system_status()
     
     async def get_system_recommendations(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/system/recommendations"""
         recommendations = []
         
-        # Economic recommendations
         if self.supply_manager:
             indicators = self.supply_manager.get_economic_indicators()
             if indicators.get('utilization', 0.5) < 0.4:
@@ -858,11 +1516,9 @@ class BioInspiredAPI:
             if indicators.get('inflation_pressure', 0) > 0.3:
                 recommendations.append("High inflation pressure. Consider token burning.")
         
-        # Storage recommendations
         if self.biomass_storage and hasattr(self.biomass_storage, 'get_optimization_recommendations'):
             recommendations.extend(self.biomass_storage.get_optimization_recommendations())
         
-        # Gradient recommendations
         if self.gradient_manager:
             for field_id in ['carbon', 'helium']:
                 explanation = self.gradient_manager.explain_gradient_state(field_id)
@@ -876,73 +1532,14 @@ class BioInspiredAPI:
     
     @require_auth
     async def run_what_if_analysis(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/system/what-if"""
         if not self.bio_core:
             return {'error': 'Bio-core not available'}
-        
         body = request_data.get('body', {})
-        
         if hasattr(self.bio_core, 'run_what_if_analysis'):
             return self.bio_core.run_what_if_analysis(body)
-        
         return {'error': 'What-if analysis not available'}
     
-    # ========================================================================
-    # Webhook Endpoints
-    # ========================================================================
-    
-    @require_auth
-    async def subscribe_webhook(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/webhooks/subscribe"""
-        body = request_data.get('body', {})
-        event_type = body.get('event_type', '')
-        callback_url = body.get('callback_url', '')
-        
-        if not event_type or not callback_url:
-            return {'error': 'event_type and callback_url required'}
-        
-        subscription_id = hashlib.sha256(
-            f"{event_type}{callback_url}{datetime.utcnow().timestamp()}".encode()
-        ).hexdigest()[:16]
-        
-        self.webhooks[event_type].append({
-            'subscription_id': subscription_id,
-            'callback_url': callback_url,
-            'created_at': datetime.utcnow().isoformat()
-        })
-        
-        # Register with event bus if available
-        if self.event_bus:
-            async def webhook_callback(event):
-                # In production, would make HTTP POST to callback_url
-                logger.info(f"Webhook triggered: {event_type} → {callback_url}")
-            
-            self.event_bus.subscribe(event_type, webhook_callback)
-        
-        return {
-            'success': True,
-            'subscription_id': subscription_id,
-            'event_type': event_type
-        }
-    
-    @require_auth
-    async def unsubscribe_webhook(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/webhooks/unsubscribe"""
-        body = request_data.get('body', {})
-        subscription_id = body.get('subscription_id', '')
-        
-        for event_type, hooks in self.webhooks.items():
-            for hook in hooks:
-                if hook['subscription_id'] == subscription_id:
-                    hooks.remove(hook)
-                    return {'success': True, 'subscription_id': subscription_id}
-        
-        return {'error': 'Subscription not found'}
-    
-    # ========================================================================
-    # Metrics Endpoint
-    # ========================================================================
-    
+    # Metrics
     async def get_metrics(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """GET /api/v1/metrics - Prometheus-compatible"""
         metrics = []
@@ -978,33 +1575,31 @@ class BioInspiredAPI:
             metrics.append(f'green_agent_atp_rate {scheduler_stats.get("current_atp_rate", 0)} {timestamp_ms}')
             metrics.append(f'green_agent_atp_efficiency {scheduler_stats.get("primary_efficiency", 0)} {timestamp_ms}')
         
+        # NEW: Rate limiter metrics
+        limiter_stats = self.adaptive_limiter.get_limiter_stats()
+        metrics.append(f'green_agent_rate_multiplier {limiter_stats.get("current_multiplier", 1.0)} {timestamp_ms}')
+        metrics.append(f'green_agent_system_load {limiter_stats.get("avg_load", 0.5)} {timestamp_ms}')
+        
         return {
             'metrics': '\n'.join(metrics),
             'content_type': 'text/plain',
             'timestamp': datetime.utcnow().isoformat()
         }
     
-    # ========================================================================
-    # Admin Endpoints
-    # ========================================================================
-    
+    # Admin
     @require_auth
     @require_role('admin')
     async def get_api_keys(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """GET /api/v1/admin/keys"""
         return self.api_key_manager.get_key_stats()
     
     @require_auth
     @require_role('admin')
     async def create_api_key(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/admin/keys/create"""
         body = request_data.get('body', {})
         name = body.get('name', 'new-key')
         rate_limit = body.get('rate_limit', 100)
         role = body.get('role', 'user')
-        
         key = self.api_key_manager.create_key(name, rate_limit, role)
-        
         return {
             'success': True,
             'api_key': key,
@@ -1017,12 +1612,9 @@ class BioInspiredAPI:
     @require_auth
     @require_role('admin')
     async def revoke_api_key(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/v1/admin/keys/revoke"""
         body = request_data.get('body', {})
         api_key = body.get('api_key', '')
-        
         success = self.api_key_manager.revoke_key(api_key)
-        
         return {'success': success, 'message': 'Key revoked' if success else 'Key not found'}
     
     # ========================================================================
@@ -1035,6 +1627,11 @@ class BioInspiredAPI:
         
         endpoint_counts = defaultdict(int)
         status_counts = defaultdict(int)
+        avg_latency = {}
+        
+        for path, latencies in self.latency_histogram.items():
+            if len(latencies) > 0:
+                avg_latency[path] = sum(latencies) / len(latencies)
         
         for req in recent:
             endpoint_counts[req['path']] += 1
@@ -1045,111 +1642,9 @@ class BioInspiredAPI:
             'recent_requests': len(recent),
             'top_endpoints': sorted(endpoint_counts.items(), key=lambda x: x[1], reverse=True)[:10],
             'status_distribution': dict(status_counts),
-            'webhook_subscriptions': sum(len(hooks) for hooks in self.webhooks.values()),
+            'average_latency_ms': avg_latency,
+            'webhook_stats': self.webhook_manager.get_webhook_stats() if self.webhook_manager else {},
+            'oauth_enabled': True,
             'registered_routes': len(self.routes),
             'api_version': API_VERSION
         }
-
-# ============================================================================
-# API Documentation Generator
-# ============================================================================
-
-def generate_openapi_spec() -> Dict[str, Any]:
-    """Generate OpenAPI 3.0 specification"""
-    return {
-        "openapi": "3.0.0",
-        "info": {
-            "title": "Green Agent Bio-Inspired API",
-            "version": API_VERSION,
-            "description": "RESTful API for the Green Agent metabolic ecosystem"
-        },
-        "servers": [
-            {"url": f"/api/{API_VERSION}", "description": "Production server"}
-        ],
-        "paths": {
-            "/health/live": {
-                "get": {
-                    "summary": "Liveness probe",
-                    "responses": {"200": {"description": "Alive"}}
-                }
-            },
-            "/health/ready": {
-                "get": {
-                    "summary": "Readiness probe",
-                    "responses": {"200": {"description": "Ready"}}
-                }
-            },
-            "/tokens/summary": {
-                "get": {
-                    "summary": "Token economy summary",
-                    "responses": {"200": {"description": "Token summary"}}
-                }
-            },
-            "/tokens/generate": {
-                "post": {
-                    "summary": "Generate Eco-ATP tokens",
-                    "security": [{"ApiKeyAuth": []}],
-                    "requestBody": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "account_id": {"type": "string"},
-                                        "carbon_saved_kg": {"type": "number"},
-                                        "energy_saved_kwh": {"type": "number"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {"200": {"description": "Tokens generated"}}
-                }
-            },
-            "/gradients/summary": {
-                "get": {
-                    "summary": "Gradient field summary",
-                    "responses": {"200": {"description": "Gradient summary"}}
-                }
-            },
-            "/atp-synthase/status": {
-                "get": {
-                    "summary": "ATP synthase status",
-                    "responses": {"200": {"description": "ATP synthase status"}}
-                }
-            },
-            "/compartments/summary": {
-                "get": {
-                    "summary": "Compartment ecosystem summary",
-                    "responses": {"200": {"description": "Compartment summary"}}
-                }
-            },
-            "/biomass/summary": {
-                "get": {
-                    "summary": "Biomass storage summary",
-                    "responses": {"200": {"description": "Biomass summary"}}
-                }
-            },
-            "/system/overview": {
-                "get": {
-                    "summary": "System overview",
-                    "responses": {"200": {"description": "System overview"}}
-                }
-            },
-            "/metrics": {
-                "get": {
-                    "summary": "Prometheus metrics",
-                    "responses": {"200": {"description": "Metrics in Prometheus format"}}
-                }
-            }
-        },
-        "components": {
-            "securitySchemes": {
-                "ApiKeyAuth": {
-                    "type": "apiKey",
-                    "in": "header",
-                    "name": "X-API-Key"
-                }
-            }
-        }
-    }
