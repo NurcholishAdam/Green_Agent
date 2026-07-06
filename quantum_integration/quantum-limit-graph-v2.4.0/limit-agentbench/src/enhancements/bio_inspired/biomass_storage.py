@@ -1,10 +1,13 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/biomass_storage.py
-# Complete enhanced file v5.0.0 with all improvements
+# Complete enhanced file v6.0.0 with all improvements
 
 """
-Enhanced Biomass Storage v5.0.0
+Enhanced Biomass Storage v6.0.0
 Complete implementation with task deduplication, demand-based mobilization,
-storage forecasting, priority-based retrieval, and storage analytics.
+storage forecasting, priority-based retrieval, storage analytics,
+dynamic tier capacity (NEW), similarity-based deduplication (NEW),
+predictive mobilization based on demand forecasts (NEW),
+real-time storage dashboard (NEW), and collateral rebalancing (NEW).
 """
 
 import asyncio
@@ -19,6 +22,8 @@ import uuid
 import math
 import hashlib
 import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,7 @@ class MobilizationTrigger(Enum):
     COMPARTMENT_AVAILABLE = "compartment_available"
     QUEUE_EMPTY = "queue_empty"
     MANUAL = "manual"
+    PREDICTIVE = "predictive"  # NEW: Predictive mobilization
 
 @dataclass
 class StoredTask:
@@ -84,8 +90,12 @@ class StoredTask:
     # Deduplication support
     reference_count: int = 1               # Number of identical tasks
     is_merged: bool = False                # Whether this is a merged task
-    merged_task_ids: List[str] = field(default_factory=list)  # Original task IDs
+    merged_task_ids: List[str] = field(default_factory=list)
     original_complexities: List[float] = field(default_factory=list)
+    
+    # Similarity deduplication (NEW)
+    similar_task_ids: List[str] = field(default_factory=list)
+    similarity_score: float = 0.0
     
     # Analytics
     access_count: int = 0
@@ -145,10 +155,13 @@ class StorageToken:
     is_executed: bool = False
     penalty_paid: bool = False
     is_duplicate: bool = False         # Whether this references a deduplicated task
+    # NEW: Collateral rebalancing
+    collateral_adjustment: float = 0.0
+    last_rebalance: Optional[datetime] = None
 
 @dataclass
 class StorageForecast:
-    """Storage capacity forecast"""
+    """Storage capacity forecast (Enhanced)"""
     tier: StorageTier
     current_usage: int
     capacity: int
@@ -156,10 +169,13 @@ class StorageForecast:
     outflow_rate: float                # Tasks per second
     predicted_full_time: Optional[datetime]
     confidence: float
+    # NEW: Dynamic capacity
+    dynamic_capacity: Optional[int] = None
+    scaling_factor: float = 1.0
 
 @dataclass
 class StorageAnalytics:
-    """Comprehensive storage analytics"""
+    """Comprehensive storage analytics (Enhanced)"""
     timestamp: datetime
     total_stored: int
     deduplication_savings: int
@@ -170,6 +186,433 @@ class StorageAnalytics:
     expiration_rate: float
     mobilization_rate: float
     cache_hit_rate: float
+    # NEW: Similarity deduplication
+    similarity_savings: int = 0
+    similarity_groups: int = 0
+    # NEW: Collateral metrics
+    avg_collateral_ratio: float = 0.0
+    collateral_utilization: float = 0.0
+
+@dataclass
+class StorageDashboardData:
+    """Real-time storage dashboard data (NEW)"""
+    timestamp: datetime
+    storage_overview: Dict[str, Any]
+    tier_utilization: Dict[str, float]
+    retrieval_metrics: Dict[str, float]
+    mobilization_activity: Dict[str, Any]
+    deduplication_stats: Dict[str, int]
+    recommendations: List[str]
+
+# ============================================================================
+# Similarity-Based Deduplication (NEW)
+# ============================================================================
+
+class SimilarityDeduplicator:
+    """
+    Similarity-based deduplication for near-duplicate tasks.
+    
+    Features:
+    - TF-IDF vectorization for task similarity
+    - Cosine similarity scoring
+    - Configurable similarity threshold
+    - Group management
+    """
+    
+    def __init__(self, similarity_threshold: float = 0.8):
+        self.similarity_threshold = similarity_threshold
+        self.vectorizer = TfidfVectorizer(max_features=100)
+        self.similarity_groups: Dict[str, List[str]] = {}
+        self.group_representatives: Dict[str, str] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info(f"Similarity Deduplicator initialized (threshold: {similarity_threshold})")
+    
+    def _get_task_text(self, task_data: Dict) -> str:
+        """Extract text representation for similarity comparison"""
+        # Extract key fields for comparison
+        parts = []
+        
+        # Task type
+        if 'task_type' in task_data:
+            parts.append(task_data['task_type'])
+        
+        # Task description
+        if 'description' in task_data:
+            parts.append(task_data['description'])
+        
+        # Parameters (flattened)
+        if 'parameters' in task_data:
+            for key, value in task_data['parameters'].items():
+                if isinstance(value, (str, int, float)):
+                    parts.append(f"{key}={value}")
+                elif isinstance(value, list):
+                    parts.append(f"{key}={' '.join(str(v) for v in value[:5])}")
+        
+        # Complexity bucket
+        if 'complexity' in task_data:
+            complexity = task_data['complexity']
+            bucket = 'high' if complexity > 0.7 else 'medium' if complexity > 0.4 else 'low'
+            parts.append(f"complexity_{bucket}")
+        
+        return ' '.join(parts)
+    
+    async def find_similar(self, task_data: Dict, existing_tasks: List[StoredTask]) -> Optional[Tuple[str, float]]:
+        """
+        Find similar tasks using TF-IDF and cosine similarity.
+        
+        Returns (task_id, similarity_score) if similar found.
+        """
+        async with self._lock:
+            if not existing_tasks:
+                return None
+            
+            # Get text representation of new task
+            new_text = self._get_task_text(task_data)
+            if not new_text:
+                return None
+            
+            # Get representations of existing tasks
+            existing_texts = []
+            task_map = {}
+            for task in existing_tasks:
+                text = self._get_task_text(task.task_data)
+                if text:
+                    existing_texts.append(text)
+                    task_map[text] = task.task_id
+            
+            if not existing_texts:
+                return None
+            
+            # Vectorize
+            all_texts = [new_text] + existing_texts
+            vectors = self.vectorizer.fit_transform(all_texts)
+            
+            # Calculate similarities
+            new_vector = vectors[0]
+            existing_vectors = vectors[1:]
+            
+            similarities = cosine_similarity(new_vector, existing_vectors)[0]
+            
+            # Find best match above threshold
+            best_idx = -1
+            best_score = 0.0
+            
+            for idx, score in enumerate(similarities):
+                if score > self.similarity_threshold and score > best_score:
+                    best_score = score
+                    best_idx = idx
+            
+            if best_idx >= 0:
+                text = existing_texts[best_idx]
+                return task_map[text], best_score
+            
+            return None
+    
+    async def group_similar(self, task_id: str, similar_task_id: str, score: float):
+        """Group similar tasks together"""
+        async with self._lock:
+            # Find or create group
+            group_id = None
+            
+            # Check if either task is already in a group
+            for gid, members in self.similarity_groups.items():
+                if task_id in members:
+                    group_id = gid
+                    break
+                if similar_task_id in members:
+                    group_id = gid
+                    break
+            
+            if group_id is None:
+                # Create new group
+                group_id = f"sim_group_{len(self.similarity_groups)}"
+                self.similarity_groups[group_id] = [task_id, similar_task_id]
+                self.group_representatives[group_id] = task_id
+            else:
+                # Add to existing group
+                if task_id not in self.similarity_groups[group_id]:
+                    self.similarity_groups[group_id].append(task_id)
+                if similar_task_id not in self.similarity_groups[group_id]:
+                    self.similarity_groups[group_id].append(similar_task_id)
+            
+            logger.debug(f"Grouped {task_id} with {similar_task_id} (score: {score:.2f})")
+    
+    def get_group_stats(self) -> Dict[str, Any]:
+        """Get similarity group statistics"""
+        return {
+            'total_groups': len(self.similarity_groups),
+            'total_grouped_tasks': sum(len(members) for members in self.similarity_groups.values()),
+            'avg_group_size': np.mean([len(members) for members in self.similarity_groups.values()]) if self.similarity_groups else 0,
+            'groups': {
+                gid: {
+                    'members': members,
+                    'representative': self.group_representatives.get(gid),
+                    'size': len(members)
+                }
+                for gid, members in self.similarity_groups.items()
+            }
+        }
+
+# ============================================================================
+# Dynamic Tier Capacity Manager (NEW)
+# ============================================================================
+
+class DynamicTierCapacityManager:
+    """
+    Dynamic tier capacity based on system load.
+    
+    Features:
+    - Load-based capacity adjustment
+    - Proportional scaling
+    - Capacity warnings
+    - Trend analysis
+    """
+    
+    def __init__(self, base_capacities: Dict[StorageTier, int]):
+        self.base_capacities = base_capacities.copy()
+        self.current_capacities = base_capacities.copy()
+        self.load_history: deque = deque(maxlen=100)
+        self.scaling_factor = 1.0
+        self._lock = asyncio.Lock()
+        
+        logger.info("Dynamic Tier Capacity Manager initialized")
+    
+    def update_system_load(self, load: float):
+        """Update system load for capacity adjustment"""
+        self.load_history.append(load)
+        
+        # Calculate average load
+        if len(self.load_history) > 10:
+            avg_load = sum(self.load_history) / len(self.load_history)
+            
+            # Adjust scaling factor based on load
+            if avg_load > 0.8:
+                self.scaling_factor = 1.5  # Increase capacity when load is high
+            elif avg_load > 0.6:
+                self.scaling_factor = 1.2
+            elif avg_load < 0.3:
+                self.scaling_factor = 0.7  # Decrease capacity when load is low
+            else:
+                self.scaling_factor = 1.0
+            
+            # Update capacities
+            for tier, base in self.base_capacities.items():
+                self.current_capacities[tier] = int(base * self.scaling_factor)
+    
+    def get_capacity(self, tier: StorageTier) -> int:
+        """Get dynamic capacity for a tier"""
+        return self.current_capacities.get(tier, self.base_capacities.get(tier, 1000))
+    
+    def get_all_capacities(self) -> Dict[StorageTier, int]:
+        """Get all dynamic capacities"""
+        return self.current_capacities.copy()
+    
+    def get_scaling_stats(self) -> Dict[str, Any]:
+        """Get scaling statistics"""
+        return {
+            'current_scaling_factor': self.scaling_factor,
+            'load_samples': len(self.load_history),
+            'avg_load': sum(self.load_history) / len(self.load_history) if self.load_history else 0.5,
+            'capacities': {
+                tier.value: {'base': self.base_capacities[tier], 'current': self.current_capacities[tier]}
+                for tier in self.base_capacities
+            }
+        }
+
+# ============================================================================
+# Predictive Mobilization Engine (NEW)
+# ============================================================================
+
+class PredictiveMobilizationEngine:
+    """
+    Predictive mobilization based on demand forecasts.
+    
+    Features:
+    - Demand forecasting
+    - Proactive mobilization
+    - Confidence-based triggering
+    - Mobilization scheduling
+    """
+    
+    def __init__(self):
+        self.demand_history: List[float] = []
+        self.mobilization_schedule: List[Dict] = []
+        self._lock = asyncio.Lock()
+        self.forecast_horizon = 10  # steps
+        self.confidence_threshold = 0.6
+        
+        logger.info("Predictive Mobilization Engine initialized")
+    
+    def record_demand(self, demand_level: float):
+        """Record demand level for forecasting"""
+        self.demand_history.append(demand_level)
+        if len(self.demand_history) > 100:
+            self.demand_history = self.demand_history[-100:]
+    
+    async def forecast_demand(self) -> Dict[str, Any]:
+        """Forecast future demand"""
+        async with self._lock:
+            if len(self.demand_history) < 10:
+                return {'status': 'insufficient_data'}
+            
+            values = self.demand_history[-50:]
+            
+            # Simple trend-based forecast
+            x = np.arange(len(values))
+            slope = np.polyfit(x, values, 1)[0]
+            intercept = np.polyfit(x, values, 1)[1]
+            
+            # Generate forecast
+            forecasts = []
+            for i in range(self.forecast_horizon):
+                pred = slope * (len(values) + i) + intercept
+                forecasts.append(max(0.0, min(1.0, pred)))
+            
+            # Confidence based on volatility
+            volatility = np.std(values[-20:]) if len(values) >= 20 else 0.2
+            confidence = max(0.1, 1.0 - volatility * 2)
+            
+            return {
+                'status': 'success',
+                'forecasts': forecasts,
+                'average': np.mean(forecasts),
+                'trend': 'increasing' if slope > 0.01 else 'decreasing' if slope < -0.01 else 'stable',
+                'slope': slope,
+                'confidence': confidence
+            }
+    
+    async def get_mobilization_recommendation(self, current_mobilized: int) -> Dict[str, Any]:
+        """Get mobilization recommendation based on forecast"""
+        forecast = await self.forecast_demand()
+        
+        if forecast.get('status') != 'success':
+            return {'action': 'no_change', 'reason': 'insufficient_data'}
+        
+        if forecast['confidence'] < self.confidence_threshold:
+            return {'action': 'no_change', 'reason': 'low_confidence'}
+        
+        avg_forecast = forecast['average']
+        
+        if avg_forecast > 0.7:
+            # High future demand - mobilize more
+            target = int(current_mobilized * 1.5)
+            return {
+                'action': 'mobilize',
+                'current': current_mobilized,
+                'target': target,
+                'increase': target - current_mobilized,
+                'reason': f'predicted_demand_{avg_forecast:.2f}',
+                'confidence': forecast['confidence']
+            }
+        elif avg_forecast < 0.3:
+            # Low future demand - reduce mobilization
+            target = max(1, int(current_mobilized * 0.5))
+            return {
+                'action': 'demobilize',
+                'current': current_mobilized,
+                'target': target,
+                'decrease': current_mobilized - target,
+                'reason': f'predicted_demand_{avg_forecast:.2f}',
+                'confidence': forecast['confidence']
+            }
+        else:
+            return {
+                'action': 'no_change',
+                'current': current_mobilized,
+                'reason': 'stable_demand',
+                'confidence': forecast['confidence']
+            }
+
+# ============================================================================
+# Collateral Rebalancing Manager (NEW)
+# ============================================================================
+
+class CollateralRebalancer:
+    """
+    Collateral rebalancing based on task priority.
+    
+    Features:
+    - Priority-based collateral adjustment
+    - Dynamic rebalancing
+    - Utilization optimization
+    - Penalty management
+    """
+    
+    def __init__(self):
+        self.rebalancing_history: deque = deque(maxlen=1000)
+        self.collateral_pool = 0.0
+        self._lock = asyncio.Lock()
+        
+        # Priority to collateral ratio mapping
+        self.priority_ratios = {
+            5: 2.0,   # Critical
+            4: 1.8,
+            3: 1.5,   # High
+            2: 1.2,   # Normal
+            1: 1.0,   # Low
+            0: 0.8    # Background
+        }
+        
+        logger.info("Collateral Rebalancer initialized")
+    
+    async def rebalance(self, tokens: List[StorageToken]) -> Dict[str, Any]:
+        """Rebalance collateral across tokens based on priority"""
+        async with self._lock:
+            if not tokens:
+                return {'status': 'no_tokens'}
+            
+            adjustments = []
+            total_adjustment = 0.0
+            
+            for token in tokens:
+                # Get priority from associated task
+                priority = 2  # Default
+                
+                # Calculate target collateral
+                target_ratio = self.priority_ratios.get(priority, 1.2)
+                target_collateral = token.original_value * target_ratio
+                
+                # Calculate adjustment
+                current_collateral = token.collateral_amount
+                adjustment = target_collateral - current_collateral
+                
+                if abs(adjustment) > 0.01:
+                    token.collateral_amount = target_collateral
+                    token.collateral_adjustment = adjustment
+                    token.last_rebalance = datetime.utcnow()
+                    total_adjustment += adjustment
+                    adjustments.append({
+                        'token_id': token.token_id,
+                        'old_collateral': current_collateral,
+                        'new_collateral': target_collateral,
+                        'adjustment': adjustment
+                    })
+            
+            # Update collateral pool
+            self.collateral_pool += total_adjustment
+            
+            self.rebalancing_history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'tokens_rebalanced': len(adjustments),
+                'total_adjustment': total_adjustment
+            })
+            
+            return {
+                'status': 'success',
+                'tokens_rebalanced': len(adjustments),
+                'total_adjustment': total_adjustment,
+                'adjustments': adjustments
+            }
+    
+    def get_rebalancing_stats(self) -> Dict[str, Any]:
+        """Get rebalancing statistics"""
+        return {
+            'total_rebalances': len(self.rebalancing_history),
+            'current_collateral_pool': self.collateral_pool,
+            'recent_rebalances': list(self.rebalancing_history)[-10:],
+            'priority_ratios': self.priority_ratios
+        }
 
 # ============================================================================
 # Enhanced Biomass Storage
@@ -177,22 +620,22 @@ class StorageAnalytics:
 
 class BiomassStorage:
     """
-    Enhanced Biomass Storage v5.0.0
+    Enhanced Biomass Storage v6.0.0
     
-    Complete implementation with:
-    - Task deduplication and merging
-    - Demand-based mobilization
-    - Storage forecasting
-    - Priority-based retrieval
-    - Storage analytics
+    New Features:
+    - Dynamic tier capacity based on system load
+    - Similarity-based deduplication
+    - Predictive mobilization based on demand forecasts
+    - Real-time storage dashboard
+    - Collateral rebalancing based on task priority
     """
     
     def __init__(self, token_manager=None, gradient_manager=None):
         self.token_manager = token_manager
         self.gradient_manager = gradient_manager
         
-        # Storage tiers with dynamic capacity
-        self.tier_capacities = {
+        # Base tier capacities
+        self.base_tier_capacities = {
             StorageTier.ATP_CACHE: 100,
             StorageTier.GLYCOGEN_QUEUE: 1000,
             StorageTier.STARCH_RESERVE: 5000,
@@ -200,54 +643,60 @@ class BiomassStorage:
             StorageTier.LIGNIN_ARCHIVE: 50000
         }
         
-        # Storage queues
-        self.atp_cache: deque = deque(maxlen=self.tier_capacities[StorageTier.ATP_CACHE])
-        self.glycogen_queue: deque = deque(maxlen=self.tier_capacities[StorageTier.GLYCOGEN_QUEUE])
-        self.starch_reserve: deque = deque(maxlen=self.tier_capacities[StorageTier.STARCH_RESERVE])
-        self.lipid_depot: deque = deque(maxlen=self.tier_capacities[StorageTier.LIPID_DEPOT])
-        self.lignin_archive: deque = deque(maxlen=self.tier_capacities[StorageTier.LIGNIN_ARCHIVE])
+        # Dynamic capacity manager
+        self.capacity_manager = DynamicTierCapacityManager(self.base_tier_capacities)
+        
+        # Storage queues with dynamic capacity
+        self.atp_cache: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.ATP_CACHE))
+        self.glycogen_queue: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.GLYCOGEN_QUEUE))
+        self.starch_reserve: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.STARCH_RESERVE))
+        self.lipid_depot: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.LIPID_DEPOT))
+        self.lignin_archive: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.LIGNIN_ARCHIVE))
         
         # Storage tokens
         self.storage_tokens: Dict[str, StorageToken] = {}
         self.collateral_pool: float = 0.0
         
-        # Global task index for O(1) lookup
+        # Global task index
         self.task_index: Dict[str, Dict[str, Any]] = {}
         self.index_hits: int = 0
         self.index_misses: int = 0
         
-        # ================================================================
-        # NEW: Deduplication support
-        # ================================================================
-        self.task_hash_index: Dict[str, str] = {}  # hash → task_id
+        # Deduplication
+        self.task_hash_index: Dict[str, str] = {}
         self.deduplication_savings: int = 0
         self.merge_savings: int = 0
         
-        # ================================================================
-        # NEW: Demand-based mobilization
-        # ================================================================
+        # NEW: Similarity deduplication
+        self.similarity_dedup = SimilarityDeduplicator()
+        self.similarity_savings: int = 0
+        
+        # Mobilization
         self.mobilization_triggers: Dict[MobilizationTrigger, bool] = {
             MobilizationTrigger.CARBON_LOW: True,
             MobilizationTrigger.ENERGY_ABUNDANT: True,
             MobilizationTrigger.DEADLINE_URGENT: True,
             MobilizationTrigger.COMPARTMENT_AVAILABLE: True,
-            MobilizationTrigger.QUEUE_EMPTY: True
+            MobilizationTrigger.QUEUE_EMPTY: True,
+            MobilizationTrigger.PREDICTIVE: True  # NEW
         }
         self.mobilization_history: deque = deque(maxlen=500)
         self.total_mobilized: int = 0
         
-        # ================================================================
-        # NEW: Storage forecasting
-        # ================================================================
+        # NEW: Predictive mobilization
+        self.predictive_mobilizer = PredictiveMobilizationEngine()
+        
+        # NEW: Collateral rebalancer
+        self.collateral_rebalancer = CollateralRebalancer()
+        
+        # Storage forecasting
         self.inflow_history: deque = deque(maxlen=100)
         self.outflow_history: deque = deque(maxlen=100)
         self.forecast_history: deque = deque(maxlen=50)
         
-        # ================================================================
-        # NEW: Storage analytics
-        # ================================================================
+        # Analytics
         self.analytics_history: deque = deque(maxlen=1000)
-        self.analytics_interval = 300  # Generate analytics every 5 minutes
+        self.analytics_interval = 300
         
         # Conversion costs
         self.conversion_costs = {
@@ -274,11 +723,12 @@ class BiomassStorage:
         asyncio.create_task(self._mobilization_loop())
         asyncio.create_task(self._forecasting_loop())
         asyncio.create_task(self._analytics_loop())
+        asyncio.create_task(self._rebalancing_loop())
         
-        logger.info("Enhanced Biomass Storage v5.0.0 initialized with all features")
+        logger.info("Enhanced Biomass Storage v6.0.0 initialized with all features")
     
     # ========================================================================
-    # Core Storage Methods
+    # Core Storage Methods (Enhanced)
     # ========================================================================
     
     def store_task(
@@ -286,34 +736,30 @@ class BiomassStorage:
         guarantee: GuaranteeLevel = GuaranteeLevel.SILVER,
         deadline: Optional[datetime] = None,
         initial_tier: StorageTier = StorageTier.GLYCOGEN_QUEUE,
-        enable_dedup: bool = True
+        enable_dedup: bool = True,
+        enable_similarity: bool = True
     ) -> Tuple[bool, Optional[str]]:
         """
-        Store a task with deduplication support.
+        Store a task with deduplication and similarity support.
         
         Returns (success, storage_token_id).
         """
         task_id = task_data.get('task_id', f"stored_{uuid.uuid4().hex[:8]}")
         
-        # ================================================================
-        # NEW: Task deduplication
-        # ================================================================
+        # Content-based deduplication
         if enable_dedup:
             task_hash = hashlib.sha256(
                 json.dumps(task_data, sort_keys=True, default=str).encode()
             ).hexdigest()
             
-            # Check if identical task already exists
             if task_hash in self.task_hash_index:
                 existing_task_id = self.task_hash_index[task_hash]
                 existing = self._find_task_by_id(existing_task_id)
                 
                 if existing:
-                    # Increment reference count instead of storing duplicate
                     existing.reference_count += 1
                     self.deduplication_savings += 1
                     
-                    # Create a lightweight reference token
                     token = StorageToken(
                         token_id=f"stoken_{task_id}_{uuid.uuid4().hex[:6]}",
                         task_id=existing_task_id,
@@ -331,17 +777,55 @@ class BiomassStorage:
                     
                     logger.debug(f"Deduplicated task {task_id} → {existing_task_id} (refs: {existing.reference_count})")
                     return True, token.token_id
-            
-            # Check for mergeable tasks
-            merged = self._try_merge_task(task_data, task_id, task_hash)
-            if merged:
-                return True, merged
         
-        # Calculate collateral
+        # Similarity-based deduplication
+        if enable_similarity and self.similarity_dedup:
+            # Get existing tasks from all tiers
+            existing_tasks = []
+            for tier in StorageTier:
+                queue = self._get_tier_queue(tier)
+                existing_tasks.extend(list(queue))
+            
+            similar = asyncio.run(self.similarity_dedup.find_similar(task_data, existing_tasks))
+            if similar:
+                similar_task_id, score = similar
+                existing = self._find_task_by_id(similar_task_id)
+                if existing:
+                    # Group similar tasks
+                    asyncio.run(self.similarity_dedup.group_similar(task_id, similar_task_id, score))
+                    
+                    existing.similar_task_ids.append(task_id)
+                    existing.similarity_score = score
+                    self.similarity_savings += 1
+                    
+                    # Create reference token
+                    token = StorageToken(
+                        token_id=f"stoken_{task_id}_{uuid.uuid4().hex[:6]}",
+                        task_id=similar_task_id,
+                        original_value=ecoatp_cost * 0.5,  # Reduced cost for similar
+                        guarantee=GuaranteeLevel.BEST_EFFORT,
+                        collateral_amount=ecoatp_cost * 0.2,
+                        storage_tier=existing.storage_tier,
+                        stored_at=datetime.utcnow(),
+                        expires_at=deadline or (datetime.utcnow() + timedelta(days=7)),
+                        is_duplicate=True
+                    )
+                    
+                    self.storage_tokens[token.token_id] = token
+                    self.collateral_pool += token.collateral_amount
+                    
+                    logger.debug(f"Similar task {task_id} → {similar_task_id} (score: {score:.2f})")
+                    return True, token.token_id
+        
+        # Merge check
+        merged = self._try_merge_task(task_data, task_id, task_hash if enable_dedup else "")
+        if merged:
+            return True, merged
+        
+        # Regular storage
         collateral_ratio = self.collateral_ratios[guarantee]
         collateral = ecoatp_cost * collateral_ratio
         
-        # Create stored task
         stored = StoredTask(
             task_id=task_id,
             task_data=task_data,
@@ -353,7 +837,6 @@ class BiomassStorage:
             priority=task_data.get('priority', 0)
         )
         
-        # Create storage token
         token = StorageToken(
             token_id=f"stoken_{task_id}_{uuid.uuid4().hex[:6]}",
             task_id=task_id,
@@ -365,33 +848,26 @@ class BiomassStorage:
             expires_at=deadline or (datetime.utcnow() + timedelta(days=7))
         )
         
-        # Add to tier
         queue = self._get_tier_queue(initial_tier)
-        position = len(queue)
         queue.append(stored)
         
-        # Add to indexes
-        self._add_to_index(task_id, initial_tier, position)
+        self._add_to_index(task_id, initial_tier, len(queue) - 1)
         if enable_dedup and task_hash:
             self.task_hash_index[task_hash] = task_id
         
         self.storage_tokens[token.token_id] = token
         self.collateral_pool += collateral
-        
-        # Track inflow
         self.inflow_history.append(datetime.utcnow())
+        
+        # Update capacity manager with current load
+        self.capacity_manager.update_system_load(len(queue) / max(self.capacity_manager.get_capacity(initial_tier), 1))
         
         logger.info(f"Stored task {task_id} in {initial_tier.value}: cost={ecoatp_cost:.1f}")
         return True, token.token_id
     
     def _try_merge_task(self, task_data: Dict[str, Any], task_id: str, 
                        task_hash: str) -> Optional[str]:
-        """
-        Try to merge similar tasks for batch execution.
-        
-        Returns token_id if merged, None otherwise.
-        """
-        # Look for similar tasks in the same tier
+        """Try to merge similar tasks for batch execution"""
         task_type = task_data.get('task_type', '')
         complexity = task_data.get('complexity', 0.5)
         
@@ -400,7 +876,6 @@ class BiomassStorage:
             if not existing:
                 continue
             
-            # Check if mergeable (same type, similar complexity)
             existing_type = existing.task_data.get('task_type', '')
             existing_complexity = existing.task_data.get('complexity', 0.5)
             
@@ -409,7 +884,6 @@ class BiomassStorage:
                 not existing.is_merged and
                 len(existing.merged_task_ids) < 10):
                 
-                # Merge into existing task
                 if not existing.is_merged:
                     existing.is_merged = True
                     existing.merged_task_ids = [existing.task_id]
@@ -417,19 +891,16 @@ class BiomassStorage:
                 
                 existing.merged_task_ids.append(task_id)
                 existing.original_complexities.append(complexity)
-                
-                # Update complexity to combined value
                 existing.task_data['complexity'] = min(1.0, sum(existing.original_complexities) * 0.7)
                 existing.task_data['batch_execution'] = True
                 existing.task_data['batch_size'] = len(existing.merged_task_ids)
                 
                 self.merge_savings += 1
                 
-                # Create reference token
                 token = StorageToken(
                     token_id=f"stoken_{task_id}_{uuid.uuid4().hex[:6]}",
                     task_id=existing_id,
-                    original_value=0,  # No additional cost
+                    original_value=0,
                     guarantee=GuaranteeLevel.BEST_EFFORT,
                     collateral_amount=0,
                     storage_tier=existing.storage_tier,
@@ -446,28 +917,26 @@ class BiomassStorage:
         return None
     
     def retrieve_task(self, token_id: str, force_retrieve: bool = False) -> Tuple[Optional[Dict[str, Any]], float]:
-        """
-        Enhanced retrieval with priority ordering.
-        
-        Returns (task_data, retrieval_cost).
-        """
+        """Enhanced retrieval with priority ordering"""
         if token_id not in self.storage_tokens:
             return None, 0.0
         
         token = self.storage_tokens[token_id]
         
-        # Handle duplicate references
         if token.is_duplicate:
             existing = self._find_task_by_id(token.task_id)
             if existing:
                 existing.reference_count = max(0, existing.reference_count - 1)
+                # Remove from similar groups if reference count is zero
+                if existing.reference_count == 0 and existing.similar_task_ids:
+                    for group_id, members in self.similarity_dedup.similarity_groups.items():
+                        if token.task_id in members:
+                            members.remove(token.task_id)
             token.is_executed = True
             del self.storage_tokens[token_id]
             return existing.task_data if existing else None, 0.0
         
         task_id = token.task_id
-        
-        # Find task using index
         location = self.find_task(task_id)
         
         if location:
@@ -481,23 +950,19 @@ class BiomassStorage:
         
         retrieval_cost = stored_task.current_retrieval_cost
         
-        # Update access tracking
         stored_task.access_count += 1
         stored_task.last_accessed = datetime.utcnow()
         
-        # Remove from tier
         queue = self._get_tier_queue(stored_task.storage_tier)
         try:
             queue.remove(stored_task)
         except ValueError:
             pass
         
-        # Clean up indexes
         self._remove_from_index(task_id)
         if stored_task.task_hash:
             self.task_hash_index.pop(stored_task.task_hash, None)
         
-        # Handle merged tasks
         if stored_task.is_merged and stored_task.merged_task_ids:
             stored_task.task_data['merged_tasks'] = stored_task.merged_task_ids
             stored_task.task_data['total_original_tasks'] = len(stored_task.merged_task_ids)
@@ -506,72 +971,32 @@ class BiomassStorage:
         self.collateral_pool -= token.collateral_amount
         del self.storage_tokens[token_id]
         
-        # Track outflow
         self.outflow_history.append(datetime.utcnow())
         
         logger.info(f"Retrieved task {task_id}: cost={retrieval_cost:.1f}, refs={stored_task.reference_count}")
         return stored_task.task_data, retrieval_cost
     
-    def retrieve_highest_priority(self) -> Tuple[Optional[Dict[str, Any]], float, Optional[str]]:
-        """
-        NEW: Retrieve the highest priority task across all tiers.
-        
-        Returns (task_data, retrieval_cost, token_id).
-        """
-        best_task = None
-        best_score = -1
-        best_token_id = None
-        
-        for token_id, token in self.storage_tokens.items():
-            if token.is_executed or token.is_duplicate:
-                continue
-            
-            location = self.find_task(token.task_id)
-            if not location:
-                continue
-            
-            tier, position = location
-            task = self._get_from_tier_position(tier, position)
-            if not task:
-                continue
-            
-            score = task.retrieval_priority_score
-            
-            if score > best_score:
-                best_score = score
-                best_task = task
-                best_token_id = token_id
-        
-        if best_task and best_token_id:
-            return self.retrieve_task(best_token_id)
-        
-        return None, 0.0, None
-    
     # ========================================================================
-    # Demand-Based Mobilization (NEW)
+    # Enhanced Mobilization with Predictive Support
     # ========================================================================
     
     def should_mobilize(self) -> List[MobilizationTrigger]:
-        """
-        Check multiple signals to determine if tasks should be mobilized.
-        
-        Returns list of active mobilization triggers.
-        """
+        """Check multiple signals for mobilization triggers"""
         triggers = []
         
-        # Check carbon gradient
+        # Carbon gradient check
         if (self.gradient_manager and 
             self.mobilization_triggers[MobilizationTrigger.CARBON_LOW]):
             carbon = self.gradient_manager.fields.get('carbon')
             if carbon and carbon.effective_strength < 0.3:
                 triggers.append(MobilizationTrigger.CARBON_LOW)
         
-        # Check if queues are empty (need more work)
+        # Queue empty check
         if self.mobilization_triggers[MobilizationTrigger.QUEUE_EMPTY]:
             if len(self.atp_cache) < 20:
                 triggers.append(MobilizationTrigger.QUEUE_EMPTY)
         
-        # Check for urgent deadlines
+        # Deadline urgent check
         if self.mobilization_triggers[MobilizationTrigger.DEADLINE_URGENT]:
             now = datetime.utcnow()
             for task in list(self.glycogen_queue)[:50]:
@@ -579,15 +1004,21 @@ class BiomassStorage:
                     triggers.append(MobilizationTrigger.DEADLINE_URGENT)
                     break
         
+        # NEW: Predictive trigger
+        if self.mobilization_triggers[MobilizationTrigger.PREDICTIVE]:
+            # Check if predictive mobilization is recommended
+            current_mobilized = self.total_mobilized
+            recommendation = asyncio.run(
+                self.predictive_mobilizer.get_mobilization_recommendation(current_mobilized)
+            )
+            if recommendation.get('action') == 'mobilize':
+                triggers.append(MobilizationTrigger.PREDICTIVE)
+        
         return triggers
     
     def mobilize_tasks(self, target_tier: StorageTier = StorageTier.ATP_CACHE, 
                       max_count: int = 10) -> int:
-        """
-        Mobilize tasks from slower tiers to faster tiers based on demand signals.
-        
-        Returns number of tasks mobilized.
-        """
+        """Enhanced mobilization with predictive support"""
         triggers = self.should_mobilize()
         
         if not triggers:
@@ -595,11 +1026,17 @@ class BiomassStorage:
         
         mobilized = 0
         
-        # Mobilize from glycogen to ATP (fastest path)
+        # Check if predictive mobilization is active
+        if MobilizationTrigger.PREDICTIVE in triggers:
+            # Adjust max_count based on forecast
+            forecast = asyncio.run(self.predictive_mobilizer.forecast_demand())
+            if forecast.get('status') == 'success':
+                avg_forecast = forecast['average']
+                max_count = int(max_count * (1.0 + avg_forecast * 0.5))
+        
         if target_tier == StorageTier.ATP_CACHE:
             source_queue = self.glycogen_queue
             
-            # Prioritize urgent tasks
             urgent_tasks = []
             normal_tasks = []
             
@@ -609,9 +1046,8 @@ class BiomassStorage:
                 else:
                     normal_tasks.append(task)
             
-            # Mobilize urgent first, then normal
             for task in urgent_tasks[:max_count]:
-                if len(self.atp_cache) < self.tier_capacities[StorageTier.ATP_CACHE]:
+                if len(self.atp_cache) < self.capacity_manager.get_capacity(StorageTier.ATP_CACHE):
                     source_queue.remove(task)
                     task.storage_tier = StorageTier.ATP_CACHE
                     self.atp_cache.append(task)
@@ -620,7 +1056,7 @@ class BiomassStorage:
             
             remaining = max_count - mobilized
             for task in normal_tasks[:remaining]:
-                if len(self.atp_cache) < self.tier_capacities[StorageTier.ATP_CACHE]:
+                if len(self.atp_cache) < self.capacity_manager.get_capacity(StorageTier.ATP_CACHE):
                     source_queue.remove(task)
                     task.storage_tier = StorageTier.ATP_CACHE
                     self.atp_cache.append(task)
@@ -633,51 +1069,67 @@ class BiomassStorage:
                 'timestamp': datetime.utcnow().isoformat(),
                 'count': mobilized,
                 'triggers': [t.value for t in triggers],
-                'target_tier': target_tier.value
+                'target_tier': target_tier.value,
+                'predictive_used': MobilizationTrigger.PREDICTIVE in triggers
             })
+            
+            # Record demand for predictive engine
+            self.predictive_mobilizer.record_demand(mobilized / max(max_count, 1))
             
             logger.info(f"Mobilized {mobilized} tasks to {target_tier.value} (triggers: {[t.value for t in triggers]})")
         
         return mobilized
     
     # ========================================================================
-    # Storage Forecasting (NEW)
+    # Collateral Rebalancing (NEW)
+    # ========================================================================
+    
+    async def _rebalancing_loop(self):
+        """Background collateral rebalancing loop"""
+        while True:
+            try:
+                # Rebalance collateral for active tokens
+                active_tokens = [t for t in self.storage_tokens.values() if not t.is_executed]
+                if active_tokens:
+                    await self.collateral_rebalancer.rebalance(active_tokens)
+                
+                await asyncio.sleep(600)  # Every 10 minutes
+            except Exception as e:
+                logger.error(f"Rebalancing loop error: {str(e)}")
+                await asyncio.sleep(120)
+    
+    # ========================================================================
+    # Enhanced Forecasting with Dynamic Capacity
     # ========================================================================
     
     def forecast_storage(self, tier: StorageTier, horizon_seconds: float = 3600) -> StorageForecast:
-        """
-        Predict when a storage tier will reach capacity.
-        
-        Returns StorageForecast with predicted full time.
-        """
+        """Enhanced forecast with dynamic capacity"""
         queue = self._get_tier_queue(tier)
         current_usage = len(queue)
-        capacity = self.tier_capacities.get(tier, 1000)
+        capacity = self.capacity_manager.get_capacity(tier)
         
-        # Calculate inflow rate
         recent_inflow = [t for t in self.inflow_history 
                         if (datetime.utcnow() - t).total_seconds() < 3600]
         inflow_rate = len(recent_inflow) / 3600.0 if recent_inflow else 0.0
         
-        # Calculate outflow rate
         recent_outflow = [t for t in self.outflow_history 
                          if (datetime.utcnow() - t).total_seconds() < 3600]
         outflow_rate = len(recent_outflow) / 3600.0 if recent_outflow else 0.0
         
-        # Calculate net fill rate
         net_rate = inflow_rate - outflow_rate
         
-        # Predict time to full
         if net_rate <= 0 or capacity <= current_usage:
-            predicted_full_time = None  # Won't fill or already full
+            predicted_full_time = None
             confidence = 0.9
         else:
             remaining = capacity - current_usage
             seconds_to_full = remaining / net_rate
             predicted_full_time = datetime.utcnow() + timedelta(seconds=seconds_to_full)
-            
-            # Confidence based on data quantity
             confidence = min(0.9, len(recent_inflow) / 100)
+        
+        # Get dynamic capacity info
+        scaling_stats = self.capacity_manager.get_scaling_stats()
+        dynamic_capacity = capacity
         
         forecast = StorageForecast(
             tier=tier,
@@ -686,42 +1138,76 @@ class BiomassStorage:
             inflow_rate=inflow_rate,
             outflow_rate=outflow_rate,
             predicted_full_time=predicted_full_time,
-            confidence=confidence
+            confidence=confidence,
+            dynamic_capacity=dynamic_capacity,
+            scaling_factor=scaling_stats.get('current_scaling_factor', 1.0)
         )
         
         self.forecast_history.append(forecast)
         
         return forecast
     
-    def get_capacity_warnings(self) -> List[str]:
-        """Get capacity warnings for all tiers"""
-        warnings = []
+    # ========================================================================
+    # Storage Dashboard (NEW)
+    # ========================================================================
+    
+    def get_dashboard_data(self) -> StorageDashboardData:
+        """Get real-time storage dashboard data"""
+        total_stored = sum(len(self._get_tier_queue(t)) for t in StorageTier)
         
+        tier_utilization = {}
         for tier in StorageTier:
-            forecast = self.forecast_storage(tier, horizon_seconds=3600)
-            
-            utilization = forecast.current_usage / max(forecast.capacity, 1)
-            
-            if utilization > 0.9:
-                warnings.append(f"CRITICAL: {tier.value} at {utilization:.0%} capacity")
-            elif utilization > 0.7:
-                warnings.append(f"WARNING: {tier.value} at {utilization:.0%} capacity")
-            
-            if forecast.predicted_full_time:
-                time_to_full = (forecast.predicted_full_time - datetime.utcnow()).total_seconds()
-                if time_to_full < 1800:  # Less than 30 minutes
-                    warnings.append(
-                        f"URGENT: {tier.value} predicted full in {time_to_full:.0f}s"
-                    )
+            queue = self._get_tier_queue(tier)
+            capacity = self.capacity_manager.get_capacity(tier)
+            tier_utilization[tier.value] = len(queue) / max(capacity, 1)
         
-        return warnings
+        # Retrieval metrics
+        active_tokens = [t for t in self.storage_tokens.values() if not t.is_executed]
+        avg_retrieval_cost = np.mean([t.retrieval_cost for t in active_tokens]) if active_tokens else 0.0
+        
+        # Mobilization activity
+        recent_mobilizations = list(self.mobilization_history)[-20:]
+        mobilization_rate = len(recent_mobilizations) / 20 if len(recent_mobilizations) >= 20 else 0
+        
+        # Deduplication stats
+        dedup_stats = {
+            'exact_savings': self.deduplication_savings,
+            'merge_savings': self.merge_savings,
+            'similarity_savings': self.similarity_savings,
+            'total_savings': self.deduplication_savings + self.merge_savings + self.similarity_savings
+        }
+        
+        # Recommendations
+        recommendations = self.get_optimization_recommendations()
+        
+        return StorageDashboardData(
+            timestamp=datetime.utcnow(),
+            storage_overview={
+                'total_stored': total_stored,
+                'active_tokens': len(active_tokens),
+                'collateral_pool': self.collateral_pool
+            },
+            tier_utilization=tier_utilization,
+            retrieval_metrics={
+                'avg_retrieval_cost': avg_retrieval_cost,
+                'cache_hit_rate': self.index_hits / max(self.index_hits + self.index_misses, 1),
+                'mobilization_rate': mobilization_rate
+            },
+            mobilization_activity={
+                'total_mobilized': self.total_mobilized,
+                'recent_count': len(recent_mobilizations),
+                'last_mobilization': self.mobilization_history[-1] if self.mobilization_history else None
+            },
+            deduplication_stats=dedup_stats,
+            recommendations=recommendations
+        )
     
     # ========================================================================
-    # Storage Analytics (NEW)
+    # Enhanced Analytics with Similarity and Collateral Metrics
     # ========================================================================
     
     def generate_analytics(self) -> StorageAnalytics:
-        """Generate comprehensive storage analytics"""
+        """Generate comprehensive storage analytics with new metrics"""
         total_stored = sum(len(self._get_tier_queue(t)) for t in StorageTier)
         
         tier_distribution = {
@@ -729,11 +1215,9 @@ class BiomassStorage:
             for tier in StorageTier
         }
         
-        # Calculate average retrieval cost
         active_tokens = [t for t in self.storage_tokens.values() if not t.is_executed]
         avg_cost = np.mean([t.retrieval_cost for t in active_tokens]) if active_tokens else 0.0
         
-        # Calculate conversion efficiency
         total_conversions = sum(
             len(task.conversion_history)
             for tier in StorageTier
@@ -744,17 +1228,22 @@ class BiomassStorage:
         )
         conversion_efficiency = successful_retrievals / max(total_conversions, 1)
         
-        # Calculate expiration rate
         total_tokens = max(len(self.storage_tokens), 1)
         expired = sum(1 for t in self.storage_tokens.values() if t.penalty_paid)
         expiration_rate = expired / total_tokens
         
-        # Calculate mobilization rate
         mobilization_rate = self.total_mobilized / max(total_tokens, 1)
+        cache_hit_rate = self.index_hits / max(self.index_hits + self.index_misses, 1)
         
-        # Calculate cache hit rate
-        total_lookups = self.index_hits + self.index_misses
-        cache_hit_rate = self.index_hits / max(total_lookups, 1)
+        # Similarity deduplication stats
+        group_stats = self.similarity_dedup.get_group_stats()
+        similarity_savings = self.similarity_savings
+        similarity_groups = group_stats.get('total_groups', 0)
+        
+        # Collateral metrics
+        avg_collateral = np.mean([t.collateral_amount for t in active_tokens]) if active_tokens else 0
+        total_collateral = self.collateral_pool
+        collateral_utilization = total_collateral / max(avg_collateral * len(active_tokens), 1) if active_tokens else 0
         
         analytics = StorageAnalytics(
             timestamp=datetime.utcnow(),
@@ -766,7 +1255,11 @@ class BiomassStorage:
             conversion_efficiency=conversion_efficiency,
             expiration_rate=expiration_rate,
             mobilization_rate=mobilization_rate,
-            cache_hit_rate=cache_hit_rate
+            cache_hit_rate=cache_hit_rate,
+            similarity_savings=similarity_savings,
+            similarity_groups=similarity_groups,
+            avg_collateral_ratio=avg_collateral / max(avg_cost, 1),
+            collateral_utilization=collateral_utilization
         )
         
         self.analytics_history.append(analytics)
@@ -774,14 +1267,18 @@ class BiomassStorage:
         return analytics
     
     def get_optimization_recommendations(self) -> List[str]:
-        """Generate storage optimization recommendations"""
+        """Enhanced optimization recommendations"""
         recommendations = []
         analytics = self.generate_analytics()
         
-        # Check utilization
+        # Check utilization with dynamic capacity
+        scaling_stats = self.capacity_manager.get_scaling_stats()
+        if scaling_stats.get('current_scaling_factor', 1.0) > 1.2:
+            recommendations.append("System load high - dynamic capacity increased")
+        
         for tier, count in analytics.tier_distribution.items():
             tier_enum = StorageTier(tier)
-            capacity = self.tier_capacities.get(tier_enum, 1000)
+            capacity = self.capacity_manager.get_capacity(tier_enum)
             utilization = count / max(capacity, 1)
             
             if utilization > 0.8:
@@ -789,24 +1286,43 @@ class BiomassStorage:
                     f"Increase {tier} capacity or accelerate conversion to slower tier"
                 )
         
-        # Check deduplication savings
-        if self.deduplication_savings > 0:
-            savings_pct = self.deduplication_savings / max(analytics.total_stored, 1) * 100
+        # Deduplication recommendations
+        total_savings = self.deduplication_savings + self.merge_savings + self.similarity_savings
+        if total_savings > 0:
+            savings_pct = total_savings / max(analytics.total_stored + total_savings, 1) * 100
             recommendations.append(
-                f"Deduplication saved {self.deduplication_savings} slots ({savings_pct:.1f}%)"
+                f"Deduplication saved {total_savings} slots ({savings_pct:.1f}%)"
             )
         
-        # Check conversion efficiency
+        # Similarity deduplication recommendation
+        if self.similarity_savings > 0:
+            recommendations.append(
+                f"Similarity deduplication saved {self.similarity_savings} slots"
+            )
+        
+        # Collateral recommendations
+        if analytics.collateral_utilization < 0.3:
+            recommendations.append(
+                "Low collateral utilization - consider reducing guarantee levels"
+            )
+        
         if analytics.conversion_efficiency < 0.5:
             recommendations.append(
                 "Low conversion efficiency. Review tier migration schedule."
             )
         
-        # Check expiration rate
         if analytics.expiration_rate > 0.1:
             recommendations.append(
                 f"High expiration rate ({analytics.expiration_rate:.1%}). "
                 "Consider reducing guarantee levels or extending deadlines."
+            )
+        
+        # Predictive mobilization recommendation
+        forecast = asyncio.run(self.predictive_mobilizer.forecast_demand())
+        if forecast.get('status') == 'success' and forecast.get('trend') == 'increasing':
+            recommendations.append(
+                f"Demand forecast indicates increasing trend ({forecast['average']:.2f}). "
+                "Consider proactive mobilization."
             )
         
         if not recommendations:
@@ -815,11 +1331,10 @@ class BiomassStorage:
         return recommendations
     
     # ========================================================================
-    # Index Methods
+    # Index Methods (Preserved)
     # ========================================================================
     
     def _add_to_index(self, task_id: str, tier: StorageTier, position: int):
-        """Add task to global index"""
         self.task_index[task_id] = {
             'tier': tier,
             'position': position,
@@ -829,18 +1344,15 @@ class BiomassStorage:
         }
     
     def _update_index_position(self, task_id: str, new_tier: StorageTier, new_position: int):
-        """Update task position after tier conversion"""
         if task_id in self.task_index:
             self.task_index[task_id]['tier'] = new_tier
             self.task_index[task_id]['position'] = new_position
             self.task_index[task_id]['stored_at'] = datetime.utcnow()
     
     def _remove_from_index(self, task_id: str):
-        """Remove task from index"""
         self.task_index.pop(task_id, None)
     
     def find_task(self, task_id: str) -> Optional[Tuple[StorageTier, int]]:
-        """Find task using global index - O(1)"""
         if task_id in self.task_index:
             self.index_hits += 1
             entry = self.task_index[task_id]
@@ -851,21 +1363,18 @@ class BiomassStorage:
         return None
     
     def _find_task_by_id(self, task_id: str) -> Optional[StoredTask]:
-        """Find task object by ID across all tiers"""
         location = self.find_task(task_id)
         if location:
             return self._get_from_tier_position(location[0], location[1])
         return self._scan_all_tiers(task_id)
     
     def _get_from_tier_position(self, tier: StorageTier, position: int) -> Optional[StoredTask]:
-        """Get task from specific tier position"""
         queue = self._get_tier_queue(tier)
         if position < len(queue):
             return queue[position]
         return None
     
     def _scan_all_tiers(self, task_id: str) -> Optional[StoredTask]:
-        """Fallback: scan all tiers"""
         for tier in StorageTier:
             queue = self._get_tier_queue(tier)
             for i, task in enumerate(queue):
@@ -875,7 +1384,6 @@ class BiomassStorage:
         return None
     
     def _get_tier_queue(self, tier: StorageTier) -> deque:
-        """Get the queue for a storage tier"""
         tier_map = {
             StorageTier.ATP_CACHE: self.atp_cache,
             StorageTier.GLYCOGEN_QUEUE: self.glycogen_queue,
@@ -886,11 +1394,10 @@ class BiomassStorage:
         return tier_map.get(tier, deque())
     
     # ========================================================================
-    # Tier Conversion
+    # Tier Conversion (Preserved)
     # ========================================================================
     
     def convert_tier(self, token_id: str, target_tier: StorageTier) -> bool:
-        """Convert stored task between tiers"""
         if token_id not in self.storage_tokens:
             return False
         
@@ -912,14 +1419,12 @@ class BiomassStorage:
         if stored_task is None:
             return False
         
-        # Remove from current tier
         queue = self._get_tier_queue(current_tier)
         try:
             queue.remove(stored_task)
         except ValueError:
             pass
         
-        # Calculate conversion cost
         conversion_cost = self.conversion_costs.get((current_tier, target_tier), 3.0)
         stored_task.current_retrieval_cost += conversion_cost
         stored_task.conversion_history.append({
@@ -929,12 +1434,10 @@ class BiomassStorage:
             'timestamp': datetime.utcnow().isoformat()
         })
         
-        # Update tier
         stored_task.storage_tier = target_tier
         token.storage_tier = target_tier
         token.retrieval_cost = stored_task.current_retrieval_cost
         
-        # Add to new tier
         new_queue = self._get_tier_queue(target_tier)
         new_position = len(new_queue)
         new_queue.append(stored_task)
@@ -945,11 +1448,10 @@ class BiomassStorage:
         return True
     
     # ========================================================================
-    # Background Loops
+    # Background Loops (Enhanced)
     # ========================================================================
     
     async def _maintenance_loop(self):
-        """Enhanced maintenance with capacity warnings"""
         while True:
             try:
                 now = datetime.utcnow()
@@ -976,11 +1478,11 @@ class BiomassStorage:
                         
                         del self.storage_tokens[token_id]
                 
-                # Check capacity warnings
-                warnings = self.get_capacity_warnings()
-                for warning in warnings:
-                    if warning.startswith("CRITICAL"):
-                        logger.warning(warning)
+                # Update dynamic capacities
+                for tier in StorageTier:
+                    queue = self._get_tier_queue(tier)
+                    load = len(queue) / max(self.capacity_manager.get_capacity(tier), 1)
+                    self.capacity_manager.update_system_load(load)
                 
                 # Auto-convert old tasks
                 for stored in list(self.glycogen_queue):
@@ -996,7 +1498,6 @@ class BiomassStorage:
                 await asyncio.sleep(60)
     
     async def _mobilization_loop(self):
-        """Demand-based mobilization loop"""
         while True:
             try:
                 self.mobilize_tasks(StorageTier.ATP_CACHE, max_count=10)
@@ -1006,7 +1507,6 @@ class BiomassStorage:
                 await asyncio.sleep(60)
     
     async def _forecasting_loop(self):
-        """Storage forecasting loop"""
         while True:
             try:
                 for tier in [StorageTier.GLYCOGEN_QUEUE, StorageTier.STARCH_RESERVE]:
@@ -1017,7 +1517,6 @@ class BiomassStorage:
                 await asyncio.sleep(600)
     
     async def _analytics_loop(self):
-        """Storage analytics generation loop"""
         while True:
             try:
                 self.generate_analytics()
@@ -1027,18 +1526,17 @@ class BiomassStorage:
                 await asyncio.sleep(600)
     
     def _find_token(self, task_id: str) -> Optional[StorageToken]:
-        """Find storage token for task"""
         for token in self.storage_tokens.values():
             if token.task_id == task_id and not token.is_duplicate:
                 return token
         return None
     
     # ========================================================================
-    # Statistics
+    # Enhanced Statistics
     # ========================================================================
     
     def get_storage_stats(self) -> Dict[str, Any]:
-        """Get comprehensive storage statistics"""
+        """Get comprehensive storage statistics with new metrics"""
         stats = {
             'tiers': {
                 tier.value: len(self._get_tier_queue(tier))
@@ -1053,26 +1551,30 @@ class BiomassStorage:
                 'hit_rate': self.index_hits / max(self.index_hits + self.index_misses, 1)
             },
             'deduplication': {
-                'savings': self.deduplication_savings,
+                'exact_savings': self.deduplication_savings,
                 'merge_savings': self.merge_savings,
-                'total_saved': self.deduplication_savings + self.merge_savings
+                'similarity_savings': self.similarity_savings,
+                'total_saved': self.deduplication_savings + self.merge_savings + self.similarity_savings
             },
+            'similarity_groups': self.similarity_dedup.get_group_stats(),
             'mobilization': {
                 'total_mobilized': self.total_mobilized,
-                'recent': list(self.mobilization_history)[-10:]
+                'recent': list(self.mobilization_history)[-10:],
+                'predictive_active': MobilizationTrigger.PREDICTIVE in [t.value for t in self.mobilization_triggers]
             },
-            'capacity_warnings': self.get_capacity_warnings()
-        }
-        
-        # Add latest forecast
-        stats['forecast'] = {
-            tier.value: {
-                'current': self.forecast_storage(tier).current_usage,
-                'capacity': self.forecast_storage(tier).capacity,
-                'predicted_full': self.forecast_storage(tier).predicted_full_time.isoformat() 
-                if self.forecast_storage(tier).predicted_full_time else None
-            }
-            for tier in [StorageTier.GLYCOGEN_QUEUE, StorageTier.STARCH_RESERVE]
+            'capacity_dynamic': self.capacity_manager.get_scaling_stats(),
+            'collateral_rebalancing': self.collateral_rebalancer.get_rebalancing_stats(),
+            'forecast': {
+                tier.value: {
+                    'current': self.forecast_storage(tier).current_usage,
+                    'capacity': self.forecast_storage(tier).capacity,
+                    'dynamic_capacity': self.forecast_storage(tier).dynamic_capacity,
+                    'predicted_full': self.forecast_storage(tier).predicted_full_time.isoformat() 
+                    if self.forecast_storage(tier).predicted_full_time else None
+                }
+                for tier in [StorageTier.GLYCOGEN_QUEUE, StorageTier.STARCH_RESERVE]
+            },
+            'recommendations': self.get_optimization_recommendations()
         }
         
         # Add latest analytics
@@ -1081,37 +1583,42 @@ class BiomassStorage:
             stats['analytics'] = {
                 'deduplication_savings': latest.deduplication_savings,
                 'merge_savings': latest.merge_savings,
+                'similarity_savings': latest.similarity_savings,
                 'avg_retrieval_cost': latest.avg_retrieval_cost,
                 'conversion_efficiency': latest.conversion_efficiency,
                 'expiration_rate': latest.expiration_rate,
                 'mobilization_rate': latest.mobilization_rate,
-                'cache_hit_rate': latest.cache_hit_rate
+                'cache_hit_rate': latest.cache_hit_rate,
+                'avg_collateral_ratio': latest.avg_collateral_ratio,
+                'collateral_utilization': latest.collateral_utilization
             }
         
-        # Add recommendations
-        stats['recommendations'] = self.get_optimization_recommendations()
+        # Add dashboard data
+        stats['dashboard'] = self.get_dashboard_data().__dict__
         
         return stats
     
     def get_deduplication_report(self) -> Dict[str, Any]:
-        """Get deduplication savings report"""
+        """Get enhanced deduplication report"""
         total_stored = sum(len(self._get_tier_queue(t)) for t in StorageTier)
-        total_saved = self.deduplication_savings + self.merge_savings
+        total_saved = self.deduplication_savings + self.merge_savings + self.similarity_savings
         
         return {
-            'deduplication_savings': self.deduplication_savings,
+            'exact_savings': self.deduplication_savings,
             'merge_savings': self.merge_savings,
+            'similarity_savings': self.similarity_savings,
             'total_savings': total_saved,
             'savings_percentage': total_saved / max(total_stored + total_saved, 1) * 100,
             'hash_index_size': len(self.task_hash_index),
+            'similarity_groups': self.similarity_dedup.get_group_stats(),
             'recommendation': (
-                f"Deduplication and merging saved {total_saved} storage slots "
+                f"Deduplication saved {total_saved} storage slots "
                 f"({total_saved / max(total_stored + total_saved, 1) * 100:.1f}% reduction)"
             )
         }
     
     def get_mobilization_report(self) -> Dict[str, Any]:
-        """Get mobilization activity report"""
+        """Get enhanced mobilization report"""
         recent = list(self.mobilization_history)[-50:]
         
         if not recent:
@@ -1122,11 +1629,18 @@ class BiomassStorage:
             for trigger in entry.get('triggers', []):
                 trigger_counts[trigger] += 1
         
+        # Get predictive forecast
+        forecast = asyncio.run(self.predictive_mobilizer.forecast_demand())
+        
         return {
             'total_mobilized': self.total_mobilized,
             'recent_activity': len(recent),
             'trigger_distribution': dict(trigger_counts),
             'most_common_trigger': max(trigger_counts, key=trigger_counts.get) if trigger_counts else 'none',
+            'predictive_mobilization': {
+                'active': MobilizationTrigger.PREDICTIVE in [t.value for t in self.mobilization_triggers],
+                'demand_forecast': forecast
+            },
             'recommendation': (
                 f"Most mobilizations triggered by: {max(trigger_counts, key=trigger_counts.get) if trigger_counts else 'none'}. "
                 f"Total mobilized: {self.total_mobilized}"
