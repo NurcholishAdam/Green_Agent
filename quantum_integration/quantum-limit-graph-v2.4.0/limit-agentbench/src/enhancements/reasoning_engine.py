@@ -2,102 +2,639 @@
 """
 Reasoning Engine for Green Agent
 Implements temporal, causal, ethical, contextual, systemic, and reflexive reasoning
+Enhanced with live data integration, persistent learning, and performance prediction
 """
 
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, TypedDict, Union
 from dataclasses import dataclass, field
 from enum import Enum
 import json
 import hashlib
 import numpy as np
 from collections import defaultdict, deque
+import sqlite3
+import aiohttp
+import pickle
+from pathlib import Path
+import os
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Temporal Reasoning: Carbon Intensity Awareness
+# Type Definitions for Better Code Clarity
 # ============================================================================
 
-class CarbonIntensityAwareScheduler:
-    """Schedule computations during low-carbon periods"""
+class SchedulingRecommendation(TypedDict):
+    """Type definition for scheduling recommendations"""
+    action: str
+    reason: str
+    schedule: str
+    expected_intensity: float
+    carbon_savings: float
+    task: str
+    urgency: str
+    compute_hours: float
+    current_intensity: float
+    forecast_window_hours: int
+
+class CausalExplanationDict(TypedDict):
+    """Type definition for causal explanations"""
+    primary_driver: str
+    contribution: float
+    pathway: List[str]
+    alternatives: List[str]
+    confidence: float
+
+class EthicalAssessment(TypedDict):
+    """Type definition for ethical assessments"""
+    score: float
+    concern: str
+    rules_violated: Optional[List[str]]
+    compliant: Optional[bool]
+
+# ============================================================================
+# Persistent Storage Manager
+# ============================================================================
+
+class PersistentStorage:
+    """Manages persistent storage for learning and historical data"""
     
-    def __init__(self):
-        self.carbon_intensity_cache = {}
-        self.region = "global"
-        self.forecast_hours = 24
+    def __init__(self, db_path: str = "green_agent_data.db"):
+        self.db_path = db_path
+        self._init_database()
+        self.cache = {}
+        self._load_cache()
+    
+    def _init_database(self):
+        """Initialize SQLite database with required tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        # Historical carbon intensity patterns (simplified)
-        # Real implementation would query Electricity Maps API
-        self.historical_patterns = {
-            "global": {
-                "peak_hours": [18, 19, 20, 21],  # Evening peak
-                "low_hours": [1, 2, 3, 4, 5],     # Night hours
-                "solar_peak": [11, 12, 13, 14]    # Solar peak
-            }
-        }
+        # Historical reasoning data
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reasoning_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                architecture_hash TEXT NOT NULL,
+                reasoning_data TEXT NOT NULL,
+                outcomes TEXT
+            )
+        ''')
+        
+        # Causal effect learning data
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS causal_effects (
+                feature TEXT NOT NULL,
+                value REAL NOT NULL,
+                carbon_impact REAL NOT NULL,
+                accuracy_impact REAL NOT NULL,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (feature, timestamp)
+            )
+        ''')
+        
+        # Carbon intensity cache
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS carbon_cache (
+                region TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                intensity REAL NOT NULL,
+                PRIMARY KEY (region, timestamp)
+            )
+        ''')
+        
+        # Performance predictions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS performance_predictions (
+                architecture_hash TEXT NOT NULL,
+                context TEXT NOT NULL,
+                predicted_latency REAL,
+                predicted_carbon REAL,
+                actual_latency REAL,
+                actual_carbon REAL,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (architecture_hash, context)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized at {self.db_path}")
+    
+    def _load_cache(self):
+        """Load frequently accessed data into memory cache"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Load latest causal effects
+            cursor.execute('''
+                SELECT feature, AVG(carbon_impact) as avg_impact
+                FROM causal_effects
+                WHERE timestamp > datetime('now', '-30 days')
+                GROUP BY feature
+            ''')
+            
+            for row in cursor.fetchall():
+                self.cache[f'causal_{row[0]}'] = row[1]
+            
+            conn.close()
+            logger.debug(f"Loaded {len(self.cache)} items into cache")
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}")
+    
+    def save_reasoning(self, architecture_hash: str, reasoning_data: Dict, outcomes: Optional[Dict] = None):
+        """Save reasoning history for learning"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO reasoning_history 
+            (timestamp, architecture_hash, reasoning_data, outcomes)
+            VALUES (?, ?, ?, ?)
+        ''', (
+            datetime.now().isoformat(),
+            architecture_hash,
+            json.dumps(reasoning_data),
+            json.dumps(outcomes) if outcomes else None
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def save_causal_effect(self, feature: str, value: float, carbon_impact: float, accuracy_impact: float):
+        """Save causal effect data for model learning"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO causal_effects (feature, value, carbon_impact, accuracy_impact, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (
+            feature,
+            value,
+            carbon_impact,
+            accuracy_impact,
+            datetime.now().isoformat()
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        # Update cache
+        self.cache[f'causal_{feature}'] = carbon_impact
+    
+    def get_carbon_intensity(self, region: str, hours_ago: int = 1) -> Optional[float]:
+        """Retrieve cached carbon intensity"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cutoff_time = (datetime.now() - timedelta(hours=hours_ago)).isoformat()
+        cursor.execute('''
+            SELECT intensity FROM carbon_cache
+            WHERE region = ? AND timestamp > ?
+            ORDER BY timestamp DESC LIMIT 1
+        ''', (region, cutoff_time))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result[0] if result else None
+    
+    def save_carbon_intensity(self, region: str, intensity: float):
+        """Cache carbon intensity data"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO carbon_cache (region, timestamp, intensity)
+            VALUES (?, ?, ?)
+        ''', (region, datetime.now().isoformat(), intensity))
+        
+        conn.commit()
+        conn.close()
+
+# ============================================================================
+# Live Carbon Data Client
+# ============================================================================
+
+class LiveCarbonDataClient:
+    """Fetches real-time and forecasted carbon intensity data"""
+    
+    def __init__(self, api_key: Optional[str] = None, storage: Optional[PersistentStorage] = None):
+        self.api_key = api_key or os.getenv('ELECTRICITY_MAPS_API_KEY', '')
+        self.base_url = "https://api.electricitymap.org/v3"
+        self.storage = storage or PersistentStorage()
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._cache = {}
+        
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
     
     async def get_current_intensity(self, region: str = "global") -> float:
-        """Get current carbon intensity in gCO2/kWh"""
-        # Simulated data - would use API in production
-        hour = datetime.now().hour
-        pattern = self.historical_patterns.get(region, self.historical_patterns["global"])
+        """
+        Get current carbon intensity for a region.
+        Falls back to simulated data if API is unavailable.
+        """
+        # Check memory cache first
+        cache_key = f"{region}_current"
+        if cache_key in self._cache:
+            cache_time, intensity = self._cache[cache_key]
+            if (datetime.now() - cache_time).seconds < 300:  # 5 minute cache
+                return intensity
         
-        if hour in pattern["low_hours"]:
-            return 200  # Low carbon intensity
-        elif hour in pattern["solar_peak"]:
-            return 300  # Moderate carbon intensity
-        elif hour in pattern["peak_hours"]:
-            return 600  # High carbon intensity
+        # Check persistent cache
+        cached_intensity = self.storage.get_carbon_intensity(region, hours_ago=1)
+        if cached_intensity is not None:
+            self._cache[cache_key] = (datetime.now(), cached_intensity)
+            return cached_intensity
+        
+        # Try API call
+        try:
+            if self.api_key and self.session:
+                headers = {"auth-token": self.api_key}
+                async with self.session.get(
+                    f"{self.base_url}/carbon-intensity/latest",
+                    params={"zone": region},
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        intensity = float(data.get('carbonIntensity', 400))
+                        self.storage.save_carbon_intensity(region, intensity)
+                        self._cache[cache_key] = (datetime.now(), intensity)
+                        return intensity
+        except Exception as e:
+            logger.warning(f"Failed to fetch live carbon data: {e}")
+        
+        # Fallback to simulated data
+        return self._simulate_intensity(region)
+    
+    def _simulate_intensity(self, region: str) -> float:
+        """Generate realistic simulated carbon intensity"""
+        hour = datetime.now().hour
+        
+        # Regional patterns (simplified)
+        patterns = {
+            "global": {"low": [1,2,3,4,5], "peak": [18,19,20,21], "solar": [11,12,13,14]},
+            "EU": {"low": [0,1,2,3,4], "peak": [19,20,21,22], "solar": [12,13,14]},
+            "US-CAL": {"low": [2,3,4,5], "peak": [17,18,19], "solar": [10,11,12,13,14]},
+            "AU": {"low": [1,2,3,4], "peak": [19,20,21], "solar": [10,11,12,13]},
+        }
+        
+        pattern = patterns.get(region, patterns["global"])
+        
+        if hour in pattern["low"]:
+            return 150 + np.random.normal(0, 30)
+        elif hour in pattern["solar"]:
+            return 250 + np.random.normal(0, 40)
+        elif hour in pattern["peak"]:
+            return 550 + np.random.normal(0, 50)
         else:
-            return 400  # Average
+            return 350 + np.random.normal(0, 45)
     
     async def get_forecast(self, region: str = "global", hours: int = 24) -> List[Dict]:
-        """Get carbon intensity forecast for next 24 hours"""
+        """Get carbon intensity forecast for next N hours"""
+        try:
+            if self.api_key and self.session:
+                headers = {"auth-token": self.api_key}
+                async with self.session.get(
+                    f"{self.base_url}/carbon-intensity/forecast",
+                    params={"zone": region, "hours": hours},
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        forecast = []
+                        for entry in data.get('forecast', []):
+                            forecast.append({
+                                'datetime': entry.get('datetime'),
+                                'intensity': float(entry.get('carbonIntensity', 400)),
+                                'savings_potential': (entry.get('carbonIntensity', 400) - 200) / max(entry.get('carbonIntensity', 400), 1)
+                            })
+                        return forecast
+        except Exception as e:
+            logger.warning(f"Failed to fetch forecast data: {e}")
+        
+        # Fallback to simulated forecast
+        return self._simulate_forecast(region, hours)
+    
+    def _simulate_forecast(self, region: str, hours: int) -> List[Dict]:
+        """Generate realistic simulated forecast"""
         forecast = []
         current_hour = datetime.now().hour
+        
+        patterns = {
+            "global": {"low": [1,2,3,4,5], "peak": [18,19,20,21], "solar": [11,12,13,14]},
+        }
+        pattern = patterns.get(region, patterns["global"])
         
         for i in range(hours):
             hour = (current_hour + i) % 24
             forecast_hour = datetime.now() + timedelta(hours=i)
             
-            # Simplified forecast based on historical patterns
-            pattern = self.historical_patterns.get(region, self.historical_patterns["global"])
-            
-            if hour in pattern["low_hours"]:
-                intensity = 180 + np.random.normal(0, 20)
-            elif hour in pattern["solar_peak"]:
-                intensity = 280 + np.random.normal(0, 30)
-            elif hour in pattern["peak_hours"]:
+            if hour in pattern["low"]:
+                intensity = 150 + np.random.normal(0, 30)
+            elif hour in pattern["solar"]:
+                intensity = 250 + np.random.normal(0, 40)
+            elif hour in pattern["peak"]:
                 intensity = 550 + np.random.normal(0, 50)
             else:
-                intensity = 380 + np.random.normal(0, 40)
+                intensity = 350 + np.random.normal(0, 45)
             
+            intensity = max(50, min(800, intensity))
             forecast.append({
                 'datetime': forecast_hour.isoformat(),
                 'hour': hour,
-                'intensity': max(100, intensity),
-                'savings_potential': (intensity - 200) / intensity  # Relative to clean energy baseline
+                'intensity': intensity,
+                'savings_potential': (intensity - 200) / max(intensity, 1)
             })
         
         return forecast
+
+# ============================================================================
+# Hardware Profiler
+# ============================================================================
+
+class HardwareProfiler:
+    """Provides hardware-specific performance profiles"""
+    
+    def __init__(self, profile_path: Optional[str] = None):
+        self.profile_path = profile_path or "hardware_profiles.json"
+        self.profiles = self._load_profiles()
+        
+    def _load_profiles(self) -> Dict:
+        """Load hardware profiles from file or create defaults"""
+        default_profiles = {
+            "cpu_x86": {
+                "base_power_w": 65,
+                "compute_efficiency": 1.0,
+                "memory_efficiency": 1.0,
+                "carbon_impact_factor": 1.0,
+                "inference_latency_ms_per_flop": 0.001,
+                "training_latency_ms_per_flop": 0.005
+            },
+            "gpu_nvidia_a100": {
+                "base_power_w": 400,
+                "compute_efficiency": 20.0,
+                "memory_efficiency": 15.0,
+                "carbon_impact_factor": 0.8,
+                "inference_latency_ms_per_flop": 0.0001,
+                "training_latency_ms_per_flop": 0.0005
+            },
+            "gpu_nvidia_h100": {
+                "base_power_w": 700,
+                "compute_efficiency": 30.0,
+                "memory_efficiency": 20.0,
+                "carbon_impact_factor": 0.7,
+                "inference_latency_ms_per_flop": 0.00008,
+                "training_latency_ms_per_flop": 0.0004
+            },
+            "edge_tpu": {
+                "base_power_w": 2,
+                "compute_efficiency": 5.0,
+                "memory_efficiency": 3.0,
+                "carbon_impact_factor": 0.1,
+                "inference_latency_ms_per_flop": 0.0002,
+                "training_latency_ms_per_flop": 0.01
+            },
+            "mobile_npu": {
+                "base_power_w": 1,
+                "compute_efficiency": 3.0,
+                "memory_efficiency": 2.0,
+                "carbon_impact_factor": 0.05,
+                "inference_latency_ms_per_flop": 0.0003,
+                "training_latency_ms_per_flop": 0.02
+            },
+            "quantum": {
+                "base_power_w": 0.1,
+                "compute_efficiency": 0.5,
+                "memory_efficiency": 0.1,
+                "carbon_impact_factor": 0.001,
+                "inference_latency_ms_per_flop": 0.01,
+                "training_latency_ms_per_flop": 0.05
+            }
+        }
+        
+        if os.path.exists(self.profile_path):
+            try:
+                with open(self.profile_path, 'r') as f:
+                    loaded = json.load(f)
+                    # Merge with defaults for missing hardware
+                    for hw in default_profiles:
+                        if hw not in loaded:
+                            loaded[hw] = default_profiles[hw]
+                    return loaded
+            except Exception as e:
+                logger.warning(f"Failed to load hardware profiles: {e}")
+        
+        return default_profiles
+    
+    def get_profile(self, hardware: str) -> Dict:
+        """Get profile for specific hardware"""
+        return self.profiles.get(hardware, self.profiles["cpu_x86"])
+    
+    def predict_energy(self, 
+                      hardware: str,
+                      flops: float,
+                      memory_ops: float,
+                      duration_hours: float) -> float:
+        """
+        Predict energy consumption for a given hardware and workload.
+        Returns energy in kWh.
+        """
+        profile = self.get_profile(hardware)
+        
+        # Base power consumption
+        power_watts = profile['base_power_w']
+        
+        # Scale with compute and memory intensity
+        compute_scaling = flops * profile['compute_efficiency'] / 1e12  # TFLOPS
+        memory_scaling = memory_ops * profile['memory_efficiency'] / 1e9  # GB/s
+        
+        # Effective power consumption
+        effective_power = power_watts * (1 + 0.5 * compute_scaling + 0.3 * memory_scaling)
+        
+        # Convert to kWh
+        energy_kwh = (effective_power * duration_hours) / 1000
+        
+        return energy_kwh
+
+# ============================================================================
+# Enhanced Performance Predictor
+# ============================================================================
+
+class PerformancePredictor:
+    """Predicts performance metrics for architectures"""
+    
+    def __init__(self, storage: Optional[PersistentStorage] = None, 
+                 hardware_profiler: Optional[HardwareProfiler] = None):
+        self.storage = storage or PersistentStorage()
+        self.hardware_profiler = hardware_profiler or HardwareProfiler()
+        
+        # Pre-trained surrogate models (simplified)
+        self.accuracy_model = self._build_accuracy_surrogate()
+        self.latency_model = self._build_latency_surrogate()
+    
+    def _build_accuracy_surrogate(self):
+        """Build a simple surrogate model for accuracy prediction"""
+        # In production, this would be a trained model
+        return {
+            'base_accuracy': 0.85,
+            'layer_impact': 0.02,  # per layer
+            'dim_impact': 0.0001,  # per hidden dimension
+            'pruning_impact': -0.3,  # per pruning rate
+            'quantization_impact': -0.05  # per bit reduction
+        }
+    
+    def _build_latency_surrogate(self):
+        """Build a simple surrogate model for latency prediction"""
+        return {
+            'base_latency_ms': 10,
+            'layer_impact_ms': 2,
+            'dim_impact_ms': 0.05,
+            'batch_impact_ms': 0.5
+        }
+    
+    def predict_accuracy(self, architecture_config: Dict[str, Any]) -> float:
+        """
+        Predict accuracy of an architecture configuration.
+        Returns accuracy as a float between 0 and 1.
+        """
+        model = self.accuracy_model
+        accuracy = model['base_accuracy']
+        
+        # Adjust based on layers
+        num_layers = architecture_config.get('num_layers', 6)
+        accuracy += model['layer_impact'] * (num_layers - 6)
+        
+        # Adjust based on hidden dimension
+        hidden_dim = architecture_config.get('hidden_dim', 384)
+        accuracy += model['dim_impact'] * (hidden_dim - 384)
+        
+        # Adjust based on pruning
+        pruning_rate = architecture_config.get('pruning_rate', 0)
+        accuracy += model['pruning_impact'] * pruning_rate
+        
+        # Adjust based on quantization
+        quantization_bits = architecture_config.get('quantization_bits', 32)
+        if quantization_bits < 32:
+            accuracy += model['quantization_impact'] * (32 - quantization_bits) / 8
+        
+        # Clamp to valid range
+        return max(0.0, min(1.0, accuracy))
+    
+    def predict_carbon(self,
+                      architecture_config: Dict[str, Any],
+                      context: str,
+                      training_epochs: int = 100,
+                      inference_count: int = 1000000) -> float:
+        """
+        Predict carbon footprint in kg CO2 equivalent.
+        """
+        # Estimate parameters
+        num_params = self._estimate_parameters(architecture_config)
+        flops = self._estimate_flops(architecture_config)
+        
+        # Estimate training carbon
+        hardware = self._get_hardware_for_context(context)
+        training_energy = self.hardware_profiler.predict_energy(
+            hardware=hardware,
+            flops=flops * training_epochs * 100,  # Simplified
+            memory_ops=num_params * 100,
+            duration_hours=training_epochs * 0.5
+        )
+        
+        # Estimate inference carbon
+        inference_energy = self.hardware_profiler.predict_energy(
+            hardware=hardware,
+            flops=flops * inference_count,
+            memory_ops=num_params * inference_count,
+            duration_hours=inference_count * 0.001 / 3600
+        )
+        
+        # Convert energy to carbon (assuming average grid intensity)
+        carbon_kg = (training_energy + inference_energy) * 0.4  # kg CO2 per kWh (global average)
+        
+        return carbon_kg
+    
+    def _estimate_parameters(self, config: Dict) -> float:
+        """Estimate number of parameters"""
+        layers = config.get('num_layers', 6)
+        hidden_dim = config.get('hidden_dim', 384)
+        heads = config.get('num_heads', 8)
+        
+        # Simplified parameter count estimation
+        params = layers * hidden_dim * hidden_dim  # Self-attention
+        params += layers * hidden_dim * 4 * hidden_dim  # FFN
+        params += layers * heads * (hidden_dim // heads) ** 2  # Attention heads
+        
+        return params
+    
+    def _estimate_flops(self, config: Dict) -> float:
+        """Estimate FLOPs per forward pass"""
+        params = self._estimate_parameters(config)
+        batch_size = config.get('batch_size', 32)
+        
+        # Simplified FLOPs estimation (2x parameters per forward pass)
+        return params * 2 * batch_size
+    
+    def _get_hardware_for_context(self, context: str) -> str:
+        """Map context to hardware type"""
+        mapping = {
+            'mobile_inference': 'mobile_npu',
+            'edge_tpu': 'edge_tpu',
+            'cloud_inference': 'gpu_nvidia_a100',
+            'batch_processing': 'gpu_nvidia_a100',
+            'quantum': 'quantum'
+        }
+        return mapping.get(context, 'cpu_x86')
+
+# ============================================================================
+# Enhanced Reasoning Components
+# ============================================================================
+
+class EnhancedCarbonIntensityAwareScheduler:
+    """Enhanced scheduler with live data and learning"""
+    
+    def __init__(self, storage: Optional[PersistentStorage] = None,
+                 carbon_client: Optional[LiveCarbonDataClient] = None):
+        self.storage = storage or PersistentStorage()
+        self.carbon_client = carbon_client or LiveCarbonDataClient(storage=self.storage)
+        self.region = "global"
+        self.forecast_hours = 24
+        self.learning_data = self._load_learning_data()
+    
+    def _load_learning_data(self):
+        """Load historical scheduling data for learning"""
+        # In production, would load from database
+        return {
+            'optimal_shift_hours': 3,  # Learned optimal delay
+            'savings_confidence': 0.8
+        }
+    
+    async def get_current_intensity(self, region: str = "global") -> float:
+        """Get current carbon intensity using live data client"""
+        return await self.carbon_client.get_current_intensity(region)
+    
+    async def get_forecast(self, region: str = "global", hours: int = 24) -> List[Dict]:
+        """Get carbon intensity forecast"""
+        return await self.carbon_client.get_forecast(region, hours)
     
     async def schedule_computation(self, 
                                    task: str, 
                                    urgency: str = "normal",
-                                   compute_hours: float = 1.0) -> Dict[str, Any]:
+                                   compute_hours: float = 1.0) -> SchedulingRecommendation:
         """
-        Schedule computation based on carbon intensity and urgency.
-        
-        Args:
-            task: Task identifier
-            urgency: "critical", "normal", or "flexible"
-            compute_hours: Estimated compute duration in hours
-            
-        Returns:
-            Scheduling recommendation
+        Enhanced scheduling with learning and better decision making.
         """
         current_intensity = await self.get_current_intensity(self.region)
         forecast = await self.get_forecast(self.region, 24)
@@ -105,38 +642,55 @@ class CarbonIntensityAwareScheduler:
         # Find best time in the next 24 hours
         best_time = min(forecast, key=lambda x: x['intensity'])
         
-        # Calculate potential savings
-        savings_percent = (current_intensity - best_time['intensity']) / current_intensity if current_intensity > 0 else 0
-        savings_percent = max(0, savings_percent)
+        # Calculate potential savings with learned adjustment
+        raw_savings = (current_intensity - best_time['intensity']) / current_intensity if current_intensity > 0 else 0
+        savings_percent = max(0, raw_savings * self.learning_data['savings_confidence'])
         
-        # Decision logic based on urgency
+        # Enhanced decision logic
         if urgency == "critical":
-            # Run immediately
             recommendation = {
                 'action': 'run_now',
                 'reason': 'Critical task - immediate execution required',
                 'schedule': datetime.now().isoformat(),
                 'expected_intensity': current_intensity,
-                'carbon_savings': 0
+                'carbon_savings': 0,
+                'task': task,
+                'urgency': urgency,
+                'compute_hours': compute_hours,
+                'current_intensity': current_intensity,
+                'forecast_window_hours': 24
             }
-        elif urgency == "normal" and savings_percent > 0.2:
-            # Delay to best time
+        elif urgency == "normal" and savings_percent > 0.15:
+            # Check if delay is worth it
+            delay_hours = self.learning_data['optimal_shift_hours']
+            delayed_time = min(forecast, key=lambda x: abs(
+                (datetime.fromisoformat(x['datetime']) - datetime.now()).total_seconds() / 3600 - delay_hours
+            ))
+            
             recommendation = {
                 'action': 'schedule',
-                'reason': f'Delay by {best_time["datetime"]} to save {savings_percent:.1%} carbon',
-                'schedule': best_time['datetime'],
-                'expected_intensity': best_time['intensity'],
-                'carbon_savings': savings_percent
+                'reason': f'Delay by {delay_hours} hours to save {savings_percent:.1%} carbon',
+                'schedule': delayed_time['datetime'],
+                'expected_intensity': delayed_time['intensity'],
+                'carbon_savings': savings_percent,
+                'task': task,
+                'urgency': urgency,
+                'compute_hours': compute_hours,
+                'current_intensity': current_intensity,
+                'forecast_window_hours': 24
             }
         elif urgency == "flexible":
-            # Find the absolute best time
-            best_time = min(forecast, key=lambda x: x['intensity'])
             recommendation = {
                 'action': 'schedule_optimal',
                 'reason': f'Flexible task - optimal schedule at {best_time["datetime"]}',
                 'schedule': best_time['datetime'],
                 'expected_intensity': best_time['intensity'],
-                'carbon_savings': savings_percent
+                'carbon_savings': savings_percent,
+                'task': task,
+                'urgency': urgency,
+                'compute_hours': compute_hours,
+                'current_intensity': current_intensity,
+                'forecast_window_hours': 24
             }
         else:
             # Default: run now if savings are minimal
@@ -145,39 +699,26 @@ class CarbonIntensityAwareScheduler:
                 'reason': f'Marginal savings ({savings_percent:.1%}) - running now',
                 'schedule': datetime.now().isoformat(),
                 'expected_intensity': current_intensity,
-                'carbon_savings': 0
+                'carbon_savings': 0,
+                'task': task,
+                'urgency': urgency,
+                'compute_hours': compute_hours,
+                'current_intensity': current_intensity,
+                'forecast_window_hours': 24
             }
-        
-        # Add context
-        recommendation.update({
-            'task': task,
-            'urgency': urgency,
-            'compute_hours': compute_hours,
-            'current_intensity': current_intensity,
-            'forecast_window_hours': 24
-        })
         
         logger.info(f"Computation scheduling for {task}: {recommendation['action']} ({savings_percent:.1%} savings)")
         return recommendation
 
-# ============================================================================
-# Causal Reasoning: Understanding Carbon Impact
-# ============================================================================
-
-@dataclass
-class CausalExplanation:
-    """Causal explanation of carbon impact"""
-    primary_driver: str
-    contribution: float
-    pathway: List[str]
-    alternatives: List[str]
-    confidence: float
-
-class CarbonCausalModel:
-    """Build and maintain causal models of carbon impact"""
+class EnhancedCarbonCausalModel:
+    """Enhanced causal model with learning and more features"""
     
-    def __init__(self):
-        # Causal graph: architectural features -> carbon pathways
+    def __init__(self, storage: Optional[PersistentStorage] = None,
+                 predictor: Optional[PerformancePredictor] = None):
+        self.storage = storage or PersistentStorage()
+        self.predictor = predictor or PerformancePredictor(storage=self.storage)
+        
+        # Expanded causal graph with more features
         self.causal_graph = {
             'num_layers': {
                 'pathways': ['parameters', 'flops', 'memory_bandwidth', 'energy', 'carbon'],
@@ -208,31 +749,47 @@ class CarbonCausalModel:
                 'pathways': ['memory', 'throughput', 'energy', 'carbon'],
                 'effect_size': 0.20,
                 'non_linear': True
+            },
+            'attention_type': {
+                'pathways': ['flops', 'memory', 'accuracy', 'carbon'],
+                'effect_size': 0.35,
+                'non_linear': True
+            },
+            'activation_function': {
+                'pathways': ['flops', 'accuracy', 'carbon'],
+                'effect_size': 0.15,
+                'non_linear': True
+            },
+            'moe_layers': {
+                'pathways': ['parameters', 'flops', 'memory', 'accuracy', 'carbon'],
+                'effect_size': 0.45,
+                'non_linear': True
             }
         }
         
-        # Historical causal effects (learned from past runs)
+        # Learning from historical data
         self.historical_effects = defaultdict(lambda: defaultdict(float))
         self.confidence_scores = defaultdict(lambda: 0.5)
-        
-        # Load historical data if available
         self._load_historical_data()
     
     def _load_historical_data(self):
-        """Load historical causal data from database"""
+        """Load historical causal data from storage"""
         try:
-            # Would load from database in production
-            pass
+            # Load from database in production
+            # For now, use cached data
+            for feature in self.causal_graph:
+                cached_impact = self.storage.cache.get(f'causal_{feature}')
+                if cached_impact:
+                    self.confidence_scores[feature] = min(1.0, cached_impact / 0.3)
         except Exception as e:
             logger.debug(f"Could not load historical causal data: {e}")
     
     def explain_carbon_impact(self, 
                              architecture_config: Dict[str, Any],
-                             fitness_metrics: Optional[Dict[str, float]] = None) -> CausalExplanation:
+                             fitness_metrics: Optional[Dict[str, float]] = None) -> CausalExplanationDict:
         """
-        Provide causal explanation of carbon impact for a given architecture.
+        Enhanced causal explanation with better alternative generation.
         """
-        # Analyze which features most impact carbon
         impacts = {}
         pathways = {}
         
@@ -243,605 +800,182 @@ class CarbonCausalModel:
                 impacts[feature] = effect['contribution']
                 pathways[feature] = effect['pathway']
         
-        # Find primary driver
-        primary_driver = max(impacts, key=impacts.get) if impacts else None
-        confidence = self.confidence_scores.get(primary_driver, 0.5) if primary_driver else 0.3
+        # Find primary driver with confidence weighting
+        if impacts:
+            # Adjust impacts with confidence scores
+            adjusted_impacts = {
+                f: impacts[f] * self.confidence_scores.get(f, 0.5)
+                for f in impacts
+            }
+            primary_driver = max(adjusted_impacts, key=adjusted_impacts.get)
+        else:
+            primary_driver = 'unknown'
         
-        # Generate alternatives
-        alternatives = self._generate_alternatives(architecture_config, primary_driver)
+        confidence = self.confidence_scores.get(primary_driver, 0.5) if primary_driver != 'unknown' else 0.3
         
-        return CausalExplanation(
-            primary_driver=primary_driver or 'unknown',
-            contribution=impacts.get(primary_driver, 0.0),
-            pathway=pathways.get(primary_driver, []),
-            alternatives=alternatives,
-            confidence=confidence
-        )
+        # Generate better alternatives using performance predictions
+        alternatives = self._generate_smart_alternatives(architecture_config, primary_driver)
+        
+        return {
+            'primary_driver': primary_driver,
+            'contribution': impacts.get(primary_driver, 0.0),
+            'pathway': pathways.get(primary_driver, []),
+            'alternatives': alternatives,
+            'confidence': confidence
+        }
     
     def _estimate_feature_impact(self, feature: str, value: Any, impact_info: Dict) -> Dict:
-        """Estimate impact of a specific feature on carbon"""
+        """Enhanced impact estimation with learning"""
         base_effect = impact_info['effect_size']
         
         # Scale effect based on value
         if isinstance(value, (int, float)):
-            # Normalize value to [0, 1] range for comparison
+            # Use learned scaling if available
             if feature == 'num_layers':
-                normalized = min(1.0, value / 20)
+                normalized = min(1.0, value / 24)
             elif feature == 'hidden_dim':
-                normalized = min(1.0, value / 1024)
+                normalized = min(1.0, value / 2048)
             elif feature == 'num_heads':
-                normalized = min(1.0, value / 16)
+                normalized = min(1.0, value / 24)
             elif feature == 'pruning_rate':
-                normalized = value  # Already 0-1
+                normalized = value
             elif feature == 'quantization_bits':
-                normalized = 1.0 - (value / 32)  # Higher bits = more impact
+                normalized = 1.0 - (value / 32)
+            elif feature == 'batch_size':
+                normalized = min(1.0, value / 512)
+            elif feature == 'moe_layers':
+                normalized = min(1.0, value / 8)
             else:
                 normalized = 0.5
             
             # Apply non-linearity if needed
             if impact_info.get('non_linear', False):
-                effect = base_effect * (normalized ** 0.7)  # Diminishing returns
+                effect = base_effect * (normalized ** 0.7)
             else:
                 effect = base_effect * normalized
         else:
-            effect = base_effect * 0.5
+            # Handle categorical features
+            if feature == 'attention_type':
+                effect = base_effect * (0.8 if value == 'flash_attention' else 1.0)
+            elif feature == 'activation_function':
+                effect = base_effect * (0.7 if value == 'swiglu' else 1.0)
+            else:
+                effect = base_effect * 0.5
         
-        contribution = min(1.0, effect)
+        contribution = min(1.0, max(0.0, effect))
         
         return {
             'contribution': contribution,
             'pathway': impact_info['pathways']
         }
     
-    def _generate_alternatives(self, config: Dict[str, Any], primary_driver: str) -> List[str]:
-        """Generate alternative configurations for carbon reduction"""
+    def _generate_smart_alternatives(self, config: Dict[str, Any], primary_driver: str) -> List[str]:
+        """Generate alternatives using performance predictions"""
         alternatives = []
         
-        if primary_driver == 'num_layers' and config.get('num_layers', 0) > 6:
-            alternatives.append(f"Reduce layers from {config['num_layers']} to {config['num_layers']-2} to save ~15% carbon")
+        # Use performance predictor to evaluate alternatives
+        current_accuracy = self.predictor.predict_accuracy(config)
+        current_carbon = self.predictor.predict_carbon(config, 'cloud_inference')
         
-        if primary_driver == 'hidden_dim' and config.get('hidden_dim', 0) > 384:
-            alternatives.append(f"Reduce hidden dimension from {config['hidden_dim']} to {int(config['hidden_dim']*0.7)} to save ~12% carbon")
+        # Generate targeted alternatives
+        if primary_driver == 'num_layers' and config.get('num_layers', 0) > 4:
+            new_config = config.copy()
+            new_config['num_layers'] = config['num_layers'] - 2
+            new_accuracy = self.predictor.predict_accuracy(new_config)
+            new_carbon = self.predictor.predict_carbon(new_config, 'cloud_inference')
+            
+            accuracy_loss = (current_accuracy - new_accuracy) * 100
+            carbon_saving = (current_carbon - new_carbon) / current_carbon * 100
+            
+            alternatives.append(
+                f"Reduce layers from {config['num_layers']} to {new_config['num_layers']}: "
+                f"{accuracy_loss:.1f}% accuracy loss, {carbon_saving:.1f}% carbon saving"
+            )
         
-        if primary_driver == 'num_heads' and config.get('num_heads', 0) > 8:
-            alternatives.append(f"Reduce attention heads from {config['num_heads']} to {config['num_heads']-2} to save ~10% carbon")
+        if primary_driver == 'hidden_dim' and config.get('hidden_dim', 0) > 256:
+            new_config = config.copy()
+            new_config['hidden_dim'] = int(config['hidden_dim'] * 0.7)
+            new_accuracy = self.predictor.predict_accuracy(new_config)
+            new_carbon = self.predictor.predict_carbon(new_config, 'cloud_inference')
+            
+            accuracy_loss = (current_accuracy - new_accuracy) * 100
+            carbon_saving = (current_carbon - new_carbon) / current_carbon * 100
+            
+            alternatives.append(
+                f"Reduce hidden dimension from {config['hidden_dim']} to {new_config['hidden_dim']}: "
+                f"{accuracy_loss:.1f}% accuracy loss, {carbon_saving:.1f}% carbon saving"
+            )
         
-        if config.get('pruning_rate', 0) < 0.2:
-            alternatives.append("Consider 20-30% pruning to reduce carbon by 15-20%")
+        if config.get('pruning_rate', 0) < 0.3:
+            new_config = config.copy()
+            new_config['pruning_rate'] = min(0.4, config.get('pruning_rate', 0) + 0.2)
+            new_accuracy = self.predictor.predict_accuracy(new_config)
+            new_carbon = self.predictor.predict_carbon(new_config, 'cloud_inference')
+            
+            accuracy_loss = (current_accuracy - new_accuracy) * 100
+            carbon_saving = (current_carbon - new_carbon) / current_carbon * 100
+            
+            alternatives.append(
+                f"Increase pruning to {new_config['pruning_rate']*100:.0f}%: "
+                f"{accuracy_loss:.1f}% accuracy loss, {carbon_saving:.1f}% carbon saving"
+            )
         
-        if config.get('quantization_bits', 32) == 32:
-            alternatives.append("Apply INT8 quantization to reduce memory bandwidth and carbon")
+        if config.get('quantization_bits', 32) > 8:
+            new_config = config.copy()
+            new_config['quantization_bits'] = 8
+            new_accuracy = self.predictor.predict_accuracy(new_config)
+            new_carbon = self.predictor.predict_carbon(new_config, 'cloud_inference')
+            
+            accuracy_loss = (current_accuracy - new_accuracy) * 100
+            carbon_saving = (current_carbon - new_carbon) / current_carbon * 100
+            
+            alternatives.append(
+                f"Quantize to INT8 from {config.get('quantization_bits', 32)} bits: "
+                f"{accuracy_loss:.1f}% accuracy loss, {carbon_saving:.1f}% carbon saving"
+            )
+        
+        # Add MoE alternative if not already using it
+        if config.get('moe_layers', 0) == 0 and config.get('num_layers', 0) > 4:
+            new_config = config.copy()
+            new_config['moe_layers'] = 2
+            new_accuracy = self.predictor.predict_accuracy(new_config)
+            new_carbon = self.predictor.predict_carbon(new_config, 'cloud_inference')
+            
+            accuracy_gain = (new_accuracy - current_accuracy) * 100
+            carbon_saving = (current_carbon - new_carbon) / current_carbon * 100
+            
+            alternatives.append(
+                f"Add 2 MoE layers: {accuracy_gain:.1f}% accuracy gain, {carbon_saving:.1f}% carbon saving"
+            )
         
         return alternatives[:3]  # Top 3 alternatives
 
 # ============================================================================
-# Ethical Reasoning: Fair and Responsible Optimization
-# ============================================================================
-
-class EthicalCarbonReasoner:
-    """Reason about ethical implications of carbon reduction decisions"""
-    
-    def __init__(self):
-        self.stakeholders = ['global_climate', 'local_community', 'organization', 'end_users']
-        self.ethical_frameworks = {
-            'utilitarian': self._utilitarian_assessment,
-            'justice': self._justice_assessment,
-            'deontological': self._deontological_assessment
-        }
-        
-        # Historical ethical assessments
-        self.assessment_history = deque(maxlen=100)
-    
-    def assess_reduction_impact(self, 
-                               architecture_config: Dict[str, Any],
-                               performance: Dict[str, float]) -> Dict[str, Any]:
-        """
-        Assess ethical impact of carbon reduction decisions.
-        """
-        assessment = {}
-        
-        # Run each ethical framework
-        for framework_name, framework_func in self.ethical_frameworks.items():
-            try:
-                assessment[framework_name] = framework_func(architecture_config, performance)
-            except Exception as e:
-                logger.error(f"Ethical assessment error in {framework_name}: {e}")
-                assessment[framework_name] = {
-                    'score': 0.5,
-                    'concern': f'Assessment unavailable: {str(e)}'
-                }
-        
-        # Calculate overall ethical score
-        overall_score = sum(assessment.get(fw, {}).get('score', 0.5) for fw in assessment) / len(assessment)
-        
-        # Store for learning
-        self.assessment_history.append({
-            'timestamp': datetime.now().isoformat(),
-            'assessment': assessment,
-            'overall_score': overall_score
-        })
-        
-        return {
-            'framework_assessments': assessment,
-            'overall_ethical_score': overall_score,
-            'recommendations': self._generate_ethical_recommendations(assessment),
-            'timestamp': datetime.now().isoformat()
-        }
-    
-    def _utilitarian_assessment(self, config: Dict, performance: Dict) -> Dict:
-        """Greatest good for greatest number"""
-        # Calculate benefits to different groups
-        benefits = {
-            'global_climate': 0.6,  # 60% benefit to global climate
-            'local_community': 0.2,  # 20% benefit to local community
-            'organization': 0.1,  # 10% benefit to organization
-            'end_users': 0.1  # 10% benefit to end users
-        }
-        
-        # Adjust based on actual reduction
-        carbon_reduction = 1.0 - performance.get('carbon_kg', 0.01)  # Normalized
-        if carbon_reduction < 0.3:
-            benefits['global_climate'] *= 0.5  # Less benefit if carbon reduction is small
-        
-        # Potential losses
-        accuracy_loss = 1.0 - performance.get('accuracy', 0.85)
-        losses = {
-            'end_users': accuracy_loss * 0.5,
-            'organization': accuracy_loss * 0.3
-        }
-        
-        net_benefit = sum(benefits.values()) - sum(losses.values())
-        
-        return {
-            'score': max(0, min(1, net_benefit)),
-            'benefits': benefits,
-            'losses': losses,
-            'net_benefit': net_benefit
-        }
-    
-    def _justice_assessment(self, config: Dict, performance: Dict) -> Dict:
-        """Fair distribution of benefits and burdens"""
-        # Check equity of reduction
-        pruning_rate = config.get('pruning_rate', 0)
-        accuracy_loss = 1.0 - performance.get('accuracy', 0.85)
-        
-        # Heavy pruning might disproportionately affect accuracy
-        if pruning_rate > 0.5 and accuracy_loss > 0.05:
-            equity_score = 0.3
-            concern = "Heavy pruning may disproportionately reduce accuracy for critical use cases"
-        elif pruning_rate > 0.3 and accuracy_loss > 0.03:
-            equity_score = 0.6
-            concern = "Moderate pruning with some accuracy trade-off"
-        else:
-            equity_score = 0.9
-            concern = "Balanced approach with minimal accuracy impact"
-        
-        # Check hardware accessibility (different hardware has different carbon footprints)
-        hardware = config.get('target_hardware', 'cpu_x86')
-        hardware_accessibility = {
-            'cpu_x86': 0.9,
-            'gpu_nvidia': 0.7,
-            'edge_tpu': 0.5,
-            'mobile_npu': 0.4
-        }.get(hardware, 0.5)
-        
-        return {
-            'score': (equity_score + hardware_accessibility) / 2,
-            'equity_concern': concern,
-            'hardware_accessibility': hardware_accessibility
-        }
-    
-    def _deontological_assessment(self, config: Dict, performance: Dict) -> Dict:
-        """Rule-based ethical assessment"""
-        rules_violated = []
-        
-        # Rule 1: Don't harm accuracy more than necessary
-        if config.get('pruning_rate', 0) > 0.5:
-            rules_violated.append("Excessive pruning may harm accuracy unnecessarily")
-        
-        # Rule 2: Ensure transparency
-        if config.get('compression') == 'none' and config.get('pruning_rate', 0) > 0:
-            rules_violated.append("Compression without proper justification - lack of transparency")
-        
-        # Rule 3: Consider deployment context
-        if config.get('target_hardware') == 'mobile_npu' and config.get('quantization_bits', 32) > 8:
-            rules_violated.append("Mobile deployment requires more aggressive quantization")
-        
-        return {
-            'score': 1.0 - (len(rules_violated) * 0.2),
-            'rules_violated': rules_violated,
-            'compliant': len(rules_violated) == 0
-        }
-    
-    def _generate_ethical_recommendations(self, assessment: Dict) -> List[str]:
-        """Generate ethical recommendations"""
-        recommendations = []
-        
-        for framework, assessment_result in assessment.items():
-            if framework == 'utilitarian' and assessment_result.get('net_benefit', 0) < 0.3:
-                recommendations.append("Reconsider carbon reduction approach - current strategy may not maximize net benefit")
-            
-            if framework == 'justice' and assessment_result.get('equity_concern', ''):
-                recommendations.append(f"Address equity concerns: {assessment_result['equity_concern']}")
-            
-            if framework == 'deontological' and not assessment_result.get('compliant', True):
-                for violation in assessment_result.get('rules_violated', []):
-                    recommendations.append(f"Address ethical violation: {violation}")
-        
-        return recommendations[:3]  # Top 3 recommendations
-
-# ============================================================================
-# Contextual Reasoning: Deployment-Aware Optimization
-# ============================================================================
-
-class ContextAwareOptimizer:
-    """Apply different optimization strategies based on deployment context"""
-    
-    def __init__(self):
-        self.context_strategies = {
-            'mobile_inference': {
-                'max_size_mb': 50,
-                'max_latency_ms': 10,
-                'min_accuracy': 0.85,
-                'max_carbon_g': 0.1,
-                'priority': ['size', 'latency', 'carbon', 'accuracy'],
-                'recommended_compression': ['quantization_int8', 'pruning_structured'],
-                'max_pruning_rate': 0.4,
-                'min_quantization_bits': 8
-            },
-            'cloud_inference': {
-                'max_size_mb': 1000,
-                'max_latency_ms': 100,
-                'min_accuracy': 0.92,
-                'max_carbon_g': 1.0,
-                'priority': ['accuracy', 'throughput', 'carbon', 'size'],
-                'recommended_compression': ['pruning_unstructured', 'quantization_fp16'],
-                'max_pruning_rate': 0.3,
-                'min_quantization_bits': 16
-            },
-            'edge_tpu': {
-                'max_size_mb': 10,
-                'max_latency_ms': 5,
-                'min_accuracy': 0.80,
-                'max_carbon_g': 0.01,
-                'priority': ['size', 'latency', 'carbon'],
-                'recommended_compression': ['quantization_int8', 'pruning_structured'],
-                'max_pruning_rate': 0.5,
-                'min_quantization_bits': 8
-            },
-            'batch_processing': {
-                'max_size_mb': 5000,
-                'max_latency_ms': 5000,
-                'min_accuracy': 0.85,
-                'max_carbon_g': 10.0,
-                'priority': ['throughput', 'carbon', 'accuracy'],
-                'recommended_compression': ['pruning_unstructured', 'quantization_fp16'],
-                'max_pruning_rate': 0.4,
-                'min_quantization_bits': 16
-            },
-            'quantum': {
-                'max_size_mb': 1,
-                'max_latency_ms': 1000,
-                'min_accuracy': 0.70,
-                'max_carbon_g': 0.001,
-                'priority': ['carbon', 'size'],
-                'recommended_compression': ['quantization_int8'],
-                'max_pruning_rate': 0.6,
-                'min_quantization_bits': 8
-            }
-        }
-    
-    def get_context_plan(self, 
-                        architecture_config: Dict[str, Any],
-                        context: str = 'cloud_inference') -> Dict[str, Any]:
-        """
-        Get context-specific optimization plan for an architecture.
-        """
-        strategy = self.context_strategies.get(context, self.context_strategies['cloud_inference'])
-        
-        # Check constraints
-        constraints = {
-            'size_ok': architecture_config.get('hidden_dim', 512) * architecture_config.get('num_layers', 6) / 1024 < strategy['max_size_mb'],
-            'latency_ok': True,  # Would need real latency estimation
-            'accuracy_ok': True,  # Would need real accuracy prediction
-            'carbon_ok': True  # Would need real carbon estimation
-        }
-        
-        # Generate optimization suggestions
-        suggestions = []
-        
-        # Check if compression is needed
-        current_pruning = architecture_config.get('pruning_rate', 0)
-        if current_pruning < strategy['max_pruning_rate'] * 0.5:
-            suggestions.append({
-                'action': 'increase_pruning',
-                'from': current_pruning,
-                'to': strategy['max_pruning_rate'] * 0.7,
-                'reason': f"{context} deployment requires aggressive pruning"
-            })
-        
-        # Check quantization
-        current_quantization = architecture_config.get('quantization_bits', 32)
-        if current_quantization > strategy['min_quantization_bits']:
-            suggestions.append({
-                'action': 'quantize',
-                'from': current_quantization,
-                'to': strategy['min_quantization_bits'],
-                'reason': f"{context} deployment benefits from lower precision"
-            })
-        
-        # Check architecture family
-        if context in ['edge_tpu', 'mobile_inference'] and architecture_config.get('family') in ['transformer', 'vit']:
-            suggestions.append({
-                'action': 'change_family',
-                'from': architecture_config.get('family'),
-                'to': 'cnn',
-                'reason': f"{context} deployment favors CNN over transformer models"
-            })
-        
-        return {
-            'context': context,
-            'strategy': strategy,
-            'constraints_met': all(constraints.values()),
-            'constraints': constraints,
-            'suggestions': suggestions[:3],  # Top 3 suggestions
-            'priority_order': strategy['priority'],
-            'recommended_compression': strategy['recommended_compression']
-        }
-
-# ============================================================================
-# Systemic Reasoning: Long-term Carbon Planning
-# ============================================================================
-
-class SystemicCarbonPlanner:
-    """Plan carbon reduction across multiple NAS runs"""
-    
-    def __init__(self):
-        self.carbon_history = deque(maxlen=100)
-        self.accuracy_history = deque(maxlen=100)
-        self.investment_returns = defaultdict(list)
-        
-        # Load historical data
-        self._load_historical_data()
-    
-    def _load_historical_data(self):
-        """Load historical planning data"""
-        try:
-            # Would load from database in production
-            pass
-        except Exception as e:
-            logger.debug(f"Could not load systemic planning data: {e}")
-    
-    def plan_carbon_investment(self, 
-                              current_accuracy: float,
-                              target_accuracy: float,
-                              carbon_budget: float) -> Dict[str, Any]:
-        """
-        Decide how much carbon to invest in exploration.
-        """
-        # Estimate improvement potential
-        improvement_gap = max(0, target_accuracy - current_accuracy)
-        
-        # Estimate compute needed for improvement (diminishing returns)
-        compute_need = self._estimate_compute_for_improvement(improvement_gap)
-        
-        # Calculate carbon cost
-        carbon_cost = compute_need * 0.001  # kg per unit compute
-        
-        # Estimate long-term savings
-        long_term_savings = self._estimate_long_term_savings(current_accuracy, target_accuracy)
-        
-        # Calculate ROI
-        roi = (long_term_savings - carbon_cost) / carbon_cost if carbon_cost > 0 else 0
-        
-        # Investment decision
-        if roi > 0.5:
-            decision = 'invest'
-            reason = f'High ROI ({roi:.2f}) - invest in exploration'
-        elif roi > 0.1:
-            decision = 'balanced'
-            reason = f'Moderate ROI ({roi:.2f}) - balanced approach'
-        else:
-            decision = 'save'
-            reason = f'Low ROI ({roi:.2f}) - save carbon for future'
-        
-        # Store for learning
-        self.investment_returns[decision].append({
-            'roi': roi,
-            'accuracy_gain': improvement_gap,
-            'carbon_cost': carbon_cost
-        })
-        
-        return {
-            'decision': decision,
-            'reason': reason,
-            'carbon_cost': carbon_cost,
-            'long_term_savings': long_term_savings,
-            'roi': roi,
-            'compute_need': compute_need,
-            'estimated_generations': int(compute_need / 0.5),  # 0.5 units per generation
-            'recommendation': self._generate_planning_recommendation(decision, roi)
-        }
-    
-    def _estimate_compute_for_improvement(self, improvement_gap: float) -> float:
-        """Estimate compute needed for accuracy improvement"""
-        # More improvement requires exponentially more compute
-        # 0.05 improvement -> 5 units, 0.10 -> 10 units, 0.20 -> 30 units
-        if improvement_gap <= 0:
-            return 1.0
-        return max(1.0, improvement_gap * 10)
-    
-    def _estimate_long_term_savings(self, current_accuracy: float, target_accuracy: float) -> float:
-        """Estimate long-term carbon savings from better architecture"""
-        # Better architecture -> less inference carbon over lifetime
-        efficiency_gain = max(0, (target_accuracy - current_accuracy) * 0.1)
-        lifetime_inferences = 1e6  # Million inferences
-        base_inference_carbon = 0.0001  # kg per inference
-        
-        return efficiency_gain * lifetime_inferences * base_inference_carbon
-    
-    def _generate_planning_recommendation(self, decision: str, roi: float) -> str:
-        """Generate planning recommendation"""
-        if decision == 'invest':
-            return f"Invest in exploration - ROI of {roi:.2f} justifies the carbon expenditure"
-        elif decision == 'balanced':
-            return f"Take a balanced approach - moderate ROI of {roi:.2f}, consider limited exploration"
-        else:
-            return f"Conserve carbon - low ROI of {roi:.2f}, focus on consolidating current gains"
-
-# ============================================================================
-# Reflexive Reasoning: Purpose-Aware Optimization
-# ============================================================================
-
-class PurposeAwareOptimizer:
-    """Understand why carbon reduction matters for specific use cases"""
-    
-    def __init__(self):
-        self.purposes = {
-            'climate_research': {
-                'priority': 'maximum_reduction',
-                'accuracy_tolerance': 0.10,
-                'transparency': 'high',
-                'carbon_priority': 0.8,
-                'description': 'Maximize carbon reduction even at cost of accuracy'
-            },
-            'medical_diagnosis': {
-                'priority': 'accuracy_first',
-                'accuracy_tolerance': 0.01,
-                'transparency': 'critical',
-                'carbon_priority': 0.3,
-                'description': 'Maintain high accuracy, reduce carbon only where possible'
-            },
-            'consumer_app': {
-                'priority': 'balanced',
-                'accuracy_tolerance': 0.05,
-                'transparency': 'medium',
-                'carbon_priority': 0.5,
-                'description': 'Balance between accuracy and carbon reduction'
-            },
-            'research_exploration': {
-                'priority': 'exploration',
-                'accuracy_tolerance': 0.15,
-                'transparency': 'low',
-                'carbon_priority': 0.6,
-                'description': 'Prioritize exploration of novel architectures'
-            },
-            'production_deployment': {
-                'priority': 'reliability',
-                'accuracy_tolerance': 0.03,
-                'transparency': 'high',
-                'carbon_priority': 0.4,
-                'description': 'Focus on reliable performance with some carbon reduction'
-            }
-        }
-        
-        self.purpose_history = deque(maxlen=100)
-    
-    def get_purpose_guide(self, purpose: str = 'balanced') -> Dict[str, Any]:
-        """
-        Get optimization guidance based on purpose.
-        """
-        guide = self.purposes.get(purpose, self.purposes['balanced'])
-        
-        # Generate specific recommendations
-        recommendations = []
-        
-        if guide['priority'] == 'maximum_reduction':
-            recommendations.append("Aggressively prune and quantize (target 40-50% reduction)")
-            recommendations.append("Consider knowledge distillation for energy savings")
-            recommendations.append("Prioritize carbon reduction over accuracy")
-        elif guide['priority'] == 'accuracy_first':
-            recommendations.append("Conservative pruning only (max 10-15%)")
-            recommendations.append("Use FP16 quantization instead of INT8")
-            recommendations.append("Maintain accuracy above all else")
-        elif guide['priority'] == 'exploration':
-            recommendations.append("Generate diverse architectures even if some are inefficient")
-            recommendations.append("Balance carbon budget for maximum exploration")
-            recommendations.append("Document all architecture attempts regardless of efficiency")
-        elif guide['priority'] == 'reliability':
-            recommendations.append("Focus on proven architecture families")
-            recommendations.append("Apply moderate compression with safety margins")
-            recommendations.append("Ensure reproducibility of results")
-        else:  # balanced
-            recommendations.append("Apply moderate compression (20-30%)")
-            recommendations.append("Test both INT8 and FP16 quantization")
-            recommendations.append("Balance carbon reduction with accuracy maintenance")
-        
-        # Add transparency requirements
-        if guide['transparency'] == 'critical':
-            recommendations.append("Generate detailed explainability reports for all decisions")
-            recommendations.append("Document all carbon reduction choices and their impact")
-            recommendations.append("Provide audit trail for all architectural decisions")
-        elif guide['transparency'] == 'high':
-            recommendations.append("Document key carbon reduction decisions")
-            recommendations.append("Provide clear reasoning for architectural choices")
-        
-        return {
-            'purpose': purpose,
-            'guide': guide,
-            'recommendations': recommendations,
-            'optimization_weight': {
-                'accuracy': 1.0 - guide['carbon_priority'],
-                'carbon': guide['carbon_priority']
-            },
-            'acceptable_accuracy_loss': guide['accuracy_tolerance']
-        }
-    
-    def reflect_on_purpose(self, 
-                          purpose: str,
-                          outcomes: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Reflect on how well the purpose was achieved.
-        """
-        guide = self.purposes.get(purpose, self.purposes['balanced'])
-        
-        # Assess achievement
-        accuracy_achieved = outcomes.get('accuracy', 0)
-        carbon_achieved = outcomes.get('carbon_reduction', 0)
-        
-        # Compare with expectations
-        accuracy_gap = max(0, guide['accuracy_tolerance'] - accuracy_achieved)
-        carbon_gap = guide['carbon_priority'] - carbon_achieved
-        
-        # Store reflection
-        reflection = {
-            'timestamp': datetime.now().isoformat(),
-            'purpose': purpose,
-            'accuracy_achieved': accuracy_achieved,
-            'carbon_achieved': carbon_achieved,
-            'accuracy_gap': accuracy_gap,
-            'carbon_gap': carbon_gap,
-            'purpose_achieved': accuracy_gap <= 0 and carbon_gap <= 0,
-            'lessons': []
-        }
-        
-        # Generate lessons
-        if accuracy_gap > 0:
-            reflection['lessons'].append(f"Accuracy gap: {accuracy_gap:.2f} - consider less aggressive compression")
-        if carbon_gap > 0:
-            reflection['lessons'].append(f"Carbon gap: {carbon_gap:.2f} - consider more aggressive optimization")
-        
-        if reflection['purpose_achieved']:
-            reflection['lessons'].append("Purpose achieved - continue with current strategy")
-        else:
-            reflection['lessons'].append("Purpose not fully achieved - adjust optimization strategy")
-        
-        self.purpose_history.append(reflection)
-        
-        return reflection
-
-# ============================================================================
-# Main Reasoning Engine
+# Enhanced Main Reasoning Engine
 # ============================================================================
 
 class GreenAgentReasoningEngine:
     """
-    Unified reasoning engine integrating all reasoning capabilities.
+    Enhanced unified reasoning engine with all improvements.
     """
     
-    def __init__(self):
-        self.scheduler = CarbonIntensityAwareScheduler()
-        self.causal_model = CarbonCausalModel()
+    def __init__(self, db_path: str = "green_agent_data.db"):
+        self.storage = PersistentStorage(db_path)
+        self.carbon_client = LiveCarbonDataClient(storage=self.storage)
+        self.hardware_profiler = HardwareProfiler()
+        self.predictor = PerformancePredictor(
+            storage=self.storage,
+            hardware_profiler=self.hardware_profiler
+        )
+        
+        self.scheduler = EnhancedCarbonIntensityAwareScheduler(
+            storage=self.storage,
+            carbon_client=self.carbon_client
+        )
+        self.causal_model = EnhancedCarbonCausalModel(
+            storage=self.storage,
+            predictor=self.predictor
+        )
         self.ethical_reasoner = EthicalCarbonReasoner()
         self.context_optimizer = ContextAwareOptimizer()
         self.planner = SystemicCarbonPlanner()
@@ -850,24 +984,39 @@ class GreenAgentReasoningEngine:
         self.reasoning_history = deque(maxlen=1000)
         self.enabled = True
         
-        logger.info("GreenAgentReasoningEngine initialized")
+        logger.info("Enhanced GreenAgentReasoningEngine initialized")
     
     async def reason_about_architecture(self,
                                        architecture_config: Dict[str, Any],
                                        fitness_metrics: Dict[str, float],
                                        context: str = 'cloud_inference',
-                                       purpose: str = 'balanced') -> Dict[str, Any]:
+                                       purpose: str = 'balanced',
+                                       training_epochs: int = 100) -> Dict[str, Any]:
         """
-        Apply all reasoning capabilities to an architecture.
+        Enhanced reasoning with performance predictions and learning.
         """
         if not self.enabled:
             return {'reasoning': 'disabled'}
         
+        architecture_hash = hashlib.md5(json.dumps(architecture_config).encode()).hexdigest()[:8]
+        
         reasoning_result = {
             'timestamp': datetime.now().isoformat(),
-            'architecture_hash': hashlib.md5(json.dumps(architecture_config).encode()).hexdigest()[:8],
+            'architecture_hash': architecture_hash,
             'context': context,
-            'purpose': purpose
+            'purpose': purpose,
+            'performance_predictions': {}
+        }
+        
+        # Performance predictions
+        predicted_accuracy = self.predictor.predict_accuracy(architecture_config)
+        predicted_carbon = self.predictor.predict_carbon(
+            architecture_config, context, training_epochs
+        )
+        reasoning_result['performance_predictions'] = {
+            'predicted_accuracy': predicted_accuracy,
+            'predicted_carbon_kg': predicted_carbon,
+            'predicted_latency_ms': self._predict_latency(architecture_config, context)
         }
         
         # Temporal reasoning
@@ -880,13 +1029,7 @@ class GreenAgentReasoningEngine:
         
         # Causal reasoning
         causal = self.causal_model.explain_carbon_impact(architecture_config, fitness_metrics)
-        reasoning_result['causal'] = {
-            'primary_driver': causal.primary_driver,
-            'contribution': causal.contribution,
-            'pathway': causal.pathway,
-            'alternatives': causal.alternatives,
-            'confidence': causal.confidence
-        }
+        reasoning_result['causal'] = causal
         
         # Ethical reasoning
         ethical = self.ethical_reasoner.assess_reduction_impact(architecture_config, fitness_metrics)
@@ -896,11 +1039,11 @@ class GreenAgentReasoningEngine:
         context_plan = self.context_optimizer.get_context_plan(architecture_config, context)
         reasoning_result['contextual'] = context_plan
         
-        # Systemic planning
+        # Systemic planning with better data
         systemic = self.planner.plan_carbon_investment(
-            current_accuracy=fitness_metrics.get('accuracy', 0.85),
-            target_accuracy=0.90,
-            carbon_budget=10.0  # kg
+            current_accuracy=fitness_metrics.get('accuracy', predicted_accuracy),
+            target_accuracy=0.92,
+            carbon_budget=10.0
         )
         reasoning_result['systemic'] = systemic
         
@@ -908,21 +1051,62 @@ class GreenAgentReasoningEngine:
         reflexive = self.purpose_optimizer.get_purpose_guide(purpose)
         reasoning_result['reflexive'] = reflexive
         
-        # Store reasoning history
-        self.reasoning_history.append(reasoning_result)
+        # Store reasoning for learning
+        self.storage.save_reasoning(architecture_hash, reasoning_result)
         
         # Generate overall recommendations
-        reasoning_result['overall_recommendations'] = self._generate_recommendations(reasoning_result)
+        reasoning_result['overall_recommendations'] = self._generate_enhanced_recommendations(
+            reasoning_result, architecture_config
+        )
+        
+        # Learn from this reasoning
+        self._update_learning_models(architecture_config, reasoning_result)
         
         return reasoning_result
     
-    def _generate_recommendations(self, reasoning_result: Dict) -> List[str]:
-        """Generate overall recommendations from all reasoning"""
+    def _predict_latency(self, architecture_config: Dict[str, Any], context: str) -> float:
+        """Predict inference latency in milliseconds"""
+        base_latency = 10
+        num_layers = architecture_config.get('num_layers', 6)
+        hidden_dim = architecture_config.get('hidden_dim', 384)
+        batch_size = architecture_config.get('batch_size', 32)
+        
+        latency = (base_latency + 
+                  num_layers * 2 + 
+                  hidden_dim * 0.05 + 
+                  batch_size * 0.5)
+        
+        # Context adjustment
+        if context in ['edge_tpu', 'mobile_inference']:
+            latency *= 1.5  # More latency on edge devices
+        elif context == 'batch_processing':
+            latency *= 0.5  # Better throughput with batching
+        
+        return latency
+    
+    def _generate_enhanced_recommendations(self, reasoning_result: Dict, 
+                                          architecture_config: Dict) -> List[str]:
+        """Generate enhanced recommendations using predictions"""
         recommendations = []
         
         # Temporal recommendations
-        if reasoning_result.get('temporal', {}).get('action') == 'schedule':
-            recommendations.append(f"Schedule evaluation for better carbon timing: {reasoning_result['temporal'].get('schedule', 'unknown')}")
+        temporal = reasoning_result.get('temporal', {})
+        if temporal.get('action') == 'schedule':
+            recommendations.append(
+                f"Schedule evaluation for better carbon timing: {temporal.get('schedule', 'unknown')}"
+            )
+        
+        # Performance-based recommendations
+        predictions = reasoning_result.get('performance_predictions', {})
+        if predictions.get('predicted_accuracy', 0) < 0.85:
+            recommendations.append(
+                f"Predicted accuracy is {predictions['predicted_accuracy']*100:.1f}% - consider architecture improvements"
+            )
+        
+        if predictions.get('predicted_carbon_kg', 0) > 5:
+            recommendations.append(
+                f"High predicted carbon ({predictions['predicted_carbon_kg']:.2f}kg) - consider optimization"
+            )
         
         # Causal recommendations
         causal_alternatives = reasoning_result.get('causal', {}).get('alternatives', [])
@@ -937,21 +1121,40 @@ class GreenAgentReasoningEngine:
         # Contextual recommendations
         contextual_suggestions = reasoning_result.get('contextual', {}).get('suggestions', [])
         for suggestion in contextual_suggestions[:2]:
-            recommendations.append(f"Contextual suggestion: {suggestion.get('action')} ({suggestion.get('reason')})")
+            recommendations.append(
+                f"Contextual suggestion: {suggestion.get('action')} ({suggestion.get('reason')})"
+            )
         
         # Systemic recommendations
-        if reasoning_result.get('systemic', {}).get('decision') == 'invest':
+        systemic = reasoning_result.get('systemic', {})
+        if systemic.get('decision') == 'invest':
             recommendations.append("Systemic decision: Invest in exploration - high ROI expected")
         
-        # Reflexive recommendations
+        # Purpose-based recommendations
         reflexive_recommendations = reasoning_result.get('reflexive', {}).get('recommendations', [])
         if reflexive_recommendations:
             recommendations.extend(reflexive_recommendations[:2])
         
-        return recommendations[:5]  # Top 5 recommendations
+        return recommendations[:5]
+    
+    def _update_learning_models(self, architecture_config: Dict, reasoning_result: Dict):
+        """Update learning models with new data"""
+        # Extract outcomes if available
+        outcomes = reasoning_result.get('actual_outcomes', {})
+        
+        if outcomes:
+            # Update causal model
+            for feature in architecture_config:
+                if feature in self.causal_model.causal_graph:
+                    self.storage.save_causal_effect(
+                        feature=feature,
+                        value=architecture_config[feature],
+                        carbon_impact=outcomes.get('carbon_impact', 0.3),
+                        accuracy_impact=outcomes.get('accuracy_impact', 0.02)
+                    )
     
     async def get_reasoning_summary(self) -> Dict[str, Any]:
-        """Get summary of reasoning history"""
+        """Get enhanced summary of reasoning history"""
         if not self.reasoning_history:
             return {'status': 'no_reasoning_history'}
         
@@ -962,6 +1165,17 @@ class GreenAgentReasoningEngine:
         for entry in recent:
             all_recommendations.extend(entry.get('overall_recommendations', []))
         
+        # Calculate average predictions
+        avg_accuracy = np.mean([
+            entry.get('performance_predictions', {}).get('predicted_accuracy', 0.85)
+            for entry in recent
+        ])
+        
+        avg_carbon = np.mean([
+            entry.get('performance_predictions', {}).get('predicted_carbon_kg', 1.0)
+            for entry in recent
+        ])
+        
         return {
             'total_reasoned_architectures': len(self.reasoning_history),
             'recent_recommendations': all_recommendations[:10],
@@ -969,6 +1183,8 @@ class GreenAgentReasoningEngine:
                 entry.get('ethical', {}).get('overall_ethical_score', 0.5)
                 for entry in recent
             ]),
+            'average_predicted_accuracy': avg_accuracy,
+            'average_predicted_carbon_kg': avg_carbon,
             'most_common_causal_driver': self._get_most_common_causal_driver(recent),
             'timestamp': datetime.now().isoformat()
         }
@@ -990,4 +1206,69 @@ class GreenAgentReasoningEngine:
     async def shutdown(self):
         """Clean shutdown"""
         self.enabled = False
-        logger.info("GreenAgentReasoningEngine shutdown complete")
+        if hasattr(self.carbon_client, 'session') and self.carbon_client.session:
+            await self.carbon_client.session.close()
+        logger.info("Enhanced GreenAgentReasoningEngine shutdown complete")
+
+# ============================================================================
+# Backward Compatibility Classes
+# ============================================================================
+
+# Keep original classes for backward compatibility
+class CarbonIntensityAwareScheduler(EnhancedCarbonIntensityAwareScheduler):
+    """Legacy class - use EnhancedCarbonIntensityAwareScheduler"""
+    pass
+
+class CarbonCausalModel(EnhancedCarbonCausalModel):
+    """Legacy class - use EnhancedCarbonCausalModel"""
+    pass
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+
+async def example_usage():
+    """Example of using the enhanced reasoning engine"""
+    engine = GreenAgentReasoningEngine()
+    
+    # Example architecture configuration
+    architecture = {
+        'num_layers': 8,
+        'hidden_dim': 512,
+        'num_heads': 10,
+        'pruning_rate': 0.1,
+        'quantization_bits': 32,
+        'batch_size': 64,
+        'attention_type': 'flash_attention',
+        'activation_function': 'swiglu',
+        'moe_layers': 0
+    }
+    
+    # Fitness metrics from previous runs (if available)
+    fitness = {
+        'accuracy': 0.88,
+        'carbon_kg': 2.5,
+        'latency_ms': 15
+    }
+    
+    # Get reasoning
+    result = await engine.reason_about_architecture(
+        architecture_config=architecture,
+        fitness_metrics=fitness,
+        context='cloud_inference',
+        purpose='balanced',
+        training_epochs=100
+    )
+    
+    print("Reasoning Results:")
+    print(json.dumps(result, indent=2, default=str))
+    
+    # Get summary
+    summary = await engine.get_reasoning_summary()
+    print("\nReasoning Summary:")
+    print(json.dumps(summary, indent=2, default=str))
+    
+    await engine.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(example_usage())
