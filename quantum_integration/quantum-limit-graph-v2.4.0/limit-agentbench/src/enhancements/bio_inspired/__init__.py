@@ -10,6 +10,8 @@ event-driven communication, predictive alerts, cost-benefit analysis, workflow o
 and anomaly detection
 """
 
+import asyncio
+from bio_inspired import EnhancedBioInspiredCore
 from .quantum_bridge import QuantumBridge
 from .time_tick_engine import TimeTickEngine
 from .helium_environment_translator import HeliumEnvironmentTranslator  # (the one I gave earlier)
@@ -1306,3 +1308,24 @@ class EnhancedBioInspiredCore:
         # Push current gradients to the quantum graph
         self._quantum_bridge.apply_to_quantum_graph()
         # Optionally log or alert
+
+
+async def main():
+    # Initialize the core (with your quantum graph if available)
+    core = EnhancedBioInspiredCore(
+        csv_path="helium_timeseries_realistic_2020_2026.csv",
+        quantum_graph=your_quantum_graph_object  # optional
+    )
+    
+    # The tick engine runs automatically in the background.
+    # If you want to manually control it:
+    # await core._tick_engine.run_simulation(tick_interval_seconds=0.1)
+    
+    # Let it run for a while, then shutdown gracefully
+    try:
+        await asyncio.sleep(3600)  # run for 1 hour
+    finally:
+        await core.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
