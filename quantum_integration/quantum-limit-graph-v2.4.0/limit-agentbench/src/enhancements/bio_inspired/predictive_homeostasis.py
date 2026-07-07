@@ -1,8 +1,11 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/photosynthetic_harvester.py
-# Complete enhanced file v7.0.0 with all module enhancements
+# Complete enhanced file v7.1.0 with:
+# - All v7.0.0 enterprise features
+# - Genetic Algorithm for evolving conversion factors, sensitivity multipliers, and repair rates
+# - Predator‑Prey competition among child harvesters for limited excitation budget
 
 """
-Enhanced Photosynthetic Harvester v7.0.0
+Enhanced Photosynthetic Harvester v7.1.0
 Enterprise-grade implementation with:
 - Distributed multi-harvester orchestration & consensus
 - Reinforcement learning for adaptive control
@@ -19,6 +22,8 @@ Enterprise-grade implementation with:
 - Vectorized processing & machine learning predictions
 - Comprehensive health monitoring & self-healing
 - WebSocket streaming for real-time monitoring
+- Genetic Algorithm for parameter evolution
+- Predator‑Prey competition among child harvesters
 """
 
 import asyncio
@@ -117,7 +122,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Enhanced Enums and Data Classes
+# Enhanced Enums and Data Classes (unchanged from v7.0.0)
 # ============================================================================
 
 class PigmentState(Enum):
@@ -2971,13 +2976,315 @@ class IoTSensorHub:
         }
 
 # ============================================================================
+# Module 11: NEW - Genetic Algorithm for Parameter Evolution
+# ============================================================================
+
+class HarvesterGeneticOptimizer:
+    """
+    Genetic algorithm to evolve harvester parameters:
+    - Conversion factors for each pigment
+    - Sensitivity multipliers
+    - Repair rates
+    """
+    
+    def __init__(self, harvester: 'EnhancedPhotosyntheticHarvester'):
+        self.harvester = harvester
+        self.population_size = 20
+        self.mutation_rate = 0.2
+        self.crossover_rate = 0.7
+        self.generations = 10
+        self.tournament_size = 3
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        
+        self.param_bounds = {
+            'conversion_factors': (0.001, 0.1),   # for each pigment
+            'sensitivity_multipliers': (0.5, 2.0),
+            'repair_rates': (0.005, 0.05)
+        }
+        logger.info("Harvester Genetic Optimizer initialized")
+    
+    def _initialize_individual(self) -> Dict:
+        """Generate random parameter set."""
+        ind = {
+            'conversion_factors': {},
+            'sensitivity_multipliers': {},
+            'repair_rates': {}
+        }
+        pigments = self.harvester.pigments.pigments.keys()
+        for p in pigments:
+            ind['conversion_factors'][p] = random.uniform(*self.param_bounds['conversion_factors'])
+            ind['sensitivity_multipliers'][p] = random.uniform(*self.param_bounds['sensitivity_multipliers'])
+            ind['repair_rates'][p] = random.uniform(*self.param_bounds['repair_rates'])
+        return ind
+    
+    def _initialize_population(self) -> List[Dict]:
+        return [self._initialize_individual() for _ in range(self.population_size)]
+    
+    def _fitness(self, individual: Dict) -> float:
+        """Fitness based on average token generation rate and system health."""
+        # Temporarily apply parameters
+        self._apply_individual(individual)
+        # Evaluate fitness
+        stats = self.harvester.get_harvesting_stats()
+        total_harvested = stats.get('total_harvested', 0)
+        harvest_cycles = stats.get('harvest_cycles', 1)
+        avg_rate = total_harvested / max(harvest_cycles, 1)
+        efficiency = stats.get('efficiency', 0.5)
+        health = stats.get('health_metrics', {}).get('overall_health', 0.5)
+        fitness = 0.5 * avg_rate + 0.3 * efficiency + 0.2 * health
+        self._restore_original_parameters()
+        return fitness
+    
+    def _apply_individual(self, individual: Dict):
+        """Temporarily apply parameters to harvester."""
+        self._original_params = {
+            'conversion_factors': {},
+            'sensitivity_multipliers': {},
+            'repair_rates': {}
+        }
+        pigments = self.harvester.pigments.pigments
+        for p in pigments:
+            self._original_params['conversion_factors'][p] = pigments[p]['energy_conversion_factor']
+            self._original_params['sensitivity_multipliers'][p] = pigments[p]['sensitivity']
+            self._original_params['repair_rates'][p] = self.harvester.pigments.pigment_health[p].recovery_rate
+            # Apply new values
+            pigments[p]['energy_conversion_factor'] = individual['conversion_factors'][p]
+            pigments[p]['sensitivity'] = individual['sensitivity_multipliers'][p] * pigments[p]['base_sensitivity']
+            self.harvester.pigments.pigment_health[p].recovery_rate = individual['repair_rates'][p]
+    
+    def _restore_original_parameters(self):
+        if hasattr(self, '_original_params'):
+            pigments = self.harvester.pigments.pigments
+            for p in pigments:
+                pigments[p]['energy_conversion_factor'] = self._original_params['conversion_factors'][p]
+                pigments[p]['sensitivity'] = self._original_params['sensitivity_multipliers'][p] * pigments[p]['base_sensitivity']
+                self.harvester.pigments.pigment_health[p].recovery_rate = self._original_params['repair_rates'][p]
+    
+    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
+        tournament = random.sample(range(len(population)), self.tournament_size)
+        best_idx = max(tournament, key=lambda i: fitness_scores[i])
+        return population[best_idx]
+    
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
+        child = {'conversion_factors': {}, 'sensitivity_multipliers': {}, 'repair_rates': {}}
+        pigments = self.harvester.pigments.pigments.keys()
+        for p in pigments:
+            if random.random() < 0.5:
+                child['conversion_factors'][p] = parent1['conversion_factors'][p]
+                child['sensitivity_multipliers'][p] = parent1['sensitivity_multipliers'][p]
+                child['repair_rates'][p] = parent1['repair_rates'][p]
+            else:
+                child['conversion_factors'][p] = parent2['conversion_factors'][p]
+                child['sensitivity_multipliers'][p] = parent2['sensitivity_multipliers'][p]
+                child['repair_rates'][p] = parent2['repair_rates'][p]
+            if random.random() < 0.3:
+                child['conversion_factors'][p] = (parent1['conversion_factors'][p] + parent2['conversion_factors'][p]) / 2
+                child['sensitivity_multipliers'][p] = (parent1['sensitivity_multipliers'][p] + parent2['sensitivity_multipliers'][p]) / 2
+                child['repair_rates'][p] = (parent1['repair_rates'][p] + parent2['repair_rates'][p]) / 2
+        return child
+    
+    def _mutate(self, individual: Dict) -> Dict:
+        mutated = {'conversion_factors': {}, 'sensitivity_multipliers': {}, 'repair_rates': {}}
+        pigments = self.harvester.pigments.pigments.keys()
+        for p in pigments:
+            mutated['conversion_factors'][p] = individual['conversion_factors'][p]
+            mutated['sensitivity_multipliers'][p] = individual['sensitivity_multipliers'][p]
+            mutated['repair_rates'][p] = individual['repair_rates'][p]
+            if random.random() < self.mutation_rate:
+                delta = random.uniform(-0.01, 0.01)
+                mutated['conversion_factors'][p] = max(0.001, min(0.1, mutated['conversion_factors'][p] + delta))
+            if random.random() < self.mutation_rate:
+                delta = random.uniform(-0.1, 0.1)
+                mutated['sensitivity_multipliers'][p] = max(0.5, min(2.0, mutated['sensitivity_multipliers'][p] + delta))
+            if random.random() < self.mutation_rate:
+                delta = random.uniform(-0.002, 0.002)
+                mutated['repair_rates'][p] = max(0.005, min(0.05, mutated['repair_rates'][p] + delta))
+        return mutated
+    
+    def _evolve_one_generation(self, population: List[Dict]) -> List[Dict]:
+        fitness_scores = [self._fitness(ind) for ind in population]
+        new_population = []
+        # Elitism
+        best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+        new_population.append(population[best_idx])
+        while len(new_population) < self.population_size:
+            if random.random() < self.crossover_rate:
+                parent1 = self._select(population, fitness_scores)
+                parent2 = self._select(population, fitness_scores)
+                child = self._crossover(parent1, parent2)
+                child = self._mutate(child)
+                new_population.append(child)
+            else:
+                parent = self._select(population, fitness_scores)
+                new_population.append(parent.copy())
+        return new_population
+    
+    async def evolve(self, generations: Optional[int] = None) -> Dict:
+        if generations is None:
+            generations = self.generations
+        population = self._initialize_population()
+        best_fitness = -float('inf')
+        best_ind = None
+        for gen in range(generations):
+            population = self._evolve_one_generation(population)
+            fitness_scores = [self._fitness(ind) for ind in population]
+            gen_best = max(range(len(population)), key=lambda i: fitness_scores[i])
+            if fitness_scores[gen_best] > best_fitness:
+                best_fitness = fitness_scores[gen_best]
+                best_ind = population[gen_best]
+            logger.debug(f"Gen {gen+1}: best fitness = {fitness_scores[gen_best]:.4f}")
+        if best_fitness > self.best_fitness:
+            self.best_fitness = best_fitness
+            self.best_individual = best_ind
+            self._apply_individual(best_ind)
+            logger.info(f"Applied best individual with fitness {best_fitness:.4f}")
+        self.evolution_history.append({
+            'timestamp': datetime.now(timezone.utc),
+            'best_fitness': best_fitness
+        })
+        return {'best_fitness': best_fitness, 'best_individual': best_ind}
+    
+    def get_status(self) -> Dict:
+        return {
+            'best_fitness': self.best_fitness,
+            'best_individual': self.best_individual,
+            'history': self.evolution_history[-10:]
+        }
+
+# ============================================================================
+# Module 12: NEW - Predator-Prey Competition for Child Harvesters
+# ============================================================================
+
+class ChildHarvesterCompetition:
+    """
+    Manages competition among child harvesters for limited excitation budget.
+    Underperformers are replaced by mutated copies of top performers.
+    Also implements a shared excitation pool that children compete for.
+    """
+    
+    def __init__(self, parent_harvester: 'EnhancedPhotosyntheticHarvester'):
+        self.parent = parent_harvester
+        self.competition_interval = 3600  # 1 hour
+        self.performance_window = 100  # cycles to consider for performance
+        self.replacement_threshold = 0.3  # bottom % of performers to replace
+        self._lock = asyncio.Lock()
+        
+        # Shared excitation budget (simulated)
+        self.excitation_budget = 1000.0  # total excitation units available per period
+        self.budget_consumption: Dict[str, float] = {}
+        self.budget_cycle = 0
+        
+        logger.info("Child Harvester Competition initialized")
+    
+    async def allocate_budget(self) -> Dict[str, float]:
+        """Allocate excitation budget to children based on past performance."""
+        async with self._lock:
+            children = list(self.parent.child_harvesters.values())
+            if not children:
+                return {}
+            
+            # Calculate performance scores (average harvested per cycle)
+            scores = {}
+            total_score = 0.0
+            for child in children:
+                cycles = child.harvest_cycles
+                if cycles > 0:
+                    score = child.total_harvested / cycles
+                else:
+                    score = 0.5
+                scores[child.harvester_id] = score
+                total_score += score
+            
+            if total_score == 0:
+                # Equal distribution
+                per_child = self.excitation_budget / len(children)
+                return {c.harvester_id: per_child for c in children}
+            
+            # Proportional allocation
+            allocation = {}
+            for child in children:
+                allocation[child.harvester_id] = (scores[child.harvester_id] / total_score) * self.excitation_budget
+            
+            # Record consumption
+            self.budget_consumption = allocation
+            self.budget_cycle += 1
+            
+            logger.debug(f"Allocated excitation budget: {allocation}")
+            return allocation
+    
+    async def run_competition(self):
+        """Evaluate child harvesters and replace underperformers."""
+        async with self._lock:
+            children = list(self.parent.child_harvesters.values())
+            if len(children) < 2:
+                return
+            
+            # Compute average token generation per cycle for each child
+            performance = {}
+            for child in children:
+                cycles = child.harvest_cycles
+                if cycles > 0:
+                    avg = child.total_harvested / cycles
+                else:
+                    avg = 0
+                performance[child.harvester_id] = avg
+            
+            if not performance:
+                return
+            
+            # Sort by performance
+            sorted_perf = sorted(performance.items(), key=lambda x: x[1])
+            # Identify bottom performers
+            bottom_count = max(1, int(len(sorted_perf) * self.replacement_threshold))
+            bottom = [child_id for child_id, _ in sorted_perf[:bottom_count]]
+            
+            # Identify top performers
+            top = [child_id for child_id, _ in sorted_perf[-bottom_count:]]
+            if not top:
+                return
+            
+            # For each bottom performer, replace with a mutated copy of a random top performer
+            for child_id in bottom:
+                # Choose a top performer to replicate
+                top_id = random.choice(top)
+                top_child = self.parent.child_harvesters.get(top_id)
+                if not top_child:
+                    continue
+                # Create a mutated copy
+                # Use the first pigment specialization as placeholder
+                specialization = top_child.pigments._pigment_names[0] if top_child.pigments._pigment_names else 'chlorophyll_a'
+                new_child = self.parent.spawn_child(specialization)
+                # Mutate parameters of the new child
+                for pigment_name, config in new_child.pigments.pigments.items():
+                    if random.random() < 0.3:
+                        config['sensitivity'] = config['base_sensitivity'] * random.uniform(0.8, 1.2)
+                
+                # Remove the old child
+                self.parent.remove_child(child_id)
+                # Add the new child
+                self.parent.child_harvesters[new_child.harvester_id] = new_child
+                logger.info(f"Replaced child {child_id} with mutated copy {new_child.harvester_id}")
+    
+    def get_stats(self) -> Dict:
+        return {
+            'competition_interval': self.competition_interval,
+            'replacement_threshold': self.replacement_threshold,
+            'children_count': len(self.parent.child_harvesters),
+            'budget_cycle': self.budget_cycle,
+            'excitation_budget': self.excitation_budget,
+            'budget_consumption': self.budget_consumption
+        }
+
+# ============================================================================
 # Main Enhanced Photosynthetic Harvester (Integration of All Modules)
 # ============================================================================
 
 class EnhancedPhotosyntheticHarvester:
     """
-    Enterprise-grade Photosynthetic Harvester v7.0.0
-    Integrates all module enhancements:
+    Enterprise-grade Photosynthetic Harvester v7.1.0
+    Integrates all module enhancements including:
     - Distributed orchestration & consensus
     - Reinforcement learning control
     - Zero-trust security
@@ -2988,6 +3295,8 @@ class EnhancedPhotosyntheticHarvester:
     - GraphQL & event system
     - Chaos engineering & testing
     - Edge computing & IoT
+    - Genetic Algorithm for parameter evolution
+    - Predator‑Prey competition among child harvesters
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -3084,6 +3393,16 @@ class EnhancedPhotosyntheticHarvester:
                 port=config.get('websocket', {}).get('port', 8765)
             )
         
+        # Child harvesters (multi-harvester scaling)
+        self.child_harvesters: Dict[str, 'EnhancedPhotosyntheticHarvester'] = {}
+        self.is_child = False  # False for primary
+        
+        # NEW: Genetic optimizer
+        self.genetic_optimizer = HarvesterGeneticOptimizer(self)
+        
+        # NEW: Competition engine
+        self.competition_engine = ChildHarvesterCompetition(self)
+        
         # Initialize orchestrator
         if self.orchestrator:
             asyncio.create_task(self.orchestrator.initialize())
@@ -3091,8 +3410,10 @@ class EnhancedPhotosyntheticHarvester:
         # Start background tasks
         self._maintenance_task = asyncio.create_task(self._maintenance_loop())
         self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+        asyncio.create_task(self._genetic_evolution_loop())
+        asyncio.create_task(self._competition_loop())
         
-        logger.info(f"Enhanced Photosynthetic Harvester v7.0.0 initialized: {self.harvester_id}")
+        logger.info(f"Enhanced Photosynthetic Harvester v7.1.0 initialized: {self.harvester_id}")
     
     async def harvest_cycle(self, environmental_data: Dict[str, float]) -> Dict[str, Any]:
         """
@@ -3282,6 +3603,57 @@ class EnhancedPhotosyntheticHarvester:
             'efficiency': self.reaction_center.current_efficiency
         }))
     
+    # ========================================================================
+    # Child harvester management (for competition)
+    # ========================================================================
+    
+    def spawn_child(self, specialization: str) -> 'EnhancedPhotosyntheticHarvester':
+        """
+        Spawn a child harvester specialized in a particular pigment type.
+        Enables multi-harvester scaling for high-demand scenarios.
+        """
+        child_id = f"{self.harvester_id}_child_{specialization}_{len(self.child_harvesters)}"
+        
+        child = EnhancedPhotosyntheticHarvester({
+            'harvester_id': child_id,
+            'token_manager': self.token_manager,
+            'gradient_manager': self.gradient_manager,
+            'latitude': self.latitude if hasattr(self, 'latitude') else 0.0,
+            'longitude': self.longitude if hasattr(self, 'longitude') else 0.0,
+            'persistence': {'enabled': False},  # Children don't persist independently
+            'security': {'level': 'STANDARD'},
+            'defi': {'auto_trade': False},
+            'carbon_market': {'enabled': False},
+            'websocket': {'enabled': False}
+        })
+        child.is_child = True
+        
+        # Specialize the child's pigments
+        for pigment_name, pigment_config in child.pigments.pigments.items():
+            if pigment_config['specialization'] != specialization:
+                pigment_config['sensitivity'] *= 0.3
+            else:
+                pigment_config['sensitivity'] *= 1.5
+        
+        self.child_harvesters[child_id] = child
+        logger.info(f"Spawned child harvester '{child_id}' specialized in {specialization}")
+        return child
+    
+    def remove_child(self, child_id: str) -> bool:
+        """Remove a child harvester"""
+        if child_id in self.child_harvesters:
+            child = self.child_harvesters[child_id]
+            # Clean up child
+            asyncio.create_task(child.cleanup())
+            del self.child_harvesters[child_id]
+            logger.info(f"Removed child harvester '{child_id}'")
+            return True
+        return False
+    
+    # ========================================================================
+    # Background loops (including new ones)
+    # ========================================================================
+    
     async def _maintenance_loop(self):
         """Background maintenance loop"""
         while True:
@@ -3335,6 +3707,37 @@ class EnhancedPhotosyntheticHarvester:
                 logger.error(f"Monitoring loop error: {e}")
                 await asyncio.sleep(60)
     
+    async def _genetic_evolution_loop(self):
+        """Run genetic optimization periodically."""
+        while True:
+            try:
+                if self.harvest_cycles > 50:
+                    logger.info("Starting genetic evolution cycle...")
+                    result = await self.genetic_optimizer.evolve(generations=10)
+                    logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}")
+                await asyncio.sleep(86400)  # every 24 hours
+            except Exception as e:
+                logger.error(f"Genetic evolution loop error: {str(e)}")
+                await asyncio.sleep(3600)
+    
+    async def _competition_loop(self):
+        """Run child harvester competition periodically."""
+        while True:
+            try:
+                if not self.is_child and len(self.child_harvesters) >= 2:
+                    # Allocate excitation budget
+                    await self.competition_engine.allocate_budget()
+                    # Run competition cycle
+                    await self.competition_engine.run_competition()
+                await asyncio.sleep(self.competition_engine.competition_interval)
+            except Exception as e:
+                logger.error(f"Competition loop error: {str(e)}")
+                await asyncio.sleep(300)
+    
+    # ========================================================================
+    # State persistence
+    # ========================================================================
+    
     async def save_state(self) -> bool:
         """Save current state to persistence"""
         if not self.persistence:
@@ -3355,6 +3758,10 @@ class EnhancedPhotosyntheticHarvester:
         except Exception as e:
             logger.error(f"State save failed: {e}")
             return False
+    
+    # ========================================================================
+    # Statistics
+    # ========================================================================
     
     def get_harvesting_stats(self) -> Dict[str, Any]:
         """Get comprehensive harvesting statistics"""
@@ -3377,7 +3784,11 @@ class EnhancedPhotosyntheticHarvester:
             'carbon': self.carbon_market.get_credit_summary(),
             'predictive_maintenance': self.predictive_maintenance.get_maintenance_recommendations(),
             'iot': self.iot_hub.get_sensor_status(),
-            'edge': {'model_size': self.edge_harvester.get_model_size()}
+            'edge': {'model_size': self.edge_harvester.get_model_size()},
+            # New features
+            'genetic_optimizer': self.genetic_optimizer.get_status(),
+            'competition': self.competition_engine.get_stats(),
+            'children_count': len(self.child_harvesters)
         }
     
     async def cleanup(self):
@@ -3398,6 +3809,10 @@ class EnhancedPhotosyntheticHarvester:
             await self.save_state()
         
         await self.event_system.cleanup()
+        
+        # Cleanup children
+        for child_id in list(self.child_harvesters.keys()):
+            await self.remove_child(child_id)
         
         logger.info(f"Harvester {self.harvester_id} cleaned up")
 
@@ -3485,6 +3900,8 @@ async def example_usage():
     print(f"Total harvested: {stats['total_harvested']:.2f}")
     print(f"Peak rate: {stats['peak_harvest_rate']:.2f}")
     print(f"Mode: {stats['mode']}")
+    print(f"Genetic optimizer: {stats['genetic_optimizer']}")
+    print(f"Competition: {stats['competition']}")
     
     # Cleanup
     await harvester.cleanup()
