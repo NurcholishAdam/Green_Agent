@@ -1,13 +1,14 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/biomass_storage.py
-# Complete enhanced file v6.0.0 with all improvements
+# Complete enhanced file v6.1.0 with GeneticOptimizer for evolutionary optimization
 
 """
-Enhanced Biomass Storage v6.0.0
+Enhanced Biomass Storage v6.1.0
 Complete implementation with task deduplication, demand-based mobilization,
 storage forecasting, priority-based retrieval, storage analytics,
-dynamic tier capacity (NEW), similarity-based deduplication (NEW),
-predictive mobilization based on demand forecasts (NEW),
-real-time storage dashboard (NEW), and collateral rebalancing (NEW).
+dynamic tier capacity, similarity-based deduplication,
+predictive mobilization based on demand forecasts,
+real-time storage dashboard, collateral rebalancing,
+and GeneticOptimizer for evolutionary optimization of conversion costs and collateral ratios.
 """
 
 import asyncio
@@ -22,6 +23,7 @@ import uuid
 import math
 import hashlib
 import json
+import random
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -70,14 +72,14 @@ class MobilizationTrigger(Enum):
     COMPARTMENT_AVAILABLE = "compartment_available"
     QUEUE_EMPTY = "queue_empty"
     MANUAL = "manual"
-    PREDICTIVE = "predictive"  # NEW: Predictive mobilization
+    PREDICTIVE = "predictive"
 
 @dataclass
 class StoredTask:
     """Enhanced stored task with deduplication and merging support"""
     task_id: str
     task_data: Dict[str, Any]
-    task_hash: str = ""                    # Content hash for deduplication
+    task_hash: str = ""
     storage_tier: StorageTier = StorageTier.GLYCOGEN_QUEUE
     stored_at: datetime = field(default_factory=datetime.utcnow)
     original_ecoatp_cost: float = 0.0
@@ -86,40 +88,34 @@ class StoredTask:
     priority: int = 0
     execution_count: int = 0
     conversion_history: List[Dict] = field(default_factory=list)
-    
-    # Deduplication support
-    reference_count: int = 1               # Number of identical tasks
-    is_merged: bool = False                # Whether this is a merged task
+    reference_count: int = 1
+    is_merged: bool = False
     merged_task_ids: List[str] = field(default_factory=list)
     original_complexities: List[float] = field(default_factory=list)
-    
-    # Similarity deduplication (NEW)
     similar_task_ids: List[str] = field(default_factory=list)
     similarity_score: float = 0.0
-    
-    # Analytics
     access_count: int = 0
     last_accessed: Optional[datetime] = None
-    
+
     def __post_init__(self):
         if not self.task_hash:
             self.task_hash = self._compute_hash()
-    
+
     def _compute_hash(self) -> str:
         """Compute content hash for deduplication"""
         task_str = json.dumps(self.task_data, sort_keys=True, default=str)
         return hashlib.sha256(task_str.encode()).hexdigest()
-    
+
     @property
     def age_hours(self) -> float:
         return (datetime.utcnow() - self.stored_at).total_seconds() / 3600
-    
+
     @property
     def is_expired(self) -> bool:
         if self.deadline:
             return datetime.utcnow() > self.deadline
         return False
-    
+
     @property
     def urgency(self) -> float:
         """Calculate urgency score (0-1, higher = more urgent)"""
@@ -130,7 +126,7 @@ class StoredTask:
         if total <= 0:
             return 1.0
         return max(0.0, 1.0 - (remaining / total))
-    
+
     @property
     def retrieval_priority_score(self) -> float:
         """Composite score for retrieval ordering"""
@@ -154,28 +150,26 @@ class StorageToken:
     retrieval_cost: float = 0.0
     is_executed: bool = False
     penalty_paid: bool = False
-    is_duplicate: bool = False         # Whether this references a deduplicated task
-    # NEW: Collateral rebalancing
+    is_duplicate: bool = False
     collateral_adjustment: float = 0.0
     last_rebalance: Optional[datetime] = None
 
 @dataclass
 class StorageForecast:
-    """Storage capacity forecast (Enhanced)"""
+    """Storage capacity forecast"""
     tier: StorageTier
     current_usage: int
     capacity: int
-    inflow_rate: float                 # Tasks per second
-    outflow_rate: float                # Tasks per second
+    inflow_rate: float
+    outflow_rate: float
     predicted_full_time: Optional[datetime]
     confidence: float
-    # NEW: Dynamic capacity
     dynamic_capacity: Optional[int] = None
     scaling_factor: float = 1.0
 
 @dataclass
 class StorageAnalytics:
-    """Comprehensive storage analytics (Enhanced)"""
+    """Comprehensive storage analytics"""
     timestamp: datetime
     total_stored: int
     deduplication_savings: int
@@ -186,16 +180,14 @@ class StorageAnalytics:
     expiration_rate: float
     mobilization_rate: float
     cache_hit_rate: float
-    # NEW: Similarity deduplication
     similarity_savings: int = 0
     similarity_groups: int = 0
-    # NEW: Collateral metrics
     avg_collateral_ratio: float = 0.0
     collateral_utilization: float = 0.0
 
 @dataclass
 class StorageDashboardData:
-    """Real-time storage dashboard data (NEW)"""
+    """Real-time storage dashboard data"""
     timestamp: datetime
     storage_overview: Dict[str, Any]
     tier_utilization: Dict[str, float]
@@ -205,7 +197,7 @@ class StorageDashboardData:
     recommendations: List[str]
 
 # ============================================================================
-# Similarity-Based Deduplication (NEW)
+# Similarity-Based Deduplication
 # ============================================================================
 
 class SimilarityDeduplicator:
@@ -355,7 +347,7 @@ class SimilarityDeduplicator:
         }
 
 # ============================================================================
-# Dynamic Tier Capacity Manager (NEW)
+# Dynamic Tier Capacity Manager
 # ============================================================================
 
 class DynamicTierCapacityManager:
@@ -421,7 +413,7 @@ class DynamicTierCapacityManager:
         }
 
 # ============================================================================
-# Predictive Mobilization Engine (NEW)
+# Predictive Mobilization Engine
 # ============================================================================
 
 class PredictiveMobilizationEngine:
@@ -525,7 +517,7 @@ class PredictiveMobilizationEngine:
             }
 
 # ============================================================================
-# Collateral Rebalancing Manager (NEW)
+# Collateral Rebalancer
 # ============================================================================
 
 class CollateralRebalancer:
@@ -615,25 +607,294 @@ class CollateralRebalancer:
         }
 
 # ============================================================================
-# Enhanced Biomass Storage
+# NEW: GeneticOptimizer – Evolutionary optimization of costs and ratios
+# ============================================================================
+
+class GeneticOptimizer:
+    """
+    Evolutionary optimizer for storage parameters (conversion costs and collateral ratios).
+    Uses a genetic algorithm to find the best configuration that maximizes retrieval success
+    and minimizes costs.
+    """
+
+    def __init__(self, biomass_storage):
+        self.biomass = biomass_storage
+
+        # GA parameters
+        self.population_size = 20
+        self.mutation_rate = 0.2
+        self.crossover_rate = 0.7
+        self.generations = 10  # per evolution cycle
+        self.tournament_size = 3
+
+        # Parameter bounds
+        self.conversion_cost_bounds = {
+            'tiers': [(StorageTier.ATP_CACHE, StorageTier.GLYCOGEN_QUEUE),
+                      (StorageTier.GLYCOGEN_QUEUE, StorageTier.STARCH_RESERVE),
+                      (StorageTier.STARCH_RESERVE, StorageTier.LIPID_DEPOT),
+                      (StorageTier.LIPID_DEPOT, StorageTier.LIGNIN_ARCHIVE),
+                      (StorageTier.LIPID_DEPOT, StorageTier.STARCH_RESERVE),
+                      (StorageTier.STARCH_RESERVE, StorageTier.GLYCOGEN_QUEUE),
+                      (StorageTier.GLYCOGEN_QUEUE, StorageTier.ATP_CACHE)],
+            'min': 0.1,
+            'max': 20.0
+        }
+        self.collateral_bounds = {
+            'levels': [GuaranteeLevel.PLATINUM, GuaranteeLevel.GOLD, GuaranteeLevel.SILVER,
+                       GuaranteeLevel.BRONZE, GuaranteeLevel.BEST_EFFORT],
+            'min': 0.2,
+            'max': 3.0
+        }
+
+        # Current best individual (parameters)
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+
+        # History for logging
+        self.evolution_history = []
+
+        logger.info("GeneticOptimizer initialized")
+
+    def _initialize_individual(self) -> Dict[str, Any]:
+        """Generate a random parameter set."""
+        # Conversion costs: dict with tuple of tiers as key, value as float
+        costs = {}
+        for (from_tier, to_tier) in self.conversion_cost_bounds['tiers']:
+            val = random.uniform(self.conversion_cost_bounds['min'],
+                                 self.conversion_cost_bounds['max'])
+            costs[(from_tier, to_tier)] = val
+
+        # Collateral ratios: dict with GuaranteeLevel as key, value as float
+        ratios = {}
+        for level in self.collateral_bounds['levels']:
+            val = random.uniform(self.collateral_bounds['min'],
+                                 self.collateral_bounds['max'])
+            ratios[level] = val
+
+        return {
+            'conversion_costs': costs,
+            'collateral_ratios': ratios
+        }
+
+    def _initialize_population(self) -> List[Dict[str, Any]]:
+        """Create initial population."""
+        return [self._initialize_individual() for _ in range(self.population_size)]
+
+    def _fitness(self, individual: Dict[str, Any]) -> float:
+        """
+        Compute fitness based on historical storage performance.
+        This uses aggregated metrics from the last analytics snapshot.
+        """
+        # Temporarily apply individual's parameters to the storage system
+        self._apply_individual(individual)
+
+        # Get current metrics from analytics
+        analytics = self.biomass.generate_analytics()
+        # Fitness components:
+        #  - High conversion efficiency (successful retrievals / total conversions)
+        #  - Low average retrieval cost
+        #  - Low expiration rate
+        #  - High cache hit rate
+        eff = analytics.conversion_efficiency
+        avg_cost = analytics.avg_retrieval_cost
+        exp_rate = analytics.expiration_rate
+        hit_rate = analytics.cache_hit_rate
+
+        # Normalize cost (lower is better) – we want to penalize high costs
+        cost_score = max(0, 1.0 - avg_cost / 100.0) if avg_cost > 0 else 0.5
+
+        # Combine components with weights
+        fitness = (0.4 * eff +
+                   0.3 * cost_score +
+                   0.2 * (1.0 - exp_rate) +
+                   0.1 * hit_rate)
+
+        # Restore original parameters (we don't persist the temporary changes)
+        self._restore_original_parameters()
+
+        return fitness
+
+    def _apply_individual(self, individual: Dict[str, Any]):
+        """Temporarily replace storage parameters with the individual's values."""
+        # Save original values to restore later
+        self._original_conversion_costs = self.biomass.conversion_costs.copy()
+        self._original_collateral_ratios = self.biomass.collateral_ratios.copy()
+
+        # Apply new values
+        self.biomass.conversion_costs = individual['conversion_costs'].copy()
+        self.biomass.collateral_ratios = individual['collateral_ratios'].copy()
+
+    def _restore_original_parameters(self):
+        """Restore original parameters after fitness evaluation."""
+        if hasattr(self, '_original_conversion_costs'):
+            self.biomass.conversion_costs = self._original_conversion_costs
+            self.biomass.collateral_ratios = self._original_collateral_ratios
+
+    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
+        """Tournament selection."""
+        tournament = random.sample(range(len(population)), self.tournament_size)
+        best_idx = max(tournament, key=lambda i: fitness_scores[i])
+        return population[best_idx]
+
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
+        """Uniform crossover with blending."""
+        child = {}
+        # Conversion costs: blend
+        costs = {}
+        for key in parent1['conversion_costs']:
+            if random.random() < 0.5:
+                costs[key] = parent1['conversion_costs'][key]
+            else:
+                costs[key] = parent2['conversion_costs'][key]
+            # Blending: sometimes average
+            if random.random() < 0.3:
+                costs[key] = (parent1['conversion_costs'][key] + parent2['conversion_costs'][key]) / 2
+        child['conversion_costs'] = costs
+
+        # Collateral ratios: similar
+        ratios = {}
+        for level in parent1['collateral_ratios']:
+            if random.random() < 0.5:
+                ratios[level] = parent1['collateral_ratios'][level]
+            else:
+                ratios[level] = parent2['collateral_ratios'][level]
+            if random.random() < 0.3:
+                ratios[level] = (parent1['collateral_ratios'][level] + parent2['collateral_ratios'][level]) / 2
+        child['collateral_ratios'] = ratios
+
+        return child
+
+    def _mutate(self, individual: Dict) -> Dict:
+        """Mutate parameters with random changes."""
+        mutated = {
+            'conversion_costs': individual['conversion_costs'].copy(),
+            'collateral_ratios': individual['collateral_ratios'].copy()
+        }
+
+        # Mutate conversion costs
+        for key in mutated['conversion_costs']:
+            if random.random() < self.mutation_rate:
+                # Randomly perturb
+                delta = random.uniform(-2.0, 2.0)
+                new_val = mutated['conversion_costs'][key] + delta
+                mutated['conversion_costs'][key] = max(
+                    self.conversion_cost_bounds['min'],
+                    min(self.conversion_cost_bounds['max'], new_val)
+                )
+
+        # Mutate collateral ratios
+        for level in mutated['collateral_ratios']:
+            if random.random() < self.mutation_rate:
+                delta = random.uniform(-0.3, 0.3)
+                new_val = mutated['collateral_ratios'][level] + delta
+                mutated['collateral_ratios'][level] = max(
+                    self.collateral_bounds['min'],
+                    min(self.collateral_bounds['max'], new_val)
+                )
+
+        return mutated
+
+    def _evolve_one_generation(self, population: List[Dict]) -> List[Dict]:
+        """Evolve one generation."""
+        fitness_scores = [self._fitness(ind) for ind in population]
+        new_population = []
+
+        # Elitism: keep best
+        best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+        new_population.append(population[best_idx])
+
+        # Fill rest
+        while len(new_population) < self.population_size:
+            if random.random() < self.crossover_rate:
+                parent1 = self._select(population, fitness_scores)
+                parent2 = self._select(population, fitness_scores)
+                child = self._crossover(parent1, parent2)
+                child = self._mutate(child)
+                new_population.append(child)
+            else:
+                # Direct copy of a selected parent
+                parent = self._select(population, fitness_scores)
+                new_population.append(parent.copy())
+
+        return new_population
+
+    async def evolve(self, generations: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Run evolution for a number of generations.
+        Returns the best individual and fitness.
+        """
+        if generations is None:
+            generations = self.generations
+
+        population = self._initialize_population()
+        best_fitness_so_far = -float('inf')
+        best_individual_so_far = None
+
+        for gen in range(generations):
+            population = self._evolve_one_generation(population)
+            # Evaluate fitness of all individuals
+            fitness_scores = [self._fitness(ind) for ind in population]
+            gen_best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+            gen_best_fitness = fitness_scores[gen_best_idx]
+            gen_best = population[gen_best_idx]
+
+            if gen_best_fitness > best_fitness_so_far:
+                best_fitness_so_far = gen_best_fitness
+                best_individual_so_far = gen_best
+
+            logger.debug(f"Generation {gen+1}: best fitness = {gen_best_fitness:.4f}")
+
+        # Update the best found
+        if best_fitness_so_far > self.best_fitness:
+            self.best_fitness = best_fitness_so_far
+            self.best_individual = best_individual_so_far
+
+        # Apply the best individual permanently to the storage system
+        if self.best_individual:
+            # Restore original, then apply best
+            self._restore_original_parameters()
+            self.biomass.conversion_costs = self.best_individual['conversion_costs'].copy()
+            self.biomass.collateral_ratios = self.best_individual['collateral_ratios'].copy()
+            logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
+
+        self.evolution_history.append({
+            'timestamp': datetime.utcnow(),
+            'generations': generations,
+            'best_fitness': self.best_fitness
+        })
+
+        return {
+            'best_fitness': self.best_fitness,
+            'best_individual': self.best_individual,
+            'generations': generations
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status of the optimizer."""
+        return {
+            'best_fitness': self.best_fitness,
+            'best_individual': self.best_individual,
+            'evolution_history': self.evolution_history[-10:],  # last 10 entries
+            'population_size': self.population_size,
+            'mutation_rate': self.mutation_rate,
+            'crossover_rate': self.crossover_rate
+        }
+
+
+# ============================================================================
+# Enhanced Biomass Storage (with GeneticOptimizer integration)
 # ============================================================================
 
 class BiomassStorage:
     """
-    Enhanced Biomass Storage v6.0.0
-    
-    New Features:
-    - Dynamic tier capacity based on system load
-    - Similarity-based deduplication
-    - Predictive mobilization based on demand forecasts
-    - Real-time storage dashboard
-    - Collateral rebalancing based on task priority
+    Enhanced Biomass Storage v6.1.0
+    New feature: GeneticOptimizer for evolutionary tuning of parameters.
     """
-    
+
     def __init__(self, token_manager=None, gradient_manager=None):
         self.token_manager = token_manager
         self.gradient_manager = gradient_manager
-        
+
         # Base tier capacities
         self.base_tier_capacities = {
             StorageTier.ATP_CACHE: 100,
@@ -642,35 +903,35 @@ class BiomassStorage:
             StorageTier.LIPID_DEPOT: 10000,
             StorageTier.LIGNIN_ARCHIVE: 50000
         }
-        
+
         # Dynamic capacity manager
         self.capacity_manager = DynamicTierCapacityManager(self.base_tier_capacities)
-        
+
         # Storage queues with dynamic capacity
         self.atp_cache: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.ATP_CACHE))
         self.glycogen_queue: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.GLYCOGEN_QUEUE))
         self.starch_reserve: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.STARCH_RESERVE))
         self.lipid_depot: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.LIPID_DEPOT))
         self.lignin_archive: deque = deque(maxlen=self.capacity_manager.get_capacity(StorageTier.LIGNIN_ARCHIVE))
-        
+
         # Storage tokens
         self.storage_tokens: Dict[str, StorageToken] = {}
         self.collateral_pool: float = 0.0
-        
+
         # Global task index
         self.task_index: Dict[str, Dict[str, Any]] = {}
         self.index_hits: int = 0
         self.index_misses: int = 0
-        
+
         # Deduplication
         self.task_hash_index: Dict[str, str] = {}
         self.deduplication_savings: int = 0
         self.merge_savings: int = 0
-        
+
         # NEW: Similarity deduplication
         self.similarity_dedup = SimilarityDeduplicator()
         self.similarity_savings: int = 0
-        
+
         # Mobilization
         self.mobilization_triggers: Dict[MobilizationTrigger, bool] = {
             MobilizationTrigger.CARBON_LOW: True,
@@ -678,27 +939,27 @@ class BiomassStorage:
             MobilizationTrigger.DEADLINE_URGENT: True,
             MobilizationTrigger.COMPARTMENT_AVAILABLE: True,
             MobilizationTrigger.QUEUE_EMPTY: True,
-            MobilizationTrigger.PREDICTIVE: True  # NEW
+            MobilizationTrigger.PREDICTIVE: True
         }
         self.mobilization_history: deque = deque(maxlen=500)
         self.total_mobilized: int = 0
-        
+
         # NEW: Predictive mobilization
         self.predictive_mobilizer = PredictiveMobilizationEngine()
-        
+
         # NEW: Collateral rebalancer
         self.collateral_rebalancer = CollateralRebalancer()
-        
+
         # Storage forecasting
         self.inflow_history: deque = deque(maxlen=100)
         self.outflow_history: deque = deque(maxlen=100)
         self.forecast_history: deque = deque(maxlen=50)
-        
+
         # Analytics
         self.analytics_history: deque = deque(maxlen=1000)
         self.analytics_interval = 300
-        
-        # Conversion costs
+
+        # Conversion costs – initial defaults (will be evolved)
         self.conversion_costs = {
             (StorageTier.ATP_CACHE, StorageTier.GLYCOGEN_QUEUE): 0.5,
             (StorageTier.GLYCOGEN_QUEUE, StorageTier.STARCH_RESERVE): 2.0,
@@ -708,8 +969,8 @@ class BiomassStorage:
             (StorageTier.STARCH_RESERVE, StorageTier.GLYCOGEN_QUEUE): 4.0,
             (StorageTier.GLYCOGEN_QUEUE, StorageTier.ATP_CACHE): 2.0,
         }
-        
-        # Collateral ratios
+
+        # Collateral ratios – initial defaults (will be evolved)
         self.collateral_ratios = {
             GuaranteeLevel.PLATINUM: 2.0,
             GuaranteeLevel.GOLD: 1.5,
@@ -717,20 +978,24 @@ class BiomassStorage:
             GuaranteeLevel.BRONZE: 1.0,
             GuaranteeLevel.BEST_EFFORT: 0.5
         }
-        
+
+        # NEW: Genetic Optimizer
+        self.genetic_optimizer = GeneticOptimizer(self)
+
         # Start background tasks
         asyncio.create_task(self._maintenance_loop())
         asyncio.create_task(self._mobilization_loop())
         asyncio.create_task(self._forecasting_loop())
         asyncio.create_task(self._analytics_loop())
         asyncio.create_task(self._rebalancing_loop())
-        
-        logger.info("Enhanced Biomass Storage v6.0.0 initialized with all features")
-    
+        asyncio.create_task(self._evolution_loop())  # NEW: evolution loop
+
+        logger.info("Enhanced Biomass Storage v6.1.0 initialized with GeneticOptimizer")
+
     # ========================================================================
     # Core Storage Methods (Enhanced)
     # ========================================================================
-    
+
     def store_task(
         self, task_data: Dict[str, Any], ecoatp_cost: float,
         guarantee: GuaranteeLevel = GuaranteeLevel.SILVER,
@@ -864,7 +1129,7 @@ class BiomassStorage:
         
         logger.info(f"Stored task {task_id} in {initial_tier.value}: cost={ecoatp_cost:.1f}")
         return True, token.token_id
-    
+
     def _try_merge_task(self, task_data: Dict[str, Any], task_id: str, 
                        task_hash: str) -> Optional[str]:
         """Try to merge similar tasks for batch execution"""
@@ -915,7 +1180,7 @@ class BiomassStorage:
                 return token.token_id
         
         return None
-    
+
     def retrieve_task(self, token_id: str, force_retrieve: bool = False) -> Tuple[Optional[Dict[str, Any]], float]:
         """Enhanced retrieval with priority ordering"""
         if token_id not in self.storage_tokens:
@@ -975,11 +1240,11 @@ class BiomassStorage:
         
         logger.info(f"Retrieved task {task_id}: cost={retrieval_cost:.1f}, refs={stored_task.reference_count}")
         return stored_task.task_data, retrieval_cost
-    
+
     # ========================================================================
     # Enhanced Mobilization with Predictive Support
     # ========================================================================
-    
+
     def should_mobilize(self) -> List[MobilizationTrigger]:
         """Check multiple signals for mobilization triggers"""
         triggers = []
@@ -1015,7 +1280,7 @@ class BiomassStorage:
                 triggers.append(MobilizationTrigger.PREDICTIVE)
         
         return triggers
-    
+
     def mobilize_tasks(self, target_tier: StorageTier = StorageTier.ATP_CACHE, 
                       max_count: int = 10) -> int:
         """Enhanced mobilization with predictive support"""
@@ -1079,11 +1344,11 @@ class BiomassStorage:
             logger.info(f"Mobilized {mobilized} tasks to {target_tier.value} (triggers: {[t.value for t in triggers]})")
         
         return mobilized
-    
+
     # ========================================================================
     # Collateral Rebalancing (NEW)
     # ========================================================================
-    
+
     async def _rebalancing_loop(self):
         """Background collateral rebalancing loop"""
         while True:
@@ -1097,11 +1362,11 @@ class BiomassStorage:
             except Exception as e:
                 logger.error(f"Rebalancing loop error: {str(e)}")
                 await asyncio.sleep(120)
-    
+
     # ========================================================================
     # Enhanced Forecasting with Dynamic Capacity
     # ========================================================================
-    
+
     def forecast_storage(self, tier: StorageTier, horizon_seconds: float = 3600) -> StorageForecast:
         """Enhanced forecast with dynamic capacity"""
         queue = self._get_tier_queue(tier)
@@ -1146,11 +1411,11 @@ class BiomassStorage:
         self.forecast_history.append(forecast)
         
         return forecast
-    
+
     # ========================================================================
     # Storage Dashboard (NEW)
     # ========================================================================
-    
+
     def get_dashboard_data(self) -> StorageDashboardData:
         """Get real-time storage dashboard data"""
         total_stored = sum(len(self._get_tier_queue(t)) for t in StorageTier)
@@ -1201,11 +1466,11 @@ class BiomassStorage:
             deduplication_stats=dedup_stats,
             recommendations=recommendations
         )
-    
+
     # ========================================================================
     # Enhanced Analytics with Similarity and Collateral Metrics
     # ========================================================================
-    
+
     def generate_analytics(self) -> StorageAnalytics:
         """Generate comprehensive storage analytics with new metrics"""
         total_stored = sum(len(self._get_tier_queue(t)) for t in StorageTier)
@@ -1265,7 +1530,7 @@ class BiomassStorage:
         self.analytics_history.append(analytics)
         
         return analytics
-    
+
     def get_optimization_recommendations(self) -> List[str]:
         """Enhanced optimization recommendations"""
         recommendations = []
@@ -1329,11 +1594,11 @@ class BiomassStorage:
             recommendations.append("Storage operating optimally. No changes needed.")
         
         return recommendations
-    
+
     # ========================================================================
     # Index Methods (Preserved)
     # ========================================================================
-    
+
     def _add_to_index(self, task_id: str, tier: StorageTier, position: int):
         self.task_index[task_id] = {
             'tier': tier,
@@ -1342,16 +1607,16 @@ class BiomassStorage:
             'access_count': 0,
             'last_accessed': None
         }
-    
+
     def _update_index_position(self, task_id: str, new_tier: StorageTier, new_position: int):
         if task_id in self.task_index:
             self.task_index[task_id]['tier'] = new_tier
             self.task_index[task_id]['position'] = new_position
             self.task_index[task_id]['stored_at'] = datetime.utcnow()
-    
+
     def _remove_from_index(self, task_id: str):
         self.task_index.pop(task_id, None)
-    
+
     def find_task(self, task_id: str) -> Optional[Tuple[StorageTier, int]]:
         if task_id in self.task_index:
             self.index_hits += 1
@@ -1361,19 +1626,19 @@ class BiomassStorage:
             return entry['tier'], entry['position']
         self.index_misses += 1
         return None
-    
+
     def _find_task_by_id(self, task_id: str) -> Optional[StoredTask]:
         location = self.find_task(task_id)
         if location:
             return self._get_from_tier_position(location[0], location[1])
         return self._scan_all_tiers(task_id)
-    
+
     def _get_from_tier_position(self, tier: StorageTier, position: int) -> Optional[StoredTask]:
         queue = self._get_tier_queue(tier)
         if position < len(queue):
             return queue[position]
         return None
-    
+
     def _scan_all_tiers(self, task_id: str) -> Optional[StoredTask]:
         for tier in StorageTier:
             queue = self._get_tier_queue(tier)
@@ -1382,7 +1647,7 @@ class BiomassStorage:
                     self._add_to_index(task_id, tier, i)
                     return task
         return None
-    
+
     def _get_tier_queue(self, tier: StorageTier) -> deque:
         tier_map = {
             StorageTier.ATP_CACHE: self.atp_cache,
@@ -1392,11 +1657,11 @@ class BiomassStorage:
             StorageTier.LIGNIN_ARCHIVE: self.lignin_archive
         }
         return tier_map.get(tier, deque())
-    
+
     # ========================================================================
     # Tier Conversion (Preserved)
     # ========================================================================
-    
+
     def convert_tier(self, token_id: str, target_tier: StorageTier) -> bool:
         if token_id not in self.storage_tokens:
             return False
@@ -1446,11 +1711,11 @@ class BiomassStorage:
         
         logger.info(f"Converted {token.task_id}: {current_tier.value} → {target_tier.value} (cost={conversion_cost:.1f})")
         return True
-    
+
     # ========================================================================
     # Background Loops (Enhanced)
     # ========================================================================
-    
+
     async def _maintenance_loop(self):
         while True:
             try:
@@ -1496,7 +1761,7 @@ class BiomassStorage:
             except Exception as e:
                 logger.error(f"Maintenance error: {str(e)}")
                 await asyncio.sleep(60)
-    
+
     async def _mobilization_loop(self):
         while True:
             try:
@@ -1505,7 +1770,7 @@ class BiomassStorage:
             except Exception as e:
                 logger.error(f"Mobilization error: {str(e)}")
                 await asyncio.sleep(60)
-    
+
     async def _forecasting_loop(self):
         while True:
             try:
@@ -1515,7 +1780,7 @@ class BiomassStorage:
             except Exception as e:
                 logger.error(f"Forecasting error: {str(e)}")
                 await asyncio.sleep(600)
-    
+
     async def _analytics_loop(self):
         while True:
             try:
@@ -1524,17 +1789,39 @@ class BiomassStorage:
             except Exception as e:
                 logger.error(f"Analytics error: {str(e)}")
                 await asyncio.sleep(600)
-    
+
+    # NEW: Evolution loop
+    async def _evolution_loop(self):
+        """
+        Periodically run the genetic optimizer to evolve conversion costs and collateral ratios.
+        Evolution is performed every 24 hours.
+        """
+        while True:
+            try:
+                # Wait for the system to accumulate enough data (24h)
+                await asyncio.sleep(86400)  # 24 hours
+
+                # Run evolution
+                logger.info("Starting genetic evolution cycle...")
+                result = await self.genetic_optimizer.evolve(generations=10)
+                logger.info(f"Evolution complete. Best fitness: {result['best_fitness']:.4f}")
+
+                # Optionally save the new parameters to persistent storage
+                # (if you have a persistence mechanism)
+            except Exception as e:
+                logger.error(f"Evolution loop error: {str(e)}")
+                await asyncio.sleep(3600)  # retry after 1 hour
+
     def _find_token(self, task_id: str) -> Optional[StorageToken]:
         for token in self.storage_tokens.values():
             if token.task_id == task_id and not token.is_duplicate:
                 return token
         return None
-    
+
     # ========================================================================
     # Enhanced Statistics
     # ========================================================================
-    
+
     def get_storage_stats(self) -> Dict[str, Any]:
         """Get comprehensive storage statistics with new metrics"""
         stats = {
@@ -1574,7 +1861,8 @@ class BiomassStorage:
                 }
                 for tier in [StorageTier.GLYCOGEN_QUEUE, StorageTier.STARCH_RESERVE]
             },
-            'recommendations': self.get_optimization_recommendations()
+            'recommendations': self.get_optimization_recommendations(),
+            'genetic_optimizer': self.genetic_optimizer.get_status()
         }
         
         # Add latest analytics
@@ -1597,7 +1885,7 @@ class BiomassStorage:
         stats['dashboard'] = self.get_dashboard_data().__dict__
         
         return stats
-    
+
     def get_deduplication_report(self) -> Dict[str, Any]:
         """Get enhanced deduplication report"""
         total_stored = sum(len(self._get_tier_queue(t)) for t in StorageTier)
@@ -1616,7 +1904,7 @@ class BiomassStorage:
                 f"({total_saved / max(total_stored + total_saved, 1) * 100:.1f}% reduction)"
             )
         }
-    
+
     def get_mobilization_report(self) -> Dict[str, Any]:
         """Get enhanced mobilization report"""
         recent = list(self.mobilization_history)[-50:]
