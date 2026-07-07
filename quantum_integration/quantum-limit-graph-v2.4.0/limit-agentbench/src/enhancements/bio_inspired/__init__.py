@@ -10,6 +10,9 @@ event-driven communication, predictive alerts, cost-benefit analysis, workflow o
 and anomaly detection
 """
 
+from .quantum_bridge import QuantumBridge
+from .time_tick_engine import TimeTickEngine
+from .helium_environment_translator import HeliumEnvironmentTranslator  # (the one I gave earlier)
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Protocol, Callable, Set
