@@ -1270,3 +1270,39 @@ def create_metabolic_ecosystem(enable_bio: bool = True) -> EnhancedBioInspiredCo
 
 def create_minimal_ecosystem() -> EnhancedBioInspiredCore:
     return EnhancedBioInspiredCore(enable_enhancements=False)
+
+class EnhancedBioInspiredCore:
+    def __init__(self, enable_enhancements: bool = True, 
+                 csv_path: str = "helium_timeseries_realistic_2020_2026.csv",
+                 quantum_graph=None):   # <-- pass your quantum graph object here
+        # ... existing initialization ...
+        
+        # NEW: Quantum Bridge
+        self._quantum_bridge = QuantumBridge(self._gradient_manager, quantum_graph)
+        
+        # NEW: TimeTickEngine (will use the translator and harvester)
+        self._translator = HeliumEnvironmentTranslator(csv_path)  # or pass the translator instance
+        self._tick_engine = TimeTickEngine(
+            csv_path=csv_path,
+            harvester=self._harvester,
+            translator_class=HeliumEnvironmentTranslator   # pass class, not instance
+        )
+        
+        # Optionally start the simulation in a background task
+        if enable_enhancements:
+            asyncio.create_task(self._run_simulation_loop())
+        
+        logger.info("EnhancedBioInspiredCore now includes QuantumBridge and TimeTickEngine")
+    
+    async def _run_simulation_loop(self):
+        """Run the tick engine in the background (example: run once)."""
+        await self._tick_engine.run_simulation(
+            tick_interval_seconds=0.1,
+            post_tick_callback=self._on_tick
+        )
+    
+    async def _on_tick(self, idx: int, row: pd.Series, harvest_result: Dict[str, Any]):
+        """Callback after each tick: update quantum graph with latest gradients."""
+        # Push current gradients to the quantum graph
+        self._quantum_bridge.apply_to_quantum_graph()
+        # Optionally log or alert
