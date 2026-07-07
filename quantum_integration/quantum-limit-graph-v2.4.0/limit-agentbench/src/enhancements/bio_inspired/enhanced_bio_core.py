@@ -1,19 +1,25 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/enhanced_bio_core.py
-# Complete enhanced file v6.0.0 with all improvements
+# Complete enhanced file v6.1.0 with:
+# - Genetic Optimizer for core parameters (health check interval, circuit breaker thresholds, etc.)
+# - Decentralized decision-making via module‑local event handling and autonomous adjustments
+# - Module marketplace for competition (replacement of underperforming modules)
 
 """
-Enhanced Bio-Inspired Core v6.0.0
+Enhanced Bio-Inspired Core v6.1.0
 Complete implementation with graceful shutdown, module registry, lifecycle management,
-health dashboard, configuration validation, module isolation, dynamic module loading (NEW),
-predictive health forecasting (NEW), configuration versioning (NEW),
-anomaly detection in performance metrics (NEW), and event-driven communication between services (NEW).
+health dashboard, configuration validation, module isolation, dynamic module loading,
+predictive health forecasting, configuration versioning,
+anomaly detection in performance metrics, event-driven communication,
+Genetic Optimizer for core parameters, Decentralized decision-making,
+and Module Marketplace for competition.
 """
 
 import asyncio
 import logging
 import signal
 import time
-from typing import Dict, Any, List, Optional, Tuple, Protocol, Callable
+import random
+from typing import Dict, Any, List, Optional, Tuple, Protocol, Callable, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -81,7 +87,7 @@ class LifecyclePhase(Enum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
-    LOADING = "loading"  # NEW: For dynamic module loading
+    LOADING = "loading"
 
 @dataclass
 class ModuleEntry:
@@ -102,17 +108,15 @@ class ModuleEntry:
     failure_count: int = 0
     last_failure: Optional[datetime] = None
     metrics: Dict[str, Any] = field(default_factory=dict)
-    # NEW: Dynamic loading
     module_path: Optional[str] = None
     version: str = "1.0.0"
     loaded_at: Optional[datetime] = None
-    # NEW: Predictive health
     predicted_health: Optional[float] = None
     failure_probability: float = 0.0
     health_trend: str = "stable"
 
 # ============================================================================
-# Event Bus for Event-Driven Communication (NEW)
+# Event Bus for Event-Driven Communication
 # ============================================================================
 
 @dataclass
@@ -204,7 +208,7 @@ class CoreEventBus:
         }
 
 # ============================================================================
-# Predictive Health Forecasting (NEW)
+# Predictive Health Forecasting
 # ============================================================================
 
 class PredictiveHealthForecaster:
@@ -319,7 +323,7 @@ class PredictiveHealthForecaster:
             return result
 
 # ============================================================================
-# Configuration Version Manager (NEW)
+# Configuration Version Manager
 # ============================================================================
 
 class ConfigurationVersionManager:
@@ -465,7 +469,7 @@ class ConfigurationVersionManager:
         return None
 
 # ============================================================================
-# Anomaly Detection in Performance Metrics (NEW)
+# Performance Anomaly Detector
 # ============================================================================
 
 class PerformanceAnomalyDetector:
@@ -545,13 +549,314 @@ class PerformanceAnomalyDetector:
         return report
 
 # ============================================================================
+# NEW: Genetic Optimizer for Core Parameters
+# ============================================================================
+
+class CoreGeneticOptimizer:
+    """
+    Genetic optimizer for core parameters:
+    - health_check_interval_seconds
+    - circuit_breaker_threshold (failure count before opening)
+    - predictive_health_retrain_interval
+    - anomaly_zscore_threshold
+    - module_retirement_threshold (health score below which a module is considered for replacement)
+    """
+    
+    def __init__(self, core: 'EnhancedBioInspiredCore'):
+        self.core = core
+        self.population_size = 20
+        self.mutation_rate = 0.2
+        self.crossover_rate = 0.7
+        self.generations = 10
+        self.tournament_size = 3
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        
+        # Parameter bounds
+        self.param_bounds = {
+            'health_check_interval_seconds': (10, 120),
+            'circuit_breaker_threshold': (3, 10),
+            'predictive_health_retrain_interval': (120, 900),
+            'anomaly_zscore_threshold': (2.0, 5.0),
+            'module_retirement_threshold': (0.1, 0.4)
+        }
+        logger.info("Core Genetic Optimizer initialized")
+    
+    def _initialize_individual(self) -> Dict:
+        """Generate random parameter set."""
+        ind = {}
+        for key, (low, high) in self.param_bounds.items():
+            ind[key] = random.uniform(low, high)
+        # Ensure integer parameters
+        ind['circuit_breaker_threshold'] = int(ind['circuit_breaker_threshold'])
+        ind['health_check_interval_seconds'] = int(ind['health_check_interval_seconds'])
+        ind['predictive_health_retrain_interval'] = int(ind['predictive_health_retrain_interval'])
+        return ind
+    
+    def _initialize_population(self) -> List[Dict]:
+        return [self._initialize_individual() for _ in range(self.population_size)]
+    
+    def _fitness(self, individual: Dict) -> float:
+        """Fitness based on system health, uptime, and response time."""
+        # Temporarily apply parameters
+        self._apply_individual(individual)
+        # Evaluate fitness
+        status = self.core.get_system_status()
+        modules_health = self.core.registry.health_check_all()
+        # Components:
+        # - Average health score of modules
+        health_scores = [1.0 if s['status'] == 'healthy' else 0.5 if s['status'] == 'degraded' else 0.0 for s in modules_health.values()]
+        avg_health = np.mean(health_scores) if health_scores else 0.5
+        
+        # - Uptime (longer is better)
+        uptime = status.get('uptime_seconds', 0)
+        uptime_score = min(1.0, uptime / 86400)  # 1 day = 1.0
+        
+        # - Circuit breaker open count (fewer open is better)
+        open_circuits = sum(1 for m in self.core.registry.modules.values() if m.circuit_breaker_state == 'open')
+        circuit_score = max(0, 1.0 - open_circuits / max(1, len(self.core.registry.modules) * 0.5))
+        
+        # - Anomaly count (fewer is better)
+        anomaly_report = asyncio.run(self.core._anomaly_detector.get_anomaly_report())
+        anomaly_count = len(anomaly_report.get('anomalies', []))
+        anomaly_score = max(0, 1.0 - anomaly_count / 20)
+        
+        # Combine
+        fitness = 0.4 * avg_health + 0.3 * uptime_score + 0.2 * circuit_score + 0.1 * anomaly_score
+        self._restore_original_parameters()
+        return fitness
+    
+    def _apply_individual(self, individual: Dict):
+        """Temporarily apply parameters to core."""
+        self._original_params = {
+            'health_check_interval_seconds': self.core.config.health_check_interval_seconds,
+            'circuit_breaker_threshold': self.core.registry._circuit_breaker_threshold if hasattr(self.core.registry, '_circuit_breaker_threshold') else 5,
+            'predictive_health_retrain_interval': self.core._predictive_health_retrain_interval if hasattr(self.core, '_predictive_health_retrain_interval') else 300,
+            'anomaly_zscore_threshold': self.core._anomaly_detector.zscore_threshold if hasattr(self.core._anomaly_detector, 'zscore_threshold') else 3.0,
+            'module_retirement_threshold': self.core._module_retirement_threshold if hasattr(self.core, '_module_retirement_threshold') else 0.2
+        }
+        # Apply new values
+        self.core.config.health_check_interval_seconds = individual['health_check_interval_seconds']
+        if hasattr(self.core.registry, '_circuit_breaker_threshold'):
+            self.core.registry._circuit_breaker_threshold = individual['circuit_breaker_threshold']
+        self.core._predictive_health_retrain_interval = individual['predictive_health_retrain_interval']
+        if hasattr(self.core._anomaly_detector, 'zscore_threshold'):
+            self.core._anomaly_detector.zscore_threshold = individual['anomaly_zscore_threshold']
+        self.core._module_retirement_threshold = individual['module_retirement_threshold']
+    
+    def _restore_original_parameters(self):
+        if hasattr(self, '_original_params'):
+            self.core.config.health_check_interval_seconds = self._original_params['health_check_interval_seconds']
+            if hasattr(self.core.registry, '_circuit_breaker_threshold'):
+                self.core.registry._circuit_breaker_threshold = self._original_params['circuit_breaker_threshold']
+            self.core._predictive_health_retrain_interval = self._original_params['predictive_health_retrain_interval']
+            if hasattr(self.core._anomaly_detector, 'zscore_threshold'):
+                self.core._anomaly_detector.zscore_threshold = self._original_params['anomaly_zscore_threshold']
+            self.core._module_retirement_threshold = self._original_params['module_retirement_threshold']
+    
+    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
+        tournament = random.sample(range(len(population)), self.tournament_size)
+        best_idx = max(tournament, key=lambda i: fitness_scores[i])
+        return population[best_idx]
+    
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
+        child = {}
+        for key in parent1:
+            if random.random() < 0.5:
+                child[key] = parent1[key]
+            else:
+                child[key] = parent2[key]
+            if random.random() < 0.3:
+                child[key] = (parent1[key] + parent2[key]) / 2
+        # Ensure integer params
+        child['circuit_breaker_threshold'] = int(child['circuit_breaker_threshold'])
+        child['health_check_interval_seconds'] = int(child['health_check_interval_seconds'])
+        child['predictive_health_retrain_interval'] = int(child['predictive_health_retrain_interval'])
+        return child
+    
+    def _mutate(self, individual: Dict) -> Dict:
+        mutated = individual.copy()
+        for key, (low, high) in self.param_bounds.items():
+            if random.random() < self.mutation_rate:
+                delta = random.uniform(-(high-low)*0.1, (high-low)*0.1)
+                mutated[key] = max(low, min(high, mutated[key] + delta))
+        # Ensure integer params
+        mutated['circuit_breaker_threshold'] = int(mutated['circuit_breaker_threshold'])
+        mutated['health_check_interval_seconds'] = int(mutated['health_check_interval_seconds'])
+        mutated['predictive_health_retrain_interval'] = int(mutated['predictive_health_retrain_interval'])
+        return mutated
+    
+    def _evolve_one_generation(self, population: List[Dict]) -> List[Dict]:
+        fitness_scores = [self._fitness(ind) for ind in population]
+        new_population = []
+        # Elitism
+        best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+        new_population.append(population[best_idx])
+        while len(new_population) < self.population_size:
+            if random.random() < self.crossover_rate:
+                parent1 = self._select(population, fitness_scores)
+                parent2 = self._select(population, fitness_scores)
+                child = self._crossover(parent1, parent2)
+                child = self._mutate(child)
+                new_population.append(child)
+            else:
+                parent = self._select(population, fitness_scores)
+                new_population.append(parent.copy())
+        return new_population
+    
+    async def evolve(self, generations: Optional[int] = None) -> Dict:
+        if generations is None:
+            generations = self.generations
+        population = self._initialize_population()
+        best_fitness = -float('inf')
+        best_ind = None
+        for gen in range(generations):
+            population = self._evolve_one_generation(population)
+            fitness_scores = [self._fitness(ind) for ind in population]
+            gen_best = max(range(len(population)), key=lambda i: fitness_scores[i])
+            if fitness_scores[gen_best] > best_fitness:
+                best_fitness = fitness_scores[gen_best]
+                best_ind = population[gen_best]
+            logger.debug(f"Gen {gen+1}: best fitness = {fitness_scores[gen_best]:.4f}")
+        if best_fitness > self.best_fitness:
+            self.best_fitness = best_fitness
+            self.best_individual = best_ind
+            self._apply_individual(best_ind)
+            logger.info(f"Applied best individual with fitness {best_fitness:.4f}")
+        self.evolution_history.append({
+            'timestamp': datetime.utcnow(),
+            'best_fitness': best_fitness
+        })
+        return {'best_fitness': best_fitness, 'best_individual': best_ind}
+    
+    def get_status(self) -> Dict:
+        return {
+            'best_fitness': self.best_fitness,
+            'best_individual': self.best_individual,
+            'history': self.evolution_history[-10:]
+        }
+
+# ============================================================================
+# NEW: Decentralized Module Base Class
+# ============================================================================
+
+class DecentralizedModule:
+    """
+    Base class for modules that can make local decisions based on events.
+    """
+    def __init__(self, module_name: str, core: 'EnhancedBioInspiredCore'):
+        self.module_name = module_name
+        self.core = core
+        self.local_state: Dict[str, Any] = {}
+        self.event_subscriptions: List[str] = []
+    
+    async def on_event(self, event: CoreEvent):
+        """Handle an event. Override in subclasses."""
+        pass
+    
+    async def local_decision(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Make a local decision based on context. Override in subclasses."""
+        return {'action': 'noop', 'reason': 'Base class'}
+
+# ============================================================================
+# NEW: Module Marketplace for Competition
+# ============================================================================
+
+class ModuleMarketplace:
+    """
+    Marketplace where modules compete for resources.
+    Underperforming modules can be replaced by better alternatives.
+    """
+    
+    def __init__(self, core: 'EnhancedBioInspiredCore'):
+        self.core = core
+        self.module_scores: Dict[str, float] = {}
+        self.replacement_history: deque = deque(maxlen=100)
+        self.competition_interval = 3600  # 1 hour
+        self._lock = asyncio.Lock()
+        logger.info("Module Marketplace initialized")
+    
+    async def evaluate_modules(self) -> Dict[str, float]:
+        """Evaluate all modules and assign a score (0-1, higher is better)."""
+        scores = {}
+        for name, entry in self.core.registry.modules.items():
+            # Score based on health status, failure count, and predicted health
+            health = 1.0 if entry.health_status == 'healthy' else 0.5 if entry.health_status == 'degraded' else 0.0
+            failure_penalty = min(1.0, entry.failure_count / 10)
+            predicted = entry.predicted_health if entry.predicted_health is not None else 0.5
+            score = 0.4 * health + 0.3 * (1 - failure_penalty) + 0.3 * predicted
+            scores[name] = score
+        self.module_scores = scores
+        return scores
+    
+    async def run_competition(self):
+        """
+        Identify underperforming modules and suggest replacements.
+        """
+        async with self._lock:
+            scores = await self.evaluate_modules()
+            if not scores:
+                return
+            
+            # Find modules with score below threshold
+            retirement_threshold = getattr(self.core, '_module_retirement_threshold', 0.2)
+            underperformers = [name for name, score in scores.items() if score < retirement_threshold]
+            
+            # For each underperformer, try to find a replacement
+            replacements = []
+            for name in underperformers:
+                # Check if there are any modules with same dependencies that are better
+                entry = self.core.registry.modules.get(name)
+                if not entry:
+                    continue
+                # Find alternative: a module with similar function (e.g., same dependency pattern)
+                alternatives = []
+                for other_name, other_entry in self.core.registry.modules.items():
+                    if other_name == name:
+                        continue
+                    if other_entry.dependencies == entry.dependencies:
+                        alternatives.append((other_name, scores.get(other_name, 0.5)))
+                if alternatives:
+                    # Choose best alternative that is not underperforming
+                    best_alt = max(alternatives, key=lambda x: x[1])
+                    if best_alt[1] > scores[name]:
+                        replacements.append({
+                            'old_module': name,
+                            'new_module': best_alt[0],
+                            'score_old': scores[name],
+                            'score_new': best_alt[1]
+                        })
+            
+            if replacements:
+                logger.info(f"Module marketplace: {len(replacements)} replacements suggested")
+                self.replacement_history.extend(replacements)
+                # We don't automatically replace; we suggest to the core admin
+                # The core can call `apply_replacement()` manually or via event.
+                # For now, we'll publish an event.
+                for rep in replacements:
+                    await self.core.event_bus.publish(CoreEvent(
+                        event_type='module_replacement_suggested',
+                        source='module_marketplace',
+                        payload=rep
+                    ))
+    
+    def get_marketplace_stats(self) -> Dict[str, Any]:
+        return {
+            'module_scores': self.module_scores,
+            'replacement_history': list(self.replacement_history)[-10:],
+            'competition_interval': self.competition_interval
+        }
+
+# ============================================================================
 # Module Registry (Enhanced)
 # ============================================================================
 
 class ModuleRegistry:
     """
     Dynamic module registry with lifecycle management, health checking,
-    circuit breaker protection, and dynamic loading (NEW).
+    circuit breaker protection, and dynamic loading.
+    Enhanced with evolvable circuit breaker threshold.
     """
     
     def __init__(self):
@@ -560,14 +865,10 @@ class ModuleRegistry:
         self.shutdown_order: List[str] = []
         self._initialized = False
         self._init_lock = asyncio.Lock()
-        
-        # NEW: Dynamic loading
         self.loaded_modules: Set[str] = set()
         self.module_paths: Dict[str, str] = {}
-        
-        # NEW: Predictive health
         self.health_forecaster = PredictiveHealthForecaster()
-        
+        self._circuit_breaker_threshold = 5  # evolvable
         logger.info("Module Registry initialized")
     
     def register(self, name: str, module: Any = None, dependencies: List[str] = None,
@@ -598,7 +899,6 @@ class ModuleRegistry:
         logger.info(f"Module registered: {name} (deps: {entry.dependencies})")
         return entry
     
-    # NEW: Dynamic module loading
     async def load_module(self, name: str, module_path: str) -> bool:
         """Dynamically load a module at runtime"""
         if name in self.loaded_modules:
@@ -836,7 +1136,7 @@ class ModuleRegistry:
         return results
     
     def record_failure(self, name: str):
-        """Record a module failure for circuit breaker"""
+        """Record a module failure for circuit breaker (using evolvable threshold)"""
         entry = self.modules.get(name)
         if not entry:
             return
@@ -844,7 +1144,7 @@ class ModuleRegistry:
         entry.failure_count += 1
         entry.last_failure = datetime.utcnow()
         
-        if entry.failure_count >= 5 and entry.circuit_breaker_state == "closed":
+        if entry.failure_count >= self._circuit_breaker_threshold and entry.circuit_breaker_state == "closed":
             entry.circuit_breaker_state = "open"
             logger.warning(f"Circuit breaker OPEN for module {name} ({entry.failure_count} failures)")
     
@@ -904,7 +1204,7 @@ class ModuleRegistry:
 
 @dataclass
 class CoreConfig:
-    """Core configuration with validation (Enhanced)"""
+    """Core configuration with validation"""
     # Token economy
     token_base_generation_rate: float = 150.0
     token_hoarding_threshold: float = 2.0
@@ -946,7 +1246,7 @@ class CoreConfig:
     # Health checks
     health_check_interval_seconds: int = 30
     
-    # NEW: Versioning
+    # Versioning
     version: str = "1.0.0"
     version_description: str = ""
     
@@ -1021,12 +1321,12 @@ class CoreConfig:
             json.dump(self.to_dict(), f, indent=2)
 
 # ============================================================================
-# Enhanced Bio-Inspired Core
+# Enhanced Bio-Inspired Core (with all new features integrated)
 # ============================================================================
 
 class EnhancedBioInspiredCore:
     """
-    Enhanced Bio-Inspired Core v6.0.0
+    Enhanced Bio-Inspired Core v6.1.0
     
     New Features:
     - Dynamic module loading for runtime extensibility
@@ -1034,6 +1334,9 @@ class EnhancedBioInspiredCore:
     - Configuration versioning for rollback capability
     - Anomaly detection in performance metrics
     - Event-driven communication between services
+    - Genetic optimizer for core parameters
+    - Decentralized decision-making via module-local events
+    - Module marketplace for competition and replacement
     """
     
     def __init__(self, config: Optional[CoreConfig] = None, config_path: Optional[str] = None):
@@ -1074,6 +1377,19 @@ class EnhancedBioInspiredCore:
         # NEW: Performance anomaly detector
         self._anomaly_detector = PerformanceAnomalyDetector()
         
+        # NEW: Genetic optimizer
+        self._genetic_optimizer = CoreGeneticOptimizer(self)
+        
+        # NEW: Module marketplace
+        self._marketplace = ModuleMarketplace(self)
+        
+        # NEW: Decentralized modules registry
+        self._decentralized_modules: Dict[str, DecentralizedModule] = {}
+        
+        # NEW: Evolvable parameters (used by genetic optimizer)
+        self._module_retirement_threshold = 0.2
+        self._predictive_health_retrain_interval = 300
+        
         # Exchange rate
         self.exchange_rate = None
         
@@ -1088,7 +1404,7 @@ class EnhancedBioInspiredCore:
         # Register signal handlers
         self._register_signal_handlers()
         
-        logger.info("Enhanced Bio-Inspired Core v6.0.0 created")
+        logger.info("Enhanced Bio-Inspired Core v6.1.0 created")
     
     def _save_initial_config(self):
         """Save initial configuration version"""
@@ -1229,6 +1545,8 @@ class EnhancedBioInspiredCore:
             asyncio.create_task(self._performance_monitoring_loop())
             asyncio.create_task(self._predictive_health_loop())
             asyncio.create_task(self._anomaly_detection_loop())
+            asyncio.create_task(self._competition_loop())
+            asyncio.create_task(self._genetic_optimization_loop())
             
             self._lifecycle_phase = LifecyclePhase.RUNNING
             
@@ -1392,7 +1710,7 @@ class EnhancedBioInspiredCore:
                 # Train health forecaster
                 await self.registry.health_forecaster.train()
                 
-                await asyncio.sleep(300)  # 5 minutes
+                await asyncio.sleep(self._predictive_health_retrain_interval)
                 
             except Exception as e:
                 logger.error(f"Predictive health loop error: {str(e)}")
@@ -1420,6 +1738,29 @@ class EnhancedBioInspiredCore:
             except Exception as e:
                 logger.error(f"Anomaly detection loop error: {str(e)}")
                 await asyncio.sleep(120)
+    
+    async def _competition_loop(self):
+        """Periodic module competition loop"""
+        while self._lifecycle_phase == LifecyclePhase.RUNNING:
+            try:
+                await self._marketplace.run_competition()
+                await asyncio.sleep(self._marketplace.competition_interval)
+            except Exception as e:
+                logger.error(f"Competition loop error: {str(e)}")
+                await asyncio.sleep(300)
+    
+    async def _genetic_optimization_loop(self):
+        """Periodic genetic optimization loop"""
+        while self._lifecycle_phase == LifecyclePhase.RUNNING:
+            try:
+                if len(self.registry.modules) >= 5:
+                    logger.info("Starting genetic optimization cycle...")
+                    result = await self._genetic_optimizer.evolve(generations=10)
+                    logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}")
+                await asyncio.sleep(86400)  # every 24 hours
+            except Exception as e:
+                logger.error(f"Genetic optimization loop error: {str(e)}")
+                await asyncio.sleep(3600)
     
     def _get_avg_compartment_health(self) -> float:
         """Get average compartment health"""
@@ -1485,7 +1826,7 @@ class EnhancedBioInspiredCore:
     def degradation_manager(self): return self._degradation_manager
     
     # ========================================================================
-    # Dynamic Module Loading (NEW)
+    # Dynamic Module Loading
     # ========================================================================
     
     async def load_module(self, name: str, module_path: str) -> bool:
@@ -1501,7 +1842,7 @@ class EnhancedBioInspiredCore:
         return list(self.registry.loaded_modules)
     
     # ========================================================================
-    # Configuration Versioning (NEW)
+    # Configuration Versioning
     # ========================================================================
     
     def save_configuration_version(self, description: str = "") -> str:
@@ -1532,6 +1873,52 @@ class EnhancedBioInspiredCore:
         return self._version_manager.get_version_diff(version_a, version_b)
     
     # ========================================================================
+    # Decentralized Module Registration (NEW)
+    # ========================================================================
+    
+    def register_decentralized_module(self, name: str, module: DecentralizedModule):
+        """Register a decentralized module that can make local decisions."""
+        self._decentralized_modules[name] = module
+        # Subscribe to events
+        for event_type in module.event_subscriptions:
+            self._event_bus.subscribe(event_type, module.on_event)
+    
+    async def trigger_local_decision(self, module_name: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Trigger a local decision for a decentralized module."""
+        if module_name in self._decentralized_modules:
+            return await self._decentralized_modules[module_name].local_decision(context)
+        return {'action': 'noop', 'reason': 'Module not found'}
+    
+    # ========================================================================
+    # Module Marketplace API (NEW)
+    # ========================================================================
+    
+    def apply_module_replacement(self, old_name: str, new_name: str) -> bool:
+        """Replace an underperforming module with another."""
+        if old_name not in self.registry.modules or new_name not in self.registry.modules:
+            return False
+        # Transfer dependencies and health checks
+        old_entry = self.registry.modules[old_name]
+        new_entry = self.registry.modules[new_name]
+        # Decommission old module
+        asyncio.run(self.registry.shutdown_all())
+        # Remove old, re-register new with same dependencies
+        self.registry.modules[old_name] = new_entry
+        # Update dependency graph
+        for dep in old_entry.dependencies:
+            if dep in self.registry.modules:
+                self.registry.modules[dep].dependents.remove(old_name)
+                self.registry.modules[dep].dependents.append(new_name)
+        logger.info(f"Module replacement: {old_name} → {new_name}")
+        return True
+    
+    def get_marketplace_status(self) -> Dict:
+        return self._marketplace.get_marketplace_stats()
+    
+    def get_genetic_status(self) -> Dict:
+        return self._genetic_optimizer.get_status()
+    
+    # ========================================================================
     # System Status and Reporting (Enhanced)
     # ========================================================================
     
@@ -1545,7 +1932,11 @@ class EnhancedBioInspiredCore:
             'modules': self.registry.get_registry_stats(),
             'event_bus': self._event_bus.get_event_stats(),
             'config_version': self._version_manager.current_version,
-            'loaded_modules': self.get_loaded_modules()
+            'loaded_modules': self.get_loaded_modules(),
+            'genetic_optimizer': self._genetic_optimizer.get_status(),
+            'marketplace': self._marketplace.get_marketplace_stats(),
+            'module_retirement_threshold': self._module_retirement_threshold,
+            'predictive_health_retrain_interval': self._predictive_health_retrain_interval
         }
         
         # Module-specific status
@@ -1738,6 +2129,10 @@ class EnhancedBioInspiredCore:
         """Process a task through the bio-inspired system with event publishing"""
         if self._lifecycle_phase != LifecyclePhase.RUNNING:
             return {'success': False, 'reason': f'System not running (phase: {self._lifecycle_phase.value})'}
+        
+        # If task specifies a decentralized module, let it decide locally
+        if 'module' in task and task['module'] in self._decentralized_modules:
+            asyncio.create_task(self._decentralized_modules[task['module']].local_decision(task))
         
         ecoatp_required = task.get('complexity', 0.5) * 10
         
