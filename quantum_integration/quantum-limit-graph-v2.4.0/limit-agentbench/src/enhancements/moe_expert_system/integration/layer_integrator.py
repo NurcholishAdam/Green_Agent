@@ -1,6 +1,6 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/integration/layer_integrator.py
 """
-Enhanced Layer Integrator v6.0.0 - Complete Green Agent Implementation
+Enhanced Layer Integrator v6.1.0 - Complete Green Agent Implementation
 
 Complete bio-inspired integration with:
 - Federated Reflexive Learning with distributed layer health
@@ -19,11 +19,13 @@ Complete bio-inspired integration with:
 - Token recovery on transaction rollback
 - Gradient-modulated retry timing
 - Harvester-aware layer vitality
-- Dynamic layer discovery for runtime registration (NEW)
-- Health-based circuit reset using gradient fields (NEW)
-- Event correlation for complex workflow orchestration (NEW)
-- Gradient-aware cache invalidation (NEW)
-- Distributed transaction support across integrators (NEW)
+- Dynamic layer discovery for runtime registration
+- Health-based circuit reset using gradient fields
+- Event correlation for complex workflow orchestration
+- Gradient-aware cache invalidation
+- Distributed transaction support across integrators
+- Context builder for MoE expert system (NEW)
+- Helium and Federated Learning telemetry integration (NEW)
 """
 
 import asyncio
@@ -79,7 +81,17 @@ except ImportError as e:
     logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard integration")
 
 # ============================================================================
-# Carbon Intensity Integration Module
+# NEW: Import MoE Expert Router
+# ============================================================================
+try:
+    from ..expert_router import ExpertRouter
+    MOE_AVAILABLE = True
+except ImportError:
+    MOE_AVAILABLE = False
+    logger.warning("MoE Expert Router not available - context building will be limited")
+
+# ============================================================================
+# Carbon Intensity Integration Module (unchanged)
 # ============================================================================
 
 class CarbonIntensityManager:
@@ -283,7 +295,7 @@ class PredictiveLayerAnalyzer:
         return actions or ["Layer health is on track"]
 
 # ============================================================================
-# Cross-Domain Knowledge Transfer Module
+# Cross-Domain Knowledge Transfer Module (unchanged)
 # ============================================================================
 
 class LayerCrossDomainTransfer:
@@ -920,12 +932,12 @@ class DistributedTransactionCoordinator:
         return None
 
 # ============================================================================
-# Enhanced Layer Integrator
+# Enhanced Layer Integrator (with new context builder and MoE integration)
 # ============================================================================
 
 class EnhancedLayerIntegrator:
     """
-    Enhanced Layer Integrator v6.0.0 - Complete Green Agent Implementation
+    Enhanced Layer Integrator v6.1.0 - Complete Green Agent Implementation
     
     New Features:
     - Dynamic layer discovery for runtime registration
@@ -933,6 +945,8 @@ class EnhancedLayerIntegrator:
     - Event correlation for complex workflow orchestration
     - Gradient-aware cache invalidation
     - Distributed transaction support across integrators
+    - Context builder for MoE expert system (NEW)
+    - Helium and Federated Learning telemetry integration (NEW)
     """
     
     def __init__(
@@ -994,6 +1008,11 @@ class EnhancedLayerIntegrator:
         self.gradient_cache = GradientAwareCacheManager(cache_ttl_seconds) if enable_gradient_cache else None
         self.distributed_coordinator = DistributedTransactionCoordinator(coordinator_id) if enable_distributed_txns else None
         
+        # NEW: MoE Expert Router reference (injected)
+        self.expert_router = None
+        self.helium_provider = None   # To be injected
+        self.fl_monitor = None        # To be injected (for FL metrics)
+        
         # Layer registry
         self.layers: Dict[int, LayerInfo] = {}
         self.layer_modules: Dict[int, Any] = {}
@@ -1035,7 +1054,7 @@ class EnhancedLayerIntegrator:
         self._start_background_tasks()
         
         logger.info(
-            f"Enhanced Layer Integrator v6.0.0 initialized: "
+            f"Enhanced Layer Integrator v6.1.0 initialized: "
             f"layers={len(self.layers)}/12, "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
@@ -1136,7 +1155,113 @@ class EnhancedLayerIntegrator:
             self.enable_bio_integration = True
     
     # ========================================================================
-    # Bio-Inspired Methods (Enhanced)
+    # NEW: Inject Expert Router, Helium Provider, and FL Monitor
+    # ========================================================================
+    
+    def set_expert_router(self, router: 'ExpertRouter'):
+        """Inject the MoE expert router."""
+        self.expert_router = router
+        logger.info("Expert Router injected into Layer Integrator")
+    
+    def set_helium_provider(self, provider):
+        """Inject the Helium provider for telemetry."""
+        self.helium_provider = provider
+        logger.info("Helium provider injected into Layer Integrator")
+    
+    def set_fl_monitor(self, fl_monitor):
+        """Inject the Federated Learning monitor for metrics."""
+        self.fl_monitor = fl_monitor
+        logger.info("FL monitor injected into Layer Integrator")
+    
+    # ========================================================================
+    # NEW: Context Builder for MoE Expert System
+    # ========================================================================
+    
+    async def build_context(self) -> Dict[str, Any]:
+        """
+        Build a comprehensive context dict for the MoE expert router.
+        Gathers:
+        - Helium telemetry (scarcity, cost, client energy)
+        - Carbon intensity and price
+        - Bio-inspired signals (gradients, token balance, stress)
+        - Federated Learning metrics (if available)
+        - Layer health and sustainability scores
+        """
+        context = {}
+        
+        # 1. Helium telemetry
+        if self.helium_provider:
+            context['helium_scarcity'] = self.helium_provider.get_scarcity()
+            context['helium_cost_index'] = self.helium_provider.get_cost_index()
+            context['avg_client_energy'] = self.helium_provider.get_avg_client_energy()
+        else:
+            # fallback
+            context['helium_scarcity'] = 0.5
+            context['helium_cost_index'] = 1.0
+            context['avg_client_energy'] = 0.5
+        
+        # 2. Carbon intensity
+        if self.enable_carbon_intensity:
+            carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_price()
+            context['carbon_intensity'] = carbon_intensity / 1000.0  # normalize
+            context['carbon_price_usd'] = carbon_price
+        else:
+            context['carbon_intensity'] = 0.5
+            context['carbon_price_usd'] = 50.0
+        
+        # 3. Bio-inspired signals
+        gradients = self._get_real_gradient_levels()
+        context['gradient_carbon'] = gradients.get('carbon', 0.5)
+        context['gradient_helium'] = gradients.get('helium', 0.5)
+        context['gradient_trust'] = gradients.get('trust', 0.5)
+        context['gradient_opportunity'] = gradients.get('opportunity', 0.5)
+        context['token_balance_norm'] = self._get_real_token_availability()
+        context['harvester_stress'] = self._get_harvester_vitality()  # use vitality as proxy
+        context['avg_layer_health'] = np.mean([info.gradient_health for info in self.layers.values()])
+        
+        # 4. Federated Learning metrics
+        if self.fl_monitor:
+            context['model_loss'] = self.fl_monitor.get_loss()
+            context['gradient_variance'] = self.fl_monitor.get_gradient_variance()
+            context['accuracy'] = self.fl_monitor.get_accuracy()
+        else:
+            context['model_loss'] = 0.0
+            context['gradient_variance'] = 0.0
+            context['accuracy'] = 0.0
+        
+        # 5. Sustainability
+        context['sustainability_score'] = self.sustainability_score
+        context['carbon_savings_kg'] = self.total_carbon_savings_kg
+        
+        # 6. Predictions (optional)
+        if self.enable_predictive:
+            forecast = await self.predictive_analyzer.predict_layer_health()
+            context['predicted_layer_health'] = forecast.get('predicted_health', 0.5)
+            context['prediction_confidence'] = forecast.get('confidence', 0.0)
+        
+        return context
+    
+    def _get_real_gradient_levels(self) -> Dict[str, float]:
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+    
+    def _get_real_token_availability(self) -> float:
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            return min(1.0, summary.get('total_balance', 500) / 1000)
+        return 0.5
+    
+    def _get_harvester_vitality(self) -> float:
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            total = stats.get('total_harvested', 0)
+            return min(1.0, total / max(total + 100, 1))
+        return 0.5
+    
+    # ========================================================================
+    # Bio-Inspired Methods (Existing - unchanged)
     # ========================================================================
     
     def _get_gradient_health(self, layer_number: int) -> float:
@@ -1184,13 +1309,6 @@ class EnhancedLayerIntegrator:
                 return base_delay * 0.5
         return base_delay
     
-    def _get_harvester_vitality(self) -> float:
-        if self.harvester:
-            stats = self.harvester.get_harvesting_stats()
-            total = stats.get('total_harvested', 0)
-            return min(1.0, total / max(total + 100, 1))
-        return 0.5
-    
     def _get_entangled_resources(self, layer_number: int) -> List[str]:
         entangled = []
         if layer_number in self.layers:
@@ -1202,11 +1320,6 @@ class EnhancedLayerIntegrator:
                 entangled.append('biomass_collateral')
         return entangled
     
-    def _get_real_gradient_levels(self) -> Dict[str, float]:
-        if self.gradient_manager:
-            return self.gradient_manager.get_field_strengths()
-        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
-    
     def _get_circuit_recovery_delay(self, layer_number: int) -> float:
         """Get gradient-modulated circuit recovery delay"""
         if self.gradient_manager:
@@ -1217,7 +1330,7 @@ class EnhancedLayerIntegrator:
         return 30.0
     
     # ========================================================================
-    # Background Loops (Enhanced)
+    # Background Loops (Existing - with minor updates)
     # ========================================================================
     
     async def _bio_sync_loop(self):
@@ -1379,7 +1492,7 @@ class EnhancedLayerIntegrator:
                 await asyncio.sleep(30)
     
     # ========================================================================
-    # Enhanced Layer Communication
+    # Enhanced Layer Communication (unchanged)
     # ========================================================================
     
     async def call_layer(
@@ -1484,7 +1597,7 @@ class EnhancedLayerIntegrator:
             return await loop.run_in_executor(self.executor, lambda: method_func(*args, **kwargs))
     
     # ========================================================================
-    # Event System (Enhanced)
+    # Event System (Enhanced) – unchanged
     # ========================================================================
     
     def subscribe_to_event(self, event_type: str, callback: Callable):
@@ -1522,7 +1635,7 @@ class EnhancedLayerIntegrator:
             logger.warning("Event queue full, dropping event")
     
     # ========================================================================
-    # Cache Management (Enhanced)
+    # Cache Management (Enhanced) – unchanged
     # ========================================================================
     
     def _get_from_cache(self, key: str) -> Optional[Any]:
@@ -1565,7 +1678,7 @@ class EnhancedLayerIntegrator:
         del self.cache[lru_key]
     
     # ========================================================================
-    # Transaction Support (Enhanced)
+    # Transaction Support (Enhanced) – unchanged
     # ========================================================================
     
     async def begin_transaction(
@@ -1633,7 +1746,7 @@ class EnhancedLayerIntegrator:
                 logger.error(f"Compensation failed: {str(e)}")
     
     # ========================================================================
-    # Layer Registration (Enhanced)
+    # Layer Registration (Enhanced) – unchanged
     # ========================================================================
     
     def register_layer_module(
@@ -1683,7 +1796,7 @@ class EnhancedLayerIntegrator:
                 await module.on_dependency_update(event)
     
     # ========================================================================
-    # Metrics
+    # Metrics (unchanged)
     # ========================================================================
     
     def _record_layer_success(self, layer_number: int, execution_time_ms: float):
@@ -1713,6 +1826,9 @@ class EnhancedLayerIntegrator:
             'event_correlation_active': self.enable_event_correlation,
             'gradient_cache_active': self.enable_gradient_cache,
             'distributed_txns_active': self.enable_distributed_txns,
+            'moe_router_injected': self.expert_router is not None,
+            'helium_provider_injected': self.helium_provider is not None,
+            'fl_monitor_injected': self.fl_monitor is not None,
             'layer_details': {}
         }
         
