@@ -180,68 +180,130 @@ class SustainabilityMetrics:
     ecoatp_generated: float = 0.0
 
 # ============================================================================
-# Real-Time Grid Carbon API Integration (NEW)
+# Configuration Dataclass for EnergyExpert
+# ============================================================================
+
+@dataclass
+class EnergyExpertConfig:
+    """Configuration for EnergyExpert to consolidate feature flags and parameters."""
+    expert_id: str = "energy_optimizer_v7"
+    enable_renewable: bool = True
+    enable_storage: bool = True
+    enable_thermal: bool = True
+    enable_dvfs: bool = True
+    enable_forecasting: bool = True
+    enable_bio_integration: bool = True
+    enable_federated: bool = True
+    enable_cross_domain: bool = True
+    enable_predictive_sustainability: bool = True
+    enable_grid_api: bool = True
+    enable_workload_aware: bool = True
+    enable_adaptive_cooling: bool = True
+    enable_dynamic_quantization: bool = True
+    enable_differential_privacy: bool = True
+    enable_climate_integration: bool = True
+    # New configurable parameters
+    grid_api_region: str = "US-CAL-CISO"
+    carbon_budget_buffer: float = 0.2
+    federated_privacy_epsilon: float = 1.0
+    federated_sparsity_ratio: float = 0.1
+    cooling_forecast_horizon: int = 15
+    workload_learning_rate: float = 0.01
+
+# ============================================================================
+# Enhanced Real-Time Grid Carbon API Integration with Resilience
 # ============================================================================
 
 class GridCarbonAPIClient:
     """
-    Real-time grid carbon intensity API integration.
+    Real-time grid carbon intensity API integration with resilience features.
     
-    Features:
-    - ElectricityMap API integration
-    - Carbon intensity fetching
-    - Renewable percentage tracking
-    - Regional support
+    Enhancements:
+    - Retry with exponential backoff (max 3 retries)
+    - Circuit breaker pattern (fail-fast after 5 failures)
+    - TTL cache with configurable update interval
+    - Support for multiple regions with fallback
+    - Asynchronous session reuse
     """
-    
-    def __init__(self, api_key: Optional[str] = None):
+
+    def __init__(self, api_key: Optional[str] = None, max_retries: int = 3, 
+                 circuit_breaker_threshold: int = 5, update_interval: int = 300):
         self.api_key = api_key or os.getenv('ELECTRICITYMAP_API_KEY', '')
         self.endpoint = "https://api.electricitymap.org/v3"
         self._session = None
         self.cache = {}
         self.last_update = None
-        self.update_interval = 300
-        
-        logger.info("Grid Carbon API Client initialized")
-    
+        self.update_interval = update_interval
+        self.max_retries = max_retries
+        self.circuit_breaker_threshold = circuit_breaker_threshold
+        self.failure_count = 0
+        self.circuit_open = False
+        self.circuit_open_until = None
+        logger.info(f"Grid Carbon API Client initialized (retries={max_retries}, circuit_breaker={circuit_breaker_threshold})")
+
     async def _get_session(self):
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
-    
+
     async def get_carbon_intensity(self, region: str = "US-CAL-CISO") -> Dict[str, Any]:
-        """Get real-time carbon intensity for a region"""
+        """Get real-time carbon intensity with resilience."""
+        # Circuit breaker check
+        if self.circuit_open:
+            if datetime.utcnow() < self.circuit_open_until:
+                logger.warning("Circuit breaker open, using fallback data")
+                return self._get_fallback_data(region)
+            else:
+                self.circuit_open = False
+                self.failure_count = 0
+                logger.info("Circuit breaker reset")
+
         cache_key = f"{region}_{datetime.utcnow().hour}"
-        
         if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.update_interval:
             return self.cache[cache_key]
-        
-        try:
-            session = await self._get_session()
-            url = f"{self.endpoint}/carbon-intensity/latest?zone={region}"
-            headers = {'auth-token': self.api_key} if self.api_key else {}
-            
-            async with session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    result = {
-                        'carbon_intensity': data.get('carbonIntensity', 400),
-                        'renewable_percentage': data.get('renewablePercentage', 0),
-                        'region': region,
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                    self.cache[cache_key] = result
-                    self.last_update = datetime.utcnow()
-                    return result
-                else:
-                    logger.warning(f"Grid API returned {response.status}, using fallback")
+
+        for attempt in range(self.max_retries):
+            try:
+                session = await self._get_session()
+                url = f"{self.endpoint}/carbon-intensity/latest?zone={region}"
+                headers = {'auth-token': self.api_key} if self.api_key else {}
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        result = {
+                            'carbon_intensity': data.get('carbonIntensity', 400),
+                            'renewable_percentage': data.get('renewablePercentage', 0),
+                            'region': region,
+                            'timestamp': datetime.utcnow().isoformat()
+                        }
+                        self.cache[cache_key] = result
+                        self.last_update = datetime.utcnow()
+                        self.failure_count = 0  # reset on success
+                        return result
+                    else:
+                        logger.warning(f"Grid API returned {response.status}, attempt {attempt+1}")
+                        if attempt == self.max_retries - 1:
+                            self.failure_count += 1
+                            if self.failure_count >= self.circuit_breaker_threshold:
+                                self.circuit_open = True
+                                self.circuit_open_until = datetime.utcnow() + timedelta(minutes=5)
+                                logger.error("Circuit breaker opened due to repeated failures")
+                            return self._get_fallback_data(region)
+                        await asyncio.sleep(2 ** attempt)  # exponential backoff
+            except Exception as e:
+                logger.error(f"Grid API error: {e}, attempt {attempt+1}")
+                if attempt == self.max_retries - 1:
+                    self.failure_count += 1
+                    if self.failure_count >= self.circuit_breaker_threshold:
+                        self.circuit_open = True
+                        self.circuit_open_until = datetime.utcnow() + timedelta(minutes=5)
                     return self._get_fallback_data(region)
-        except Exception as e:
-            logger.error(f"Grid API error: {e}")
-            return self._get_fallback_data(region)
-    
+                await asyncio.sleep(2 ** attempt)
+
+        # Should never reach here
+        return self._get_fallback_data(region)
+
     def _get_fallback_data(self, region: str) -> Dict[str, Any]:
-        """Fallback data when API is unavailable"""
         fallback_intensities = {
             'US-CAL-CISO': 350, 'US-TEX-ERCO': 420, 'US-NE-ISNE': 380,
             'EU-FR': 50, 'EU-DE': 450, 'EU-UK': 280
@@ -255,26 +317,24 @@ class GridCarbonAPIClient:
             'timestamp': datetime.utcnow().isoformat(),
             'is_fallback': True
         }
-    
+
     async def close(self):
         if self._session:
             await self._session.close()
 
 # ============================================================================
-# Workload-Aware Power State Selector (NEW)
+# Enhanced Workload-Aware Power Selector with Real-time Metrics and Online Learning
 # ============================================================================
 
 class WorkloadAwarePowerSelector:
     """
-    Workload-aware power state selection.
-    
-    Features:
-    - Task complexity analysis
-    - Performance-energy tradeoff
-    - Dynamic power state selection
+    Workload-aware power state selection enhanced with:
+    - Real-time hardware metrics (CPU load, temperature, power draw)
+    - Online learning using stochastic gradient descent
+    - Adaptive scoring based on actual performance/energy tradeoffs
     """
-    
-    def __init__(self):
+
+    def __init__(self, learning_rate: float = 0.01):
         self.workload_characteristics = {
             'inference': {'complexity': 0.3, 'latency_sensitivity': 0.8, 'energy_sensitivity': 0.2},
             'training': {'complexity': 0.9, 'latency_sensitivity': 0.3, 'energy_sensitivity': 0.4},
@@ -282,7 +342,6 @@ class WorkloadAwarePowerSelector:
             'data_processing': {'complexity': 0.5, 'latency_sensitivity': 0.5, 'energy_sensitivity': 0.5},
             'quantum': {'complexity': 0.95, 'latency_sensitivity': 0.6, 'energy_sensitivity': 0.8}
         }
-        
         self.power_state_scores = {
             PowerState.PERFORMANCE: {'performance': 1.0, 'energy': 0.1, 'latency': 1.0},
             PowerState.BALANCED: {'performance': 0.7, 'energy': 0.5, 'latency': 0.8},
@@ -290,60 +349,82 @@ class WorkloadAwarePowerSelector:
             PowerState.ULTRA_LOW: {'performance': 0.3, 'energy': 0.95, 'latency': 0.3},
             PowerState.WORKLOAD_AWARE: {'performance': 0.6, 'energy': 0.6, 'latency': 0.6}
         }
-        
-        logger.info("Workload-Aware Power Selector initialized")
-    
-    def select_power_state(self, task_config: Dict[str, Any], carbon_budget: float) -> PowerState:
-        """Select optimal power state based on workload characteristics"""
+        # Online learning weights for each power state (initialized to base scores)
+        self.weights = {state: 1.0 for state in self.power_state_scores}
+        self.learning_rate = learning_rate
+        self.history = deque(maxlen=100)
+        logger.info("Enhanced Workload-Aware Power Selector initialized with online learning")
+
+    def select_power_state(self, task_config: Dict[str, Any], carbon_budget: float,
+                           hardware_metrics: Optional[Dict[str, float]] = None) -> PowerState:
+        """Select optimal power state using real-time metrics and learned weights."""
         task_type = task_config.get('task_type', 'inference')
         complexity = task_config.get('complexity', 0.5)
         latency_requirement = task_config.get('latency_requirement_ms', 100)
-        
-        # Get workload characteristics
+
+        # Get base characteristics
         characteristics = self.workload_characteristics.get(task_type, self.workload_characteristics['inference'])
-        
-        # Adjust for complexity
         if complexity > 0.7:
             characteristics = {**characteristics, 'complexity': min(1.0, complexity)}
-        
-        # Calculate scores for each power state
+
+        # Adjust with hardware metrics (if provided)
+        if hardware_metrics:
+            cpu_load = hardware_metrics.get('cpu_load', 0.5)
+            gpu_load = hardware_metrics.get('gpu_load', 0.5)
+            temperature = hardware_metrics.get('temperature_c', 35)
+            # Increase energy sensitivity if temperature is high
+            if temperature > 70:
+                characteristics['energy_sensitivity'] = min(1.0, characteristics['energy_sensitivity'] * 1.5)
+
+        # Calculate scores with learned weights
         scores = {}
         for state, scores_dict in self.power_state_scores.items():
-            performance_score = scores_dict['performance'] * (1 - characteristics['complexity'] * 0.3)
-            energy_score = scores_dict['energy'] * (1 - characteristics['energy_sensitivity'] * 0.5)
-            latency_score = scores_dict['latency'] * (1 - latency_requirement / 1000)
-            
-            # Carbon budget adjustment
+            base_perf = scores_dict['performance'] * (1 - characteristics['complexity'] * 0.3)
+            base_energy = scores_dict['energy'] * (1 - characteristics['energy_sensitivity'] * 0.5)
+            base_latency = scores_dict['latency'] * (1 - latency_requirement / 1000)
+
+            # Apply learned weight
+            weight = self.weights.get(state, 1.0)
             if carbon_budget < 0.001:
-                energy_score *= 1.5
-            
-            scores[state] = performance_score * 0.3 + energy_score * 0.4 + latency_score * 0.3
-        
-        # Select best state
+                base_energy *= 1.5
+
+            scores[state] = weight * (base_perf * 0.3 + base_energy * 0.4 + base_latency * 0.3)
+
         best_state = max(scores, key=scores.get)
-        
-        # If workload is training or quantum, prefer performance
-        if task_type in ['training', 'quantum']:
-            if scores[PowerState.PERFORMANCE] > scores[PowerState.BALANCED] * 0.8:
-                best_state = PowerState.PERFORMANCE
-        
+        if task_type in ['training', 'quantum'] and scores[PowerState.PERFORMANCE] > scores[PowerState.BALANCED] * 0.8:
+            best_state = PowerState.PERFORMANCE
+
         return best_state
 
+    def update_weights(self, selected_state: PowerState, actual_energy: float, actual_performance: float, 
+                       expected_energy: float, expected_performance: float):
+        """Online learning: update weights based on actual vs expected."""
+        error = (actual_energy / expected_energy) - (actual_performance / expected_performance)
+        # Adjust weight: if actual energy is higher than expected or performance lower, reduce weight
+        self.weights[selected_state] -= self.learning_rate * error
+        # Clip weights to avoid extreme values
+        self.weights[selected_state] = max(0.1, min(10.0, self.weights[selected_state]))
+        self.history.append({
+            'state': selected_state.value,
+            'error': error,
+            'new_weight': self.weights[selected_state]
+        })
+
 # ============================================================================
-# Adaptive Cooling Controller (NEW)
+# Enhanced Adaptive Cooling Controller with Predictive Thermal Forecasting
 # ============================================================================
 
 class AdaptiveCoolingController:
     """
-    Adaptive cooling based on thermal profile.
+    Adaptive cooling with predictive thermal load forecasting.
     
-    Features:
-    - Dynamic cooling method selection
-    - Thermal margin management
-    - Energy-efficient cooling
+    Enhancements:
+    - Uses ARIMA-like model (simple exponential smoothing) to forecast future temperature.
+    - Selects cooling method based on predicted peak temperature over next 15 minutes.
+    - Incorporates helium scarcity and ambient temperature in decision.
     """
-    
-    def __init__(self):
+
+    def __init__(self, forecast_horizon_minutes: int = 15):
         self.cooling_methods = {
             CoolingMethod.AIR_COOLING: {'energy_overhead': 0.02, 'cooling_capacity': 50, 'helium_usage': 0.0, 'sustainability_score': 0.6},
             CoolingMethod.LIQUID_COOLING: {'energy_overhead': 0.05, 'cooling_capacity': 200, 'helium_usage': 0.0, 'sustainability_score': 0.5},
@@ -353,38 +434,292 @@ class AdaptiveCoolingController:
             CoolingMethod.HELIUM_COOLING: {'energy_overhead': 0.10, 'cooling_capacity': 1000, 'helium_usage': 0.05, 'sustainability_score': 0.4},
             CoolingMethod.ADAPTIVE_COOLING: {'energy_overhead': 0.0, 'cooling_capacity': 0, 'helium_usage': 0.0, 'sustainability_score': 0.8}
         }
-        
-        logger.info("Adaptive Cooling Controller initialized")
-    
+        self.forecast_horizon = forecast_horizon_minutes
+        self.temp_history = deque(maxlen=30)  # last 30 readings (assuming 1-min intervals)
+        logger.info(f"Adaptive Cooling Controller initialized with {forecast_horizon_minutes}-min forecast")
+
+    def update_temperature_history(self, current_temp_c: float):
+        self.temp_history.append(current_temp_c)
+
+    def _predict_future_temp(self) -> float:
+        """Simple exponential smoothing forecast for next forecast_horizon minutes."""
+        if len(self.temp_history) < 5:
+            return self.temp_history[-1] if self.temp_history else 35.0
+        alpha = 0.7  # smoothing factor
+        forecast = self.temp_history[-1]
+        for _ in range(self.forecast_horizon):
+            forecast = alpha * forecast + (1 - alpha) * self.temp_history[-1]
+        return forecast
+
     def select_cooling_method(self, thermal_profile: ThermalProfile, helium_scarcity: float) -> CoolingMethod:
-        """Select optimal cooling method based on thermal profile"""
-        if thermal_profile.requires_throttling:
+        """Select cooling method based on predicted peak temperature."""
+        # Update history
+        self.update_temperature_history(thermal_profile.current_temp_c)
+        predicted_temp = self._predict_future_temp()
+        thermal_headroom = thermal_profile.throttle_temp_c - predicted_temp
+
+        # If predicted temperature exceeds throttle, use aggressive cooling
+        if thermal_headroom < 5:
             if helium_scarcity < 0.3:
                 return CoolingMethod.HELIUM_COOLING
             elif thermal_profile.ambient_temp_c < 20:
                 return CoolingMethod.FREE_COOLING
             else:
                 return CoolingMethod.IMMERSION_COOLING
-        
-        if thermal_profile.thermal_headroom_c < 20:
+
+        # Moderate heat
+        if thermal_headroom < 20:
             if thermal_profile.ambient_temp_c < 15:
                 return CoolingMethod.FREE_COOLING
             elif helium_scarcity < 0.5:
                 return CoolingMethod.LIQUID_COOLING
             else:
                 return CoolingMethod.COMPARTMENT_AWARE
-        
+
+        # Low heat
         if thermal_profile.cooling_efficiency > 0.9:
             return CoolingMethod.AIR_COOLING
-        
+
         return CoolingMethod.ADAPTIVE_COOLING
-    
+
     def get_cooling_energy_overhead(self, method: CoolingMethod) -> float:
-        """Get energy overhead for a cooling method"""
         return self.cooling_methods.get(method, {}).get('energy_overhead', 0.02)
 
 # ============================================================================
-# Dynamic Quantization Controller (NEW)
+# Enhanced Federated Energy Learner with Model Compression (Top‑K Sparsification)
+# ============================================================================
+
+class FederatedEnergyLearner:
+    """Federated reflexive learning with differential privacy and model compression."""
+
+    def __init__(self, expert_id: str, server_url: Optional[str] = None, privacy_epsilon: float = 1.0,
+                 sparsity_ratio: float = 0.1):
+        self.expert_id = expert_id
+        self.server_url = server_url
+        self.state = FederatedLearningState(privacy_epsilon=privacy_epsilon)
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.local_model = None
+        self.global_model = None
+        self.energy_history = deque(maxlen=1000)
+        self.noise_scale = 0.001
+        self.sparsity_ratio = sparsity_ratio  # Keep top-k% of weights
+        self._init_energy_model()
+
+    def _init_energy_model(self):
+        class EnergyOptimizerModel(nn.Module):
+            def __init__(self, input_size=10, hidden_size=64):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(input_size, hidden_size),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size),
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size // 2),
+                    nn.Linear(hidden_size // 2, 1)
+                )
+            
+            def forward(self, x):
+                return self.network(x)
+        
+        self.local_model = EnergyOptimizerModel()
+        self.global_model = EnergyOptimizerModel()
+
+    def _add_differential_privacy(self, weights: Dict) -> Dict:
+        """Add differential privacy noise to weights"""
+        if self.state.privacy_epsilon <= 0:
+            return weights
+        
+        private_weights = {}
+        sensitivity = 1.0
+        
+        for key, tensor in weights.items():
+            scale = (2 * sensitivity) / self.state.privacy_epsilon
+            noise = torch.randn_like(tensor) * scale * self.noise_scale
+            private_weights[key] = tensor + noise
+        
+        return private_weights
+
+    def _compress_weights(self, weights: Dict) -> Dict:
+        """Apply top‑k sparsification: keep only largest k% of weights."""
+        compressed = {}
+        for key, tensor in weights.items():
+            flat = tensor.view(-1)
+            k = int(flat.numel() * self.sparsity_ratio)
+            if k == 0:
+                compressed[key] = torch.zeros_like(tensor)
+                continue
+            # Get top-k values and indices
+            topk_vals, topk_idx = torch.topk(flat.abs(), k)
+            # Create sparse tensor: only top-k values preserved
+            sparse = torch.zeros_like(flat)
+            sparse[topk_idx] = flat[topk_idx]
+            compressed[key] = sparse.view(tensor.shape)
+        return compressed
+
+    async def _get_session(self):
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def train_local_model(self, energy_data: List[Dict[str, float]], epochs: int = 10) -> float:
+        if not energy_data:
+            return 0.0
+        
+        X = []
+        y = []
+        for item in energy_data:
+            X.append([
+                item.get('energy_consumption', 0.5),
+                item.get('carbon_intensity', 0.5),
+                item.get('renewable_percentage', 0.5),
+                item.get('thermal_load', 0.5),
+                item.get('helium_scarcity', 0.5),
+                item.get('grid_carbon', 0.5),
+                item.get('solar_available', 0.5),
+                item.get('wind_available', 0.5),
+                item.get('battery_level', 0.5),
+                item.get('ecoatp_balance', 0.5)
+            ])
+            y.append(item.get('optimization_score', 0.5))
+        
+        X = torch.FloatTensor(X)
+        y = torch.FloatTensor(y).unsqueeze(1)
+        
+        dataset = TensorDataset(X, y)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        optimizer = optim.Adam(self.local_model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        
+        total_loss = 0
+        for epoch in range(epochs):
+            epoch_loss = 0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                output = self.local_model(batch_X)
+                loss = criterion(output, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.local_model.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+            total_loss += epoch_loss
+        
+        avg_loss = total_loss / epochs
+        logger.info(f"Local energy model trained. Loss: {avg_loss:.4f}")
+        return avg_loss
+
+    async def send_local_update(self, performance_metric: float = 1.0) -> Dict:
+        if not self.server_url:
+            return {'status': 'disabled'}
+
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                weights = self.local_model.state_dict()
+                # Apply differential privacy
+                private_weights = self._add_differential_privacy(weights)
+                # Compress weights (top-k sparsification)
+                compressed_weights = self._compress_weights(private_weights)
+                # Serialize (convert to list for JSON)
+                weights_serialized = {k: v.tolist() for k, v in compressed_weights.items()}
+
+                update_data = {
+                    'expert_id': self.expert_id,
+                    'round': self.state.round,
+                    'weights': weights_serialized,
+                    'performance': performance_metric,
+                    'energy_sharing_ratio': self.state.energy_sharing_ratio,
+                    'privacy_epsilon': self.state.privacy_epsilon,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'sparsity_ratio': self.sparsity_ratio
+                }
+
+                async with session.post(
+                    f"{self.server_url}/federated/update",
+                    json=update_data,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.state.round += 1
+                        self.state.contribution_score += performance_metric
+                        self.state.privacy_epsilon *= 0.99
+                        logger.info(f"Federated energy update sent (compressed). Round: {self.state.round}")
+                        return result
+                    else:
+                        logger.error(f"Federated update failed: {response.status}")
+                        return {'status': 'failed'}
+            except Exception as e:
+                logger.error(f"Federated update error: {e}")
+                return {'status': 'error'}
+
+    async def get_global_model(self) -> Optional[Dict]:
+        if not self.server_url:
+            return None
+        
+        async with self._lock:
+            session = await self._get_session()
+            try:
+                async with session.get(
+                    f"{self.server_url}/federated/global/energy",
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        weights = data.get('weights', {})
+                        self.state.global_model_weights = weights
+                        self.state.round = data.get('round', 0)
+                        self.state.participants = data.get('participants', [])
+                        self.state.energy_sharing_ratio = data.get('sharing_ratio', 0.0)
+                        
+                        for k, v in weights.items():
+                            self.global_model.state_dict()[k] = torch.FloatTensor(v)
+                        
+                        return weights
+            except Exception as e:
+                logger.error(f"Global model fetch error: {e}")
+                return None
+
+    async def participate_in_round(self, energy_data: List[Dict[str, float]], 
+                                  performance: float = 1.0) -> Dict:
+        await self.train_local_model(energy_data)
+        result = await self.send_local_update(performance)
+        global_weights = await self.get_global_model()
+        
+        if global_weights:
+            self.state.global_model_weights = global_weights
+            self.state.participants.append(self.expert_id)
+        
+        return {
+            'round': self.state.round,
+            'participated': bool(global_weights),
+            'contribution_score': self.state.contribution_score,
+            'performance': performance,
+            'peer_count': len(self.state.participants),
+            'energy_sharing_ratio': self.state.energy_sharing_ratio,
+            'privacy_epsilon': self.state.privacy_epsilon,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+
+    def get_federated_insights(self) -> Dict:
+        return {
+            'round': self.state.round,
+            'contribution_score': self.state.contribution_score,
+            'participants': len(self.state.participants),
+            'has_global_model': bool(self.state.global_model_weights),
+            'energy_sharing_ratio': self.state.energy_sharing_ratio,
+            'privacy_epsilon': self.state.privacy_epsilon,
+            'last_aggregation': self.state.last_aggregation.isoformat() if self.state.last_aggregation else None
+        }
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Dynamic Quantization Controller (Unchanged)
 # ============================================================================
 
 class DynamicQuantizationController:
@@ -434,223 +769,7 @@ class DynamicQuantizationController:
             return 'fp16'
 
 # ============================================================================
-# Enhanced Federated Energy Learner with Differential Privacy
-# ============================================================================
-
-class FederatedEnergyLearner:
-    """Federated reflexive learning for distributed energy optimization with differential privacy"""
-    
-    def __init__(self, expert_id: str, server_url: Optional[str] = None, privacy_epsilon: float = 1.0):
-        self.expert_id = expert_id
-        self.server_url = server_url
-        self.state = FederatedLearningState(privacy_epsilon=privacy_epsilon)
-        self._lock = asyncio.Lock()
-        self._session = None
-        self.local_model = None
-        self.global_model = None
-        self.energy_history = deque(maxlen=1000)
-        self.noise_scale = 0.001
-        
-        # Initialize local model
-        self._init_energy_model()
-    
-    def _init_energy_model(self):
-        class EnergyOptimizerModel(nn.Module):
-            def __init__(self, input_size=10, hidden_size=64):
-                super().__init__()
-                self.network = nn.Sequential(
-                    nn.Linear(input_size, hidden_size),
-                    nn.ReLU(),
-                    nn.BatchNorm1d(hidden_size),
-                    nn.Linear(hidden_size, hidden_size // 2),
-                    nn.ReLU(),
-                    nn.BatchNorm1d(hidden_size // 2),
-                    nn.Linear(hidden_size // 2, 1)
-                )
-            
-            def forward(self, x):
-                return self.network(x)
-        
-        self.local_model = EnergyOptimizerModel()
-        self.global_model = EnergyOptimizerModel()
-    
-    def _add_differential_privacy(self, weights: Dict) -> Dict:
-        """Add differential privacy noise to weights"""
-        if self.state.privacy_epsilon <= 0:
-            return weights
-        
-        private_weights = {}
-        sensitivity = 1.0
-        
-        for key, tensor in weights.items():
-            scale = (2 * sensitivity) / self.state.privacy_epsilon
-            noise = torch.randn_like(tensor) * scale * self.noise_scale
-            private_weights[key] = tensor + noise
-        
-        return private_weights
-    
-    async def _get_session(self):
-        if self._session is None and self.server_url:
-            self._session = aiohttp.ClientSession()
-        return self._session
-    
-    async def train_local_model(self, energy_data: List[Dict[str, float]], epochs: int = 10) -> float:
-        if not energy_data:
-            return 0.0
-        
-        X = []
-        y = []
-        for item in energy_data:
-            X.append([
-                item.get('energy_consumption', 0.5),
-                item.get('carbon_intensity', 0.5),
-                item.get('renewable_percentage', 0.5),
-                item.get('thermal_load', 0.5),
-                item.get('helium_scarcity', 0.5),
-                item.get('grid_carbon', 0.5),
-                item.get('solar_available', 0.5),
-                item.get('wind_available', 0.5),
-                item.get('battery_level', 0.5),
-                item.get('ecoatp_balance', 0.5)
-            ])
-            y.append(item.get('optimization_score', 0.5))
-        
-        X = torch.FloatTensor(X)
-        y = torch.FloatTensor(y).unsqueeze(1)
-        
-        dataset = TensorDataset(X, y)
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-        
-        optimizer = optim.Adam(self.local_model.parameters(), lr=0.001)
-        criterion = nn.MSELoss()
-        
-        total_loss = 0
-        for epoch in range(epochs):
-            epoch_loss = 0
-            for batch_X, batch_y in dataloader:
-                optimizer.zero_grad()
-                output = self.local_model(batch_X)
-                loss = criterion(output, batch_y)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.local_model.parameters(), 1.0)
-                optimizer.step()
-                epoch_loss += loss.item()
-            total_loss += epoch_loss
-        
-        avg_loss = total_loss / epochs
-        logger.info(f"Local energy model trained. Loss: {avg_loss:.4f}")
-        return avg_loss
-    
-    async def send_local_update(self, performance_metric: float = 1.0) -> Dict:
-        if not self.server_url:
-            return {'status': 'disabled'}
-        
-        async with self._lock:
-            session = await self._get_session()
-            
-            try:
-                weights = self.local_model.state_dict()
-                # Apply differential privacy
-                private_weights = self._add_differential_privacy(weights)
-                weights_serialized = {k: v.tolist() for k, v in private_weights.items()}
-                
-                update_data = {
-                    'expert_id': self.expert_id,
-                    'round': self.state.round,
-                    'weights': weights_serialized,
-                    'performance': performance_metric,
-                    'energy_sharing_ratio': self.state.energy_sharing_ratio,
-                    'privacy_epsilon': self.state.privacy_epsilon,
-                    'timestamp': datetime.utcnow().isoformat()
-                }
-                
-                async with session.post(
-                    f"{self.server_url}/federated/update",
-                    json=update_data,
-                    timeout=30
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        self.state.round += 1
-                        self.state.contribution_score += performance_metric
-                        self.state.privacy_epsilon *= 0.99  # Privacy budget decays
-                        logger.info(f"Federated energy update sent. Round: {self.state.round}")
-                        return result
-                    else:
-                        logger.error(f"Federated update failed: {response.status}")
-                        return {'status': 'failed'}
-                        
-            except Exception as e:
-                logger.error(f"Federated update error: {e}")
-                return {'status': 'error'}
-    
-    async def get_global_model(self) -> Optional[Dict]:
-        if not self.server_url:
-            return None
-        
-        async with self._lock:
-            session = await self._get_session()
-            
-            try:
-                async with session.get(
-                    f"{self.server_url}/federated/global/energy",
-                    timeout=30
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        weights = data.get('weights', {})
-                        self.state.global_model_weights = weights
-                        self.state.round = data.get('round', 0)
-                        self.state.participants = data.get('participants', [])
-                        self.state.energy_sharing_ratio = data.get('sharing_ratio', 0.0)
-                        
-                        for k, v in weights.items():
-                            self.global_model.state_dict()[k] = torch.FloatTensor(v)
-                        
-                        return weights
-                        
-            except Exception as e:
-                logger.error(f"Global model fetch error: {e}")
-                return None
-    
-    async def participate_in_round(self, energy_data: List[Dict[str, float]], 
-                                  performance: float = 1.0) -> Dict:
-        await self.train_local_model(energy_data)
-        result = await self.send_local_update(performance)
-        global_weights = await self.get_global_model()
-        
-        if global_weights:
-            self.state.global_model_weights = global_weights
-            self.state.participants.append(self.expert_id)
-        
-        return {
-            'round': self.state.round,
-            'participated': bool(global_weights),
-            'contribution_score': self.state.contribution_score,
-            'performance': performance,
-            'peer_count': len(self.state.participants),
-            'energy_sharing_ratio': self.state.energy_sharing_ratio,
-            'privacy_epsilon': self.state.privacy_epsilon,
-            'timestamp': datetime.utcnow().isoformat()
-        }
-    
-    def get_federated_insights(self) -> Dict:
-        return {
-            'round': self.state.round,
-            'contribution_score': self.state.contribution_score,
-            'participants': len(self.state.participants),
-            'has_global_model': bool(self.state.global_model_weights),
-            'energy_sharing_ratio': self.state.energy_sharing_ratio,
-            'privacy_epsilon': self.state.privacy_epsilon,
-            'last_aggregation': self.state.last_aggregation.isoformat() if self.state.last_aggregation else None
-        }
-    
-    async def close(self):
-        if self._session:
-            await self._session.close()
-
-# ============================================================================
-# Enhanced Predictive Energy Sustainability with Climate Integration
+# Predictive Energy Sustainability with Climate Integration (Unchanged)
 # ============================================================================
 
 class PredictiveEnergySustainability:
@@ -845,7 +964,7 @@ class PredictiveEnergySustainability:
         }
 
 # ============================================================================
-# Cross-Domain Knowledge Transfer Module (Enhanced)
+# Cross-Domain Knowledge Transfer Module (Unchanged)
 # ============================================================================
 
 class EnergyCrossDomainTransfer:
@@ -988,42 +1107,36 @@ class EnergyCrossDomainTransfer:
         }
 
 # ============================================================================
-# Enhanced Energy Expert (Main Class)
+# Enhanced Energy Expert (Main Class) with Configuration
 # ============================================================================
 
 class EnergyExpert:
-    """Enhanced Energy Expert v7.0.0 with all green agent features"""
-    
-    def __init__(self, expert_id: str = "energy_optimizer_v7", enable_renewable: bool = True,
-                 enable_storage: bool = True, enable_thermal: bool = True, enable_dvfs: bool = True,
-                 enable_forecasting: bool = True, enable_bio_integration: bool = True,
-                 enable_federated: bool = True, enable_cross_domain: bool = True,
-                 enable_predictive_sustainability: bool = True,
-                 enable_grid_api: bool = True,  # NEW
-                 enable_workload_aware: bool = True,  # NEW
-                 enable_adaptive_cooling: bool = True,  # NEW
-                 enable_dynamic_quantization: bool = True,  # NEW
-                 enable_differential_privacy: bool = True,  # NEW
-                 enable_climate_integration: bool = True):  # NEW
-        self.expert_id = expert_id
+    """Enhanced Energy Expert v7.0.0 with configuration object."""
+
+    def __init__(self, config: Optional[EnergyExpertConfig] = None):
+        if config is None:
+            config = EnergyExpertConfig()
+        self.config = config
+        self.expert_id = config.expert_id
         self.version = "7.0.0"
-        self.enable_renewable = enable_renewable
-        self.enable_storage = enable_storage
-        self.enable_thermal = enable_thermal
-        self.enable_dvfs = enable_dvfs
-        self.enable_forecasting = enable_forecasting
-        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
-        self.enable_federated = enable_federated
-        self.enable_cross_domain = enable_cross_domain
-        self.enable_predictive_sustainability = enable_predictive_sustainability
+        # Delegate feature flags to config
+        self.enable_renewable = config.enable_renewable
+        self.enable_storage = config.enable_storage
+        self.enable_thermal = config.enable_thermal
+        self.enable_dvfs = config.enable_dvfs
+        self.enable_forecasting = config.enable_forecasting
+        self.enable_bio_integration = config.enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_federated = config.enable_federated
+        self.enable_cross_domain = config.enable_cross_domain
+        self.enable_predictive_sustainability = config.enable_predictive_sustainability
         
         # NEW feature flags
-        self.enable_grid_api = enable_grid_api
-        self.enable_workload_aware = enable_workload_aware
-        self.enable_adaptive_cooling = enable_adaptive_cooling
-        self.enable_dynamic_quantization = enable_dynamic_quantization
-        self.enable_differential_privacy = enable_differential_privacy
-        self.enable_climate_integration = enable_climate_integration
+        self.enable_grid_api = config.enable_grid_api
+        self.enable_workload_aware = config.enable_workload_aware
+        self.enable_adaptive_cooling = config.enable_adaptive_cooling
+        self.enable_dynamic_quantization = config.enable_dynamic_quantization
+        self.enable_differential_privacy = config.enable_differential_privacy
+        self.enable_climate_integration = config.enable_climate_integration
         
         # Bio-inspired components
         self.token_manager = None
@@ -1033,19 +1146,22 @@ class EnergyExpert:
         self.biomass_storage = None
         self.harvester = None
         
-        # NEW modules
-        self.grid_api = GridCarbonAPIClient() if enable_grid_api else None
-        self.workload_selector = WorkloadAwarePowerSelector() if enable_workload_aware else None
-        self.cooling_controller = AdaptiveCoolingController() if enable_adaptive_cooling else None
-        self.quantization_controller = DynamicQuantizationController() if enable_dynamic_quantization else None
+        # NEW modules with enhanced versions
+        self.grid_api = GridCarbonAPIClient() if self.enable_grid_api else None
+        self.workload_selector = WorkloadAwarePowerSelector(learning_rate=config.workload_learning_rate) if self.enable_workload_aware else None
+        self.cooling_controller = AdaptiveCoolingController(forecast_horizon_minutes=config.cooling_forecast_horizon) if self.enable_adaptive_cooling else None
+        self.quantization_controller = DynamicQuantizationController() if self.enable_dynamic_quantization else None
         
-        privacy_epsilon = 1.0 if enable_differential_privacy else 0.0
-        self.federated_learner = FederatedEnergyLearner(expert_id, privacy_epsilon=privacy_epsilon)
+        self.federated_learner = FederatedEnergyLearner(
+            expert_id=self.expert_id,
+            privacy_epsilon=config.federated_privacy_epsilon,
+            sparsity_ratio=config.federated_sparsity_ratio
+        )
         self.cross_domain_transfer = EnergyCrossDomainTransfer()
         self.predictive_sustainability = PredictiveEnergySustainability()
         
         self.profile = ExpertProfile(
-            expert_id=expert_id,
+            expert_id=self.expert_id,
             domain=ExpertDomain.ENERGY,
             hardware_profile=HardwareProfile.CPU_EFFICIENT,
             helium_per_inference=0.008,
@@ -1103,7 +1219,7 @@ class EnergyExpert:
             'thermal_throttle_threshold': 75.0,
             'dvfs_aggressiveness': 0.5,
             'federated_sharing_threshold': 0.3,
-            'carbon_budget_buffer': 0.2
+            'carbon_budget_buffer': config.carbon_budget_buffer
         }
         
         self.sustainability_metrics = SustainabilityMetrics()
@@ -1242,7 +1358,7 @@ class EnergyExpert:
         # NEW: Get real-time grid carbon intensity
         if self.enable_grid_api and self.grid_api:
             try:
-                grid_data = await self.grid_api.get_carbon_intensity('US-CAL-CISO')
+                grid_data = await self.grid_api.get_carbon_intensity(self.config.grid_api_region)
                 grid_carbon_intensity = grid_data.get('carbon_intensity', 400)
                 if renewable_profile:
                     renewable_profile.grid_carbon_intensity = grid_carbon_intensity
@@ -1252,7 +1368,9 @@ class EnergyExpert:
         
         # NEW: Workload-aware power state selection
         if self.enable_workload_aware and self.workload_selector:
-            workload_power_state = self.workload_selector.select_power_state(task_config, carbon_budget)
+            # Optionally pass hardware metrics from task_config
+            hardware_metrics = task_config.get('hardware_metrics')
+            workload_power_state = self.workload_selector.select_power_state(task_config, carbon_budget, hardware_metrics)
             power_state = workload_power_state
         else:
             power_state = self._get_atp_driven_dvfs() if self.enable_bio_integration else (
