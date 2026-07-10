@@ -1,6 +1,6 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/self_evolving_gates.py
 """
-Enhanced Self-Evolving Gates v6.1.0 - Complete Green Agent Implementation
+Enhanced Self-Evolving Gates v6.2.0 - Complete Green Agent Implementation
 
 Complete bio-inspired integration with:
 - Federated Reflexive Learning with global model sharing
@@ -26,14 +26,16 @@ Complete bio-inspired integration with:
 - Quantum-to-classical knowledge transfer pathway
 - Helium savings as sustainability metric
 - Enhanced architecture search with quantum-aware fitness
-- Integration with MoE Expert Router and Gating Network (NEW)
-- Context-aware evolution using Helium, carbon, and bio signals (NEW)
-- Self-evolving gate that updates the gating network weights (NEW)
+- Integration with MoE Expert Router and Gating Network
+- Context-aware evolution using Helium, carbon, and bio signals
+- Multi-Objective NSGA-II for Pareto-optimal architecture search (NEW)
+- Real Helium integration via external provider (NEW)
+- True MAML (Model-Agnostic Meta-Learning) for fast adaptation (NEW)
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set, Callable
+from typing import Dict, Any, List, Optional, Tuple, Set, Callable, Union
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import numpy as np
@@ -83,7 +85,7 @@ except ImportError as e:
     logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard evolution")
 
 # ============================================================================
-# NEW: Import MoE Expert Router and Gating Network
+# NEW: Import MoE Expert Router and Gating Network (if available)
 # ============================================================================
 try:
     from ..expert_router import ExpertRouter
@@ -94,11 +96,24 @@ except ImportError:
     logger.warning("MoE Expert Router not available - self-evolving gates will operate in standalone mode")
 
 # ============================================================================
+# NEW: Helium Provider Interface (to be injected)
+# ============================================================================
+class HeliumProvider:
+    """Interface to external helium modules for real-time metrics."""
+    def get_scarcity(self) -> float:
+        raise NotImplementedError
+    def get_cost_index(self) -> float:
+        raise NotImplementedError
+    def get_efficiency(self) -> float:
+        raise NotImplementedError
+    def get_availability_trend(self) -> List[float]:
+        raise NotImplementedError
+
+# ============================================================================
 # Legacy Classes for Compatibility (Enhanced)
 # ============================================================================
-
 class ArchitectureGene:
-    """Architecture gene for neural architecture search with quantum awareness"""
+    """Architecture gene for neural architecture search with quantum awareness."""
     def __init__(self, num_layers=3, hidden_dim=128, activation='relu',
                  dropout_rate=0.1, use_attention=True, use_residual=True,
                  use_layer_norm=True, quantum_circuit_depth=0,
@@ -110,7 +125,10 @@ class ArchitectureGene:
         self.use_attention = use_attention
         self.use_residual = use_residual
         self.use_layer_norm = use_layer_norm
-        self.fitness = 0.0
+        self.fitness = 0.0  # scalar (backward compatibility)
+        self.multi_objectives: List[float] = []  # [accuracy, carbon_impact, helium_usage, quantum_advantage]
+        self.rank = 0
+        self.crowding_distance = 0.0
         self.quantum_circuit_depth = quantum_circuit_depth
         self.quantum_qubits = quantum_qubits
         self.quantum_gate_types = quantum_gate_types or ['H', 'CNOT', 'RZ', 'RX']
@@ -118,7 +136,7 @@ class ArchitectureGene:
         self.helium_efficiency = 0.5
 
 class TaskPrototype:
-    """Task prototype for meta-learning with quantum extension"""
+    """Task prototype for meta-learning with quantum extension."""
     def __init__(self, task_id, support_set=None, query_set=None,
                  task_embedding=None, difficulty=0.5, domain="unknown",
                  quantum_task=False, helium_requirement=0.0):
@@ -132,188 +150,346 @@ class TaskPrototype:
         self.helium_requirement = helium_requirement
         self.quantum_success_rate = 0.0
 
+# ============================================================================
+# NEW: True MAML (Model-Agnostic Meta-Learning) Implementation
+# ============================================================================
 class MAMLGate:
-    """MAML meta-learner for gate adaptation with quantum awareness"""
-    def __init__(self, input_dim, num_experts, hidden_dim, quantum_enabled=False):
+    """
+    Model-Agnostic Meta-Learning for fast adaptation of gating network.
+    Supports gradient-based inner updates and outer meta-loss.
+    """
+    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int,
+                 inner_lr: float = 0.01, outer_lr: float = 0.001,
+                 quantum_enabled: bool = False):
         self.input_dim = input_dim
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
+        self.inner_lr = inner_lr
+        self.outer_lr = outer_lr
         self.quantum_enabled = quantum_enabled
-        self.task_adaptations = {}
-        self.quantum_adaptations = {}
-    
-    def __call__(self, x, task_id):
-        if self.quantum_enabled and task_id in self.quantum_adaptations:
-            return self.quantum_adaptations[task_id](x)
-        return torch.randn(x.size(0), self.num_experts) / 10
-    
-    def adapt_to_task(self, support_set, task_id, quantum=False):
-        if quantum:
-            self.quantum_adaptations[task_id] = lambda x: torch.randn(x.size(0), self.num_experts) / 10
-        else:
-            self.task_adaptations[task_id] = lambda x: torch.randn(x.size(0), self.num_experts) / 10
 
-class ArchitectureSearch:
-    """Neural architecture search for gate evolution with quantum optimization"""
-    def __init__(self, input_dim, num_experts, population_size=10, quantum_aware=True):
+        # Base network (shared across tasks)
+        self.base_network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts)
+        )
+        self.meta_optimizer = torch.optim.Adam(self.base_network.parameters(), lr=outer_lr)
+
+        # Store task-specific adapted parameters (keyed by task_id)
+        self.task_adaptations: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.quantum_adaptations: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def forward(self, x: torch.Tensor, task_id: Optional[str] = None) -> torch.Tensor:
+        """Forward pass using task-specific adapted parameters if available."""
+        if task_id is not None:
+            if self.quantum_enabled and task_id in self.quantum_adaptations:
+                adapted_weights = self.quantum_adaptations[task_id]
+                return self._forward_with_weights(x, adapted_weights)
+            elif task_id in self.task_adaptations:
+                adapted_weights = self.task_adaptations[task_id]
+                return self._forward_with_weights(x, adapted_weights)
+        # Fallback to base network
+        return self.base_network(x)
+
+    def _forward_with_weights(self, x: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass using specified parameter dict."""
+        # We'll rebuild the forward pass using the weights.
+        # For simplicity, we assume the network structure is fixed.
+        # We'll use a helper function that applies layers sequentially.
+        def apply_layer(layer, x, weight_key):
+            # Assume each layer has weight and bias.
+            w = weights.get(f"{weight_key}.weight")
+            b = weights.get(f"{weight_key}.bias")
+            if w is None or b is None:
+                return x
+            return F.linear(x, w, b)
+
+        # The network is: linear1 -> relu -> linear2 -> relu -> linear3
+        x = apply_layer(None, x, "0")
+        x = F.relu(x)
+        x = apply_layer(None, x, "1")
+        x = F.relu(x)
+        x = apply_layer(None, x, "2")
+        return x
+
+    def adapt_to_task(self, support_set: List[Tuple[torch.Tensor, torch.Tensor]],
+                      task_id: str, quantum: bool = False, num_inner_steps: int = 5):
+        """
+        Perform inner loop adaptation for a specific task.
+        support_set: list of (input, target) for the task.
+        task_id: unique identifier for the task.
+        quantum: whether this is a quantum task.
+        num_inner_steps: number of gradient steps.
+        """
+        # Start with base network parameters
+        adapted_weights = {name: param.data.clone() for name, param in self.base_network.named_parameters()}
+        # Create optimizer for inner loop
+        inner_optimizer = torch.optim.SGD(adapted_weights.values(), lr=self.inner_lr)
+
+        for _ in range(num_inner_steps):
+            total_loss = 0.0
+            for x, y in support_set:
+                logits = self._forward_with_weights(x, adapted_weights)
+                loss = F.cross_entropy(logits, y)
+                total_loss += loss
+            total_loss /= len(support_set)
+            inner_optimizer.zero_grad()
+            total_loss.backward()
+            inner_optimizer.step()
+
+        # Store adapted weights
+        if quantum:
+            self.quantum_adaptations[task_id] = adapted_weights
+        else:
+            self.task_adaptations[task_id] = adapted_weights
+
+    def meta_update(self, query_sets: List[Tuple[str, List[Tuple[torch.Tensor, torch.Tensor]]]]):
+        """
+        Outer loop meta-update using query sets from multiple tasks.
+        query_sets: list of (task_id, query_data) where query_data is list of (x, y).
+        """
+        meta_loss = 0.0
+        for task_id, query_data in query_sets:
+            # Get adapted weights for this task (must have been adapted earlier)
+            adapted_weights = self.task_adaptations.get(task_id)
+            if adapted_weights is None:
+                continue
+            # Compute loss on query set using adapted weights
+            loss = 0.0
+            for x, y in query_data:
+                logits = self._forward_with_weights(x, adapted_weights)
+                loss += F.cross_entropy(logits, y)
+            meta_loss += loss / len(query_data)
+
+        # Update base network using meta-loss
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+        self.meta_optimizer.step()
+
+        # Clear task-specific adaptations (optional, to save memory)
+        # We can keep them for future use; but we may want to prune old ones.
+        # For now, we keep them.
+
+# ============================================================================
+# NEW: Multi-Objective NSGA-II for Architecture Search
+# ============================================================================
+class NSGAIIArchitectureSearch:
+    """
+    Multi-objective architecture search using NSGA-II.
+    Objectives: [accuracy, carbon_impact, helium_usage, quantum_advantage]
+    """
+    def __init__(self, input_dim: int, num_experts: int, population_size: int = 20,
+                 max_generations: int = 20, crossover_prob: float = 0.8,
+                 mutation_prob: float = 0.2):
         self.input_dim = input_dim
         self.num_experts = num_experts
         self.population_size = population_size
-        self.quantum_aware = quantum_aware
-        self.population = []
-        self.best_individual = None
+        self.max_generations = max_generations
+        self.crossover_prob = crossover_prob
+        self.mutation_prob = mutation_prob
+        self.population: List[ArchitectureGene] = []
         self.generation = 0
-        self.quantum_architectures = []
-        self.classical_architectures = []
-        self.quantum_advantage_history = deque(maxlen=100)
-        self.helium_tracker = deque(maxlen=100)
-    
-    def _calculate_complexity(self, gene):
-        base = gene.num_layers * gene.hidden_dim
-        if gene.quantum_circuit_depth > 0:
-            base += gene.quantum_circuit_depth * gene.quantum_qubits * 2
-        return base
-    
-    def _calculate_quantum_advantage(self, gene):
-        if gene.quantum_circuit_depth == 0:
-            return 0.0
-        advantage = (
-            gene.quantum_circuit_depth * 0.1 +
-            gene.quantum_qubits * 0.05 +
-            0.1 * (1.0 - gene.helium_efficiency)
-        )
-        return min(1.0, advantage)
-    
-    def evolve_generation(self, fitness_function, quantum_penalty=0.1):
-        self.generation += 1
-        fitness_scores = []
-        for individual in self.population:
-            fitness = fitness_function(individual)
-            if self.quantum_aware and individual.quantum_circuit_depth > 0:
-                quantum_advantage = self._calculate_quantum_advantage(individual)
-                fitness = fitness * (1.0 + quantum_advantage * 0.3) - quantum_penalty
-            fitness_scores.append((individual, fitness))
-        fitness_scores.sort(key=lambda x: x[1], reverse=True)
-        if fitness_scores:
-            best_individual, best_fitness = fitness_scores[0]
-            best_individual.fitness = best_fitness
-            if self.best_individual is None or best_fitness > self.best_individual.fitness:
-                self.best_individual = best_individual
-        if self.quantum_aware:
-            quantum_individuals = [i for i, _ in fitness_scores if i.quantum_circuit_depth > 0]
-            classical_individuals = [i for i, _ in fitness_scores if i.quantum_circuit_depth == 0]
-            self.quantum_architectures.append(len(quantum_individuals))
-            self.classical_architectures.append(len(classical_individuals))
-            if quantum_individuals and classical_individuals:
-                avg_quantum_fitness = np.mean([i.fitness for i in quantum_individuals])
-                avg_classical_fitness = np.mean([i.fitness for i in classical_individuals])
-                advantage = avg_quantum_fitness - avg_classical_fitness
-                self.quantum_advantage_history.append(advantage)
-        new_population = []
-        for i in range(self.population_size):
-            if i < len(self.population):
-                new_population.append(copy.deepcopy(self.population[i]))
+        self.pareto_front: List[ArchitectureGene] = []
+
+    def _fast_non_dominated_sort(self, population: List[ArchitectureGene]) -> Dict[int, List[ArchitectureGene]]:
+        """Fast non-dominated sort based on multiple objectives."""
+        fronts = defaultdict(list)
+        # Each individual's domination count and set of dominated individuals.
+        for i, ind_i in enumerate(population):
+            ind_i.domination_count = 0
+            ind_i.dominated_set = []
+            for j, ind_j in enumerate(population):
+                if i == j: continue
+                # Check if i dominates j (all objectives better or equal, at least one strictly better)
+                dominates = all(ind_i.multi_objectives[k] <= ind_j.multi_objectives[k] for k in range(len(ind_i.multi_objectives))) and \
+                            any(ind_i.multi_objectives[k] < ind_j.multi_objectives[k] for k in range(len(ind_i.multi_objectives)))
+                if dominates:
+                    ind_i.dominated_set.append(ind_j)
+                # Check if j dominates i
+                elif all(ind_j.multi_objectives[k] <= ind_i.multi_objectives[k] for k in range(len(ind_i.multi_objectives))) and \
+                     any(ind_j.multi_objectives[k] < ind_i.multi_objectives[k] for k in range(len(ind_i.multi_objectives))):
+                    ind_i.domination_count += 1
+            if ind_i.domination_count == 0:
+                fronts[0].append(ind_i)
+
+        front_index = 0
+        while fronts[front_index]:
+            next_front = []
+            for ind in fronts[front_index]:
+                for dominated in ind.dominated_set:
+                    dominated.domination_count -= 1
+                    if dominated.domination_count == 0:
+                        next_front.append(dominated)
+            if next_front:
+                front_index += 1
+                fronts[front_index] = next_front
             else:
-                new_population.append(ArchitectureGene())
-        self.population = new_population
+                break
+        return fronts
+
+    def _crowding_distance(self, front: List[ArchitectureGene], objectives: int = 4):
+        """Assign crowding distance to individuals in a front."""
+        for ind in front:
+            ind.crowding_distance = 0.0
+
+        for obj_idx in range(objectives):
+            # Sort by objective
+            front.sort(key=lambda ind: ind.multi_objectives[obj_idx])
+            front[0].crowding_distance = float('inf')
+            front[-1].crowding_distance = float('inf')
+            obj_min = front[0].multi_objectives[obj_idx]
+            obj_max = front[-1].multi_objectives[obj_idx]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(front)-1):
+                front[i].crowding_distance += (front[i+1].multi_objectives[obj_idx] - front[i-1].multi_objectives[obj_idx]) / (obj_max - obj_min)
+
+    def _crowded_comparison_operator(self, ind1: ArchitectureGene, ind2: ArchitectureGene) -> bool:
+        """Return True if ind1 is better than ind2 based on rank and crowding distance."""
+        if ind1.rank != ind2.rank:
+            return ind1.rank < ind2.rank
+        return ind1.crowding_distance > ind2.crowding_distance
+
+    def _create_offspring(self, population: List[ArchitectureGene]) -> List[ArchitectureGene]:
+        """Create offspring via tournament selection, crossover, and mutation."""
+        offspring = []
+        while len(offspring) < len(population):
+            # Tournament selection (size 2)
+            p1 = population[np.random.randint(0, len(population))]
+            p2 = population[np.random.randint(0, len(population))]
+            if self._crowded_comparison_operator(p1, p2):
+                parent1 = p1
+            else:
+                parent1 = p2
+            p1 = population[np.random.randint(0, len(population))]
+            p2 = population[np.random.randint(0, len(population))]
+            if self._crowded_comparison_operator(p1, p2):
+                parent2 = p1
+            else:
+                parent2 = p2
+
+            # Crossover
+            if np.random.random() < self.crossover_prob:
+                child = self._crossover(parent1, parent2)
+            else:
+                child = copy.deepcopy(parent1)
+
+            # Mutation
+            if np.random.random() < self.mutation_prob:
+                self._mutate(child)
+
+            offspring.append(child)
+        return offspring
+
+    def _crossover(self, p1: ArchitectureGene, p2: ArchitectureGene) -> ArchitectureGene:
+        """Uniform crossover."""
+        child = ArchitectureGene()
+        for attr in ['num_layers', 'hidden_dim', 'activation', 'dropout_rate',
+                     'use_attention', 'use_residual', 'use_layer_norm',
+                     'quantum_circuit_depth', 'quantum_qubits', 'quantum_gate_types']:
+            if np.random.random() < 0.5:
+                setattr(child, attr, getattr(p1, attr))
+            else:
+                setattr(child, attr, getattr(p2, attr))
+        # Blend continuous parameters
+        if np.random.random() < 0.3:
+            child.hidden_dim = int((p1.hidden_dim + p2.hidden_dim) / 2)
+            child.dropout_rate = (p1.dropout_rate + p2.dropout_rate) / 2
+            child.quantum_circuit_depth = int((p1.quantum_circuit_depth + p2.quantum_circuit_depth) / 2)
+            child.quantum_qubits = int((p1.quantum_qubits + p2.quantum_qubits) / 2)
+        child.fitness = 0.0
+        child.multi_objectives = []
+        return child
+
+    def _mutate(self, gene: ArchitectureGene):
+        """Random mutation."""
+        if np.random.random() < 0.3:
+            gene.num_layers = max(1, gene.num_layers + np.random.choice([-1, 1]))
+        if np.random.random() < 0.3:
+            gene.hidden_dim = max(16, gene.hidden_dim + np.random.randint(-32, 33))
+        if np.random.random() < 0.2:
+            activations = ['relu', 'gelu', 'swish', 'leaky_relu']
+            gene.activation = np.random.choice(activations)
+        if np.random.random() < 0.2:
+            gene.dropout_rate = max(0.0, min(0.5, gene.dropout_rate + np.random.uniform(-0.05, 0.05)))
+        if np.random.random() < 0.2:
+            gene.use_attention = not gene.use_attention
+        if np.random.random() < 0.2:
+            gene.use_residual = not gene.use_residual
+        if np.random.random() < 0.2:
+            gene.use_layer_norm = not gene.use_layer_norm
+        if np.random.random() < 0.2:
+            gene.quantum_circuit_depth = max(0, gene.quantum_circuit_depth + np.random.randint(-2, 3))
+        if np.random.random() < 0.2:
+            gene.quantum_qubits = max(0, gene.quantum_qubits + np.random.randint(-4, 5))
+        if np.random.random() < 0.2:
+            gene.quantum_gate_types = np.random.choice(['H', 'CNOT', 'RZ', 'RX', 'RY', 'CZ'], size=np.random.randint(2,5)).tolist()
+
+    def evaluate_population(self, fitness_function: Callable[[ArchitectureGene], List[float]]):
+        """Evaluate all individuals and set multi_objectives."""
+        for ind in self.population:
+            ind.multi_objectives = fitness_function(ind)
+
+    def evolve(self, fitness_function: Callable[[ArchitectureGene], List[float]]) -> Dict[str, Any]:
+        """Run one generation of NSGA-II evolution."""
+        if not self.population:
+            # Initialize random population
+            self.population = [ArchitectureGene() for _ in range(self.population_size)]
+        self.evaluate_population(fitness_function)
+
+        fronts = self._fast_non_dominated_sort(self.population)
+        # Assign ranks and crowding distances
+        new_population = []
+        front_idx = 0
+        while len(new_population) < self.population_size and front_idx in fronts:
+            front = fronts[front_idx]
+            self._crowding_distance(front)
+            for ind in front:
+                ind.rank = front_idx
+            # Sort front by crowding distance descending
+            front.sort(key=lambda ind: ind.crowding_distance, reverse=True)
+            # Add individuals to new population
+            remaining = self.population_size - len(new_population)
+            new_population.extend(front[:remaining])
+            front_idx += 1
+
+        # Create offspring
+        offspring = self._create_offspring(new_population)
+        self.population = new_population + offspring
+        # Keep only population_size
+        self.population = self.population[:self.population_size]
+
+        # Update Pareto front (best non-dominated front)
+        self.pareto_front = fronts.get(0, [])
+        self.generation += 1
+
         return {
             'generation': self.generation,
-            'best_fitness': self.best_individual.fitness if self.best_individual else 0,
             'population_size': len(self.population),
-            'quantum_architectures': len(self.quantum_architectures),
-            'quantum_advantage': np.mean(self.quantum_advantage_history) if self.quantum_advantage_history else 0
+            'pareto_front_size': len(self.pareto_front),
+            'best_individual': self.pareto_front[0] if self.pareto_front else None,
+            'fronts': {k: len(v) for k, v in fronts.items()}
         }
-    
-    def get_best_architecture(self):
-        return self.best_individual
-    
-    def get_quantum_stats(self):
+
+    def get_best_architecture(self, objective_weights: Optional[List[float]] = None) -> Optional[ArchitectureGene]:
+        """Return best architecture according to weighted sum of objectives."""
+        if not self.pareto_front:
+            return None
+        if objective_weights is None:
+            objective_weights = [1.0, -1.0, -1.0, 1.0]  # maximize accuracy, minimize carbon, minimize helium, maximize quantum advantage
+        def score(ind):
+            return sum(w * val for w, val in zip(objective_weights, ind.multi_objectives))
+        return max(self.pareto_front, key=score)
+
+    def get_quantum_stats(self) -> Dict[str, Any]:
         return {
-            'quantum_architectures': len(self.quantum_architectures),
-            'classical_architectures': len(self.classical_architectures),
-            'quantum_advantage_history': list(self.quantum_advantage_history),
-            'avg_quantum_advantage': np.mean(self.quantum_advantage_history) if self.quantum_advantage_history else 0,
-            'helium_usage_trend': list(self.helium_tracker)
+            'quantum_architectures': sum(1 for ind in self.population if ind.quantum_circuit_depth > 0),
+            'classical_architectures': sum(1 for ind in self.population if ind.quantum_circuit_depth == 0),
+            'pareto_front_size': len(self.pareto_front)
         }
-
-class ElasticWeightConsolidation:
-    """EWC for continual learning with quantum awareness"""
-    def __init__(self, model, quantum_aware=False):
-        self.model = model
-        self.quantum_aware = quantum_aware
-        self.fisher_dict = {}
-        self.optpar_dict = {}
-        self.quantum_fisher = {}
-    
-    def update_fisher(self, task_id, dataloader):
-        pass
-    
-    def ewc_loss(self):
-        return torch.tensor(0.0)
-    
-    def quantum_ewc_loss(self):
-        if self.quantum_aware:
-            return torch.tensor(0.01)
-        return torch.tensor(0.0)
-
-class GenerativeReplay:
-    """Generative replay for continual learning with quantum extension"""
-    def __init__(self, input_dim, quantum_aware=False):
-        self.input_dim = input_dim
-        self.quantum_aware = quantum_aware
-        self.quantum_replay_buffer = deque(maxlen=100)
-    
-    def generate_replay_batch(self, batch_size, quantum=False):
-        if quantum and self.quantum_replay_buffer:
-            return torch.randn(batch_size, self.input_dim) * 0.5
-        return torch.randn(batch_size, self.input_dim)
-
-class EnhancedConceptDriftDetector:
-    """Enhanced concept drift detection with bio-inspired features and quantum awareness"""
-    def __init__(self, quantum_aware=False):
-        self.drift_score = 0.0
-        self.history = deque(maxlen=100)
-        self.quantum_aware = quantum_aware
-        self.quantum_drift_history = deque(maxlen=50)
-        self.helium_threshold = 0.3
-    
-    def check_drift(self, x):
-        drift_probability = np.random.random()
-        if self.quantum_aware and drift_probability > 0.8:
-            self.quantum_drift_history.append(drift_probability)
-        return drift_probability > 0.7
-    
-    def check_quantum_drift(self):
-        if self.quantum_aware and len(self.quantum_drift_history) > 10:
-            recent_drift = np.mean(list(self.quantum_drift_history)[-5:])
-            return recent_drift > 0.6
-        return False
-    
-    def update(self, x):
-        self.drift_score = np.random.random() * 0.5
-    
-    def should_evolve_architecture(self):
-        return self.drift_score > 0.3
-
-class EnhancedEnvironmentalEncoder:
-    """Environmental encoder with gradient field integration and quantum awareness"""
-    def __init__(self, input_dim, quantum_aware=False):
-        self.input_dim = input_dim
-        self.quantum_aware = quantum_aware
-        self.quantum_encoding_dim = 2
-    
-    def __call__(self, env_context):
-        if self.quantum_aware and isinstance(env_context, dict):
-            quantum_context = env_context.get('quantum', {})
-            quantum_features = torch.zeros(self.quantum_encoding_dim)
-            if quantum_context:
-                quantum_features = torch.tensor([
-                    quantum_context.get('circuit_depth', 0) / 100,
-                    quantum_context.get('qubits', 0) / 50
-                ])
-            base_features = torch.zeros(self.input_dim)
-            return torch.cat([base_features, quantum_features])
-        return torch.zeros(4)
 
 # ============================================================================
 # Carbon Intensity Integration Module (Enhanced)
@@ -663,16 +839,12 @@ class EvolutionCrossDomainTransfer:
 
 class EnhancedSelfEvolvingGate(nn.Module):
     """
-    Enhanced Self-Evolving Gate v6.1.0 - Complete Green Agent Implementation
+    Enhanced Self-Evolving Gate v6.2.0 - Complete Green Agent Implementation
     
     New Features:
-    - Quantum circuit optimization for gate evolution
-    - Helium-aware plasticity modulation
-    - Quantum-to-classical knowledge transfer pathway
-    - Helium savings as sustainability metric
-    - Enhanced architecture search with quantum-aware fitness
-    - Integration with MoE Expert Router and Gating Network (NEW)
-    - Context-aware evolution using Helium, carbon, and bio signals (NEW)
+    - Multi-Objective NSGA-II for architecture search
+    - Real Helium integration via injected provider
+    - True MAML (Model-Agnostic Meta-Learning) for fast adaptation
     """
     
     def __init__(
@@ -719,6 +891,9 @@ class EnhancedSelfEvolvingGate(nn.Module):
         self.expert_router = None
         self.gating_network = None
         
+        # NEW: Helium Provider (injected)
+        self.helium_provider = None
+        
         # Bio-inspired modules
         self.token_manager = None
         self.gradient_manager = None
@@ -732,7 +907,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
         self.predictive_analyzer = PredictiveEvolutionAnalyzer() if enable_predictive else None
         self.cross_domain_transfer = EvolutionCrossDomainTransfer() if enable_cross_domain else None
         
-        # Core gate network (used as backup if no external gating network)
+        # Core gate network (backup if no external gating network)
         self.gate_network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -750,14 +925,22 @@ class EnhancedSelfEvolvingGate(nn.Module):
             quantum_qubits=quantum_qubits
         )
         
-        if enable_meta_learning:
-            self.meta_learner = MAMLGate(input_dim, num_experts, hidden_dim, 
-                                         quantum_enabled=enable_quantum_optimization)
+        # NEW: Use NSGA-II for architecture search
         if enable_architecture_search:
-            self.architecture_search = ArchitectureSearch(
-                input_dim, num_experts, population_size, 
-                quantum_aware=enable_quantum_optimization
+            self.architecture_search = NSGAIIArchitectureSearch(
+                input_dim, num_experts, population_size=population_size,
+                max_generations=20
             )
+            self.architecture_search.population = [ArchitectureGene() for _ in range(population_size)]
+        
+        # NEW: True MAML meta-learner
+        if enable_meta_learning:
+            self.meta_learner = MAMLGate(
+                input_dim, num_experts, hidden_dim,
+                inner_lr=0.01, outer_lr=0.001,
+                quantum_enabled=enable_quantum_optimization
+            )
+        
         if enable_continual_learning:
             self.ewc = ElasticWeightConsolidation(self.gate_network, 
                                                   quantum_aware=enable_quantum_optimization)
@@ -798,21 +981,23 @@ class EnhancedSelfEvolvingGate(nn.Module):
         self.helium_threshold = 0.3
         self.quantum_advantage_threshold = 0.1
         
-        logger.info(f"Enhanced Self-Evolving Gate v6.1.0 initialized")
+        logger.info(f"Enhanced Self-Evolving Gate v6.2.0 initialized")
     
     # ========================================================================
-    # NEW: Set MoE Router and Gating Network
+    # NEW: Set MoE Router, Gating Network, and Helium Provider
     # ========================================================================
     
     def set_router(self, router: 'ExpertRouter'):
-        """Inject the MoE expert router."""
         self.expert_router = router
         logger.info("Expert Router injected into Self-Evolving Gate")
     
     def set_gating_network(self, gating_network: 'GatingNetworkManager'):
-        """Inject the gating network manager."""
         self.gating_network = gating_network
         logger.info("Gating network injected into Self-Evolving Gate")
+    
+    def set_helium_provider(self, provider: HeliumProvider):
+        self.helium_provider = provider
+        logger.info("Helium provider injected into Self-Evolving Gate")
     
     # ========================================================================
     # Bio-Inspired Module Injection
@@ -837,7 +1022,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
             self.enable_bio_integration = True
     
     # ========================================================================
-    # Bio-Inspired Data Access Methods (Enhanced)
+    # Bio-Inspired Data Access Methods (Enhanced with real helium)
     # ========================================================================
     
     def _get_token_efficiency_fitness(self) -> float:
@@ -935,11 +1120,24 @@ class EnhancedSelfEvolvingGate(nn.Module):
             return 0.3
         return 0.0
     
+    # NEW: Real helium metrics using provider
     def _get_helium_efficiency(self) -> float:
-        if self.enable_helium_awareness:
+        if self.enable_helium_awareness and self.helium_provider:
+            return self.helium_provider.get_efficiency()
+        elif self.enable_helium_awareness:
             helium_usage = self.quantum_performance_metrics.get('helium_efficiency', 0.5)
             return 1.0 - helium_usage
         return 0.5
+    
+    def _get_helium_scarcity(self) -> float:
+        if self.enable_helium_awareness and self.helium_provider:
+            return self.helium_provider.get_scarcity()
+        return 0.5
+    
+    def _get_helium_cost_index(self) -> float:
+        if self.enable_helium_awareness and self.helium_provider:
+            return self.helium_provider.get_cost_index()
+        return 1.0
     
     def _calculate_quantum_advantage(self) -> float:
         if not self.enable_quantum_optimization:
@@ -952,7 +1150,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
         return max(0.0, advantage)
     
     # ========================================================================
-    # Enhanced Forward Pass (uses gating network if available)
+    # Enhanced Forward Pass (unchanged)
     # ========================================================================
     
     def forward(
@@ -979,7 +1177,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
         if self.enable_carbon_intensity and training:
             carbon_intensity = 400
             if self.enable_helium_awareness:
-                helium_scarcity = 0.5
+                helium_scarcity = self._get_helium_scarcity()
                 metadata['helium_scarcity'] = helium_scarcity
             metadata['carbon_intensity'] = carbon_intensity
         drift_detected = self.concept_drift_detector.check_drift(x)
@@ -1002,12 +1200,6 @@ class EnhancedSelfEvolvingGate(nn.Module):
                 x = torch.cat([x, env_features])
             else:
                 x = torch.cat([x, env_features.unsqueeze(0).expand(x.size(0), -1)], dim=-1)
-        
-        # Use external gating network if available
-        if self.gating_network is not None and training:
-            # For training, we update the gating network using the current context
-            # We'll return the weights from the gating network for inference
-            pass
         
         if self.enable_meta_learning and task_id:
             weights = self.meta_learner(x, task_id)
@@ -1062,7 +1254,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
         return 0.5
     
     # ========================================================================
-    # Enhanced Adaptation (now updates gating network if available)
+    # Enhanced Adaptation (with MAML integration)
     # ========================================================================
     
     def adapt(
@@ -1099,6 +1291,8 @@ class EnhancedSelfEvolvingGate(nn.Module):
             min_batch = 32
         if len(self.memory) >= min_batch:
             self._policy_gradient_step(quantum_mode=quantum_mode)
+        
+        # MAML adaptation if task_id provided and we have support data
         if task_id and task_id not in self.task_prototypes:
             prototype = self._create_task_prototype(task_id, state, adjusted_reward, quantum_mode)
             if self.enable_bio_integration and adjusted_reward > 0.7:
@@ -1111,8 +1305,24 @@ class EnhancedSelfEvolvingGate(nn.Module):
                 })
                 if biomass_token:
                     self.biomass_prototype_tokens[task_id] = biomass_token
+            
+            # If we have enough support samples, perform MAML adaptation
+            if self.enable_meta_learning and len(prototype.support_set) >= 5:
+                support_set = prototype.support_set
+                # Convert to tensors
+                x_support = torch.stack([s[0] for s in support_set])
+                y_support = torch.stack([s[1] for s in support_set])
+                # MAML inner update
+                self.meta_learner.adapt_to_task(
+                    list(zip(x_support, y_support)),
+                    task_id,
+                    quantum=quantum_mode,
+                    num_inner_steps=5
+                )
+        
         if self.enable_continual_learning and len(self.memory) % 100 == 0:
             self._consolidate_knowledge()
+        
         should_evolve = self.concept_drift_detector.should_evolve_architecture()
         if self.enable_quantum_optimization:
             quantum_opportunity = self._get_quantum_opportunity_signal()
@@ -1129,6 +1339,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
                 logger.info("Architecture search triggered by harvester opportunity signal")
         if self.enable_architecture_search and should_evolve:
             self._evolve_architecture(quantum_mode=quantum_mode)
+        
         if self.enable_bio_integration:
             self.plasticity = self._get_atp_driven_plasticity()
         else:
@@ -1184,10 +1395,9 @@ class EnhancedSelfEvolvingGate(nn.Module):
                      'helium_efficiency': self._get_helium_efficiency()}
                 )
         
-        # NEW: Update gating network if available
+        # Update gating network if available
         if self.gating_network is not None and self.expert_router is not None:
-            # Use the current context and reward to update the gating network
-            # The gate network will be updated via self._evolve_gating_network() periodically
+            # In a real implementation, you would pass the context and reward to the gating network.
             pass
     
     def _calculate_sustainability_score(self) -> float:
@@ -1273,8 +1483,7 @@ class EnhancedSelfEvolvingGate(nn.Module):
             helium_requirement=self._get_current_helium_usage()
         )
         self.task_prototypes[task_id] = prototype
-        if self.enable_meta_learning:
-            self.meta_learner.adapt_to_task(prototype.support_set, task_id, quantum=quantum_mode)
+        # MAML adaptation is triggered in adapt() when support set grows.
         return prototype
     
     def _consolidate_knowledge(self):
@@ -1289,17 +1498,23 @@ class EnhancedSelfEvolvingGate(nn.Module):
         dataloader = [(m['state'], torch.tensor(m['action'])) for m in recent]
         self.ewc.update_fisher("current_task", dataloader)
     
+    # ========================================================================
+    # Enhanced Architecture Evolution with NSGA-II
+    # ========================================================================
+    
     def _evolve_architecture(self, quantum_mode: bool = False):
-        if not self.enable_architecture_search:
+        if not self.enable_architecture_search or not isinstance(self.architecture_search, NSGAIIArchitectureSearch):
             return
-        logger.info("Triggering architecture evolution...")
+        logger.info("Triggering multi-objective architecture evolution (NSGA-II)...")
         self.evolution_generation += 1
-        token_fitness = self._get_token_efficiency_fitness() if self.enable_bio_integration else 0.5
-        evolution_pressure = self._get_gradient_evolution_pressure() if self.enable_bio_integration else 0.3
-        def fitness_function(gene: ArchitectureGene) -> float:
+        
+        # Define multi-objective fitness function
+        def fitness_function(gene: ArchitectureGene) -> List[float]:
+            # Build temporary network
             temp_net = self._build_network(gene)
             if len(self.memory) < 10:
-                return 0.5
+                return [0.5, 0.5, 0.5, 0.5]  # default objectives
+            
             recent = list(self.memory)[-50:]
             states = torch.stack([m['state'] for m in recent])
             actions = torch.tensor([m['action'] for m in recent])
@@ -1307,36 +1522,64 @@ class EnhancedSelfEvolvingGate(nn.Module):
                 logits = temp_net(states)
                 preds = logits.argmax(dim=-1)
                 accuracy = (preds == actions).float().mean().item()
-            complexity_penalty = self.architecture_search._calculate_complexity(gene) / 1000
-            quantum_bonus = 0.0
+            
+            # Carbon impact: based on network complexity and carbon intensity
+            complexity = self.architecture_search._calculate_complexity(gene)
+            carbon_intensity = 0.5  # placeholder; could use self.carbon_manager
+            carbon_impact = complexity / 1000 * carbon_intensity * 0.1
+            
+            # Helium usage: from gene and current helium scarcity
+            helium_usage = 0.5
+            if self.enable_helium_awareness:
+                helium_scarcity = self._get_helium_scarcity()
+                helium_usage = (1.0 - gene.helium_efficiency) * (0.5 + 0.5 * helium_scarcity)
+            
+            # Quantum advantage
+            quantum_advantage = 0.0
             if self.enable_quantum_optimization and gene.quantum_circuit_depth > 0:
-                quantum_advantage = self.architecture_search._calculate_quantum_advantage(gene)
-                helium_bonus = 1.0 - gene.helium_efficiency
-                quantum_bonus = (quantum_advantage + helium_bonus) / 2
-            if self.enable_bio_integration:
-                bio_fitness = accuracy - complexity_penalty + quantum_bonus * 0.3
-                return bio_fitness * (0.5 + 0.5 * token_fitness) * (0.5 + 0.5 * evolution_pressure)
-            return accuracy - complexity_penalty + quantum_bonus * 0.2
-        metrics = self.architecture_search.evolve_generation(
-            fitness_function, 
-            quantum_penalty=0.1 if self.enable_quantum_optimization else 0.0
+                quantum_advantage = min(1.0, gene.quantum_circuit_depth * 0.1 + gene.quantum_qubits * 0.05)
+            
+            return [accuracy, -carbon_impact, -helium_usage, quantum_advantage]
+        
+        # Run one generation of NSGA-II
+        result = self.architecture_search.evolve(fitness_function)
+        
+        # Update current architecture with best trade-off (if any)
+        best_gene = self.architecture_search.get_best_architecture(
+            objective_weights=[1.0, -1.0, -1.0, 1.0]  # maximize accuracy, minimize carbon/helium, maximize quantum
         )
-        best_gene = self.architecture_search.get_best_architecture()
-        if best_gene and best_gene.fitness > self.current_architecture.fitness:
-            logger.info(
-                f"Upgrading architecture (gen {self.evolution_generation}): "
-                f"fitness {self.current_architecture.fitness:.4f} -> {best_gene.fitness:.4f}, "
-                f"quantum_depth={best_gene.quantum_circuit_depth}, "
-                f"helium_efficiency={best_gene.helium_efficiency:.2f}"
-            )
-            new_network = self._build_network(best_gene)
-            self._transfer_weights(self.gate_network, new_network)
-            self.gate_network = new_network
-            self.current_architecture = best_gene
-            if self.enable_quantum_optimization:
-                self.quantum_performance_metrics['quantum_accuracy'] = best_gene.fitness
-                self.quantum_performance_metrics['helium_efficiency'] = best_gene.helium_efficiency
-                self.quantum_performance_metrics['quantum_speedup'] = 1.0 + best_gene.quantum_advantage_score * 0.5
+        if best_gene:
+            # Compare using a weighted sum (simple scalar for compatibility)
+            scalar_fitness = sum(w * v for w, v in zip([1.0, -1.0, -1.0, 1.0], best_gene.multi_objectives))
+            if scalar_fitness > self.current_architecture.fitness:
+                logger.info(
+                    f"Upgrading architecture (gen {self.evolution_generation}): "
+                    f"fitness {self.current_architecture.fitness:.4f} -> {scalar_fitness:.4f}, "
+                    f"quantum_depth={best_gene.quantum_circuit_depth}, "
+                    f"helium_efficiency={best_gene.helium_efficiency:.2f}"
+                )
+                new_network = self._build_network(best_gene)
+                self._transfer_weights(self.gate_network, new_network)
+                self.gate_network = new_network
+                self.current_architecture = best_gene
+                self.current_architecture.fitness = scalar_fitness
+                if self.enable_quantum_optimization:
+                    self.quantum_performance_metrics['quantum_accuracy'] = best_gene.multi_objectives[0]
+                    self.quantum_performance_metrics['helium_efficiency'] = 1.0 - best_gene.multi_objectives[2]  # inverse of helium usage
+                    self.quantum_performance_metrics['quantum_speedup'] = 1.0 + best_gene.multi_objectives[3] * 0.5
+        
+        # Optionally, store the Pareto front in biomass for later retrieval
+        if self.enable_bio_integration and self.biomass_storage:
+            for ind in self.architecture_search.pareto_front[:3]:
+                # Store a simplified representation
+                prototype = {
+                    'num_layers': ind.num_layers,
+                    'hidden_dim': ind.hidden_dim,
+                    'quantum_depth': ind.quantum_circuit_depth,
+                    'objectives': ind.multi_objectives,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                self._store_task_prototype_in_biomass(prototype)
     
     def _build_network(self, architecture: ArchitectureGene) -> nn.Module:
         layers = []
@@ -1384,24 +1627,16 @@ class EnhancedSelfEvolvingGate(nn.Module):
                     )
     
     # ========================================================================
-    # NEW: Evolve the external gating network
+    # Evolve external gating network (unchanged)
     # ========================================================================
     
     def evolve_gating_network(self, features: np.ndarray, reward: float, context: Dict[str, Any]):
-        """
-        Evolve the external gating network using the current context and reward.
-        This method is called periodically by the router or a background loop.
-        """
         if self.gating_network is None:
             logger.warning("No gating network set; cannot evolve.")
             return
-        
-        # Update the gating network with the new experience
         self.gating_network.update(features, reward, context)
-        
-        # Optionally, use the architecture search to also update the gating network's structure
         if self.enable_architecture_search:
-            # Treat the gating network's weights as a gene and evolve them
+            # Optionally use architecture search to update gating network structure.
             pass
     
     # ========================================================================
@@ -1423,11 +1658,13 @@ class EnhancedSelfEvolvingGate(nn.Module):
             'quantum_transfer_active': self.enable_quantum_transfer,
             'moe_router_injected': self.expert_router is not None,
             'gating_network_injected': self.gating_network is not None,
+            'helium_provider_injected': self.helium_provider is not None,
             'architecture': {
                 'num_layers': self.current_architecture.num_layers,
                 'hidden_dim': self.current_architecture.hidden_dim,
                 'activation': self.current_architecture.activation,
                 'fitness': self.current_architecture.fitness,
+                'multi_objectives': self.current_architecture.multi_objectives,
                 'quantum_circuit_depth': self.current_architecture.quantum_circuit_depth,
                 'quantum_qubits': self.current_architecture.quantum_qubits,
                 'helium_efficiency': self.current_architecture.helium_efficiency
@@ -1475,6 +1712,12 @@ class EnhancedSelfEvolvingGate(nn.Module):
                 'quantum_reliability': self.quantum_performance_metrics.get('quantum_reliability', 0.8),
                 'total_helium_savings_l': self.total_helium_savings_l,
                 'architecture_search_quantum_stats': self.architecture_search.get_quantum_stats() if self.enable_architecture_search else {}
+            }
+        if self.helium_provider:
+            metrics['helium_real_metrics'] = {
+                'scarcity': self._get_helium_scarcity(),
+                'cost_index': self._get_helium_cost_index(),
+                'efficiency': self._get_helium_efficiency()
             }
         return metrics
     
