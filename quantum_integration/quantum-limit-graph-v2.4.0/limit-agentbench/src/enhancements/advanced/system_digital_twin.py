@@ -1,26 +1,29 @@
-# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/advanced/system_digital_twin.py
 """
-System-Wide Digital Twin for Green Agent v2.0.0
+System-Wide Digital Twin for Green Agent v2.1.0
 Simulates the entire agent network, expert interactions, and material flows
 to forecast long-term sustainability implications.
 
 Enhanced Features:
-- Interdependent Scenarios (policy + technology adoption) (NEW)
-- Correlated Uncertainty Between Resources (NEW)
-- Resource Substitution Modeling (NEW)
-- Weighted Scoring Based on User Priorities (NEW)
-- Cost-Benefit Analysis for Recommendations (NEW)
-
-Integrates with:
-- quantum_limit_integration.py for quantum resource modeling
-- biodiversity_impact.py for ecological impact simulations
-- expert_registry.py for expert population dynamics
-- circular_computing.py for hardware lifecycle modeling
+- Interdependent Scenarios (policy + technology adoption)
+- Correlated Uncertainty Between Resources
+- Resource Substitution Modeling
+- Weighted Scoring Based on User Priorities
+- Cost-Benefit Analysis for Recommendations
+- Configuration dataclass for centralized tuning
+- Resilience with retry and circuit breaker
+- Persistence for state across restarts
+- Telemetry export for monitoring
+- Health status reporting
+- Scenario parameter validation
+- Enhanced parallel simulation with asyncio.gather
+- Dynamic substitution models
+- Configurable correlation matrix
+- Predictive model integration stubs
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union, Callable, Protocol
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -28,26 +31,16 @@ import numpy as np
 from collections import deque, defaultdict
 import hashlib
 import json
-from scipy.stats import multivariate_normal  # For correlated uncertainty
+import os
+import pickle
+import zlib
+from scipy.stats import multivariate_normal
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Enums and Data Classes (Enhanced)
+# Configuration Dataclass (Enhanced)
 # ============================================================================
-
-class SimulationScenario(Enum):
-    """Types of simulation scenarios"""
-    POLICY_CHANGE = "policy_change"
-    MARKET_SHOCK = "market_shock"
-    RESOURCE_DEPLETION = "resource_depletion"
-    TECHNOLOGY_ADOPTION = "technology_adoption"
-    REGULATORY_CHANGE = "regulatory_change"
-    CLIMATE_EVENT = "climate_event"
-    # NEW: Interdependent scenarios
-    POLICY_AND_TECHNOLOGY = "policy_and_technology"
-    MARKET_AND_REGULATORY = "market_and_regulatory"
-    RESOURCE_AND_CLIMATE = "resource_and_climate"
 
 @dataclass
 class DigitalTwinConfig:
@@ -62,7 +55,8 @@ class DigitalTwinConfig:
     material_flow_tracking: bool = True
     carbon_pricing_scenario: str = "linear_increase"
     helium_depletion_model: str = "exponential"
-    # NEW: Enhanced configuration
+    
+    # Enhanced features
     correlated_uncertainty: bool = True
     resource_substitution_enabled: bool = True
     user_priorities: Dict[str, float] = field(default_factory=lambda: {
@@ -72,10 +66,62 @@ class DigitalTwinConfig:
         'circularity': 0.20,
         'biodiversity': 0.20
     })
+    
+    # Retry and circuit breaker
+    max_retries: int = 3
+    retry_base_delay_ms: float = 100.0
+    retry_max_delay_ms: float = 5000.0
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery_timeout: float = 30.0
+    
+    # Persistence
+    persistence_path: str = "digital_twin_state.pkl"
+    
+    # Telemetry
+    telemetry_export_interval: int = 60
+    
+    # Correlation matrix override (optional)
+    correlation_matrix_override: Optional[Dict[str, Dict[str, float]]] = None
+    
+    # Substitution model parameters
+    substitution_availability_default: Dict[str, float] = field(default_factory=lambda: {
+        'helium': 0.3,
+        'carbon': 0.5,
+        'energy': 0.6
+    })
+    substitution_cost_factor_default: Dict[str, float] = field(default_factory=lambda: {
+        'helium': 2.0,
+        'carbon': 1.5,
+        'energy': 1.3
+    })
+    substitution_timeline_default: Dict[str, float] = field(default_factory=lambda: {
+        'helium': 24.0,
+        'carbon': 12.0,
+        'energy': 18.0
+    })
+    substitution_ramp_start_step: int = 10
+    substitution_ramp_rate: float = 0.05
+
+# ============================================================================
+# Enums and Data Classes (Enhanced)
+# ============================================================================
+
+class SimulationScenario(Enum):
+    """Types of simulation scenarios"""
+    POLICY_CHANGE = "policy_change"
+    MARKET_SHOCK = "market_shock"
+    RESOURCE_DEPLETION = "resource_depletion"
+    TECHNOLOGY_ADOPTION = "technology_adoption"
+    REGULATORY_CHANGE = "regulatory_change"
+    CLIMATE_EVENT = "climate_event"
+    # Interdependent scenarios
+    POLICY_AND_TECHNOLOGY = "policy_and_technology"
+    MARKET_AND_REGULATORY = "market_and_regulatory"
+    RESOURCE_AND_CLIMATE = "resource_and_climate"
 
 @dataclass
-class SimulationResult:
-    """Result of a digital twin simulation"""
+class DigitalTwinResult:
+    """Result of a digital twin simulation (enhanced)"""
     scenario_id: str
     scenario_type: SimulationScenario
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -83,97 +129,293 @@ class SimulationResult:
     projections: Dict[str, List[float]] = field(default_factory=dict)
     confidence_intervals: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     risk_factors: List[str] = field(default_factory=list)
-    recommendations: List[Dict[str, Any]] = field(default_factory=list)  # Enhanced with cost-benefit
+    recommendations: List[Dict[str, Any]] = field(default_factory=list)
     sustainability_score: float = 0.0
-    # NEW: Enhanced fields
     interdependent_factors: List[str] = field(default_factory=list)
-    substitution_effects: Dict[str, float] = field(default_factory=dict)
+    substitution_effects: Dict[str, Dict] = field(default_factory=dict)
     weighted_score: float = 0.0
 
 @dataclass
 class ResourceProjection:
     """Projection for a specific resource with substitution modeling"""
-    resource_type: str  # helium, carbon, energy
+    resource_type: str
     current_level: float
-    projected_levels: List[float]  # Time series
+    projected_levels: List[float]
     depletion_year: Optional[int] = None
     confidence_lower: List[float] = field(default_factory=list)
     confidence_upper: List[float] = field(default_factory=list)
-    # NEW: Substitution modeling
     substitution_availability: float = 0.0
     substitution_cost_factor: float = 1.0
     substitution_timeline: Optional[List[float]] = None
     alternative_resources: List[str] = field(default_factory=list)
 
-@dataclass
-class RecommendationWithCostBenefit:
-    """Recommendation with cost-benefit analysis"""
-    action: str
-    description: str
-    estimated_cost: float  # In Eco-ATP units
-    estimated_benefit: float  # In sustainability score points
-    roi: float
-    time_horizon_months: int
-    risk_level: str  # low, medium, high
-    prerequisites: List[str] = field(default_factory=list)
-    confidence: float = 0.7
+# ============================================================================
+# Retry Helper (NEW)
+# ============================================================================
+
+async def retry_async(
+    func: Callable,
+    max_retries: int,
+    base_delay_ms: float,
+    max_delay_ms: float,
+    *args,
+    **kwargs
+) -> Any:
+    """Retry an async function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
+            await asyncio.sleep(delay)
+    raise RuntimeError("Max retries exceeded")
 
 # ============================================================================
-# ENHANCED SYSTEM DIGITAL TWIN
+# Persistence Manager (NEW)
+# ============================================================================
+
+class DigitalTwinPersistenceManager:
+    """Manages persistence of digital twin state."""
+
+    def __init__(self, config: DigitalTwinConfig):
+        self.config = config
+        self.path = config.persistence_path
+        self._lock = asyncio.Lock()
+        logger.info(f"DigitalTwinPersistenceManager initialized (path={self.path})")
+
+    async def save_state(self, twin: 'SystemDigitalTwin') -> bool:
+        async with self._lock:
+            try:
+                state = {
+                    'config': twin.config,
+                    'scenario_results': twin.scenario_results,
+                    'simulation_cache': {k: v for k, v in twin.simulation_cache.items()},
+                    'resource_projections': {k: v for k, v in twin.resource_projections.items()},
+                    'priority_weights': twin.priority_weights,
+                    'resource_correlation': twin.resource_correlation,
+                    'substitution_options': twin.substitution_options,
+                }
+                serialized = pickle.dumps(state)
+                compressed = zlib.compress(serialized)
+                with open(self.path, 'wb') as f:
+                    f.write(compressed)
+                logger.info(f"Digital twin state saved to {self.path}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save state: {e}")
+                return False
+
+    async def load_state(self, twin: 'SystemDigitalTwin') -> bool:
+        async with self._lock:
+            if not os.path.exists(self.path):
+                logger.warning(f"Persistence file {self.path} not found")
+                return False
+            try:
+                with open(self.path, 'rb') as f:
+                    compressed = f.read()
+                serialized = zlib.decompress(compressed)
+                state = pickle.loads(serialized)
+
+                twin.scenario_results = state.get('scenario_results', [])
+                twin.simulation_cache = state.get('simulation_cache', {})
+                twin.resource_projections = state.get('resource_projections', {})
+                twin.priority_weights = state.get('priority_weights', twin.config.user_priorities)
+                twin.resource_correlation = state.get('resource_correlation', twin._init_correlation_matrix())
+                twin.substitution_options = state.get('substitution_options', twin._init_substitution_options())
+
+                logger.info(f"Digital twin state loaded from {self.path}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to load state: {e}")
+                return False
+
+    async def delete_state(self):
+        async with self._lock:
+            if os.path.exists(self.path):
+                os.remove(self.path)
+                logger.info(f"Persistence file {self.path} deleted")
+                return True
+            return False
+
+# ============================================================================
+# Telemetry Collector (NEW)
+# ============================================================================
+
+class DigitalTwinTelemetry:
+    """Collects telemetry for the digital twin."""
+
+    def __init__(self):
+        self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
+        self._lock = asyncio.Lock()
+
+    def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None, value: float = 1.0):
+        key = self._make_key(metric_name, tags)
+        self.metrics['counters'][key] += value
+
+    def gauge(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
+        key = self._make_key(metric_name, tags)
+        self.metrics['gauges'][key] = value
+
+    def histogram(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
+        key = self._make_key(metric_name, tags)
+        if key not in self.metrics['histograms']:
+            self.metrics['histograms'][key] = []
+        self.metrics['histograms'][key].append(value)
+        if len(self.metrics['histograms'][key]) > 1000:
+            self.metrics['histograms'][key] = self.metrics['histograms'][key][-1000:]
+
+    def _make_key(self, metric_name: str, tags: Optional[Dict[str, str]]) -> str:
+        if tags:
+            tag_str = ','.join(f"{k}={v}" for k, v in sorted(tags.items()))
+            return f"{metric_name}{{{tag_str}}}"
+        return metric_name
+
+    async def export(self) -> str:
+        # Prometheus text format
+        output = []
+        for key, value in self.metrics['counters'].items():
+            output.append(f"# TYPE {key} counter\n{key} {value}")
+        for key, value in self.metrics['gauges'].items():
+            output.append(f"# TYPE {key} gauge\n{key} {value}")
+        for key, values in self.metrics['histograms'].items():
+            output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
+        return "\n".join(output)
+
+    def reset(self):
+        self.metrics.clear()
+        self.metrics['counters'] = defaultdict(int)
+        self.metrics['gauges'] = {}
+        self.metrics['histograms'] = defaultdict(list)
+
+# ============================================================================
+# Scenario Parameter Validator (NEW)
+# ============================================================================
+
+class ScenarioParameterValidator:
+    """Validates scenario parameters for each scenario type."""
+
+    REQUIRED_PARAMS = {
+        SimulationScenario.POLICY_CHANGE: {
+            'carbon_reduction_rate': (float, 0.0, 1.0),
+            'helium_conservation_rate': (float, 0.0, 1.0),
+        },
+        SimulationScenario.MARKET_SHOCK: {
+            'shock_size': (float, 0.0, 1.0),
+            'shock_duration': (int, 1, 10),
+        },
+        SimulationScenario.RESOURCE_DEPLETION: {
+            'carbon_depletion_rate': (float, 0.0, 1.0),
+            'helium_depletion_rate': (float, 0.0, 1.0),
+        },
+        SimulationScenario.TECHNOLOGY_ADOPTION: {
+            'adoption_rate': (float, 0.0, 1.0),
+            'carbon_efficiency_gain': (float, 0.0, 1.0),
+            'helium_efficiency_gain': (float, 0.0, 1.0),
+        },
+        SimulationScenario.REGULATORY_CHANGE: {
+            'carbon_tax_rate': (float, 0.0, 1.0),
+            'helium_quota_reduction': (float, 0.0, 1.0),
+        },
+        SimulationScenario.CLIMATE_EVENT: {
+            'event_impact': (float, 0.0, 1.0),
+            'event_duration': (int, 1, 10),
+            'recovery_rate': (float, 0.0, 1.0),
+        },
+        SimulationScenario.POLICY_AND_TECHNOLOGY: {
+            'carbon_reduction_rate': (float, 0.0, 1.0),
+            'adoption_rate': (float, 0.0, 1.0),
+            'carbon_efficiency_gain': (float, 0.0, 1.0),
+        },
+        SimulationScenario.MARKET_AND_REGULATORY: {
+            'shock_size': (float, 0.0, 1.0),
+            'shock_duration': (int, 1, 10),
+            'carbon_tax_rate': (float, 0.0, 1.0),
+            'helium_quota_reduction': (float, 0.0, 1.0),
+        },
+        SimulationScenario.RESOURCE_AND_CLIMATE: {
+            'carbon_depletion_rate': (float, 0.0, 1.0),
+            'helium_depletion_rate': (float, 0.0, 1.0),
+            'event_impact': (float, 0.0, 1.0),
+            'event_duration': (int, 1, 10),
+            'recovery_rate': (float, 0.0, 1.0),
+        },
+    }
+
+    @classmethod
+    def validate(cls, scenario_type: SimulationScenario, parameters: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """Validate parameters for a given scenario type."""
+        if scenario_type not in cls.REQUIRED_PARAMS:
+            return True, None  # No validation defined
+
+        required = cls.REQUIRED_PARAMS[scenario_type]
+        for param, (param_type, min_val, max_val) in required.items():
+            if param not in parameters:
+                return False, f"Missing required parameter: {param}"
+            value = parameters[param]
+            if not isinstance(value, param_type):
+                return False, f"Parameter {param} should be of type {param_type.__name__}"
+            if isinstance(value, (int, float)):
+                if value < min_val or value > max_val:
+                    return False, f"Parameter {param} out of range [{min_val}, {max_val}]"
+        return True, None
+
+# ============================================================================
+# System Digital Twin (Enhanced)
 # ============================================================================
 
 class SystemDigitalTwin:
     """
-    System-Wide Digital Twin v2.0.0 for Green Agent.
-    
-    Features:
-    - High-level simulation of the entire agent ecosystem
-    - Strategic "what-if" analysis for policies and events
-    - Long-term resource depletion forecasting
-    - Expert population dynamics simulation
-    - Material flow and circularity modeling
-    - Interdependent scenarios (NEW)
-    - Correlated uncertainty between resources (NEW)
-    - Resource substitution modeling (NEW)
-    - Weighted scoring based on user priorities (NEW)
-    - Cost-benefit analysis for recommendations (NEW)
+    System-Wide Digital Twin v2.1.0 for Green Agent.
     """
-    
+
     def __init__(self, config: Optional[DigitalTwinConfig] = None):
         self.config = config or DigitalTwinConfig()
-        self.scenario_results: List[SimulationResult] = []
-        self.simulation_cache: Dict[str, SimulationResult] = {}
+        self.scenario_results: List[DigitalTwinResult] = []
+        self.simulation_cache: Dict[str, DigitalTwinResult] = {}
         self._lock = asyncio.Lock()
-        
-        # Sub-modules (will be injected)
+
+        # Sub-modules (injected)
         self.quantum_limits = None
         self.biodiversity = None
         self.expert_registry = None
         self.circular_manager = None
         self.carbon_manager = None
         self.helium_tracker = None
-        
-        # Resource projections with substitution
+        self.predictive_analyzer = None  # Optional predictive model from other modules
+
+        # Resource projections
         self.resource_projections: Dict[str, ResourceProjection] = {}
-        self.substitution_options: Dict[str, List[str]] = {
-            'helium': ['hydrogen_cooling', 'nitrogen_cooling', 'cryogenic_alternative'],
-            'carbon': ['renewable_energy', 'carbon_offset', 'carbon_capture'],
-            'energy': ['solar', 'wind', 'geothermal', 'nuclear']
-        }
-        
+        self.substitution_options: Dict[str, List[str]] = self._init_substitution_options()
+
         # Simulation history
         self.simulation_history: deque = deque(maxlen=100)
-        
-        # NEW: Correlation matrix for resources
+
+        # Correlation matrix
         self.resource_correlation = self._init_correlation_matrix()
-        
-        # NEW: User priority weights
-        self.priority_weights = self.config.user_priorities
-        
-        logger.info("System Digital Twin v2.0.0 initialized")
-    
+
+        # User priority weights
+        self.priority_weights = self.config.user_priorities.copy()
+
+        # NEW: Persistence and telemetry
+        self.persistence = DigitalTwinPersistenceManager(self.config)
+        self.telemetry = DigitalTwinTelemetry()
+
+        # Circuit breaker state for external calls
+        self.failure_count = 0
+        self.circuit_open = False
+        self.circuit_open_until: Optional[datetime] = None
+
+        # Load state if persistence enabled
+        asyncio.create_task(self._load_state())
+
+        logger.info("System Digital Twin v2.1.0 initialized")
+
     def _init_correlation_matrix(self) -> Dict[str, Dict[str, float]]:
-        """Initialize correlation matrix between resources"""
+        """Initialize correlation matrix, possibly from config override."""
+        if self.config.correlation_matrix_override:
+            return self.config.correlation_matrix_override
         return {
             'carbon': {'carbon': 1.0, 'helium': 0.3, 'energy': 0.7, 'circularity': -0.4, 'biodiversity': -0.6},
             'helium': {'carbon': 0.3, 'helium': 1.0, 'energy': 0.5, 'circularity': -0.2, 'biodiversity': -0.3},
@@ -181,113 +423,155 @@ class SystemDigitalTwin:
             'circularity': {'carbon': -0.4, 'helium': -0.2, 'energy': -0.3, 'circularity': 1.0, 'biodiversity': 0.3},
             'biodiversity': {'carbon': -0.6, 'helium': -0.3, 'energy': -0.4, 'circularity': 0.3, 'biodiversity': 1.0}
         }
-    
+
+    def _init_substitution_options(self) -> Dict[str, List[str]]:
+        return {
+            'helium': ['hydrogen_cooling', 'nitrogen_cooling', 'cryogenic_alternative'],
+            'carbon': ['renewable_energy', 'carbon_offset', 'carbon_capture'],
+            'energy': ['solar', 'wind', 'geothermal', 'nuclear']
+        }
+
+    async def _load_state(self):
+        if self.persistence:
+            await self.persistence.load_state(self)
+
+    async def save_state(self):
+        if self.persistence:
+            await self.persistence.save_state(self)
+
+    async def delete_state(self):
+        if self.persistence:
+            await self.persistence.delete_state()
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Report health of the digital twin."""
+        return {
+            'status': 'healthy' if not self.circuit_open else 'degraded',
+            'score': min(1.0, (len(self.scenario_results) / 10) if self.scenario_results else 0.5),
+            'details': {
+                'modules_injected': {
+                    'quantum_limits': self.quantum_limits is not None,
+                    'biodiversity': self.biodiversity is not None,
+                    'expert_registry': self.expert_registry is not None,
+                    'circular_manager': self.circular_manager is not None,
+                    'carbon_manager': self.carbon_manager is not None,
+                    'helium_tracker': self.helium_tracker is not None,
+                    'predictive_analyzer': self.predictive_analyzer is not None,
+                },
+                'scenario_results': len(self.scenario_results),
+                'cached_scenarios': len(self.simulation_cache),
+                'persistence_enabled': self.persistence is not None,
+                'telemetry_active': True,
+                'circuit_open': self.circuit_open,
+            }
+        }
+
     # ========================================================================
     # Module Injection
     # ========================================================================
-    
+
     def inject_modules(self, **modules):
-        """Inject required system modules"""
+        """Inject required system modules."""
         for name, module in modules.items():
             setattr(self, name, module)
             logger.info(f"Injected module: {name}")
-    
+
     # ========================================================================
-    # Enhanced Core Simulation Methods
+    # Core Simulation Methods (Enhanced)
     # ========================================================================
-    
+
     async def run_scenario(
         self,
         scenario_type: SimulationScenario,
         parameters: Dict[str, Any],
         time_horizon_years: Optional[int] = None,
         n_simulations: Optional[int] = None
-    ) -> SimulationResult:
+    ) -> DigitalTwinResult:
         """
-        Run a simulation scenario on the digital twin with enhanced features.
-        
-        Args:
-            scenario_type: Type of scenario to simulate
-            parameters: Scenario-specific parameters
-            time_horizon_years: Override config time horizon
-            n_simulations: Override config simulation count
-            
-        Returns:
-            SimulationResult with projections and recommendations
+        Run a simulation scenario on the digital twin.
         """
+        # Validate parameters
+        valid, error = ScenarioParameterValidator.validate(scenario_type, parameters)
+        if not valid:
+            raise ValueError(f"Invalid scenario parameters: {error}")
+
         async with self._lock:
             scenario_id = self._generate_scenario_id(scenario_type, parameters)
-            
+
             if scenario_id in self.simulation_cache:
                 logger.info(f"Returning cached simulation for {scenario_id}")
                 return self.simulation_cache[scenario_id]
-            
+
             time_horizon = time_horizon_years or self.config.time_horizon_years
             n_sim = n_simulations or self.config.n_simulations
-            
+
             result = await self._run_simulation(
                 scenario_type, parameters, time_horizon, n_sim
             )
-            
+
             self.simulation_cache[scenario_id] = result
             self.scenario_results.append(result)
-            
+            self.simulation_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'scenario_id': scenario_id,
+                'type': scenario_type.value,
+                'sustainability_score': result.sustainability_score
+            })
+
+            # Telemetry
+            self.telemetry.increment('scenarios_run')
+            self.telemetry.gauge('sustainability_score', result.sustainability_score)
+            self.telemetry.gauge('weighted_score', result.weighted_score)
+
             logger.info(f"Completed scenario: {scenario_id}")
             return result
-    
+
     async def _run_simulation(
         self,
         scenario_type: SimulationScenario,
         parameters: Dict[str, Any],
         time_horizon_years: int,
         n_simulations: int
-    ) -> SimulationResult:
-        """Internal method to run the simulation with enhanced features"""
+    ) -> DigitalTwinResult:
         n_steps = int(time_horizon_years * 365 / self.config.time_step_days)
         timestamps = [
             datetime.now() + timedelta(days=i * self.config.time_step_days)
             for i in range(n_steps)
         ]
-        
-        # Initialize projections
-        projections = {
-            'carbon_emissions': [0.0] * n_steps,
-            'helium_depletion': [0.0] * n_steps,
-            'energy_consumption': [0.0] * n_steps,
-            'expert_population': [0.0] * n_steps,
-            'circularity_index': [0.0] * n_steps,
-            'biodiversity_impact': [0.0] * n_steps
-        }
-        
-        # Determine interdependent factors
-        interdependent_factors = self._get_interdependent_factors(scenario_type, parameters)
-        
-        # Run Monte Carlo simulations with correlated uncertainty
-        all_simulations = []
-        n_parallel = min(n_simulations, self.config.parallel_simulations)
-        
-        for sim_idx in range(n_parallel):
-            sim_result = await self._run_single_simulation_correlated(
-                scenario_type, parameters, timestamps, sim_idx, n_parallel
-            )
-            all_simulations.append(sim_result)
-        
+
+        # Run Monte Carlo simulations in parallel using asyncio.gather
+        tasks = []
+        for sim_idx in range(n_simulations):
+            tasks.append(self._run_single_simulation_correlated(
+                scenario_type, parameters, timestamps, sim_idx, n_simulations
+            ))
+        all_simulations = await asyncio.gather(*tasks)
+
         # Aggregate results
+        projections = {
+            'carbon_emissions': [],
+            'helium_depletion': [],
+            'energy_consumption': [],
+            'expert_population': [],
+            'circularity_index': [],
+            'biodiversity_impact': []
+        }
+
         for key in projections.keys():
             values = [sim[key] for sim in all_simulations]
             projections[key] = np.mean(values, axis=0).tolist()
-            
+
             if self.config.confidence_level < 1.0:
                 lower = np.percentile(values, (1 - self.config.confidence_level) / 2 * 100, axis=0)
                 upper = np.percentile(values, (1 + self.config.confidence_level) / 2 * 100, axis=0)
             else:
                 lower = [0.0] * len(projections[key])
                 upper = [0.0] * len(projections[key])
-            
-            # Store with substitution modeling
+
+            # Build resource projections
             substitution = self._get_substitution_effects(key)
             alternative_resources = self.substitution_options.get(key, [])
-            
+
             self.resource_projections[key] = ResourceProjection(
                 resource_type=key,
                 current_level=projections[key][0] if projections[key] else 0,
@@ -299,20 +583,26 @@ class SystemDigitalTwin:
                 substitution_cost_factor=substitution.get('cost_factor', 1.0),
                 alternative_resources=alternative_resources
             )
-        
-        # Calculate weighted sustainability score
+
+        # Calculate weighted and unweighted sustainability scores
         weighted_score = self._calculate_weighted_sustainability_score(projections)
         sustainability_score = self._calculate_sustainability_score(projections)
-        
+
         # Generate cost-benefit recommendations
         recommendations = self._generate_cost_benefit_recommendations(
             scenario_type, projections, parameters
         )
-        
+
         # Identify risk factors
         risk_factors = self._identify_risk_factors(projections)
-        
-        return SimulationResult(
+
+        # Interdependent factors
+        interdependent_factors = self._get_interdependent_factors(scenario_type, parameters)
+
+        # Substitution effects
+        substitution_effects = self._get_substitution_effects_all()
+
+        return DigitalTwinResult(
             scenario_id=self._generate_scenario_id(scenario_type, parameters),
             scenario_type=scenario_type,
             metrics={
@@ -333,10 +623,10 @@ class SystemDigitalTwin:
             recommendations=recommendations,
             sustainability_score=sustainability_score,
             interdependent_factors=interdependent_factors,
-            substitution_effects=self._get_substitution_effects_all(),
+            substitution_effects=substitution_effects,
             weighted_score=weighted_score
         )
-    
+
     async def _run_single_simulation_correlated(
         self,
         scenario_type: SimulationScenario,
@@ -345,21 +635,20 @@ class SystemDigitalTwin:
         sim_idx: int,
         total_sims: int
     ) -> Dict[str, List[float]]:
-        """Run a single simulation with correlated uncertainty"""
-        # Get current state
+        """Run a single simulation with correlated uncertainty."""
+        # Get current state with retry protection
         current_carbon = await self._get_current_carbon()
         current_helium = await self._get_current_helium()
         current_energy = await self._get_current_energy()
         current_experts = await self._get_current_expert_count()
         current_circularity = await self._get_current_circularity()
-        
+
         # Generate correlated noise
         if self.config.correlated_uncertainty:
-            # Create correlation matrix
             resources = ['carbon', 'helium', 'energy', 'circularity', 'biodiversity']
             mean = np.zeros(len(resources))
             cov_matrix = self._build_covariance_matrix(resources)
-            
+
             # Generate correlated noise
             noise_samples = multivariate_normal.rvs(mean, cov_matrix, size=len(timestamps))
             carbon_noise = noise_samples[:, 0]
@@ -374,42 +663,34 @@ class SystemDigitalTwin:
             energy_noise = np.random.normal(0, 0.01, len(timestamps))
             circularity_noise = np.random.normal(0, 0.01, len(timestamps))
             biodiversity_noise = np.random.normal(0, 0.01, len(timestamps))
-        
+
         carbon_emissions = []
         helium_depletion = []
         energy_consumption = []
         expert_population = []
         circularity_index = []
         biodiversity_impact = []
-        
+
         for i, timestamp in enumerate(timestamps):
             # Apply scenario effects with interdependence
             carbon_effect, helium_effect, energy_effect = self._apply_interdependent_scenario(
                 scenario_type, parameters, i
             )
-            
-            # Apply individual scenario effects if not interdependent
-            if scenario_type not in [SimulationScenario.POLICY_AND_TECHNOLOGY,
-                                     SimulationScenario.MARKET_AND_REGULATORY,
-                                     SimulationScenario.RESOURCE_AND_CLIMATE]:
-                carbon_effect = self._apply_scenario_effect(scenario_type, parameters, i, 'carbon')
-                helium_effect = self._apply_scenario_effect(scenario_type, parameters, i, 'helium')
-                energy_effect = self._apply_scenario_effect(scenario_type, parameters, i, 'energy')
-            
+
             # Apply substitution effects
             substitution_factor = 1.0
             if self.config.resource_substitution_enabled:
                 substitution_factor = self._apply_substitution_effects(i, parameters)
-            
+
             # Update state with correlated noise
             noise_factor_carbon = 1.0 + carbon_noise[i] * 0.1
             noise_factor_helium = 1.0 + helium_noise[i] * 0.1
             noise_factor_energy = 1.0 + energy_noise[i] * 0.05
-            
+
             carbon_val = current_carbon * carbon_effect * noise_factor_carbon * substitution_factor
             helium_val = current_helium * helium_effect * noise_factor_helium * substitution_factor
             energy_val = current_energy * energy_effect * noise_factor_energy * substitution_factor
-            
+
             carbon_emissions.append(carbon_val)
             helium_depletion.append(helium_val)
             energy_consumption.append(energy_val)
@@ -422,7 +703,7 @@ class SystemDigitalTwin:
             biodiversity_impact.append(
                 1.0 - (carbon_val / 1000) * 0.1 + biodiversity_noise[i] * 0.02
             )
-        
+
         return {
             'carbon_emissions': carbon_emissions,
             'helium_depletion': helium_depletion,
@@ -431,31 +712,29 @@ class SystemDigitalTwin:
             'circularity_index': circularity_index,
             'biodiversity_impact': biodiversity_impact
         }
-    
+
     def _build_covariance_matrix(self, resources: List[str]) -> np.ndarray:
-        """Build covariance matrix from correlation matrix"""
+        """Build covariance matrix from correlation matrix."""
         n = len(resources)
         corr_matrix = np.zeros((n, n))
-        
+
         for i, res_i in enumerate(resources):
             for j, res_j in enumerate(resources):
                 corr_matrix[i, j] = self.resource_correlation.get(res_i, {}).get(res_j, 0.0)
-        
+
         # Add small variance terms
         variances = [0.02, 0.02, 0.01, 0.01, 0.01]  # Standard deviations
         std_matrix = np.diag(variances[:n])
         cov_matrix = std_matrix @ corr_matrix @ std_matrix
-        
+
         return cov_matrix
-    
+
     # ========================================================================
-    # Enhanced Scenario Effect Functions
+    # Scenario Effect Functions (Enhanced)
     # ========================================================================
-    
+
     def _get_interdependent_factors(self, scenario_type: SimulationScenario, parameters: Dict) -> List[str]:
-        """Get interdependent factors for a scenario"""
         factors = []
-        
         if scenario_type == SimulationScenario.POLICY_AND_TECHNOLOGY:
             if 'carbon_reduction_rate' in parameters:
                 factors.append('carbon_policy')
@@ -463,7 +742,6 @@ class SystemDigitalTwin:
                 factors.append('technology_adoption')
             if 'carbon_efficiency_gain' in parameters:
                 factors.append('carbon_efficiency')
-        
         elif scenario_type == SimulationScenario.MARKET_AND_REGULATORY:
             if 'shock_size' in parameters:
                 factors.append('market_shock')
@@ -471,7 +749,6 @@ class SystemDigitalTwin:
                 factors.append('carbon_regulation')
             if 'helium_quota_reduction' in parameters:
                 factors.append('helium_regulation')
-        
         elif scenario_type == SimulationScenario.RESOURCE_AND_CLIMATE:
             if 'carbon_depletion_rate' in parameters:
                 factors.append('carbon_depletion')
@@ -479,64 +756,55 @@ class SystemDigitalTwin:
                 factors.append('helium_depletion')
             if 'event_impact' in parameters:
                 factors.append('climate_event')
-        
         return factors
-    
+
     def _apply_interdependent_scenario(
         self,
         scenario_type: SimulationScenario,
         parameters: Dict,
         step: int
     ) -> Tuple[float, float, float]:
-        """Apply interdependent scenario effects"""
+        """Apply interdependent scenario effects."""
         carbon_effect = 1.0
         helium_effect = 1.0
         energy_effect = 1.0
-        
+
         if scenario_type == SimulationScenario.POLICY_AND_TECHNOLOGY:
-            # Combined policy and technology effects
             carbon_reduction = parameters.get('carbon_reduction_rate', 0.05)
             adoption_rate = parameters.get('adoption_rate', 0.1)
             efficiency_gain = parameters.get('carbon_efficiency_gain', 0.3)
-            
-            # Interdependent effect: technology accelerates policy impact
+
             tech_factor = 1 - np.exp(-adoption_rate * step)
             carbon_effect = 1.0 - (carbon_reduction * (1 + tech_factor * 0.5)) * (step / 10)
             helium_effect = 1.0 - (carbon_reduction * 0.3 * (1 + tech_factor * 0.3)) * (step / 10)
             energy_effect = 1.0 - efficiency_gain * tech_factor * 0.5
-        
+
         elif scenario_type == SimulationScenario.MARKET_AND_REGULATORY:
-            # Combined market and regulatory effects
             shock_size = parameters.get('shock_size', 0.3)
             shock_duration = parameters.get('shock_duration', 5)
             tax_rate = parameters.get('carbon_tax_rate', 0.1)
             quota_reduction = parameters.get('helium_quota_reduction', 0.05)
-            
-            # Market shock affects carbon
+
             if step < shock_duration:
                 shock_factor = 1.0 + (1.0 - step / shock_duration) * shock_size
                 carbon_effect = shock_factor
                 helium_effect = shock_factor * 0.5
                 energy_effect = shock_factor * 0.3
-            
-            # Regulatory effect accumulates
+
             carbon_effect *= (1.0 + tax_rate * (step / 10))
             helium_effect *= (1.0 - quota_reduction * (step / 10))
             energy_effect *= (1.0 + tax_rate * 0.5 * (step / 10))
-        
+
         elif scenario_type == SimulationScenario.RESOURCE_AND_CLIMATE:
-            # Combined resource depletion and climate effects
             carbon_depletion = parameters.get('carbon_depletion_rate', 0.02)
             helium_depletion = parameters.get('helium_depletion_rate', 0.03)
             event_impact = parameters.get('event_impact', 0.2)
             event_duration = parameters.get('event_duration', 3)
             recovery_rate = parameters.get('recovery_rate', 0.1)
-            
-            # Resource depletion
+
             carbon_effect = 1.0 - carbon_depletion * step
             helium_effect = max(0.1, 1.0 - helium_depletion * step)
-            
-            # Climate event
+
             if step < event_duration:
                 carbon_effect *= (1.0 + event_impact)
                 helium_effect *= (1.0 + event_impact * 0.7)
@@ -546,221 +814,188 @@ class SystemDigitalTwin:
                 carbon_effect *= (1.0 + event_impact * recovery * 0.5)
                 helium_effect *= (1.0 + event_impact * 0.7 * recovery * 0.5)
                 energy_effect *= (1.0 + event_impact * 0.5 * recovery * 0.5)
-        
+
         return carbon_effect, helium_effect, energy_effect
-    
-    def _apply_scenario_effect(
-        self,
-        scenario_type: SimulationScenario,
-        params: Dict,
-        step: int,
-        resource: str = 'carbon'
-    ) -> float:
-        """Apply individual scenario effect"""
-        if scenario_type == SimulationScenario.POLICY_CHANGE:
-            if resource == 'carbon':
-                reduction_rate = params.get('carbon_reduction_rate', 0.05)
-                return 1.0 - reduction_rate * (step / 10)
-            else:  # helium
-                conservation_rate = params.get('helium_conservation_rate', 0.03)
-                return 1.0 - conservation_rate * (step / 10)
-        
-        elif scenario_type == SimulationScenario.MARKET_SHOCK:
-            shock_size = params.get('shock_size', 0.3)
-            shock_duration = params.get('shock_duration', 5)
-            if step < shock_duration:
-                return 1.0 + (1.0 - step / shock_duration) * shock_size
-            return 1.0
-        
-        elif scenario_type == SimulationScenario.RESOURCE_DEPLETION:
-            if resource == 'carbon':
-                depletion_rate = params.get('carbon_depletion_rate', 0.02)
-                return 1.0 - depletion_rate * step
-            else:  # helium
-                depletion_rate = params.get('helium_depletion_rate', 0.03)
-                return max(0.1, 1.0 - depletion_rate * step)
-        
-        elif scenario_type == SimulationScenario.TECHNOLOGY_ADOPTION:
-            adoption_rate = params.get('adoption_rate', 0.1)
-            if resource == 'carbon':
-                efficiency_gain = params.get('carbon_efficiency_gain', 0.3)
-                return 1.0 - efficiency_gain * (1 - np.exp(-adoption_rate * step))
-            else:  # helium
-                efficiency_gain = params.get('helium_efficiency_gain', 0.2)
-                return 1.0 - efficiency_gain * (1 - np.exp(-adoption_rate * step))
-        
-        elif scenario_type == SimulationScenario.REGULATORY_CHANGE:
-            if resource == 'carbon':
-                tax_rate = params.get('carbon_tax_rate', 0.1)
-                return 1.0 + tax_rate * (step / 10)
-            else:  # helium
-                quota_reduction = params.get('helium_quota_reduction', 0.05)
-                return 1.0 - quota_reduction * (step / 10)
-        
-        elif scenario_type == SimulationScenario.CLIMATE_EVENT:
-            event_impact = params.get('event_impact', 0.2)
-            event_duration = params.get('event_duration', 3)
-            recovery_rate = params.get('recovery_rate', 0.1)
-            
-            if step < event_duration:
-                return 1.0 + event_impact
-            else:
-                return 1.0 + event_impact * np.exp(-recovery_rate * (step - event_duration))
-        
-        return 1.0
-    
+
     # ========================================================================
-    # Resource Substitution Modeling (NEW)
+    # Substitution Modeling (Enhanced)
     # ========================================================================
-    
+
     def _get_substitution_effects(self, resource_type: str) -> Dict[str, float]:
-        """Get substitution effects for a resource"""
-        effects = {
-            'availability': 0.0,
-            'cost_factor': 1.0,
-            'timeline': 0.0
+        """Get substitution effects for a resource."""
+        default = {
+            'availability': self.config.substitution_availability_default.get(resource_type, 0.0),
+            'cost_factor': self.config.substitution_cost_factor_default.get(resource_type, 1.0),
+            'timeline': self.config.substitution_timeline_default.get(resource_type, 12.0)
         }
-        
-        if resource_type == 'helium':
-            # Helium substitution with alternatives
-            effects['availability'] = 0.3  # 30% of helium can be substituted
-            effects['cost_factor'] = 2.0  # 2x cost for alternatives
-            effects['timeline'] = 24.0  # months to implement
-        
-        elif resource_type == 'carbon':
-            # Carbon substitution with renewables
-            effects['availability'] = 0.5
-            effects['cost_factor'] = 1.5
-            effects['timeline'] = 12.0
-        
-        elif resource_type == 'energy':
-            # Energy substitution with renewables
-            effects['availability'] = 0.6
-            effects['cost_factor'] = 1.3
-            effects['timeline'] = 18.0
-        
-        return effects
-    
+        return default
+
     def _apply_substitution_effects(self, step: int, parameters: Dict) -> float:
-        """Apply substitution effects based on step and parameters"""
-        # Simulate substitution ramp-up
-        substitution_start = parameters.get('substitution_start_step', 10)
-        substitution_rate = parameters.get('substitution_rate', 0.05)
-        
+        """Apply substitution effects based on step and parameters."""
+        substitution_start = parameters.get('substitution_start_step', self.config.substitution_ramp_start_step)
+        substitution_rate = parameters.get('substitution_rate', self.config.substitution_ramp_rate)
+
         if step < substitution_start:
             return 1.0
-        
+
         ramp_steps = step - substitution_start
         return 1.0 - min(0.5, substitution_rate * ramp_steps)
-    
-    def _get_substitution_effects_all(self) -> Dict[str, float]:
-        """Get substitution effects for all resources"""
+
+    def _get_substitution_effects_all(self) -> Dict[str, Dict]:
+        """Get substitution effects for all resources."""
         effects = {}
         for resource in ['carbon', 'helium', 'energy', 'circularity', 'biodiversity']:
             effects[resource] = self._get_substitution_effects(resource)
         return effects
-    
+
     # ========================================================================
-    # Real Data Access Methods (Preserved)
+    # Real Data Access Methods (with Retry)
     # ========================================================================
-    
+
     async def _get_current_carbon(self) -> float:
         if self.carbon_manager:
-            if hasattr(self.carbon_manager, 'get_current_intensity'):
-                intensity = await self.carbon_manager.get_current_intensity()
-                return intensity / 1000
-            elif hasattr(self.carbon_manager, 'carbon_intensity'):
-                return self.carbon_manager.carbon_intensity / 1000
+            try:
+                if hasattr(self.carbon_manager, 'get_current_intensity'):
+                    intensity = await retry_async(
+                        self.carbon_manager.get_current_intensity,
+                        self.config.max_retries,
+                        self.config.retry_base_delay_ms,
+                        self.config.retry_max_delay_ms
+                    )
+                    return intensity / 1000
+                elif hasattr(self.carbon_manager, 'carbon_intensity'):
+                    return self.carbon_manager.carbon_intensity / 1000
+            except Exception as e:
+                logger.warning(f"Failed to get carbon intensity: {e}")
+                self._record_failure()
         return 0.5
-    
+
     async def _get_current_helium(self) -> float:
         if self.helium_tracker:
-            if hasattr(self.helium_tracker, 'get_helium_position'):
-                position = self.helium_tracker.get_helium_position()
-                if position:
-                    return position.get('total_usage_l', 0) / position.get('budget_l', 100)
+            try:
+                if hasattr(self.helium_tracker, 'get_helium_position'):
+                    position = await retry_async(
+                        self.helium_tracker.get_helium_position,
+                        self.config.max_retries,
+                        self.config.retry_base_delay_ms,
+                        self.config.retry_max_delay_ms
+                    )
+                    if position:
+                        return position.get('total_usage_l', 0) / position.get('budget_l', 100)
+            except Exception as e:
+                logger.warning(f"Failed to get helium position: {e}")
+                self._record_failure()
         return 0.5
-    
+
     async def _get_current_energy(self) -> float:
         if self.expert_registry:
-            experts = self.expert_registry.get_all_active_experts()
-            total_energy = sum(
-                getattr(e, 'energy_per_inference', 0.001) 
-                for e in experts[:10]
-            )
-            return min(1.0, total_energy * 100)
+            try:
+                experts = await retry_async(
+                    self.expert_registry.get_all_active_experts,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+                total_energy = sum(
+                    getattr(e, 'energy_per_inference', 0.001) 
+                    for e in experts[:10]
+                )
+                return min(1.0, total_energy * 100)
+            except Exception as e:
+                logger.warning(f"Failed to get energy consumption: {e}")
+                self._record_failure()
         return 0.5
-    
+
     async def _get_current_expert_count(self) -> float:
         if self.expert_registry:
-            return len(self.expert_registry.get_all_active_experts())
+            try:
+                experts = await retry_async(
+                    self.expert_registry.get_all_active_experts,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+                return len(experts)
+            except Exception as e:
+                logger.warning(f"Failed to get expert count: {e}")
+                self._record_failure()
         return 10
-    
+
     async def _get_current_circularity(self) -> float:
         if self.circular_manager:
-            if hasattr(self.circular_manager, 'get_circularity_report'):
-                report = self.circular_manager.get_circularity_report()
-                if report:
-                    return report.get('circularity_score', 0.5)
+            try:
+                if hasattr(self.circular_manager, 'get_circularity_report'):
+                    report = await retry_async(
+                        self.circular_manager.get_circularity_report,
+                        self.config.max_retries,
+                        self.config.retry_base_delay_ms,
+                        self.config.retry_max_delay_ms
+                    )
+                    if report:
+                        return report.get('circularity_score', 0.5)
+            except Exception as e:
+                logger.warning(f"Failed to get circularity: {e}")
+                self._record_failure()
         return 0.5
-    
+
+    def _record_failure(self):
+        self.failure_count += 1
+        if self.failure_count >= self.config.circuit_breaker_threshold:
+            self.circuit_open = True
+            self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
+            logger.error("Circuit breaker opened for SystemDigitalTwin external calls")
+
     # ========================================================================
-    # Enhanced Analysis Methods
+    # Analysis Methods (Enhanced)
     # ========================================================================
-    
+
     def _calculate_depletion_year(self, projection: List[float]) -> Optional[int]:
         if len(projection) < 2:
             return None
-        
+
         for i, value in enumerate(projection):
             if value <= 0.0:
                 years_from_now = i * self.config.time_step_days / 365.0
                 return int(datetime.now().year + years_from_now)
-        
+
         trend = (projection[-1] - projection[0]) / len(projection)
         if trend < 0:
             steps_to_zero = int(projection[-1] / -trend)
             years_from_now = (len(projection) + steps_to_zero) * self.config.time_step_days / 365.0
             return int(datetime.now().year + years_from_now)
-        
+
         return None
-    
+
     def _calculate_sustainability_score(self, projections: Dict) -> float:
         scores = []
-        
         if 'carbon_emissions' in projections and projections['carbon_emissions']:
             carbon_end = projections['carbon_emissions'][-1]
             carbon_start = projections['carbon_emissions'][0]
             carbon_score = 1.0 - min(1.0, (carbon_end - carbon_start) / max(carbon_start, 0.1))
             scores.append(carbon_score)
-        
         if 'helium_depletion' in projections and projections['helium_depletion']:
             helium_end = projections['helium_depletion'][-1]
             helium_start = projections['helium_depletion'][0]
             helium_score = min(1.0, helium_end / max(helium_start, 0.1))
             scores.append(helium_score)
-        
         if 'circularity_index' in projections and projections['circularity_index']:
             circ_end = projections['circularity_index'][-1]
             circ_start = projections['circularity_index'][0]
             circ_score = min(1.0, circ_end / max(circ_start, 0.1))
             scores.append(circ_score)
-        
         if 'biodiversity_impact' in projections and projections['biodiversity_impact']:
             bio_end = projections['biodiversity_impact'][-1]
             bio_score = max(0, min(1.0, bio_end))
             scores.append(bio_score)
-        
         return np.mean(scores) if scores else 0.5
-    
+
     def _calculate_weighted_sustainability_score(self, projections: Dict) -> float:
-        """Calculate sustainability score weighted by user priorities"""
         if not self.priority_weights:
             return self._calculate_sustainability_score(projections)
-        
+
         weighted_scores = []
         total_weight = 0.0
-        
+
         for key, weight in self.priority_weights.items():
             if key == 'carbon' and 'carbon_emissions' in projections:
                 carbon_end = projections['carbon_emissions'][-1]
@@ -768,54 +1003,49 @@ class SystemDigitalTwin:
                 score = 1.0 - min(1.0, (carbon_end - carbon_start) / max(carbon_start, 0.1))
                 weighted_scores.append(score * weight)
                 total_weight += weight
-            
             elif key == 'helium' and 'helium_depletion' in projections:
                 helium_end = projections['helium_depletion'][-1]
                 helium_start = projections['helium_depletion'][0]
                 score = min(1.0, helium_end / max(helium_start, 0.1))
                 weighted_scores.append(score * weight)
                 total_weight += weight
-            
             elif key == 'energy' and 'energy_consumption' in projections:
                 energy_end = projections['energy_consumption'][-1]
                 energy_start = projections['energy_consumption'][0]
                 score = 1.0 - min(1.0, (energy_end - energy_start) / max(energy_start, 0.1))
                 weighted_scores.append(score * weight)
                 total_weight += weight
-            
             elif key == 'circularity' and 'circularity_index' in projections:
                 circ_end = projections['circularity_index'][-1]
                 circ_start = projections['circularity_index'][0]
                 score = min(1.0, circ_end / max(circ_start, 0.1))
                 weighted_scores.append(score * weight)
                 total_weight += weight
-            
             elif key == 'biodiversity' and 'biodiversity_impact' in projections:
                 bio_end = projections['biodiversity_impact'][-1]
                 score = max(0, min(1.0, bio_end))
                 weighted_scores.append(score * weight)
                 total_weight += weight
-        
+
         return sum(weighted_scores) / max(total_weight, 0.001)
-    
+
     # ========================================================================
-    # Enhanced Cost-Benefit Recommendations (NEW)
+    # Recommendation Generation (Enhanced with Cost-Benefit)
     # ========================================================================
-    
+
     def _generate_cost_benefit_recommendations(
         self,
         scenario_type: SimulationScenario,
         projections: Dict,
         parameters: Dict
     ) -> List[Dict[str, Any]]:
-        """Generate recommendations with cost-benefit analysis"""
         recommendations = []
-        
+
         # Carbon recommendations
         if 'carbon_emissions' in projections and projections['carbon_emissions']:
             trend = projections['carbon_emissions'][-1] - projections['carbon_emissions'][0]
             if trend > 0:
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="Reduce Carbon Emissions",
                     description="Implement aggressive carbon reduction strategies",
                     estimated_cost=50.0,
@@ -825,7 +1055,7 @@ class SystemDigitalTwin:
                     prerequisites=["Carbon budget approval", "Expert review"],
                     confidence=0.75
                 ))
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="Adopt Renewable Energy",
                     description="Increase renewable energy adoption to 50%",
                     estimated_cost=30.0,
@@ -836,7 +1066,7 @@ class SystemDigitalTwin:
                     confidence=0.85
                 ))
             elif trend < -0.1:
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="Maintain Carbon Momentum",
                     description="Continue successful carbon reduction strategies",
                     estimated_cost=10.0,
@@ -845,11 +1075,11 @@ class SystemDigitalTwin:
                     risk_level="low",
                     confidence=0.9
                 ))
-        
+
         # Helium recommendations
         if 'helium_depletion' in projections and projections['helium_depletion']:
             if projections['helium_depletion'][-1] < 0.3:
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="CRITICAL: Helium Conservation",
                     description="Implement immediate helium recovery and substitution",
                     estimated_cost=80.0,
@@ -860,7 +1090,7 @@ class SystemDigitalTwin:
                     confidence=0.7
                 ))
             elif projections['helium_depletion'][-1] < 0.5:
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="Optimize Helium Usage",
                     description="Improve helium efficiency in quantum cooling",
                     estimated_cost=25.0,
@@ -870,11 +1100,11 @@ class SystemDigitalTwin:
                     prerequisites=["Helium audit", "Efficiency review"],
                     confidence=0.8
                 ))
-        
+
         # Circularity recommendations
         if 'circularity_index' in projections and projections['circularity_index']:
             if projections['circularity_index'][-1] < 0.5:
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="Improve Circularity",
                     description="Enhance material recovery and recycling",
                     estimated_cost=40.0,
@@ -884,11 +1114,11 @@ class SystemDigitalTwin:
                     prerequisites=["Circularity audit", "Recycling infrastructure"],
                     confidence=0.75
                 ))
-        
+
         # Scenario-specific recommendations
         if scenario_type == SimulationScenario.POLICY_CHANGE:
             if parameters.get('carbon_reduction_rate', 0) > 0.05:
-                recommendations.append(self._create_recommendation_with_cost_benefit(
+                recommendations.append(self._create_recommendation(
                     action="Increase Policy Ambition",
                     description="Consider more aggressive carbon reduction targets",
                     estimated_cost=15.0,
@@ -897,9 +1127,9 @@ class SystemDigitalTwin:
                     risk_level="low",
                     confidence=0.85
                 ))
-        
+
         if scenario_type == SimulationScenario.RESOURCE_DEPLETION:
-            recommendations.append(self._create_recommendation_with_cost_benefit(
+            recommendations.append(self._create_recommendation(
                 action="Resource Diversification",
                 description="Diversify resource portfolio to reduce dependency",
                 estimated_cost=60.0,
@@ -909,14 +1139,14 @@ class SystemDigitalTwin:
                 prerequisites=["Resource audit", "Alternative identification"],
                 confidence=0.7
             ))
-        
-        # Add substitution recommendations
+
+        # Substitution recommendations
         if self.config.resource_substitution_enabled:
             for resource, alternatives in self.substitution_options.items():
                 if resource in self.resource_projections:
                     proj = self.resource_projections[resource]
                     if proj.substitution_availability > 0.3:
-                        recommendations.append(self._create_recommendation_with_cost_benefit(
+                        recommendations.append(self._create_recommendation(
                             action=f"Substitute {resource.capitalize()}",
                             description=f"Transition to {', '.join(alternatives[:2])} as alternatives",
                             estimated_cost=45.0,
@@ -926,13 +1156,12 @@ class SystemDigitalTwin:
                             prerequisites=[f"{resource} substitution study", "Alternative validation"],
                             confidence=0.7
                         ))
-        
+
         # Sort by ROI
         recommendations.sort(key=lambda x: x.get('roi', 0), reverse=True)
-        
         return recommendations
-    
-    def _create_recommendation_with_cost_benefit(
+
+    def _create_recommendation(
         self,
         action: str,
         description: str,
@@ -943,9 +1172,7 @@ class SystemDigitalTwin:
         prerequisites: List[str] = None,
         confidence: float = 0.7
     ) -> Dict[str, Any]:
-        """Create a recommendation with cost-benefit analysis"""
         roi = estimated_benefit / max(estimated_cost, 0.01)
-        
         return {
             'action': action,
             'description': description,
@@ -958,10 +1185,10 @@ class SystemDigitalTwin:
             'confidence': confidence,
             'cost_benefit_ratio': f"1:{roi:.2f}"
         }
-    
+
     def _identify_risk_factors(self, projections: Dict) -> List[str]:
         risks = []
-        
+
         for key, values in projections.items():
             if values and len(values) > 1:
                 trend = values[-1] - values[0]
@@ -970,34 +1197,33 @@ class SystemDigitalTwin:
                         risks.append(f"Increasing {key} - carbon risk")
                     elif 'helium' in key or 'depletion' in key:
                         risks.append(f"Declining {key} - helium scarcity risk")
-        
+
         for key, values in projections.items():
             if values and len(values) > 10:
                 volatility = np.std(values[-10:])
                 if volatility > 0.1:
                     risks.append(f"High volatility in {key}")
-        
+
         for key, proj in self.resource_projections.items():
             if proj.depletion_year and proj.depletion_year < datetime.now().year + 5:
                 risks.append(f"{key} depletion risk within 5 years")
-        
+
         return risks
-    
+
     # ========================================================================
-    # Utility Methods (Preserved)
+    # Utility Methods
     # ========================================================================
-    
+
     def _generate_scenario_id(self, scenario_type: SimulationScenario, parameters: Dict) -> str:
         param_str = json.dumps(parameters, sort_keys=True)
         hash_str = hashlib.md5(f"{scenario_type.value}{param_str}".encode()).hexdigest()[:8]
         return f"{scenario_type.value}_{hash_str}"
-    
+
     # ========================================================================
-    # Enhanced Statistics and Export
+    # Statistics and Export
     # ========================================================================
-    
+
     def get_simulation_stats(self) -> Dict[str, Any]:
-        """Get simulation statistics with enhanced metrics"""
         return {
             'total_scenarios': len(self.scenario_results),
             'cached_scenarios': len(self.simulation_cache),
@@ -1018,14 +1244,12 @@ class SystemDigitalTwin:
                 for r in self.scenario_results[-5:]
             ] if self.scenario_results else []
         }
-    
+
     def update_user_priorities(self, new_priorities: Dict[str, float]):
-        """Update user priority weights"""
         self.priority_weights.update(new_priorities)
         logger.info(f"User priorities updated: {self.priority_weights}")
-    
+
     async def export_projections(self) -> Dict[str, Any]:
-        """Export all resource projections with substitution data"""
         return {
             'timestamp': datetime.now().isoformat(),
             'config': {
@@ -1050,7 +1274,12 @@ class SystemDigitalTwin:
             'user_priorities': self.priority_weights,
             'resource_correlation': self.resource_correlation
         }
-    
+
+    async def get_telemetry_export(self) -> str:
+        return await self.telemetry.export()
+
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("Shutting down System Digital Twin v2.0.0")
+        """Graceful shutdown."""
+        logger.info("Shutting down System Digital Twin v2.1.0")
+        await self.save_state()
+        logger.info("Shutdown complete")
