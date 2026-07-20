@@ -1,785 +1,873 @@
-# =============================================================================
-# Enhanced Bio-Integrated Green Agent v6.3.0 - Complete Implementation
-# =============================================================================
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/bio_integrated_agent.py
+# Enhanced version v8.0.0 – Energy‑aware RL, persistent PQC keys, blockchain audit policy
+
+"""
+Bio‑Integrated Green Agent v8.0.0
+Full integration of bio‑inspired modules with:
+- Energy‑aware RL strategy selector (Q‑learning)
+- Persistent PQC keys for verifiable identity
+- Selective blockchain auditing based on sustainability impact
+- Helium/carbon coupling via TimeTickEngine
+- Configurable energy policies
+"""
 
 import asyncio
 import logging
-import signal
 import json
 import os
-import yaml
-import pickle
-from typing import Dict, Any, List, Optional, Callable, Set, Tuple, Union
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
-from enum import Enum
-import numpy as np
-from collections import defaultdict, deque
-import uuid
 import hashlib
-import shutil
-from contextlib import asynccontextmanager
-import pandas as pd
-import networkx as nx
+import uuid
+from typing import Dict, Any, List, Optional, Tuple, Callable
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from collections import defaultdict
+import numpy as np
+import pickle
 
-# ============================================================================
-# Optional dependencies with graceful degradation
-# ============================================================================
+# Try optional dependencies
 try:
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
-
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-
-try:
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server, CollectorRegistry
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-try:
-    from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
+    from pydantic import BaseModel, Field, validator
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# Post-quantum cryptography
 try:
-    from pqcrypto.sign import dilithium, falcon, sphincs
+    import structlog
+    logger = structlog.get_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
+
+try:
+    from prometheus_client import Gauge, Counter, Histogram
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+# Local imports (with fallback)
+try:
+    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
+    TOKEN_AVAILABLE = True
+except ImportError:
+    TOKEN_AVAILABLE = False
+
+try:
+    from .proton_gradient_fields import GradientFieldManager
+    GRADIENT_AVAILABLE = True
+except ImportError:
+    GRADIENT_AVAILABLE = False
+
+try:
+    from .atp_synthase_scheduler import ATPSynthaseScheduler
+    ATP_AVAILABLE = True
+except ImportError:
+    ATP_AVAILABLE = False
+
+try:
+    from .chromatophore_compartments import HierarchicalCompartmentManager
+    COMPARTMENT_AVAILABLE = True
+except ImportError:
+    COMPARTMENT_AVAILABLE = False
+
+try:
+    from .biomass_storage import BiomassStorage
+    BIOMASS_AVAILABLE = True
+except ImportError:
+    BIOMASS_AVAILABLE = False
+
+try:
+    from .photosynthetic_harvester import PhotosyntheticHarvester
+    HARVESTER_AVAILABLE = True
+except ImportError:
+    HARVESTER_AVAILABLE = False
+
+try:
+    from .time_tick_engine import TimeTickEngine
+    TICK_ENGINE_AVAILABLE = True
+except ImportError:
+    TICK_ENGINE_AVAILABLE = False
+
+try:
+    from .quantum_bridge import QuantumBridge
+    QUANTUM_BRIDGE_AVAILABLE = True
+except ImportError:
+    QUANTUM_BRIDGE_AVAILABLE = False
+
+# PQC (post‑quantum cryptography) – use a simple fallback if not available
+try:
+    from pqcrypto.sign import falcon
     PQC_AVAILABLE = True
 except ImportError:
     PQC_AVAILABLE = False
 
-# Web3 for blockchain
-try:
-    from web3 import Web3, Account, HTTPProvider
-    from web3.middleware import geth_poa_middleware
-    WEB3_AVAILABLE = True
-except ImportError:
-    WEB3_AVAILABLE = False
-
-# Cloud SDKs
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-    AWS_AVAILABLE = True
-except ImportError:
-    AWS_AVAILABLE = False
-
-try:
-    from azure.storage.blob import BlobServiceClient
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
-
-try:
-    from google.cloud import storage
-    GCP_AVAILABLE = True
-except ImportError:
-    GCP_AVAILABLE = False
-
-# OpenTelemetry
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import Tracer, SpanKind
-    from opentelemetry.trace.propagation import get_global_textmap_propagator
-    OPENTELEMETRY_AVAILABLE = True
-except ImportError:
-    OPENTELEMETRY_AVAILABLE = False
-
-# FastAPI for health endpoint (optional)
-try:
-    from fastapi import FastAPI, Response
-    from fastapi.responses import JSONResponse
-    import uvicorn
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    FASTAPI_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
-
 # ============================================================================
-# Module Availability Checks (keep original)
-# ============================================================================
-
-BIO_INSPIRED_AVAILABLE = True
-MODULE_STATUS = {}
-
-try:
-    from .eco_atp_currency import (
-        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
-        TokenSupplyManager, PredictiveTokenAllocator
-    )
-    MODULE_STATUS['token_manager'] = True
-except ImportError as e:
-    MODULE_STATUS['token_manager'] = False
-    logger.error(f"Token manager not available: {str(e)}")
-
-try:
-    from .proton_gradient_fields import HierarchicalGradientManager
-    MODULE_STATUS['gradient_manager'] = True
-except ImportError as e:
-    MODULE_STATUS['gradient_manager'] = False
-
-try:
-    from .atp_synthase_scheduler import ATPSynthaseScheduler, SynthaseConfig
-    MODULE_STATUS['atp_synthase'] = True
-except ImportError as e:
-    MODULE_STATUS['atp_synthase'] = False
-
-try:
-    from .chromatophore_compartments import HierarchicalCompartmentManager
-    MODULE_STATUS['compartment_manager'] = True
-except ImportError as e:
-    MODULE_STATUS['compartment_manager'] = False
-
-try:
-    from .biomass_storage import BiomassStorage
-    MODULE_STATUS['biomass_storage'] = True
-except ImportError as e:
-    MODULE_STATUS['biomass_storage'] = False
-
-try:
-    from .photosynthetic_harvester import EnhancedPhotosyntheticHarvester
-    MODULE_STATUS['harvester'] = True
-except ImportError as e:
-    MODULE_STATUS['harvester'] = False
-
-# ============================================================================
-# Enums and Data Classes (Enhanced)
-# ============================================================================
-
-class AgentState(Enum):
-    UNINITIALIZED = "uninitialized"
-    INITIALIZING = "initializing"
-    INITIALIZED = "initialized"
-    RUNNING = "running"
-    DEGRADED = "degraded"
-    PAUSED = "paused"
-    SHUTTING_DOWN = "shutting_down"
-    SHUTDOWN = "shutdown"
-    ERROR = "error"
-    RECOVERING = "recovering"
-
-class HealthStatus(Enum):
-    HEALTHY = "healthy"
-    DEGRADED = "degraded"
-    UNHEALTHY = "unhealthy"
-    STARTING = "starting"
-    STOPPED = "stopped"
-    UNKNOWN = "unknown"
-    PREDICTED_UNHEALTHY = "predicted_unhealthy"
-
-# ============================================================================
-# Configuration (Enhanced with Pydantic, environment, and YAML)
+# Configuration (Pydantic or dataclass)
 # ============================================================================
 
 if PYDANTIC_AVAILABLE:
     class AgentConfig(BaseModel):
-        """Centralized configuration for Bio-Integrated Green Agent.
-        Loads from environment variables and YAML file.
-        """
-        model_config = ConfigDict(arbitrary_types_allowed=True)
-
-        # Token economy
-        token_base_generation_rate: float = Field(default=150.0, ge=0.1)
-        token_hoarding_threshold: float = Field(default=2.0, ge=0.0)
-        token_emergency_threshold: float = Field(default=50.0, ge=0.0)
-        token_target_utilization: float = Field(default=0.75, ge=0.0, le=1.0)
-
-        # Compartments
-        compartments_per_expert_type: int = Field(default=2, ge=1)
-        max_total_compartments: int = Field(default=100, ge=1)
-        compartment_health_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
-        scale_up_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
-        scale_down_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
-        min_compartments_per_type: int = Field(default=1, ge=0)
-
-        # Gradient fields
-        carbon_leakage_rate: float = Field(default=0.03, ge=0.0)
-        helium_leakage_rate: float = Field(default=0.08, ge=0.0)
-        trust_leakage_rate: float = Field(default=0.10, ge=0.0)
-
-        # ATP Synthase
-        atp_c_ring_size: int = Field(default=12, ge=1)
-        atp_max_rotation_speed: float = Field(default=6000, ge=1)
-        enable_multi_synthase: bool = True
-
-        # Expert types
-        enable_quantum_expert: bool = False
-        enable_helium_expert: bool = False
-
-        # Features
-        enable_degradation_manager: bool = True
-        enable_predictive_homeostasis: bool = True
-        enable_knowledge_transfer: bool = True
-        enable_supply_management: bool = True
-        enable_token_preallocation: bool = True
-
-        # State persistence
-        enable_state_persistence: bool = True
-        state_save_interval_seconds: int = Field(default=300, ge=10)
-        state_directory: str = Field(default="./agent_state")
-        max_snapshots: int = Field(default=20, ge=1)
-
-        # Health checks
-        health_check_interval_seconds: int = Field(default=30, ge=5)
-        predictive_health_window_minutes: int = Field(default=60, ge=10)
-
-        # Predictive scaling
-        enable_predictive_scaling: bool = True
-        scaling_lookback_hours: int = Field(default=24, ge=1)
-        scaling_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-
-        # OpenTelemetry
-        enable_opentelemetry: bool = True
-        service_name: str = Field(default="green-agent")
-
-        # Event persistence
-        enable_event_persistence: bool = True
-        event_retention_days: int = Field(default=7, ge=1)
-        event_flush_interval_seconds: int = Field(default=60, ge=5)
-
-        # Quantum Bridge
+        """Configuration for the Bio‑Integrated Agent."""
+        # General
+        agent_id: str = Field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
+        enable_energy_aware_rl: bool = True
         enable_quantum_bridge: bool = True
-        quantum_graph: Optional[Any] = None
-
-        # TimeTickEngine
         enable_time_tick_engine: bool = True
-        csv_path: str = Field(default="./helium_timeseries_realistic_2020_2026.csv")
-        tick_interval_seconds: float = Field(default=0.1, ge=0.01)
-        simulation_loop_interval_seconds: float = Field(default=3600, ge=60)
 
-        # Failure probability threshold for proactive actions
-        health_failure_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+        # RL strategy
+        rl_learning_rate: float = 0.1
+        rl_discount_factor: float = 0.9
+        rl_epsilon: float = 0.1
+        rl_state_bins: Dict[str, List[str]] = Field(
+            default_factory=lambda: {
+                'load': ['low', 'medium', 'high'],
+                'health': ['poor', 'medium', 'good'],
+                'token': ['scarce', 'adequate', 'abundant'],
+                'energy': ['light', 'normal', 'heavy'],
+                'helium': ['scarce', 'normal', 'abundant']
+            }
+        )
+        rl_strategies: List[str] = ['conservative', 'balanced', 'performance']
 
-        # ===== ENTERPRISE ENHANCEMENTS (v6.3.0) =====
-        # Retry
-        max_retries: int = Field(default=3, ge=1)
-        retry_base_delay_ms: float = Field(default=100.0, ge=0)
-        retry_max_delay_ms: float = Field(default=5000.0, ge=0)
+        # Energy policies (strategy → config overrides)
+        strategy_policies: Dict[str, Dict[str, Any]] = Field(
+            default_factory=lambda: {
+                'conservative': {
+                    'state_save_interval_seconds': 600,
+                    'health_check_interval_seconds': 60,
+                    'task_throughput': 0.3,
+                    'token_base_generation_rate': 0.5,
+                    'biomass_storage_preference': True,
+                    'genetic_evolution_interval': 86400 * 2,
+                    'competition_interval': 7200,
+                },
+                'balanced': {
+                    'state_save_interval_seconds': 300,
+                    'health_check_interval_seconds': 30,
+                    'task_throughput': 1.0,
+                    'token_base_generation_rate': 1.0,
+                    'biomass_storage_preference': False,
+                    'genetic_evolution_interval': 86400,
+                    'competition_interval': 3600,
+                },
+                'performance': {
+                    'state_save_interval_seconds': 60,
+                    'health_check_interval_seconds': 10,
+                    'task_throughput': 2.0,
+                    'token_base_generation_rate': 1.5,
+                    'biomass_storage_preference': False,
+                    'genetic_evolution_interval': 43200,
+                    'competition_interval': 1800,
+                }
+            }
+        )
 
-        # Circuit breaker
-        enable_circuit_breaker: bool = True
-        circuit_breaker_failure_threshold: int = Field(default=5, ge=1)
-        circuit_breaker_timeout_seconds: float = Field(default=60.0, ge=1)
+        # PQC keys
+        pqc_key_dir: str = Field("./pqc_keys", description="Directory for PQC key storage")
 
-        # Quantum signing (now real)
-        enable_quantum_signing: bool = True
-        quantum_signing_algorithm: str = Field(default='dilithium')
+        # Blockchain audit policy
+        blockchain_audit_events: List[str] = Field(
+            default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot']
+        )
+        blockchain_audit_min_importance: float = 0.5  # 0–1 threshold
 
-        # Blockchain audit (now real)
-        enable_blockchain_audit: bool = True
-        blockchain_rpc_url: str = Field(default='http://localhost:8545')
-        blockchain_contract_address: str = Field(default='0x0000000000000000000000000000000000000000')
-        blockchain_private_key: Optional[str] = Field(default=None)
+        # Persistence
+        state_save_interval_seconds: int = 300
+        state_save_path: str = "./agent_state.pkl"
 
-        # Autonomous optimizer (now real Q-learning)
-        enable_autonomous_optimizer: bool = True
-        rl_learning_rate: float = Field(default=0.1, ge=0.0, le=1.0)
-        rl_discount_factor: float = Field(default=0.9, ge=0.0, le=1.0)
-        rl_exploration_rate: float = Field(default=0.1, ge=0.0, le=1.0)
+        # Feature flags
+        enable_prometheus: bool = False
 
-        # Multi-cloud (now real)
-        enable_multi_cloud: bool = True
-        cloud_provider: str = Field(default='aws')
-        cloud_region: str = Field(default='us-east-1')
-        cloud_bucket: str = Field(default='green-agent-state')
-        cloud_access_key: Optional[str] = None
-        cloud_secret_key: Optional[str] = None
-
-        # Prometheus
-        prometheus_port: Optional[int] = Field(default=None, description="Port for Prometheus HTTP endpoint")
-
-        # Health check HTTP endpoint
-        enable_health_endpoint: bool = True
-        health_endpoint_port: int = Field(default=8080)
-
-        @classmethod
-        def from_env_and_file(cls, config_path: Optional[str] = None) -> 'AgentConfig':
-            """Load configuration from environment variables and optional YAML file."""
-            env_overrides = {}
-            for key in cls.model_fields.keys():
-                env_var = f"GREEN_AGENT_{key.upper()}"
-                if env_var in os.environ:
-                    env_overrides[key] = os.environ[env_var]
-            if config_path and os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    yaml_data = yaml.safe_load(f)
-                    if yaml_data:
-                        yaml_data.update(env_overrides)
-                        return cls(**yaml_data)
-            return cls(**env_overrides) if env_overrides else cls()
-
-        def to_dict(self) -> Dict[str, Any]:
-            return self.model_dump()
-
-        @classmethod
-        def from_dict(cls, data: Dict[str, Any]) -> 'AgentConfig':
-            return cls(**data)
-
-        def validate(self) -> List[str]:
-            """Validate configuration and return list of issues"""
-            issues = []
-            if self.token_base_generation_rate <= 0:
-                issues.append("token_base_generation_rate must be positive")
-            if self.compartments_per_expert_type < 1:
-                issues.append("compartments_per_expert_type must be at least 1")
-            if self.carbon_leakage_rate <= 0:
-                issues.append("carbon_leakage_rate must be positive")
-            if self.scale_up_threshold <= self.scale_down_threshold:
-                issues.append("scale_up_threshold must be greater than scale_down_threshold")
-            if self.state_save_interval_seconds < 10:
-                issues.append("state_save_interval_seconds must be at least 10")
-            if self.health_check_interval_seconds < 5:
-                issues.append("health_check_interval_seconds must be at least 5")
-            return issues
+        class Config:
+            env_prefix = "AGENT_"
 else:
-    # Fallback: dataclass only (simplified)
     @dataclass
     class AgentConfig:
-        # ... all fields with defaults (omitted for brevity, but would be present)
-        pass
+        agent_id: str = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
+        enable_energy_aware_rl: bool = True
+        enable_quantum_bridge: bool = True
+        enable_time_tick_engine: bool = True
+        rl_learning_rate: float = 0.1
+        rl_discount_factor: float = 0.9
+        rl_epsilon: float = 0.1
+        rl_state_bins: Dict[str, List[str]] = field(default_factory=lambda: {
+            'load': ['low', 'medium', 'high'],
+            'health': ['poor', 'medium', 'good'],
+            'token': ['scarce', 'adequate', 'abundant'],
+            'energy': ['light', 'normal', 'heavy'],
+            'helium': ['scarce', 'normal', 'abundant']
+        })
+        rl_strategies: List[str] = field(default_factory=lambda: ['conservative', 'balanced', 'performance'])
+        strategy_policies: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+            'conservative': {
+                'state_save_interval_seconds': 600,
+                'health_check_interval_seconds': 60,
+                'task_throughput': 0.3,
+                'token_base_generation_rate': 0.5,
+                'biomass_storage_preference': True,
+                'genetic_evolution_interval': 86400 * 2,
+                'competition_interval': 7200,
+            },
+            'balanced': {
+                'state_save_interval_seconds': 300,
+                'health_check_interval_seconds': 30,
+                'task_throughput': 1.0,
+                'token_base_generation_rate': 1.0,
+                'biomass_storage_preference': False,
+                'genetic_evolution_interval': 86400,
+                'competition_interval': 3600,
+            },
+            'performance': {
+                'state_save_interval_seconds': 60,
+                'health_check_interval_seconds': 10,
+                'task_throughput': 2.0,
+                'token_base_generation_rate': 1.5,
+                'biomass_storage_preference': False,
+                'genetic_evolution_interval': 43200,
+                'competition_interval': 1800,
+            }
+        })
+        pqc_key_dir: str = "./pqc_keys"
+        blockchain_audit_events: List[str] = field(default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot'])
+        blockchain_audit_min_importance: float = 0.5
+        state_save_interval_seconds: int = 300
+        state_save_path: str = "./agent_state.pkl"
+        enable_prometheus: bool = False
 
 # ============================================================================
-# Data Classes for Health, Snapshots, Events (Enhanced)
-# ============================================================================
-
-@dataclass
-class ModuleHealth:
-    module_name: str
-    status: HealthStatus = HealthStatus.UNKNOWN
-    last_check: datetime = field(default_factory=datetime.utcnow)
-    error_message: Optional[str] = None
-    metrics: Dict[str, Any] = field(default_factory=dict)
-    predicted_status: Optional[HealthStatus] = None
-    predicted_at: Optional[datetime] = None
-    health_trend: str = "stable"
-    failure_probability: float = 0.0
-
-@dataclass
-class SystemSnapshot:
-    version: int = 1
-    agent_state: str
-    timestamp: datetime
-    token_state: Optional[Dict[str, Any]] = None
-    gradient_state: Optional[Dict[str, Any]] = None
-    compartment_state: Optional[Dict[str, Any]] = None
-    biomass_state: Optional[Dict[str, Any]] = None
-    config: Optional[Dict[str, Any]] = None
-    correlation_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    parent_snapshot_id: Optional[str] = None
-    quantum_signature: Optional[Dict] = None
-    blockchain_tx_hash: Optional[str] = None
-    cloud_upload_urls: Optional[Dict[str, str]] = None
-
-@dataclass
-class PersistedEvent:
-    event_id: str
-    event_type: str
-    payload: Dict[str, Any]
-    timestamp: datetime
-    correlation_id: Optional[str] = None
-    source: Optional[str] = None
-    version: int = 1
-    quantum_signature: Optional[Dict] = None
-    blockchain_tx_hash: Optional[str] = None
-
-# ============================================================================
-# Real Post-Quantum Security (using pqcrypto)
+# Quantum‑Resilient Security (with persistent keys)
 # ============================================================================
 
 class QuantumResilientSecurity:
-    """Real post-quantum signing using Dilithium/Falcon/SPHINCS+."""
-    def __init__(self, algorithm: str = 'dilithium'):
-        self.algorithm = algorithm
-        self.pqc_available = PQC_AVAILABLE
-        if self.pqc_available:
-            self._load_algorithm()
-        else:
-            logger.warning("PQC libraries not found – using ECDSA fallback.")
+    """
+    Provides post‑quantum signature capabilities with persistent key storage.
+    """
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self.pqc_key_dir = Path(config.pqc_key_dir)
+        self.pqc_key_dir.mkdir(parents=True, exist_ok=True)
+        self.private_key = None
+        self.public_key = None
+        self._load_or_generate_keys()
 
-    def _load_algorithm(self):
-        if self.algorithm == 'dilithium':
-            self.sign_func = dilithium.sign
-            self.verify_func = dilithium.verify
-        elif self.algorithm == 'falcon':
-            self.sign_func = falcon.sign
-            self.verify_func = falcon.verify
-        elif self.algorithm == 'sphincs':
-            self.sign_func = sphincs.sign
-            self.verify_func = sphincs.verify
-        else:
-            raise ValueError(f"Unknown algorithm: {self.algorithm}")
-
-    async def sign_data(self, data: Dict) -> Dict:
-        data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-        if self.pqc_available:
+    def _load_or_generate_keys(self):
+        """Load existing PQC keys or generate new ones."""
+        priv_path = self.pqc_key_dir / "private.key"
+        pub_path = self.pqc_key_dir / "public.key"
+        if priv_path.exists() and pub_path.exists():
             try:
-                # Generate a keypair (simplified; in production you'd reuse keys)
-                public_key, private_key = self.sign_func.generate_keypair()
-                signature = self.sign_func.sign(data_bytes, private_key)
-                return {
-                    'signature': signature.hex(),
-                    'algorithm': self.algorithm,
-                    'public_key': public_key.hex(),
-                    'timestamp': datetime.utcnow().isoformat()
-                }
+                with open(priv_path, 'rb') as f:
+                    self.private_key = f.read()
+                with open(pub_path, 'rb') as f:
+                    self.public_key = f.read()
+                logger.info("Loaded existing PQC keys")
+                return
             except Exception as e:
-                logger.error(f"PQC signing failed: {e}")
-        # Fallback: ECDSA (using cryptography)
-        from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.hazmat.primitives import hashes
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        signature = private_key.sign(data_bytes, ec.ECDSA(hashes.SHA256()))
-        return {
-            'signature': signature.hex(),
-            'algorithm': 'ecdsa',
-            'timestamp': datetime.utcnow().isoformat()
-        }
+                logger.warning(f"Failed to load PQC keys: {e}")
 
-    async def verify_data(self, data: Dict, signature_data: Dict) -> bool:
-        data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-        algorithm = signature_data.get('algorithm')
-        signature = bytes.fromhex(signature_data['signature'])
-        if algorithm in ['dilithium', 'falcon', 'sphincs'] and self.pqc_available:
-            public_key = bytes.fromhex(signature_data['public_key'])
-            return self.verify_func.verify(data_bytes, signature, public_key)
-        elif algorithm == 'ecdsa':
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import hashes
-            public_key = ec.load_der_public_key(bytes.fromhex(signature_data['public_key']))
-            public_key.verify(signature, data_bytes, ec.ECDSA(hashes.SHA256()))
-            return True
-        return False
+        # Generate new keys
+        if PQC_AVAILABLE:
+            self.private_key, self.public_key = falcon.generate_keypair()
+            with open(priv_path, 'wb') as f:
+                f.write(self.private_key)
+            with open(pub_path, 'wb') as f:
+                f.write(self.public_key)
+            logger.info("Generated and saved new PQC keys")
+        else:
+            # Fallback: use SHA‑256 HMAC as a placeholder
+            self.private_key = os.urandom(32)
+            self.public_key = hashlib.sha256(self.private_key).digest()
+            with open(priv_path, 'wb') as f:
+                f.write(self.private_key)
+            with open(pub_path, 'wb') as f:
+                f.write(self.public_key)
+            logger.warning("PQC library not available; using fallback HMAC keys")
+
+    def sign_data(self, data: Dict[str, Any]) -> str:
+        """Sign data with the persistent private key."""
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        if PQC_AVAILABLE:
+            signature = falcon.sign(payload, self.private_key)
+            return signature.hex()
+        else:
+            # Fallback HMAC
+            import hmac
+            signature = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
+            return signature
+
+    def verify_signature(self, data: Dict[str, Any], signature: str) -> bool:
+        """Verify a signature with the persistent public key."""
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        if PQC_AVAILABLE:
+            try:
+                falcon.verify(payload, bytes.fromhex(signature), self.public_key)
+                return True
+            except Exception:
+                return False
+        else:
+            import hmac
+            expected = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
+            return hmac.compare_digest(expected, signature)
 
 # ============================================================================
-# Real Blockchain Auditor (using web3.py)
+# Blockchain Auditor (with selective auditing)
 # ============================================================================
 
 class BlockchainAuditor:
-    """Real Ethereum integration for recording critical events."""
+    """
+    Records important events on a simulated blockchain with selective auditing.
+    """
+    def __init__(self, config: AgentConfig, security: QuantumResilientSecurity):
+        self.config = config
+        self.security = security
+        self.ledger = []
+        self._lock = asyncio.Lock()
+
+    async def record_event(self, event_type: str, payload: Dict[str, Any], importance: float = 0.5) -> bool:
+        """
+        Record an event if it meets the audit policy.
+        Returns True if recorded.
+        """
+        # Check if event type is allowed
+        if event_type not in self.config.blockchain_audit_events:
+            logger.debug(f"Event {event_type} not in audit list; skipping")
+            return False
+
+        # Check importance threshold
+        if importance < self.config.blockchain_audit_min_importance:
+            logger.debug(f"Event importance {importance} below threshold; skipping")
+            return False
+
+        # Sign the payload
+        signature = self.security.sign_data(payload)
+        entry = {
+            'event_type': event_type,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'payload': payload,
+            'signature': signature,
+            'hash': hashlib.sha256(json.dumps(payload, default=str).encode()).hexdigest()
+        }
+        async with self._lock:
+            self.ledger.append(entry)
+        logger.info(f"Audit recorded: {event_type} (importance {importance})")
+        return True
+
+    def get_ledger(self, limit: int = 100) -> List[Dict]:
+        return self.ledger[-limit:]
+
+    def verify_entry(self, entry: Dict) -> bool:
+        """Verify the signature of a ledger entry."""
+        payload = entry['payload']
+        signature = entry['signature']
+        return self.security.verify_signature(payload, signature)
+
+# ============================================================================
+# RL Strategy Selector (Q‑Learning with extended state)
+# ============================================================================
+
+class RLStrategySelector:
+    """
+    Q‑learning strategy selector that is energy‑aware.
+    State includes energy_intensity, helium_level, carbon_leakage_proxy.
+    """
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.web3 = None
-        self.contract = None
-        self.account = None
-        self.available = False
-        if WEB3_AVAILABLE:
-            self._initialize()
-
-    def _initialize(self):
-        try:
-            self.web3 = Web3(HTTPProvider(self.config.blockchain_rpc_url))
-            if not self.web3.is_connected():
-                raise ConnectionError("Cannot connect to blockchain RPC")
-            self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
-            if self.config.blockchain_private_key:
-                self.account = Account.from_key(self.config.blockchain_private_key)
-                self.web3.eth.default_account = self.account.address
-            else:
-                self.account = self.web3.eth.accounts[0]
-            # Minimal ABI for recording events
-            abi = [
-                {"constant": False, "inputs": [{"name": "eventType", "type": "string"}, {"name": "payload", "type": "string"}], "name": "recordEvent", "outputs": [], "type": "function"}
-            ]
-            if self.config.blockchain_contract_address:
-                self.contract = self.web3.eth.contract(
-                    address=self.config.blockchain_contract_address,
-                    abi=abi
-                )
-                self.available = True
-                logger.info("Blockchain auditor connected")
-            else:
-                logger.warning("Contract address not configured – blockchain audit will be simulated.")
-        except Exception as e:
-            logger.error(f"Blockchain initialization failed: {e}")
-
-    async def record_event(self, event_type: str, payload: Dict) -> Dict:
-        if not self.available:
-            return {'status': 'simulated', 'tx_hash': f"0x{hashlib.sha256(os.urandom(32)).hexdigest()}"}
-        try:
-            payload_str = json.dumps(payload, default=str)
-            nonce = self.web3.eth.get_transaction_count(self.account.address)
-            gas_estimate = self.contract.functions.recordEvent(event_type, payload_str).estimate_gas({'from': self.account.address})
-            gas_price = self.web3.eth.gas_price
-            tx = self.contract.functions.recordEvent(event_type, payload_str).build_transaction({
-                'from': self.account.address,
-                'nonce': nonce,
-                'gas': int(gas_estimate * 1.2),
-                'gasPrice': gas_price
-            })
-            signed_tx = self.account.sign_transaction(tx)
-            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
-            if receipt.status == 1:
-                logger.info(f"Blockchain event recorded: {tx_hash.hex()}")
-                return {'status': 'success', 'tx_hash': tx_hash.hex(), 'block_number': receipt.blockNumber}
-            else:
-                logger.error(f"Transaction reverted for {event_type}")
-                return {'status': 'failed', 'error': 'transaction reverted'}
-        except Exception as e:
-            logger.error(f"Blockchain recording failed: {e}")
-            return {'status': 'failed', 'error': str(e)}
-
-# ============================================================================
-# Real Multi-Cloud Distributor (using SDKs)
-# ============================================================================
-
-class MultiCloudDistributor:
-    """Distribute snapshots and events to S3, Azure Blob, or GCP."""
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self._clients = {}
-        if self.config.cloud_provider == 'aws' and AWS_AVAILABLE:
-            self._clients['aws'] = boto3.client(
-                's3',
-                aws_access_key_id=self.config.cloud_access_key,
-                aws_secret_access_key=self.config.cloud_secret_key,
-                region_name=self.config.cloud_region
-            )
-        elif self.config.cloud_provider == 'azure' and AZURE_AVAILABLE:
-            self._clients['azure'] = BlobServiceClient.from_connection_string(self.config.cloud_access_key)
-        elif self.config.cloud_provider == 'gcp' and GCP_AVAILABLE:
-            self._clients['gcp'] = storage.Client.from_service_account_json(self.config.cloud_access_key)
-
-    async def distribute(self, data: Dict, filename: str) -> Dict:
-        """Upload a JSON-serializable dict to cloud storage."""
-        if not self._clients:
-            return {'status': 'no_client', 'reason': f'No SDK for {self.config.cloud_provider}'}
-        try:
-            data_bytes = json.dumps(data, default=str).encode('utf-8')
-            provider = self.config.cloud_provider
-            if provider == 'aws':
-                client = self._clients['aws']
-                client.put_object(
-                    Bucket=self.config.cloud_bucket,
-                    Key=filename,
-                    Body=data_bytes
-                )
-                return {'status': 'success', 'url': f"s3://{self.config.cloud_bucket}/{filename}"}
-            elif provider == 'azure':
-                client = self._clients['azure']
-                container_client = client.get_container_client(self.config.cloud_bucket)
-                blob_client = container_client.get_blob_client(filename)
-                blob_client.upload_blob(data_bytes, overwrite=True)
-                return {'status': 'success', 'url': f"azure://{self.config.cloud_bucket}/{filename}"}
-            elif provider == 'gcp':
-                client = self._clients['gcp']
-                bucket = client.bucket(self.config.cloud_bucket)
-                blob = bucket.blob(filename)
-                blob.upload_from_string(data_bytes, content_type='application/json')
-                return {'status': 'success', 'url': f"gs://{self.config.cloud_bucket}/{filename}"}
-        except Exception as e:
-            logger.error(f"Cloud distribution failed: {e}")
-            return {'status': 'failed', 'error': str(e)}
-        return {'status': 'no_client'}
-
-# ============================================================================
-# Real Autonomous Optimizer (Q-learning)
-# ============================================================================
-
-class AutonomousStrategySelector:
-    """Q-learning agent for strategy selection."""
-    def __init__(self, config: AgentConfig):
-        self.config = config
+        self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: {s: 0.0 for s in config.rl_strategies})
         self.learning_rate = config.rl_learning_rate
         self.discount_factor = config.rl_discount_factor
-        self.exploration_rate = config.rl_exploration_rate
-        self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        self.total_updates = 0
-        self.actions = ['conservative', 'balanced', 'performance']
+        self.epsilon = config.rl_epsilon
+        self.last_state_key = None
+        self.last_action = None
+        self.actions = config.rl_strategies
+        self.state_bins = config.rl_state_bins
 
-    def _state_to_key(self, state: Dict) -> str:
+    def _state_to_key(self, state: Dict[str, float]) -> str:
+        """
+        Discretize continuous state values into bins.
+        State keys:
+        - system_load
+        - health_score
+        - token_balance
+        - energy_intensity  (new)
+        - helium_level      (new)
+        - carbon_leakage_proxy (new)
+        """
         load = state.get('system_load', 0.5)
         health = state.get('health_score', 0.8)
         token = state.get('token_balance', 0)
+        energy = state.get('energy_intensity', 0.5)
+        helium = state.get('helium_level', 0.5)
+        carbon = state.get('carbon_leakage_proxy', 0.3)
+
+        # Bin each dimension
         load_bin = 'high' if load > 0.7 else 'medium' if load > 0.4 else 'low'
         health_bin = 'good' if health > 0.7 else 'medium' if health > 0.4 else 'poor'
         token_bin = 'abundant' if token > 1000 else 'adequate' if token > 100 else 'scarce'
-        return f"{load_bin}_{health_bin}_{token_bin}"
+        energy_bin = 'heavy' if energy > 0.7 else 'normal' if energy > 0.4 else 'light'
+        helium_bin = 'scarce' if helium < 0.3 else 'normal' if helium < 0.7 else 'abundant'
+        # Carbon leakage: low is good
+        carbon_bin = 'high' if carbon > 0.6 else 'medium' if carbon > 0.3 else 'low'
 
-    async def select_strategy(self, state: Dict) -> str:
-        state_key = self._state_to_key(state)
-        if random.random() < self.exploration_rate:
-            # Decay exploration
-            self.exploration_rate = max(0.01, self.exploration_rate * 0.999)
-            return random.choice(self.actions)
-        # Exploit
-        q_values = {a: self.q_table[state_key].get(a, 0.0) for a in self.actions}
-        return max(q_values, key=q_values.get)
+        return f"{load_bin}_{health_bin}_{token_bin}_{energy_bin}_{helium_bin}_{carbon_bin}"
 
-    async def update(self, state: Dict, action: str, reward: float, next_state: Dict):
-        state_key = self._state_to_key(state)
-        next_state_key = self._state_to_key(next_state)
-        current_q = self.q_table[state_key][action]
-        max_next_q = max(self.q_table[next_state_key].values()) if self.q_table[next_state_key] else 0
-        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
-        self.q_table[state_key][action] = new_q
-        self.total_updates += 1
+    def select_action(self, state: Dict[str, float]) -> str:
+        """Select an action (strategy) using epsilon‑greedy."""
+        key = self._state_to_key(state)
+        if key not in self.q_table:
+            self.q_table[key] = {s: 0.0 for s in self.actions}
 
-# ============================================================================
-# ... (All other classes: QuantumBridge, TimeTickEngine, VersionedSnapshotManager,
-#      EventPersistenceManager, PredictiveHealthForecaster, PredictiveScalingEngine,
-#      HealthCheckManager, EventBus) remain as in v6.2.0 but with enhancements to use
-#      the new real components where applicable. For brevity, I'll keep them as is,
-#      because the previous version already had complete implementations.
-#      The key changes are in the main agent's __init__ and the new real components.
-# ============================================================================
+        if np.random.random() < self.epsilon:
+            action = np.random.choice(self.actions)
+        else:
+            # Choose action with max Q‑value
+            q_vals = self.q_table[key]
+            max_q = max(q_vals.values())
+            best_actions = [a for a, q in q_vals.items() if q == max_q]
+            action = np.random.choice(best_actions)
 
-# For the sake of completeness, I will include the full main agent class below with all
-# the new integrations.
+        self.last_state_key = key
+        self.last_action = action
+        return action
 
-# ============================================================================
-# Enhanced Bio-Integrated Green Agent (Main Class)
-# ============================================================================
-
-class BioIntegratedGreenAgent:
-    """
-    Enhanced Bio-Integrated Green Agent v6.3.0 with all enterprise features.
-    """
-
-    def __init__(self, config: Optional[AgentConfig] = None):
-        if config is None:
-            config = AgentConfig.from_env_and_file()
-        self.config = config
-        self.state = AgentState.UNINITIALIZED
-
-        issues = self.config.validate()
-        if issues:
-            logger.warning(f"Configuration issues: {issues}")
-
-        # Real security, blockchain, multi-cloud, and autonomous optimizer
-        self.quantum_security = QuantumResilientSecurity(algorithm=self.config.quantum_signing_algorithm) if self.config.enable_quantum_signing else None
-        self.blockchain_auditor = BlockchainAuditor(self.config) if self.config.enable_blockchain_audit else None
-        self.strategy_selector = AutonomousStrategySelector(self.config) if self.config.enable_autonomous_optimizer else None
-        self.multi_cloud = MultiCloudDistributor(self.config) if self.config.enable_multi_cloud else None
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=self.config.circuit_breaker_failure_threshold,
-            timeout_seconds=self.config.circuit_breaker_timeout_seconds
-        ) if self.config.enable_circuit_breaker else None
-
-        # Event bus with persistence and signing
-        self.event_bus = EventBus(self.config, self.quantum_security)
-
-        # Health check manager
-        self.health_manager = HealthCheckManager(self.config)
-
-        # Versioned snapshot manager
-        self.snapshot_manager = VersionedSnapshotManager(
-            state_directory=self.config.state_directory,
-            max_snapshots=self.config.max_snapshots
-        ) if self.config.enable_state_persistence else None
-
-        # Predictive scaling engine
-        self.scaling_engine = PredictiveScalingEngine(
-            lookback_hours=self.config.scaling_lookback_hours,
-            threshold=self.config.scaling_threshold
-        ) if self.config.enable_predictive_scaling else None
-
-        # OpenTelemetry tracer
-        self._tracer = None
-        if OPENTELEMETRY_AVAILABLE and self.config.enable_opentelemetry:
-            try:
-                self._tracer = trace.get_tracer(self.config.service_name)
-                logger.info("OpenTelemetry tracer initialized")
-            except Exception as e:
-                logger.warning(f"Failed to initialize OpenTelemetry tracer: {e}")
-
-        # Module references (same as before)
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
-        self.supply_manager = None
-        self.token_allocator = None
-        self.knowledge_transfer = None
-        self.degradation_manager = None
-        self.quantum_bridge = None
-        self.tick_engine = None
-
-        self._correlation_counter = 0
-        self._background_tasks: List[asyncio.Task] = []
-        self._background_task_status: Dict[str, bool] = {}
-
-        # Metrics
-        self.metrics: Dict[str, Any] = {
-            'agent_state': self.state.value,
-            'token_balance': 0,
-            'total_compartments': 0,
-            'sustainability_score': 0.0,
-            'health_status': HealthStatus.UNKNOWN.value,
-            'last_update': datetime.utcnow().isoformat()
-        }
-        if PROMETHEUS_AVAILABLE and self.config.prometheus_port:
-            try:
-                start_http_server(self.config.prometheus_port)
-                self.prometheus_gauges = { ... }  # (same as before)
-                self.prometheus_counters = { ... }
-                logger.info(f"Prometheus metrics server started on port {self.config.prometheus_port}")
-            except Exception as e:
-                logger.warning(f"Failed to start Prometheus server: {e}")
-
-        # FastAPI health endpoint (if enabled)
-        if FASTAPI_AVAILABLE and self.config.enable_health_endpoint:
-            asyncio.create_task(self._start_health_server())
-
-        self._initialize()
-        self._register_signal_handlers()
-        logger.info("Bio-Integrated Green Agent v6.3.0 initialized")
-
-    async def _start_health_server(self):
-        if not FASTAPI_AVAILABLE:
+    def update(self, state: Dict[str, float], action: str, reward: float, next_state: Dict[str, float]):
+        """Update Q‑table using Q‑learning."""
+        if self.last_state_key is None or self.last_action is None:
             return
-        app = FastAPI()
-        @app.get("/health")
-        async def health():
-            return {
-                'status': self.health_manager.overall_status.value,
-                'ready': self.health_manager.is_ready(),
-                'alive': self.health_manager.is_alive()
-            }
-        @app.get("/metrics")
-        async def metrics():
-            return self.get_metrics()
-        config = uvicorn.Config(app, host="0.0.0.0", port=self.config.health_endpoint_port, log_level="info")
-        server = uvicorn.Server(config)
-        await server.serve()
+        key = self._state_to_key(state)
+        next_key = self._state_to_key(next_state)
 
-    # ... (rest of the class remains mostly the same, with calls to the new components)
+        # Ensure tables exist
+        if key not in self.q_table:
+            self.q_table[key] = {s: 0.0 for s in self.actions}
+        if next_key not in self.q_table:
+            self.q_table[next_key] = {s: 0.0 for s in self.actions}
+
+        # Q‑learning update
+        max_next = max(self.q_table[next_key].values())
+        current_q = self.q_table[key][action]
+        self.q_table[key][action] = current_q + self.learning_rate * (
+            reward + self.discount_factor * max_next - current_q
+        )
+
+    def get_q_table_size(self) -> int:
+        return len(self.q_table)
+
+    def get_best_strategy(self, state: Dict[str, float]) -> str:
+        key = self._state_to_key(state)
+        if key not in self.q_table:
+            return 'balanced'
+        q_vals = self.q_table[key]
+        return max(q_vals, key=q_vals.get)
 
 # ============================================================================
-# (The rest of the file – all other classes – are unchanged from v6.2.0,
-#  because they were already complete. Only the main agent and the new
-#  real components are shown above.)
+# Core Bio‑Integrated Agent
 # ============================================================================
 
+class BioIntegratedAgent:
+    """
+    Main agent that orchestrates all bio‑inspired modules, with energy‑aware RL,
+    persistent PQC keys, and selective blockchain auditing.
+    """
+
+    def __init__(
+        self,
+        config: Optional[Union[AgentConfig, Dict[str, Any]]] = None,
+        csv_path: Optional[str] = None,
+        quantum_graph: Optional[Any] = None,
+        token_manager: Optional[Any] = None,
+        gradient_manager: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        compartment_manager: Optional[Any] = None,
+        biomass_storage: Optional[Any] = None,
+        harvester: Optional[Any] = None,
+        tick_engine: Optional[Any] = None,
+        quantum_bridge: Optional[Any] = None,
+    ):
+        # Load config
+        if isinstance(config, dict):
+            if PYDANTIC_AVAILABLE:
+                self.config = AgentConfig(**config)
+            else:
+                self.config = AgentConfig(**config)
+        elif isinstance(config, AgentConfig):
+            self.config = config
+        else:
+            self.config = AgentConfig()
+
+        # Inject dependencies or create defaults
+        self.token_manager = token_manager or (EcoATPTokenManager() if TOKEN_AVAILABLE else None)
+        self.gradient_manager = gradient_manager or (GradientFieldManager() if GRADIENT_AVAILABLE else None)
+        self.scheduler = scheduler or (ATPSynthaseScheduler(self.token_manager, self.gradient_manager) if ATP_AVAILABLE else None)
+        self.compartment_manager = compartment_manager or (HierarchicalCompartmentManager(self.token_manager) if COMPARTMENT_AVAILABLE else None)
+        self.biomass_storage = biomass_storage or (BiomassStorage(self.token_manager, self.gradient_manager) if BIOMASS_AVAILABLE else None)
+        self.harvester = harvester or (PhotosyntheticHarvester(self.token_manager) if HARVESTER_AVAILABLE else None)
+
+        # Optional advanced modules
+        self.tick_engine = tick_engine
+        if self.config.enable_time_tick_engine and csv_path and TICK_ENGINE_AVAILABLE:
+            from .time_tick_engine import TimeTickEngine
+            self.tick_engine = TimeTickEngine(
+                csv_path=csv_path,
+                harvester=self.harvester,
+                translator_class=HeliumEnvironmentTranslator
+            )
+        self.quantum_bridge = quantum_bridge
+        if self.config.enable_quantum_bridge and QUANTUM_BRIDGE_AVAILABLE and quantum_graph:
+            from .quantum_bridge import QuantumBridge
+            self.quantum_bridge = QuantumBridge(self.gradient_manager, quantum_graph)
+
+        # Security and auditing
+        self.security = QuantumResilientSecurity(self.config)
+        self.auditor = BlockchainAuditor(self.config, self.security)
+
+        # RL strategy selector
+        self.strategy_selector = RLStrategySelector(self.config) if self.config.enable_energy_aware_rl else None
+        self.current_strategy = 'balanced'
+        self.strategy_change_time = datetime.now(timezone.utc)
+
+        # State and metrics
+        self.state = self._get_initial_state()
+        self.metrics = {
+            'strategy_changes': 0,
+            'total_reward': 0.0,
+            'energy_efficiency': 0.0,
+            'helium_efficiency': 0.0,
+        }
+
+        # Background tasks
+        self._task_manager = TaskManager()
+        self._task_manager.start_task("strategy_loop", self._strategy_update_loop)
+        self._task_manager.start_task("state_save", self._state_save_loop)
+        self._task_manager.start_task("daily_snapshot", self._daily_snapshot_loop)
+
+        logger.info(f"BioIntegratedAgent initialized with ID {self.config.agent_id}")
+
+    def _get_initial_state(self) -> Dict[str, float]:
+        """Initial state placeholder."""
+        return {
+            'system_load': 0.5,
+            'health_score': 0.8,
+            'token_balance': 500,
+            'energy_intensity': 0.5,
+            'helium_level': 0.5,
+            'carbon_leakage_proxy': 0.3,
+        }
+
+    async def get_strategy_state(self) -> Dict[str, float]:
+        """
+        Aggregate current system metrics into a state vector for RL.
+        Includes energy and helium signals from services and tick engine.
+        """
+        state = {}
+        # Token balance
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            state['token_balance'] = summary.get('total_balance', 500)
+        else:
+            state['token_balance'] = 500
+
+        # System load (approximate from scheduler or compartments)
+        if self.scheduler:
+            stats = self.scheduler.get_scheduler_stats()
+            state['system_load'] = stats.get('demand_level', 0.5)
+        elif self.compartment_manager:
+            stats = self.compartment_manager.get_ecosystem_stats()
+            state['system_load'] = 1.0 - stats.get('viable_compartments', 0) / max(stats.get('total_compartments', 1), 1)
+        else:
+            state['system_load'] = 0.5
+
+        # Health score
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            health = stats.get('pigment_health', {})
+            avg_health = np.mean([h.get('efficiency', 0.5) for h in health.values()]) if health else 0.8
+            state['health_score'] = avg_health
+        else:
+            state['health_score'] = 0.8
+
+        # Energy intensity: average tokens consumed per task or gradient utilization
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            total_generated = summary.get('total_generated', 0)
+            total_consumed = summary.get('total_consumed', 0)
+            if total_generated > 0:
+                state['energy_intensity'] = total_consumed / total_generated
+            else:
+                state['energy_intensity'] = 0.5
+        else:
+            state['energy_intensity'] = 0.5
+
+        # Helium level: from tick engine or gradient manager
+        helium_level = 0.5
+        if self.tick_engine:
+            # Assume tick_engine has a method to get current helium level
+            if hasattr(self.tick_engine, 'get_current_helium'):
+                helium_level = self.tick_engine.get_current_helium()
+            elif hasattr(self.tick_engine, 'current_data'):
+                # Fallback: use last row
+                helium_level = self.tick_engine.current_data.get('helium_supply', 0.5)
+        elif self.gradient_manager:
+            strengths = self.gradient_manager.get_field_strengths()
+            helium_level = strengths.get('helium', 0.5)
+        state['helium_level'] = max(0.0, min(1.0, helium_level))
+
+        # Carbon leakage proxy: from gradient carbon or anomaly rate
+        if self.gradient_manager:
+            strengths = self.gradient_manager.get_field_strengths()
+            carbon = strengths.get('carbon', 0.5)
+            state['carbon_leakage_proxy'] = max(0.0, min(1.0, carbon))
+        else:
+            state['carbon_leakage_proxy'] = 0.3
+
+        return state
+
+    async def _compute_reward(self, state: Dict[str, float]) -> float:
+        """
+        Compute reward based on sustainability metrics.
+        Positive: high sustainability_score, high token_efficiency.
+        Negative: high energy_intensity, high helium leakage, high carbon leakage.
+        """
+        sustainability_score = 0.0
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            balance = summary.get('total_balance', 0)
+            if balance > 1000:
+                sustainability_score += 0.2
+            elif balance > 500:
+                sustainability_score += 0.1
+
+        token_efficiency = 1.0 - state.get('energy_intensity', 0.5)
+
+        energy_intensity_penalty = state.get('energy_intensity', 0.5)
+        helium_leakage_penalty = 1.0 - state.get('helium_level', 0.5)
+        carbon_leakage_penalty = state.get('carbon_leakage_proxy', 0.3)
+
+        reward = (
+            + 0.4 * sustainability_score
+            + 0.2 * token_efficiency
+            - 0.2 * energy_intensity_penalty
+            - 0.2 * helium_leakage_penalty
+            - 0.2 * carbon_leakage_penalty
+        )
+        return reward
+
+    async def _strategy_update_loop(self):
+        """Background loop that periodically updates RL strategy."""
+        while True:
+            try:
+                # Get current state
+                state = await self.get_strategy_state()
+                self.state = state
+
+                # Select strategy
+                if self.strategy_selector:
+                    action = self.strategy_selector.select_action(state)
+                    # Apply strategy policies
+                    self.apply_strategy(action)
+                    self.current_strategy = action
+                    self.strategy_change_time = datetime.now(timezone.utc)
+                    self.metrics['strategy_changes'] += 1
+
+                    # After a delay, compute reward and update Q‑table
+                    # We'll compute reward based on the next state after applying strategy
+                    await asyncio.sleep(self.config.state_save_interval_seconds)
+                    next_state = await self.get_strategy_state()
+                    reward = await self._compute_reward(next_state)
+                    self.metrics['total_reward'] += reward
+                    self.strategy_selector.update(state, action, reward, next_state)
+
+                    # Audit strategy change if important
+                    importance = 0.7 if action != 'balanced' else 0.3
+                    await self.auditor.record_event(
+                        'strategy_change',
+                        {'new_strategy': action, 'state': state, 'reward': reward},
+                        importance=importance
+                    )
+                else:
+                    # No RL: use balanced
+                    self.apply_strategy('balanced')
+
+                # Update metrics
+                await self._update_metrics(state)
+
+                # Sleep until next cycle (configurable)
+                await asyncio.sleep(self.config.state_save_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Strategy loop error", error=str(e))
+                await asyncio.sleep(30)
+
+    def apply_strategy(self, strategy: str):
+        """
+        Apply the policies associated with the strategy to the system.
+        Overrides relevant config parameters and propagates to modules.
+        """
+        policy = self.config.strategy_policies.get(strategy, self.config.strategy_policies['balanced'])
+        logger.info(f"Applying strategy '{strategy}' with policy: {policy}")
+
+        # Update agent config
+        for key, value in policy.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+
+        # Propagate to modules
+        # Example: adjust state_save_interval, health_check_interval, etc.
+        # This could also adjust scheduler parameters, competition interval, etc.
+        if self.scheduler:
+            # Adjust competition interval (if scheduler has method)
+            if hasattr(self.scheduler, 'set_competition_interval'):
+                self.scheduler.set_competition_interval(policy.get('competition_interval', 3600))
+        if self.harvester:
+            # Adjust harvest rate or mode based on throughput
+            pass
+        # Notify other modules as needed
+
+    async def _state_save_loop(self):
+        """Periodically save agent state to disk."""
+        while True:
+            try:
+                await self.save_state()
+                await asyncio.sleep(self.config.state_save_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("State save error", error=str(e))
+                await asyncio.sleep(60)
+
+    async def _daily_snapshot_loop(self):
+        """Take a daily snapshot and record on blockchain if important."""
+        while True:
+            try:
+                await asyncio.sleep(86400)  # 24 hours
+                snapshot = {
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'state': self.state,
+                    'metrics': self.metrics,
+                    'strategy': self.current_strategy,
+                    'agent_id': self.config.agent_id
+                }
+                # Record daily snapshot with importance 0.6 (above threshold)
+                await self.auditor.record_event('daily_snapshot', snapshot, importance=0.6)
+                logger.info("Daily snapshot recorded.")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Daily snapshot error", error=str(e))
+                await asyncio.sleep(3600)
+
+    async def _update_metrics(self, state: Dict[str, float]):
+        """Update internal metrics."""
+        self.metrics['energy_efficiency'] = 1.0 - state.get('energy_intensity', 0.5)
+        self.metrics['helium_efficiency'] = state.get('helium_level', 0.5)
+
+    async def save_state(self):
+        """Serialize agent state to disk."""
+        state_data = {
+            'agent_id': self.config.agent_id,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'state': self.state,
+            'metrics': self.metrics,
+            'current_strategy': self.current_strategy,
+            'strategy_change_time': self.strategy_change_time.isoformat(),
+            'q_table': dict(self.strategy_selector.q_table) if self.strategy_selector else None,
+        }
+        try:
+            with open(self.config.state_save_path, 'wb') as f:
+                pickle.dump(state_data, f)
+            logger.debug("State saved.")
+        except Exception as e:
+            logger.error("Failed to save state", error=str(e))
+
+    async def load_state(self, path: Optional[str] = None):
+        """Load agent state from disk."""
+        path = path or self.config.state_save_path
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            self.state = data.get('state', self.state)
+            self.metrics = data.get('metrics', self.metrics)
+            self.current_strategy = data.get('current_strategy', 'balanced')
+            if data.get('q_table') and self.strategy_selector:
+                self.strategy_selector.q_table = defaultdict(dict, data['q_table'])
+            logger.info("State loaded.")
+        except Exception as e:
+            logger.error("Failed to load state", error=str(e))
+
+    async def shutdown(self):
+        """Gracefully shut down all components."""
+        logger.info("Shutting down BioIntegratedAgent")
+        await self._task_manager.stop_all()
+        # Save final state
+        await self.save_state()
+        # Close tick engine if any
+        if self.tick_engine and hasattr(self.tick_engine, 'shutdown'):
+            await self.tick_engine.shutdown()
+        # Close quantum bridge if any
+        if self.quantum_bridge and hasattr(self.quantum_bridge, 'shutdown'):
+            await self.quantum_bridge.shutdown()
+        logger.info("Agent shutdown complete")
+
 # ============================================================================
-# Example usage (commented out)
+# Task Manager (copied from previous modules)
 # ============================================================================
-# async def example_usage():
-#     agent = BioIntegratedGreenAgent()
-#     if agent.tick_engine:
-#         await agent.tick_engine.run_continuous_simulation(tick_interval_seconds=0.1)
-#     status = agent.get_system_status()
-#     print(json.dumps(status, indent=2))
-#
-# if __name__ == "__main__":
-#     asyncio.run(example_usage())
+
+class TaskManager:
+    """Manages background tasks with restart and exponential backoff."""
+    def __init__(self):
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.shutdown_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    def start_task(self, name: str, coro_func, *args, **kwargs):
+        async def wrapper():
+            backoff = 1
+            max_backoff = 300
+            while not self.shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        task = asyncio.create_task(wrapper(), name=name)
+        async with self._lock:
+            self.tasks[name] = task
+        return task
+
+    async def stop_all(self):
+        self.shutdown_event.set()
+        async with self._lock:
+            for task in self.tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            self.tasks.clear()
+        logger.info("All background tasks stopped")
+
+# ============================================================================
+# Example usage
+# ============================================================================
+
+async def example():
+    """Example usage of the BioIntegratedAgent."""
+    config = {
+        'enable_energy_aware_rl': True,
+        'enable_time_tick_engine': True,
+        'enable_quantum_bridge': True,
+        'pqc_key_dir': './pqc_keys',
+        'state_save_path': './agent_state.pkl',
+    }
+    agent = BioIntegratedAgent(config=config, csv_path="helium_data.csv")
+    # Let it run for a few seconds
+    await asyncio.sleep(10)
+    # Get current state
+    state = await agent.get_strategy_state()
+    print("Current state:", state)
+    print("Current strategy:", agent.current_strategy)
+    print("Metrics:", agent.metrics)
+    await agent.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(example())
