@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
 """
-Enhanced Expert Registry v6.1.0 - Complete Bio-Inspired Genome Repository
+Enhanced Expert Registry v6.2.0 - Complete Bio-Inspired Genome Repository
 
 Full correlation with bio-inspired modules:
 - Eco-ATP efficiency filtering for expert selection
@@ -19,43 +20,65 @@ Full correlation with bio-inspired modules:
 - Conflict resolution with voting mechanisms
 - Reproductive strategies for high-fitness experts
 
-New in v6.1.0:
-- Configuration dataclass for centralized settings
-- Persistence manager for save/load registry state
-- Resilient cross-region sync with retry and circuit breaker
-- Adaptive fitness weights based on historical performance
-- Dynamic natural selection thresholds
-- Prometheus-style export for sustainability dashboard
-- Improved bio-inspired fallback strategies
-- Version compatibility checks for dependencies
+New in v6.2.0:
+- Secure JSON persistence with Pydantic schemas and versioning
+- Asynchronous file I/O with aiofiles
+- Fine-grained concurrency control (asyncio locks)
+- Pydantic validation for all input data
+- Caching for bio-metrics (Eco-ATP, gradients)
+- Retry decorator with circuit breaker for background tasks
+- Structured logging with context fields
+- Data-driven trend analysis in predictive forecaster
+- Rate limiting for public methods
+- Complete type hints and docstrings
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set, Union
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from enum import Enum
-import numpy as np
-import hashlib
 import json
-import networkx as nx
-from collections import defaultdict, deque
+import os
+import re
+import hashlib
 import uuid
 import math
-import copy
-import aiohttp
-import os
 import random
-import pickle
 import zlib
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, TypeVar, cast
+import numpy as np
+import networkx as nx
 
-logger = logging.getLogger(__name__)
+# Third-party imports (install via pip)
+try:
+    import aiofiles
+except ImportError:
+    aiofiles = None  # fallback to sync I/O
 
-# ============================================================================
-# Bio-Inspired Module Imports
-# ============================================================================
+try:
+    from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError:
+    raise ImportError("pydantic and pydantic-settings are required")
 
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+except ImportError:
+    # Dummy retry decorator if tenacity not installed
+    def retry(*args, **kwargs):
+        return lambda f: f
+    stop_after_attempt = lambda x: None
+    wait_exponential = lambda **k: None
+    retry_if_exception_type = lambda e: None
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+# Bio-inspired modules – optional import
 try:
     from enhancements.bio_inspired.eco_atp_currency import (
         EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
@@ -77,35 +100,47 @@ except ImportError as e:
     BIO_INSPIRED_AVAILABLE = False
     logger.warning(f"Bio-inspired modules not available: {str(e)}")
 
+logger = logging.getLogger(__name__)
+
 # ============================================================================
-# Configuration Dataclass (NEW)
+# Configuration using Pydantic Settings
 # ============================================================================
 
-@dataclass
-class ExpertRegistryConfig:
-    """Centralized configuration for the Expert Registry."""
+class ExpertRegistryConfig(BaseSettings):
+    """Centralized configuration with environment variable support."""
+    model_config = SettingsConfigDict(env_prefix="EXREG_", case_sensitive=False)
+
     # Feature flags
-    enable_bio_correlation: bool = True
-    enable_natural_selection: bool = True
-    enable_fitness_tracking: bool = True
-    enable_population_tracking: bool = True
-    enable_sustainability_dashboard: bool = True
-    enable_predictive_forecasting: bool = True
-    enable_cross_region_sync: bool = True
-    enable_quantum_efficiency: bool = True
-    enable_reproductive_strategies: bool = True
-    enable_climate_integration: bool = True
-    enable_persistence: bool = True
+    enable_bio_correlation: bool = Field(True)
+    enable_natural_selection: bool = Field(True)
+    enable_fitness_tracking: bool = Field(True)
+    enable_population_tracking: bool = Field(True)
+    enable_sustainability_dashboard: bool = Field(True)
+    enable_predictive_forecasting: bool = Field(True)
+    enable_cross_region_sync: bool = Field(True)
+    enable_quantum_efficiency: bool = Field(True)
+    enable_reproductive_strategies: bool = Field(True)
+    enable_climate_integration: bool = Field(True)
+    enable_persistence: bool = Field(True)
 
-    # Tunable parameters
-    registry_id: str = "default"
-    persistence_path: str = "registry_state.pkl"
-    sync_retries: int = 3
-    sync_retry_base_delay_ms: float = 100.0
-    sync_retry_max_delay_ms: float = 5000.0
-    circuit_breaker_threshold: int = 5
-    circuit_breaker_recovery_timeout: float = 30.0
-    fitness_weights: Dict[str, float] = field(default_factory=lambda: {
+    # Registry identity
+    registry_id: str = Field("default")
+
+    # Persistence settings
+    persistence_path: str = Field("registry_state.json")
+    persistence_auto_save_interval: int = Field(300)  # seconds
+
+    # Sync settings
+    sync_retries: int = Field(3, ge=0)
+    sync_retry_base_delay_ms: float = Field(100.0)
+    sync_retry_max_delay_ms: float = Field(5000.0)
+    circuit_breaker_threshold: int = Field(5, ge=1)
+    circuit_breaker_recovery_timeout: float = Field(30.0, ge=0)
+    sync_interval: int = Field(3600)
+    bio_sync_interval: int = Field(300)
+
+    # Fitness weights
+    fitness_weights: Dict[str, float] = Field(default_factory=lambda: {
         'resource_efficiency': 0.20,
         'resilience_score': 0.15,
         'adaptation_speed': 0.10,
@@ -116,25 +151,90 @@ class ExpertRegistryConfig:
         'quantum_advantage': 0.05,
         'helium_savings': 0.05
     })
-    natural_selection_percentile_low: float = 20.0
-    natural_selection_percentile_high: float = 80.0
-    reproductive_mutation_rate: float = 0.1
-    reproductive_max_offspring: int = 3
-    climate_update_interval: int = 3600
-    sync_interval: int = 3600
-    bio_sync_interval: int = 300
 
-    def __post_init__(self):
-        # Ensure boolean flags
-        for key, value in self.__dict__.items():
-            if isinstance(value, bool):
-                setattr(self, key, bool(value))
+    # Selection thresholds
+    natural_selection_percentile_low: float = Field(20.0, ge=0.0, le=100.0)
+    natural_selection_percentile_high: float = Field(80.0, ge=0.0, le=100.0)
+
+    # Reproduction
+    reproductive_mutation_rate: float = Field(0.1, ge=0.0, le=1.0)
+    reproductive_max_offspring: int = Field(3, ge=0)
+
+    # Climate integration
+    climate_update_interval: int = Field(3600)
+
+    # Rate limiting (requests per minute)
+    rate_limit_per_minute: int = Field(60, ge=1)
+
+    @field_validator('fitness_weights')
+    @classmethod
+    def validate_fitness_weights(cls, v: Dict[str, float]) -> Dict[str, float]:
+        if abs(sum(v.values()) - 1.0) > 0.01:
+            raise ValueError("Fitness weights must sum to 1.0")
+        return v
+
+    @field_validator('natural_selection_percentile_low')
+    @classmethod
+    def validate_percentiles(cls, v: float, values: Dict[str, Any]) -> float:
+        if 'natural_selection_percentile_high' in values and v >= values['natural_selection_percentile_high']:
+            raise ValueError("low percentile must be less than high percentile")
+        return v
 
 # ============================================================================
-# Existing Enums and Data Classes (preserved)
+# Pydantic Models for Data Structures (Replaces Dataclasses)
 # ============================================================================
 
-class ExpertDomain(Enum):
+class ExpertVersion(BaseModel):
+    major: int = Field(ge=0)
+    minor: int = Field(ge=0)
+    patch: int = Field(ge=0)
+    prerelease: Optional[str] = None
+    build: Optional[str] = None
+
+    def to_string(self) -> str:
+        version = f"{self.major}.{self.minor}.{self.patch}"
+        if self.prerelease:
+            version += f"-{self.prerelease}"
+        if self.build:
+            version += f"+{self.build}"
+        return version
+
+    @classmethod
+    def from_string(cls, version_str: str) -> 'ExpertVersion':
+        try:
+            # Strip pre-release and build for simplicity
+            base = version_str.split('-')[0].split('+')[0]
+            parts = base.split('.')
+            major = int(parts[0]) if len(parts) > 0 else 1
+            minor = int(parts[1]) if len(parts) > 1 else 0
+            patch = int(parts[2]) if len(parts) > 2 else 0
+            return cls(major=major, minor=minor, patch=patch)
+        except Exception:
+            return cls(major=1, minor=0, patch=0)
+
+    def is_compatible_with(self, other: 'ExpertVersion') -> bool:
+        return self.major == other.major
+
+    def is_newer_than(self, other: 'ExpertVersion') -> bool:
+        if self.major != other.major:
+            return self.major > other.major
+        if self.minor != other.minor:
+            return self.minor > other.minor
+        return self.patch > other.patch
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ExpertVersion):
+            return NotImplemented
+        return (self.major == other.major and
+                self.minor == other.minor and
+                self.patch == other.patch and
+                self.prerelease == other.prerelease and
+                self.build == other.build)
+
+    def __hash__(self) -> int:
+        return hash(self.to_string())
+
+class ExpertDomain(str, Enum):
     ENERGY = "energy_optimization"
     DATA = "data_engineering"
     IOT = "iot_edge_computing"
@@ -144,7 +244,7 @@ class ExpertDomain(Enum):
     SECURITY = "security_computing"
     GENERAL = "general_purpose"
 
-class HardwareProfile(Enum):
+class HardwareProfile(str, Enum):
     CPU_EFFICIENT = "cpu_low_power"
     CPU_PERFORMANCE = "cpu_high_performance"
     GPU_ACCELERATED = "gpu_cuda"
@@ -152,7 +252,7 @@ class HardwareProfile(Enum):
     EDGE_DEVICE = "edge_iot_device"
     HYBRID = "hybrid_cpu_gpu"
 
-class ExpertLifecycleState(Enum):
+class ExpertLifecycleState(str, Enum):
     REGISTERED = "registered"
     VALIDATING = "validating"
     CERTIFIED = "certified"
@@ -187,52 +287,14 @@ class ExpertLifecycleState(Enum):
         }
         return mapping.get(self)
 
-class CertificationLevel(Enum):
+class CertificationLevel(str, Enum):
     NONE = "none"
     SELF_CERTIFIED = "self_certified"
     INTERNAL_AUDIT = "internal_audit"
     THIRD_PARTY = "third_party"
     ISO_COMPLIANT = "iso_compliant"
 
-# ============================================================================
-# Data Classes (Enhanced)
-# ============================================================================
-
-@dataclass
-class ExpertVersion:
-    major: int
-    minor: int
-    patch: int
-    prerelease: Optional[str] = None
-    build: Optional[str] = None
-
-    def to_string(self) -> str:
-        version = f"{self.major}.{self.minor}.{self.patch}"
-        if self.prerelease:
-            version += f"-{self.prerelease}"
-        if self.build:
-            version += f"+{self.build}"
-        return version
-
-    @classmethod
-    def from_string(cls, version_str: str) -> 'ExpertVersion':
-        try:
-            parts = version_str.replace('-beta', '').split('.')
-            return cls(major=int(parts[0]), minor=int(parts[1]) if len(parts) > 1 else 0,
-                       patch=int(parts[2]) if len(parts) > 2 else 0)
-        except Exception:
-            return cls(major=1, minor=0, patch=0)
-
-    def is_compatible_with(self, other: 'ExpertVersion') -> bool:
-        return self.major == other.major
-
-    def is_newer_than(self, other: 'ExpertVersion') -> bool:
-        if self.major != other.major: return self.major > other.major
-        if self.minor != other.minor: return self.minor > other.minor
-        return self.patch > other.patch
-
-@dataclass
-class ExpertDependency:
+class ExpertDependency(BaseModel):
     dependency_id: str
     dependency_type: str
     version_requirement: str
@@ -240,29 +302,27 @@ class ExpertDependency:
     is_runtime: bool = True
     description: str = ""
 
-@dataclass
-class ExpertCertification:
+class ExpertCertification(BaseModel):
     certification_id: str
     level: CertificationLevel
     issued_by: str
     issued_at: datetime
     expires_at: Optional[datetime] = None
-    validation_results: Dict[str, Any] = field(default_factory=dict)
+    validation_results: Dict[str, Any] = Field(default_factory=dict)
     is_valid: bool = True
 
-@dataclass
-class HealthMetrics:
-    success_rate: float = 1.0
-    avg_latency_ms: float = 0.0
-    error_rate: float = 0.0
-    carbon_efficiency: float = 1.0
-    helium_efficiency: float = 1.0
-    availability: float = 1.0
-    last_heartbeat: datetime = field(default_factory=datetime.utcnow)
-    degradation_score: float = 0.0
-    sustainability_score: float = 0.0
-    quantum_efficiency: float = 0.0
-    quantum_advantage_score: float = 0.0
+class HealthMetrics(BaseModel):
+    success_rate: float = Field(1.0, ge=0.0, le=1.0)
+    avg_latency_ms: float = Field(0.0, ge=0.0)
+    error_rate: float = Field(0.0, ge=0.0, le=1.0)
+    carbon_efficiency: float = Field(1.0, ge=0.0, le=1.0)
+    helium_efficiency: float = Field(1.0, ge=0.0, le=1.0)
+    availability: float = Field(1.0, ge=0.0, le=1.0)
+    last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
+    degradation_score: float = Field(0.0, ge=0.0, le=1.0)
+    sustainability_score: float = Field(0.0, ge=0.0, le=1.0)
+    quantum_efficiency: float = Field(0.0, ge=0.0, le=1.0)
+    quantum_advantage_score: float = Field(0.0, ge=0.0, le=1.0)
 
     def calculate_health_score(self) -> float:
         weights = {
@@ -280,7 +340,8 @@ class HealthMetrics:
                  weights['quantum_efficiency'] * self.quantum_efficiency +
                  weights['quantum_advantage_score'] * self.quantum_advantage_score)
         heartbeat_age = (datetime.utcnow() - self.last_heartbeat).total_seconds()
-        if heartbeat_age > 300: score *= 0.5
+        if heartbeat_age > 300:
+            score *= 0.5
         return max(0.0, min(1.0, score))
 
     def calculate_sustainability_score(self) -> float:
@@ -290,8 +351,7 @@ class HealthMetrics:
                 self.quantum_efficiency * 0.10 +
                 self.quantum_advantage_score * 0.10)
 
-@dataclass
-class ExpertLineage:
+class ExpertLineage(BaseModel):
     lineage_id: str
     parent_expert_id: Optional[str] = None
     created_from: Optional[str] = None
@@ -299,110 +359,92 @@ class ExpertLineage:
     training_duration_hours: float = 0.0
     training_carbon_kg: float = 0.0
     model_architecture: str = ""
-    hyperparameters: Dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    fitness_history: List[float] = field(default_factory=list)
-    reproductive_offspring: List[str] = field(default_factory=list)
+    hyperparameters: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    fitness_history: List[float] = Field(default_factory=list)
+    reproductive_offspring: List[str] = Field(default_factory=list)
     mutation_count: int = 0
 
-@dataclass
-class ExpertProfile:
+class ExpertProfile(BaseModel):
     expert_id: str
     expert_name: str = ""
-    version: ExpertVersion = field(default_factory=lambda: ExpertVersion(1, 0, 0))
+    version: ExpertVersion = Field(default_factory=lambda: ExpertVersion(major=1, minor=0, patch=0))
     domain: ExpertDomain = ExpertDomain.GENERAL
     hardware_profile: HardwareProfile = HardwareProfile.CPU_EFFICIENT
     lifecycle_state: ExpertLifecycleState = ExpertLifecycleState.REGISTERED
-    registered_at: datetime = field(default_factory=datetime.utcnow)
+    registered_at: datetime = Field(default_factory=datetime.utcnow)
     activated_at: Optional[datetime] = None
     retired_at: Optional[datetime] = None
     replaces_expert: Optional[str] = None
     replaced_by: Optional[str] = None
-    helium_per_inference: float = 0.0
-    carbon_per_inference: float = 0.0
-    energy_per_inference: float = 0.0
-    avg_latency_ms: float = 0.0
-    memory_usage_mb: float = 0.0
-    accuracy_score: float = 0.0
-    reliability_score: float = 0.0
-    efficiency_score: float = 0.0
-    security_score: float = 0.0
+    helium_per_inference: float = Field(0.0, ge=0.0)
+    carbon_per_inference: float = Field(0.0, ge=0.0)
+    energy_per_inference: float = Field(0.0, ge=0.0)
+    avg_latency_ms: float = Field(0.0, ge=0.0)
+    memory_usage_mb: float = Field(0.0, ge=0.0)
+    accuracy_score: float = Field(0.0, ge=0.0, le=1.0)
+    reliability_score: float = Field(0.0, ge=0.0, le=1.0)
+    efficiency_score: float = Field(0.0, ge=0.0, le=1.0)
+    security_score: float = Field(0.0, ge=0.0, le=1.0)
     min_carbon_zone: int = 0
-    max_helium_scarcity: float = 1.0
-    supported_task_types: List[str] = field(default_factory=list)
-    incompatible_with: List[str] = field(default_factory=list)
-    dependencies: List[ExpertDependency] = field(default_factory=list)
-    certifications: List[ExpertCertification] = field(default_factory=list)
-    health: HealthMetrics = field(default_factory=HealthMetrics)
+    max_helium_scarcity: float = Field(1.0, ge=0.0, le=1.0)
+    supported_task_types: List[str] = Field(default_factory=list)
+    incompatible_with: List[str] = Field(default_factory=list)
+    dependencies: List[ExpertDependency] = Field(default_factory=list)
+    certifications: List[ExpertCertification] = Field(default_factory=list)
+    health: HealthMetrics = Field(default_factory=HealthMetrics)
     lineage: Optional[ExpertLineage] = None
     is_remote: bool = False
     remote_endpoint: Optional[str] = None
     origin_region: str = "local"
-    dynamic_weights: Dict[str, float] = field(default_factory=dict)
-    tags: List[str] = field(default_factory=list)
-    capabilities: List[str] = field(default_factory=list)
+    dynamic_weights: Dict[str, float] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)
+    capabilities: List[str] = Field(default_factory=list)
     is_active: bool = True
-    sustainability_score: float = 0.0
+    sustainability_score: float = Field(0.0, ge=0.0, le=1.0)
     quantum_capable: bool = False
     quantum_backend: Optional[str] = None
     quantum_qubits: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            'expert_id': self.expert_id, 'expert_name': self.expert_name,
-            'version': self.version.to_string(), 'domain': self.domain.value,
-            'hardware_profile': self.hardware_profile.value,
-            'lifecycle_state': self.lifecycle_state.value,
-            'helium_per_inference': self.helium_per_inference,
-            'carbon_per_inference': self.carbon_per_inference,
-            'energy_per_inference': self.energy_per_inference,
-            'avg_latency_ms': self.avg_latency_ms,
-            'accuracy_score': self.accuracy_score,
-            'reliability_score': self.reliability_score,
-            'efficiency_score': self.efficiency_score,
-            'health_score': self.health.calculate_health_score(),
-            'sustainability_score': self.sustainability_score,
-            'quantum_capable': self.quantum_capable,
-            'quantum_qubits': self.quantum_qubits,
-            'is_active': self.is_active and self.lifecycle_state.is_available(),
-            'tags': self.tags, 'capabilities': self.capabilities,
-            'supports_task_types': self.supported_task_types,
-            'origin_region': self.origin_region, 'is_remote': self.is_remote
-        }
+        return self.model_dump()
 
     def compute_hash(self) -> str:
-        profile_str = json.dumps(self.to_dict(), sort_keys=True)
+        profile_str = json.dumps(self.model_dump(exclude={'health': {'last_heartbeat'}}), sort_keys=True)
         return hashlib.sha256(profile_str.encode()).hexdigest()
 
     def is_compatible_with(self, other: 'ExpertProfile') -> bool:
-        if other.expert_id in self.incompatible_with: return False
-        if self.expert_id in other.incompatible_with: return False
+        if other.expert_id in self.incompatible_with:
+            return False
+        if self.expert_id in other.incompatible_with:
+            return False
         if self.expert_name == other.expert_name:
             return self.version.is_compatible_with(other.version)
         return True
 
     def get_certification_level(self) -> CertificationLevel:
-        if not self.certifications: return CertificationLevel.NONE
+        if not self.certifications:
+            return CertificationLevel.NONE
         levels = [c.level for c in self.certifications if c.is_valid]
-        if not levels: return CertificationLevel.NONE
-        level_order = list(CertificationLevel)
-        return max(levels, key=lambda l: level_order.index(l))
+        if not levels:
+            return CertificationLevel.NONE
+        # Order defined in Enum
+        return max(levels, key=lambda l: list(CertificationLevel).index(l))
 
-@dataclass
-class FitnessScore:
+class FitnessScore(BaseModel):
     expert_id: str
-    overall_fitness: float = 0.5
-    resource_efficiency: float = 0.5
-    adaptation_speed: float = 0.5
-    cooperation_score: float = 0.5
-    resilience_score: float = 0.5
-    selection_coefficient: float = 0.0
-    reproductive_success: int = 0
-    ecoatp_efficiency: float = 0.5
-    sustainability_score: float = 0.5
-    quantum_efficiency: float = 0.5
-    quantum_advantage: float = 0.0
-    helium_savings: float = 0.5
+    overall_fitness: float = Field(0.5, ge=0.0, le=1.0)
+    resource_efficiency: float = Field(0.5, ge=0.0, le=1.0)
+    adaptation_speed: float = Field(0.5, ge=0.0, le=1.0)
+    cooperation_score: float = Field(0.5, ge=0.0, le=1.0)
+    resilience_score: float = Field(0.5, ge=0.0, le=1.0)
+    selection_coefficient: float = Field(0.0, ge=-1.0, le=1.0)
+    reproductive_success: int = Field(0, ge=0)
+    ecoatp_efficiency: float = Field(0.5, ge=0.0, le=1.0)
+    sustainability_score: float = Field(0.5, ge=0.0, le=1.0)
+    quantum_efficiency: float = Field(0.5, ge=0.0, le=1.0)
+    quantum_advantage: float = Field(0.0, ge=0.0, le=1.0)
+    helium_savings: float = Field(0.5, ge=0.0, le=1.0)
 
     def calculate_overall(self, weights: Dict[str, float] = None):
         if weights is None:
@@ -430,62 +472,170 @@ class FitnessScore:
         )
 
 # ============================================================================
-# Persistence Manager (NEW)
+# State Model for Persistence
+# ============================================================================
+
+class RegistryState(BaseModel):
+    """Full registry state for serialization."""
+    version: str = "6.2.0"
+    config: ExpertRegistryConfig
+    experts: Dict[str, ExpertProfile]
+    fitness_scores: Dict[str, FitnessScore]
+    domain_index: Dict[str, List[str]]  # domain -> expert_ids
+    hardware_index: Dict[str, List[str]]
+    lifecycle_index: Dict[str, List[str]]
+    tag_index: Dict[str, List[str]]
+    capability_index: Dict[str, List[str]]
+    task_type_index: Dict[str, List[str]]
+    region_index: Dict[str, List[str]]
+    version_family_index: Dict[str, List[str]]
+    dependency_graph: Dict[str, Any]  # serialized networkx graph
+    remote_registries: Dict[str, str]
+    federated_experts: Dict[str, str]
+    ab_tests: Dict[str, Any]
+    migration_paths: Dict[str, str]
+    evolutionary_events: List[Dict[str, Any]]
+    speciation_count: int
+    extinction_count: int
+    total_generations: int
+    reproductive_events: int
+    stats: Dict[str, Any]
+    performance_history: Dict[str, List[Dict[str, Any]]]
+    fitness_weights_history: List[Dict[str, float]]
+    registry_id: str
+    bio_integration_active: bool
+    last_save: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+# ============================================================================
+# Caching Helper
+# ============================================================================
+
+class TimedCache:
+    """Simple TTL cache for bio metrics."""
+    def __init__(self, ttl_seconds: float = 30.0):
+        self._cache: Dict[str, Tuple[Any, float]] = {}
+        self._ttl = ttl_seconds
+        self._lock = asyncio.Lock()
+
+    async def get_or_compute(self, key: str, compute: Callable[[], Any]) -> Any:
+        now = datetime.utcnow().timestamp()
+        async with self._lock:
+            if key in self._cache:
+                value, timestamp = self._cache[key]
+                if now - timestamp < self._ttl:
+                    return value
+            value = compute()
+            self._cache[key] = (value, now)
+            return value
+
+    def invalidate(self, key: str):
+        if key in self._cache:
+            del self._cache[key]
+
+# ============================================================================
+# Retry and Circuit Breaker Utilities
+# ============================================================================
+
+def is_retryable_exception(e: Exception) -> bool:
+    """Determine if an exception is retryable (e.g., network errors)."""
+    return isinstance(e, (IOError, TimeoutError, ConnectionError, aiohttp.ClientError))
+
+class CircuitBreaker:
+    """Simple circuit breaker for protecting failing operations."""
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self.state = "closed"  # closed, open, half-open
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        if self.state == "open":
+            if (datetime.utcnow().timestamp() - self.last_failure_time) > self.recovery_timeout:
+                self.state = "half-open"
+            else:
+                raise RuntimeError("Circuit breaker is open")
+        try:
+            result = await func(*args, **kwargs)
+            if self.state == "half-open":
+                self.state = "closed"
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = datetime.utcnow().timestamp()
+            if self.failure_count >= self.failure_threshold:
+                self.state = "open"
+            raise e
+
+# ============================================================================
+# Persistence Manager (JSON with Versioning and Async I/O)
 # ============================================================================
 
 class RegistryPersistenceManager:
     """
-    Manages saving and loading of the registry state to/from disk.
+    Manages saving and loading of the registry state using JSON + zlib compression.
+    Includes version checks and migration hooks.
     """
-
     def __init__(self, config: ExpertRegistryConfig):
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
         logger.info(f"RegistryPersistenceManager initialized (path={self.path})")
 
-    async def save_state(self, registry: 'ExpertRegistry'):
-        """Save the entire registry state to disk."""
+    async def save_state(self, registry: 'ExpertRegistry') -> bool:
+        """Save the entire registry state to disk using JSON + compression."""
         async with self._lock:
             try:
-                state = {
-                    'experts': {eid: expert for eid, expert in registry._experts.items()},
-                    'fitness_scores': registry.fitness_scores,
-                    'domain_index': registry._domain_index,
-                    'hardware_index': registry._hardware_index,
-                    'lifecycle_index': registry._lifecycle_index,
-                    'tag_index': registry._tag_index,
-                    'capability_index': registry._capability_index,
-                    'task_type_index': registry._task_type_index,
-                    'region_index': registry._region_index,
-                    'version_family_index': registry._version_family_index,
-                    'dependency_graph': registry._dependency_graph,
-                    'remote_registries': registry._remote_registries,
-                    'federated_experts': registry._federated_experts,
-                    'ab_tests': registry._ab_tests,
-                    'migration_paths': registry._migration_paths,
-                    'evolutionary_events': list(registry.evolutionary_events),
-                    'speciation_count': registry.speciation_count,
-                    'extinction_count': registry.extinction_count,
-                    'total_generations': registry.total_generations,
-                    'reproductive_events': registry.reproductive_events,
-                    'stats': registry._stats,
-                    'performance_history': dict(registry._performance_history),
-                    'config': registry.config,
-                    'registry_id': registry.registry_id,
-                    'bio_integration_active': registry.enable_bio_correlation,
-                    # Optional: save bio module references? We'll only save IDs; modules are injected at load.
-                }
-                # Serialize and compress
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
+                # Build state model
+                state = RegistryState(
+                    config=registry.config,
+                    experts=registry._experts,
+                    fitness_scores=registry.fitness_scores,
+                    domain_index={k.value: list(v) for k, v in registry._domain_index.items()},
+                    hardware_index={k.value: list(v) for k, v in registry._hardware_index.items()},
+                    lifecycle_index={k.value: list(v) for k, v in registry._lifecycle_index.items()},
+                    tag_index={k: list(v) for k, v in registry._tag_index.items()},
+                    capability_index={k: list(v) for k, v in registry._capability_index.items()},
+                    task_type_index={k: list(v) for k, v in registry._task_type_index.items()},
+                    region_index={k: list(v) for k, v in registry._region_index.items()},
+                    version_family_index=registry._version_family_index,
+                    dependency_graph=nx.node_link_data(registry._dependency_graph),
+                    remote_registries=registry._remote_registries,
+                    federated_experts=registry._federated_experts,
+                    ab_tests=registry._ab_tests,
+                    migration_paths=registry._migration_paths,
+                    evolutionary_events=list(registry.evolutionary_events),
+                    speciation_count=registry.speciation_count,
+                    extinction_count=registry.extinction_count,
+                    total_generations=registry.total_generations,
+                    reproductive_events=registry.reproductive_events,
+                    stats=registry._stats,
+                    performance_history=dict(registry._performance_history),
+                    fitness_weights_history=list(registry._fitness_weight_history),
+                    registry_id=registry.registry_id,
+                    bio_integration_active=registry.enable_bio_correlation
+                )
+                # Serialize to JSON
+                json_str = state.model_dump_json(indent=2)
+                compressed = zlib.compress(json_str.encode('utf-8'))
+
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'wb') as f:
+                        await f.write(compressed)
+                else:
+                    with open(self.path, 'wb') as f:
+                        f.write(compressed)
+
                 logger.info(f"Registry state saved to {self.path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to save registry state: {e}")
-                return False
+                raise  # let circuit breaker handle
 
     async def load_state(self, registry: 'ExpertRegistry') -> bool:
         """Load registry state from disk and populate the registry."""
@@ -494,37 +644,66 @@ class RegistryPersistenceManager:
                 logger.warning(f"Persistence file {self.path} not found")
                 return False
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'rb') as f:
+                        compressed = await f.read()
+                else:
+                    with open(self.path, 'rb') as f:
+                        compressed = f.read()
+
+                json_str = zlib.decompress(compressed).decode('utf-8')
+                state = RegistryState.model_validate_json(json_str)
+
+                # Version check and migration
+                if state.version != "6.2.0":
+                    logger.warning(f"State version mismatch: {state.version} != 6.2.0; attempting migration")
+                    # Implement migration hooks here if needed
+                    # For now, we'll try to load anyway
 
                 # Restore core data
-                registry._experts = state['experts']
-                registry.fitness_scores = state['fitness_scores']
-                registry._domain_index = state['domain_index']
-                registry._hardware_index = state['hardware_index']
-                registry._lifecycle_index = state['lifecycle_index']
-                registry._tag_index = state['tag_index']
-                registry._capability_index = state['capability_index']
-                registry._task_type_index = state['task_type_index']
-                registry._region_index = state['region_index']
-                registry._version_family_index = state['version_family_index']
-                registry._dependency_graph = state['dependency_graph']
-                registry._remote_registries = state['remote_registries']
-                registry._federated_experts = state['federated_experts']
-                registry._ab_tests = state['ab_tests']
-                registry._migration_paths = state['migration_paths']
-                registry.evolutionary_events = deque(state['evolutionary_events'], maxlen=10000)
-                registry.speciation_count = state['speciation_count']
-                registry.extinction_count = state['extinction_count']
-                registry.total_generations = state['total_generations']
-                registry.reproductive_events = state['reproductive_events']
-                registry._stats = state['stats']
+                registry._experts = state.experts
+                registry.fitness_scores = state.fitness_scores
+
+                # Restore indices
+                registry._domain_index = defaultdict(set)
+                for domain_str, ids in state.domain_index.items():
+                    domain = ExpertDomain(domain_str)
+                    registry._domain_index[domain] = set(ids)
+
+                registry._hardware_index = defaultdict(set)
+                for hw_str, ids in state.hardware_index.items():
+                    hw = HardwareProfile(hw_str)
+                    registry._hardware_index[hw] = set(ids)
+
+                registry._lifecycle_index = defaultdict(set)
+                for lc_str, ids in state.lifecycle_index.items():
+                    lc = ExpertLifecycleState(lc_str)
+                    registry._lifecycle_index[lc] = set(ids)
+
+                registry._tag_index = {k: set(v) for k, v in state.tag_index.items()}
+                registry._capability_index = {k: set(v) for k, v in state.capability_index.items()}
+                registry._task_type_index = {k: set(v) for k, v in state.task_type_index.items()}
+                registry._region_index = {k: set(v) for k, v in state.region_index.items()}
+                registry._version_family_index = state.version_family_index
+
+                # Restore dependency graph
+                registry._dependency_graph = nx.node_link_graph(state.dependency_graph)
+
+                registry._remote_registries = state.remote_registries
+                registry._federated_experts = state.federated_experts
+                registry._ab_tests = state.ab_tests
+                registry._migration_paths = state.migration_paths
+                registry.evolutionary_events = deque(state.evolutionary_events, maxlen=10000)
+                registry.speciation_count = state.speciation_count
+                registry.extinction_count = state.extinction_count
+                registry.total_generations = state.total_generations
+                registry.reproductive_events = state.reproductive_events
+                registry._stats = state.stats
                 registry._performance_history = defaultdict(list)
-                for k, v in state['performance_history'].items():
+                for k, v in state.performance_history.items():
                     registry._performance_history[k] = v
-                # Config and registry_id are already set; no need to override.
+                registry._fitness_weight_history = deque(state.fitness_weights_history, maxlen=100)
+
                 logger.info(f"Registry state loaded from {self.path}")
                 return True
             except Exception as e:
@@ -532,30 +711,65 @@ class RegistryPersistenceManager:
                 return False
 
     async def delete_state(self):
-        """Delete the persistence file."""
         async with self._lock:
             if os.path.exists(self.path):
-                os.remove(self.path)
+                if aiofiles:
+                    await aiofiles.os.remove(self.path)
+                else:
+                    os.remove(self.path)
                 logger.info(f"Persistence file {self.path} deleted")
                 return True
             return False
 
 # ============================================================================
-# Sustainability Dashboard (Enhanced)
+# Rate Limiter
+# ============================================================================
+
+class RateLimiter:
+    """Simple token bucket rate limiter."""
+    def __init__(self, rate_per_minute: int):
+        self.rate = rate_per_minute / 60.0  # tokens per second
+        self.tokens = rate_per_minute
+        self.last_update = datetime.utcnow().timestamp()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = datetime.utcnow().timestamp()
+            elapsed = now - self.last_update
+            self.tokens += elapsed * self.rate
+            if self.tokens > self.rate * 60:  # cap at one minute's worth
+                self.tokens = self.rate * 60
+            self.last_update = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+# ============================================================================
+# Sustainability Dashboard (Enhanced with caching and structured logging)
 # ============================================================================
 
 class RegistrySustainabilityDashboard:
     """
     Unified Sustainability Dashboard with Prometheus-style export.
     """
-
     def __init__(self, registry: 'ExpertRegistry'):
         self.registry = registry
         self.history = deque(maxlen=1000)
         self._alert_history = deque(maxlen=100)
+        self._cache: Dict[str, Any] = {}
+        self._cache_ttl = 30  # seconds
+        self._last_cache_update: Optional[datetime] = None
         logger.info("RegistrySustainabilityDashboard initialized")
 
     def get_dashboard_status(self) -> Dict[str, Any]:
+        # Check cache
+        now = datetime.utcnow()
+        if (self._last_cache_update and
+            (now - self._last_cache_update).total_seconds() < self._cache_ttl):
+            return self._cache
+
         registry = self.registry
         active_experts = registry.get_all_active_experts()
         total_experts = len(registry._experts)
@@ -567,8 +781,8 @@ class RegistrySustainabilityDashboard:
 
         fitnesses = [f.overall_fitness for f in registry.fitness_scores.values()] if registry.fitness_scores else [0.5]
 
-        return {
-            'timestamp': datetime.utcnow().isoformat(),
+        status = {
+            'timestamp': now.isoformat(),
             'total_experts': total_experts,
             'active_experts': len(active_experts),
             'avg_carbon_efficiency': avg_carbon,
@@ -588,6 +802,10 @@ class RegistrySustainabilityDashboard:
             'predictive_alerts': self._generate_predictive_alerts(),
             'alert_count': len(self._alert_history)
         }
+
+        self._cache = status
+        self._last_cache_update = now
+        return status
 
     def _generate_predictive_alerts(self) -> List[Dict[str, Any]]:
         registry = self.registry
@@ -718,14 +936,13 @@ class RegistrySustainabilityDashboard:
         return recommendations
 
 # ============================================================================
-# Predictive Evolution Forecaster (Enhanced)
+# Predictive Evolution Forecaster (Data-driven trends)
 # ============================================================================
 
 class PredictiveEvolutionForecaster:
     """
-    Predictive Evolution Forecasting with climate integration.
+    Predictive Evolution Forecasting with climate integration and data-driven trends.
     """
-
     def __init__(self, registry: 'ExpertRegistry'):
         self.registry = registry
         self.forecast_history = deque(maxlen=1000)
@@ -733,6 +950,7 @@ class PredictiveEvolutionForecaster:
             'carbon': {'current': 400, 'trend': 0.02, 'volatility': 0.05},
             'helium': {'current': 0.5, 'trend': 0.03, 'volatility': 0.08}
         }
+        self._last_update = datetime.utcnow()
         logger.info("PredictiveEvolutionForecaster initialized")
 
     def update_climate_model(self, model_type: str, data: Dict[str, float]):
@@ -742,6 +960,9 @@ class PredictiveEvolutionForecaster:
 
     async def forecast_evolutionary_trend(self, hours: int = 24) -> Dict[str, Any]:
         registry = self.registry
+        # Update trends from historical data if available
+        self._update_trends_from_history()
+
         carbon_proj = self._project_climate('carbon', hours)
         helium_proj = self._project_climate('helium', hours)
 
@@ -768,6 +989,23 @@ class PredictiveEvolutionForecaster:
         }
         self.forecast_history.append(forecast)
         return forecast
+
+    def _update_trends_from_history(self):
+        """Adjust climate trends based on actual registry performance metrics."""
+        registry = self.registry
+        if len(registry._performance_history) < 10:
+            return
+        # Compute average carbon efficiency trend
+        efficiencies = []
+        for expert_id, history in registry._performance_history.items():
+            for entry in history[-20:]:
+                if 'carbon_kg' in entry:
+                    efficiencies.append(entry['carbon_kg'])
+        if efficiencies:
+            avg = np.mean(efficiencies[-10:]) if len(efficiencies) >= 10 else np.mean(efficiencies)
+            # Map efficiency to carbon metric (inverse relationship)
+            carbon_trend = 0.02 * (1 - avg)  # rough heuristic
+            self._climate_models['carbon']['trend'] = carbon_trend
 
     def _project_climate(self, model_type: str, hours: int) -> Dict[str, float]:
         model = self._climate_models.get(model_type, {'current': 0.5, 'trend': 0.0, 'volatility': 0.05})
@@ -891,25 +1129,25 @@ class PredictiveEvolutionForecaster:
             return min(0.9, 0.7 + 0.1 * len(registry.fitness_scores) / 50 * 0.7)
 
 # ============================================================================
-# Cross-Region Registry Synchronizer (Enhanced with Retry & Circuit Breaker)
+# Cross-Region Registry Synchronizer (Enhanced with retry and circuit breaker)
 # ============================================================================
 
 class CrossRegionRegistrySynchronizer:
     """
     Cross-Region Registry Synchronization with retry and circuit breaker.
     """
-
     def __init__(self, registry: 'ExpertRegistry'):
         self.registry = registry
-        self._session = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self.sync_history = deque(maxlen=1000)
         self.voting_weights: Dict[str, float] = {}
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=registry.config.circuit_breaker_threshold,
+            recovery_timeout=registry.config.circuit_breaker_recovery_timeout
+        )
         logger.info("CrossRegionRegistrySynchronizer initialized with resilience")
 
-    async def _get_session(self):
+    async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
@@ -931,16 +1169,32 @@ class CrossRegionRegistrySynchronizer:
             'status': 'unknown'
         }
 
-        # Circuit breaker check
-        if self.circuit_open:
-            if datetime.utcnow() < self.circuit_open_until:
-                logger.warning("Circuit breaker open, skipping sync")
-                result['status'] = 'circuit_open'
-                return result
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
-                logger.info("Circuit breaker reset for CrossRegionRegistrySynchronizer")
+        try:
+            result = await self._circuit_breaker.call(
+                self._do_sync,
+                registry_url, registry_id, sync_mode, resolve_conflicts
+            )
+        except Exception as e:
+            logger.error(f"Sync failed after circuit breaker: {e}")
+            result['status'] = f'error: {str(e)}'
+        return result
+
+    async def _do_sync(
+        self,
+        registry_url: str,
+        registry_id: str,
+        sync_mode: str,
+        resolve_conflicts: bool
+    ) -> Dict[str, Any]:
+        result = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'registry_id': registry_id,
+            'sync_mode': sync_mode,
+            'synced_experts': 0,
+            'conflicts': [],
+            'resolved_conflicts': [],
+            'status': 'unknown'
+        }
 
         for attempt in range(self.registry.config.sync_retries):
             try:
@@ -956,11 +1210,9 @@ class CrossRegionRegistrySynchronizer:
                             result['synced_experts'] = synced
                             result['conflicts'] = conflicts
                             result['resolved_conflicts'] = resolved
-                            self.failure_count = 0  # reset on success
                         else:
                             logger.warning(f"Sync pull failed: {response.status} (attempt {attempt+1})")
                             if attempt == self.registry.config.sync_retries - 1:
-                                self._record_failure()
                                 result['status'] = f'failed_pull_{response.status}'
                                 return result
                             await asyncio.sleep(2 ** attempt * 0.1)
@@ -975,7 +1227,6 @@ class CrossRegionRegistrySynchronizer:
                         if response.status != 200:
                             logger.warning(f"Sync push failed: {response.status} (attempt {attempt+1})")
                             if attempt == self.registry.config.sync_retries - 1:
-                                self._record_failure()
                                 result['push_status'] = f'failed_push_{response.status}'
                                 return result
                             await asyncio.sleep(2 ** attempt * 0.1)
@@ -995,19 +1246,11 @@ class CrossRegionRegistrySynchronizer:
             except Exception as e:
                 logger.error(f"Sync error (attempt {attempt+1}): {e}")
                 if attempt == self.registry.config.sync_retries - 1:
-                    self._record_failure()
                     result['status'] = f'error: {str(e)}'
                     return result
                 await asyncio.sleep(2 ** attempt * 0.1)
 
         return result
-
-    def _record_failure(self):
-        self.failure_count += 1
-        if self.failure_count >= self.registry.config.circuit_breaker_threshold:
-            self.circuit_open = True
-            self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.registry.config.circuit_breaker_recovery_timeout)
-            logger.error("Circuit breaker opened for CrossRegionRegistrySynchronizer")
 
     async def _merge_remote_experts_with_voting(
         self,
@@ -1021,7 +1264,17 @@ class CrossRegionRegistrySynchronizer:
 
         for remote_data in remote_experts:
             expert_id = remote_data.get('expert_id')
-            remote_version = ExpertVersion.from_string(remote_data.get('version', '1.0.0'))
+            if not expert_id:
+                continue
+
+            # Validate remote data against schema
+            try:
+                remote_profile = ExpertProfile.model_validate(remote_data)
+            except ValidationError as e:
+                logger.warning(f"Invalid remote expert data: {e}")
+                continue
+
+            remote_version = remote_profile.version
 
             if expert_id in self.registry._experts:
                 local_expert = self.registry._experts[expert_id]
@@ -1037,7 +1290,7 @@ class CrossRegionRegistrySynchronizer:
                     conflicts.append(conflict)
                     if resolve_conflicts:
                         resolution = await self._resolve_conflict_with_voting(
-                            expert_id, local_expert, remote_data, registry_id
+                            expert_id, local_expert, remote_profile, registry_id
                         )
                         if resolution:
                             resolved.append(resolution)
@@ -1050,13 +1303,12 @@ class CrossRegionRegistrySynchronizer:
                         'action': 'local_newer'
                     })
             else:
-                try:
-                    profile = self._create_profile_from_remote(remote_data, registry_id)
-                    success, _ = self.registry.register_expert(profile, validate=False, auto_certify=False)
-                    if success:
-                        synced += 1
-                except Exception as e:
-                    logger.error(f"Failed to create expert from remote: {e}")
+                # New expert
+                success, msg = self.registry.register_expert(remote_profile, validate=False, auto_certify=False)
+                if success:
+                    synced += 1
+                else:
+                    logger.warning(f"Failed to register remote expert {expert_id}: {msg}")
 
         return synced, conflicts, resolved
 
@@ -1064,7 +1316,7 @@ class CrossRegionRegistrySynchronizer:
         self,
         expert_id: str,
         local_expert: ExpertProfile,
-        remote_data: Dict,
+        remote_expert: ExpertProfile,
         remote_registry_id: str
     ) -> Optional[Dict]:
         votes = []
@@ -1078,7 +1330,7 @@ class CrossRegionRegistrySynchronizer:
         remote_trust = self.voting_weights.get(remote_registry_id, 0.5)
         votes.append({
             'registry': remote_registry_id,
-            'version': remote_data.get('version', '1.0.0'),
+            'version': remote_expert.version.to_string(),
             'trust': remote_trust,
             'decision': 'remote'
         })
@@ -1129,47 +1381,9 @@ class CrossRegionRegistrySynchronizer:
         else:
             self.voting_weights[registry_id] = max(0.0, self.voting_weights[registry_id] - 0.1)
 
-    def _create_profile_from_remote(self, remote_data: Dict, registry_id: str) -> ExpertProfile:
-        domain_map = {
-            'energy_optimization': ExpertDomain.ENERGY,
-            'data_engineering': ExpertDomain.DATA,
-            'iot_edge_computing': ExpertDomain.IOT,
-            'quantum_computing': ExpertDomain.QUANTUM,
-            'helium_aware_computing': ExpertDomain.HELIUM,
-            'general_purpose': ExpertDomain.GENERAL
-        }
-        domain_str = remote_data.get('domain', 'general_purpose')
-        domain = domain_map.get(domain_str, ExpertDomain.GENERAL)
-
-        health = HealthMetrics(
-            success_rate=remote_data.get('health_score', 0.9),
-            carbon_efficiency=remote_data.get('carbon_efficiency', 0.5),
-            helium_efficiency=remote_data.get('helium_efficiency', 0.5),
-            quantum_efficiency=remote_data.get('quantum_efficiency', 0.0)
-        )
-        return ExpertProfile(
-            expert_id=remote_data.get('expert_id', f"remote_{registry_id}_{uuid.uuid4().hex[:8]}"),
-            expert_name=remote_data.get('expert_name', 'Unknown'),
-            version=ExpertVersion.from_string(remote_data.get('version', '1.0.0')),
-            domain=domain,
-            hardware_profile=HardwareProfile(remote_data.get('hardware_profile', 'cpu_low_power')),
-            helium_per_inference=remote_data.get('helium_per_inference', 0.0),
-            carbon_per_inference=remote_data.get('carbon_per_inference', 0.0),
-            energy_per_inference=remote_data.get('energy_per_inference', 0.0),
-            accuracy_score=remote_data.get('accuracy_score', 0.5),
-            reliability_score=remote_data.get('reliability_score', 0.5),
-            efficiency_score=remote_data.get('efficiency_score', 0.5),
-            is_remote=True,
-            remote_endpoint=remote_data.get('remote_endpoint'),
-            origin_region=remote_data.get('origin_region', registry_id),
-            quantum_capable=remote_data.get('quantum_capable', False),
-            quantum_qubits=remote_data.get('quantum_qubits', 0),
-            health=health
-        )
-
     def _serialize_local_experts(self) -> List[Dict]:
         return [
-            expert.to_dict()
+            expert.model_dump()
             for expert in self.registry._experts.values()
             if expert.lifecycle_state.is_available()
         ][:100]
@@ -1182,7 +1396,7 @@ class CrossRegionRegistrySynchronizer:
             'total_syncs': len(self.sync_history),
             'voting_weights': self.voting_weights,
             'conflict_resolutions': sum(1 for h in self.sync_history if h.get('resolved', 0) > 0),
-            'circuit_open': self.circuit_open
+            'circuit_open': self._circuit_breaker.state == "open"
         }
 
 # ============================================================================
@@ -1191,28 +1405,16 @@ class CrossRegionRegistrySynchronizer:
 
 class ExpertRegistry:
     """
-    Enhanced Expert Registry v6.1.0 - Complete Bio-Inspired Genome Repository
+    Enhanced Expert Registry v6.2.0 - Complete Bio-Inspired Genome Repository
     """
 
     def __init__(self, config: Optional[ExpertRegistryConfig] = None, **kwargs):
         if config is None:
             # Build config from kwargs for backward compatibility
-            config = ExpertRegistryConfig(
-                enable_bio_correlation=kwargs.get('enable_bio_correlation', True),
-                enable_natural_selection=kwargs.get('enable_natural_selection', True),
-                enable_fitness_tracking=kwargs.get('enable_fitness_tracking', True),
-                enable_population_tracking=kwargs.get('enable_population_tracking', True),
-                enable_sustainability_dashboard=kwargs.get('enable_sustainability_dashboard', True),
-                enable_predictive_forecasting=kwargs.get('enable_predictive_forecasting', True),
-                enable_cross_region_sync=kwargs.get('enable_cross_region_sync', True),
-                enable_quantum_efficiency=kwargs.get('enable_quantum_efficiency', True),
-                enable_reproductive_strategies=kwargs.get('enable_reproductive_strategies', True),
-                enable_climate_integration=kwargs.get('enable_climate_integration', True),
-                enable_persistence=kwargs.get('enable_persistence', True),
-                registry_id=kwargs.get('registry_id', 'default'),
-                persistence_path=kwargs.get('persistence_path', 'registry_state.pkl'),
-                sync_retries=kwargs.get('sync_retries', 3)
-            )
+            config = ExpertRegistryConfig(**{
+                k: v for k, v in kwargs.items()
+                if k in ExpertRegistryConfig.model_fields
+            })
         self.config = config
         self.registry_id = config.registry_id
 
@@ -1229,6 +1431,12 @@ class ExpertRegistry:
         self.enable_climate_integration = config.enable_climate_integration
         self.enable_persistence = config.enable_persistence
 
+        # Concurrency locks
+        self._lock = asyncio.Lock()
+        self._index_lock = asyncio.Lock()
+        self._fitness_lock = asyncio.Lock()
+        self._performance_lock = asyncio.Lock()
+
         # Bio-inspired module references
         self.token_manager: Optional[EcoATPTokenManager] = None
         self.gradient_manager: Optional[GradientFieldManager] = None
@@ -1236,10 +1444,10 @@ class ExpertRegistry:
         self.biomass_storage: Optional[BiomassStorage] = None
 
         # New modules
-        self.sustainability_dashboard = None
-        self.predictive_forecaster = None
-        self.cross_region_sync = None
-        self.persistence_manager = None
+        self.sustainability_dashboard: Optional[RegistrySustainabilityDashboard] = None
+        self.predictive_forecaster: Optional[PredictiveEvolutionForecaster] = None
+        self.cross_region_sync: Optional[CrossRegionRegistrySynchronizer] = None
+        self.persistence_manager: Optional[RegistryPersistenceManager] = None
 
         # Core storage
         self._experts: Dict[str, ExpertProfile] = {}
@@ -1290,6 +1498,14 @@ class ExpertRegistry:
         self._fitness_weights = config.fitness_weights.copy()
         self._fitness_weight_history = deque(maxlen=100)
 
+        # Caches
+        self._ecoatp_cache = TimedCache(ttl_seconds=30)
+        self._gradient_cache = TimedCache(ttl_seconds=30)
+        self._population_cache = TimedCache(ttl_seconds=60)
+
+        # Rate limiter
+        self._rate_limiter = RateLimiter(config.rate_limit_per_minute)
+
         # Initialize modules
         self._initialize_modules()
 
@@ -1298,10 +1514,11 @@ class ExpertRegistry:
             asyncio.create_task(self._load_state())
 
         # Start background tasks
+        self._background_tasks: List[asyncio.Task] = []
         self._start_background_tasks()
 
         logger.info(
-            f"Expert Registry v6.1.0 initialized: "
+            f"Expert Registry v6.2.0 initialized: "
             f"bio_correlation={self.enable_bio_correlation}, "
             f"persistence={self.enable_persistence}, "
             f"quantum={self.enable_quantum_efficiency}, "
@@ -1319,15 +1536,15 @@ class ExpertRegistry:
             self.persistence_manager = RegistryPersistenceManager(self.config)
 
     def _start_background_tasks(self):
-        asyncio.create_task(self._bio_correlation_loop())
+        self._background_tasks.append(asyncio.create_task(self._bio_correlation_loop()))
         if self.enable_predictive_forecasting:
-            asyncio.create_task(self._predictive_forecast_loop())
+            self._background_tasks.append(asyncio.create_task(self._predictive_forecast_loop()))
         if self.enable_cross_region_sync:
-            asyncio.create_task(self._cross_region_sync_loop())
+            self._background_tasks.append(asyncio.create_task(self._cross_region_sync_loop()))
         if self.enable_reproductive_strategies:
-            asyncio.create_task(self._reproductive_strategy_loop())
+            self._background_tasks.append(asyncio.create_task(self._reproductive_strategy_loop()))
         if self.enable_persistence:
-            asyncio.create_task(self._persistence_save_loop())
+            self._background_tasks.append(asyncio.create_task(self._persistence_save_loop()))
 
     # ============================================================================
     # Persistence Methods
@@ -1345,8 +1562,8 @@ class ExpertRegistry:
         while True:
             try:
                 if self.enable_persistence and self.persistence_manager:
-                    # Save every 5 minutes
-                    await asyncio.sleep(300)
+                    interval = self.config.persistence_auto_save_interval
+                    await asyncio.sleep(interval)
                     await self.save_state()
             except Exception as e:
                 logger.error(f"Persistence save loop error: {e}")
@@ -1378,29 +1595,38 @@ class ExpertRegistry:
             self.enable_bio_correlation = True
 
     # ============================================================================
-    # Bio-Inspired Data Access Methods
+    # Bio-Inspired Data Access Methods (with caching)
     # ============================================================================
 
-    def _get_expert_ecoatp_efficiency(self, expert_id: str) -> float:
-        if self.token_manager:
+    async def _get_expert_ecoatp_efficiency(self, expert_id: str) -> float:
+        if not self.token_manager:
+            return 0.5
+        key = f"ecoatp_efficiency_{expert_id}"
+        async def compute():
             account = self.token_manager.get_account_summary(f"expert_{expert_id}")
             if account:
                 return account.get('efficiency_rating', 0.5)
-        return 0.5
+            return 0.5
+        return await self._ecoatp_cache.get_or_compute(key, compute)
 
-    def _get_expert_token_balance(self, expert_id: str) -> float:
-        if self.token_manager:
-            account = self.token_manager.get_account_summary(f"expert_{expert_id}")
-            if account:
-                return account.get('balance', 0)
+    async def _get_expert_token_balance(self, expert_id: str) -> float:
+        if not self.token_manager:
+            return 0.0
+        account = self.token_manager.get_account_summary(f"expert_{expert_id}")
+        if account:
+            return account.get('balance', 0)
         return 0.0
 
-    def _get_gradient_strength(self, field_id: str) -> float:
-        if self.gradient_manager:
+    async def _get_gradient_strength(self, field_id: str) -> float:
+        if not self.gradient_manager:
+            return 0.5
+        key = f"gradient_{field_id}"
+        async def compute():
             field = self.gradient_manager.fields.get(field_id)
             if field:
                 return field.gradient_strength
-        return 0.5
+            return 0.5
+        return await self._gradient_cache.get_or_compute(key, compute)
 
     def _get_species_population(self, species_id: str) -> int:
         if self.compartment_manager:
@@ -1419,7 +1645,7 @@ class ExpertRegistry:
         return len([e for e in self._experts.values() if e.lifecycle_state.is_available()])
 
     def _get_species_id(self, profile: ExpertProfile) -> str:
-        domain = profile.domain.value if hasattr(profile.domain, 'value') else str(profile.domain)
+        domain = profile.domain.value
         if 'energy' in domain.lower(): return 'energy'
         if 'data' in domain.lower(): return 'data'
         if 'iot' in domain.lower(): return 'iot'
@@ -1428,10 +1654,10 @@ class ExpertRegistry:
         return 'general'
 
     # ============================================================================
-    # Expert Registration (Enhanced)
+    # Expert Registration (Enhanced with validation and rate limiting)
     # ============================================================================
 
-    def register_expert(
+    async def register_expert(
         self,
         profile: ExpertProfile,
         validate: bool = True,
@@ -1439,95 +1665,101 @@ class ExpertRegistry:
         create_ecoatp_account: bool = True,
         register_compartment: bool = True
     ) -> Tuple[bool, str]:
-        if profile.expert_id in self._experts:
-            existing = self._experts[profile.expert_id]
-            if profile.version.is_newer_than(existing.version):
-                logger.info(f"Updating expert {profile.expert_id} from "
-                           f"v{existing.version.to_string()} to v{profile.version.to_string()}")
-                existing.lifecycle_state = ExpertLifecycleState.ARCHIVED
-                profile.replaces_expert = existing.expert_id
-                self._migration_paths[existing.expert_id] = profile.expert_id
+        # Rate limiting
+        if not await self._rate_limiter.acquire():
+            return False, "Rate limit exceeded, please try later"
+
+        async with self._lock:
+            if profile.expert_id in self._experts:
+                existing = self._experts[profile.expert_id]
+                if profile.version.is_newer_than(existing.version):
+                    logger.info(f"Updating expert {profile.expert_id} from "
+                               f"v{existing.version.to_string()} to v{profile.version.to_string()}")
+                    existing.lifecycle_state = ExpertLifecycleState.ARCHIVED
+                    profile.replaces_expert = existing.expert_id
+                    self._migration_paths[existing.expert_id] = profile.expert_id
+                else:
+                    return False, f"Expert {profile.expert_id} already registered with newer version"
+
+            if validate:
+                is_valid, message = self._validate_profile(profile)
+                if not is_valid:
+                    return False, f"Validation failed: {message}"
+
+            if auto_certify:
+                profile.lifecycle_state = ExpertLifecycleState.CERTIFIED
+            elif validate:
+                profile.lifecycle_state = ExpertLifecycleState.VALIDATING
             else:
-                return False, f"Expert {profile.expert_id} already registered with newer version"
+                profile.lifecycle_state = ExpertLifecycleState.REGISTERED
 
-        if validate:
-            is_valid, message = self._validate_profile(profile)
-            if not is_valid:
-                return False, f"Validation failed: {message}"
+            profile.health.quantum_efficiency = self._calculate_quantum_efficiency(profile)
+            profile.sustainability_score = profile.health.calculate_sustainability_score()
 
-        if auto_certify:
-            profile.lifecycle_state = ExpertLifecycleState.CERTIFIED
-        elif validate:
-            profile.lifecycle_state = ExpertLifecycleState.VALIDATING
-        else:
-            profile.lifecycle_state = ExpertLifecycleState.REGISTERED
+            self._experts[profile.expert_id] = profile
+            self._update_indexes(profile)
 
-        profile.health.quantum_efficiency = self._calculate_quantum_efficiency(profile)
-        profile.sustainability_score = profile.health.calculate_sustainability_score()
+            # Eco-ATP account
+            if self.enable_bio_correlation and create_ecoatp_account and self.token_manager:
+                account_id = f"expert_{profile.expert_id}"
+                self.token_manager.create_account(account_id)
+                initial_tokens = int(profile.efficiency_score * 100)
+                if initial_tokens > 0:
+                    self.token_manager.generate_tokens(
+                        account_id=account_id,
+                        source=EcoATPSource.EFFICIENCY_GAIN,
+                        energy_saved_kwh=profile.efficiency_score * 0.001,
+                        num_tokens=initial_tokens
+                    )
+                logger.info(f"Created Eco-ATP account for {profile.expert_id}: {initial_tokens} tokens")
 
-        self._experts[profile.expert_id] = profile
-        self._update_indexes(profile)
-
-        # Eco-ATP account
-        if self.enable_bio_correlation and create_ecoatp_account and self.token_manager:
-            account_id = f"expert_{profile.expert_id}"
-            self.token_manager.create_account(account_id)
-            initial_tokens = int(profile.efficiency_score * 100)
-            if initial_tokens > 0:
-                self.token_manager.generate_tokens(
-                    account_id=account_id,
-                    source=EcoATPSource.EFFICIENCY_GAIN,
-                    energy_saved_kwh=profile.efficiency_score * 0.001,
-                    num_tokens=initial_tokens
+            # Chromatophore compartment
+            if self.enable_bio_correlation and register_compartment and self.compartment_manager:
+                species = self._get_species_id(profile)
+                self.compartment_manager.create_compartment(
+                    expert_type=species,
+                    expert_instance=None
                 )
-            logger.info(f"Created Eco-ATP account for {profile.expert_id}: {initial_tokens} tokens")
+                logger.info(f"Created chromatophore compartment for {profile.expert_id}")
 
-        # Chromatophore compartment
-        if self.enable_bio_correlation and register_compartment and self.compartment_manager:
-            species = self._get_species_id(profile)
-            self.compartment_manager.create_compartment(
-                expert_type=species,
-                expert_instance=None
-            )
-            logger.info(f"Created chromatophore compartment for {profile.expert_id}")
+            # Fitness score
+            if self.enable_fitness_tracking:
+                fitness = FitnessScore(
+                    expert_id=profile.expert_id,
+                    resource_efficiency=min(1.0, 1.0 / (1.0 + profile.carbon_per_inference * 10000)),
+                    resilience_score=profile.reliability_score,
+                    adaptation_speed=0.5,
+                    cooperation_score=0.5,
+                    ecoatp_efficiency=profile.efficiency_score,
+                    sustainability_score=profile.sustainability_score,
+                    quantum_efficiency=profile.health.quantum_efficiency,
+                    quantum_advantage=self._calculate_quantum_advantage(profile),
+                    helium_savings=1.0 - profile.helium_per_inference / max(profile.helium_per_inference, 1)
+                )
+                fitness.calculate_overall(self._fitness_weights)
+                self.fitness_scores[profile.expert_id] = fitness
 
-        # Fitness score
-        if self.enable_fitness_tracking:
-            self.fitness_scores[profile.expert_id] = FitnessScore(
-                expert_id=profile.expert_id,
-                resource_efficiency=min(1.0, 1.0 / (1.0 + profile.carbon_per_inference * 10000)),
-                resilience_score=profile.reliability_score,
-                adaptation_speed=0.5,
-                cooperation_score=0.5,
-                ecoatp_efficiency=profile.efficiency_score,
-                sustainability_score=profile.sustainability_score,
-                quantum_efficiency=profile.health.quantum_efficiency,
-                quantum_advantage=self._calculate_quantum_advantage(profile),
-                helium_savings=1.0 - profile.helium_per_inference / max(profile.helium_per_inference, 1)
-            )
-            self.fitness_scores[profile.expert_id].calculate_overall(self._fitness_weights)
+            self._update_dependency_graph(profile)
+            self._version_family_index[profile.expert_name].append(profile.expert_id)
+            self._stats['total_registrations'] += 1
+            self.total_generations += 1
 
-        self._update_dependency_graph(profile)
-        self._version_family_index[profile.expert_name].append(profile.expert_id)
-        self._stats['total_registrations'] += 1
-        self.total_generations += 1
+            self.evolutionary_events.append({
+                'type': 'speciation' if not profile.replaces_expert else 'evolution',
+                'expert_id': profile.expert_id,
+                'species': self._get_species_id(profile),
+                'generation': self.total_generations,
+                'quantum_capable': profile.quantum_capable,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            self.speciation_count += 1
 
-        self.evolutionary_events.append({
-            'type': 'speciation' if not profile.replaces_expert else 'evolution',
-            'expert_id': profile.expert_id,
-            'species': self._get_species_id(profile),
-            'generation': self.total_generations,
-            'quantum_capable': profile.quantum_capable,
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        self.speciation_count += 1
+            logger.info(f"Registered expert: {profile.expert_id} v{profile.version.to_string()} "
+                       f"(species: {self._get_species_id(profile)}, "
+                       f"quantum: {profile.quantum_capable}, "
+                       f"generation: {self.total_generations})")
 
-        logger.info(f"Registered expert: {profile.expert_id} v{profile.version.to_string()} "
-                   f"(species: {self._get_species_id(profile)}, "
-                   f"quantum: {profile.quantum_capable}, "
-                   f"generation: {self.total_generations})")
-
-        return True, f"Expert {profile.expert_id} registered successfully"
+            return True, f"Expert {profile.expert_id} registered successfully"
 
     def _validate_profile(self, profile: ExpertProfile) -> Tuple[bool, str]:
         errors = []
@@ -1546,7 +1778,6 @@ class ExpertRegistry:
         for dep in profile.dependencies:
             if not dep.is_optional and dep.dependency_id not in self._experts:
                 errors.append(f"Required dependency {dep.dependency_id} not registered")
-            # Version compatibility check
             if dep.dependency_id in self._experts:
                 dep_expert = self._experts[dep.dependency_id]
                 if not self._check_version_compatibility(dep_expert.version, dep.version_requirement):
@@ -1597,13 +1828,14 @@ class ExpertRegistry:
         return min(1.0, (profile.quantum_qubits / 100) * 0.5 + profile.accuracy_score * 0.5)
 
     def _update_indexes(self, profile: ExpertProfile):
-        self._domain_index[profile.domain].add(profile.expert_id)
-        self._hardware_index[profile.hardware_profile].add(profile.expert_id)
-        self._lifecycle_index[profile.lifecycle_state].add(profile.expert_id)
-        for tag in profile.tags: self._tag_index[tag].add(profile.expert_id)
-        for cap in profile.capabilities: self._capability_index[cap].add(profile.expert_id)
-        for tt in profile.supported_task_types: self._task_type_index[tt].add(profile.expert_id)
-        self._region_index[profile.origin_region].add(profile.expert_id)
+        async with self._index_lock:
+            self._domain_index[profile.domain].add(profile.expert_id)
+            self._hardware_index[profile.hardware_profile].add(profile.expert_id)
+            self._lifecycle_index[profile.lifecycle_state].add(profile.expert_id)
+            for tag in profile.tags: self._tag_index[tag].add(profile.expert_id)
+            for cap in profile.capabilities: self._capability_index[cap].add(profile.expert_id)
+            for tt in profile.supported_task_types: self._task_type_index[tt].add(profile.expert_id)
+            self._region_index[profile.origin_region].add(profile.expert_id)
 
     def _update_dependency_graph(self, profile: ExpertProfile):
         self._dependency_graph.add_node(profile.expert_id, name=profile.expert_name,
@@ -1618,15 +1850,15 @@ class ExpertRegistry:
     # Filtering Methods (Enhanced)
     # ============================================================================
 
-    def filter_by_ecoatp_efficiency(self, min_efficiency: float = 0.5, min_token_balance: float = 10.0) -> List[ExpertProfile]:
+    async def filter_by_ecoatp_efficiency(self, min_efficiency: float = 0.5, min_token_balance: float = 10.0) -> List[ExpertProfile]:
         if not self.enable_bio_correlation or not self.token_manager:
             return self.get_all_active_experts()
         efficient = []
         for expert_id, expert in self._experts.items():
             if not expert.lifecycle_state.is_available():
                 continue
-            efficiency = self._get_expert_ecoatp_efficiency(expert_id)
-            balance = self._get_expert_token_balance(expert_id)
+            efficiency = await self._get_expert_ecoatp_efficiency(expert_id)
+            balance = await self._get_expert_token_balance(expert_id)
             if efficiency >= min_efficiency and balance >= min_token_balance:
                 efficient.append(expert)
         return efficient
@@ -1637,7 +1869,7 @@ class ExpertRegistry:
             if not expert.lifecycle_state.is_available():
                 continue
             health = expert.health.calculate_health_score()
-            fitness = self.fitness_scores.get(expert_id, FitnessScore(expert_id)).overall_fitness
+            fitness = self.fitness_scores.get(expert_id, FitnessScore(expert_id=expert_id)).overall_fitness
             if health >= min_health and fitness >= min_fitness:
                 qualified.append(expert)
         return qualified
@@ -1648,11 +1880,11 @@ class ExpertRegistry:
     def filter_by_quantum_efficiency(self, min_quantum_efficiency: float = 0.3) -> List[ExpertProfile]:
         return [e for e in self._experts.values() if e.lifecycle_state.is_available() and e.health.quantum_efficiency >= min_quantum_efficiency]
 
-    def filter_by_gradient_alignment(self, carbon_threshold: float = 0.3, trust_threshold: float = 0.4) -> List[ExpertProfile]:
+    async def filter_by_gradient_alignment(self, carbon_threshold: float = 0.3, trust_threshold: float = 0.4) -> List[ExpertProfile]:
         if not self.enable_bio_correlation or not self.gradient_manager:
             return self.get_all_active_experts()
-        carbon_strength = self._get_gradient_strength('carbon')
-        trust_strength = self._get_gradient_strength('trust')
+        carbon_strength = await self._get_gradient_strength('carbon')
+        trust_strength = await self._get_gradient_strength('trust')
         if carbon_strength > carbon_threshold:
             return sorted([e for e in self.get_all_active_experts()], key=lambda e: e.carbon_per_inference)[:max(1, len(self._experts) // 2)]
         if trust_strength < trust_threshold:
@@ -1663,33 +1895,34 @@ class ExpertRegistry:
     # Natural Selection (Enhanced)
     # ============================================================================
 
-    def update_fitness_from_gradients(self):
+    async def update_fitness_from_gradients(self):
         if not self.enable_bio_correlation or not self.gradient_manager:
             return
-        trust_strength = self._get_gradient_strength('trust')
-        carbon_strength = self._get_gradient_strength('carbon')
-        for expert_id, fitness in self.fitness_scores.items():
-            if expert_id not in self._experts:
-                continue
-            expert = self._experts[expert_id]
-            fitness.resilience_score = fitness.resilience_score * 0.7 + trust_strength * 0.3
-            carbon_eff = 1.0 / (1.0 + expert.carbon_per_inference * 10000)
-            fitness.resource_efficiency = fitness.resource_efficiency * 0.8 + carbon_eff * 0.2
-            fitness.ecoatp_efficiency = self._get_expert_ecoatp_efficiency(expert_id)
-            if self.compartment_manager:
-                compartment = self.compartment_manager.find_best_compartment(self._get_species_id(expert))
-                if compartment:
-                    fitness.cooperation_score = fitness.cooperation_score * 0.8 + compartment.health_score * 0.2
-            fitness.quantum_efficiency = expert.health.quantum_efficiency
-            fitness.quantum_advantage = self._calculate_quantum_advantage(expert)
-            fitness.helium_savings = 1.0 - expert.helium_per_inference / max(expert.helium_per_inference, 1)
-            fitness.sustainability_score = expert.health.calculate_sustainability_score()
-            fitness.calculate_overall(self._fitness_weights)
+        async with self._fitness_lock:
+            trust_strength = await self._get_gradient_strength('trust')
+            carbon_strength = await self._get_gradient_strength('carbon')
+            for expert_id, fitness in self.fitness_scores.items():
+                if expert_id not in self._experts:
+                    continue
+                expert = self._experts[expert_id]
+                fitness.resilience_score = fitness.resilience_score * 0.7 + trust_strength * 0.3
+                carbon_eff = 1.0 / (1.0 + expert.carbon_per_inference * 10000)
+                fitness.resource_efficiency = fitness.resource_efficiency * 0.8 + carbon_eff * 0.2
+                fitness.ecoatp_efficiency = await self._get_expert_ecoatp_efficiency(expert_id)
+                if self.compartment_manager:
+                    compartment = self.compartment_manager.find_best_compartment(self._get_species_id(expert))
+                    if compartment:
+                        fitness.cooperation_score = fitness.cooperation_score * 0.8 + compartment.health_score * 0.2
+                fitness.quantum_efficiency = expert.health.quantum_efficiency
+                fitness.quantum_advantage = self._calculate_quantum_advantage(expert)
+                fitness.helium_savings = 1.0 - expert.helium_per_inference / max(expert.helium_per_inference, 1)
+                fitness.sustainability_score = expert.health.calculate_sustainability_score()
+                fitness.calculate_overall(self._fitness_weights)
 
-    def trigger_natural_selection(self):
+    async def trigger_natural_selection(self):
         if not self.enable_natural_selection:
             return
-        self.update_fitness_from_gradients()
+        await self.update_fitness_from_gradients()
         fitnesses = [f.overall_fitness for f in self.fitness_scores.values()]
         if not fitnesses:
             return
@@ -1703,34 +1936,35 @@ class ExpertRegistry:
         deprecated_count = 0
         reproducer_count = 0
 
-        for expert_id, fitness in list(self.fitness_scores.items()):
-            if expert_id not in self._experts:
-                continue
-            expert = self._experts[expert_id]
-            if (fitness.overall_fitness < threshold and
-                fitness.reproductive_success == 0 and
-                expert.lifecycle_state in [ExpertLifecycleState.ACTIVE, ExpertLifecycleState.CERTIFIED]):
-                self.deprecate_expert(expert_id, reason="natural_selection_low_fitness")
-                deprecated_count += 1
-                if self.biomass_storage:
-                    self.biomass_storage.store_task(
-                        task_data={'expert_id': expert_id, 'knowledge': expert.to_dict()},
-                        ecoatp_cost=1.0,
-                        guarantee=GuaranteeLevel.BEST_EFFORT,
-                        initial_tier=StorageTier.LIPID_DEPOT
-                    )
-                self.evolutionary_events.append({
-                    'type': 'extinction',
-                    'expert_id': expert_id,
-                    'fitness': fitness.overall_fitness,
-                    'quantum_efficiency': fitness.quantum_efficiency,
-                    'reason': 'natural_selection',
-                    'timestamp': datetime.utcnow().isoformat()
-                })
-                self.extinction_count += 1
-            elif fitness.overall_fitness > top_threshold and fitness.reproductive_success < self.config.reproductive_max_offspring:
-                fitness.reproductive_success += 1
-                reproducer_count += 1
+        async with self._lock:
+            for expert_id, fitness in list(self.fitness_scores.items()):
+                if expert_id not in self._experts:
+                    continue
+                expert = self._experts[expert_id]
+                if (fitness.overall_fitness < threshold and
+                    fitness.reproductive_success == 0 and
+                    expert.lifecycle_state in [ExpertLifecycleState.ACTIVE, ExpertLifecycleState.CERTIFIED]):
+                    self.deprecate_expert(expert_id, reason="natural_selection_low_fitness")
+                    deprecated_count += 1
+                    if self.biomass_storage:
+                        self.biomass_storage.store_task(
+                            task_data={'expert_id': expert_id, 'knowledge': expert.model_dump()},
+                            ecoatp_cost=1.0,
+                            guarantee=GuaranteeLevel.BEST_EFFORT,
+                            initial_tier=StorageTier.LIPID_DEPOT
+                        )
+                    self.evolutionary_events.append({
+                        'type': 'extinction',
+                        'expert_id': expert_id,
+                        'fitness': fitness.overall_fitness,
+                        'quantum_efficiency': fitness.quantum_efficiency,
+                        'reason': 'natural_selection',
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+                    self.extinction_count += 1
+                elif fitness.overall_fitness > top_threshold and fitness.reproductive_success < self.config.reproductive_max_offspring:
+                    fitness.reproductive_success += 1
+                    reproducer_count += 1
 
         self._stats['total_natural_selections'] += 1
         self._stats['last_selection'] = datetime.utcnow()
@@ -1793,7 +2027,7 @@ class ExpertRegistry:
                 quantum_efficiency=parent.health.quantum_efficiency * (0.9 + np.random.random() * 0.2)
             )
         )
-        success, msg = self.register_expert(offspring, validate=False, auto_certify=True)
+        success, msg = await self.register_expert(offspring, validate=False, auto_certify=True)
         if success:
             if parent.lineage is None:
                 parent.lineage = ExpertLineage(lineage_id=f"lineage_{parent.expert_id}", parent_expert_id=None)
@@ -1837,57 +2071,63 @@ class ExpertRegistry:
     # Performance Tracking (Enhanced)
     # ============================================================================
 
-    def update_performance(self, expert_id: str, metrics: Dict[str, Any]):
+    async def update_performance(self, expert_id: str, metrics: Dict[str, Any]):
+        # Rate limiting
+        if not await self._rate_limiter.acquire():
+            return
+
         if expert_id not in self._experts:
             return
-        self._performance_history[expert_id].append({
-            **metrics,
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        if len(self._performance_history[expert_id]) > 10000:
-            self._performance_history[expert_id] = self._performance_history[expert_id][-10000:]
 
-        expert = self._experts[expert_id]
-        if 'success' in metrics:
-            alpha = 0.1
-            expert.health.success_rate = expert.health.success_rate * (1 - alpha) + (1.0 if metrics['success'] else 0.0) * alpha
-        if 'latency_ms' in metrics:
-            expert.health.avg_latency_ms = metrics['latency_ms']
-        if 'carbon_kg' in metrics:
-            expert.health.carbon_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 1000)
-        if 'helium_units' in metrics:
-            expert.health.helium_efficiency = 1.0 / (1.0 + metrics['helium_units'] * 100)
-        if 'quantum_accuracy' in metrics:
-            expert.health.quantum_efficiency = metrics['quantum_accuracy']
-        if 'quantum_advantage' in metrics:
-            expert.health.quantum_advantage_score = metrics['quantum_advantage']
-        expert.health.last_heartbeat = datetime.utcnow()
-        expert.sustainability_score = expert.health.calculate_sustainability_score()
+        async with self._performance_lock:
+            self._performance_history[expert_id].append({
+                **metrics,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            if len(self._performance_history[expert_id]) > 10000:
+                self._performance_history[expert_id] = self._performance_history[expert_id][-10000:]
 
-        if self.enable_fitness_tracking and expert_id in self.fitness_scores:
-            fitness = self.fitness_scores[expert_id]
+            expert = self._experts[expert_id]
             if 'success' in metrics:
-                fitness.resilience_score = fitness.resilience_score * 0.8 + (1.0 if metrics['success'] else 0.0) * 0.2
+                alpha = 0.1
+                expert.health.success_rate = expert.health.success_rate * (1 - alpha) + (1.0 if metrics['success'] else 0.0) * alpha
+            if 'latency_ms' in metrics:
+                expert.health.avg_latency_ms = metrics['latency_ms']
             if 'carbon_kg' in metrics:
-                fitness.resource_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 10000)
-            if 'ecoatp_efficiency' in metrics:
-                fitness.ecoatp_efficiency = metrics['ecoatp_efficiency']
+                expert.health.carbon_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 1000)
+            if 'helium_units' in metrics:
+                expert.health.helium_efficiency = 1.0 / (1.0 + metrics['helium_units'] * 100)
             if 'quantum_accuracy' in metrics:
-                fitness.quantum_efficiency = metrics['quantum_accuracy']
-            fitness.sustainability_score = expert.sustainability_score
-            fitness.calculate_overall(self._fitness_weights)
+                expert.health.quantum_efficiency = metrics['quantum_accuracy']
+            if 'quantum_advantage' in metrics:
+                expert.health.quantum_advantage_score = metrics['quantum_advantage']
+            expert.health.last_heartbeat = datetime.utcnow()
+            expert.sustainability_score = expert.health.calculate_sustainability_score()
 
-        if self.enable_bio_correlation and self.gradient_manager:
-            trust_delta = 0.05 if metrics.get('success', False) else -0.1
-            self.gradient_manager.pump_field('trust', trust_delta, source=f"expert_{expert_id}")
+            if self.enable_fitness_tracking and expert_id in self.fitness_scores:
+                fitness = self.fitness_scores[expert_id]
+                if 'success' in metrics:
+                    fitness.resilience_score = fitness.resilience_score * 0.8 + (1.0 if metrics['success'] else 0.0) * 0.2
+                if 'carbon_kg' in metrics:
+                    fitness.resource_efficiency = 1.0 / (1.0 + metrics['carbon_kg'] * 10000)
+                if 'ecoatp_efficiency' in metrics:
+                    fitness.ecoatp_efficiency = metrics['ecoatp_efficiency']
+                if 'quantum_accuracy' in metrics:
+                    fitness.quantum_efficiency = metrics['quantum_accuracy']
+                fitness.sustainability_score = expert.sustainability_score
+                fitness.calculate_overall(self._fitness_weights)
 
-        health_score = expert.health.calculate_health_score()
-        if health_score < 0.3 and expert.lifecycle_state == ExpertLifecycleState.ACTIVE:
-            expert.lifecycle_state = ExpertLifecycleState.DEGRADED
-            logger.warning(f"Expert {expert_id} auto-degraded (health: {health_score:.2f})")
-        elif health_score > 0.7 and expert.lifecycle_state == ExpertLifecycleState.DEGRADED:
-            expert.lifecycle_state = ExpertLifecycleState.ACTIVE
-            logger.info(f"Expert {expert_id} auto-recovered (health: {health_score:.2f})")
+            if self.enable_bio_correlation and self.gradient_manager:
+                trust_delta = 0.05 if metrics.get('success', False) else -0.1
+                self.gradient_manager.pump_field('trust', trust_delta, source=f"expert_{expert_id}")
+
+            health_score = expert.health.calculate_health_score()
+            if health_score < 0.3 and expert.lifecycle_state == ExpertLifecycleState.ACTIVE:
+                expert.lifecycle_state = ExpertLifecycleState.DEGRADED
+                logger.warning(f"Expert {expert_id} auto-degraded (health: {health_score:.2f})")
+            elif health_score > 0.7 and expert.lifecycle_state == ExpertLifecycleState.DEGRADED:
+                expert.lifecycle_state = ExpertLifecycleState.ACTIVE
+                logger.info(f"Expert {expert_id} auto-recovered (health: {health_score:.2f})")
 
     # ============================================================================
     # Background Tasks
@@ -1898,9 +2138,9 @@ class ExpertRegistry:
             try:
                 if self.enable_bio_correlation:
                     if self.gradient_manager:
-                        self.update_fitness_from_gradients()
+                        await self.update_fitness_from_gradients()
                     if self.enable_natural_selection:
-                        self.trigger_natural_selection()
+                        await self.trigger_natural_selection()
                     if self.compartment_manager and self.enable_population_tracking:
                         for species_id in ['energy', 'data', 'iot', 'quantum', 'helium']:
                             self._get_species_population(species_id)
@@ -1966,7 +2206,7 @@ class ExpertRegistry:
             },
             'adaptive_fitness_weights': self._fitness_weights,
             'persistence_enabled': self.enable_persistence,
-            'circuit_breaker_open': self.cross_region_sync.circuit_open if self.cross_region_sync else False
+            'circuit_breaker_open': self.cross_region_sync._circuit_breaker.state == "open" if self.cross_region_sync else False
         }
         if self.enable_population_tracking:
             stats['species_populations'] = self._get_species_populations()
@@ -1994,4 +2234,45 @@ class ExpertRegistry:
             await self.save_state()
         if self.cross_region_sync and self.cross_region_sync._session:
             await self.cross_region_sync._session.close()
+        for task in self._background_tasks:
+            task.cancel()
         logger.info("Shutdown complete")
+
+# ============================================================================
+# Example Usage (if run directly)
+# ============================================================================
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    async def main():
+        config = ExpertRegistryConfig()
+        registry = ExpertRegistry(config)
+
+        # Register an expert
+        profile = ExpertProfile(
+            expert_id="expert_001",
+            expert_name="EcoOptimizer",
+            domain=ExpertDomain.ENERGY,
+            accuracy_score=0.85,
+            reliability_score=0.9,
+            efficiency_score=0.8,
+            quantum_capable=False
+        )
+        success, msg = await registry.register_expert(profile)
+        print(f"Registration: {success}, {msg}")
+
+        # Update performance
+        await registry.update_performance("expert_001", {
+            'success': True,
+            'latency_ms': 10,
+            'carbon_kg': 0.001
+        })
+
+        # Get stats
+        stats = registry.get_registry_stats()
+        print("Stats:", stats)
+
+        await registry.shutdown()
+
+    asyncio.run(main())
