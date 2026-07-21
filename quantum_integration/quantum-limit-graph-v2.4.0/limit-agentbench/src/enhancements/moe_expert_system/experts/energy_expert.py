@@ -1,29 +1,20 @@
-# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/bio_integrated_agent.py
-# Enhanced version v10.0.0 – Full integration with bio‑inspired core, predictive, economic, and swarm‑aware
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/energy_expert.py
+# Enhanced Energy Expert v3.0.0 – Lean MoE Energy & Sustainability Expert
 
 """
-Bio‑Integrated Green Agent v10.0.0
-Full integration of bio‑inspired modules with:
-- Energy‑aware RL strategy selector (Q‑learning)
-- Persistent PQC keys for verifiable identity
-- Selective blockchain auditing based on sustainability impact
-- Event‑driven state updates via core EventBroker
-- Reward enrichment from core analytics (alerts, anomalies, cost‑benefit, health)
-- Strategy propagation to core configuration, scheduler tier, workflows
-- Circuit breakers for resilient service calls
-- Automatic Q‑table recovery on startup
-- Correlation ID tracing
-- Self‑healing trigger on critical alerts
-- Deep TimeTickEngine integration (forecasts, simulation)
-- Active QuantumBridge usage (QUBO penalties in state)
-- Swarm coordination (publish state, receive consensus)
-- Expanded workflow triggers per strategy
-- Full cost‑benefit integration (ROI in reward)
-- HealthMonitor integration (health score in state)
-- Predictive alert count in state and reward
-- Dynamic hyperparameter tuning (adaptive LR/epsilon)
-- Multi‑objective reward decomposition with dynamic weights
-- Edge deployment optimizations (Q‑table compression, batch event processing)
+Energy Expert v3.0.0 – MoE Expert for Energy, Carbon & Helium Profiling
+
+A specialized expert that handles energy-related tasks within the MoE pipeline:
+- Energy consumption estimation (compute, memory, network)
+- Carbon footprint calculation (real-time intensity per region)
+- Helium usage and availability analysis
+- Task routing based on energy/carbon/helium impact
+- Sustainable strategy recommendation (conservative/balanced/performance)
+- Integration with Green_Agent bio-inspired modules
+- Energy-aware telemetry tracking
+- Multi-objective sustainability metrics
+- Predictive energy forecasting (via TimeTickEngine if available)
+- Quantum penalty analysis (QUBO carbon/helium costs)
 """
 
 import asyncio
@@ -32,12 +23,14 @@ import json
 import os
 import hashlib
 import uuid
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union
+from typing import Dict, Any, List, Optional, Tuple, Union, Callable
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from datetime import datetime, timezone
+from collections import defaultdict, deque
+from enum import Enum
 import numpy as np
 import pickle
+from pathlib import Path
 
 # ============================================================================
 # Try optional dependencies
@@ -61,1191 +54,860 @@ except ImportError:
     PROMETHEUS_AVAILABLE = False
 
 # ============================================================================
-# Local imports from bio‑inspired core (with fallback)
+# Local imports – BaseExpert and bio-inspired modules
 # ============================================================================
 try:
-    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
+    from .base_expert import BaseExpert
+    BASE_EXPERT_AVAILABLE = True
+except ImportError:
+    BASE_EXPERT_AVAILABLE = False
+    logger.warning("BaseExpert not available; using fallback interface")
+
+try:
+    from enhancements.bio_inspired.eco_atp_currency import EcoATPTokenManager, EcoATPConsumer
     TOKEN_AVAILABLE = True
 except ImportError:
     TOKEN_AVAILABLE = False
 
 try:
-    from .proton_gradient_fields import GradientFieldManager
+    from enhancements.bio_inspired.proton_gradient_fields import GradientFieldManager
     GRADIENT_AVAILABLE = True
 except ImportError:
     GRADIENT_AVAILABLE = False
 
 try:
-    from .atp_synthase_scheduler import ATPSynthaseScheduler
+    from enhancements.bio_inspired.atp_synthase_scheduler import ATPSynthaseScheduler
     ATP_AVAILABLE = True
 except ImportError:
     ATP_AVAILABLE = False
 
 try:
-    from .chromatophore_compartments import HierarchicalCompartmentManager
-    COMPARTMENT_AVAILABLE = True
-except ImportError:
-    COMPARTMENT_AVAILABLE = False
-
-try:
-    from .biomass_storage import BiomassStorage
-    BIOMASS_AVAILABLE = True
-except ImportError:
-    BIOMASS_AVAILABLE = False
-
-try:
-    from .photosynthetic_harvester import PhotosyntheticHarvester
-    HARVESTER_AVAILABLE = True
-except ImportError:
-    HARVESTER_AVAILABLE = False
-
-try:
-    from .time_tick_engine import TimeTickEngine
+    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
     TICK_ENGINE_AVAILABLE = True
 except ImportError:
-    TICK_AVAILABLE = False
+    TICK_ENGINE_AVAILABLE = False
 
 try:
-    from .quantum_bridge import QuantumBridge
+    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
     QUANTUM_BRIDGE_AVAILABLE = True
 except ImportError:
     QUANTUM_BRIDGE_AVAILABLE = False
 
-try:
-    from .__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
-    CORE_AVAILABLE = True
-except ImportError:
-    CORE_AVAILABLE = False
-
-# PQC (post‑quantum cryptography) – use a simple fallback if not available
-try:
-    from pqcrypto.sign import falcon
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
-
 # ============================================================================
-# Fallback definitions if core not available
+# Configuration Dataclass
 # ============================================================================
-if not CORE_AVAILABLE:
-    class CircuitBreaker:
-        """Fallback circuit breaker."""
-        def __init__(self, name: str, failure_threshold: int = 3, recovery_timeout: float = 30.0):
-            self.name = name
-            self.failure_threshold = failure_threshold
-            self.recovery_timeout = recovery_timeout
-            self._state = "closed"
-            self._failure_count = 0
-            self._last_failure_time = None
-            self._lock = asyncio.Lock()
 
-        async def call(self, func: Callable, *args, **kwargs):
-            async with self._lock:
-                if self._state == "open":
-                    if (datetime.now(timezone.utc) - self._last_failure_time).total_seconds() > self.recovery_timeout:
-                        self._state = "half_open"
-                    else:
-                        raise Exception(f"Circuit breaker {self.name} is OPEN")
-            try:
-                result = await func(*args, **kwargs)
-                async with self._lock:
-                    self._state = "closed"
-                    self._failure_count = 0
-                return result
-            except Exception as e:
-                async with self._lock:
-                    self._failure_count += 1
-                    self._last_failure_time = datetime.now(timezone.utc)
-                    if self._failure_count >= self.failure_threshold:
-                        self._state = "open"
-                raise e
+@dataclass
+class EnergyExpertConfig:
+    """Centralized configuration for the Energy Expert."""
+    # Feature flags
+    enable_energy_estimation: bool = True
+    enable_carbon_tracking: bool = True
+    enable_helium_analysis: bool = True
+    enable_forecasting: bool = True
+    enable_telemetry: bool = True
+    enable_persistence: bool = True
 
-    @dataclass
-    class BioEvent:
-        event_type: str
-        source: str
-        timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-        data: Dict[str, Any] = field(default_factory=dict)
-        correlation_id: Optional[str] = None
-        priority: int = 0
+    # Energy estimation
+    cpu_power_watt: float = 50.0       # Typical CPU power consumption
+    memory_power_per_gb: float = 0.5   # Power per GB of RAM
+    network_power_per_mbps: float = 0.01  # Power per Mbps of bandwidth
+    storage_power_per_gb: float = 0.001   # Power per GB of storage
 
-# ============================================================================
-# Configuration (Pydantic or dataclass) – extended for new features
-# ============================================================================
-if PYDANTIC_AVAILABLE:
-    class AgentConfig(BaseModel):
-        """Configuration for the Bio‑Integrated Agent."""
-        # General
-        agent_id: str = Field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
-        enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
-
-        # RL strategy
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_learning_rate_min: float = 0.01
-        rl_epsilon_min: float = 0.01
-        rl_state_bins: Dict[str, List[str]] = Field(
-            default_factory=lambda: {
-                'load': ['low', 'medium', 'high'],
-                'health': ['poor', 'medium', 'good'],
-                'token': ['scarce', 'adequate', 'abundant'],
-                'energy': ['light', 'normal', 'heavy'],
-                'helium': ['scarce', 'normal', 'abundant'],
-                'carbon': ['low', 'medium', 'high'],
-                'alert_count': ['none', 'some', 'many'],
-                'helium_trend': ['falling', 'stable', 'rising'],
-                'q_penalty_carbon': ['low', 'medium', 'high'],
-                'q_penalty_helium': ['low', 'medium', 'high'],
-            }
-        )
-        rl_strategies: List[str] = ['conservative', 'balanced', 'performance']
-
-        # Energy policies (strategy → config overrides)
-        strategy_policies: Dict[str, Dict[str, Any]] = Field(
-            default_factory=lambda: {
-                'conservative': {
-                    'state_save_interval_seconds': 600,
-                    'health_check_interval_seconds': 60,
-                    'task_throughput': 0.3,
-                    'token_base_generation_rate': 0.5,
-                    'biomass_storage_preference': True,
-                    'genetic_evolution_interval': 86400 * 2,
-                    'competition_interval': 7200,
-                },
-                'balanced': {
-                    'state_save_interval_seconds': 300,
-                    'health_check_interval_seconds': 30,
-                    'task_throughput': 1.0,
-                    'token_base_generation_rate': 1.0,
-                    'biomass_storage_preference': False,
-                    'genetic_evolution_interval': 86400,
-                    'competition_interval': 3600,
-                },
-                'performance': {
-                    'state_save_interval_seconds': 60,
-                    'health_check_interval_seconds': 10,
-                    'task_throughput': 2.0,
-                    'token_base_generation_rate': 1.5,
-                    'biomass_storage_preference': False,
-                    'genetic_evolution_interval': 43200,
-                    'competition_interval': 1800,
-                }
-            }
-        )
-
-        # PQC keys
-        pqc_key_dir: str = Field("./pqc_keys", description="Directory for PQC key storage")
-
-        # Blockchain audit policy
-        blockchain_audit_events: List[str] = Field(
-            default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot']
-        )
-        blockchain_audit_min_importance: float = 0.5  # 0–1 threshold
-
-        # Persistence
-        state_save_interval_seconds: int = 300
-        state_save_path: str = "./agent_state.pkl"
-
-        # Q‑table compression
-        q_table_max_size: int = 5000  # max states before compression
-
-        # Feature flags
-        enable_prometheus: bool = False
-
-        # Multi‑objective weights (if enabled)
-        objective_weights: Dict[str, float] = Field(
-            default_factory=lambda: {
-                'energy_efficiency': 0.3,
-                'helium_sustainability': 0.25,
-                'token_balance': 0.2,
-                'health_score': 0.15,
-                'carbon_leakage': 0.1,
-            }
-        )
-
-        class Config:
-            env_prefix = "AGENT_"
-else:
-    @dataclass
-    class AgentConfig:
-        agent_id: str = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
-        enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_learning_rate_min: float = 0.01
-        rl_epsilon_min: float = 0.01
-        rl_state_bins: Dict[str, List[str]] = field(default_factory=lambda: {
-            'load': ['low', 'medium', 'high'],
-            'health': ['poor', 'medium', 'good'],
-            'token': ['scarce', 'adequate', 'abundant'],
-            'energy': ['light', 'normal', 'heavy'],
-            'helium': ['scarce', 'normal', 'abundant'],
-            'carbon': ['low', 'medium', 'high'],
-            'alert_count': ['none', 'some', 'many'],
-            'helium_trend': ['falling', 'stable', 'rising'],
-            'q_penalty_carbon': ['low', 'medium', 'high'],
-            'q_penalty_helium': ['low', 'medium', 'high'],
-        })
-        rl_strategies: List[str] = field(default_factory=lambda: ['conservative', 'balanced', 'performance'])
-        strategy_policies: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
-            'conservative': {
-                'state_save_interval_seconds': 600,
-                'health_check_interval_seconds': 60,
-                'task_throughput': 0.3,
-                'token_base_generation_rate': 0.5,
-                'biomass_storage_preference': True,
-                'genetic_evolution_interval': 86400 * 2,
-                'competition_interval': 7200,
-            },
-            'balanced': {
-                'state_save_interval_seconds': 300,
-                'health_check_interval_seconds': 30,
-                'task_throughput': 1.0,
-                'token_base_generation_rate': 1.0,
-                'biomass_storage_preference': False,
-                'genetic_evolution_interval': 86400,
-                'competition_interval': 3600,
-            },
-            'performance': {
-                'state_save_interval_seconds': 60,
-                'health_check_interval_seconds': 10,
-                'task_throughput': 2.0,
-                'token_base_generation_rate': 1.5,
-                'biomass_storage_preference': False,
-                'genetic_evolution_interval': 43200,
-                'competition_interval': 1800,
-            }
-        })
-        pqc_key_dir: str = "./pqc_keys"
-        blockchain_audit_events: List[str] = field(default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot'])
-        blockchain_audit_min_importance: float = 0.5
-        state_save_interval_seconds: int = 300
-        state_save_path: str = "./agent_state.pkl"
-        q_table_max_size: int = 5000
-        enable_prometheus: bool = False
-        objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'energy_efficiency': 0.3,
-            'helium_sustainability': 0.25,
-            'token_balance': 0.2,
-            'health_score': 0.15,
-            'carbon_leakage': 0.1,
-        })
-
-# ============================================================================
-# Quantum‑Resilient Security (with persistent keys)
-# ============================================================================
-class QuantumResilientSecurity:
-    """
-    Provides post‑quantum signature capabilities with persistent key storage.
-    """
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.pqc_key_dir = Path(config.pqc_key_dir)
-        self.pqc_key_dir.mkdir(parents=True, exist_ok=True)
-        self.private_key = None
-        self.public_key = None
-        self._load_or_generate_keys()
-
-    def _load_or_generate_keys(self):
-        """Load existing PQC keys or generate new ones."""
-        priv_path = self.pqc_key_dir / "private.key"
-        pub_path = self.pqc_key_dir / "public.key"
-        if priv_path.exists() and pub_path.exists():
-            try:
-                with open(priv_path, 'rb') as f:
-                    self.private_key = f.read()
-                with open(pub_path, 'rb') as f:
-                    self.public_key = f.read()
-                logger.info("Loaded existing PQC keys")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load PQC keys: {e}")
-
-        # Generate new keys
-        if PQC_AVAILABLE:
-            self.private_key, self.public_key = falcon.generate_keypair()
-            with open(priv_path, 'wb') as f:
-                f.write(self.private_key)
-            with open(pub_path, 'wb') as f:
-                f.write(self.public_key)
-            logger.info("Generated and saved new PQC keys")
-        else:
-            # Fallback: use SHA‑256 HMAC as a placeholder
-            self.private_key = os.urandom(32)
-            self.public_key = hashlib.sha256(self.private_key).digest()
-            with open(priv_path, 'wb') as f:
-                f.write(self.private_key)
-            with open(pub_path, 'wb') as f:
-                f.write(self.public_key)
-            logger.warning("PQC library not available; using fallback HMAC keys")
-
-    def sign_data(self, data: Dict[str, Any]) -> str:
-        """Sign data with the persistent private key."""
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            signature = falcon.sign(payload, self.private_key)
-            return signature.hex()
-        else:
-            import hmac
-            signature = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
-            return signature
-
-    def verify_signature(self, data: Dict[str, Any], signature: str) -> bool:
-        """Verify a signature with the persistent public key."""
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            try:
-                falcon.verify(payload, bytes.fromhex(signature), self.public_key)
-                return True
-            except Exception:
-                return False
-        else:
-            import hmac
-            expected = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
-            return hmac.compare_digest(expected, signature)
-
-# ============================================================================
-# Blockchain Auditor (with selective auditing)
-# ============================================================================
-class BlockchainAuditor:
-    """
-    Records important events on a simulated blockchain with selective auditing.
-    """
-    def __init__(self, config: AgentConfig, security: QuantumResilientSecurity):
-        self.config = config
-        self.security = security
-        self.ledger = []
-        self._lock = asyncio.Lock()
-
-    async def record_event(self, event_type: str, payload: Dict[str, Any], importance: float = 0.5) -> bool:
-        """
-        Record an event if it meets the audit policy.
-        Returns True if recorded.
-        """
-        if event_type not in self.config.blockchain_audit_events:
-            logger.debug(f"Event {event_type} not in audit list; skipping")
-            return False
-
-        if importance < self.config.blockchain_audit_min_importance:
-            logger.debug(f"Event importance {importance} below threshold; skipping")
-            return False
-
-        signature = self.security.sign_data(payload)
-        entry = {
-            'event_type': event_type,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'payload': payload,
-            'signature': signature,
-            'hash': hashlib.sha256(json.dumps(payload, default=str).encode()).hexdigest()
+    # Carbon tracking
+    carbon_intensity_g_per_kwh: float = 100.0  # Default CO2 intensity (g/kWh)
+    regional_carbon_map: Dict[str, float] = field(
+        default_factory=lambda: {
+            'us-west': 50.0,    # Low carbon (renewable-heavy)
+            'us-east': 150.0,   # Medium carbon
+            'eu-west': 80.0,    # Low carbon (wind/hydro)
+            'asia-southeast': 400.0,  # High carbon (coal-heavy)
+            'default': 100.0,
         }
-        async with self._lock:
-            self.ledger.append(entry)
-        logger.info(f"Audit recorded: {event_type} (importance {importance})")
-        return True
+    )
 
-    def get_ledger(self, limit: int = 100) -> List[Dict]:
-        return self.ledger[-limit:]
+    # Helium availability and cost
+    helium_scarcity_factor: float = 1.0  # 1.0 = normal, >1 = scarce
+    helium_recovery_efficiency: float = 0.7  # Recovery rate 70%
+    helium_cost_per_liter_usd: float = 0.5
 
-    def verify_entry(self, entry: Dict) -> bool:
-        payload = entry['payload']
-        signature = entry['signature']
-        return self.security.verify_signature(payload, signature)
+    # Sustainability thresholds
+    energy_efficiency_threshold: float = 0.7  # Above 70% efficiency is good
+    carbon_budget_per_task_g: float = 10.0    # ~10g CO2 per task
+    helium_budget_per_task_ml: float = 5.0    # ~5ml helium per task
 
-# ============================================================================
-# RL Strategy Selector (Q‑Learning with extended state, multi‑objective)
-# ============================================================================
-class RLStrategySelector:
-    """
-    Q‑learning strategy selector that is energy‑aware and supports multi‑objective rewards.
-    """
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: {s: 0.0 for s in config.rl_strategies})
-        self.learning_rate = config.rl_learning_rate
-        self.discount_factor = config.rl_discount_factor
-        self.epsilon = config.rl_epsilon
-        self.last_state_key = None
-        self.last_action = None
-        self.actions = config.rl_strategies
-        self.state_bins = config.rl_state_bins
-        self.reward_history = deque(maxlen=100)  # for dynamic tuning
+    # Forecasting
+    forecast_window_hours: int = 24
 
-    def _state_to_key(self, state: Dict[str, float]) -> str:
-        """
-        Discretize continuous state values into bins.
-        Extended state includes:
-        - helium_trend (from forecasts)
-        - q_penalty_carbon, q_penalty_helium (from QuantumBridge)
-        - alert_count (from PredictiveAlertSystem)
-        - carbon leakage
-        """
-        load = state.get('system_load', 0.5)
-        health = state.get('health_score', 0.8)
-        token = state.get('token_balance', 0)
-        energy = state.get('energy_intensity', 0.5)
-        helium = state.get('helium_level', 0.5)
-        carbon = state.get('carbon_leakage_proxy', 0.3)
-        alert_count = state.get('alert_count', 0)
-        helium_trend = state.get('helium_trend', 0)  # -1 falling, 0 stable, 1 rising
-        q_penalty_carbon = state.get('q_penalty_carbon', 0.5)
-        q_penalty_helium = state.get('q_penalty_helium', 0.5)
+    # Persistence
+    state_save_path: str = "./energy_expert_state.pkl"
 
-        # Binning
-        load_bin = 'high' if load > 0.7 else 'medium' if load > 0.4 else 'low'
-        health_bin = 'good' if health > 0.7 else 'medium' if health > 0.4 else 'poor'
-        token_bin = 'abundant' if token > 1000 else 'adequate' if token > 100 else 'scarce'
-        energy_bin = 'heavy' if energy > 0.7 else 'normal' if energy > 0.4 else 'light'
-        helium_bin = 'scarce' if helium < 0.3 else 'normal' if helium < 0.7 else 'abundant'
-        carbon_bin = 'high' if carbon > 0.6 else 'medium' if carbon > 0.3 else 'low'
-        alert_bin = 'many' if alert_count > 2 else 'some' if alert_count > 0 else 'none'
-        helium_trend_bin = 'rising' if helium_trend > 0.1 else 'falling' if helium_trend < -0.1 else 'stable'
-        q_carbon_bin = 'high' if q_penalty_carbon > 0.7 else 'medium' if q_penalty_carbon > 0.3 else 'low'
-        q_helium_bin = 'high' if q_penalty_helium > 0.7 else 'medium' if q_penalty_helium > 0.3 else 'low'
-
-        return f"{load_bin}_{health_bin}_{token_bin}_{energy_bin}_{helium_bin}_{carbon_bin}_{alert_bin}_{helium_trend_bin}_{q_carbon_bin}_{q_helium_bin}"
-
-    def select_action(self, state: Dict[str, float]) -> str:
-        key = self._state_to_key(state)
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-
-        # Adaptive epsilon: reduce exploration if reward variance is low and system is stable
-        if len(self.reward_history) > 20:
-            var = np.var(self.reward_history)
-            # If variance is low (<0.05), reduce exploration
-            if var < 0.05:
-                eps = max(self.config.rl_epsilon_min, self.epsilon * 0.95)
-            else:
-                eps = min(self.config.rl_epsilon, self.epsilon * 1.05)
-            self.epsilon = eps
-
-        if np.random.random() < self.epsilon:
-            action = np.random.choice(self.actions)
-        else:
-            q_vals = self.q_table[key]
-            max_q = max(q_vals.values())
-            best_actions = [a for a, q in q_vals.items() if q == max_q]
-            action = np.random.choice(best_actions)
-
-        self.last_state_key = key
-        self.last_action = action
-        return action
-
-    def update(self, state: Dict[str, float], action: str, reward: float, next_state: Dict[str, float]):
-        if self.last_state_key is None or self.last_action is None:
-            return
-        key = self._state_to_key(state)
-        next_key = self._state_to_key(next_state)
-
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-        if next_key not in self.q_table:
-            self.q_table[next_key] = {s: 0.0 for s in self.actions}
-
-        max_next = max(self.q_table[next_key].values())
-        current_q = self.q_table[key][action]
-        self.q_table[key][action] = current_q + self.learning_rate * (
-            reward + self.discount_factor * max_next - current_q
-        )
-
-        # Store reward for variance tracking
-        self.reward_history.append(reward)
-
-        # Adaptive learning rate: increase when variance is high
-        if len(self.reward_history) > 20:
-            var = np.var(self.reward_history)
-            if var > 0.2:
-                self.learning_rate = max(self.config.rl_learning_rate_min, self.learning_rate * 0.9)
-            elif var < 0.05:
-                self.learning_rate = min(self.config.rl_learning_rate, self.learning_rate * 1.1)
-
-        # Compress Q‑table if it grows too large
-        if len(self.q_table) > self.config.q_table_max_size:
-            self._compress_q_table()
-
-    def _compress_q_table(self):
-        """Prune least‑visited states."""
-        # Count visits per state (approximate by number of updates)
-        # For simplicity, we remove half of the states with lowest average Q‑value
-        sorted_keys = sorted(self.q_table.keys(), key=lambda k: max(self.q_table[k].values()))
-        to_remove = sorted_keys[:len(sorted_keys)//2]
-        for k in to_remove:
-            del self.q_table[k]
-        logger.info(f"Compressed Q‑table to {len(self.q_table)} states.")
-
-    def get_q_table_size(self) -> int:
-        return len(self.q_table)
-
-    def get_best_strategy(self, state: Dict[str, float]) -> str:
-        key = self._state_to_key(state)
-        if key not in self.q_table:
-            return 'balanced'
-        q_vals = self.q_table[key]
-        return max(q_vals, key=q_vals.get)
+    def __post_init__(self):
+        """Validate configuration."""
+        if self.cpu_power_watt <= 0:
+            self.cpu_power_watt = 50.0
+        if self.carbon_intensity_g_per_kwh < 0:
+            self.carbon_intensity_g_per_kwh = 100.0
 
 # ============================================================================
-# Task Manager (for background loops)
+# Enums for Energy Operations
 # ============================================================================
-class TaskManager:
-    """Manages background tasks with restart and exponential backoff."""
-    def __init__(self):
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.shutdown_event = asyncio.Event()
-        self._lock = asyncio.Lock()
 
-    def start_task(self, name: str, coro_func, *args, **kwargs):
-        async def wrapper():
-            backoff = 1
-            max_backoff = 300
-            while not self.shutdown_event.is_set():
-                try:
-                    await coro_func(*args, **kwargs)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-        task = asyncio.create_task(wrapper(), name=name)
-        async with self._lock:
-            self.tasks[name] = task
-        return task
+class EnergySourceType(Enum):
+    RENEWABLE = "renewable"
+    FOSSIL_FUEL = "fossil_fuel"
+    NUCLEAR = "nuclear"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
 
-    async def stop_all(self):
-        self.shutdown_event.set()
-        async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
+class SustainabilityStrategy(Enum):
+    CONSERVATIVE = "conservative"   # Minimize energy/carbon
+    BALANCED = "balanced"            # Balance performance and sustainability
+    PERFORMANCE = "performance"      # Prioritize performance
+    RENEWABLE_ONLY = "renewable_only"  # Only renewable energy
 
 # ============================================================================
-# Core Bio‑Integrated Agent (v10.0.0 – fully enhanced)
+# Energy Profiling Results
 # ============================================================================
-class BioIntegratedAgent:
-    """
-    Main agent that orchestrates all bio‑inspired modules, with energy‑aware RL,
-    persistent PQC keys, selective blockchain auditing, and full integration with
-    the bio‑inspired core's event, analytics, and self‑healing capabilities.
-    """
 
-    def __init__(
-        self,
-        bio_core: Optional[Any] = None,  # EnhancedBioInspiredCore instance
-        config: Optional[Union[AgentConfig, Dict[str, Any]]] = None,
-        csv_path: Optional[str] = None,
-        quantum_graph: Optional[Any] = None,
-        token_manager: Optional[Any] = None,
-        gradient_manager: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-        compartment_manager: Optional[Any] = None,
-        biomass_storage: Optional[Any] = None,
-        harvester: Optional[Any] = None,
-        tick_engine: Optional[Any] = None,
-        quantum_bridge: Optional[Any] = None,
-    ):
-        # Load config
-        if isinstance(config, dict):
-            if PYDANTIC_AVAILABLE:
-                self.config = AgentConfig(**config)
-            else:
-                self.config = AgentConfig(**config)
-        elif isinstance(config, AgentConfig):
-            self.config = config
-        else:
-            self.config = AgentConfig()
+@dataclass
+class EnergyProfile:
+    """Profile of a task's energy footprint."""
+    task_id: str
+    estimated_duration_seconds: float
+    estimated_cpu_energy_kwh: float
+    estimated_memory_energy_kwh: float
+    estimated_network_energy_kwh: float
+    estimated_total_energy_kwh: float
+    carbon_intensity_g_per_kwh: float
+    estimated_carbon_g: float
+    estimated_helium_ml: float
+    energy_efficiency_score: float  # 0-1, higher is better
+    sustainability_score: float      # 0-1, combines energy/carbon/helium
+    recommended_strategy: str
+    region: str
+    timestamp: str
 
-        # Store core reference
-        self.bio_core = bio_core
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-        # Inject dependencies or create defaults
-        self.token_manager = token_manager or (EcoATPTokenManager() if TOKEN_AVAILABLE else None)
-        self.gradient_manager = gradient_manager or (GradientFieldManager() if GRADIENT_AVAILABLE else None)
-        self.scheduler = scheduler or (ATPSynthaseScheduler(self.token_manager, self.gradient_manager) if ATP_AVAILABLE else None)
-        self.compartment_manager = compartment_manager or (HierarchicalCompartmentManager(self.token_manager) if COMPARTMENT_AVAILABLE else None)
-        self.biomass_storage = biomass_storage or (BiomassStorage(self.token_manager, self.gradient_manager) if BIOMASS_AVAILABLE else None)
-        self.harvester = harvester or (PhotosyntheticHarvester(self.token_manager) if HARVESTER_AVAILABLE else None)
+@dataclass
+class HeliumAnalysis:
+    """Analysis of helium usage and availability."""
+    available_ml: float
+    required_ml: float
+    scarcity_factor: float
+    recovery_potential_ml: float
+    can_proceed: bool
+    recommendation: str
+    timestamp: str
 
-        # Optional advanced modules
-        self.tick_engine = tick_engine
-        if self.config.enable_time_tick_engine and csv_path and TICK_ENGINE_AVAILABLE:
-            from .time_tick_engine import TimeTickEngine
-            self.tick_engine = TimeTickEngine(
-                csv_path=csv_path,
-                harvester=self.harvester,
-                translator_class=HeliumEnvironmentTranslator
-            )
-        self.quantum_bridge = quantum_bridge
-        if self.config.enable_quantum_bridge and QUANTUM_BRIDGE_AVAILABLE and quantum_graph:
-            from .quantum_bridge import QuantumBridge
-            self.quantum_bridge = QuantumBridge(self.gradient_manager, quantum_graph)
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-        # Security and auditing
-        self.security = QuantumResilientSecurity(self.config)
-        self.auditor = BlockchainAuditor(self.config, self.security)
+@dataclass
+class CarbonFootprint:
+    """Carbon footprint analysis."""
+    baseline_carbon_g: float  # Raw CO2 from energy use
+    offset_strategy: Optional[str]  # e.g., "renewable_swap", "purchase_offset"
+    offset_carbon_g: float  # CO2 offset by strategy
+    net_carbon_g: float      # Baseline - offset
+    cost_usd: float          # Cost of operations + offsets
+    roi_factor: float        # Cost-benefit ratio
+    timestamp: str
 
-        # RL strategy selector
-        self.strategy_selector = RLStrategySelector(self.config) if self.config.enable_energy_aware_rl else None
-        self.current_strategy = 'balanced'
-        self.strategy_change_time = datetime.now(timezone.utc)
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-        # State and metrics
-        self.state = self._get_initial_state()
-        self.metrics = {
-            'strategy_changes': 0,
-            'total_reward': 0.0,
-            'energy_efficiency': 0.0,
-            'helium_efficiency': 0.0,
-            'avg_reward': 0.0,
-        }
-        self.reward_history = deque(maxlen=100)
+@dataclass
+class EnergyExpertMetrics:
+    """Metrics for energy expert operations."""
+    operation_name: str
+    start_time: float
+    end_time: Optional[float] = None
+    tasks_analyzed: int = 0
+    total_energy_kwh: float = 0.0
+    total_carbon_kg: float = 0.0
+    total_helium_ml: float = 0.0
+    success: bool = True
+    error_message: Optional[str] = None
 
-        # Circuit breakers for external services
-        self._token_circuit = CircuitBreaker("token_service")
-        self._gradient_circuit = CircuitBreaker("gradient_service")
+    def duration_seconds(self) -> float:
+        if self.end_time:
+            return self.end_time - self.start_time
+        return 0.0
 
-        # Correlation ID for tracing
-        self.correlation_id = str(uuid.uuid4())
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-        # Access to core sub‑modules if available
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.health_monitor = getattr(self.bio_core, 'health_monitor', None)
+# ============================================================================
+# Fallback BaseExpert if not available
+# ============================================================================
 
-            # Subscribe to core events
-            if self.event_broker:
-                self._subscribe_events()
-        else:
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-            self.health_monitor = None
+if not BASE_EXPERT_AVAILABLE:
+    class BaseExpert:
+        """Fallback base expert interface."""
+        def __init__(self):
+            self.expert_name = "energy_expert"
+            self.supported_task_types = [
+                "energy_estimate", "carbon_profile", "helium_analysis",
+                "sustainability_recommend", "energy_route", "forecast"
+            ]
+            self.health_status = "healthy"
 
-        # Background tasks
-        self._task_manager = TaskManager()
-        self._task_manager.start_task("strategy_loop", self._strategy_update_loop)
-        self._task_manager.start_task("state_save", self._state_save_loop)
-        self._task_manager.start_task("daily_snapshot", self._daily_snapshot_loop)
-        if self.config.enable_swarm_coordination and self.swarm_coordinator:
-            self._task_manager.start_task("swarm_update", self._swarm_update_loop)
+        async def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+            raise NotImplementedError()
 
-        # Load saved state (including Q‑table) on startup
-        asyncio.create_task(self.load_state())
-
-        logger.info(f"BioIntegratedAgent v10.0.0 initialized with ID {self.config.agent_id}, correlation_id={self.correlation_id}")
-
-    def _subscribe_events(self):
-        """Subscribe to core events for state updates."""
-        if self.event_broker:
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('gradient_update', self._on_gradient_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            self.event_broker.subscribe('health_update', self._on_health_update)
-            logger.info("Subscribed to core events")
-
-    async def _on_token_update(self, event: BioEvent):
-        self.state['token_balance'] = event.data.get('balance', 500)
-        await self._maybe_update_strategy()
-
-    async def _on_gradient_update(self, event: BioEvent):
-        field = event.data.get('field', 'carbon')
-        strength = event.data.get('strength', 0.5)
-        if field == 'helium':
-            self.state['helium_level'] = strength
-        elif field == 'carbon':
-            self.state['carbon_leakage_proxy'] = strength
-        await self._maybe_update_strategy()
-
-    async def _on_helium_update(self, event: BioEvent):
-        self.state['helium_level'] = event.data.get('helium_level', 0.5)
-        await self._maybe_update_strategy()
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        # Anomalies may influence strategy
-        await self._maybe_update_strategy()
-
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative and triggering healing")
-            await self.apply_strategy('conservative')
-            if self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-
-    async def _on_health_update(self, event: BioEvent):
-        self.state['health_score'] = event.data.get('health_score', 0.8)
-        await self._maybe_update_strategy()
-
-    async def _maybe_update_strategy(self):
-        """Check if strategy should be re‑evaluated immediately based on state changes."""
-        pass  # strategy loop handles periodic updates
-
-    def _get_initial_state(self) -> Dict[str, float]:
-        return {
-            'system_load': 0.5,
-            'health_score': 0.8,
-            'token_balance': 500,
-            'energy_intensity': 0.5,
-            'helium_level': 0.5,
-            'carbon_leakage_proxy': 0.3,
-            'helium_trend': 0.0,
-            'alert_count': 0,
-            'q_penalty_carbon': 0.5,
-            'q_penalty_helium': 0.5,
-        }
-
-    async def get_strategy_state(self) -> Dict[str, float]:
-        """
-        Aggregate current system metrics into a state vector for RL.
-        Includes energy and helium signals, forecasts, QUBO penalties, and alert counts.
-        Uses circuit breakers for resilience.
-        """
-        state = {}
-
-        # Token balance
-        if self.token_manager:
-            try:
-                summary = await self._token_circuit.call(self.token_manager.get_system_summary)
-                state['token_balance'] = summary.get('total_balance', 500)
-            except Exception as e:
-                logger.warning(f"Failed to get token summary: {e}")
-                state['token_balance'] = self.state.get('token_balance', 500)
-        else:
-            state['token_balance'] = 500
-
-        # System load
-        if self.scheduler:
-            try:
-                stats = await self._token_circuit.call(self.scheduler.get_scheduler_stats)
-                state['system_load'] = stats.get('demand_level', 0.5)
-            except Exception:
-                state['system_load'] = self.state.get('system_load', 0.5)
-        elif self.compartment_manager:
-            try:
-                stats = await self._token_circuit.call(self.compartment_manager.get_ecosystem_stats)
-                state['system_load'] = 1.0 - stats.get('viable_compartments', 0) / max(stats.get('total_compartments', 1), 1)
-            except Exception:
-                state['system_load'] = self.state.get('system_load', 0.5)
-        else:
-            state['system_load'] = 0.5
-
-        # Health score
-        if self.harvester:
-            try:
-                stats = await self._token_circuit.call(self.harvester.get_harvesting_stats)
-                health = stats.get('pigment_health', {})
-                avg_health = np.mean([h.get('efficiency', 0.5) for h in health.values()]) if health else 0.8
-                state['health_score'] = avg_health
-            except Exception:
-                state['health_score'] = self.state.get('health_score', 0.8)
-        else:
-            state['health_score'] = 0.8
-
-        # Energy intensity
-        if self.token_manager:
-            try:
-                summary = await self._token_circuit.call(self.token_manager.get_system_summary)
-                total_generated = summary.get('total_generated', 0)
-                total_consumed = summary.get('total_consumed', 0)
-                if total_generated > 0:
-                    state['energy_intensity'] = total_consumed / total_generated
-                else:
-                    state['energy_intensity'] = 0.5
-            except Exception:
-                state['energy_intensity'] = self.state.get('energy_intensity', 0.5)
-        else:
-            state['energy_intensity'] = 0.5
-
-        # Helium level and trend
-        helium_level = 0.5
-        helium_trend = 0.0
-        if self.tick_engine:
-            try:
-                if hasattr(self.tick_engine, 'get_current_helium'):
-                    helium_level = self.tick_engine.get_current_helium()
-                elif hasattr(self.tick_engine, 'current_data'):
-                    helium_level = self.tick_engine.current_data.get('helium_supply', 0.5)
-                # Get forecast trend
-                if hasattr(self.tick_engine, 'get_helium_forecast'):
-                    forecast = self.tick_engine.get_helium_forecast(2)  # next 2 hours
-                    if forecast and len(forecast) > 1:
-                        # Compute slope of forecast
-                        x = np.arange(len(forecast))
-                        slope = np.polyfit(x, forecast, 1)[0]
-                        helium_trend = slope / (max(forecast) + 0.001)  # normalized
-            except Exception as e:
-                logger.warning(f"Failed to get helium data from tick engine: {e}")
-                helium_level = self.state.get('helium_level', 0.5)
-                helium_trend = self.state.get('helium_trend', 0.0)
-        elif self.gradient_manager:
-            try:
-                strengths = await self._gradient_circuit.call(self.gradient_manager.get_field_strengths)
-                helium_level = strengths.get('helium', 0.5)
-                # No trend data from gradient manager; we could compute from history
-            except Exception:
-                helium_level = self.state.get('helium_level', 0.5)
-        state['helium_level'] = max(0.0, min(1.0, helium_level))
-        state['helium_trend'] = helium_trend
-
-        # Carbon leakage proxy
-        if self.gradient_manager:
-            try:
-                strengths = await self._gradient_circuit.call(self.gradient_manager.get_field_strengths)
-                carbon = strengths.get('carbon', 0.5)
-                state['carbon_leakage_proxy'] = max(0.0, min(1.0, carbon))
-            except Exception:
-                state['carbon_leakage_proxy'] = self.state.get('carbon_leakage_proxy', 0.3)
-        else:
-            state['carbon_leakage_proxy'] = 0.3
-
-        # Alert count
-        if self.alert_system:
-            alerts = await self.alert_system.get_active_alerts()
-            state['alert_count'] = len(alerts)
-        else:
-            state['alert_count'] = 0
-
-        # QuantumBridge penalties
-        if self.quantum_bridge and hasattr(self.quantum_bridge, 'get_qubo_parameters'):
-            try:
-                q_params = self.quantum_bridge.get_qubo_parameters()
-                state['q_penalty_carbon'] = q_params.get('penalty_carbon', 0.5)
-                state['q_penalty_helium'] = q_params.get('penalty_helium_shortage', 0.5)
-            except Exception:
-                state['q_penalty_carbon'] = self.state.get('q_penalty_carbon', 0.5)
-                state['q_penalty_helium'] = self.state.get('q_penalty_helium', 0.5)
-        else:
-            state['q_penalty_carbon'] = 0.5
-            state['q_penalty_helium'] = 0.5
-
-        return state
-
-    async def _compute_reward(self, state: Dict[str, float]) -> float:
-        """
-        Compute reward based on sustainability metrics, core analytics, and multi‑objective decomposition.
-        """
-        # Base components
-        energy_efficiency = 1.0 - state.get('energy_intensity', 0.5)
-        helium_sustainability = state.get('helium_level', 0.5)
-        token_balance = min(1.0, state.get('token_balance', 500) / 1000)  # normalize to 0-1
-        health_score = state.get('health_score', 0.8)
-        carbon_leakage = state.get('carbon_leakage_proxy', 0.3)
-
-        # Penalties for alerts and anomalies
-        alert_penalty = 0.0
-        if self.alert_system:
-            alerts = await self.alert_system.get_active_alerts()
-            critical_alerts = [a for a in alerts if a.severity == 'critical']
-            alert_penalty = 0.2 * len(critical_alerts)
-
-        anomaly_penalty = 0.0
-        if self.anomaly_detection:
-            anomalies = await self.anomaly_detection.get_recent_anomalies(limit=5)
-            anomaly_penalty = 0.1 * len(anomalies)
-
-        # Cost‑benefit bonus
-        cb_bonus = 0.0
-        if self.cost_benefit_engine:
-            stats = await self.cost_benefit_engine.get_analysis_stats()
-            avg_roi = stats.get('average_roi', 0)
-            if avg_roi > 0.5:
-                cb_bonus = 0.1
-
-        # Multi‑objective or scalar reward
-        if self.config.enable_multi_objective_rl:
-            # Weighted sum of objectives
-            weights = self.config.objective_weights
-            reward = (
-                weights.get('energy_efficiency', 0.3) * energy_efficiency +
-                weights.get('helium_sustainability', 0.25) * helium_sustainability +
-                weights.get('token_balance', 0.2) * token_balance +
-                weights.get('health_score', 0.15) * health_score -
-                weights.get('carbon_leakage', 0.1) * carbon_leakage
-            ) - alert_penalty - anomaly_penalty + cb_bonus
-        else:
-            # Scalar reward (v9 style)
-            reward = (
-                + 0.4 * energy_efficiency
-                + 0.2 * helium_sustainability
-                + 0.2 * token_balance
-                + 0.1 * health_score
-                - 0.1 * carbon_leakage
-                - alert_penalty
-                - anomaly_penalty
-                + cb_bonus
-            )
-
-        return reward
-
-    async def _strategy_update_loop(self):
-        """Background loop that periodically updates RL strategy."""
-        while True:
-            try:
-                # Get current state
-                state = await self.get_strategy_state()
-                self.state = state
-
-                # Select strategy
-                if self.strategy_selector:
-                    action = self.strategy_selector.select_action(state)
-                    await self.apply_strategy(action)
-                    self.current_strategy = action
-                    self.strategy_change_time = datetime.now(timezone.utc)
-                    self.metrics['strategy_changes'] += 1
-
-                    # After a delay, compute reward and update Q‑table
-                    await asyncio.sleep(self.config.state_save_interval_seconds)
-                    next_state = await self.get_strategy_state()
-                    reward = await self._compute_reward(next_state)
-                    self.metrics['total_reward'] += reward
-                    self.reward_history.append(reward)
-                    self.metrics['avg_reward'] = np.mean(self.reward_history) if self.reward_history else 0
-                    self.strategy_selector.update(state, action, reward, next_state)
-
-                    # Audit strategy change if important
-                    importance = 0.7 if action != 'balanced' else 0.3
-                    await self.auditor.record_event(
-                        'strategy_change',
-                        {'new_strategy': action, 'state': state, 'reward': reward},
-                        importance=importance
-                    )
-
-                    # Update metrics
-                    await self._update_metrics(state)
-                else:
-                    # No RL: use balanced
-                    await self.apply_strategy('balanced')
-
-                # Sleep until next cycle
-                await asyncio.sleep(self.config.state_save_interval_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Strategy loop error", error=str(e))
-                await asyncio.sleep(30)
-
-    async def apply_strategy(self, strategy: str):
-        """
-        Apply the policies associated with the strategy to the system.
-        Overrides relevant config parameters and propagates to modules.
-        Also updates core configuration if available, sets degradation tier,
-        and triggers workflows.
-        """
-        policy = self.config.strategy_policies.get(strategy, self.config.strategy_policies['balanced'])
-        logger.info(f"Applying strategy '{strategy}' with policy: {policy}")
-
-        # Update agent config
-        for key, value in policy.items():
-            if hasattr(self.config, key):
-                setattr(self.config, key, value)
-
-        # Propagate to core if available
-        if self.bio_core and hasattr(self.bio_core, 'update_configuration'):
-            await self.bio_core.update_configuration(policy)
-
-        # Adjust scheduler degradation tier
-        if self.scheduler and hasattr(self.scheduler, 'set_degradation_tier'):
-            tier = 5 if strategy == 'conservative' else 3 if strategy == 'balanced' else 1
-            self.scheduler.set_degradation_tier(tier)
-
-        # Trigger workflow based on strategy
-        if self.workflow_orchestrator:
-            workflow_map = {
-                'conservative': 'repair_and_storage',
-                'balanced': 'standard_operations',
-                'performance': 'scale_up_production',
+        def get_capabilities(self) -> Dict[str, Any]:
+            return {
+                'name': self.expert_name,
+                'supported_tasks': self.supported_task_types,
+                'health': self.health_status,
             }
-            wf_id = workflow_map.get(strategy)
-            if wf_id:
-                await self.workflow_orchestrator.execute_workflow(wf_id)
 
-        # Notify other modules as needed
+        def get_metrics(self) -> Dict[str, Any]:
+            return {}
 
-    async def _state_save_loop(self):
-        """Periodically save agent state to disk."""
-        while True:
+# ============================================================================
+# Energy Expert Implementation
+# ============================================================================
+
+class EnergyExpert(BaseExpert):
+    """
+    Energy Expert for MoE System v3.0.0
+
+    Handles energy estimation, carbon tracking, helium analysis,
+    and sustainability recommendations with full integration into
+    Green_Agent metrics and bio-inspired modules.
+    """
+
+    def __init__(self, config: Optional[EnergyExpertConfig] = None):
+        super().__init__()
+        self.expert_name = "energy_expert"
+        self.supported_task_types = [
+            "energy_estimate", "carbon_profile", "helium_analysis",
+            "sustainability_recommend", "energy_route", "forecast"
+        ]
+        self.health_status = "healthy"
+
+        # Configuration
+        self.config = config or EnergyExpertConfig()
+
+        # State
+        self.energy_profiles: Dict[str, EnergyProfile] = {}
+        self.carbon_footprints: Dict[str, CarbonFootprint] = {}
+        self.helium_analyses: Dict[str, HeliumAnalysis] = {}
+        self.metrics_history: List[EnergyExpertMetrics] = []
+        self.tasks_handled = 0
+        self.total_latency = 0.0
+        self.task_energy_cache: Dict[str, float] = {}
+
+        # Bio-inspired integration
+        self.token_manager = None
+        if TOKEN_AVAILABLE:
             try:
-                await self.save_state()
-                await asyncio.sleep(self.config.state_save_interval_seconds)
-            except asyncio.CancelledError:
-                break
+                self.token_manager = EcoATPTokenManager()
             except Exception as e:
-                logger.error("State save error", error=str(e))
-                await asyncio.sleep(60)
+                logger.warning(f"Failed to initialize token manager: {e}")
 
-    async def _daily_snapshot_loop(self):
-        """Take a daily snapshot and record on blockchain if important."""
-        while True:
+        self.gradient_manager = None
+        if GRADIENT_AVAILABLE:
             try:
-                await asyncio.sleep(86400)  # 24 hours
-                snapshot = {
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'state': self.state,
-                    'metrics': self.metrics,
-                    'strategy': self.current_strategy,
-                    'agent_id': self.config.agent_id
-                }
-                # Record daily snapshot with importance 0.6 (above threshold)
-                await self.auditor.record_event('daily_snapshot', snapshot, importance=0.6)
-                logger.info("Daily snapshot recorded.")
-            except asyncio.CancelledError:
-                break
+                self.gradient_manager = GradientFieldManager()
             except Exception as e:
-                logger.error("Daily snapshot error", error=str(e))
-                await asyncio.sleep(3600)
+                logger.warning(f"Failed to initialize gradient manager: {e}")
 
-    async def _swarm_update_loop(self):
-        """Publish state to swarm coordinator and receive consensus."""
-        while True:
+        self.scheduler = None
+        if ATP_AVAILABLE:
             try:
-                if self.swarm_coordinator:
-                    # Publish our state and strategy
-                    await self.swarm_coordinator.share_predictions({
-                        'agent_id': self.config.agent_id,
-                        'state': self.state,
-                        'strategy': self.current_strategy,
-                        'metrics': self.metrics
-                    })
-                    # Receive aggregated swarm predictions
-                    swarm_state = self.swarm_coordinator.get_shared_predictions()
-                    # Optionally adjust strategy based on swarm consensus
-                    if swarm_state:
-                        # Example: if majority of agents are in 'conservative', we may follow
-                        strategies = [s.get('strategy') for s in swarm_state.values() if 'strategy' in s]
-                        if strategies:
-                            most_common = max(set(strategies), key=strategies.count)
-                            # Boost reward if we align with majority, or adjust epsilon
-                            if most_common == self.current_strategy:
-                                # Positive reinforcement (optional)
-                                pass
-                await asyncio.sleep(60)  # update every minute
-            except asyncio.CancelledError:
-                break
+                self.scheduler = ATPSynthaseScheduler(self.token_manager, self.gradient_manager)
             except Exception as e:
-                logger.error("Swarm update error", error=str(e))
-                await asyncio.sleep(120)
+                logger.warning(f"Failed to initialize scheduler: {e}")
 
-    async def _update_metrics(self, state: Dict[str, float]):
-        self.metrics['energy_efficiency'] = 1.0 - state.get('energy_intensity', 0.5)
-        self.metrics['helium_efficiency'] = state.get('helium_level', 0.5)
+        self.tick_engine = None
+        if TICK_ENGINE_AVAILABLE:
+            try:
+                self.tick_engine = TimeTickEngine()
+            except Exception as e:
+                logger.warning(f"Failed to initialize tick engine: {e}")
 
-    async def save_state(self):
-        """Serialize agent state to disk."""
-        state_data = {
-            'agent_id': self.config.agent_id,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'state': self.state,
-            'metrics': self.metrics,
-            'current_strategy': self.current_strategy,
-            'strategy_change_time': self.strategy_change_time.isoformat(),
-            'q_table': dict(self.strategy_selector.q_table) if self.strategy_selector else None,
-            'correlation_id': self.correlation_id,
-            'reward_history': list(self.reward_history),
-        }
+        self.quantum_bridge = None
+        if QUANTUM_BRIDGE_AVAILABLE:
+            try:
+                self.quantum_bridge = QuantumBridge(self.gradient_manager, None)
+            except Exception as e:
+                logger.warning(f"Failed to initialize quantum bridge: {e}")
+
+        # Prometheus metrics (if available)
+        self.prometheus_metrics = {}
+        if PROMETHEUS_AVAILABLE:
+            self._init_prometheus()
+
+        logger.info(f"EnergyExpert initialized with config: {self.config}")
+
+    def _init_prometheus(self):
+        """Initialize Prometheus metrics."""
         try:
-            with open(self.config.state_save_path, 'wb') as f:
-                pickle.dump(state_data, f)
-            logger.debug("State saved.")
+            self.prometheus_metrics = {
+                'energy_expert_tasks_total': Counter(
+                    'energy_expert_tasks_total',
+                    'Total tasks handled by energy expert',
+                    ['task_type', 'status']
+                ),
+                'energy_expert_carbon_kg': Gauge(
+                    'energy_expert_carbon_kg',
+                    'Carbon footprint (kg CO2) of energy expert'
+                ),
+                'energy_expert_energy_kwh': Gauge(
+                    'energy_expert_energy_kwh',
+                    'Total energy (kWh) of energy expert'
+                ),
+                'energy_expert_latency_seconds': Histogram(
+                    'energy_expert_latency_seconds',
+                    'Latency of energy expert operations',
+                    ['operation']
+                ),
+            }
         except Exception as e:
-            logger.error("Failed to save state", error=str(e))
+            logger.warning(f"Failed to init Prometheus: {e}")
 
-    async def load_state(self, path: Optional[str] = None):
-        """Load agent state from disk, including Q‑table."""
-        path = path or self.config.state_save_path
-        if not os.path.exists(path):
-            logger.info("No saved state found; starting fresh.")
-            return
+    # ========================================================================
+    # Core Expert Interface
+    # ========================================================================
+
+    async def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle a task routed to this expert.
+
+        Task format:
+        {
+            'type': 'energy_estimate' | 'carbon_profile' | 'helium_analysis' | ...,
+            'payload': {<task-specific data>},
+            'correlation_id': <for tracing>,
+        }
+        """
+        task_type = task.get('type', 'unknown')
+        task_id = task.get('correlation_id', str(uuid.uuid4()))
+
+        start_time = datetime.now(timezone.utc)
+        start_ts = asyncio.get_event_loop().time()
+
+        logger.info(f"EnergyExpert handling task: {task_type} (ID: {task_id})")
+
+        try:
+            if task_type == 'energy_estimate':
+                result = await self.estimate_task_energy(task)
+            elif task_type == 'carbon_profile':
+                result = await self.profile_carbon_footprint(task)
+            elif task_type == 'helium_analysis':
+                result = await self.analyze_helium_impact(task)
+            elif task_type == 'sustainability_recommend':
+                result = await self.recommend_strategy(task)
+            elif task_type == 'energy_route':
+                result = await self.route_by_energy(task)
+            elif task_type == 'forecast':
+                result = await self.forecast_energy(task)
+            else:
+                result = {
+                    'status': 'error',
+                    'error': f"Unknown task type: {task_type}",
+                }
+
+            end_ts = asyncio.get_event_loop().time()
+            latency = end_ts - start_ts
+            self.tasks_handled += 1
+            self.total_latency += latency
+
+            # Record metrics
+            if PROMETHEUS_AVAILABLE and 'energy_expert_latency_seconds' in self.prometheus_metrics:
+                self.prometheus_metrics['energy_expert_latency_seconds'].labels(
+                    operation=task_type
+                ).observe(latency)
+
+            result['correlation_id'] = task_id
+            result['latency_seconds'] = latency
+            logger.info(f"EnergyExpert completed {task_type}: latency={latency:.3f}s")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"EnergyExpert error on {task_type}: {e}", exc_info=True)
+            return {
+                'status': 'error',
+                'error': str(e),
+                'correlation_id': task_id,
+            }
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        """Return expert capabilities for registry and gating network."""
+        return {
+            'expert_name': self.expert_name,
+            'supported_tasks': self.supported_task_types,
+            'health_status': self.health_status,
+            'avg_latency_seconds': (
+                self.total_latency / self.tasks_handled
+                if self.tasks_handled > 0 else 0.0
+            ),
+            'tasks_handled': self.tasks_handled,
+            'config': asdict(self.config),
+        }
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return expert-level metrics for MoE dashboard and analytics."""
+        total_carbon = sum(cf.net_carbon_g for cf in self.carbon_footprints.values()) / 1000.0
+        total_energy = sum(ep.estimated_total_energy_kwh for ep in self.energy_profiles.values())
+        total_helium = sum(ha.available_ml for ha in self.helium_analyses.values())
+        failures = sum(1 for m in self.metrics_history if not m.success)
+
+        return {
+            'expert_name': self.expert_name,
+            'tasks_handled': self.tasks_handled,
+            'avg_latency_seconds': (
+                self.total_latency / self.tasks_handled
+                if self.tasks_handled > 0 else 0.0
+            ),
+            'total_carbon_kg': total_carbon,
+            'total_energy_kwh': total_energy,
+            'total_helium_ml': total_helium,
+            'failure_rate': failures / len(self.metrics_history) if self.metrics_history else 0.0,
+            'profiles_cached': len(self.energy_profiles),
+        }
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Health check for MoE registry."""
+        try:
+            # Quick energy estimate as health check
+            test_task = {
+                'type': 'energy_estimate',
+                'payload': {
+                    'cpu_seconds': 1.0,
+                    'memory_gb': 0.5,
+                    'network_mbps': 1.0,
+                    'duration_seconds': 10.0,
+                },
+            }
+            result = await self.estimate_task_energy(test_task)
+
+            self.health_status = "healthy"
+            return {
+                'status': 'healthy',
+                'expert': self.expert_name,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'last_tasks': self.tasks_handled,
+                'last_error': None,
+            }
+        except Exception as e:
+            self.health_status = "unhealthy"
+            logger.warning(f"EnergyExpert health check failed: {e}")
+            return {
+                'status': 'unhealthy',
+                'expert': self.expert_name,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'error': str(e),
+            }
+
+    # ========================================================================
+    # Core Energy Operations
+    # ========================================================================
+
+    async def estimate_task_energy(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Estimate energy footprint of a task based on compute characteristics.
+
+        Payload:
+        {
+            'cpu_seconds': <compute time>,
+            'memory_gb': <peak memory>,
+            'network_mbps': <bandwidth>,
+            'storage_gb': <storage accessed>,
+            'duration_seconds': <total duration>,
+            'region': <optional region for carbon intensity>,
+        }
+        """
+        payload = task.get('payload', {})
+        task_id = task.get('correlation_id', str(uuid.uuid4()))
+        region = payload.get('region', 'default')
+
+        start_ts = asyncio.get_event_loop().time()
+
+        cpu_seconds = payload.get('cpu_seconds', 1.0)
+        memory_gb = payload.get('memory_gb', 0.5)
+        network_mbps = payload.get('network_mbps', 1.0)
+        storage_gb = payload.get('storage_gb', 0.0)
+        duration_seconds = payload.get('duration_seconds', cpu_seconds)
+
+        # Estimate energy components
+        cpu_energy_kwh = (cpu_seconds * self.config.cpu_power_watt) / 3600.0 / 1000.0
+        memory_energy_kwh = (duration_seconds * memory_gb * self.config.memory_power_per_gb) / 3600.0 / 1000.0
+        network_energy_kwh = (network_mbps * duration_seconds * self.config.network_power_per_mbps) / 3600.0 / 1000.0
+        storage_energy_kwh = (storage_gb * self.config.storage_power_per_gb) / 1000.0
+
+        total_energy_kwh = cpu_energy_kwh + memory_energy_kwh + network_energy_kwh + storage_energy_kwh
+
+        # Carbon intensity
+        carbon_intensity = self.config.regional_carbon_map.get(region, self.config.carbon_intensity_g_per_kwh)
+        carbon_g = total_energy_kwh * carbon_intensity * 1000.0  # Convert to grams
+
+        # Helium impact (cryogenic cooling estimate)
+        helium_ml = total_energy_kwh * 100.0  # Rough estimate: 100ml per kWh
+
+        # Energy efficiency score (higher is better)
+        efficiency_score = max(0.0, min(1.0, 1.0 - (total_energy_kwh / 0.1)))
+
+        # Sustainability score
+        sustainability_score = (
+            0.4 * efficiency_score +
+            0.3 * max(0.0, 1.0 - (carbon_g / 100.0)) +
+            0.3 * max(0.0, 1.0 - (helium_ml / 100.0))
+        )
+
+        # Recommend strategy
+        if sustainability_score > 0.8:
+            recommended_strategy = "performance"
+        elif sustainability_score > 0.5:
+            recommended_strategy = "balanced"
+        else:
+            recommended_strategy = "conservative"
+
+        profile = EnergyProfile(
+            task_id=task_id,
+            estimated_duration_seconds=duration_seconds,
+            estimated_cpu_energy_kwh=cpu_energy_kwh,
+            estimated_memory_energy_kwh=memory_energy_kwh,
+            estimated_network_energy_kwh=network_energy_kwh,
+            estimated_total_energy_kwh=total_energy_kwh,
+            carbon_intensity_g_per_kwh=carbon_intensity,
+            estimated_carbon_g=carbon_g,
+            estimated_helium_ml=helium_ml,
+            energy_efficiency_score=efficiency_score,
+            sustainability_score=sustainability_score,
+            recommended_strategy=recommended_strategy,
+            region=region,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+        self.energy_profiles[task_id] = profile
+        self.task_energy_cache[task_id] = total_energy_kwh
+
+        end_ts = asyncio.get_event_loop().time()
+        metrics = EnergyExpertMetrics(
+            operation_name="estimate_task_energy",
+            start_time=start_ts,
+            end_time=end_ts,
+            tasks_analyzed=1,
+            total_energy_kwh=total_energy_kwh,
+            total_carbon_kg=carbon_g / 1000.0,
+        )
+        self.metrics_history.append(metrics)
+
+        return {
+            'status': 'success',
+            'task_id': task_id,
+            'profile': profile.to_dict(),
+        }
+
+    async def profile_carbon_footprint(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Profile complete carbon footprint including offsets and strategies.
+
+        Payload:
+        {
+            'baseline_carbon_g': <raw CO2>,
+            'offset_strategy': 'renewable_swap' | 'purchase_offset' | None,
+            'region': <optional>,
+        }
+        """
+        payload = task.get('payload', {})
+        task_id = task.get('correlation_id', str(uuid.uuid4()))
+
+        baseline_carbon_g = payload.get('baseline_carbon_g', 50.0)
+        offset_strategy = payload.get('offset_strategy', 'purchase_offset')
+
+        # Calculate offset
+        offset_carbon_g = 0.0
+        if offset_strategy == 'renewable_swap':
+            offset_carbon_g = baseline_carbon_g * 0.8  # 80% offset
+        elif offset_strategy == 'purchase_offset':
+            offset_carbon_g = baseline_carbon_g * 0.5  # 50% offset
+
+        net_carbon_g = baseline_carbon_g - offset_carbon_g
+
+        # Cost estimation (rough: $0.01/g CO2 offset)
+        cost_usd = net_carbon_g * 0.00001 if offset_strategy else 0.0
+
+        # ROI factor (lower carbon = higher ROI)
+        roi_factor = baseline_carbon_g / max(net_carbon_g, 0.1)
+
+        footprint = CarbonFootprint(
+            baseline_carbon_g=baseline_carbon_g,
+            offset_strategy=offset_strategy,
+            offset_carbon_g=offset_carbon_g,
+            net_carbon_g=net_carbon_g,
+            cost_usd=cost_usd,
+            roi_factor=roi_factor,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+        self.carbon_footprints[task_id] = footprint
+
+        return {
+            'status': 'success',
+            'task_id': task_id,
+            'footprint': footprint.to_dict(),
+        }
+
+    async def analyze_helium_impact(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze helium usage and availability.
+
+        Payload:
+        {
+            'required_ml': <helium needed>,
+            'region': <optional>,
+        }
+        """
+        payload = task.get('payload', {})
+        task_id = task.get('correlation_id', str(uuid.uuid4()))
+
+        required_ml = payload.get('required_ml', 5.0)
+
+        # Get helium availability
+        available_ml = 1000.0 / self.config.helium_scarcity_factor
+
+        # Recovery potential
+        recovery_potential_ml = required_ml * self.config.helium_recovery_efficiency
+
+        # Can proceed?
+        can_proceed = available_ml >= required_ml
+
+        # Recommendation
+        if can_proceed:
+            recommendation = "Sufficient helium available; proceed normally"
+        else:
+            recommendation = "Low helium; enable recovery or defer non-critical tasks"
+
+        analysis = HeliumAnalysis(
+            available_ml=available_ml,
+            required_ml=required_ml,
+            scarcity_factor=self.config.helium_scarcity_factor,
+            recovery_potential_ml=recovery_potential_ml,
+            can_proceed=can_proceed,
+            recommendation=recommendation,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+        self.helium_analyses[task_id] = analysis
+
+        return {
+            'status': 'success',
+            'task_id': task_id,
+            'analysis': analysis.to_dict(),
+        }
+
+    async def recommend_strategy(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Recommend sustainability strategy based on current state.
+
+        Payload:
+        {
+            'system_load': <0-1>,
+            'energy_budget': <kWh>,
+            'carbon_budget': <g>,
+            'helium_availability': <0-1>,
+        }
+        """
+        payload = task.get('payload', {})
+
+        system_load = payload.get('system_load', 0.5)
+        energy_budget = payload.get('energy_budget', 100.0)
+        carbon_budget = payload.get('carbon_budget', 1000.0)
+        helium_availability = payload.get('helium_availability', 0.7)
+
+        # Decision logic
+        if helium_availability < 0.3 or energy_budget < 20.0:
+            strategy = SustainabilityStrategy.CONSERVATIVE.value
+            reason = "Low resources (helium/energy); using conservative strategy"
+        elif helium_availability > 0.8 and energy_budget > 100.0 and carbon_budget > 5000.0:
+            strategy = SustainabilityStrategy.PERFORMANCE.value
+            reason = "Abundant resources; using performance strategy"
+        else:
+            strategy = SustainabilityStrategy.BALANCED.value
+            reason = "Balanced resource availability; using balanced strategy"
+
+        return {
+            'status': 'success',
+            'recommended_strategy': strategy,
+            'reason': reason,
+            'details': {
+                'system_load': system_load,
+                'energy_budget_remaining': energy_budget,
+                'carbon_budget_remaining': carbon_budget,
+                'helium_availability': helium_availability,
+            },
+        }
+
+    async def route_by_energy(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Route tasks to experts based on energy characteristics.
+
+        Payload:
+        {
+            'energy_kwh': <estimated energy>,
+            'carbon_g': <estimated carbon>,
+        }
+        """
+        payload = task.get('payload', {})
+        energy_kwh = payload.get('energy_kwh', 0.1)
+        carbon_g = payload.get('carbon_g', 50.0)
+
+        routing = {
+            'cpu_expert': energy_kwh > 0.5,
+            'optimization_expert': carbon_g > 500.0,
+            'io_expert': energy_kwh > 0.05 and energy_kwh <= 0.5,
+        }
+
+        recommended = [k for k, v in routing.items() if v]
+
+        return {
+            'status': 'success',
+            'routing': routing,
+            'recommended_experts': recommended or ['io_expert'],
+        }
+
+    async def forecast_energy(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Forecast energy consumption over time.
+
+        Payload:
+        {
+            'current_load': <0-1>,
+            'forecast_hours': <hours>,
+        }
+        """
+        payload = task.get('payload', {})
+        current_load = payload.get('current_load', 0.5)
+        forecast_hours = payload.get('forecast_hours', self.config.forecast_window_hours)
+
+        # Simple linear forecast
+        forecast = []
+        for hour in range(forecast_hours):
+            # Simulate variation
+            variation = 0.1 * np.sin(hour / 6.0)
+            load = current_load + variation
+            energy_kwh = load * 50.0 / 1000.0  # Rough estimate
+            forecast.append({
+                'hour': hour,
+                'predicted_load': max(0.0, min(1.0, load)),
+                'predicted_energy_kwh': energy_kwh,
+            })
+
+        return {
+            'status': 'success',
+            'forecast': forecast,
+            'horizon_hours': forecast_hours,
+        }
+
+    # ========================================================================
+    # Persistence and State Management
+    # ========================================================================
+
+    async def save_state(self) -> bool:
+        """Save expert state to disk."""
+        try:
+            state = {
+                'energy_profiles': {k: v.to_dict() for k, v in self.energy_profiles.items()},
+                'carbon_footprints': {k: v.to_dict() for k, v in self.carbon_footprints.items()},
+                'helium_analyses': {k: v.to_dict() for k, v in self.helium_analyses.items()},
+                'metrics': [m.to_dict() for m in self.metrics_history],
+                'tasks_handled': self.tasks_handled,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            }
+            with open(self.config.state_save_path, 'wb') as f:
+                pickle.dump(state, f)
+            logger.info("EnergyExpert state saved")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+            return False
+
+    async def load_state(self) -> bool:
+        """Load expert state from disk."""
+        path = Path(self.config.state_save_path)
+        if not path.exists():
+            logger.info("No saved state found")
+            return False
+
         try:
             with open(path, 'rb') as f:
-                data = pickle.load(f)
-            self.state = data.get('state', self.state)
-            self.metrics = data.get('metrics', self.metrics)
-            self.current_strategy = data.get('current_strategy', 'balanced')
-            if data.get('q_table') and self.strategy_selector:
-                self.strategy_selector.q_table = defaultdict(dict, data['q_table'])
-            self.correlation_id = data.get('correlation_id', self.correlation_id)
-            self.reward_history = deque(data.get('reward_history', []), maxlen=100)
-            logger.info("State loaded.")
+                state = pickle.load(f)
+            self.tasks_handled = state.get('tasks_handled', 0)
+            logger.info("EnergyExpert state loaded")
+            return True
         except Exception as e:
-            logger.error("Failed to load state", error=str(e))
-
-    async def shutdown(self):
-        """Gracefully shut down all components."""
-        logger.info("Shutting down BioIntegratedAgent")
-        await self._task_manager.stop_all()
-        # Save final state
-        await self.save_state()
-        # Close tick engine if any
-        if self.tick_engine and hasattr(self.tick_engine, 'shutdown'):
-            await self.tick_engine.shutdown()
-        # Close quantum bridge if any
-        if self.quantum_bridge and hasattr(self.quantum_bridge, 'shutdown'):
-            await self.quantum_bridge.shutdown()
-        logger.info("Agent shutdown complete")
+            logger.error(f"Failed to load state: {e}")
+            return False
 
 # ============================================================================
-# Example usage
+# Example Usage
 # ============================================================================
-async def example():
-    """Example usage of the BioIntegratedAgent with a mock core."""
-    # Create a mock core (if real core not available)
-    class MockCore:
-        def __init__(self):
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-            self.health_monitor = None
-        async def update_configuration(self, policy):
-            pass
 
-    config = {
-        'enable_energy_aware_rl': True,
-        'enable_time_tick_engine': True,
-        'enable_quantum_bridge': True,
-        'enable_swarm_coordination': True,
-        'pqc_key_dir': './pqc_keys',
-        'state_save_path': './agent_state.pkl',
-        'enable_multi_objective_rl': True,
-    }
-    agent = BioIntegratedAgent(
-        bio_core=MockCore(),
-        config=config,
-        csv_path="helium_data.csv"
+async def example_usage():
+    """Example usage of the EnergyExpert."""
+    config = EnergyExpertConfig(
+        enable_energy_estimation=True,
+        enable_carbon_tracking=True,
+        enable_helium_analysis=True,
     )
-    # Let it run for a few seconds
-    await asyncio.sleep(10)
-    # Get current state
-    state = await agent.get_strategy_state()
-    print("Current state:", state)
-    print("Current strategy:", agent.current_strategy)
-    print("Metrics:", agent.metrics)
-    await agent.shutdown()
+    expert = EnergyExpert(config)
+
+    # Example 1: Estimate task energy
+    task_estimate = {
+        'type': 'energy_estimate',
+        'payload': {
+            'cpu_seconds': 10.0,
+            'memory_gb': 2.0,
+            'network_mbps': 10.0,
+            'duration_seconds': 30.0,
+            'region': 'us-west',
+        },
+        'correlation_id': 'task_001',
+    }
+
+    result = await expert.handle_task(task_estimate)
+    print("Energy estimate:", result['status'])
+
+    # Example 2: Carbon profile
+    task_carbon = {
+        'type': 'carbon_profile',
+        'payload': {
+            'baseline_carbon_g': 100.0,
+            'offset_strategy': 'purchase_offset',
+        },
+        'correlation_id': 'task_002',
+    }
+
+    result = await expert.handle_task(task_carbon)
+    print("Carbon profile:", result['status'])
+
+    # Example 3: Helium analysis
+    task_helium = {
+        'type': 'helium_analysis',
+        'payload': {
+            'required_ml': 50.0,
+        },
+        'correlation_id': 'task_003',
+    }
+
+    result = await expert.handle_task(task_helium)
+    print("Helium analysis:", result['status'])
+
+    # Example 4: Health check
+    health = await expert.get_health_status()
+    print("Health:", health['status'])
+
+    # Print metrics
+    metrics = expert.get_metrics()
+    print("Metrics:", metrics)
 
 if __name__ == "__main__":
-    asyncio.run(example())
+    asyncio.run(example_usage())
