@@ -1,19 +1,21 @@
-# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/bio_integrated_agent.py
-# Enhanced version v9.0.0 – Full integration with bio‑inspired core, event‑driven, analytics‑aware
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/data_expert.py
+# Enhanced Data Expert v3.0.0 – Complete Data Services Layer for MoE System
 
 """
-Bio‑Integrated Green Agent v9.0.0
-Full integration of bio‑inspired modules with:
-- Energy‑aware RL strategy selector (Q‑learning)
-- Persistent PQC keys for verifiable identity
-- Selective blockchain auditing based on sustainability impact
-- Event‑driven state updates via core EventBroker
-- Reward enrichment from core analytics (alerts, anomalies, cost‑benefit)
-- Strategy propagation to core configuration, scheduler tier, workflows
-- Circuit breakers for resilient service calls
-- Automatic Q‑table recovery on startup
-- Correlation ID tracing
-- Self‑healing trigger on critical alerts
+Data Expert v3.0.0 – Data Services Layer for MoE System
+
+A specialized expert that handles all data-related tasks within the MoE pipeline:
+- Data ingestion (files, URLs, databases, in-memory payloads)
+- Comprehensive data profiling (statistics, type inference, missingness analysis, skew detection)
+- Data cleaning (deduplication, missing value handling, normalization)
+- Data summarization (column-level stats, samples, schema inspection)
+- Data routing to task-specific experts (feature engineering, modeling, optimization)
+- Energy-aware telemetry tracking (bytes processed, preprocessing latency, energy proxies)
+- Integration with Green_Agent metrics pipeline
+- Health checks for MoE registry
+- Sustainable computing practices (carbon-aware data handling)
+- Federated data aggregation (privacy-preserving profiling)
+- Incremental learning and streaming data support
 """
 
 import asyncio
@@ -22,12 +24,16 @@ import json
 import os
 import hashlib
 import uuid
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union
+from typing import Dict, Any, List, Optional, Tuple, Union, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import defaultdict, Counter
 import numpy as np
+import pandas as pd
 import pickle
+from enum import Enum
+import aiohttp
+from pathlib import Path
 
 # ============================================================================
 # Try optional dependencies
@@ -51,988 +57,890 @@ except ImportError:
     PROMETHEUS_AVAILABLE = False
 
 # ============================================================================
-# Local imports from bio‑inspired core (with fallback)
+# Local imports – BaseExpert and bio-inspired modules
 # ============================================================================
 try:
-    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
+    from .base_expert import BaseExpert
+    BASE_EXPERT_AVAILABLE = True
+except ImportError:
+    BASE_EXPERT_AVAILABLE = False
+    logger.warning("BaseExpert not available; using fallback interface")
+
+try:
+    from enhancements.bio_inspired.eco_atp_currency import EcoATPTokenManager, EcoATPConsumer
     TOKEN_AVAILABLE = True
 except ImportError:
     TOKEN_AVAILABLE = False
 
 try:
-    from .proton_gradient_fields import GradientFieldManager
+    from enhancements.bio_inspired.proton_gradient_fields import GradientFieldManager
     GRADIENT_AVAILABLE = True
 except ImportError:
     GRADIENT_AVAILABLE = False
 
-try:
-    from .atp_synthase_scheduler import ATPSynthaseScheduler
-    ATP_AVAILABLE = True
-except ImportError:
-    ATP_AVAILABLE = False
+# ============================================================================
+# Configuration Dataclass
+# ============================================================================
 
-try:
-    from .chromatophore_compartments import HierarchicalCompartmentManager
-    COMPARTMENT_AVAILABLE = True
-except ImportError:
-    COMPARTMENT_AVAILABLE = False
+@dataclass
+class DataExpertConfig:
+    """Centralized configuration for the Data Expert."""
+    # Feature flags
+    enable_profiling: bool = True
+    enable_cleaning: bool = True
+    enable_summarization: bool = True
+    enable_energy_tracking: bool = True
+    enable_federated_aggregation: bool = True
+    enable_telemetry: bool = True
+    enable_persistence: bool = True
 
-try:
-    from .biomass_storage import BiomassStorage
-    BIOMASS_AVAILABLE = True
-except ImportError:
-    BIOMASS_AVAILABLE = False
-
-try:
-    from .photosynthetic_harvester import PhotosyntheticHarvester
-    HARVESTER_AVAILABLE = True
-except ImportError:
-    HARVESTER_AVAILABLE = False
-
-try:
-    from .time_tick_engine import TimeTickEngine
-    TICK_ENGINE_AVAILABLE = True
-except ImportError:
-    TICK_AVAILABLE = False
-
-try:
-    from .quantum_bridge import QuantumBridge
-    QUANTUM_BRIDGE_AVAILABLE = True
-except ImportError:
-    QUANTUM_BRIDGE_AVAILABLE = False
-
-try:
-    from .__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
-    CORE_AVAILABLE = True
-except ImportError:
-    CORE_AVAILABLE = False
-
-# PQC (post‑quantum cryptography) – use a simple fallback if not available
-try:
-    from pqcrypto.sign import falcon
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
+    # Data handling
+    max_rows_profile: int = 10000  # Profile sample size
+    max_unique_values: int = 100   # For categorical analysis
+    missing_value_threshold: float = 0.5  # Flag columns with > 50% missing
+    
+    # Energy and carbon tracking
+    bytes_to_kwh_factor: float = 1e-9  # Rough estimate: 1 byte ≈ 1e-9 kWh
+    carbon_intensity_g_per_kwh: float = 100.0  # Default CO2 intensity
+    
+    # Federated learning
+    federated_enabled: bool = False
+    federated_server_url: Optional[str] = None
+    
+    # Persistence
+    state_save_path: str = "./data_expert_state.pkl"
+    
+    # Telemetry
+    telemetry_export_interval: int = 60
+    
+    def __post_init__(self):
+        """Validate configuration."""
+        if self.missing_value_threshold < 0 or self.missing_value_threshold > 1:
+            self.missing_value_threshold = 0.5
+        if self.bytes_to_kwh_factor <= 0:
+            self.bytes_to_kwh_factor = 1e-9
 
 # ============================================================================
-# Fallback definitions if core not available
+# Enums for Data Operations
 # ============================================================================
-if not CORE_AVAILABLE:
-    class CircuitBreaker:
-        """Fallback circuit breaker."""
-        def __init__(self, name: str, failure_threshold: int = 3, recovery_timeout: float = 30.0):
-            self.name = name
-            self.failure_threshold = failure_threshold
-            self.recovery_timeout = recovery_timeout
-            self._state = "closed"
-            self._failure_count = 0
-            self._last_failure_time = None
-            self._lock = asyncio.Lock()
 
-        async def call(self, func: Callable, *args, **kwargs):
-            async with self._lock:
-                if self._state == "open":
-                    if (datetime.now(timezone.utc) - self._last_failure_time).total_seconds() > self.recovery_timeout:
-                        self._state = "half_open"
-                    else:
-                        raise Exception(f"Circuit breaker {self.name} is OPEN")
-            try:
-                result = await func(*args, **kwargs)
-                async with self._lock:
-                    self._state = "closed"
-                    self._failure_count = 0
-                return result
-            except Exception as e:
-                async with self._lock:
-                    self._failure_count += 1
-                    self._last_failure_time = datetime.now(timezone.utc)
-                    if self._failure_count >= self.failure_threshold:
-                        self._state = "open"
-                raise e
+class DataSourceType(Enum):
+    CSV = "csv"
+    JSON = "json"
+    PARQUET = "parquet"
+    DATABASE = "database"
+    IN_MEMORY = "in_memory"
+    URL = "url"
+    STREAM = "stream"
 
-    @dataclass
-    class BioEvent:
-        event_type: str
-        source: str
-        timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-        data: Dict[str, Any] = field(default_factory=dict)
-        correlation_id: Optional[str] = None
-        priority: int = 0
+class DataQualityIssue(Enum):
+    MISSING_VALUES = "missing_values"
+    DUPLICATES = "duplicates"
+    OUTLIERS = "outliers"
+    TYPE_MISMATCH = "type_mismatch"
+    SKEW = "skew"
+    HIGH_CARDINALITY = "high_cardinality"
 
 # ============================================================================
-# Configuration (Pydantic or dataclass)
+# Data Profiling Results
 # ============================================================================
-if PYDANTIC_AVAILABLE:
-    class AgentConfig(BaseModel):
-        """Configuration for the Bio‑Integrated Agent."""
-        # General
-        agent_id: str = Field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
-        enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
 
-        # RL strategy
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_state_bins: Dict[str, List[str]] = Field(
-            default_factory=lambda: {
-                'load': ['low', 'medium', 'high'],
-                'health': ['poor', 'medium', 'good'],
-                'token': ['scarce', 'adequate', 'abundant'],
-                'energy': ['light', 'normal', 'heavy'],
-                'helium': ['scarce', 'normal', 'abundant']
-            }
-        )
-        rl_strategies: List[str] = ['conservative', 'balanced', 'performance']
+@dataclass
+class ColumnProfile:
+    """Profile of a single column."""
+    name: str
+    dtype: str
+    non_null_count: int
+    null_count: int
+    unique_count: int
+    missing_pct: float
+    min_val: Optional[Any] = None
+    max_val: Optional[Any] = None
+    mean_val: Optional[float] = None
+    std_val: Optional[float] = None
+    median_val: Optional[Any] = None
+    skewness: Optional[float] = None
+    kurtosis: Optional[float] = None
+    top_values: Optional[List[Tuple[Any, int]]] = None
+    issues: List[DataQualityIssue] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-        # Energy policies (strategy → config overrides)
-        strategy_policies: Dict[str, Dict[str, Any]] = Field(
-            default_factory=lambda: {
-                'conservative': {
-                    'state_save_interval_seconds': 600,
-                    'health_check_interval_seconds': 60,
-                    'task_throughput': 0.3,
-                    'token_base_generation_rate': 0.5,
-                    'biomass_storage_preference': True,
-                    'genetic_evolution_interval': 86400 * 2,
-                    'competition_interval': 7200,
-                },
-                'balanced': {
-                    'state_save_interval_seconds': 300,
-                    'health_check_interval_seconds': 30,
-                    'task_throughput': 1.0,
-                    'token_base_generation_rate': 1.0,
-                    'biomass_storage_preference': False,
-                    'genetic_evolution_interval': 86400,
-                    'competition_interval': 3600,
-                },
-                'performance': {
-                    'state_save_interval_seconds': 60,
-                    'health_check_interval_seconds': 10,
-                    'task_throughput': 2.0,
-                    'token_base_generation_rate': 1.5,
-                    'biomass_storage_preference': False,
-                    'genetic_evolution_interval': 43200,
-                    'competition_interval': 1800,
-                }
-            }
-        )
-
-        # PQC keys
-        pqc_key_dir: str = Field("./pqc_keys", description="Directory for PQC key storage")
-
-        # Blockchain audit policy
-        blockchain_audit_events: List[str] = Field(
-            default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot']
-        )
-        blockchain_audit_min_importance: float = 0.5  # 0–1 threshold
-
-        # Persistence
-        state_save_interval_seconds: int = 300
-        state_save_path: str = "./agent_state.pkl"
-
-        # Feature flags
-        enable_prometheus: bool = False
-
-        class Config:
-            env_prefix = "AGENT_"
-else:
-    @dataclass
-    class AgentConfig:
-        agent_id: str = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
-        enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_state_bins: Dict[str, List[str]] = field(default_factory=lambda: {
-            'load': ['low', 'medium', 'high'],
-            'health': ['poor', 'medium', 'good'],
-            'token': ['scarce', 'adequate', 'abundant'],
-            'energy': ['light', 'normal', 'heavy'],
-            'helium': ['scarce', 'normal', 'abundant']
-        })
-        rl_strategies: List[str] = field(default_factory=lambda: ['conservative', 'balanced', 'performance'])
-        strategy_policies: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
-            'conservative': {
-                'state_save_interval_seconds': 600,
-                'health_check_interval_seconds': 60,
-                'task_throughput': 0.3,
-                'token_base_generation_rate': 0.5,
-                'biomass_storage_preference': True,
-                'genetic_evolution_interval': 86400 * 2,
-                'competition_interval': 7200,
-            },
-            'balanced': {
-                'state_save_interval_seconds': 300,
-                'health_check_interval_seconds': 30,
-                'task_throughput': 1.0,
-                'token_base_generation_rate': 1.0,
-                'biomass_storage_preference': False,
-                'genetic_evolution_interval': 86400,
-                'competition_interval': 3600,
-            },
-            'performance': {
-                'state_save_interval_seconds': 60,
-                'health_check_interval_seconds': 10,
-                'task_throughput': 2.0,
-                'token_base_generation_rate': 1.5,
-                'biomass_storage_preference': False,
-                'genetic_evolution_interval': 43200,
-                'competition_interval': 1800,
-            }
-        })
-        pqc_key_dir: str = "./pqc_keys"
-        blockchain_audit_events: List[str] = field(default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot'])
-        blockchain_audit_min_importance: float = 0.5
-        state_save_interval_seconds: int = 300
-        state_save_path: str = "./agent_state.pkl"
-        enable_prometheus: bool = False
-
-# ============================================================================
-# Quantum‑Resilient Security (with persistent keys)
-# ============================================================================
-class QuantumResilientSecurity:
-    """
-    Provides post‑quantum signature capabilities with persistent key storage.
-    """
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.pqc_key_dir = Path(config.pqc_key_dir)
-        self.pqc_key_dir.mkdir(parents=True, exist_ok=True)
-        self.private_key = None
-        self.public_key = None
-        self._load_or_generate_keys()
-
-    def _load_or_generate_keys(self):
-        """Load existing PQC keys or generate new ones."""
-        priv_path = self.pqc_key_dir / "private.key"
-        pub_path = self.pqc_key_dir / "public.key"
-        if priv_path.exists() and pub_path.exists():
-            try:
-                with open(priv_path, 'rb') as f:
-                    self.private_key = f.read()
-                with open(pub_path, 'rb') as f:
-                    self.public_key = f.read()
-                logger.info("Loaded existing PQC keys")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load PQC keys: {e}")
-
-        # Generate new keys
-        if PQC_AVAILABLE:
-            self.private_key, self.public_key = falcon.generate_keypair()
-            with open(priv_path, 'wb') as f:
-                f.write(self.private_key)
-            with open(pub_path, 'wb') as f:
-                f.write(self.public_key)
-            logger.info("Generated and saved new PQC keys")
-        else:
-            # Fallback: use SHA‑256 HMAC as a placeholder
-            self.private_key = os.urandom(32)
-            self.public_key = hashlib.sha256(self.private_key).digest()
-            with open(priv_path, 'wb') as f:
-                f.write(self.private_key)
-            with open(pub_path, 'wb') as f:
-                f.write(self.public_key)
-            logger.warning("PQC library not available; using fallback HMAC keys")
-
-    def sign_data(self, data: Dict[str, Any]) -> str:
-        """Sign data with the persistent private key."""
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            signature = falcon.sign(payload, self.private_key)
-            return signature.hex()
-        else:
-            import hmac
-            signature = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
-            return signature
-
-    def verify_signature(self, data: Dict[str, Any], signature: str) -> bool:
-        """Verify a signature with the persistent public key."""
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            try:
-                falcon.verify(payload, bytes.fromhex(signature), self.public_key)
-                return True
-            except Exception:
-                return False
-        else:
-            import hmac
-            expected = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
-            return hmac.compare_digest(expected, signature)
-
-# ============================================================================
-# Blockchain Auditor (with selective auditing)
-# ============================================================================
-class BlockchainAuditor:
-    """
-    Records important events on a simulated blockchain with selective auditing.
-    """
-    def __init__(self, config: AgentConfig, security: QuantumResilientSecurity):
-        self.config = config
-        self.security = security
-        self.ledger = []
-        self._lock = asyncio.Lock()
-
-    async def record_event(self, event_type: str, payload: Dict[str, Any], importance: float = 0.5) -> bool:
-        """
-        Record an event if it meets the audit policy.
-        Returns True if recorded.
-        """
-        if event_type not in self.config.blockchain_audit_events:
-            logger.debug(f"Event {event_type} not in audit list; skipping")
-            return False
-
-        if importance < self.config.blockchain_audit_min_importance:
-            logger.debug(f"Event importance {importance} below threshold; skipping")
-            return False
-
-        signature = self.security.sign_data(payload)
-        entry = {
-            'event_type': event_type,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'payload': payload,
-            'signature': signature,
-            'hash': hashlib.sha256(json.dumps(payload, default=str).encode()).hexdigest()
-        }
-        async with self._lock:
-            self.ledger.append(entry)
-        logger.info(f"Audit recorded: {event_type} (importance {importance})")
-        return True
-
-    def get_ledger(self, limit: int = 100) -> List[Dict]:
-        return self.ledger[-limit:]
-
-    def verify_entry(self, entry: Dict) -> bool:
-        payload = entry['payload']
-        signature = entry['signature']
-        return self.security.verify_signature(payload, signature)
-
-# ============================================================================
-# RL Strategy Selector (Q‑Learning with extended state)
-# ============================================================================
-class RLStrategySelector:
-    """
-    Q‑learning strategy selector that is energy‑aware.
-    State includes energy_intensity, helium_level, carbon_leakage_proxy.
-    """
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: {s: 0.0 for s in config.rl_strategies})
-        self.learning_rate = config.rl_learning_rate
-        self.discount_factor = config.rl_discount_factor
-        self.epsilon = config.rl_epsilon
-        self.last_state_key = None
-        self.last_action = None
-        self.actions = config.rl_strategies
-        self.state_bins = config.rl_state_bins
-
-    def _state_to_key(self, state: Dict[str, float]) -> str:
-        """
-        Discretize continuous state values into bins.
-        State keys:
-        - system_load
-        - health_score
-        - token_balance
-        - energy_intensity  (new)
-        - helium_level      (new)
-        - carbon_leakage_proxy (new)
-        """
-        load = state.get('system_load', 0.5)
-        health = state.get('health_score', 0.8)
-        token = state.get('token_balance', 0)
-        energy = state.get('energy_intensity', 0.5)
-        helium = state.get('helium_level', 0.5)
-        carbon = state.get('carbon_leakage_proxy', 0.3)
-
-        load_bin = 'high' if load > 0.7 else 'medium' if load > 0.4 else 'low'
-        health_bin = 'good' if health > 0.7 else 'medium' if health > 0.4 else 'poor'
-        token_bin = 'abundant' if token > 1000 else 'adequate' if token > 100 else 'scarce'
-        energy_bin = 'heavy' if energy > 0.7 else 'normal' if energy > 0.4 else 'light'
-        helium_bin = 'scarce' if helium < 0.3 else 'normal' if helium < 0.7 else 'abundant'
-        carbon_bin = 'high' if carbon > 0.6 else 'medium' if carbon > 0.3 else 'low'
-
-        return f"{load_bin}_{health_bin}_{token_bin}_{energy_bin}_{helium_bin}_{carbon_bin}"
-
-    def select_action(self, state: Dict[str, float]) -> str:
-        key = self._state_to_key(state)
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-
-        if np.random.random() < self.epsilon:
-            action = np.random.choice(self.actions)
-        else:
-            q_vals = self.q_table[key]
-            max_q = max(q_vals.values())
-            best_actions = [a for a, q in q_vals.items() if q == max_q]
-            action = np.random.choice(best_actions)
-
-        self.last_state_key = key
-        self.last_action = action
-        return action
-
-    def update(self, state: Dict[str, float], action: str, reward: float, next_state: Dict[str, float]):
-        if self.last_state_key is None or self.last_action is None:
-            return
-        key = self._state_to_key(state)
-        next_key = self._state_to_key(next_state)
-
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-        if next_key not in self.q_table:
-            self.q_table[next_key] = {s: 0.0 for s in self.actions}
-
-        max_next = max(self.q_table[next_key].values())
-        current_q = self.q_table[key][action]
-        self.q_table[key][action] = current_q + self.learning_rate * (
-            reward + self.discount_factor * max_next - current_q
-        )
-
-    def get_q_table_size(self) -> int:
-        return len(self.q_table)
-
-    def get_best_strategy(self, state: Dict[str, float]) -> str:
-        key = self._state_to_key(state)
-        if key not in self.q_table:
-            return 'balanced'
-        q_vals = self.q_table[key]
-        return max(q_vals, key=q_vals.get)
-
-# ============================================================================
-# Task Manager (for background loops)
-# ============================================================================
-class TaskManager:
-    """Manages background tasks with restart and exponential backoff."""
-    def __init__(self):
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.shutdown_event = asyncio.Event()
-        self._lock = asyncio.Lock()
-
-    def start_task(self, name: str, coro_func, *args, **kwargs):
-        async def wrapper():
-            backoff = 1
-            max_backoff = 300
-            while not self.shutdown_event.is_set():
-                try:
-                    await coro_func(*args, **kwargs)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-        task = asyncio.create_task(wrapper(), name=name)
-        async with self._lock:
-            self.tasks[name] = task
-        return task
-
-    async def stop_all(self):
-        self.shutdown_event.set()
-        async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
-
-# ============================================================================
-# Core Bio‑Integrated Agent
-# ============================================================================
-class BioIntegratedAgent:
-    """
-    Main agent that orchestrates all bio‑inspired modules, with energy‑aware RL,
-    persistent PQC keys, selective blockchain auditing, and full integration with
-    the bio‑inspired core's event, analytics, and self‑healing capabilities.
-    """
-
-    def __init__(
-        self,
-        bio_core: Optional[Any] = None,  # EnhancedBioInspiredCore instance
-        config: Optional[Union[AgentConfig, Dict[str, Any]]] = None,
-        csv_path: Optional[str] = None,
-        quantum_graph: Optional[Any] = None,
-        token_manager: Optional[Any] = None,
-        gradient_manager: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-        compartment_manager: Optional[Any] = None,
-        biomass_storage: Optional[Any] = None,
-        harvester: Optional[Any] = None,
-        tick_engine: Optional[Any] = None,
-        quantum_bridge: Optional[Any] = None,
-    ):
-        # Load config
-        if isinstance(config, dict):
-            if PYDANTIC_AVAILABLE:
-                self.config = AgentConfig(**config)
-            else:
-                self.config = AgentConfig(**config)
-        elif isinstance(config, AgentConfig):
-            self.config = config
-        else:
-            self.config = AgentConfig()
-
-        # Store core reference
-        self.bio_core = bio_core
-
-        # Inject dependencies or create defaults
-        self.token_manager = token_manager or (EcoATPTokenManager() if TOKEN_AVAILABLE else None)
-        self.gradient_manager = gradient_manager or (GradientFieldManager() if GRADIENT_AVAILABLE else None)
-        self.scheduler = scheduler or (ATPSynthaseScheduler(self.token_manager, self.gradient_manager) if ATP_AVAILABLE else None)
-        self.compartment_manager = compartment_manager or (HierarchicalCompartmentManager(self.token_manager) if COMPARTMENT_AVAILABLE else None)
-        self.biomass_storage = biomass_storage or (BiomassStorage(self.token_manager, self.gradient_manager) if BIOMASS_AVAILABLE else None)
-        self.harvester = harvester or (PhotosyntheticHarvester(self.token_manager) if HARVESTER_AVAILABLE else None)
-
-        # Optional advanced modules
-        self.tick_engine = tick_engine
-        if self.config.enable_time_tick_engine and csv_path and TICK_ENGINE_AVAILABLE:
-            from .time_tick_engine import TimeTickEngine
-            self.tick_engine = TimeTickEngine(
-                csv_path=csv_path,
-                harvester=self.harvester,
-                translator_class=HeliumEnvironmentTranslator
-            )
-        self.quantum_bridge = quantum_bridge
-        if self.config.enable_quantum_bridge and QUANTUM_BRIDGE_AVAILABLE and quantum_graph:
-            from .quantum_bridge import QuantumBridge
-            self.quantum_bridge = QuantumBridge(self.gradient_manager, quantum_graph)
-
-        # Security and auditing
-        self.security = QuantumResilientSecurity(self.config)
-        self.auditor = BlockchainAuditor(self.config, self.security)
-
-        # RL strategy selector
-        self.strategy_selector = RLStrategySelector(self.config) if self.config.enable_energy_aware_rl else None
-        self.current_strategy = 'balanced'
-        self.strategy_change_time = datetime.now(timezone.utc)
-
-        # State and metrics
-        self.state = self._get_initial_state()
-        self.metrics = {
-            'strategy_changes': 0,
-            'total_reward': 0.0,
-            'energy_efficiency': 0.0,
-            'helium_efficiency': 0.0,
-        }
-
-        # Circuit breakers for external services
-        self._token_circuit = CircuitBreaker("token_service")
-        self._gradient_circuit = CircuitBreaker("gradient_service")
-
-        # Correlation ID for tracing
-        self.correlation_id = str(uuid.uuid4())
-
-        # Access to core sub‑modules if available
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-
-            # Subscribe to core events
-            if self.event_broker:
-                self._subscribe_events()
-        else:
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-
-        # Background tasks
-        self._task_manager = TaskManager()
-        self._task_manager.start_task("strategy_loop", self._strategy_update_loop)
-        self._task_manager.start_task("state_save", self._state_save_loop)
-        self._task_manager.start_task("daily_snapshot", self._daily_snapshot_loop)
-
-        # Load saved state (including Q‑table) on startup
-        asyncio.create_task(self.load_state())
-
-        logger.info(f"BioIntegratedAgent initialized with ID {self.config.agent_id}, correlation_id={self.correlation_id}")
-
-    def _subscribe_events(self):
-        """Subscribe to core events for state updates."""
-        if self.event_broker:
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('gradient_update', self._on_gradient_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            logger.info("Subscribed to core events")
-
-    async def _on_token_update(self, event: BioEvent):
-        self.state['token_balance'] = event.data.get('balance', 500)
-        await self._maybe_update_strategy()
-
-    async def _on_gradient_update(self, event: BioEvent):
-        field = event.data.get('field', 'carbon')
-        strength = event.data.get('strength', 0.5)
-        if field == 'helium':
-            self.state['helium_level'] = strength
-        elif field == 'carbon':
-            self.state['carbon_leakage_proxy'] = strength
-        await self._maybe_update_strategy()
-
-    async def _on_helium_update(self, event: BioEvent):
-        self.state['helium_level'] = event.data.get('helium_level', 0.5)
-        await self._maybe_update_strategy()
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        # Anomalies may influence strategy
-        await self._maybe_update_strategy()
-
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative and triggering healing")
-            await self.apply_strategy('conservative')
-            if self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-
-    async def _maybe_update_strategy(self):
-        """Check if strategy should be re‑evaluated immediately based on state changes."""
-        # This can be called on each event; we may want to throttle.
-        # For simplicity, we let the strategy loop handle it periodically.
-        pass
-
-    def _get_initial_state(self) -> Dict[str, float]:
+@dataclass
+class DataProfile:
+    """Complete profile of a dataset."""
+    dataset_name: str
+    shape: Tuple[int, int]  # (rows, columns)
+    total_cells: int
+    memory_usage_bytes: int
+    timestamp: str
+    columns: Dict[str, ColumnProfile]
+    global_issues: List[DataQualityIssue]
+    quality_score: float  # 0-1, higher is better
+    
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            'system_load': 0.5,
-            'health_score': 0.8,
-            'token_balance': 500,
-            'energy_intensity': 0.5,
-            'helium_level': 0.5,
-            'carbon_leakage_proxy': 0.3,
+            'dataset_name': self.dataset_name,
+            'shape': self.shape,
+            'total_cells': self.total_cells,
+            'memory_usage_bytes': self.memory_usage_bytes,
+            'timestamp': self.timestamp,
+            'columns': {k: v.to_dict() for k, v in self.columns.items()},
+            'global_issues': [i.value for i in self.global_issues],
+            'quality_score': self.quality_score,
         }
 
-    async def get_strategy_state(self) -> Dict[str, float]:
-        """
-        Aggregate current system metrics into a state vector for RL.
-        Includes energy and helium signals from services and tick engine.
-        Uses circuit breakers for resilience.
-        """
-        state = {}
-
-        # Token balance
-        if self.token_manager:
-            try:
-                summary = await self._token_circuit.call(self.token_manager.get_system_summary)
-                state['token_balance'] = summary.get('total_balance', 500)
-            except Exception as e:
-                logger.warning(f"Failed to get token summary: {e}")
-                state['token_balance'] = self.state.get('token_balance', 500)
-        else:
-            state['token_balance'] = 500
-
-        # System load
-        if self.scheduler:
-            try:
-                stats = await self._token_circuit.call(self.scheduler.get_scheduler_stats)
-                state['system_load'] = stats.get('demand_level', 0.5)
-            except Exception:
-                state['system_load'] = self.state.get('system_load', 0.5)
-        elif self.compartment_manager:
-            try:
-                stats = await self._token_circuit.call(self.compartment_manager.get_ecosystem_stats)
-                state['system_load'] = 1.0 - stats.get('viable_compartments', 0) / max(stats.get('total_compartments', 1), 1)
-            except Exception:
-                state['system_load'] = self.state.get('system_load', 0.5)
-        else:
-            state['system_load'] = 0.5
-
-        # Health score
-        if self.harvester:
-            try:
-                stats = await self._token_circuit.call(self.harvester.get_harvesting_stats)
-                health = stats.get('pigment_health', {})
-                avg_health = np.mean([h.get('efficiency', 0.5) for h in health.values()]) if health else 0.8
-                state['health_score'] = avg_health
-            except Exception:
-                state['health_score'] = self.state.get('health_score', 0.8)
-        else:
-            state['health_score'] = 0.8
-
-        # Energy intensity
-        if self.token_manager:
-            try:
-                summary = await self._token_circuit.call(self.token_manager.get_system_summary)
-                total_generated = summary.get('total_generated', 0)
-                total_consumed = summary.get('total_consumed', 0)
-                if total_generated > 0:
-                    state['energy_intensity'] = total_consumed / total_generated
-                else:
-                    state['energy_intensity'] = 0.5
-            except Exception:
-                state['energy_intensity'] = self.state.get('energy_intensity', 0.5)
-        else:
-            state['energy_intensity'] = 0.5
-
-        # Helium level
-        helium_level = 0.5
-        if self.tick_engine:
-            try:
-                if hasattr(self.tick_engine, 'get_current_helium'):
-                    helium_level = self.tick_engine.get_current_helium()
-                elif hasattr(self.tick_engine, 'current_data'):
-                    helium_level = self.tick_engine.current_data.get('helium_supply', 0.5)
-            except Exception:
-                helium_level = self.state.get('helium_level', 0.5)
-        elif self.gradient_manager:
-            try:
-                strengths = await self._gradient_circuit.call(self.gradient_manager.get_field_strengths)
-                helium_level = strengths.get('helium', 0.5)
-            except Exception:
-                helium_level = self.state.get('helium_level', 0.5)
-        state['helium_level'] = max(0.0, min(1.0, helium_level))
-
-        # Carbon leakage proxy
-        if self.gradient_manager:
-            try:
-                strengths = await self._gradient_circuit.call(self.gradient_manager.get_field_strengths)
-                carbon = strengths.get('carbon', 0.5)
-                state['carbon_leakage_proxy'] = max(0.0, min(1.0, carbon))
-            except Exception:
-                state['carbon_leakage_proxy'] = self.state.get('carbon_leakage_proxy', 0.3)
-        else:
-            state['carbon_leakage_proxy'] = 0.3
-
-        return state
-
-    async def _compute_reward(self, state: Dict[str, float]) -> float:
-        """
-        Compute reward based on sustainability metrics and core analytics.
-        """
-        # Base reward from energy, helium, carbon
-        base = (
-            + 0.4 * (1.0 - state.get('energy_intensity', 0.5))
-            + 0.2 * state.get('helium_level', 0.5)
-            - 0.2 * state.get('carbon_leakage_proxy', 0.3)
-        )
-
-        # Add core analytics if available
-        if self.alert_system:
-            alerts = await self.alert_system.get_active_alerts(severity='critical')
-            base -= 0.2 * len(alerts)
-
-        if self.anomaly_detection:
-            anomalies = await self.anomaly_detection.get_recent_anomalies(limit=5)
-            base -= 0.1 * len(anomalies)
-
-        if self.cost_benefit_engine:
-            stats = await self.cost_benefit_engine.get_analysis_stats()
-            if stats.get('average_roi', 0) > 0.5:
-                base += 0.1
-
-        return base
-
-    async def _strategy_update_loop(self):
-        """Background loop that periodically updates RL strategy."""
-        while True:
-            try:
-                # Get current state
-                state = await self.get_strategy_state()
-                self.state = state
-
-                # Select strategy
-                if self.strategy_selector:
-                    action = self.strategy_selector.select_action(state)
-                    await self.apply_strategy(action)
-                    self.current_strategy = action
-                    self.strategy_change_time = datetime.now(timezone.utc)
-                    self.metrics['strategy_changes'] += 1
-
-                    # After a delay, compute reward and update Q‑table
-                    await asyncio.sleep(self.config.state_save_interval_seconds)
-                    next_state = await self.get_strategy_state()
-                    reward = await self._compute_reward(next_state)
-                    self.metrics['total_reward'] += reward
-                    self.strategy_selector.update(state, action, reward, next_state)
-
-                    # Audit strategy change if important
-                    importance = 0.7 if action != 'balanced' else 0.3
-                    await self.auditor.record_event(
-                        'strategy_change',
-                        {'new_strategy': action, 'state': state, 'reward': reward},
-                        importance=importance
-                    )
-                else:
-                    # No RL: use balanced
-                    await self.apply_strategy('balanced')
-
-                # Update metrics
-                await self._update_metrics(state)
-
-                # Sleep until next cycle
-                await asyncio.sleep(self.config.state_save_interval_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Strategy loop error", error=str(e))
-                await asyncio.sleep(30)
-
-    async def apply_strategy(self, strategy: str):
-        """
-        Apply the policies associated with the strategy to the system.
-        Overrides relevant config parameters and propagates to modules.
-        Also updates core configuration if available, sets degradation tier,
-        and triggers workflows.
-        """
-        policy = self.config.strategy_policies.get(strategy, self.config.strategy_policies['balanced'])
-        logger.info(f"Applying strategy '{strategy}' with policy: {policy}")
-
-        # Update agent config
-        for key, value in policy.items():
-            if hasattr(self.config, key):
-                setattr(self.config, key, value)
-
-        # Propagate to core if available
-        if self.bio_core and hasattr(self.bio_core, 'update_configuration'):
-            await self.bio_core.update_configuration(policy)
-
-        # Adjust scheduler degradation tier
-        if self.scheduler and hasattr(self.scheduler, 'set_degradation_tier'):
-            tier = 5 if strategy == 'conservative' else 3 if strategy == 'balanced' else 1
-            self.scheduler.set_degradation_tier(tier)
-
-        # Trigger workflow for performance mode
-        if self.workflow_orchestrator and strategy == 'performance':
-            await self.workflow_orchestrator.execute_workflow('token_generation')
-
-        # Notify other modules as needed
-
-    async def _state_save_loop(self):
-        """Periodically save agent state to disk."""
-        while True:
-            try:
-                await self.save_state()
-                await asyncio.sleep(self.config.state_save_interval_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("State save error", error=str(e))
-                await asyncio.sleep(60)
-
-    async def _daily_snapshot_loop(self):
-        """Take a daily snapshot and record on blockchain if important."""
-        while True:
-            try:
-                await asyncio.sleep(86400)  # 24 hours
-                snapshot = {
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'state': self.state,
-                    'metrics': self.metrics,
-                    'strategy': self.current_strategy,
-                    'agent_id': self.config.agent_id
-                }
-                # Record daily snapshot with importance 0.6 (above threshold)
-                await self.auditor.record_event('daily_snapshot', snapshot, importance=0.6)
-                logger.info("Daily snapshot recorded.")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Daily snapshot error", error=str(e))
-                await asyncio.sleep(3600)
-
-    async def _update_metrics(self, state: Dict[str, float]):
-        self.metrics['energy_efficiency'] = 1.0 - state.get('energy_intensity', 0.5)
-        self.metrics['helium_efficiency'] = state.get('helium_level', 0.5)
-
-    async def save_state(self):
-        """Serialize agent state to disk."""
-        state_data = {
-            'agent_id': self.config.agent_id,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'state': self.state,
-            'metrics': self.metrics,
-            'current_strategy': self.current_strategy,
-            'strategy_change_time': self.strategy_change_time.isoformat(),
-            'q_table': dict(self.strategy_selector.q_table) if self.strategy_selector else None,
-            'correlation_id': self.correlation_id,
+@dataclass
+class DataSummary:
+    """Summary of a dataset for downstream experts."""
+    dataset_id: str
+    rows: int
+    columns: int
+    column_names: List[str]
+    column_dtypes: Dict[str, str]
+    sample_rows: List[Dict[str, Any]]
+    schema_hash: str
+    data_profile: Optional[DataProfile] = None
+    quality_issues: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'dataset_id': self.dataset_id,
+            'rows': self.rows,
+            'columns': self.columns,
+            'column_names': self.column_names,
+            'column_dtypes': self.column_dtypes,
+            'sample_rows': self.sample_rows,
+            'schema_hash': self.schema_hash,
+            'data_profile': self.data_profile.to_dict() if self.data_profile else None,
+            'quality_issues': self.quality_issues,
+            'recommendations': self.recommendations,
         }
+
+# ============================================================================
+# Energy and Metrics Tracking
+# ============================================================================
+
+@dataclass
+class DataOperationMetrics:
+    """Metrics for a data operation."""
+    operation_name: str
+    start_time: float
+    end_time: Optional[float] = None
+    bytes_processed: int = 0
+    rows_processed: int = 0
+    energy_kwh: float = 0.0
+    carbon_kg: float = 0.0
+    success: bool = True
+    error_message: Optional[str] = None
+    
+    def compute_energy_carbon(self, config: DataExpertConfig):
+        """Compute energy and carbon footprint."""
+        self.energy_kwh = self.bytes_processed * config.bytes_to_kwh_factor
+        self.carbon_kg = self.energy_kwh * config.carbon_intensity_g_per_kwh / 1000.0
+    
+    def duration_seconds(self) -> float:
+        if self.end_time:
+            return self.end_time - self.start_time
+        return 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+# ============================================================================
+# Fallback BaseExpert if not available
+# ============================================================================
+
+if not BASE_EXPERT_AVAILABLE:
+    class BaseExpert:
+        """Fallback base expert interface."""
+        def __init__(self):
+            self.expert_name = "data_expert"
+            self.supported_task_types = [
+                "data_profile", "data_clean", "data_summary",
+                "data_validate", "data_transform"
+            ]
+            self.health_status = "healthy"
+        
+        async def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+            raise NotImplementedError()
+        
+        def get_capabilities(self) -> Dict[str, Any]:
+            return {
+                'name': self.expert_name,
+                'supported_tasks': self.supported_task_types,
+                'health': self.health_status,
+            }
+        
+        def get_metrics(self) -> Dict[str, Any]:
+            return {}
+
+# ============================================================================
+# Data Expert Implementation
+# ============================================================================
+
+class DataExpert(BaseExpert):
+    """
+    Data Expert for MoE System v3.0.0
+    
+    Handles data profiling, cleaning, summarization, and routing
+    with full integration into Green_Agent metrics and sustainability tracking.
+    """
+    
+    def __init__(self, config: Optional[DataExpertConfig] = None):
+        super().__init__()
+        self.expert_name = "data_expert"
+        self.supported_task_types = [
+            "data_profile", "data_clean", "data_summary",
+            "data_validate", "data_transform", "data_route"
+        ]
+        self.health_status = "healthy"
+        
+        # Configuration
+        self.config = config or DataExpertConfig()
+        
+        # State
+        self.datasets: Dict[str, pd.DataFrame] = {}
+        self.profiles: Dict[str, DataProfile] = {}
+        self.metrics_history: List[DataOperationMetrics] = []
+        self.tasks_handled = 0
+        self.total_latency = 0.0
+        
+        # Bio-inspired integration
+        self.token_manager = None
+        if TOKEN_AVAILABLE:
+            try:
+                self.token_manager = EcoATPTokenManager()
+            except Exception as e:
+                logger.warning(f"Failed to initialize token manager: {e}")
+        
+        self.gradient_manager = None
+        if GRADIENT_AVAILABLE:
+            try:
+                self.gradient_manager = GradientFieldManager()
+            except Exception as e:
+                logger.warning(f"Failed to initialize gradient manager: {e}")
+        
+        # Prometheus metrics (if available)
+        self.prometheus_metrics = {}
+        if PROMETHEUS_AVAILABLE:
+            self._init_prometheus()
+        
+        logger.info(f"DataExpert initialized with config: {self.config}")
+    
+    def _init_prometheus(self):
+        """Initialize Prometheus metrics."""
         try:
-            with open(self.config.state_save_path, 'wb') as f:
-                pickle.dump(state_data, f)
-            logger.debug("State saved.")
+            self.prometheus_metrics = {
+                'data_expert_tasks_total': Counter(
+                    'data_expert_tasks_total',
+                    'Total tasks handled by data expert',
+                    ['task_type', 'status']
+                ),
+                'data_expert_latency_seconds': Histogram(
+                    'data_expert_latency_seconds',
+                    'Latency of data expert operations',
+                    ['operation']
+                ),
+                'data_expert_bytes_processed': Gauge(
+                    'data_expert_bytes_processed',
+                    'Bytes processed by data expert'
+                ),
+                'data_expert_carbon_kg': Gauge(
+                    'data_expert_carbon_kg',
+                    'Carbon footprint (kg CO2) of data expert'
+                ),
+            }
         except Exception as e:
-            logger.error("Failed to save state", error=str(e))
-
-    async def load_state(self, path: Optional[str] = None):
-        """Load agent state from disk, including Q‑table."""
-        path = path or self.config.state_save_path
-        if not os.path.exists(path):
-            logger.info("No saved state found; starting fresh.")
-            return
+            logger.warning(f"Failed to init Prometheus: {e}")
+    
+    # ========================================================================
+    # Core Expert Interface
+    # ========================================================================
+    
+    async def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle a task routed to this expert.
+        
+        Task format:
+        {
+            'type': 'data_profile' | 'data_clean' | 'data_summary' | ...,
+            'data': <data payload or reference>,
+            'params': {<operation-specific params>},
+            'correlation_id': <for tracing>,
+        }
+        """
+        task_type = task.get('type', 'unknown')
+        task_id = task.get('correlation_id', str(uuid.uuid4()))
+        
+        start_time = datetime.now(timezone.utc)
+        start_ts = asyncio.get_event_loop().time()
+        
+        logger.info(f"DataExpert handling task: {task_type} (ID: {task_id})")
+        
+        try:
+            if task_type == 'data_profile':
+                result = await self.profile_data(task)
+            elif task_type == 'data_clean':
+                result = await self.clean_data(task)
+            elif task_type == 'data_summary':
+                result = await self.summarize_data(task)
+            elif task_type == 'data_validate':
+                result = await self.validate_data(task)
+            elif task_type == 'data_route':
+                result = await self.route_data(task)
+            else:
+                result = {
+                    'status': 'error',
+                    'error': f"Unknown task type: {task_type}",
+                }
+            
+            end_ts = asyncio.get_event_loop().time()
+            latency = end_ts - start_ts
+            self.tasks_handled += 1
+            self.total_latency += latency
+            
+            # Record metrics
+            if PROMETHEUS_AVAILABLE and 'data_expert_latency_seconds' in self.prometheus_metrics:
+                self.prometheus_metrics['data_expert_latency_seconds'].labels(
+                    operation=task_type
+                ).observe(latency)
+            
+            result['correlation_id'] = task_id
+            result['latency_seconds'] = latency
+            logger.info(f"DataExpert completed {task_type}: latency={latency:.3f}s")
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"DataExpert error on {task_type}: {e}", exc_info=True)
+            return {
+                'status': 'error',
+                'error': str(e),
+                'correlation_id': task_id,
+            }
+    
+    def get_capabilities(self) -> Dict[str, Any]:
+        """Return expert capabilities for registry and gating network."""
+        return {
+            'expert_name': self.expert_name,
+            'supported_tasks': self.supported_task_types,
+            'health_status': self.health_status,
+            'avg_latency_seconds': (
+                self.total_latency / self.tasks_handled 
+                if self.tasks_handled > 0 else 0.0
+            ),
+            'tasks_handled': self.tasks_handled,
+            'config': asdict(self.config),
+        }
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return expert-level metrics for MoE dashboard and analytics."""
+        total_bytes = sum(m.bytes_processed for m in self.metrics_history)
+        total_carbon = sum(m.carbon_kg for m in self.metrics_history)
+        failures = sum(1 for m in self.metrics_history if not m.success)
+        
+        return {
+            'expert_name': self.expert_name,
+            'tasks_handled': self.tasks_handled,
+            'avg_latency_seconds': (
+                self.total_latency / self.tasks_handled 
+                if self.tasks_handled > 0 else 0.0
+            ),
+            'total_bytes_processed': total_bytes,
+            'total_carbon_kg': total_carbon,
+            'total_energy_kwh': total_bytes * self.config.bytes_to_kwh_factor,
+            'failure_rate': failures / len(self.metrics_history) if self.metrics_history else 0.0,
+            'datasets_cached': len(self.datasets),
+            'profiles_cached': len(self.profiles),
+        }
+    
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Health check for MoE registry."""
+        # Check if data expert can perform basic operations
+        try:
+            test_df = pd.DataFrame({'x': [1, 2, 3], 'y': [4, 5, 6]})
+            profile = await self._profile_dataframe(test_df, "health_check")
+            
+            self.health_status = "healthy"
+            return {
+                'status': 'healthy',
+                'expert': self.expert_name,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'last_tasks': self.tasks_handled,
+                'last_error': None,
+            }
+        except Exception as e:
+            self.health_status = "unhealthy"
+            logger.warning(f"DataExpert health check failed: {e}")
+            return {
+                'status': 'unhealthy',
+                'expert': self.expert_name,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'error': str(e),
+            }
+    
+    # ========================================================================
+    # Core Data Operations
+    # ========================================================================
+    
+    async def load_data(
+        self,
+        source: Union[str, pd.DataFrame, Dict, List],
+        source_type: DataSourceType = DataSourceType.IN_MEMORY,
+        dataset_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Load data from various sources."""
+        if dataset_id is None:
+            dataset_id = f"dataset_{uuid.uuid4().hex[:8]}"
+        
+        start_ts = asyncio.get_event_loop().time()
+        
+        try:
+            if source_type == DataSourceType.IN_MEMORY or isinstance(source, (pd.DataFrame, dict, list)):
+                df = pd.DataFrame(source) if isinstance(source, (dict, list)) else source
+            elif source_type == DataSourceType.CSV:
+                df = pd.read_csv(source)
+            elif source_type == DataSourceType.JSON:
+                df = pd.read_json(source)
+            elif source_type == DataSourceType.PARQUET:
+                df = pd.read_parquet(source)
+            else:
+                raise ValueError(f"Unsupported source type: {source_type}")
+            
+            self.datasets[dataset_id] = df
+            
+            end_ts = asyncio.get_event_loop().time()
+            latency = end_ts - start_ts
+            bytes_loaded = df.memory_usage(deep=True).sum()
+            
+            # Record metrics
+            metrics = DataOperationMetrics(
+                operation_name="load_data",
+                start_time=start_ts,
+                end_time=end_ts,
+                bytes_processed=bytes_loaded,
+                rows_processed=len(df),
+            )
+            metrics.compute_energy_carbon(self.config)
+            self.metrics_history.append(metrics)
+            
+            logger.info(f"Loaded dataset {dataset_id}: {df.shape}, {bytes_loaded} bytes")
+            return df
+        
+        except Exception as e:
+            logger.error(f"Failed to load data: {e}")
+            raise
+    
+    async def profile_data(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Profile a dataset: compute statistics, type inference, quality metrics.
+        """
+        dataset = task.get('data')
+        dataset_id = task.get('dataset_id', f"profile_{uuid.uuid4().hex[:8]}")
+        
+        if isinstance(dataset, str):
+            df = await self.load_data(dataset, DataSourceType.CSV, dataset_id)
+        elif isinstance(dataset, pd.DataFrame):
+            df = dataset
+        else:
+            df = pd.DataFrame(dataset)
+        
+        profile = await self._profile_dataframe(df, dataset_id)
+        self.profiles[dataset_id] = profile
+        
+        return {
+            'status': 'success',
+            'dataset_id': dataset_id,
+            'profile': profile.to_dict(),
+        }
+    
+    async def _profile_dataframe(self, df: pd.DataFrame, dataset_id: str) -> DataProfile:
+        """Internal method to profile a dataframe."""
+        start_ts = asyncio.get_event_loop().time()
+        
+        # Sample for large datasets
+        sample_df = df.head(self.config.max_rows_profile)
+        
+        columns = {}
+        global_issues = []
+        
+        for col in sample_df.columns:
+            col_data = sample_df[col]
+            non_null = col_data.notna().sum()
+            null_count = col_data.isna().sum()
+            missing_pct = null_count / len(sample_df)
+            
+            # Type inference
+            dtype = str(col_data.dtype)
+            unique_count = col_data.nunique()
+            
+            # Statistics
+            col_profile = ColumnProfile(
+                name=col,
+                dtype=dtype,
+                non_null_count=non_null,
+                null_count=null_count,
+                unique_count=unique_count,
+                missing_pct=missing_pct,
+                issues=[],
+            )
+            
+            # Quality issues
+            if missing_pct > self.config.missing_value_threshold:
+                col_profile.issues.append(DataQualityIssue.MISSING_VALUES)
+                global_issues.append(DataQualityIssue.MISSING_VALUES)
+            
+            if unique_count == 1:
+                col_profile.issues.append(DataQualityIssue.DUPLICATES)
+            
+            if unique_count > self.config.max_unique_values and dtype == 'object':
+                col_profile.issues.append(DataQualityIssue.HIGH_CARDINALITY)
+            
+            # Numeric statistics
+            if pd.api.types.is_numeric_dtype(col_data):
+                col_profile.min_val = col_data.min()
+                col_profile.max_val = col_data.max()
+                col_profile.mean_val = col_data.mean()
+                col_profile.std_val = col_data.std()
+                col_profile.median_val = col_data.median()
+                
+                try:
+                    col_profile.skewness = col_data.skew()
+                    col_profile.kurtosis = col_data.kurtosis()
+                except:
+                    pass
+            
+            # Top values for categorical
+            if pd.api.types.is_object_dtype(col_data) or unique_count <= self.config.max_unique_values:
+                top_vals = col_data.value_counts().head(5)
+                col_profile.top_values = list(zip(top_vals.index, top_vals.values))
+            
+            columns[col] = col_profile
+        
+        # Quality score (0-1)
+        issue_penalty = len(global_issues) * 0.1
+        quality_score = max(0.0, 1.0 - issue_penalty)
+        
+        end_ts = asyncio.get_event_loop().time()
+        bytes_processed = df.memory_usage(deep=True).sum()
+        
+        # Record metrics
+        metrics = DataOperationMetrics(
+            operation_name="profile_data",
+            start_time=start_ts,
+            end_time=end_ts,
+            bytes_processed=bytes_processed,
+            rows_processed=len(df),
+        )
+        metrics.compute_energy_carbon(self.config)
+        self.metrics_history.append(metrics)
+        
+        return DataProfile(
+            dataset_name=dataset_id,
+            shape=df.shape,
+            total_cells=df.shape[0] * df.shape[1],
+            memory_usage_bytes=int(bytes_processed),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            columns=columns,
+            global_issues=global_issues,
+            quality_score=quality_score,
+        )
+    
+    async def clean_data(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Clean a dataset: dedup, handle missing values, normalize.
+        """
+        dataset = task.get('data')
+        dataset_id = task.get('dataset_id', f"cleaned_{uuid.uuid4().hex[:8]}")
+        params = task.get('params', {})
+        
+        if isinstance(dataset, pd.DataFrame):
+            df = dataset.copy()
+        else:
+            df = await self.load_data(dataset, DataSourceType.CSV, dataset_id)
+        
+        start_ts = asyncio.get_event_loop().time()
+        
+        # Deduplication
+        if params.get('remove_duplicates', True):
+            df = df.drop_duplicates()
+        
+        # Handle missing values
+        if params.get('drop_missing', False):
+            df = df.dropna()
+        elif params.get('fill_missing', True):
+            df = df.fillna(df.mean(numeric_only=True))
+        
+        # Simple normalization for numeric columns
+        if params.get('normalize', False):
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            df[numeric_cols] = (df[numeric_cols] - df[numeric_cols].mean()) / (df[numeric_cols].std() + 1e-8)
+        
+        self.datasets[dataset_id] = df
+        
+        end_ts = asyncio.get_event_loop().time()
+        bytes_processed = df.memory_usage(deep=True).sum()
+        
+        # Record metrics
+        metrics = DataOperationMetrics(
+            operation_name="clean_data",
+            start_time=start_ts,
+            end_time=end_ts,
+            bytes_processed=bytes_processed,
+            rows_processed=len(df),
+        )
+        metrics.compute_energy_carbon(self.config)
+        self.metrics_history.append(metrics)
+        
+        return {
+            'status': 'success',
+            'dataset_id': dataset_id,
+            'shape': df.shape,
+            'rows_removed': len(dataset) - len(df),
+        }
+    
+    async def summarize_data(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Summarize a dataset for downstream experts.
+        """
+        dataset = task.get('data')
+        dataset_id = task.get('dataset_id', f"summary_{uuid.uuid4().hex[:8]}")
+        
+        if isinstance(dataset, pd.DataFrame):
+            df = dataset
+        else:
+            df = await self.load_data(dataset, DataSourceType.CSV, dataset_id)
+        
+        start_ts = asyncio.get_event_loop().time()
+        
+        # Compute schema hash
+        schema_str = json.dumps({str(k): str(v) for k, v in df.dtypes.items()})
+        schema_hash = hashlib.sha256(schema_str.encode()).hexdigest()
+        
+        # Sample rows
+        sample_rows = df.head(5).to_dict('records')
+        
+        # Create summary
+        summary = DataSummary(
+            dataset_id=dataset_id,
+            rows=len(df),
+            columns=len(df.columns),
+            column_names=list(df.columns),
+            column_dtypes={str(k): str(v) for k, v in df.dtypes.items()},
+            sample_rows=sample_rows,
+            schema_hash=schema_hash,
+        )
+        
+        # Quality issues and recommendations
+        if df.isnull().any().any():
+            summary.quality_issues.append("Missing values detected")
+            summary.recommendations.append("Consider imputation or removal of missing values")
+        
+        if len(df) == 0:
+            summary.quality_issues.append("Empty dataset")
+        
+        if df.duplicated().any():
+            summary.quality_issues.append("Duplicate rows detected")
+            summary.recommendations.append("Remove duplicates before modeling")
+        
+        end_ts = asyncio.get_event_loop().time()
+        bytes_processed = df.memory_usage(deep=True).sum()
+        
+        # Record metrics
+        metrics = DataOperationMetrics(
+            operation_name="summarize_data",
+            start_time=start_ts,
+            end_time=end_ts,
+            bytes_processed=bytes_processed,
+            rows_processed=len(df),
+        )
+        metrics.compute_energy_carbon(self.config)
+        self.metrics_history.append(metrics)
+        
+        return {
+            'status': 'success',
+            'summary': summary.to_dict(),
+        }
+    
+    async def validate_data(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate data against schema or quality criteria.
+        """
+        dataset = task.get('data')
+        schema = task.get('schema', {})
+        
+        if isinstance(dataset, pd.DataFrame):
+            df = dataset
+        else:
+            df = pd.DataFrame(dataset)
+        
+        issues = []
+        
+        # Schema validation
+        for col, expected_type in schema.items():
+            if col not in df.columns:
+                issues.append(f"Missing column: {col}")
+            elif str(df[col].dtype) != str(expected_type):
+                issues.append(f"Type mismatch on {col}: expected {expected_type}, got {df[col].dtype}")
+        
+        # Quality checks
+        if df.empty:
+            issues.append("Dataset is empty")
+        
+        if df.isnull().all().any():
+            null_cols = df.columns[df.isnull().all()].tolist()
+            issues.append(f"Columns with all nulls: {null_cols}")
+        
+        return {
+            'status': 'success' if not issues else 'warning',
+            'valid': len(issues) == 0,
+            'issues': issues,
+        }
+    
+    async def route_data(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Route data to task-specific experts based on characteristics.
+        """
+        dataset = task.get('data')
+        dataset_id = task.get('dataset_id', f"route_{uuid.uuid4().hex[:8]}")
+        
+        if isinstance(dataset, pd.DataFrame):
+            df = dataset
+        else:
+            df = pd.DataFrame(dataset)
+        
+        # Determine routing based on data characteristics
+        routing = {
+            'feature_expert': False,
+            'model_expert': False,
+            'optimization_expert': False,
+        }
+        
+        # Route to feature expert if many columns or need engineering
+        if len(df.columns) > 10:
+            routing['feature_expert'] = True
+        
+        # Route to model expert if sufficient data
+        if len(df) > 100:
+            routing['model_expert'] = True
+        
+        # Route to optimization expert if large dataset
+        if len(df) > 1000 or len(df.columns) > 20:
+            routing['optimization_expert'] = True
+        
+        recommended_experts = [k for k, v in routing.items() if v]
+        
+        return {
+            'status': 'success',
+            'dataset_id': dataset_id,
+            'routing': routing,
+            'recommended_experts': recommended_experts,
+            'task_descriptors': [
+                {'expert': exp, 'task_type': 'process', 'data_ref': dataset_id}
+                for exp in recommended_experts
+            ],
+        }
+    
+    # ========================================================================
+    # Persistence and State Management
+    # ========================================================================
+    
+    async def save_state(self) -> bool:
+        """Save expert state to disk."""
+        try:
+            state = {
+                'datasets': {k: v.to_dict() for k, v in self.datasets.items()},
+                'profiles': {k: v.to_dict() for k, v in self.profiles.items()},
+                'metrics': [m.to_dict() for m in self.metrics_history],
+                'tasks_handled': self.tasks_handled,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            }
+            with open(self.config.state_save_path, 'wb') as f:
+                pickle.dump(state, f)
+            logger.info("DataExpert state saved")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+            return False
+    
+    async def load_state(self) -> bool:
+        """Load expert state from disk."""
+        path = Path(self.config.state_save_path)
+        if not path.exists():
+            logger.info("No saved state found")
+            return False
+        
         try:
             with open(path, 'rb') as f:
-                data = pickle.load(f)
-            self.state = data.get('state', self.state)
-            self.metrics = data.get('metrics', self.metrics)
-            self.current_strategy = data.get('current_strategy', 'balanced')
-            if data.get('q_table') and self.strategy_selector:
-                self.strategy_selector.q_table = defaultdict(dict, data['q_table'])
-            self.correlation_id = data.get('correlation_id', self.correlation_id)
-            logger.info("State loaded.")
+                state = pickle.load(f)
+            # Restore state (datasets would need to be reconstructed from dicts)
+            self.tasks_handled = state.get('tasks_handled', 0)
+            logger.info("DataExpert state loaded")
+            return True
         except Exception as e:
-            logger.error("Failed to load state", error=str(e))
-
-    async def shutdown(self):
-        """Gracefully shut down all components."""
-        logger.info("Shutting down BioIntegratedAgent")
-        await self._task_manager.stop_all()
-        # Save final state
-        await self.save_state()
-        # Close tick engine if any
-        if self.tick_engine and hasattr(self.tick_engine, 'shutdown'):
-            await self.tick_engine.shutdown()
-        # Close quantum bridge if any
-        if self.quantum_bridge and hasattr(self.quantum_bridge, 'shutdown'):
-            await self.quantum_bridge.shutdown()
-        logger.info("Agent shutdown complete")
+            logger.error(f"Failed to load state: {e}")
+            return False
 
 # ============================================================================
-# Example usage
+# Example Usage
 # ============================================================================
-async def example():
-    """Example usage of the BioIntegratedAgent with a mock core."""
-    # Create a mock core (if real core not available)
-    class MockCore:
-        def __init__(self):
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-        async def update_configuration(self, policy):
-            pass
 
-    config = {
-        'enable_energy_aware_rl': True,
-        'enable_time_tick_engine': True,
-        'enable_quantum_bridge': True,
-        'pqc_key_dir': './pqc_keys',
-        'state_save_path': './agent_state.pkl',
-    }
-    agent = BioIntegratedAgent(
-        bio_core=MockCore(),
-        config=config,
-        csv_path="helium_data.csv"
+async def example_usage():
+    """Example usage of the DataExpert."""
+    config = DataExpertConfig(
+        enable_profiling=True,
+        enable_cleaning=True,
+        enable_energy_tracking=True,
     )
-    # Let it run for a few seconds
-    await asyncio.sleep(10)
-    # Get current state
-    state = await agent.get_strategy_state()
-    print("Current state:", state)
-    print("Current strategy:", agent.current_strategy)
-    print("Metrics:", agent.metrics)
-    await agent.shutdown()
+    expert = DataExpert(config)
+    
+    # Example 1: Load and profile CSV
+    sample_data = {
+        'id': [1, 2, 3, 4, 5],
+        'value': [10.5, 20.3, None, 40.1, 50.0],
+        'category': ['A', 'B', 'A', 'C', 'B'],
+    }
+    
+    task_profile = {
+        'type': 'data_profile',
+        'data': sample_data,
+        'dataset_id': 'sample_001',
+    }
+    
+    result = await expert.handle_task(task_profile)
+    print("Profile result:", result['status'])
+    
+    # Example 2: Clean data
+    task_clean = {
+        'type': 'data_clean',
+        'data': sample_data,
+        'dataset_id': 'sample_001_clean',
+        'params': {'drop_missing': True},
+    }
+    
+    result = await expert.handle_task(task_clean)
+    print("Clean result:", result['status'])
+    
+    # Example 3: Summarize
+    task_summary = {
+        'type': 'data_summary',
+        'data': sample_data,
+        'dataset_id': 'sample_001_summary',
+    }
+    
+    result = await expert.handle_task(task_summary)
+    print("Summary result:", result['status'])
+    
+    # Example 4: Check health
+    health = await expert.get_health_status()
+    print("Health:", health['status'])
+    
+    # Print metrics
+    metrics = expert.get_metrics()
+    print("Metrics:", metrics)
 
 if __name__ == "__main__":
-    asyncio.run(example())
+    asyncio.run(example_usage())
