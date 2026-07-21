@@ -1,5 +1,8 @@
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/enhanced_work_integrator.py
+# Enhanced version v7.0.0 – Full integration with bio‑inspired core, event‑driven, circuit breakers, self‑healing, and system persistence
+
 """
-Enhanced Work Integration v6.0.1 - Complete Green Agent Implementation
+Enhanced Work Integrator v7.0.0 - Complete Green Agent Implementation
 
 Complete bio-inspired integration with:
 - Federated Reflexive Learning with meta-cognitive state sharing
@@ -26,21 +29,24 @@ Complete bio-inspired integration with:
 - SLA prediction for proactive scheduling
 - Sustainability dashboard for work items
 
-New in v6.0.1:
-- Configuration dataclass for centralized settings
-- Resilient carbon intensity manager with retry & circuit breaker
-- Enhanced state persistence with full context recovery
-- Dynamic pricing integrated with real-time carbon/helix prices
-- Adaptive hybrid pipeline with backend availability checks
-- Telemetry collector for Prometheus metrics export
-- Improved bio-inspired fallback strategies
+Enhancements v7.0.0:
+- Event-driven integration via core EventBroker (carbon, helium, alerts, config)
+- Circuit breakers for all external services
+- Self-healing and reactive alert handling
+- System-level persistence for integrator state (sustainability, SLA violations, etc.)
+- Integration with QuantumBridge and TimeTickEngine
+- Swarm coordination via SwarmCoordinator
+- Integration with CostBenefitEngine and PredictiveAlertSystem
+- Workflow orchestration triggers on threshold breaches
+- Health monitoring and configuration reload
+- Enhanced telemetry and sustainability dashboard
 """
 
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Set, Callable, Union
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import numpy as np
 from collections import defaultdict, deque
@@ -57,9 +63,10 @@ import zlib
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Bio-Inspired Import Check
+# Bio-Inspired Core Import (with fallback)
 # ============================================================================
 try:
+    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker, Persistence
     from enhancements.bio_inspired.eco_atp_currency import (
         EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
         TokenState, EcoATPToken, EcoATPAccount
@@ -80,16 +87,35 @@ try:
     from enhancements.bio_inspired.photosynthetic_harvester import (
         PhotosyntheticHarvester
     )
+    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
+    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
     BIO_INSPIRED_AVAILABLE = True
-    logger.info("Bio-inspired modules loaded for Enhanced Work Integration")
+    logger.info("Bio-inspired core modules loaded for Enhanced Work Integrator")
 except ImportError as e:
     BIO_INSPIRED_AVAILABLE = False
-    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard work processing")
+    logger.warning(f"Bio-inspired core modules not available: {str(e)} - using standard work processing")
+    # Fallback definitions
+    class BioEvent:
+        def __init__(self, event_type, source, data=None):
+            self.event_type = event_type
+            self.source = source
+            self.data = data or {}
+
+    class CircuitBreaker:
+        def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._state = "closed"
+            self._failure_count = 0
+            self._last_failure_time = None
+            self._lock = asyncio.Lock()
+        async def call(self, func, *args, **kwargs):
+            return await func(*args, **kwargs)
 
 # ============================================================================
 # Work State Machine (unchanged)
 # ============================================================================
-
 class WorkState(Enum):
     CREATED = "created"; VALIDATED = "validated"; QUEUED = "queued"; SCHEDULED = "scheduled"
     RESOURCES_RESERVED = "resources_reserved"; TOKENS_ALLOCATED = "tokens_allocated"
@@ -139,7 +165,7 @@ class SLALevel(Enum):
     PLATINUM = "platinum"; GOLD = "gold"; SILVER = "silver"; BRONZE = "bronze"; BEST_EFFORT = "best_effort"
 
 # ============================================================================
-# Configuration Dataclass (NEW)
+# Configuration Dataclass (Enhanced)
 # ============================================================================
 @dataclass
 class WorkIntegratorConfig:
@@ -160,6 +186,11 @@ class WorkIntegratorConfig:
     enable_hybrid_pipeline: bool = True
     enable_sustainability_dashboard: bool = True
     enable_telemetry: bool = True
+    enable_event_driven: bool = True
+    enable_self_healing: bool = True
+    enable_swarm_coordination: bool = True
+    enable_quantum_bridge: bool = True
+    enable_time_tick_engine: bool = True
 
     # Tunable parameters
     carbon_api_region: str = "us-east"
@@ -179,19 +210,20 @@ class WorkIntegratorConfig:
         'success': 0.15,
         'pricing': 0.1
     })
+    self_healing_enabled: bool = True
+    workflow_on_critical_alert: str = "adjust_work_policy"
+    swarm_share_interval: int = 60
 
     def __post_init__(self):
-        # Ensure boolean flags
         for key, value in self.__dict__.items():
             if isinstance(value, bool):
                 setattr(self, key, bool(value))
 
 # ============================================================================
-# Enhanced Carbon Intensity Manager with Retry & Circuit Breaker
+# Enhanced Carbon Intensity Manager (unchanged, but we keep it)
 # ============================================================================
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration with retry, circuit breaker, and caching."""
-
+    # ... (same as before) ...
     def __init__(self, config: WorkIntegratorConfig):
         self.config = config
         self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
@@ -219,25 +251,19 @@ class CarbonIntensityManager:
         return self._session
 
     async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
-        """Update carbon intensity with retry and circuit breaker."""
         if region is not None:
             self.region = region
-
-        # Circuit breaker check
         if self.circuit_open:
-            if datetime.utcnow() < self.circuit_open_until:
+            if datetime.now(timezone.utc) < self.circuit_open_until:
                 logger.warning("Circuit breaker open, using fallback data")
                 return self._get_fallback_response()
             else:
                 self.circuit_open = False
                 self.failure_count = 0
                 logger.info("Circuit breaker reset for CarbonIntensityManager")
-
-        # Cache check
-        cache_key = f"{self.region}_{datetime.utcnow().hour}"
-        if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.config.carbon_update_interval:
+        cache_key = f"{self.region}_{datetime.now(timezone.utc).hour}"
+        if cache_key in self.cache and self.last_update and (datetime.now(timezone.utc) - self.last_update).seconds < self.config.carbon_update_interval:
             return self.cache[cache_key]
-
         for attempt in range(self.max_retries):
             try:
                 session = await self._get_session()
@@ -247,7 +273,7 @@ class CarbonIntensityManager:
                     if response.status == 200:
                         data = await response.json()
                         self.carbon_intensity = data.get('carbonIntensity', 400)
-                        self.last_update = datetime.now()
+                        self.last_update = datetime.now(timezone.utc)
                         self.cache[cache_key] = {
                             'intensity': self.carbon_intensity,
                             'timestamp': self.last_update.isoformat()
@@ -268,7 +294,7 @@ class CarbonIntensityManager:
                             self.failure_count += 1
                             if self.failure_count >= self.circuit_breaker_threshold:
                                 self.circuit_open = True
-                                self.circuit_open_until = datetime.utcnow() + timedelta(minutes=5)
+                                self.circuit_open_until = datetime.now(timezone.utc) + timedelta(minutes=5)
                                 logger.error("Circuit breaker opened for CarbonIntensityManager")
                             return self._get_fallback_response()
                         await asyncio.sleep(2 ** attempt)
@@ -278,15 +304,12 @@ class CarbonIntensityManager:
                     self.failure_count += 1
                     if self.failure_count >= self.circuit_breaker_threshold:
                         self.circuit_open = True
-                        self.circuit_open_until = datetime.utcnow() + timedelta(minutes=5)
+                        self.circuit_open_until = datetime.now(timezone.utc) + timedelta(minutes=5)
                     return self._get_fallback_response()
                 await asyncio.sleep(2 ** attempt)
-
-        # Should never reach here
         return self._get_fallback_response()
 
     def _update_carbon_price(self, intensity: float):
-        """Update carbon price based on intensity."""
         base_price = 50.0
         volatility = np.random.normal(0, 5)
         intensity_factor = (intensity - 300) / 500
@@ -311,19 +334,19 @@ class CarbonIntensityManager:
         return {
             'intensity': intensity,
             'region': self.region,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'price_usd_per_ton': self.carbon_price_usd_per_ton,
             'is_fallback': True,
             'trend': self.price_trend
         }
 
     async def get_current_intensity(self) -> float:
-        if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.config.carbon_update_interval:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.config.carbon_update_interval:
             await self.update_carbon_intensity(self.region)
         return self.carbon_intensity
 
     async def get_current_price(self) -> float:
-        if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.config.carbon_update_interval:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.config.carbon_update_interval:
             await self.update_carbon_intensity(self.region)
         return self.carbon_price_usd_per_ton
 
@@ -335,8 +358,7 @@ class CarbonIntensityManager:
 # Predictive Work Analyzer (unchanged)
 # ============================================================================
 class PredictiveWorkAnalyzer:
-    """Predictive reflexivity with ensemble forecasting for work processing"""
-    
+    # ... (same as before) ...
     def __init__(self, history_window: int = 100):
         self.history_window = history_window
         self.work_history = deque(maxlen=history_window)
@@ -344,7 +366,6 @@ class PredictiveWorkAnalyzer:
         self.models = {}
         self.scaler = None
         self.is_trained = False
-        
         try:
             from sklearn.preprocessing import StandardScaler
             from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -355,21 +376,20 @@ class PredictiveWorkAnalyzer:
             self._ml_available = True
         except ImportError:
             self._ml_available = False
-    
+
     def update_history(self, work_metrics: Dict):
         self.work_history.append({
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(timezone.utc),
             'success_rate': work_metrics.get('success_rate', 0.8),
             'avg_latency_ms': work_metrics.get('avg_latency_ms', 100),
             'carbon_intensity': work_metrics.get('carbon_intensity', 400),
             'token_efficiency': work_metrics.get('token_efficiency', 0.5),
             'workload': work_metrics.get('workload', 0.5)
         })
-    
+
     async def train_forecast_model(self):
         if not self._ml_available or len(self.work_history) < 10:
             return {'status': 'insufficient_data'}
-        
         X, y = [], []
         history_list = list(self.work_history)
         for i in range(len(history_list) - 5):
@@ -381,7 +401,6 @@ class PredictiveWorkAnalyzer:
                                data['workload']])
             X.append(features)
             y.append(history_list[i + 5]['success_rate'])
-        
         X = np.array(X); y = np.array(y)
         X_scaled = self.scaler.fit_transform(X)
         results = {}
@@ -393,11 +412,10 @@ class PredictiveWorkAnalyzer:
                 results[name] = r2_score(y, predictions)
         self.is_trained = True
         return {'status': 'success', 'results': results}
-    
+
     async def predict_work_trend(self) -> Dict:
         if not self.is_trained or len(self.work_history) < 10:
             return {'predicted_success': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
-        
         recent = list(self.work_history)[-5:]
         features = []
         for data in recent:
@@ -422,7 +440,7 @@ class PredictiveWorkAnalyzer:
         self.forecast_history.append({'prediction': prediction, 'trend': trend})
         return {'predicted_success': prediction, 'confidence': confidence, 'trend': trend,
                 'recommended_actions': self._generate_actions(prediction)}
-    
+
     def _generate_actions(self, prediction: float) -> List[str]:
         actions = []
         if prediction < 0.4:
@@ -437,8 +455,7 @@ class PredictiveWorkAnalyzer:
 # Work Cross-Domain Transfer (unchanged)
 # ============================================================================
 class WorkCrossDomainTransfer:
-    """Cross-domain knowledge transfer for work processing"""
-    
+    # ... (same as before) ...
     def __init__(self):
         self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
         self.transfer_logs = deque(maxlen=1000)
@@ -457,7 +474,7 @@ class WorkCrossDomainTransfer:
                 'compression_strategies': ['lossy', 'lossless', 'adaptive']
             }
         }
-    
+
     def transfer_knowledge(self, source_domain: str, target_domain: str, 
                           knowledge_type: str, data: Dict[str, Any]) -> Dict:
         key = f"{source_domain}→{target_domain}"
@@ -465,15 +482,15 @@ class WorkCrossDomainTransfer:
             self.knowledge_base[key] = {}
         if knowledge_type not in self.knowledge_base[key]:
             self.knowledge_base[key][knowledge_type] = {'data': data, 'transfer_count': 1,
-                'effectiveness_score': 0.5, 'last_used': datetime.utcnow()}
+                'effectiveness_score': 0.5, 'last_used': datetime.now(timezone.utc)}
         else:
             existing = self.knowledge_base[key][knowledge_type]
             existing['data'].update(data); existing['transfer_count'] += 1
-            existing['last_used'] = datetime.utcnow()
-        self.transfer_logs.append({'timestamp': datetime.utcnow(), 'source': source_domain,
+            existing['last_used'] = datetime.now(timezone.utc)
+        self.transfer_logs.append({'timestamp': datetime.now(timezone.utc), 'source': source_domain,
                                    'target': target_domain, 'type': knowledge_type})
         return self.knowledge_base[key][knowledge_type]
-    
+
     def get_transfer_statistics(self) -> Dict:
         total_transfers = len(self.transfer_logs)
         domain_pairs = {}
@@ -484,9 +501,8 @@ class WorkCrossDomainTransfer:
                 'knowledge_types': list(self.knowledge_base.keys())}
 
 # ============================================================================
-# Data Classes (Enhanced)
+# Data Classes (unchanged, but we'll add system state persistence)
 # ============================================================================
-
 @dataclass
 class WorkSLA:
     level: SLALevel
@@ -500,19 +516,19 @@ class WorkSLA:
     violations: int = 0
     predicted_violation_probability: float = 0.0
     sla_health_score: float = 1.0
-    
+
     def is_violated(self, actual_latency_ms: float) -> bool:
         return actual_latency_ms > self.max_latency_ms
-    
+
     def time_until_deadline(self) -> Optional[float]:
         if self.deadline:
-            return (self.deadline - datetime.utcnow()).total_seconds()
+            return (self.deadline - datetime.now(timezone.utc)).total_seconds()
         return None
-    
+
     def is_deadline_critical(self) -> bool:
         remaining = self.time_until_deadline()
         return remaining is not None and remaining < 60
-    
+
     def update_health(self, predicted_probability: float):
         self.predicted_violation_probability = predicted_probability
         self.sla_health_score = 1.0 - predicted_probability
@@ -540,7 +556,7 @@ class WorkCheckpoint:
     intermediate_results: Dict[str, Any]
     resource_usage: Dict[str, float]
     ecoatp_consumed: float = 0.0
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     pipeline_state: Dict[str, Any] = field(default_factory=dict)
     carbon_footprint_at_checkpoint: float = 0.0
     helium_usage_at_checkpoint: float = 0.0
@@ -587,7 +603,7 @@ class EnhancedWorkContext:
     tokens_recovered: float = 0.0
     biomass_storage_token: Optional[str] = None
     compartment_id: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     execution_attempts: int = 0
@@ -602,30 +618,30 @@ class EnhancedWorkContext:
     deadline_risk_score: float = 0.0
     resource_efficiency_score: float = 0.0
     dynamic_token_price: float = 1.0
-    
+
     def transition_to(self, new_state: WorkState) -> bool:
         if not self.state.can_transition_to(new_state):
             logger.warning(f"Invalid state transition: {self.state.value} -> {new_state.value}")
             return False
         old_state = self.state
         self.state = new_state
-        self.state_history.append((new_state, datetime.utcnow()))
+        self.state_history.append((new_state, datetime.now(timezone.utc)))
         return True
-    
+
     def add_checkpoint(self, checkpoint: WorkCheckpoint):
         self.checkpoints.append(checkpoint)
         if len(self.checkpoints) > 5:
             self.checkpoints = self.checkpoints[-5:]
-    
+
     def add_event(self, event_type: str, details: Dict[str, Any]):
         self.events.append({'type': event_type, 'details': details,
-                           'timestamp': datetime.utcnow().isoformat()})
+                           'timestamp': datetime.now(timezone.utc).isoformat()})
         if len(self.events) > 1000:
             self.events = self.events[-1000:]
-    
+
     def can_retry(self) -> bool:
         return self.execution_attempts < self.max_attempts
-    
+
     def to_routing_context(self) -> Dict[str, Any]:
         return {
             'task_id': self.task_id,
@@ -644,19 +660,10 @@ class EnhancedWorkContext:
         }
 
 # ============================================================================
-# Enhanced State Persistence Manager (NEW)
+# Enhanced State Persistence Manager (unchanged)
 # ============================================================================
 class StatePersistenceManager:
-    """
-    Enhanced state persistence with full context recovery.
-    
-    Features:
-    - Full `EnhancedWorkContext` serialization (including checkpoints, meta state)
-    - Recovery from persistent storage
-    - Compression support
-    - Versioning
-    """
-
+    # ... (same as before) ...
     def __init__(self, config: WorkIntegratorConfig):
         self.config = config
         self.storage_path = config.persistence_storage_path
@@ -665,14 +672,9 @@ class StatePersistenceManager:
         logger.info(f"State Persistence Manager initialized at {self.storage_path}")
 
     async def save_work_state(self, context: EnhancedWorkContext):
-        """Save full work context to persistent storage."""
         async with self._lock:
             try:
                 filename = f"{self.storage_path}/{context.task_id}.pkl"
-                
-                # Serialize the entire context
-                # We need to handle non-serializable fields (e.g., callables in rollback_actions)
-                # We'll store them as placeholders and warn.
                 serializable_context = {
                     'task_id': context.task_id,
                     'work_type': context.work_type,
@@ -742,41 +744,28 @@ class StatePersistenceManager:
                     'resource_efficiency_score': context.resource_efficiency_score,
                     'dynamic_token_price': context.dynamic_token_price
                 }
-                
-                # Note: rollback_actions and compensation_actions are not serializable;
-                # they will be lost on restart. We log a warning.
                 if context.rollback_actions or context.compensation_actions:
                     logger.warning(f"Work {context.task_id} has non-serializable rollback/compensation actions; they will not be persisted.")
-                
-                # Compress and save
                 serialized = pickle.dumps(serializable_context)
                 compressed = zlib.compress(serialized)
-                
                 with open(filename, 'wb') as f:
                     f.write(compressed)
-                
                 logger.debug(f"Saved full work state for {context.task_id}")
                 return True
-                
             except Exception as e:
                 logger.error(f"Error saving work state for {context.task_id}: {e}")
                 return False
 
     async def load_work_context(self, task_id: str) -> Optional[EnhancedWorkContext]:
-        """Load full work context from persistent storage."""
         async with self._lock:
             try:
                 filename = f"{self.storage_path}/{task_id}.pkl"
                 if not os.path.exists(filename):
                     return None
-                
                 with open(filename, 'rb') as f:
                     compressed = f.read()
-                
                 serialized = zlib.decompress(compressed)
                 data = pickle.loads(serialized)
-                
-                # Reconstruct context
                 context = EnhancedWorkContext(
                     task_id=data['task_id'],
                     work_type=data['work_type'],
@@ -830,14 +819,10 @@ class StatePersistenceManager:
                     resource_efficiency_score=data['resource_efficiency_score'],
                     dynamic_token_price=data['dynamic_token_price']
                 )
-                
-                # Reconstruct state history
                 for state_str, timestamp_str in data['state_history']:
                     state = WorkState(state_str)
                     timestamp = datetime.fromisoformat(timestamp_str)
                     context.state_history.append((state, timestamp))
-                
-                # Reconstruct checkpoints
                 for cp_data in data['checkpoints']:
                     checkpoint = WorkCheckpoint(
                         checkpoint_id=cp_data['checkpoint_id'],
@@ -853,10 +838,8 @@ class StatePersistenceManager:
                         helium_usage_at_checkpoint=cp_data['helium_usage_at_checkpoint']
                     )
                     context.checkpoints.append(checkpoint)
-                
                 logger.debug(f"Loaded full work state for {task_id}")
                 return context
-                
             except Exception as e:
                 logger.error(f"Error loading work state for {task_id}: {e}")
                 return None
@@ -875,19 +858,42 @@ class StatePersistenceManager:
                 return False
 
 # ============================================================================
-# Enhanced Dynamic Token Pricing Manager with Real-time Prices
+# System State Persistence (NEW)
+# ============================================================================
+class SystemStatePersistence:
+    """Persists the integrator's global state (sustainability, SLA violations, metrics)."""
+    def __init__(self, config: WorkIntegratorConfig):
+        self.config = config
+        self.path = os.path.join(config.persistence_storage_path, "system_state.pkl")
+        self._lock = asyncio.Lock()
+
+    async def save(self, state: Dict[str, Any]) -> bool:
+        async with self._lock:
+            try:
+                with open(self.path, 'wb') as f:
+                    pickle.dump(state, f)
+                logger.debug("System state saved")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save system state: {e}")
+                return False
+
+    async def load(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            if not os.path.exists(self.path):
+                return None
+            try:
+                with open(self.path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load system state: {e}")
+                return None
+
+# ============================================================================
+# Enhanced Dynamic Token Pricing Manager (unchanged)
 # ============================================================================
 class DynamicTokenPricingManager:
-    """
-    Dynamic token pricing based on priority, scarcity, and real-time carbon/helix prices.
-    
-    Features:
-    - Priority-based multipliers
-    - Scarcity factors updated from carbon/helix real-time prices
-    - Demand forecasting
-    - Integration with CarbonIntensityManager
-    """
-
+    # ... (same as before) ...
     def __init__(self, config: WorkIntegratorConfig, carbon_manager: Optional[CarbonIntensityManager] = None):
         self.config = config
         self.carbon_manager = carbon_manager
@@ -918,37 +924,25 @@ class DynamicTokenPricingManager:
         carbon_intensity: Optional[float] = None,
         helium_scarcity: Optional[float] = None
     ) -> float:
-        """Get dynamic token price for a work item."""
         async with self._lock:
-            # Get real-time prices if available
             if self.carbon_manager:
                 if carbon_intensity is None:
                     carbon_intensity = await self.carbon_manager.get_current_intensity()
-                # Update scarcity factor for carbon based on intensity
                 self.scarcity_factors['carbon'] = 1.0 + (carbon_intensity / 800) * 0.5
             else:
-                # Fallback to static scarcity if no carbon manager
                 carbon_intensity = 400
                 self.scarcity_factors['carbon'] = 1.0
-
-            # Update helium scarcity if provided
             if helium_scarcity is not None:
                 self.scarcity_factors['helium'] = 1.0 + helium_scarcity * 0.5
-
-            # Priority multiplier
             priority_mult = self.priority_multipliers.get(priority, 1.0)
-            # Resource-specific scarcity
             scarcity_mult = self.scarcity_factors.get(resource_type, 1.0)
-            # Demand adjustment
             if len(self.demand_history) > 10:
                 recent_demand = np.mean(list(self.demand_history)[-10:])
                 demand_adjustment = 1.0 + (recent_demand - 0.5) * 0.5
             else:
                 demand_adjustment = 1.0
-
             price = self.base_price * priority_mult * scarcity_mult * demand_adjustment
             price = max(0.1, min(10.0, price))
-            
             self.price_history.append(price)
             return price
 
@@ -970,13 +964,10 @@ class DynamicTokenPricingManager:
         }
 
 # ============================================================================
-# Enhanced Quantum-Classical Hybrid Pipeline with Adaptive Routing
+# Enhanced Quantum-Classical Hybrid Pipeline (unchanged)
 # ============================================================================
 class QuantumClassicalHybridPipeline:
-    """
-    Enhanced hybrid pipeline with adaptive routing based on backend availability and sustainability.
-    """
-
+    # ... (same as before) ...
     def __init__(self, config: WorkIntegratorConfig, quantum_module=None):
         self.config = config
         self.quantum_module = quantum_module
@@ -989,75 +980,44 @@ class QuantumClassicalHybridPipeline:
             'savings_by_mode': defaultdict(float)
         }
         self._lock = asyncio.Lock()
-        # Cache for backend availability (simulated)
         self.backend_availability = {}
         logger.info("Quantum-Classical Hybrid Pipeline initialized")
 
-    async def execute(
-        self,
-        context: EnhancedWorkContext,
-        work_fn: Callable,
-        quantum_threshold: Optional[float] = None
-    ) -> Dict[str, Any]:
-        """
-        Execute work with adaptive quantum-classical routing.
-        
-        Uses:
-        - Task complexity and quantum capability
-        - Quantum backend availability (if any)
-        - Sustainability score of each mode
-        """
+    async def execute(self, context: EnhancedWorkContext, work_fn: Callable, quantum_threshold: Optional[float] = None) -> Dict[str, Any]:
         async with self._lock:
             if quantum_threshold is None:
                 quantum_threshold = self.config.hybrid_quantum_threshold
-
-            # Check if quantum is feasible
             should_use_quantum = False
-            if (
-                context.quantum_capable and
-                context.complexity > quantum_threshold and
-                self.quantum_module is not None and
-                await self._is_quantum_backend_available()
-            ):
+            if (context.quantum_capable and context.complexity > quantum_threshold and
+                self.quantum_module is not None and await self._is_quantum_backend_available()):
                 should_use_quantum = True
-
             if should_use_quantum:
                 try:
                     result = await self._execute_quantum(context, work_fn)
                     self.hybrid_stats['quantum_executions'] += 1
                     if result.get('success', False):
-                        self.hybrid_stats['quantum_success_rate'] = (
-                            (self.hybrid_stats['quantum_success_rate'] * 0.9) + 0.1
-                        )
+                        self.hybrid_stats['quantum_success_rate'] = (self.hybrid_stats['quantum_success_rate'] * 0.9) + 0.1
                         result['execution_mode'] = 'quantum'
                         return result
                     else:
                         logger.info(f"Quantum execution failed, falling back to classical for {context.task_id}")
                 except Exception as e:
                     logger.warning(f"Quantum execution error: {e}, falling back to classical")
-
-            # Classical execution
             result = await self._execute_classical(context, work_fn)
             self.hybrid_stats['classical_executions'] += 1
             if result.get('success', False):
-                self.hybrid_stats['classical_success_rate'] = (
-                    (self.hybrid_stats['classical_success_rate'] * 0.9) + 0.1
-                )
+                self.hybrid_stats['classical_success_rate'] = (self.hybrid_stats['classical_success_rate'] * 0.9) + 0.1
             result['execution_mode'] = 'classical'
             return result
 
     async def _is_quantum_backend_available(self) -> bool:
-        """Check if a quantum backend is available."""
         if not self.quantum_module:
             return False
-        # Simulate: assume available 80% of the time
-        # In production, query backend status
         return np.random.random() < 0.8
 
     async def _execute_quantum(self, context: EnhancedWorkContext, work_fn: Callable) -> Dict:
         if not self.quantum_module:
             return {'success': False, 'error': 'Quantum module not available'}
-        
         circuit_params = {
             'qubits': context.quantum_capable if hasattr(context, 'quantum_capable') else 4,
             'depth': min(10, int(context.complexity * 20)),
@@ -1090,8 +1050,7 @@ class QuantumClassicalHybridPipeline:
 # Work Sustainability Dashboard (unchanged)
 # ============================================================================
 class WorkSustainabilityDashboard:
-    """Sustainability dashboard for work items."""
-    
+    # ... (same as before) ...
     def __init__(self):
         self.metrics: Dict[str, deque] = {}
         self.scores: Dict[str, float] = {}
@@ -1111,7 +1070,7 @@ class WorkSustainabilityDashboard:
                 if key in self.metrics:
                     self.metrics[key].append(value)
             self.history.append({
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'work_id': work_id,
                 'metrics': metrics
             })
@@ -1172,11 +1131,10 @@ class WorkSustainabilityDashboard:
         return recommendations or ["All sustainability metrics are within acceptable ranges"]
 
 # ============================================================================
-# Telemetry Collector (NEW)
+# Telemetry Collector (unchanged)
 # ============================================================================
 class TelemetryCollector:
-    """Collects and exports metrics for monitoring (Prometheus-style)."""
-
+    # ... (same as before) ...
     def __init__(self):
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
@@ -1204,7 +1162,6 @@ class TelemetryCollector:
         return metric_name
 
     async def export(self) -> str:
-        # Prometheus text format
         output = []
         for key, value in self.metrics['counters'].items():
             output.append(f"# TYPE {key} counter\n{key} {value}")
@@ -1235,10 +1192,10 @@ class ResourceReservationManager:
                 ecoatp_budget: float = 0.0, duration_seconds: float = 300,
                 carbon_price: float = 50.0, helium_price: float = 0.5) -> Optional[ResourceReservation]:
         reservation = ResourceReservation(
-            reservation_id=f"res_{work_id}_{datetime.utcnow().timestamp()}",
+            reservation_id=f"res_{work_id}_{datetime.now(timezone.utc).timestamp()}",
             work_id=work_id, resources=resources,
-            reserved_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(seconds=duration_seconds),
+            reserved_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=duration_seconds),
             carbon_budget_kg=carbon_budget, helium_budget=helium_budget,
             ecoatp_budget=ecoatp_budget,
             carbon_price_at_reservation=carbon_price,
@@ -1258,26 +1215,28 @@ class ResourceReservationManager:
             self.total_ecoatp_allocated -= reservation.ecoatp_budget
 
 # ============================================================================
-# Enhanced Work Integrator (Main Class)
+# Enhanced Work Integrator (Main Class) – v7.0.0 with full bio‑inspired integration
 # ============================================================================
 class EnhancedWorkIntegrator:
     """
-    Enhanced Work Integrator v6.0.1 - Complete Green Agent Implementation
+    Enhanced Work Integrator v7.0.0 - Complete Green Agent Implementation with full bio‑inspired core integration.
     """
 
     def __init__(
         self,
+        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        config: Optional[Union[WorkIntegratorConfig, Dict[str, Any]]] = None,
         expert_router=None,
         meta_cognitive_module=None,
         neuro_symbolic_module=None,
         quantum_module=None,
-        config: Optional[WorkIntegratorConfig] = None,
         **kwargs
     ):
         """
         Initialize the integrator.
         Accepts either a `config` object or legacy keyword arguments for backward compatibility.
         """
+        # Load configuration
         if config is None:
             # Legacy mode: read from kwargs or defaults
             config = WorkIntegratorConfig(
@@ -1296,17 +1255,57 @@ class EnhancedWorkIntegrator:
                 enable_hybrid_pipeline=kwargs.get('enable_hybrid_pipeline', True),
                 enable_sustainability_dashboard=kwargs.get('enable_sustainability_dashboard', True),
                 enable_telemetry=kwargs.get('enable_telemetry', True),
+                enable_event_driven=kwargs.get('enable_event_driven', True),
+                enable_self_healing=kwargs.get('enable_self_healing', True),
+                enable_swarm_coordination=kwargs.get('enable_swarm_coordination', True),
+                enable_quantum_bridge=kwargs.get('enable_quantum_bridge', True),
+                enable_time_tick_engine=kwargs.get('enable_time_tick_engine', True),
                 carbon_api_region=kwargs.get('carbon_api_region', 'us-east'),
                 max_retries=kwargs.get('max_retries', 3),
-                persistence_storage_path=kwargs.get('persistence_storage_path', 'work_states')
+                persistence_storage_path=kwargs.get('persistence_storage_path', 'work_states'),
+                self_healing_enabled=kwargs.get('self_healing_enabled', True),
+                workflow_on_critical_alert=kwargs.get('workflow_on_critical_alert', 'adjust_work_policy'),
+                swarm_share_interval=kwargs.get('swarm_share_interval', 60)
             )
+        elif isinstance(config, dict):
+            config = WorkIntegratorConfig(**config)
         self.config = config
 
-        # Core modules
-        self.router = expert_router
-        self.meta_cognitive = meta_cognitive_module
-        self.neuro_symbolic = neuro_symbolic_module
-        self.quantum_module = quantum_module
+        # Store bio‑core reference
+        self.bio_core = bio_core
+        self.event_broker = None
+        self.alert_system = None
+        self.anomaly_detection = None
+        self.cost_benefit_engine = None
+        self.quantum_bridge = None
+        self.tick_engine = None
+        self.swarm_coordinator = None
+        self.self_healer = None
+        self.workflow_orchestrator = None
+        self.token_manager = None
+        self.gradient_manager = None
+        self.scheduler = None
+        self.compartment_manager = None
+        self.biomass_storage = None
+        self.harvester = None
+
+        # Extract core sub‑modules if available
+        if self.bio_core:
+            self.event_broker = getattr(self.bio_core, 'event_broker', None)
+            self.alert_system = getattr(self.bio_core, 'alert_system', None)
+            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
+            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
+            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
+            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
+            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
+            self.self_healer = getattr(self.bio_core, 'self_healer', None)
+            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
+            self.token_manager = getattr(self.bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(self.bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
+            self.harvester = getattr(self.bio_core, 'harvester', None)
 
         # Feature flags
         self.enable_batching = config.enable_batching
@@ -1324,14 +1323,17 @@ class EnhancedWorkIntegrator:
         self.enable_hybrid_pipeline = config.enable_hybrid_pipeline
         self.enable_sustainability_dashboard = config.enable_sustainability_dashboard
         self.enable_telemetry = config.enable_telemetry
+        self.enable_event_driven = config.enable_event_driven
+        self.enable_self_healing = config.enable_self_healing
+        self.enable_swarm_coordination = config.enable_swarm_coordination
+        self.enable_quantum_bridge = config.enable_quantum_bridge
+        self.enable_time_tick_engine = config.enable_time_tick_engine
 
-        # Bio-inspired modules
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
+        # Core modules
+        self.router = expert_router
+        self.meta_cognitive = meta_cognitive_module
+        self.neuro_symbolic = neuro_symbolic_module
+        self.quantum_module = quantum_module
 
         # Existing modules
         self.carbon_manager = CarbonIntensityManager(config) if self.enable_carbon_intensity else None
@@ -1340,10 +1342,18 @@ class EnhancedWorkIntegrator:
 
         # NEW modules
         self.state_persistence = StatePersistenceManager(config) if self.enable_state_persistence else None
+        self.system_persistence = SystemStatePersistence(config) if self.enable_state_persistence else None
         self.dynamic_pricing = DynamicTokenPricingManager(config, self.carbon_manager) if self.enable_dynamic_pricing else None
         self.hybrid_pipeline = QuantumClassicalHybridPipeline(config, quantum_module) if self.enable_hybrid_pipeline else None
         self.sustainability_dashboard = WorkSustainabilityDashboard() if self.enable_sustainability_dashboard else None
         self.telemetry = TelemetryCollector() if self.enable_telemetry else None
+
+        # Circuit breakers for external services
+        self._token_circuit = CircuitBreaker("token_service")
+        self._scheduler_circuit = CircuitBreaker("scheduler_service")
+        self._biomass_circuit = CircuitBreaker("biomass_storage")
+        self._compartment_circuit = CircuitBreaker("compartment_service")
+        self._carbon_circuit = CircuitBreaker("carbon_api")
 
         # Work management
         self.active_works: Dict[str, EnhancedWorkContext] = {}
@@ -1373,11 +1383,23 @@ class EnhancedWorkIntegrator:
             'hybrid_quantum_classical': self._hybrid_pipeline
         }
 
+        # Health status
+        self.health_status = "healthy"
+        self.last_error = None
+
+        # Subscribe to core events if enabled
+        if self.enable_event_driven and self.event_broker:
+            self._subscribe_events()
+
+        # Load system state from persistence
+        if self.enable_state_persistence and self.system_persistence:
+            self._load_system_state()
+
         # Start background tasks
         self._start_background_tasks()
 
         logger.info(
-            f"Enhanced Work Integrator v6.0.1 initialized: "
+            f"Enhanced Work Integrator v7.0.0 initialized: "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
             f"predictive={self.enable_predictive}, "
@@ -1385,209 +1407,139 @@ class EnhancedWorkIntegrator:
             f"dynamic_pricing={self.enable_dynamic_pricing}, "
             f"hybrid_pipeline={self.enable_hybrid_pipeline}, "
             f"sustainability_dashboard={self.enable_sustainability_dashboard}, "
-            f"telemetry={self.enable_telemetry}"
+            f"telemetry={self.enable_telemetry}, "
+            f"event_driven={self.enable_event_driven}, "
+            f"self_healing={self.enable_self_healing}, "
+            f"swarm_coordination={self.enable_swarm_coordination}, "
+            f"quantum_bridge={self.enable_quantum_bridge}, "
+            f"time_tick_engine={self.enable_time_tick_engine}"
         )
 
-    def _start_background_tasks(self):
-        asyncio.create_task(self._cleanup_loop())
-        asyncio.create_task(self._sla_monitor_loop())
-        if self.enable_bio_integration:
-            asyncio.create_task(self._biomass_mobilization_loop())
-            asyncio.create_task(self._token_expiration_loop())
-        if self.enable_carbon_intensity:
-            asyncio.create_task(self._carbon_update_loop())
-        if self.enable_state_persistence:
-            asyncio.create_task(self._persistence_cleanup_loop())
-        if self.enable_sustainability_dashboard:
-            asyncio.create_task(self._dashboard_update_loop())
-        if self.enable_telemetry:
-            asyncio.create_task(self._telemetry_export_loop())
+    # ============================================================================
+    # Event Subscriptions
+    # ============================================================================
+    def _subscribe_events(self):
+        if self.event_broker:
+            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
+            self.event_broker.subscribe('helium_update', self._on_helium_update)
+            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
+            self.event_broker.subscribe('config_updated', self._on_config_updated)
+            self.event_broker.subscribe('token_balance_update', self._on_token_update)
+            self.event_broker.subscribe('health_update', self._on_health_update)
+            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
+            logger.info("WorkIntegrator subscribed to core events")
 
-    # ========================================================================
-    # Background Loops (Enhanced)
-    # ========================================================================
+    async def _on_carbon_update(self, event: BioEvent):
+        intensity = event.data.get('intensity', 400)
+        price = event.data.get('price', 50.0)
+        self.carbon_intensity = intensity
+        self.carbon_price = price
+        # Update dynamic pricing
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            await self.dynamic_pricing.update_scarcity('carbon', intensity / 800)
+        # Adjust work priorities based on carbon
+        for work in self.active_works.values():
+            if work.meta_cognitive_state is not None:
+                work.meta_cognitive_state['carbon_intensity'] = intensity
+                work.meta_cognitive_state['carbon_price'] = price
 
-    async def _biomass_mobilization_loop(self):
-        while True:
-            try:
-                if not self.enable_bio_integration or not self.biomass_storage:
-                    await asyncio.sleep(60); continue
-                mobilize = False
-                if self.gradient_manager:
-                    carbon = self.gradient_manager.fields.get('carbon')
-                    if carbon and carbon.gradient_strength < 0.3:
-                        mobilize = True
-                if mobilize:
-                    stats = self.biomass_storage.get_storage_stats()
-                    glycogen_count = stats.get('tiers', {}).get('glycogen_queue', 0)
-                    if glycogen_count > 0:
-                        mobilized = min(10, glycogen_count)
-                        logger.info(f"Mobilizing {mobilized} tasks from biomass storage")
-                        self.biomass_mobilized_count += mobilized
-                        if self.enable_telemetry:
-                            self.telemetry.increment('biomass_mobilized', value=mobilized)
-                await asyncio.sleep(30)
-            except Exception as e:
-                logger.error(f"Biomass mobilization error: {str(e)}")
-                await asyncio.sleep(60)
+    async def _on_helium_update(self, event: BioEvent):
+        scarcity = event.data.get('scarcity', 0.5)
+        price = event.data.get('price', 0.5)
+        self.helium_scarcity = scarcity
+        self.helium_price = price
+        if self.enable_dynamic_pricing and self.dynamic_pricing:
+            await self.dynamic_pricing.update_scarcity('helium', scarcity)
+        for work in self.active_works.values():
+            work.helium_dependency = scarcity
 
-    async def _token_expiration_loop(self):
-        while True:
-            try:
-                if not self.enable_bio_integration or not self.token_manager:
-                    await asyncio.sleep(300); continue
-                now = datetime.utcnow()
-                for work_id, work in list(self.active_works.items()):
-                    if work.tokens_allocated > 0 and work.state == WorkState.TOKENS_ALLOCATED:
-                        if work.started_at is None:
-                            wait_time = (now - work.created_at).total_seconds()
-                            if wait_time > 3600:
-                                logger.warning(f"Work {work_id} token timeout - recovering tokens")
-                                recovered = self._recover_tokens_on_failure(work_id, 0.1)
-                                work.tokens_recovered = recovered
-                                work.tokens_allocated = 0
-                                work.transition_to(WorkState.FAILED)
-                                if self.enable_telemetry:
-                                    self.telemetry.increment('token_expirations')
-                await asyncio.sleep(300)
-            except Exception as e:
-                logger.error(f"Token expiration error: {str(e)}")
-                await asyncio.sleep(600)
+    async def _on_alert_generated(self, event: BioEvent):
+        if event.data.get('severity') == 'critical':
+            logger.warning("Critical alert received; switching to conservative pipeline and triggering healing")
+            self.pipeline_preference = 'bio_optimized'
+            if self.enable_self_healing and self.self_healer:
+                await self.self_healer.apply_healing('damage_accumulation')
+            if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
+                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_alert)
 
-    async def _carbon_update_loop(self):
-        while True:
-            try:
-                await self.carbon_manager.update_carbon_intensity()
-                if self.enable_telemetry:
-                    intensity = await self.carbon_manager.get_current_intensity()
-                    self.telemetry.gauge('carbon_intensity', intensity)
-                    price = await self.carbon_manager.get_current_price()
-                    self.telemetry.gauge('carbon_price_usd', price)
-                await asyncio.sleep(self.config.carbon_update_interval)
-            except Exception as e:
-                logger.error(f"Carbon update error: {str(e)}")
-                await asyncio.sleep(60)
+    async def _on_config_updated(self, event: BioEvent):
+        updates = event.data.get('updates', {})
+        if 'work_integrator' in updates:
+            new_config = updates['work_integrator']
+            for key, value in new_config.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+            logger.info("WorkIntegrator configuration reloaded")
 
-    async def _sla_monitor_loop(self):
-        while True:
-            try:
-                if not self.enable_sla_tracking:
-                    await asyncio.sleep(60); continue
-                for work_id, work in list(self.active_works.items()):
-                    if work.sla and work.sla.deadline:
-                        remaining = work.sla.time_until_deadline()
-                        if remaining is not None and remaining <= 0:
-                            logger.warning(f"SLA deadline exceeded for {work_id}")
-                            self._record_sla_violation(work, float('inf'))
-                        elif remaining is not None and remaining < 30:
-                            work.priority = WorkPriority.CRITICAL
-                            if work.sla:
-                                work.sla.update_health(0.8)
-                await asyncio.sleep(5)
-            except Exception as e:
-                logger.error(f"SLA monitor error: {str(e)}")
-                await asyncio.sleep(30)
+    async def _on_token_update(self, event: BioEvent):
+        self.token_balance = event.data.get('balance', 500)
 
-    async def _cleanup_loop(self):
-        while True:
-            try:
-                now = datetime.utcnow()
-                max_age = timedelta(hours=24)
-                for wid in [wid for wid, work in self.completed_works.items()
-                           if now - datetime.fromisoformat(work['timestamp']) > max_age]:
-                    del self.completed_works[wid]
-                for wid in [wid for wid, work in self.failed_works.items()
-                           if now - datetime.fromisoformat(work['timestamp']) > max_age]:
-                    del self.failed_works[wid]
-                await asyncio.sleep(300)
-            except Exception as e:
-                logger.error(f"Cleanup error: {str(e)}")
-                await asyncio.sleep(60)
+    async def _on_health_update(self, event: BioEvent):
+        self.health_status = event.data.get('status', 'healthy')
 
-    async def _persistence_cleanup_loop(self):
-        while True:
-            try:
-                if not self.enable_state_persistence or not self.state_persistence:
-                    await asyncio.sleep(3600); continue
-                # Could implement periodic cleanup of old state files
-                await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error(f"Persistence cleanup error: {str(e)}")
-                await asyncio.sleep(600)
+    async def _on_anomaly_detected(self, event: BioEvent):
+        if event.data.get('metric') == 'carbon_intensity':
+            logger.info("Carbon anomaly detected; adjusting pricing")
+            if self.enable_dynamic_pricing and self.dynamic_pricing:
+                await self.dynamic_pricing.update_scarcity('carbon', 1.2)
 
-    async def _dashboard_update_loop(self):
-        while True:
-            try:
-                if self.enable_sustainability_dashboard and self.sustainability_dashboard:
-                    for work_id, work in list(self.completed_works.items())[-10:]:
-                        metrics = {
-                            'sustainability_score': work.get('sustainability_score', 0.5),
-                            'carbon_intensity': work.get('carbon_intensity', 400),
-                            'helium_usage': work.get('helium_usage', 0.5),
-                            'token_efficiency': work.get('token_efficiency', 0.5),
-                            'success_rate': 1.0 if work.get('success', False) else 0.0
-                        }
-                        await self.sustainability_dashboard.update_metrics(work_id, metrics)
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"Dashboard update error: {str(e)}")
-                await asyncio.sleep(120)
+    # ============================================================================
+    # System State Persistence
+    # ============================================================================
+    def _save_system_state(self):
+        state = {
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'total_helium_savings_l': self.total_helium_savings_l,
+            'biomass_mobilized_count': self.biomass_mobilized_count,
+            'sla_violations': self.sla_violations,
+            'workflow_dag': nx.readwrite.json_graph.node_link_data(self.workflow_dag) if self.workflow_dag else {},
+            'health_status': self.health_status,
+            'last_error': self.last_error,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        if self.enable_state_persistence and self.system_persistence:
+            asyncio.create_task(self.system_persistence.save(state))
 
-    async def _telemetry_export_loop(self):
-        while True:
-            try:
-                if self.enable_telemetry and self.telemetry:
-                    # Export metrics periodically (e.g., to a file or via HTTP)
-                    # For now, just log a summary
-                    logger.debug("Telemetry export (simulated)")
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"Telemetry export error: {str(e)}")
-                await asyncio.sleep(120)
+    def _load_system_state(self):
+        if self.system_persistence:
+            state = asyncio.run(self.system_persistence.load())
+            if state:
+                self.sustainability_score = state.get('sustainability_score', 0.0)
+                self.total_carbon_savings_kg = state.get('total_carbon_savings_kg', 0.0)
+                self.total_helium_savings_l = state.get('total_helium_savings_l', 0.0)
+                self.biomass_mobilized_count = state.get('biomass_mobilized_count', 0)
+                self.sla_violations = state.get('sla_violations', [])
+                graph_data = state.get('workflow_dag', {})
+                if graph_data:
+                    self.workflow_dag = nx.readwrite.json_graph.node_link_graph(graph_data)
+                self.health_status = state.get('health_status', 'healthy')
+                self.last_error = state.get('last_error', None)
+                logger.info("System state loaded from persistence")
 
-    # ========================================================================
-    # Bio-Inspired Module Injection (unchanged)
-    # ========================================================================
-
-    def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
-            self.enable_bio_integration = True
-
-    # ========================================================================
-    # Bio-Inspired Methods (Enhanced)
-    # ========================================================================
-
+    # ============================================================================
+    # Bio-Inspired Methods (Enhanced with circuit breakers)
+    # ============================================================================
     async def _allocate_ecoatp_for_work(self, work_id: str, ecoatp_required: float, priority: int = 0) -> Tuple[bool, float]:
         if not self.token_manager:
             return True, 0.0
-
         if self.enable_dynamic_pricing and self.dynamic_pricing:
             price = await self.dynamic_pricing.get_price(
                 WorkPriority(priority) if priority < len(WorkPriority) else WorkPriority.MEDIUM
             )
             ecoatp_required *= price
-
         if self.scheduler:
-            success = self.scheduler.schedule_execution(task_id=work_id, eco_atp_required=ecoatp_required, priority=priority)
+            success = await self._scheduler_circuit.call(
+                self.scheduler.schedule_execution,
+                task_id=work_id,
+                eco_atp_required=ecoatp_required,
+                priority=priority
+            )
             if success:
                 return True, ecoatp_required
-
         account_id = f"work_{work_id}"
-        success, token_ids = self.token_manager.reserve_tokens(
+        success, token_ids = await self._token_circuit.call(
+            self.token_manager.reserve_tokens,
             account_id=account_id,
             amount=ecoatp_required,
             consumer=EcoATPConsumer.EXPERT_EXECUTION
@@ -1649,10 +1601,9 @@ class EnhancedWorkIntegrator:
         base_cost *= (1.0 + data_size / 1000.0)
         return base_cost
 
-    # ========================================================================
-    # Primary Work Processing (Enhanced)
-    # ========================================================================
-
+    # ============================================================================
+    # Primary Work Processing (Enhanced with event triggers and circuit breakers)
+    # ============================================================================
     async def process_work(
         self,
         work_request: Dict[str, Any],
@@ -1663,7 +1614,7 @@ class EnhancedWorkIntegrator:
         # Create context
         context = self._create_work_context(work_request, tenant_id)
 
-        # Update carbon intensity
+        # Update carbon intensity from event or fallback
         if self.enable_carbon_intensity:
             carbon_data = await self.carbon_manager.update_carbon_intensity()
             context.meta_cognitive_state['carbon_intensity'] = carbon_data.get('intensity', 400)
@@ -1671,7 +1622,6 @@ class EnhancedWorkIntegrator:
 
         # Get dynamic pricing
         if self.enable_dynamic_pricing and self.dynamic_pricing:
-            # Use real-time carbon intensity
             carbon_intensity = context.meta_cognitive_state.get('carbon_intensity', 400)
             context.dynamic_token_price = await self.dynamic_pricing.get_price(
                 context.priority,
@@ -1679,7 +1629,6 @@ class EnhancedWorkIntegrator:
                 carbon_intensity=carbon_intensity,
                 helium_scarcity=context.helium_dependency
             )
-            # Update scarcity factors
             await self.dynamic_pricing.update_scarcity('carbon', context.carbon_zone / 10)
             await self.dynamic_pricing.update_scarcity('helium', context.helium_dependency)
 
@@ -1743,7 +1692,7 @@ class EnhancedWorkIntegrator:
         if not context.transition_to(WorkState.EXECUTING):
             return self._create_error_response(context, "Cannot start execution")
 
-        context.started_at = datetime.utcnow()
+        context.started_at = datetime.now(timezone.utc)
         context.execution_attempts += 1
         self.active_works[context.task_id] = context
 
@@ -1770,7 +1719,7 @@ class EnhancedWorkIntegrator:
 
             # Complete work
             context.transition_to(WorkState.COMPLETED)
-            context.completed_at = datetime.utcnow()
+            context.completed_at = datetime.now(timezone.utc)
             self.workflow_dag.nodes[context.task_id]['completed'] = True
 
             # Calculate sustainability metrics
@@ -1822,7 +1771,7 @@ class EnhancedWorkIntegrator:
             result['carbon_savings_kg'] = carbon_savings
             self.completed_works[context.task_id] = {
                 'context': context, 'result': result,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'sustainability_score': context.sustainability_score,
                 'carbon_savings_kg': carbon_savings
             }
@@ -1856,6 +1805,9 @@ class EnhancedWorkIntegrator:
             if self.enable_state_persistence and self.state_persistence:
                 await self.state_persistence.delete_work_state(context.task_id)
 
+            # Save system state periodically
+            self._save_system_state()
+
             return result
 
         except Exception as e:
@@ -1876,7 +1828,7 @@ class EnhancedWorkIntegrator:
 
             self.failed_works[context.task_id] = {
                 'context': context, 'error': str(e),
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
             return self._create_error_response(context, str(e))
 
@@ -1890,34 +1842,28 @@ class EnhancedWorkIntegrator:
         price_factor = 1.0
         if self.enable_dynamic_pricing and self.dynamic_pricing:
             price_factor = 1.0 / (1.0 + context.dynamic_token_price * 0.1)
-
         score = (carbon_factor * 0.25 + token_efficiency * 0.25 + success_factor * 0.3 + price_factor * 0.2)
         return min(1.0, max(0.0, score))
 
-    # ========================================================================
-    # Pipelines (Enhanced)
-    # ========================================================================
-
+    # ============================================================================
+    # Pipelines (unchanged)
+    # ============================================================================
     async def _standard_pipeline(self, context: EnhancedWorkContext) -> Dict[str, Any]:
+        # ... (same as before, omitted for brevity) ...
         if self.meta_cognitive:
             context = await self._apply_meta_cognition(context)
-
         symbolic_constraints = None
         if self.neuro_symbolic:
             symbolic_constraints = await self._extract_symbolic_constraints(context)
-
         dual_axis_context = self._build_dual_axis_context(context)
-
         if self.enable_bio_integration and self.gradient_manager:
             dual_axis_context['gradient_levels'] = self.gradient_manager.get_field_strengths()
-
         routing_result = self.router.route_and_execute(
             workload_profile=context.to_routing_context(),
             meta_cognitive_state=context.meta_cognitive_state,
             dual_axis_context=dual_axis_context,
             symbolic_constraints=symbolic_constraints
         )
-
         result = self._post_process_result(routing_result, context)
         result['work_metadata'] = {
             'task_id': context.task_id, 'work_type': context.work_type,
@@ -1984,11 +1930,11 @@ class EnhancedWorkIntegrator:
         await self._create_checkpoint(context, result)
         return result
 
-    # ========================================================================
-    # Helper Methods (Enhanced)
-    # ========================================================================
-
+    # ============================================================================
+    # Helper Methods (unchanged, but with added event publishing)
+    # ============================================================================
     async def _apply_meta_cognition(self, context: EnhancedWorkContext) -> EnhancedWorkContext:
+        # ... (same as before) ...
         if not self.meta_cognitive:
             return context
         try:
@@ -2051,7 +1997,7 @@ class EnhancedWorkIntegrator:
         if not self.enable_checkpointing:
             return
         checkpoint = WorkCheckpoint(
-            checkpoint_id=f"ckpt_{context.task_id}_{datetime.utcnow().timestamp()}",
+            checkpoint_id=f"ckpt_{context.task_id}_{datetime.now(timezone.utc).timestamp()}",
             work_id=context.task_id,
             state=context.state,
             progress=0.5,
@@ -2067,7 +2013,6 @@ class EnhancedWorkIntegrator:
         context.add_checkpoint(checkpoint)
         if context.state == WorkState.EXECUTING:
             context.transition_to(WorkState.CHECKPOINTED)
-
         if self.enable_state_persistence and self.state_persistence:
             await self.state_persistence.save_work_state(context)
 
@@ -2128,7 +2073,7 @@ class EnhancedWorkIntegrator:
 
     def _update_work_metrics(self, task_id: str, result: Dict[str, Any]):
         self.work_metrics[task_id].append({
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'success': result.get('success', False),
             'action': result.get('final_plan', {}).get('action', 'unknown'),
             'execution_time': result.get('execution_time_ms', 0)
@@ -2140,17 +2085,230 @@ class EnhancedWorkIntegrator:
             'sla_level': context.sla.level.value,
             'max_latency_ms': context.sla.max_latency_ms,
             'actual_latency_ms': actual_latency_ms,
-            'violated_at': datetime.utcnow().isoformat(),
+            'violated_at': datetime.now(timezone.utc).isoformat(),
             'tenant_id': context.tenant_id
         }
         self.sla_violations.append(violation)
         context.sla.violations += 1
         context.sla.update_health(0.9)
 
-    # ========================================================================
-    # Statistics (Enhanced)
-    # ========================================================================
+    # ============================================================================
+    # Self-Healing
+    # ============================================================================
+    async def self_heal(self):
+        logger.info("EnhancedWorkIntegrator self‑healing")
+        if self.config.self_healing_enabled:
+            # Reset system state
+            self.sustainability_score = 0.0
+            self.total_carbon_savings_kg = 0.0
+            self.total_helium_savings_l = 0.0
+            self.biomass_mobilized_count = 0
+            self.sla_violations.clear()
+            self.health_status = "healthy"
+            self.last_error = None
+            # Reset pipeline preference
+            self.pipeline_preference = 'standard'
+            # Clear stuck works
+            for work_id in list(self.active_works.keys()):
+                if self.active_works[work_id].state in [WorkState.EXECUTING, WorkState.CHECKPOINTED]:
+                    self.active_works[work_id].transition_to(WorkState.FAILED)
+            # Save system state
+            self._save_system_state()
+            logger.info("Self-healing completed")
 
+    # ============================================================================
+    # Swarm Coordination
+    # ============================================================================
+    async def share_with_swarm(self):
+        if not self.enable_swarm_coordination or not self.swarm_coordinator:
+            return
+        swarm_payload = {
+            'expert_id': 'work_integrator',
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'active_works': len(self.active_works),
+            'success_rate': len(self.completed_works) / max(len(self.completed_works) + len(self.failed_works), 1),
+            'sla_violations': len(self.sla_violations),
+            'pipeline_distribution': {
+                pipeline: sum(1 for w in self.completed_works.values()
+                            if w['result'].get('pipeline_type') == pipeline)
+                for pipeline in self.pipelines.keys()
+            }
+        }
+        await self.swarm_coordinator.share_predictions(swarm_payload)
+
+    async def _swarm_update_loop(self):
+        while True:
+            try:
+                await self.share_with_swarm()
+                await asyncio.sleep(self.config.swarm_share_interval)
+            except Exception as e:
+                logger.error(f"Swarm update error: {str(e)}")
+                await asyncio.sleep(60)
+
+    # ============================================================================
+    # Background Loops (unchanged, but we add the swarm loop)
+    # ============================================================================
+    def _start_background_tasks(self):
+        # ... (existing loops) ...
+        asyncio.create_task(self._cleanup_loop())
+        asyncio.create_task(self._sla_monitor_loop())
+        if self.enable_bio_integration:
+            asyncio.create_task(self._biomass_mobilization_loop())
+            asyncio.create_task(self._token_expiration_loop())
+        if self.enable_carbon_intensity:
+            asyncio.create_task(self._carbon_update_loop())
+        if self.enable_state_persistence:
+            asyncio.create_task(self._persistence_cleanup_loop())
+        if self.enable_sustainability_dashboard:
+            asyncio.create_task(self._dashboard_update_loop())
+        if self.enable_telemetry:
+            asyncio.create_task(self._telemetry_export_loop())
+        if self.enable_swarm_coordination and self.swarm_coordinator:
+            asyncio.create_task(self._swarm_update_loop())
+
+    async def _biomass_mobilization_loop(self):
+        # ... (same as before) ...
+        while True:
+            try:
+                if not self.enable_bio_integration or not self.biomass_storage:
+                    await asyncio.sleep(60); continue
+                mobilize = False
+                if self.gradient_manager:
+                    carbon = self.gradient_manager.fields.get('carbon')
+                    if carbon and carbon.gradient_strength < 0.3:
+                        mobilize = True
+                if mobilize:
+                    stats = self.biomass_storage.get_storage_stats()
+                    glycogen_count = stats.get('tiers', {}).get('glycogen_queue', 0)
+                    if glycogen_count > 0:
+                        mobilized = min(10, glycogen_count)
+                        logger.info(f"Mobilizing {mobilized} tasks from biomass storage")
+                        self.biomass_mobilized_count += mobilized
+                        if self.enable_telemetry:
+                            self.telemetry.increment('biomass_mobilized', value=mobilized)
+                await asyncio.sleep(30)
+            except Exception as e:
+                logger.error(f"Biomass mobilization error: {str(e)}")
+                await asyncio.sleep(60)
+
+    async def _token_expiration_loop(self):
+        # ... (same as before) ...
+        while True:
+            try:
+                if not self.enable_bio_integration or not self.token_manager:
+                    await asyncio.sleep(300); continue
+                now = datetime.now(timezone.utc)
+                for work_id, work in list(self.active_works.items()):
+                    if work.tokens_allocated > 0 and work.state == WorkState.TOKENS_ALLOCATED:
+                        if work.started_at is None:
+                            wait_time = (now - work.created_at).total_seconds()
+                            if wait_time > 3600:
+                                logger.warning(f"Work {work_id} token timeout - recovering tokens")
+                                recovered = self._recover_tokens_on_failure(work_id, 0.1)
+                                work.tokens_recovered = recovered
+                                work.tokens_allocated = 0
+                                work.transition_to(WorkState.FAILED)
+                                if self.enable_telemetry:
+                                    self.telemetry.increment('token_expirations')
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Token expiration error: {str(e)}")
+                await asyncio.sleep(600)
+
+    async def _carbon_update_loop(self):
+        while True:
+            try:
+                await self.carbon_manager.update_carbon_intensity()
+                if self.enable_telemetry:
+                    intensity = await self.carbon_manager.get_current_intensity()
+                    self.telemetry.gauge('carbon_intensity', intensity)
+                    price = await self.carbon_manager.get_current_price()
+                    self.telemetry.gauge('carbon_price_usd', price)
+                await asyncio.sleep(self.config.carbon_update_interval)
+            except Exception as e:
+                logger.error(f"Carbon update error: {str(e)}")
+                await asyncio.sleep(60)
+
+    async def _sla_monitor_loop(self):
+        while True:
+            try:
+                if not self.enable_sla_tracking:
+                    await asyncio.sleep(60); continue
+                for work_id, work in list(self.active_works.items()):
+                    if work.sla and work.sla.deadline:
+                        remaining = work.sla.time_until_deadline()
+                        if remaining is not None and remaining <= 0:
+                            logger.warning(f"SLA deadline exceeded for {work_id}")
+                            self._record_sla_violation(work, float('inf'))
+                        elif remaining is not None and remaining < 30:
+                            work.priority = WorkPriority.CRITICAL
+                            if work.sla:
+                                work.sla.update_health(0.8)
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"SLA monitor error: {str(e)}")
+                await asyncio.sleep(30)
+
+    async def _cleanup_loop(self):
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                max_age = timedelta(hours=24)
+                for wid in [wid for wid, work in self.completed_works.items()
+                           if now - datetime.fromisoformat(work['timestamp']) > max_age]:
+                    del self.completed_works[wid]
+                for wid in [wid for wid, work in self.failed_works.items()
+                           if now - datetime.fromisoformat(work['timestamp']) > max_age]:
+                    del self.failed_works[wid]
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Cleanup error: {str(e)}")
+                await asyncio.sleep(60)
+
+    async def _persistence_cleanup_loop(self):
+        while True:
+            try:
+                if not self.enable_state_persistence or not self.state_persistence:
+                    await asyncio.sleep(3600); continue
+                # Could implement periodic cleanup of old state files
+                await asyncio.sleep(3600)
+            except Exception as e:
+                logger.error(f"Persistence cleanup error: {str(e)}")
+                await asyncio.sleep(600)
+
+    async def _dashboard_update_loop(self):
+        while True:
+            try:
+                if self.enable_sustainability_dashboard and self.sustainability_dashboard:
+                    for work_id, work in list(self.completed_works.items())[-10:]:
+                        metrics = {
+                            'sustainability_score': work.get('sustainability_score', 0.5),
+                            'carbon_intensity': work.get('carbon_intensity', 400),
+                            'helium_usage': work.get('helium_usage', 0.5),
+                            'token_efficiency': work.get('token_efficiency', 0.5),
+                            'success_rate': 1.0 if work.get('success', False) else 0.0
+                        }
+                        await self.sustainability_dashboard.update_metrics(work_id, metrics)
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Dashboard update error: {str(e)}")
+                await asyncio.sleep(120)
+
+    async def _telemetry_export_loop(self):
+        while True:
+            try:
+                if self.enable_telemetry and self.telemetry:
+                    # Export metrics periodically (e.g., to a file or via HTTP)
+                    logger.debug("Telemetry export (simulated)")
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Telemetry export error: {str(e)}")
+                await asyncio.sleep(120)
+
+    # ============================================================================
+    # Statistics (Enhanced)
+    # ============================================================================
     def get_work_statistics(self) -> Dict[str, Any]:
         stats = {
             'total_works': len(self.completed_works) + len(self.failed_works) + len(self.active_works),
@@ -2169,6 +2327,9 @@ class EnhancedWorkIntegrator:
             'hybrid_pipeline_active': self.enable_hybrid_pipeline,
             'sustainability_dashboard_active': self.enable_sustainability_dashboard,
             'telemetry_active': self.enable_telemetry,
+            'event_driven_active': self.enable_event_driven,
+            'self_healing_active': self.enable_self_healing,
+            'swarm_coordination_active': self.enable_swarm_coordination,
             'biomass_mobilized': self.biomass_mobilized_count,
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
             'sustainability_score': self.sustainability_score,
@@ -2226,7 +2387,7 @@ class EnhancedWorkIntegrator:
 
     def get_sustainability_report(self) -> Dict[str, Any]:
         report = {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'sustainability_score': self.sustainability_score,
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
             'total_helium_savings_l': self.total_helium_savings_l,
@@ -2266,8 +2427,32 @@ class EnhancedWorkIntegrator:
 
         return recommendations or ["Work integration sustainability is on track"]
 
+    def get_health_status(self) -> Dict[str, Any]:
+        return {
+            'status': self.health_status,
+            'last_error': self.last_error,
+            'active_works': len(self.active_works),
+            'bio_integration_active': self.enable_bio_integration,
+            'event_driven_active': self.enable_event_driven,
+            'self_healing_enabled': self.enable_self_healing,
+            'persistence_enabled': self.enable_state_persistence,
+            'swarm_coordination_active': self.enable_swarm_coordination,
+        }
+
+    # ============================================================================
+    # Shutdown
+    # ============================================================================
     async def shutdown(self):
         logger.info("Shutting down Enhanced Work Integrator")
+        # Save system state
+        self._save_system_state()
         if self.enable_carbon_intensity:
             await self.carbon_manager.close()
+        if self.enable_bio_integration and self.scheduler and hasattr(self.scheduler, 'shutdown'):
+            await self.scheduler.shutdown()
+        if self.enable_bio_integration and self.biomass_storage and hasattr(self.biomass_storage, 'shutdown'):
+            await self.biomass_storage.shutdown()
+        if self.enable_state_persistence and self.state_persistence:
+            # Clean up any pending state saves
+            pass
         logger.info("Shutdown complete")
