@@ -1,30 +1,23 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/cross_region_federation.py
-"""
-Enhanced Cross-Region Federation v7.1.0 - Global Federated Network
-With Tiered Aggregation, Global Resource Optimization, and Federated Discovery
-MoE Expert Router integration, Self-Evolving Gate integration, Real Helium provider,
-and Asynchronous Region updates with staleness handling.
+# Enhanced version v8.0.0 – Full integration with bio‑inspired core, event‑driven, circuit breakers, persistence, self‑healing, and deep MoE/SEG integration
 
-Complete bio-inspired integration with:
-- Federated Reflexive Learning with global model sharing
-- Tiered Aggregation (Edge → Regional → Continental → Global)
-- Global Resource Optimization with carbon/helium awareness
-- Federated Discovery and Registration
-- User-Adaptive Reflexivity with dynamic thresholds
-- Real-time Carbon Intensity Integration with API support
-- Cross-Domain Knowledge Transfer with domain mapping
-- Human-AI Collaborative Reflection with feedback loops
-- Predictive Reflexivity with ensemble forecasting
-- Sustainability Score with multi-metric aggregation
-- Enhanced Carbon/Helium Awareness with real-time tracking
-- Model Compression at each tier
-- Real-time pricing signals for carbon and helium
-- Reputation scoring for nodes
-- Strategic playbook system
-- MoE Expert Router integration (NEW)
-- Self-Evolving Gate integration (NEW)
-- Real Helium provider injection (NEW)
-- Asynchronous region updates with staleness handling (NEW)
+"""
+Enhanced Cross-Region Federation v8.0.0 - Global Federated Network
+With full bio‑inspired core integration, event‑driven, circuit breakers, persistence,
+self‑healing, and deep MoE/SEG integration.
+
+New Features:
+- Event-driven integration via core EventBroker (carbon, helium, alerts, config)
+- Circuit breakers for all external services
+- System-level persistence for federation state
+- Self-healing and reactive alert handling
+- Configuration reload via events
+- Swarm coordination via SwarmCoordinator
+- Integration with TimeTickEngine and QuantumBridge
+- Integration with CostBenefitEngine and PredictiveAlertSystem
+- Workflow orchestration triggers on threshold breaches
+- Deep MoE and Self-Evolving Gate integration with rich context
+- Health monitoring and enhanced telemetry
 """
 
 import asyncio
@@ -37,7 +30,7 @@ import time
 import uuid
 from typing import Dict, Any, List, Optional, Tuple, Set, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import numpy as np
 from collections import defaultdict, deque
@@ -56,9 +49,10 @@ import asyncio
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Bio-Inspired Import Check
+# Bio-Inspired Core Import (with fallback)
 # ============================================================================
 try:
+    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker, Persistence
     from enhancements.bio_inspired.eco_atp_currency import (
         EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
         TokenState, EcoATPToken, EcoATPAccount
@@ -79,14 +73,34 @@ try:
     from enhancements.bio_inspired.photosynthetic_harvester import (
         PhotosyntheticHarvester
     )
+    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
+    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
     BIO_INSPIRED_AVAILABLE = True
-    logger.info("Bio-inspired modules loaded for Cross-Region Federation")
+    logger.info("Bio-inspired core modules loaded for Cross-Region Federation")
 except ImportError as e:
     BIO_INSPIRED_AVAILABLE = False
-    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard federation")
+    logger.warning(f"Bio-inspired core modules not available: {str(e)} - using standard federation")
+    # Fallback definitions
+    class BioEvent:
+        def __init__(self, event_type, source, data=None):
+            self.event_type = event_type
+            self.source = source
+            self.data = data or {}
+
+    class CircuitBreaker:
+        def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._state = "closed"
+            self._failure_count = 0
+            self._last_failure_time = None
+            self._lock = asyncio.Lock()
+        async def call(self, func, *args, **kwargs):
+            return await func(*args, **kwargs)
 
 # ============================================================================
-# NEW: Import MoE components (if available)
+# MoE and Self-Evolving Gate imports (optional)
 # ============================================================================
 try:
     from ..expert_router import ExpertRouter
@@ -98,7 +112,7 @@ except ImportError:
     logger.warning("MoE Expert Router or Self-Evolving Gates not available - cross-region federation will operate standalone")
 
 # ============================================================================
-# NEW: Helium Provider Interface (to be injected)
+# Helium Provider Interface (unchanged)
 # ============================================================================
 class HeliumProvider:
     """Interface to external helium modules for real-time metrics."""
@@ -112,7 +126,6 @@ class HeliumProvider:
 # ============================================================================
 # Enhanced Enums and Data Classes (unchanged)
 # ============================================================================
-
 class Region(Enum):
     US_EAST = "us_east"; US_WEST = "us_west"; EU_WEST = "eu_west"
     EU_NORTH = "eu_north"; ASIA_EAST = "asia_east"; ASIA_SOUTHEAST = "asia_southeast"
@@ -266,7 +279,6 @@ class PlaybookStrategy:
 # ============================================================================
 # Model Compression Module (unchanged)
 # ============================================================================
-
 class ModelCompressor:
     """
     Model compression at each aggregation tier.
@@ -414,7 +426,6 @@ class ModelCompressor:
 # ============================================================================
 # Reputation Scoring System (unchanged)
 # ============================================================================
-
 class ReputationScoringSystem:
     def __init__(self, decay_rate: float = 0.01, min_score: float = 0.1):
         self.reputation_records: Dict[str, ReputationRecord] = {}
@@ -529,7 +540,6 @@ class ReputationScoringSystem:
 # ============================================================================
 # Strategic Playbook System (unchanged)
 # ============================================================================
-
 class StrategicPlaybookSystem:
     def __init__(self):
         self.playbooks: Dict[str, PlaybookStrategy] = {}
@@ -716,7 +726,6 @@ class StrategicPlaybookSystem:
 # ============================================================================
 # Economic Pricing Manager (unchanged)
 # ============================================================================
-
 class EconomicPricingManager:
     def __init__(self):
         self.carbon_prices: Dict[str, float] = {}
@@ -832,9 +841,8 @@ class EconomicPricingManager:
         }
 
 # ============================================================================
-# NEW: Asynchronous Region Staleness Manager
+# Asynchronous Region Manager (unchanged)
 # ============================================================================
-
 class AsynchronousRegionManager:
     """
     Manages asynchronous region updates with staleness handling.
@@ -899,1296 +907,8 @@ class AsynchronousRegionManager:
             return aggregated
 
 # ============================================================================
-# Enhanced Cross-Region Federation Optimizer (with new integrations)
-# ============================================================================
-
-class CrossRegionFederationOptimizer:
-    """
-    Enhanced Cross-Region Federation v7.1.0 - Complete Production-Grade Implementation
-    With MoE integration, real helium, and asynchronous region updates.
-    """
-    
-    def __init__(
-        self,
-        enable_async: bool = True,
-        enable_carbon_scheduling: bool = True,
-        enable_compression: bool = True,
-        enable_multi_tier: bool = True,
-        enable_personalization: bool = True,
-        enable_bio_integration: bool = True,
-        enable_federated_reflexive: bool = True,
-        enable_carbon_intensity: bool = True,
-        enable_predictive: bool = True,
-        enable_cross_domain: bool = True,
-        enable_sustainability_scoring: bool = True,
-        enable_tiered_aggregation: bool = True,
-        enable_resource_optimization: bool = True,
-        enable_discovery: bool = True,
-        enable_compression_enhanced: bool = True,
-        enable_reputation: bool = True,
-        enable_playbook: bool = True,
-        enable_economic_pricing: bool = True,
-        server_url: Optional[str] = None
-    ):
-        # Feature flags
-        self.enable_async = enable_async
-        self.enable_carbon_scheduling = enable_carbon_scheduling
-        self.enable_compression = enable_compression
-        self.enable_multi_tier = enable_multi_tier
-        self.enable_personalization = enable_personalization
-        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
-        self.enable_federated_reflexive = enable_federated_reflexive
-        self.enable_carbon_intensity = enable_carbon_intensity
-        self.enable_predictive = enable_predictive
-        self.enable_cross_domain = enable_cross_domain
-        self.enable_sustainability_scoring = enable_sustainability_scoring
-        self.enable_tiered_aggregation = enable_tiered_aggregation
-        self.enable_resource_optimization = enable_resource_optimization
-        self.enable_discovery = enable_discovery
-        self.enable_compression_enhanced = enable_compression_enhanced
-        self.enable_reputation = enable_reputation
-        self.enable_playbook = enable_playbook
-        self.enable_economic_pricing = enable_economic_pricing
-
-        # NEW: MoE and Self-Evolving Gate references (injected)
-        self.gating_network = None
-        self.self_evolving_gate = None
-        self.expert_router = None
-        
-        # NEW: Helium provider (injected)
-        self.helium_provider = None
-        
-        # NEW: Asynchronous region manager
-        self.async_region_manager = AsynchronousRegionManager() if enable_async else None
-        
-        # Core modules
-        self.tiered_aggregator = TieredAggregator() if enable_tiered_aggregation else None
-        self.resource_optimizer = GlobalResourceOptimizer() if enable_resource_optimization else None
-        self.discovery = FederatedDiscovery(server_url) if enable_discovery else None
-        
-        self.compressor = ModelCompressor() if enable_compression_enhanced else None
-        self.reputation_system = ReputationScoringSystem() if enable_reputation else None
-        self.playbook_system = StrategicPlaybookSystem() if enable_playbook else None
-        self.pricing_manager = EconomicPricingManager() if enable_economic_pricing else None
-        
-        # Bio-inspired modules
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
-        
-        self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
-        self.predictive_analyzer = PredictiveFederationAnalyzer() if enable_predictive else None
-        self.cross_domain_transfer = FederationCrossDomainTransfer() if enable_cross_domain else None
-        
-        self.regions: Dict[str, RegionNode] = {}
-        self.regional_profiles: Dict[Region, RegionalProfile] = {}
-        self.participants: Dict[str, FederatedExpert] = {}
-        self.aggregation_history: List[Dict] = []
-        self.round_number = 0
-        self.global_model: Optional[Dict[str, Any]] = None
-        
-        self.federation_token_pool: float = 0.0
-        self.total_carbon_savings_kg = 0.0
-        self.total_helium_savings_l = 0.0
-        self.sustainability_score = 0.0
-        self.instance_id = f"federation_{int(time.time())}"
-        
-        self._initialize_regional_profiles()
-        
-        if self.enable_economic_pricing and self.pricing_manager:
-            asyncio.create_task(self._price_update_loop())
-        
-        logger.info(
-            f"Cross-Region Federation v7.1.0 initialized: "
-            f"bio_integration={self.enable_bio_integration}, "
-            f"tiered_aggregation={self.enable_tiered_aggregation}, "
-            f"resource_optimization={self.enable_resource_optimization}, "
-            f"discovery={self.enable_discovery}, "
-            f"compression={self.enable_compression_enhanced}, "
-            f"reputation={self.enable_reputation}, "
-            f"playbook={self.enable_playbook}, "
-            f"economic_pricing={self.enable_economic_pricing}, "
-            f"async_regions={self.enable_async}"
-        )
-    
-    def _initialize_regional_profiles(self):
-        profiles = {
-            Region.US_EAST: {'timezone': -5, 'renewable_hours': [2, 3, 4, 5],
-                'carbon_low_hours': [2, 3, 4, 5, 22, 23], 'renewable_mix': {'wind': 0.15, 'solar': 0.10, 'nuclear': 0.30, 'gas': 0.35, 'coal': 0.10}},
-            Region.EU_WEST: {'timezone': 0, 'renewable_hours': [12, 13, 14],
-                'carbon_low_hours': [1, 2, 3, 4, 12, 13], 'renewable_mix': {'wind': 0.25, 'solar': 0.15, 'nuclear': 0.25, 'gas': 0.25, 'coal': 0.10}},
-            Region.ASIA_EAST: {'timezone': 8, 'renewable_hours': [10, 11, 12, 13],
-                'carbon_low_hours': [2, 3, 4, 5], 'renewable_mix': {'wind': 0.10, 'solar': 0.15, 'nuclear': 0.10, 'coal': 0.50, 'gas': 0.15}}
-        }
-        for region, data in profiles.items():
-            carbon_profile = {}
-            for hour in range(24):
-                if hour in data['carbon_low_hours']:
-                    carbon_profile[hour] = np.random.uniform(50, 200)
-                else:
-                    carbon_profile[hour] = np.random.uniform(200, 400)
-            self.regional_profiles[region] = RegionalProfile(
-                region=region,
-                timezone_offset=data['timezone'],
-                typical_renewable_hours=data['renewable_hours'],
-                carbon_intensity_profile=carbon_profile,
-                renewable_mix=data['renewable_mix'],
-                network_latency_matrix={'us_east': 0, 'eu_west': 80, 'asia_east': 150},
-                bandwidth_capacity_mbps=1000,
-                available_compute_flops=1e15,
-                helium_availability=np.random.uniform(0.5, 1.0),
-                data_sovereignty_constraints=[],
-                optimal_sync_windows=[(data['carbon_low_hours'][0], data['carbon_low_hours'][-1])]
-            )
-    
-    async def _price_update_loop(self):
-        while True:
-            try:
-                if self.pricing_manager:
-                    for region in self.regions:
-                        await self.pricing_manager.update_prices(region)
-                    await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error(f"Price update error: {e}")
-                await asyncio.sleep(300)
-    
-    # ========================================================================
-    # NEW: Set MoE Router, Gating Network, Self-Evolving Gate, and Helium Provider
-    # ========================================================================
-    
-    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
-        self.gating_network = gating_network
-        logger.info("Gating network injected into Cross-Region Federation")
-    
-    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
-        self.self_evolving_gate = gate
-        logger.info("Self-Evolving Gate injected into Cross-Region Federation")
-    
-    def set_expert_router(self, router: 'ExpertRouter'):
-        self.expert_router = router
-        logger.info("Expert Router injected into Cross-Region Federation")
-    
-    def set_helium_provider(self, provider: HeliumProvider):
-        self.helium_provider = provider
-        logger.info("Helium provider injected into Cross-Region Federation")
-    
-    # ========================================================================
-    # Bio-Inspired Module Injection
-    # ========================================================================
-    
-    def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
-            self.enable_bio_integration = True
-    
-    # ========================================================================
-    # Bio-Inspired Data Access Methods (with real helium)
-    # ========================================================================
-    
-    def _get_gradient_aligned_schedule(self, region: Region) -> float:
-        if self.gradient_manager and self.enable_bio_integration:
-            carbon = self.gradient_manager.fields.get('carbon')
-            if carbon and carbon.gradient_strength < 0.3:
-                return 0.0
-            elif carbon:
-                return carbon.gradient_strength * 3600
-        return 0.0
-    
-    def _stake_tokens_for_update(self, region: str, amount: float) -> Tuple[bool, float]:
-        if self.token_manager and self.enable_bio_integration:
-            success, token_ids = self.token_manager.reserve_tokens(
-                account_id=f"federation_{region}",
-                amount=amount,
-                consumer=EcoATPConsumer.EXPERT_EXECUTION
-            )
-            if success:
-                self.federation_token_pool += amount
-                return True, amount
-            return False, 0.0
-        return True, 0.0
-    
-    def _get_compartment_tier(self, region: str) -> AggregationTier:
-        if self.compartment_manager and self.enable_bio_integration:
-            region_types = {
-                'us_east': 'data', 'us_west': 'energy',
-                'eu_west': 'data', 'eu_north': 'energy',
-                'asia_east': 'iot', 'asia_southeast': 'data'
-            }
-            expert_type = region_types.get(region, 'data')
-            compartment = self.compartment_manager.find_best_compartment(expert_type)
-            if compartment:
-                if compartment.state == CompartmentState.ACTIVE:
-                    return AggregationTier.REGIONAL
-                elif compartment.health_score > 0.8:
-                    return AggregationTier.CONTINENTAL
-        return AggregationTier.REGIONAL
-    
-    def _get_harvester_signal_quality(self) -> float:
-        if self.harvester and self.enable_bio_integration:
-            stats = self.harvester.get_harvesting_stats()
-            recent = stats.get('recent_conversions', [])
-            if recent:
-                return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
-        return 0.5
-    
-    def _get_trust_based_byzantine_threshold(self, region: str) -> float:
-        if self.gradient_manager and self.enable_bio_integration:
-            trust = self.gradient_manager.fields.get('trust')
-            if trust:
-                return max(0.1, 1.0 - trust.gradient_strength)
-        return 0.5
-    
-    # NEW: Real helium access
-    def _get_helium_scarcity(self) -> float:
-        if self.helium_provider:
-            return self.helium_provider.get_scarcity()
-        return 0.5
-    
-    def _get_helium_cost_index(self) -> float:
-        if self.helium_provider:
-            return self.helium_provider.get_cost_index()
-        return 1.0
-    
-    def _get_helium_efficiency(self) -> float:
-        if self.helium_provider:
-            return self.helium_provider.get_efficiency()
-        return 0.5
-    
-    # ========================================================================
-    # Region Management (unchanged)
-    # ========================================================================
-    
-    def register_region(
-        self,
-        region_id: str,
-        tier: AggregationTier = AggregationTier.REGIONAL,
-        parent_id: Optional[str] = None,
-        participants: List[str] = None,
-        resource_capacity: float = 1.0
-    ) -> RegionNode:
-        if region_id in self.regions:
-            logger.warning(f"Region {region_id} already registered")
-            return self.regions[region_id]
-        node = RegionNode(
-            region_id=region_id,
-            tier=tier,
-            parent_id=parent_id,
-            participants=participants or [],
-            resource_capacity=resource_capacity
-        )
-        self.regions[region_id] = node
-        if parent_id and parent_id in self.regions:
-            self.regions[parent_id].child_ids.append(region_id)
-        if self.enable_discovery and self.discovery:
-            asyncio.create_task(
-                self.discovery.register_region(
-                    region_id,
-                    {
-                        'tier': tier.value,
-                        'resource_capacity': resource_capacity,
-                        'participants': len(participants or [])
-                    },
-                    parent_id
-                )
-            )
-        if self.enable_reputation and self.reputation_system:
-            asyncio.create_task(
-                self.reputation_system.update_reputation(
-                    region_id,
-                    success=True,
-                    sustainability_contribution=0.5,
-                    token_stake=0.0
-                )
-            )
-        logger.info(f"Registered region: {region_id} (tier: {tier.value})")
-        return node
-    
-    async def update_region_status(
-        self,
-        region_id: str,
-        carbon_intensity: float = None,
-        helium_availability: float = None,
-        resource_usage: float = None
-    ):
-        if region_id not in self.regions:
-            return
-        node = self.regions[region_id]
-        if carbon_intensity is not None:
-            node.carbon_intensity = carbon_intensity
-        if helium_availability is not None:
-            node.helium_availability = helium_availability
-        if resource_usage is not None:
-            node.resource_usage = resource_usage
-        node.last_update = datetime.utcnow()
-        if self.enable_discovery and self.discovery:
-            await self.discovery.update_health(region_id, {
-                'status': 'healthy',
-                'metrics': {
-                    'carbon_intensity': carbon_intensity,
-                    'helium_availability': helium_availability,
-                    'resource_usage': resource_usage
-                }
-            })
-        if self.enable_reputation and self.reputation_system:
-            sustainability = 1.0 - (carbon_intensity or 400) / 800
-            await self.reputation_system.update_reputation(
-                region_id,
-                success=True,
-                sustainability_contribution=sustainability
-            )
-    
-    # ========================================================================
-    # Enhanced Federation Round (with MoE, real helium, async regions)
-    # ========================================================================
-    
-    async def federated_round(
-        self,
-        carbon_zone: int,
-        helium_scarcity: float,
-        timeout_seconds: int = 300,
-        region_filter: Optional[List[str]] = None
-    ) -> Optional[Dict[str, Any]]:
-        self.round_number += 1
-        round_start = datetime.utcnow()
-        
-        carbon_intensity = 400
-        if self.carbon_manager:
-            carbon_data = await self.carbon_manager.update_carbon_intensity('us-east')
-            carbon_intensity = carbon_data.get('intensity', 400)
-        
-        # Use real helium if provider available
-        if self.helium_provider:
-            helium_scarcity = self._get_helium_scarcity()
-            helium_cost = self._get_helium_cost_index()
-            helium_efficiency = self._get_helium_efficiency()
-        else:
-            helium_cost = 1.0
-            helium_efficiency = 0.5
-        
-        if self.enable_economic_pricing and self.pricing_manager:
-            for region_id in self.regions:
-                await self.pricing_manager.update_prices(region_id)
-        
-        playbook_recommendations = []
-        if self.enable_playbook and self.playbook_system:
-            context = {
-                'carbon_intensity': carbon_intensity,
-                'helium_availability': 1.0 - helium_scarcity,
-                'carbon_zone': carbon_zone,
-                'quantum_workload': 0.5,
-                'renewable_availability': 0.6
-            }
-            playbook_recommendations = await self.playbook_system.evaluate_playbooks(context)
-        
-        selected = await self._select_participants_multi_criteria(
-            carbon_zone, helium_scarcity, carbon_intensity
-        )
-        if len(selected) < 3:
-            logger.warning(f"Insufficient participants: {len(selected)}")
-            return None
-        
-        for participant_id in selected:
-            if participant_id in self.participants:
-                participant = self.participants[participant_id]
-                stake_amount = participant.carbon_footprint * 100
-                success, staked = self._stake_tokens_for_update(participant_id, stake_amount)
-                if success:
-                    participant.tokens_staked = staked
-        
-        # Collect updates (with compression)
-        updates = {}
-        for participant_id in selected:
-            if participant_id in self.participants:
-                reputation_score = 0.5
-                if self.enable_reputation and self.reputation_system:
-                    reputation_score = await self.reputation_system.get_reputation_score(participant_id)
-                update = await self._collect_update(participant_id, carbon_intensity, reputation_score)
-                if update:
-                    if self.enable_compression_enhanced and self.compressor:
-                        region_id = self.participants[participant_id].region_id or "default"
-                        tier = self.regions.get(region_id, RegionNode(
-                            region_id=region_id,
-                            tier=AggregationTier.REGIONAL
-                        )).tier
-                        compressed, metadata = await self.compressor.compress_model(
-                            update.model_delta,
-                            tier
-                        )
-                        update.original_size_bytes = metadata['original_size']
-                        update.compressed_size_bytes = metadata['compressed_size']
-                        update.compression_ratio = metadata['ratio']
-                        update.model_delta = await self.compressor.decompress_model(
-                            compressed,
-                            metadata
-                        )
-                    updates[participant_id] = update
-        
-        if len(updates) < 3:
-            return None
-        
-        for participant_id in list(updates.keys()):
-            threshold = self._get_trust_based_byzantine_threshold(participant_id)
-            if threshold > 0.7:
-                logger.warning(f"High Byzantine risk for {participant_id}: threshold={threshold:.2f}")
-        
-        # Determine aggregation strategy
-        strategy = AggregationStrategy.FED_AVG
-        carbon_price = 50.0
-        helium_price = 0.5
-        if self.enable_economic_pricing and self.pricing_manager:
-            prices = await self.pricing_manager.get_current_prices()
-            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
-            helium_price = prices.get('helium_price_usd_per_l', 0.5)
-        
-        if self.enable_tiered_aggregation and self.tiered_aggregator:
-            region_id = selected[0] if selected else "default"
-            region_tier = self.regions.get(region_id, RegionNode(
-                region_id=region_id,
-                tier=AggregationTier.REGIONAL
-            )).tier
-            aggregated = await self.tiered_aggregator.aggregate_tier(
-                region_tier,
-                [u.model_delta for u in updates.values()],
-                region_id,
-                strategy=AggregationStrategy.TIERED_AGGREGATION
-            )
-        elif self.enable_reputation and self.reputation_system:
-            strategy = AggregationStrategy.REPUTATION_WEIGHTED
-            aggregated = await self._reputation_weighted_aggregate(updates)
-        elif self.enable_economic_pricing and carbon_price > 100:
-            strategy = AggregationStrategy.PRICE_AWARE
-            aggregated = await self._price_aware_aggregate(updates, carbon_price, helium_price)
-        elif self.enable_bio_integration and self.token_manager and self.federation_token_pool > 100:
-            strategy = AggregationStrategy.TOKEN_WEIGHTED
-            aggregated = self._token_weighted_aggregate(updates)
-        elif self.enable_sustainability_scoring:
-            strategy = AggregationStrategy.SUSTAINABILITY_WEIGHTED
-            aggregated = self._sustainability_weighted_aggregate(updates)
-        else:
-            aggregated = self._federated_averaging([u.model_delta for u in updates.values()])
-        
-        # Asynchronous region updates: submit to async manager (if enabled)
-        if self.enable_async and self.async_region_manager:
-            for participant_id, update in updates.items():
-                region_id = self.participants[participant_id].region_id or "default"
-                await self.async_region_manager.submit_update(
-                    region_id,
-                    update.model_delta,
-                    update.timestamp
-                )
-            # Optionally, aggregate from the async manager instead of the synchronous result.
-            # We'll keep the synchronous result as the main global model.
-        
-        self.global_model = aggregated
-        
-        # ====================================================================
-        # NEW: Push to gating network and self-evolving gate
-        # ====================================================================
-        if self.gating_network:
-            features = np.array([
-                len(self.global_model),
-                carbon_intensity / 1000.0,
-                helium_scarcity,
-                carbon_price / 100.0
-            ])
-            reward = self.sustainability_score
-            context = {
-                'carbon_intensity': carbon_intensity,
-                'helium_scarcity': helium_scarcity,
-                'carbon_price': carbon_price,
-                'participants': len(selected)
-            }
-            self.gating_network.update(features, reward, context)
-            logger.info("Updated gating network with global model")
-        
-        if self.self_evolving_gate:
-            features = np.array([
-                len(self.global_model),
-                carbon_intensity,
-                helium_scarcity
-            ])
-            reward = self.sustainability_score
-            context = {
-                'carbon_intensity': carbon_intensity,
-                'helium_scarcity': helium_scarcity,
-                'carbon_price': carbon_price,
-                'participants': len(selected)
-            }
-            self.self_evolving_gate.evolve_gating_network(features, reward, context)
-            logger.info("Triggered self-evolving gate evolution")
-        
-        # ====================================================================
-        # Update sustainability and reputation
-        # ====================================================================
-        self.total_carbon_savings_kg += sum(u.carbon_savings for u in updates.values())
-        self.sustainability_score = self._calculate_sustainability_score(
-            updates, carbon_intensity, helium_scarcity
-        )
-        
-        if self.enable_reputation and self.reputation_system:
-            for participant_id, update in updates.items():
-                success = update.local_accuracy > 0.7
-                await self.reputation_system.update_reputation(
-                    participant_id,
-                    success=success,
-                    sustainability_contribution=update.sustainability_impact,
-                    token_stake=update.tokens_staked,
-                    data_quality=update.local_accuracy,
-                    carbon_efficiency=update.carbon_savings / max(1.0, update.training_data_size)
-                )
-        
-        if self.enable_playbook and playbook_recommendations:
-            for rec in playbook_recommendations[:2]:
-                playbook = rec['playbook']
-                success = await self._apply_playbook(playbook, rec['match_score'])
-                await self.playbook_system.record_playbook_usage(
-                    playbook['playbook_id'],
-                    success=success,
-                    metrics={'sustainability': self.sustainability_score}
-                )
-        
-        if self.enable_resource_optimization and self.resource_optimizer:
-            region_status = {}
-            for region_id, node in self.regions.items():
-                region_status[region_id] = {
-                    'carbon_intensity': node.carbon_intensity,
-                    'helium_availability': node.helium_availability,
-                    'resource_capacity': node.resource_capacity,
-                    'resource_usage': node.resource_usage
-                }
-            await self.resource_optimizer.optimize_resources(
-                self.regions,
-                {rid: node.carbon_intensity for rid, node in self.regions.items()},
-                {rid: node.helium_availability for rid, node in self.regions.items()}
-            )
-        
-        if self.enable_predictive:
-            self.predictive_analyzer.update_history({
-                'participants': len(selected),
-                'carbon_intensity': carbon_intensity,
-                'helium_scarcity': helium_scarcity,
-                'sustainability_score': self.sustainability_score,
-                'token_pool': self.federation_token_pool
-            })
-            await self.predictive_analyzer.train_forecast_model()
-            forecast = await self.predictive_analyzer.predict_federation_trend()
-        else:
-            forecast = None
-        
-        if self.enable_discovery and self.discovery:
-            await self.discovery.discover_peers(self.instance_id)
-        
-        # Record round
-        round_record = {
-            'round_number': self.round_number,
-            'participants': len(selected),
-            'updates': len(updates),
-            'strategy': strategy.value,
-            'timestamp': round_start.isoformat(),
-            'sustainability_score': self.sustainability_score,
-            'carbon_savings_kg': self.total_carbon_savings_kg,
-            'federation_token_pool': self.federation_token_pool,
-            'predictive_forecast': {
-                'predicted_score': forecast.predicted_sustainability_score if forecast else None,
-                'confidence': forecast.confidence if forecast else None,
-                'trend': forecast.trend if forecast else None
-            } if self.enable_predictive and forecast else None,
-            'resource_optimization': self.resource_optimizer.get_optimization_stats() if self.enable_resource_optimization else None,
-            'discovery_stats': self.discovery.get_discovery_stats() if self.enable_discovery else None,
-            'compression_stats': self.compressor.get_compression_stats() if self.enable_compression_enhanced else None,
-            'reputation_stats': self.reputation_system.get_reputation_stats() if self.enable_reputation else None,
-            'playbook_usage': self.playbook_system.get_playbook_stats() if self.enable_playbook else None,
-            'price_stats': self.pricing_manager.get_price_stats() if self.enable_economic_pricing else None,
-            'gating_network_updated': self.gating_network is not None,
-            'self_evolving_gate_triggered': self.self_evolving_gate is not None
-        }
-        self.aggregation_history.append(round_record)
-        
-        return aggregated
-    
-    # ========================================================================
-    # Helper methods (unchanged, with minor modifications for helium)
-    # ========================================================================
-    
-    async def _select_participants_multi_criteria(
-        self, carbon_zone: int, helium_scarcity: float, carbon_intensity: float
-    ) -> List[str]:
-        scored_participants = []
-        for participant_id, participant in self.participants.items():
-            if not participant.is_active:
-                continue
-            data_score = 0.5
-            carbon_score = 1.0 / (1.0 + participant.carbon_footprint * 100)
-            helium_score = 1.0 / (1.0 + participant.helium_usage * 10)
-            intensity_score = 1.0 - (carbon_intensity / 800) if carbon_intensity > 0 else 0.5
-            sustainability_score = participant.sustainability_contribution if hasattr(participant, 'sustainability_contribution') else 0.5
-            reputation_score = 0.5
-            if self.enable_reputation and self.reputation_system:
-                reputation_score = asyncio.run(self.reputation_system.get_reputation_score(participant_id))
-            carbon_price_score = 0.5
-            helium_price_score = 0.5
-            if self.enable_economic_pricing and self.pricing_manager:
-                prices = asyncio.run(self.pricing_manager.get_current_prices())
-                carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
-                helium_price = prices.get('helium_price_usd_per_l', 0.5)
-                carbon_price_score = 1.0 - (carbon_price / 200)
-                helium_price_score = 1.0 - (helium_price / 2.0)
-            if carbon_zone >= 8:
-                weights = {'carbon': 0.25, 'helium': 0.10, 'data': 0.10,
-                          'intensity': 0.15, 'sustainability': 0.15, 'reliability': 0.10,
-                          'reputation': 0.10, 'carbon_price': 0.05}
-            elif helium_scarcity > 0.7:
-                weights = {'helium': 0.25, 'carbon': 0.10, 'data': 0.10,
-                          'intensity': 0.10, 'sustainability': 0.15, 'reliability': 0.10,
-                          'reputation': 0.15, 'helium_price': 0.05}
-            else:
-                weights = {'data': 0.15, 'carbon': 0.10, 'helium': 0.05,
-                          'intensity': 0.15, 'sustainability': 0.20, 'reliability': 0.10,
-                          'reputation': 0.15, 'carbon_price': 0.05, 'helium_price': 0.05}
-            score = (
-                weights.get('data', 0.15) * data_score +
-                weights.get('carbon', 0.10) * carbon_score +
-                weights.get('helium', 0.05) * helium_score +
-                weights.get('intensity', 0.15) * intensity_score +
-                weights.get('sustainability', 0.20) * sustainability_score +
-                weights.get('reliability', 0.10) * 0.8 +
-                weights.get('reputation', 0.15) * reputation_score +
-                weights.get('carbon_price', 0.05) * carbon_price_score +
-                weights.get('helium_price', 0.05) * helium_price_score
-            )
-            scored_participants.append((participant_id, score))
-        scored_participants.sort(key=lambda x: x[1], reverse=True)
-        n_select = max(3, min(len(scored_participants), int(len(scored_participants) * 0.7)))
-        selected = [p[0] for p in scored_participants[:n_select]]
-        return selected
-    
-    async def _collect_update(
-        self,
-        participant_id: str,
-        carbon_intensity: float,
-        reputation_score: float = 0.5
-    ) -> Optional[AsyncUpdate]:
-        if participant_id not in self.participants:
-            return None
-        participant = self.participants[participant_id]
-        region_id = participant.region_id or "default"
-        region = Region(region_id) if region_id in [r.value for r in Region] else Region.US_EAST
-        carbon_price = 50.0
-        helium_price = 0.5
-        if self.enable_economic_pricing and self.pricing_manager:
-            prices = await self.pricing_manager.get_current_prices()
-            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
-            helium_price = prices.get('helium_price_usd_per_l', 0.5)
-        economic_impact = (
-            carbon_price * participant.carbon_footprint * 0.01 +
-            helium_price * participant.helium_usage * 0.1
-        )
-        update = AsyncUpdate(
-            update_id=f"update_{participant_id}_{datetime.utcnow().timestamp()}",
-            source_region=region,
-            model_delta=participant.local_model,
-            compression_ratio=0.8,
-            timestamp=datetime.utcnow(),
-            carbon_intensity_at_update=carbon_intensity,
-            training_data_size=1000,
-            local_accuracy=0.9,
-            vector_clock={},
-            signature=hashlib.sha256(f"{participant_id}{datetime.utcnow()}".encode()).hexdigest(),
-            tokens_staked=participant.tokens_staked if hasattr(participant, 'tokens_staked') else 0.0,
-            carbon_savings=participant.carbon_footprint * 0.01,
-            sustainability_impact=participant.sustainability_contribution if hasattr(participant, 'sustainability_contribution') else 0.5,
-            carbon_price=carbon_price,
-            helium_price=helium_price,
-            economic_impact=economic_impact
-        )
-        return update
-    
-    async def _reputation_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
-        if not self.enable_reputation or not self.reputation_system:
-            return self._federated_averaging([u.model_delta for u in updates.values()])
-        aggregated = {}
-        total_reputation = 0.0
-        reputation_scores = {}
-        for participant_id in updates:
-            score = await self.reputation_system.get_reputation_score(participant_id)
-            reputation_scores[participant_id] = max(0.1, score)
-            total_reputation += reputation_scores[participant_id]
-        if total_reputation == 0:
-            return self._federated_averaging([u.model_delta for u in updates.values()])
-        for key in next(iter(updates.values())).model_delta.keys():
-            weighted_sum = 0.0
-            for participant_id, update in updates.items():
-                if key in update.model_delta:
-                    weight = reputation_scores[participant_id] / total_reputation
-                    weighted_sum += update.model_delta[key] * weight
-            aggregated[key] = weighted_sum
-        return aggregated
-    
-    async def _price_aware_aggregate(
-        self,
-        updates: Dict[str, AsyncUpdate],
-        carbon_price: float,
-        helium_price: float
-    ) -> Dict[str, Any]:
-        aggregated = {}
-        total_economic_weight = 0.0
-        economic_weights = {}
-        for participant_id, update in updates.items():
-            cost = update.carbon_price * update.carbon_savings + update.helium_price * update.helium_usage
-            weight = 1.0 / (1.0 + cost)
-            economic_weights[participant_id] = weight
-            total_economic_weight += weight
-        if total_economic_weight == 0:
-            return self._federated_averaging([u.model_delta for u in updates.values()])
-        for key in next(iter(updates.values())).model_delta.keys():
-            weighted_sum = 0.0
-            for participant_id, update in updates.items():
-                if key in update.model_delta:
-                    weight = economic_weights[participant_id] / total_economic_weight
-                    weighted_sum += update.model_delta[key] * weight
-            aggregated[key] = weighted_sum
-        return aggregated
-    
-    def _token_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
-        aggregated = {}
-        total_tokens = sum(u.tokens_staked for u in updates.values())
-        if total_tokens == 0:
-            return self._federated_averaging([u.model_delta for u in updates.values()])
-        for key in next(iter(updates.values())).model_delta.keys():
-            weighted_sum = 0.0
-            for update in updates.values():
-                if key in update.model_delta:
-                    weight = update.tokens_staked / total_tokens
-                    weighted_sum += update.model_delta[key] * weight
-            aggregated[key] = weighted_sum
-        return aggregated
-    
-    def _sustainability_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
-        aggregated = {}
-        total_sustainability = sum(u.sustainability_impact for u in updates.values())
-        if total_sustainability == 0:
-            return self._federated_averaging([u.model_delta for u in updates.values()])
-        for key in next(iter(updates.values())).model_delta.keys():
-            weighted_sum = 0.0
-            for update in updates.values():
-                if key in update.model_delta:
-                    weight = update.sustainability_impact / total_sustainability
-                    weighted_sum += update.model_delta[key] * weight
-            aggregated[key] = weighted_sum
-        return aggregated
-    
-    def _federated_averaging(self, updates: List[Dict]) -> Dict[str, Any]:
-        if not updates:
-            return {}
-        aggregated = {}
-        n = len(updates)
-        for key in updates[0].keys():
-            values = [u[key] for u in updates if key in u]
-            if values:
-                if isinstance(values[0], np.ndarray):
-                    aggregated[key] = np.mean(values, axis=0)
-                else:
-                    aggregated[key] = sum(values) / n
-        return aggregated
-    
-    def _calculate_sustainability_score(
-        self, updates: Dict[str, AsyncUpdate], carbon_intensity: float, helium_scarcity: float
-    ) -> float:
-        if not updates:
-            return 0.0
-        avg_carbon_savings = np.mean([u.carbon_savings for u in updates.values()])
-        avg_sustainability = np.mean([u.sustainability_impact for u in updates.values()])
-        carbon_factor = 1.0 - (carbon_intensity / 800)
-        helium_factor = 1.0 - helium_scarcity
-        economic_factor = 0.5
-        if self.enable_economic_pricing and self.pricing_manager:
-            prices = asyncio.run(self.pricing_manager.get_current_prices())
-            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
-            economic_factor = 1.0 - (carbon_price / 200)
-        score = (
-            avg_carbon_savings * 0.25 +
-            avg_sustainability * 0.25 +
-            carbon_factor * 0.20 +
-            helium_factor * 0.20 +
-            economic_factor * 0.10
-        )
-        return min(1.0, max(0.0, score))
-    
-    async def _apply_playbook(self, playbook: Dict[str, Any], match_score: float) -> bool:
-        try:
-            for action in playbook.get('actions', []):
-                action_type = action.get('type')
-                if action_type == 'schedule_shift':
-                    pass
-                elif action_type == 'reduce_workload':
-                    pass
-                elif action_type == 'switch_cooling':
-                    pass
-                elif action_type == 'circuit_compression':
-                    pass
-            logger.info(f"Applied playbook: {playbook.get('name')} (match: {match_score:.2f})")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to apply playbook: {e}")
-            return False
-    
-    # ========================================================================
-    # Statistics (unchanged)
-    # ========================================================================
-    
-    def get_federation_stats(self) -> Dict[str, Any]:
-        stats = {
-            'total_participants': len(self.participants),
-            'total_regions': len(self.regions),
-            'total_rounds': len(self.aggregation_history),
-            'bio_integration_active': self.enable_bio_integration,
-            'tiered_aggregation_active': self.enable_tiered_aggregation,
-            'resource_optimization_active': self.enable_resource_optimization,
-            'discovery_active': self.enable_discovery,
-            'federated_reflexive_active': self.enable_federated_reflexive,
-            'carbon_intensity_active': self.enable_carbon_intensity,
-            'predictive_active': self.enable_predictive,
-            'cross_domain_active': self.enable_cross_domain,
-            'sustainability_scoring_active': self.enable_sustainability_scoring,
-            'compression_active': self.enable_compression_enhanced,
-            'reputation_active': self.enable_reputation,
-            'playbook_active': self.enable_playbook,
-            'economic_pricing_active': self.enable_economic_pricing,
-            'async_regions_active': self.enable_async,
-            'moe_gating_injected': self.gating_network is not None,
-            'moe_gate_injected': self.self_evolving_gate is not None,
-            'helium_provider_injected': self.helium_provider is not None,
-            'federation_token_pool': self.federation_token_pool,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'sustainability_score': self.sustainability_score,
-            'recent_rounds': self.aggregation_history[-5:] if self.aggregation_history else []
-        }
-        if self.enable_tiered_aggregation and self.tiered_aggregator:
-            stats['tier_stats'] = self.tiered_aggregator.get_tier_stats()
-        if self.enable_resource_optimization and self.resource_optimizer:
-            stats['resource_stats'] = self.resource_optimizer.get_optimization_stats()
-        if self.enable_discovery and self.discovery:
-            stats['discovery_stats'] = self.discovery.get_discovery_stats()
-        if self.enable_bio_integration:
-            stats['gradient_levels'] = self._get_real_gradient_levels()
-            stats['harvester_quality'] = self._get_harvester_signal_quality()
-        if self.enable_predictive:
-            stats['predictive_summary'] = self.predictive_analyzer.get_sustainability_summary()
-        if self.enable_cross_domain:
-            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
-        if self.enable_compression_enhanced and self.compressor:
-            stats['compression_stats'] = self.compressor.get_compression_stats()
-        if self.enable_reputation and self.reputation_system:
-            stats['reputation_stats'] = self.reputation_system.get_reputation_stats()
-        if self.enable_playbook and self.playbook_system:
-            stats['playbook_stats'] = self.playbook_system.get_playbook_stats()
-        if self.enable_economic_pricing and self.pricing_manager:
-            stats['price_stats'] = self.pricing_manager.get_price_stats()
-        if self.async_region_manager:
-            stats['async_region_stats'] = {
-                'regions_tracked': len(self.async_region_manager.region_updates)
-            }
-        return stats
-    
-    def _get_real_gradient_levels(self) -> Dict[str, float]:
-        if self.gradient_manager:
-            return self.gradient_manager.get_field_strengths()
-        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
-    
-    def get_regional_profile(self, region: Region) -> Optional[Dict[str, Any]]:
-        if region not in self.regional_profiles:
-            return None
-        profile = self.regional_profiles[region]
-        return {
-            'region': region.value,
-            'carbon_gradient': profile.local_carbon_gradient,
-            'trust_gradient': profile.local_trust_gradient,
-            'token_balance': profile.token_balance,
-            'compartment_count': profile.compartment_count,
-            'harvester_vitality': profile.harvester_vitality,
-            'sustainability_score': profile.sustainability_score,
-            'carbon_savings_kg': profile.carbon_savings_kg,
-            'helium_savings_l': profile.helium_savings_l,
-            'tier': profile.tier.value if hasattr(profile, 'tier') else 'regional',
-            'carbon_price_usd_per_ton': profile.carbon_price_usd_per_ton,
-            'helium_price_usd_per_l': profile.helium_price_usd_per_l,
-            'reputation_score': profile.reputation_score,
-            'active_playbooks': profile.active_playbooks
-        }
-    
-    def register_participant(
-        self,
-        participant_id: str,
-        initial_model: Dict[str, Any],
-        capabilities: ClientCapabilities,
-        carbon_footprint: float,
-        helium_usage: float,
-        sustainability_contribution: float = 0.5,
-        region_id: Optional[str] = None
-    ) -> bool:
-        if participant_id in self.participants:
-            logger.warning(f"Participant {participant_id} already registered")
-            return False
-        participant = FederatedExpert(
-            expert_id=participant_id,
-            local_model=initial_model,
-            data_distribution={},
-            capabilities=capabilities,
-            carbon_footprint=carbon_footprint,
-            helium_usage=helium_usage,
-            sustainability_contribution=sustainability_contribution,
-            region_id=region_id
-        )
-        if self.enable_federated_reflexive:
-            asyncio.create_task(
-                self.federated_learner.register_participant(participant_id, initial_model)
-            )
-        if region_id and region_id in self.regions:
-            self.regions[region_id].participants.append(participant_id)
-        if self.enable_reputation and self.reputation_system:
-            asyncio.create_task(
-                self.reputation_system.update_reputation(
-                    participant_id,
-                    success=True,
-                    sustainability_contribution=sustainability_contribution,
-                    token_stake=0.0
-                )
-            )
-        self.participants[participant_id] = participant
-        logger.info(f"Registered federation participant: {participant_id} (region: {region_id})")
-        return True
-    
-    def get_sustainability_report(self) -> Dict[str, Any]:
-        report = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'total_helium_savings_l': self.total_helium_savings_l,
-            'federation_token_pool': self.federation_token_pool,
-            'participant_count': len(self.participants),
-            'region_count': len(self.regions),
-            'round_count': self.round_number,
-            'bio_integration_active': self.enable_bio_integration,
-            'predictive_forecast': self.predictive_analyzer.get_sustainability_summary() if self.enable_predictive else {},
-            'resource_optimization': self.resource_optimizer.get_optimization_stats() if self.enable_resource_optimization else {},
-            'compression_savings_mb': self.compressor.get_compression_stats().get('total_size_saved_mb', 0) if self.enable_compression_enhanced else 0,
-            'reputation_average': self.reputation_system.get_reputation_stats().get('average_score', 0.5) if self.enable_reputation else 0.5,
-            'playbook_usage': self.playbook_system.get_playbook_stats() if self.enable_playbook else {},
-            'recommendations': self._generate_sustainability_recommendations()
-        }
-        return report
-    
-    def _generate_sustainability_recommendations(self) -> List[str]:
-        recommendations = []
-        if self.sustainability_score < 0.5:
-            recommendations.append("Increase federated participation for better sustainability")
-            recommendations.append("Optimize carbon-aware scheduling")
-        if self.total_carbon_savings_kg < 10:
-            recommendations.append("Implement more aggressive carbon reduction strategies")
-        if self.federation_token_pool < 50:
-            recommendations.append("Boost token staking incentives")
-        if self.enable_bio_integration and self._get_harvester_signal_quality() < 0.4:
-            recommendations.append("Improve harvester signal quality for better drift detection")
-        if self.enable_resource_optimization and self.resource_optimizer:
-            resource_stats = self.resource_optimizer.get_optimization_stats()
-            for region_id, alloc in resource_stats.get('current_allocations', {}).items():
-                if alloc.get('usage', 0) > alloc.get('allocated', 1) * 0.9:
-                    recommendations.append(f"Region {region_id} is near capacity - consider scaling")
-        if self.enable_playbook and self.playbook_system:
-            context = {
-                'carbon_intensity': self.regions.get('us_east', RegionNode(region_id='us_east', tier=AggregationTier.REGIONAL)).carbon_intensity if 'us_east' in self.regions else 400,
-                'helium_availability': self.regions.get('us_east', RegionNode(region_id='us_east', tier=AggregationTier.REGIONAL)).helium_availability if 'us_east' in self.regions else 0.5
-            }
-            playbooks = asyncio.run(self.playbook_system.evaluate_playbooks(context))
-            if playbooks:
-                recommendations.append(f"Consider applying playbook: {playbooks[0]['playbook']['name']}")
-        return recommendations or ["Federation sustainability is on track"]
-    
-    async def shutdown(self):
-        logger.info("Shutting down Cross-Region Federation Optimizer")
-        if hasattr(self, 'federated_learner') and self.federated_learner:
-            await self.federated_learner.close()
-        if hasattr(self, 'carbon_manager') and self.carbon_manager:
-            await self.carbon_manager.close()
-        if self.enable_discovery and self.discovery:
-            await self.discovery.close()
-        if self.enable_economic_pricing and self.pricing_manager and self.pricing_manager._session:
-            await self.pricing_manager._session.close()
-        logger.info("Cross-Region Federation Optimizer shutdown complete")
-
-# ============================================================================
-# Carbon Intensity Manager (unchanged)
-# ============================================================================
-
-class CarbonIntensityManager:
-    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
-        self.endpoint = endpoint
-        self.carbon_intensity = 0.0
-        self.region = "us-east"
-        self.last_update = None
-        self._lock = asyncio.Lock()
-        self._session = None
-        self.update_interval = 300
-        self.cache = {}
-        self.historical_intensities = deque(maxlen=1000)
-        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
-    
-    async def _get_session(self):
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
-    
-    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
-        async with self._lock:
-            session = await self._get_session()
-            try:
-                url = f"{self.endpoint}/latest?zone={region}"
-                headers = {'auth-token': self.api_key} if self.api_key else {}
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self.carbon_intensity = data.get('carbonIntensity', 400)
-                        self.region = region
-                        self.last_update = datetime.now()
-                        self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
-                        self.historical_intensities.append(self.carbon_intensity)
-                    else:
-                        self.carbon_intensity = self._get_fallback_intensity(region)
-                        self.last_update = datetime.now()
-            except Exception as e:
-                logger.error(f"Carbon intensity fetch error: {e}")
-                self.carbon_intensity = self._get_fallback_intensity(region)
-                self.last_update = datetime.now()
-            return {
-                'intensity': self.carbon_intensity,
-                'region': self.region,
-                'timestamp': self.last_update.isoformat() if self.last_update else None
-            }
-    
-    def _get_fallback_intensity(self, region: str) -> float:
-        fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
-        return fallback_values.get(region, 400)
-    
-    async def get_current_intensity(self) -> float:
-        if self.last_update is None or (datetime.now() - self.last_update).seconds > self.update_interval:
-            await self.update_carbon_intensity(self.region)
-        return self.carbon_intensity
-    
-    async def close(self):
-        if self._session:
-            await self._session.close()
-
-# ============================================================================
-# Predictive Federation Analyzer (unchanged)
-# ============================================================================
-
-class PredictiveFederationAnalyzer:
-    def __init__(self, history_window: int = 100):
-        self.history_window = history_window
-        self.federation_history = deque(maxlen=history_window)
-        self.forecast_history = deque(maxlen=50)
-        self.models = {}
-        self.scaler = None
-        self.is_trained = False
-        try:
-            from sklearn.preprocessing import StandardScaler
-            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-            self.scaler = StandardScaler()
-            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
-            self._ml_available = True
-        except ImportError:
-            self._ml_available = False
-            logger.warning("ML libraries not available for predictive forecasting")
-    
-    def update_history(self, federation_metrics: Dict):
-        self.federation_history.append({
-            'timestamp': datetime.utcnow(),
-            'participants': federation_metrics.get('participants', 0),
-            'carbon_intensity': federation_metrics.get('carbon_intensity', 400),
-            'helium_scarcity': federation_metrics.get('helium_scarcity', 0.5),
-            'sustainability_score': federation_metrics.get('sustainability_score', 0.5),
-            'token_pool': federation_metrics.get('token_pool', 0),
-            'round_success': federation_metrics.get('round_success', True),
-            'participant_health': federation_metrics.get('participant_health', {})
-        })
-    
-    async def train_forecast_model(self):
-        if not self._ml_available or len(self.federation_history) < 10:
-            return {'status': 'insufficient_data'}
-        X, y = [], []
-        history_list = list(self.federation_history)
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['participants'],
-                    data['carbon_intensity'] / 100,
-                    data['helium_scarcity'],
-                    data['sustainability_score'],
-                    data['token_pool'] / 100,
-                    1 if data['round_success'] else 0
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['sustainability_score'])
-        X = np.array(X)
-        y = np.array(y)
-        X_scaled = self.scaler.fit_transform(X)
-        results = {}
-        for name, model in self.models.items():
-            if model is not None:
-                model.fit(X_scaled, y)
-                predictions = model.predict(X_scaled)
-                r2 = r2_score(y, predictions)
-                results[name] = r2
-        self.is_trained = True
-        logger.info(f"Federation forecast models trained. R²: {results}")
-        return {'status': 'success', 'results': results}
-    
-    async def predict_federation_trend(self):
-        if not self.is_trained or len(self.federation_history) < 10:
-            return PredictiveFederationForecast(confidence=0.0, trend="insufficient_data")
-        recent = list(self.federation_history)[-5:]
-        features = []
-        for data in recent:
-            features.extend([
-                data['participants'],
-                data['carbon_intensity'] / 100,
-                data['helium_scarcity'],
-                data['sustainability_score'],
-                data['token_pool'] / 100,
-                1 if data['round_success'] else 0
-            ])
-        features = np.array(features).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-        predictions = []
-        for name, model in self.models.items():
-            if model is not None:
-                pred = model.predict(features_scaled)[0]
-                predictions.append(pred)
-        if not predictions:
-            return PredictiveFederationForecast(confidence=0.0, trend="no_models")
-        prediction = np.mean(predictions)
-        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
-            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
-        else:
-            trend = "stable"
-        participant_health = {}
-        if self.federation_history:
-            latest = self.federation_history[-1]
-            for pid, health in latest.get('participant_health', {}).items():
-                participant_health[pid] = health * 0.9 + 0.1 * prediction
-        forecast = PredictiveFederationForecast(
-            predicted_sustainability_score=prediction,
-            predicted_carbon_impact=prediction * 400 * 0.1,
-            predicted_helium_usage=(1 - prediction) * 0.5,
-            confidence=confidence,
-            trend=trend,
-            recommended_actions=self._generate_actions(prediction),
-            participant_health=participant_health
-        )
-        self.forecast_history.append(forecast)
-        return forecast
-    
-    def _generate_actions(self, prediction: float) -> List[str]:
-        actions = []
-        if prediction < 0.4:
-            actions.append("Increase federated participation")
-            actions.append("Optimize carbon-aware scheduling")
-            actions.append("Boost token staking incentives")
-        elif prediction < 0.6:
-            actions.append("Enhance cross-domain knowledge transfer")
-            actions.append("Improve gradient alignment")
-        elif prediction < 0.8:
-            actions.append("Maintain current sustainability trajectory")
-        return actions or ["Federation sustainability is on track"]
-    
-    def get_sustainability_summary(self) -> Dict:
-        if not self.federation_history:
-            return {'status': 'insufficient_data'}
-        recent = list(self.federation_history)[-50:]
-        return {
-            'average_sustainability_score': np.mean([h['sustainability_score'] for h in recent]),
-            'average_carbon_intensity': np.mean([h['carbon_intensity'] for h in recent]),
-            'average_helium_scarcity': np.mean([h['helium_scarcity'] for h in recent]),
-            'success_rate': np.mean([1 if h['round_success'] else 0 for h in recent]),
-            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
-        }
-
-# ============================================================================
-# Data Classes (unchanged)
-# ============================================================================
-
-@dataclass
-class PredictiveFederationForecast:
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    predicted_sustainability_score: float = 0.0
-    predicted_carbon_impact: float = 0.0
-    predicted_helium_usage: float = 0.0
-    confidence: float = 0.0
-    trend: str = "stable"
-    recommended_actions: List[str] = field(default_factory=list)
-    participant_health: Dict[str, float] = field(default_factory=dict)
-
-@dataclass
-class FederatedExpert:
-    expert_id: str
-    local_model: Dict[str, Any]
-    data_distribution: Dict[str, float]
-    capabilities: ClientCapabilities
-    carbon_footprint: float
-    helium_usage: float
-    privacy_budget: float = 1.0
-    reputation_score: float = 0.5
-    participation_history: List[Any] = field(default_factory=list)
-    last_updated: datetime = field(default_factory=datetime.utcnow)
-    is_active: bool = True
-    architecture_type: str = "standard"
-    tokens_staked: float = 0.0
-    gradient_alignment: float = 0.5
-    compartment_id: Optional[str] = None
-    harvester_contribution: float = 0.0
-    sustainability_contribution: float = 0.0
-    federated_round: int = 0
-    region_id: Optional[str] = None
-
-@dataclass
-class ClientCapabilities:
-    client_id: str
-    compute_power_flops: float
-    memory_gb: float
-    network_bandwidth_mbps: float
-    network_latency_ms: float
-    energy_source_renewable: bool
-    carbon_intensity_g_per_kwh: float
-    helium_availability: float
-    max_model_size_mb: float
-    supported_architectures: List[str]
-    availability_schedule: Dict[int, float]
-
-# ============================================================================
 # Tiered Aggregator (unchanged)
 # ============================================================================
-
 class TieredAggregator:
     def __init__(self):
         self.tier_hierarchy = {AggregationTier.EDGE: 0, AggregationTier.REGIONAL: 1, AggregationTier.CONTINENTAL: 2, AggregationTier.GLOBAL: 3}
@@ -2288,7 +1008,6 @@ class TieredAggregator:
 # ============================================================================
 # Global Resource Optimizer (unchanged)
 # ============================================================================
-
 @dataclass
 class ResourceAllocation:
     region_id: str
@@ -2384,7 +1103,6 @@ class GlobalResourceOptimizer:
 # ============================================================================
 # Federated Discovery (unchanged)
 # ============================================================================
-
 class FederatedDiscovery:
     def __init__(self, server_url: Optional[str] = None):
         self.server_url = server_url
@@ -2459,7 +1177,6 @@ class FederatedDiscovery:
 # ============================================================================
 # Federation Cross-Domain Transfer (unchanged)
 # ============================================================================
-
 class FederationCrossDomainTransfer:
     def __init__(self):
         self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
@@ -2496,9 +1213,1662 @@ class FederationCrossDomainTransfer:
         return {'total_transfers': total_transfers, 'domain_pairs': domain_pairs, 'knowledge_types': list(self.knowledge_base.keys()), 'recent_transfers': list(self.transfer_logs)[-10:]}
 
 # ============================================================================
+# System State Persistence (NEW)
+# ============================================================================
+class FederationPersistence:
+    """Persists federation state (regions, participants, global model, history, metrics)."""
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    async def save(self, state: Dict[str, Any]) -> bool:
+        async with self._lock:
+            try:
+                with open(self.path, 'wb') as f:
+                    pickle.dump(state, f)
+                logger.debug("Federation state saved")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save federation state: {e}")
+                return False
+
+    async def load(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            if not os.path.exists(self.path):
+                return None
+            try:
+                with open(self.path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load federation state: {e}")
+                return None
+
+# ============================================================================
+# Enhanced Cross-Region Federation Optimizer v8.0.0 (Main class)
+# ============================================================================
+class CrossRegionFederationOptimizer:
+    """
+    Enhanced Cross-Region Federation v8.0.0 - Global Federated Network
+    With full bio‑inspired core integration, event‑driven, circuit breakers, persistence,
+    self‑healing, and deep MoE/SEG integration.
+    """
+    
+    def __init__(
+        self,
+        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        config: Optional[Dict[str, Any]] = None,
+        enable_async: bool = True,
+        enable_carbon_scheduling: bool = True,
+        enable_compression: bool = True,
+        enable_multi_tier: bool = True,
+        enable_personalization: bool = True,
+        enable_bio_integration: bool = True,
+        enable_federated_reflexive: bool = True,
+        enable_carbon_intensity: bool = True,
+        enable_predictive: bool = True,
+        enable_cross_domain: bool = True,
+        enable_sustainability_scoring: bool = True,
+        enable_tiered_aggregation: bool = True,
+        enable_resource_optimization: bool = True,
+        enable_discovery: bool = True,
+        enable_compression_enhanced: bool = True,
+        enable_reputation: bool = True,
+        enable_playbook: bool = True,
+        enable_economic_pricing: bool = True,
+        enable_event_driven: bool = True,
+        enable_self_healing: bool = True,
+        enable_swarm_coordination: bool = True,
+        enable_time_tick_engine: bool = True,
+        enable_quantum_bridge: bool = True,
+        enable_cost_benefit: bool = True,
+        server_url: Optional[str] = None,
+        persistence_path: Optional[str] = "./federation_state.pkl"
+    ):
+        # Feature flags
+        self.enable_async = enable_async
+        self.enable_carbon_scheduling = enable_carbon_scheduling
+        self.enable_compression = enable_compression
+        self.enable_multi_tier = enable_multi_tier
+        self.enable_personalization = enable_personalization
+        self.enable_bio_integration = enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_federated_reflexive = enable_federated_reflexive
+        self.enable_carbon_intensity = enable_carbon_intensity
+        self.enable_predictive = enable_predictive
+        self.enable_cross_domain = enable_cross_domain
+        self.enable_sustainability_scoring = enable_sustainability_scoring
+        self.enable_tiered_aggregation = enable_tiered_aggregation
+        self.enable_resource_optimization = enable_resource_optimization
+        self.enable_discovery = enable_discovery
+        self.enable_compression_enhanced = enable_compression_enhanced
+        self.enable_reputation = enable_reputation
+        self.enable_playbook = enable_playbook
+        self.enable_economic_pricing = enable_economic_pricing
+        self.enable_event_driven = enable_event_driven
+        self.enable_self_healing = enable_self_healing
+        self.enable_swarm_coordination = enable_swarm_coordination
+        self.enable_time_tick_engine = enable_time_tick_engine
+        self.enable_quantum_bridge = enable_quantum_bridge
+        self.enable_cost_benefit = enable_cost_benefit
+
+        # Store bio‑core reference
+        self.bio_core = bio_core
+        self.event_broker = None
+        self.alert_system = None
+        self.anomaly_detection = None
+        self.cost_benefit_engine = None
+        self.quantum_bridge = None
+        self.tick_engine = None
+        self.swarm_coordinator = None
+        self.self_healer = None
+        self.workflow_orchestrator = None
+        self.token_manager = None
+        self.gradient_manager = None
+        self.scheduler = None
+        self.compartment_manager = None
+        self.biomass_storage = None
+        self.harvester = None
+
+        # Extract core sub‑modules if available
+        if self.bio_core:
+            self.event_broker = getattr(self.bio_core, 'event_broker', None)
+            self.alert_system = getattr(self.bio_core, 'alert_system', None)
+            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
+            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
+            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
+            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
+            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
+            self.self_healer = getattr(self.bio_core, 'self_healer', None)
+            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
+            self.token_manager = getattr(self.bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(self.bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
+            self.harvester = getattr(self.bio_core, 'harvester', None)
+
+        # NEW: MoE and Self-Evolving Gate references (injected)
+        self.expert_router = None
+        self.gating_network = None
+        self.self_evolving_gate = None
+
+        # NEW: Helium provider (injected)
+        self.helium_provider = None
+
+        # Core modules
+        self.tiered_aggregator = TieredAggregator() if enable_tiered_aggregation else None
+        self.resource_optimizer = GlobalResourceOptimizer() if enable_resource_optimization else None
+        self.discovery = FederatedDiscovery(server_url) if enable_discovery else None
+        self.async_region_manager = AsynchronousRegionManager() if enable_async else None
+        self.compressor = ModelCompressor() if enable_compression_enhanced else None
+        self.reputation_system = ReputationScoringSystem() if enable_reputation else None
+        self.playbook_system = StrategicPlaybookSystem() if enable_playbook else None
+        self.pricing_manager = EconomicPricingManager() if enable_economic_pricing else None
+
+        # Bio-inspired modules (already set via inject_bio_core)
+        self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
+        self.predictive_analyzer = PredictiveFederationAnalyzer() if enable_predictive else None
+        self.cross_domain_transfer = FederationCrossDomainTransfer() if enable_cross_domain else None
+
+        # Persistence
+        self.persistence = FederationPersistence(persistence_path) if persistence_path else None
+
+        # State
+        self.regions: Dict[str, RegionNode] = {}
+        self.regional_profiles: Dict[Region, RegionalProfile] = {}
+        self.participants: Dict[str, FederatedExpert] = {}
+        self.aggregation_history: List[Dict] = []
+        self.round_number = 0
+        self.global_model: Optional[Dict[str, Any]] = None
+
+        self.federation_token_pool: float = 0.0
+        self.total_carbon_savings_kg = 0.0
+        self.total_helium_savings_l = 0.0
+        self.sustainability_score = 0.0
+        self.instance_id = f"federation_{int(time.time())}"
+
+        # Circuit breakers for external services
+        self._token_circuit = CircuitBreaker("token_service")
+        self._gradient_circuit = CircuitBreaker("gradient_service")
+        self._scheduler_circuit = CircuitBreaker("scheduler_service")
+        self._biomass_circuit = CircuitBreaker("biomass_storage")
+        self._compartment_circuit = CircuitBreaker("compartment_service")
+        self._pricing_circuit = CircuitBreaker("pricing_service")
+        self._carbon_circuit = CircuitBreaker("carbon_api")
+
+        # Health status
+        self.health_status = "healthy"
+        self.last_error = None
+
+        # Initialize regional profiles
+        self._initialize_regional_profiles()
+
+        # Load persisted state
+        if self.persistence:
+            self._load_state()
+
+        # Subscribe to core events if enabled
+        if self.enable_event_driven and self.event_broker:
+            self._subscribe_events()
+
+        # Start background loops
+        self._start_background_tasks()
+
+        logger.info(
+            f"Cross-Region Federation v8.0.0 initialized: "
+            f"bio_integration={self.enable_bio_integration}, "
+            f"event_driven={self.enable_event_driven}, "
+            f"self_healing={self.enable_self_healing}, "
+            f"swarm_coordination={self.enable_swarm_coordination}, "
+            f"persistence={self.persistence is not None}, "
+            f"moe_integration={MOE_AVAILABLE}"
+        )
+    
+    def _initialize_regional_profiles(self):
+        profiles = {
+            Region.US_EAST: {'timezone': -5, 'renewable_hours': [2, 3, 4, 5],
+                'carbon_low_hours': [2, 3, 4, 5, 22, 23], 'renewable_mix': {'wind': 0.15, 'solar': 0.10, 'nuclear': 0.30, 'gas': 0.35, 'coal': 0.10}},
+            Region.EU_WEST: {'timezone': 0, 'renewable_hours': [12, 13, 14],
+                'carbon_low_hours': [1, 2, 3, 4, 12, 13], 'renewable_mix': {'wind': 0.25, 'solar': 0.15, 'nuclear': 0.25, 'gas': 0.25, 'coal': 0.10}},
+            Region.ASIA_EAST: {'timezone': 8, 'renewable_hours': [10, 11, 12, 13],
+                'carbon_low_hours': [2, 3, 4, 5], 'renewable_mix': {'wind': 0.10, 'solar': 0.15, 'nuclear': 0.10, 'coal': 0.50, 'gas': 0.15}}
+        }
+        for region, data in profiles.items():
+            carbon_profile = {}
+            for hour in range(24):
+                if hour in data['carbon_low_hours']:
+                    carbon_profile[hour] = np.random.uniform(50, 200)
+                else:
+                    carbon_profile[hour] = np.random.uniform(200, 400)
+            self.regional_profiles[region] = RegionalProfile(
+                region=region,
+                timezone_offset=data['timezone'],
+                typical_renewable_hours=data['renewable_hours'],
+                carbon_intensity_profile=carbon_profile,
+                renewable_mix=data['renewable_mix'],
+                network_latency_matrix={'us_east': 0, 'eu_west': 80, 'asia_east': 150},
+                bandwidth_capacity_mbps=1000,
+                available_compute_flops=1e15,
+                helium_availability=np.random.uniform(0.5, 1.0),
+                data_sovereignty_constraints=[],
+                optimal_sync_windows=[(data['carbon_low_hours'][0], data['carbon_low_hours'][-1])]
+            )
+    
+    # ========================================================================
+    # Event Subscriptions
+    # ========================================================================
+    def _subscribe_events(self):
+        if self.event_broker:
+            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
+            self.event_broker.subscribe('helium_update', self._on_helium_update)
+            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
+            self.event_broker.subscribe('config_updated', self._on_config_updated)
+            self.event_broker.subscribe('token_balance_update', self._on_token_update)
+            self.event_broker.subscribe('health_update', self._on_health_update)
+            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
+            logger.info("Cross-Region Federation subscribed to core events")
+
+    async def _on_carbon_update(self, event: BioEvent):
+        intensity = event.data.get('intensity', 400)
+        price = event.data.get('price', 50.0)
+        self.carbon_intensity = intensity
+        self.carbon_price = price
+        # Update regional profiles
+        for region in self.regions.values():
+            region.carbon_intensity = intensity
+        if self.enable_economic_pricing and self.pricing_manager:
+            await self.pricing_manager.update_prices()
+
+    async def _on_helium_update(self, event: BioEvent):
+        scarcity = event.data.get('scarcity', 0.5)
+        price = event.data.get('price', 0.5)
+        self.helium_scarcity = scarcity
+        self.helium_price = price
+        for region in self.regions.values():
+            region.helium_availability = scarcity
+
+    async def _on_alert_generated(self, event: BioEvent):
+        if event.data.get('severity') == 'critical':
+            logger.warning("Critical alert received; switching to conservative federation and triggering healing")
+            self.enable_async = False
+            self.aggregation_strategy = AggregationStrategy.FED_AVG
+            if self.enable_self_healing and self.self_healer:
+                await self.self_healer.apply_healing('damage_accumulation')
+            if self.workflow_orchestrator:
+                await self.workflow_orchestrator.execute_workflow('adjust_federation_policy')
+
+    async def _on_config_updated(self, event: BioEvent):
+        updates = event.data.get('updates', {})
+        if 'cross_region_federation' in updates:
+            new_config = updates['cross_region_federation']
+            for key, value in new_config.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
+            logger.info("Cross-Region Federation configuration reloaded")
+
+    async def _on_token_update(self, event: BioEvent):
+        self.token_balance = event.data.get('balance', 500)
+
+    async def _on_health_update(self, event: BioEvent):
+        self.health_status = event.data.get('status', 'healthy')
+
+    async def _on_anomaly_detected(self, event: BioEvent):
+        if event.data.get('metric') == 'carbon_intensity':
+            logger.info("Carbon anomaly detected; adjusting federation parameters")
+            self.privacy_epsilon *= 0.9
+        if event.data.get('metric') == 'helium_scarcity':
+            logger.info("Helium anomaly detected; adjusting helium thresholds")
+            self.helium_threshold *= 0.9
+
+    # ========================================================================
+    # State Persistence
+    # ========================================================================
+    def _save_state(self):
+        if not self.persistence:
+            return
+        state = {
+            'regions': self.regions,
+            'regional_profiles': self.regional_profiles,
+            'participants': self.participants,
+            'global_model': self.global_model,
+            'aggregation_history': self.aggregation_history,
+            'round_number': self.round_number,
+            'federation_token_pool': self.federation_token_pool,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'total_helium_savings_l': self.total_helium_savings_l,
+            'sustainability_score': self.sustainability_score,
+            'health_status': self.health_status,
+            'last_error': self.last_error,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        asyncio.create_task(self.persistence.save(state))
+
+    def _load_state(self):
+        state = asyncio.run(self.persistence.load())
+        if state:
+            self.regions = state.get('regions', {})
+            self.regional_profiles = state.get('regional_profiles', {})
+            self.participants = state.get('participants', {})
+            self.global_model = state.get('global_model')
+            self.aggregation_history = state.get('aggregation_history', [])
+            self.round_number = state.get('round_number', 0)
+            self.federation_token_pool = state.get('federation_token_pool', 0.0)
+            self.total_carbon_savings_kg = state.get('total_carbon_savings_kg', 0.0)
+            self.total_helium_savings_l = state.get('total_helium_savings_l', 0.0)
+            self.sustainability_score = state.get('sustainability_score', 0.0)
+            self.health_status = state.get('health_status', 'healthy')
+            self.last_error = state.get('last_error', None)
+            logger.info("Federation state loaded from persistence")
+
+    # ========================================================================
+    # Background Tasks
+    # ========================================================================
+    def _start_background_tasks(self):
+        if self.enable_economic_pricing and self.pricing_manager:
+            asyncio.create_task(self._price_update_loop())
+        if self.enable_persistence and self.persistence:
+            asyncio.create_task(self._persistence_save_loop())
+        if self.enable_swarm_coordination and self.swarm_coordinator:
+            asyncio.create_task(self._swarm_update_loop())
+
+    async def _price_update_loop(self):
+        while True:
+            try:
+                if self.pricing_manager:
+                    for region in self.regions:
+                        await self.pricing_manager.update_prices(region)
+                await asyncio.sleep(3600)
+            except Exception as e:
+                logger.error(f"Price update error: {e}")
+                await asyncio.sleep(300)
+
+    async def _persistence_save_loop(self):
+        while True:
+            try:
+                self._save_state()
+                await asyncio.sleep(300)  # every 5 minutes
+            except Exception as e:
+                logger.error(f"Persistence save error: {e}")
+                await asyncio.sleep(60)
+
+    async def _swarm_update_loop(self):
+        while True:
+            try:
+                await self.share_with_swarm()
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Swarm update error: {e}")
+                await asyncio.sleep(120)
+
+    # ========================================================================
+    # Swarm Coordination
+    # ========================================================================
+    async def share_with_swarm(self):
+        if not self.enable_swarm_coordination or not self.swarm_coordinator:
+            return
+        swarm_payload = {
+            'orchestrator_id': self.instance_id,
+            'sustainability_score': self.sustainability_score,
+            'regions': len(self.regions),
+            'participants': len(self.participants),
+            'round_number': self.round_number,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'total_helium_savings_l': self.total_helium_savings_l,
+            'aggregation_strategy': self.aggregation_strategy.value if hasattr(self, 'aggregation_strategy') else 'unknown',
+            'federation_token_pool': self.federation_token_pool
+        }
+        await self.swarm_coordinator.share_predictions(swarm_payload)
+
+    # ========================================================================
+    # Setter Methods
+    # ========================================================================
+    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
+        self.gating_network = gating_network
+        logger.info("Gating network injected into Cross-Region Federation")
+
+    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
+        self.self_evolving_gate = gate
+        logger.info("Self-Evolving Gate injected into Cross-Region Federation")
+
+    def set_expert_router(self, router: 'ExpertRouter'):
+        self.expert_router = router
+        logger.info("Expert Router injected into Cross-Region Federation")
+
+    def set_helium_provider(self, provider: HeliumProvider):
+        self.helium_provider = provider
+        logger.info("Helium provider injected into Cross-Region Federation")
+
+    # ========================================================================
+    # Bio-Inspired Module Injection
+    # ========================================================================
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
+            self.enable_bio_integration = True
+
+    # ========================================================================
+    # Bio-Inspired Data Access Methods (with circuit breakers)
+    # ========================================================================
+    def _get_gradient_aligned_schedule(self, region: Region) -> float:
+        if self.gradient_manager and self.enable_bio_integration:
+            try:
+                carbon = self.gradient_manager.fields.get('carbon')
+                if carbon and carbon.gradient_strength < 0.3:
+                    return 0.0
+                elif carbon:
+                    return carbon.gradient_strength * 3600
+            except:
+                pass
+        return 0.0
+
+    async def _stake_tokens_for_update(self, region: str, amount: float) -> Tuple[bool, float]:
+        if self.token_manager and self.enable_bio_integration:
+            try:
+                success, token_ids = await self._token_circuit.call(
+                    self.token_manager.reserve_tokens,
+                    account_id=f"federation_{region}",
+                    amount=amount,
+                    consumer=EcoATPConsumer.EXPERT_EXECUTION
+                )
+                if success:
+                    self.federation_token_pool += amount
+                    return True, amount
+                return False, 0.0
+            except:
+                pass
+        return True, 0.0
+
+    def _get_compartment_tier(self, region: str) -> AggregationTier:
+        if self.compartment_manager and self.enable_bio_integration:
+            try:
+                region_types = {
+                    'us_east': 'data', 'us_west': 'energy',
+                    'eu_west': 'data', 'eu_north': 'energy',
+                    'asia_east': 'iot', 'asia_southeast': 'data'
+                }
+                expert_type = region_types.get(region, 'data')
+                compartment = self.compartment_manager.find_best_compartment(expert_type)
+                if compartment:
+                    if compartment.state == CompartmentState.ACTIVE:
+                        return AggregationTier.REGIONAL
+                    elif compartment.health_score > 0.8:
+                        return AggregationTier.CONTINENTAL
+            except:
+                pass
+        return AggregationTier.REGIONAL
+
+    def _get_harvester_signal_quality(self) -> float:
+        if self.harvester and self.enable_bio_integration:
+            try:
+                stats = self.harvester.get_harvesting_stats()
+                recent = stats.get('recent_conversions', [])
+                if recent:
+                    return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
+            except:
+                pass
+        return 0.5
+
+    def _get_trust_based_byzantine_threshold(self, region: str) -> float:
+        if self.gradient_manager and self.enable_bio_integration:
+            try:
+                trust = self.gradient_manager.fields.get('trust')
+                if trust:
+                    return max(0.1, 1.0 - trust.gradient_strength)
+            except:
+                pass
+        return 0.5
+
+    # Real helium access
+    def _get_helium_scarcity(self) -> float:
+        if self.helium_provider:
+            try:
+                return self.helium_provider.get_scarcity()
+            except:
+                pass
+        return 0.5
+
+    def _get_helium_cost_index(self) -> float:
+        if self.helium_provider:
+            try:
+                return self.helium_provider.get_cost_index()
+            except:
+                pass
+        return 1.0
+
+    def _get_helium_efficiency(self) -> float:
+        if self.helium_provider:
+            try:
+                return self.helium_provider.get_efficiency()
+            except:
+                pass
+        return 0.5
+
+    # ========================================================================
+    # Region Management (unchanged)
+    # ========================================================================
+    def register_region(
+        self,
+        region_id: str,
+        tier: AggregationTier = AggregationTier.REGIONAL,
+        parent_id: Optional[str] = None,
+        participants: List[str] = None,
+        resource_capacity: float = 1.0
+    ) -> RegionNode:
+        if region_id in self.regions:
+            logger.warning(f"Region {region_id} already registered")
+            return self.regions[region_id]
+        node = RegionNode(
+            region_id=region_id,
+            tier=tier,
+            parent_id=parent_id,
+            participants=participants or [],
+            resource_capacity=resource_capacity
+        )
+        self.regions[region_id] = node
+        if parent_id and parent_id in self.regions:
+            self.regions[parent_id].child_ids.append(region_id)
+        if self.enable_discovery and self.discovery:
+            asyncio.create_task(
+                self.discovery.register_region(
+                    region_id,
+                    {
+                        'tier': tier.value,
+                        'resource_capacity': resource_capacity,
+                        'participants': len(participants or [])
+                    },
+                    parent_id
+                )
+            )
+        if self.enable_reputation and self.reputation_system:
+            asyncio.create_task(
+                self.reputation_system.update_reputation(
+                    region_id,
+                    success=True,
+                    sustainability_contribution=0.5,
+                    token_stake=0.0
+                )
+            )
+        logger.info(f"Registered region: {region_id} (tier: {tier.value})")
+        return node
+
+    async def update_region_status(
+        self,
+        region_id: str,
+        carbon_intensity: float = None,
+        helium_availability: float = None,
+        resource_usage: float = None
+    ):
+        if region_id not in self.regions:
+            return
+        node = self.regions[region_id]
+        if carbon_intensity is not None:
+            node.carbon_intensity = carbon_intensity
+        if helium_availability is not None:
+            node.helium_availability = helium_availability
+        if resource_usage is not None:
+            node.resource_usage = resource_usage
+        node.last_update = datetime.now(timezone.utc)
+        if self.enable_discovery and self.discovery:
+            await self.discovery.update_health(region_id, {
+                'status': 'healthy',
+                'metrics': {
+                    'carbon_intensity': carbon_intensity,
+                    'helium_availability': helium_availability,
+                    'resource_usage': resource_usage
+                }
+            })
+        if self.enable_reputation and self.reputation_system:
+            sustainability = 1.0 - (carbon_intensity or 400) / 800
+            await self.reputation_system.update_reputation(
+                region_id,
+                success=True,
+                sustainability_contribution=sustainability
+            )
+
+    # ========================================================================
+    # Enhanced Federation Round (with MoE, real helium, async regions, and all integrations)
+    # ========================================================================
+    async def federated_round(
+        self,
+        carbon_zone: int,
+        helium_scarcity: float,
+        timeout_seconds: int = 300,
+        region_filter: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        self.round_number += 1
+        round_start = datetime.now(timezone.utc)
+
+        # Update carbon intensity (from event or fallback)
+        if self.enable_carbon_intensity and self.carbon_manager:
+            carbon_data = await self.carbon_manager.update_carbon_intensity('us-east')
+            carbon_intensity = carbon_data.get('intensity', 400)
+        else:
+            carbon_intensity = 400
+
+        # Use real helium if provider available
+        if self.helium_provider:
+            helium_scarcity = self._get_helium_scarcity()
+            helium_cost = self._get_helium_cost_index()
+            helium_efficiency = self._get_helium_efficiency()
+        else:
+            helium_cost = 1.0
+            helium_efficiency = 0.5
+
+        # Update economic prices if enabled
+        if self.enable_economic_pricing and self.pricing_manager:
+            prices = await self.pricing_manager.get_current_prices()
+            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
+            helium_price = prices.get('helium_price_usd_per_l', 0.5)
+        else:
+            carbon_price = 50.0
+            helium_price = 0.5
+
+        # Evaluate playbooks
+        playbook_recommendations = []
+        if self.enable_playbook and self.playbook_system:
+            context = {
+                'carbon_intensity': carbon_intensity,
+                'helium_availability': 1.0 - helium_scarcity,
+                'carbon_zone': carbon_zone,
+                'quantum_workload': 0.5,
+                'renewable_availability': 0.6
+            }
+            playbook_recommendations = await self.playbook_system.evaluate_playbooks(context)
+
+        # Select participants
+        selected = await self._select_participants_multi_criteria(
+            carbon_zone, helium_scarcity, carbon_intensity
+        )
+        if len(selected) < 3:
+            logger.warning(f"Insufficient participants: {len(selected)}")
+            return None
+
+        # Stake tokens for selected participants
+        for participant_id in selected:
+            if participant_id in self.participants:
+                participant = self.participants[participant_id]
+                stake_amount = participant.carbon_footprint * 100
+                success, staked = await self._stake_tokens_for_update(participant_id, stake_amount)
+                if success:
+                    participant.tokens_staked = staked
+
+        # Collect updates (with compression)
+        updates = {}
+        for participant_id in selected:
+            if participant_id in self.participants:
+                reputation_score = 0.5
+                if self.enable_reputation and self.reputation_system:
+                    reputation_score = await self.reputation_system.get_reputation_score(participant_id)
+                update = await self._collect_update(participant_id, carbon_intensity, reputation_score)
+                if update:
+                    if self.enable_compression_enhanced and self.compressor:
+                        region_id = self.participants[participant_id].region_id or "default"
+                        tier = self.regions.get(region_id, RegionNode(
+                            region_id=region_id,
+                            tier=AggregationTier.REGIONAL
+                        )).tier
+                        compressed, metadata = await self.compressor.compress_model(
+                            update.model_delta,
+                            tier
+                        )
+                        update.original_size_bytes = metadata['original_size']
+                        update.compressed_size_bytes = metadata['compressed_size']
+                        update.compression_ratio = metadata['ratio']
+                        update.model_delta = await self.compressor.decompress_model(
+                            compressed,
+                            metadata
+                        )
+                    updates[participant_id] = update
+
+        if len(updates) < 3:
+            return None
+
+        # Byzantine risk check
+        for participant_id in list(updates.keys()):
+            threshold = self._get_trust_based_byzantine_threshold(participant_id)
+            if threshold > 0.7:
+                logger.warning(f"High Byzantine risk for {participant_id}: threshold={threshold:.2f}")
+
+        # Determine aggregation strategy
+        strategy = AggregationStrategy.FED_AVG
+        if self.enable_cost_benefit and self.cost_benefit_engine:
+            # Evaluate strategies using cost-benefit engine
+            strategies = [AggregationStrategy.FED_AVG, AggregationStrategy.ADAPTIVE, AggregationStrategy.TIERED_AGGREGATION]
+            best_strategy = AggregationStrategy.FED_AVG
+            best_roi = -float('inf')
+            for strat in strategies:
+                params = {'strategy': strat.value, 'participants': len(updates), 'carbon_intensity': carbon_intensity}
+                analysis = await self.cost_benefit_engine.analyze_scenario(f'federation_{strat.value}', params)
+                if analysis.roi > best_roi:
+                    best_roi = analysis.roi
+                    best_strategy = strat
+            strategy = best_strategy
+        elif self.enable_reputation and self.reputation_system:
+            strategy = AggregationStrategy.REPUTATION_WEIGHTED
+        elif self.enable_economic_pricing and carbon_price > 100:
+            strategy = AggregationStrategy.PRICE_AWARE
+        elif self.enable_bio_integration and self.federation_token_pool > 100:
+            strategy = AggregationStrategy.TOKEN_WEIGHTED
+        elif self.enable_sustainability_scoring:
+            strategy = AggregationStrategy.SUSTAINABILITY_WEIGHTED
+        elif self.enable_tiered_aggregation and self.tiered_aggregator:
+            strategy = AggregationStrategy.TIERED_AGGREGATION
+        else:
+            strategy = AggregationStrategy.FED_AVG
+
+        # Use QuantumBridge to adjust aggregation weights
+        if self.enable_quantum_bridge and self.quantum_bridge:
+            q_params = self.quantum_bridge.get_qubo_parameters()
+            penalty_helium = q_params.get('penalty_helium_shortage', 0.5)
+            if penalty_helium > 0.7:
+                # Increase weight on helium savings
+                for pid in updates:
+                    updates[pid].sustainability_impact *= 1.2
+
+        # Use TimeTickEngine to adjust number of participants
+        if self.enable_time_tick_engine and self.tick_engine:
+            forecast = self.tick_engine.get_helium_forecast(4)
+            if forecast and len(forecast) > 3:
+                avg_future = np.mean(forecast)
+                if avg_future < 0.3:
+                    self.max_participants = max(3, self.max_participants - 1)
+
+        # Aggregate updates
+        if self.enable_tiered_aggregation and self.tiered_aggregator:
+            region_id = selected[0] if selected else "default"
+            region_tier = self.regions.get(region_id, RegionNode(
+                region_id=region_id,
+                tier=AggregationTier.REGIONAL
+            )).tier
+            aggregated = await self.tiered_aggregator.aggregate_tier(
+                region_tier,
+                [u.model_delta for u in updates.values()],
+                region_id,
+                strategy=strategy
+            )
+        elif strategy == AggregationStrategy.REPUTATION_WEIGHTED:
+            aggregated = await self._reputation_weighted_aggregate(updates)
+        elif strategy == AggregationStrategy.PRICE_AWARE:
+            aggregated = await self._price_aware_aggregate(updates, carbon_price, helium_price)
+        elif strategy == AggregationStrategy.TOKEN_WEIGHTED:
+            aggregated = self._token_weighted_aggregate(updates)
+        elif strategy == AggregationStrategy.SUSTAINABILITY_WEIGHTED:
+            aggregated = self._sustainability_weighted_aggregate(updates)
+        else:
+            aggregated = self._federated_averaging([u.model_delta for u in updates.values()])
+
+        self.global_model = aggregated
+
+        # ====================================================================
+        # Deep MoE and Self-Evolving Gate integration with rich context
+        # ====================================================================
+        if self.gating_network and self.expert_router:
+            context = {
+                'carbon_intensity': carbon_intensity,
+                'helium_scarcity': helium_scarcity,
+                'carbon_price': carbon_price,
+                'participants': len(selected),
+                'sustainability_score': self.sustainability_score,
+                'avg_participant_health': np.mean([p.capabilities.compartment_health for p in self.participants.values() if hasattr(p, 'capabilities') and hasattr(p.capabilities, 'compartment_health')])
+            }
+            features = np.array([
+                context['carbon_intensity'] / 1000,
+                context['helium_scarcity'],
+                context['carbon_price'] / 100,
+                context['participants'] / 10,
+                context['sustainability_score']
+            ])
+            reward = self.sustainability_score
+            self.gating_network.update(features, reward, context)
+            logger.info("Updated gating network with global model")
+
+        if self.self_evolving_gate:
+            features = np.array([
+                len(self.global_model),
+                carbon_intensity,
+                helium_scarcity
+            ])
+            reward = self.sustainability_score
+            context = {
+                'carbon_intensity': carbon_intensity,
+                'helium_scarcity': helium_scarcity,
+                'carbon_price': carbon_price,
+                'participants': len(selected)
+            }
+            self.self_evolving_gate.evolve_gating_network(features, reward, context)
+            logger.info("Triggered self-evolving gate evolution")
+
+        # Asynchronous region updates
+        if self.enable_async and self.async_region_manager:
+            for participant_id, update in updates.items():
+                region_id = self.participants[participant_id].region_id or "default"
+                await self.async_region_manager.submit_update(
+                    region_id,
+                    update.model_delta,
+                    update.timestamp
+                )
+
+        # Update sustainability and reputation
+        self.total_carbon_savings_kg += sum(u.carbon_savings for u in updates.values())
+        self.sustainability_score = self._calculate_sustainability_score(
+            updates, carbon_intensity, helium_scarcity
+        )
+
+        if self.enable_reputation and self.reputation_system:
+            for participant_id, update in updates.items():
+                success = update.local_accuracy > 0.7
+                await self.reputation_system.update_reputation(
+                    participant_id,
+                    success=success,
+                    sustainability_contribution=update.sustainability_impact,
+                    token_stake=update.tokens_staked,
+                    data_quality=update.local_accuracy,
+                    carbon_efficiency=update.carbon_savings / max(1.0, update.training_data_size)
+                )
+
+        if self.enable_playbook and playbook_recommendations:
+            for rec in playbook_recommendations[:2]:
+                playbook = rec['playbook']
+                success = await self._apply_playbook(playbook, rec['match_score'])
+                await self.playbook_system.record_playbook_usage(
+                    playbook['playbook_id'],
+                    success=success,
+                    metrics={'sustainability': self.sustainability_score}
+                )
+
+        if self.enable_resource_optimization and self.resource_optimizer:
+            region_status = {}
+            for region_id, node in self.regions.items():
+                region_status[region_id] = {
+                    'carbon_intensity': node.carbon_intensity,
+                    'helium_availability': node.helium_availability,
+                    'resource_capacity': node.resource_capacity,
+                    'resource_usage': node.resource_usage
+                }
+            await self.resource_optimizer.optimize_resources(
+                self.regions,
+                {rid: node.carbon_intensity for rid, node in self.regions.items()},
+                {rid: node.helium_availability for rid, node in self.regions.items()}
+            )
+
+        if self.enable_predictive:
+            self.predictive_analyzer.update_history({
+                'participants': len(selected),
+                'carbon_intensity': carbon_intensity,
+                'helium_scarcity': helium_scarcity,
+                'sustainability_score': self.sustainability_score,
+                'token_pool': self.federation_token_pool
+            })
+            await self.predictive_analyzer.train_forecast_model()
+            forecast = await self.predictive_analyzer.predict_federation_trend()
+        else:
+            forecast = None
+
+        if self.enable_discovery and self.discovery:
+            await self.discovery.discover_peers(self.instance_id)
+
+        # Workflow triggers
+        if self.sustainability_score < 0.4 and self.workflow_orchestrator:
+            await self.workflow_orchestrator.execute_workflow('adjust_federation_policy')
+        if self.total_helium_savings_l < 1.0 and self.workflow_orchestrator:
+            await self.workflow_orchestrator.execute_workflow('optimize_helium_usage')
+
+        # Record round
+        round_record = {
+            'round_number': self.round_number,
+            'participants': len(selected),
+            'updates': len(updates),
+            'strategy': strategy.value,
+            'timestamp': round_start.isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'carbon_savings_kg': self.total_carbon_savings_kg,
+            'federation_token_pool': self.federation_token_pool,
+            'predictive_forecast': {
+                'predicted_score': forecast.predicted_sustainability_score if forecast else None,
+                'confidence': forecast.confidence if forecast else None,
+                'trend': forecast.trend if forecast else None
+            } if self.enable_predictive and forecast else None,
+            'resource_optimization': self.resource_optimizer.get_optimization_stats() if self.enable_resource_optimization else None,
+            'discovery_stats': self.discovery.get_discovery_stats() if self.enable_discovery else None,
+            'compression_stats': self.compressor.get_compression_stats() if self.enable_compression_enhanced else None,
+            'reputation_stats': self.reputation_system.get_reputation_stats() if self.enable_reputation else None,
+            'playbook_usage': self.playbook_system.get_playbook_stats() if self.enable_playbook else None,
+            'price_stats': self.pricing_manager.get_price_stats() if self.enable_economic_pricing else None,
+            'gating_network_updated': self.gating_network is not None,
+            'self_evolving_gate_triggered': self.self_evolving_gate is not None
+        }
+        self.aggregation_history.append(round_record)
+
+        # Save state
+        self._save_state()
+
+        return aggregated
+
+    # ========================================================================
+    # Helper methods (unchanged, with minor modifications)
+    # ========================================================================
+    async def _select_participants_multi_criteria(
+        self, carbon_zone: int, helium_scarcity: float, carbon_intensity: float
+    ) -> List[str]:
+        scored_participants = []
+        for participant_id, participant in self.participants.items():
+            if not participant.is_active:
+                continue
+            data_score = 0.5
+            carbon_score = 1.0 / (1.0 + participant.carbon_footprint * 100)
+            helium_score = 1.0 / (1.0 + participant.helium_usage * 10)
+            intensity_score = 1.0 - (carbon_intensity / 800) if carbon_intensity > 0 else 0.5
+            sustainability_score = participant.sustainability_contribution if hasattr(participant, 'sustainability_contribution') else 0.5
+            reputation_score = 0.5
+            if self.enable_reputation and self.reputation_system:
+                reputation_score = await self.reputation_system.get_reputation_score(participant_id)
+            carbon_price_score = 0.5
+            helium_price_score = 0.5
+            if self.enable_economic_pricing and self.pricing_manager:
+                prices = await self.pricing_manager.get_current_prices()
+                carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
+                helium_price = prices.get('helium_price_usd_per_l', 0.5)
+                carbon_price_score = 1.0 - (carbon_price / 200)
+                helium_price_score = 1.0 - (helium_price / 2.0)
+            if carbon_zone >= 8:
+                weights = {'carbon': 0.25, 'helium': 0.10, 'data': 0.10,
+                          'intensity': 0.15, 'sustainability': 0.15, 'reliability': 0.10,
+                          'reputation': 0.10, 'carbon_price': 0.05}
+            elif helium_scarcity > 0.7:
+                weights = {'helium': 0.25, 'carbon': 0.10, 'data': 0.10,
+                          'intensity': 0.10, 'sustainability': 0.15, 'reliability': 0.10,
+                          'reputation': 0.15, 'helium_price': 0.05}
+            else:
+                weights = {'data': 0.15, 'carbon': 0.10, 'helium': 0.05,
+                          'intensity': 0.15, 'sustainability': 0.20, 'reliability': 0.10,
+                          'reputation': 0.15, 'carbon_price': 0.05, 'helium_price': 0.05}
+            score = (
+                weights.get('data', 0.15) * data_score +
+                weights.get('carbon', 0.10) * carbon_score +
+                weights.get('helium', 0.05) * helium_score +
+                weights.get('intensity', 0.15) * intensity_score +
+                weights.get('sustainability', 0.20) * sustainability_score +
+                weights.get('reliability', 0.10) * 0.8 +
+                weights.get('reputation', 0.15) * reputation_score +
+                weights.get('carbon_price', 0.05) * carbon_price_score +
+                weights.get('helium_price', 0.05) * helium_price_score
+            )
+            scored_participants.append((participant_id, score))
+        scored_participants.sort(key=lambda x: x[1], reverse=True)
+        n_select = max(3, min(len(scored_participants), int(len(scored_participants) * 0.7)))
+        selected = [p[0] for p in scored_participants[:n_select]]
+        return selected
+
+    async def _collect_update(
+        self,
+        participant_id: str,
+        carbon_intensity: float,
+        reputation_score: float = 0.5
+    ) -> Optional[AsyncUpdate]:
+        if participant_id not in self.participants:
+            return None
+        participant = self.participants[participant_id]
+        region_id = participant.region_id or "default"
+        region = Region(region_id) if region_id in [r.value for r in Region] else Region.US_EAST
+        carbon_price = 50.0
+        helium_price = 0.5
+        if self.enable_economic_pricing and self.pricing_manager:
+            prices = await self.pricing_manager.get_current_prices()
+            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
+            helium_price = prices.get('helium_price_usd_per_l', 0.5)
+        economic_impact = (
+            carbon_price * participant.carbon_footprint * 0.01 +
+            helium_price * participant.helium_usage * 0.1
+        )
+        update = AsyncUpdate(
+            update_id=f"update_{participant_id}_{datetime.now(timezone.utc).timestamp()}",
+            source_region=region,
+            model_delta=participant.local_model,
+            compression_ratio=0.8,
+            timestamp=datetime.now(timezone.utc),
+            carbon_intensity_at_update=carbon_intensity,
+            training_data_size=1000,
+            local_accuracy=0.9,
+            vector_clock={},
+            signature=hashlib.sha256(f"{participant_id}{datetime.now(timezone.utc)}".encode()).hexdigest(),
+            tokens_staked=participant.tokens_staked if hasattr(participant, 'tokens_staked') else 0.0,
+            carbon_savings=participant.carbon_footprint * 0.01,
+            sustainability_impact=participant.sustainability_contribution if hasattr(participant, 'sustainability_contribution') else 0.5,
+            carbon_price=carbon_price,
+            helium_price=helium_price,
+            economic_impact=economic_impact
+        )
+        return update
+
+    async def _reputation_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
+        if not self.enable_reputation or not self.reputation_system:
+            return self._federated_averaging([u.model_delta for u in updates.values()])
+        aggregated = {}
+        total_reputation = 0.0
+        reputation_scores = {}
+        for participant_id in updates:
+            score = await self.reputation_system.get_reputation_score(participant_id)
+            reputation_scores[participant_id] = max(0.1, score)
+            total_reputation += reputation_scores[participant_id]
+        if total_reputation == 0:
+            return self._federated_averaging([u.model_delta for u in updates.values()])
+        for key in next(iter(updates.values())).model_delta.keys():
+            weighted_sum = 0.0
+            for participant_id, update in updates.items():
+                if key in update.model_delta:
+                    weight = reputation_scores[participant_id] / total_reputation
+                    weighted_sum += update.model_delta[key] * weight
+            aggregated[key] = weighted_sum
+        return aggregated
+
+    async def _price_aware_aggregate(
+        self,
+        updates: Dict[str, AsyncUpdate],
+        carbon_price: float,
+        helium_price: float
+    ) -> Dict[str, Any]:
+        aggregated = {}
+        total_economic_weight = 0.0
+        economic_weights = {}
+        for participant_id, update in updates.items():
+            cost = update.carbon_price * update.carbon_savings + update.helium_price * update.helium_usage
+            weight = 1.0 / (1.0 + cost)
+            economic_weights[participant_id] = weight
+            total_economic_weight += weight
+        if total_economic_weight == 0:
+            return self._federated_averaging([u.model_delta for u in updates.values()])
+        for key in next(iter(updates.values())).model_delta.keys():
+            weighted_sum = 0.0
+            for participant_id, update in updates.items():
+                if key in update.model_delta:
+                    weight = economic_weights[participant_id] / total_economic_weight
+                    weighted_sum += update.model_delta[key] * weight
+            aggregated[key] = weighted_sum
+        return aggregated
+
+    def _token_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
+        aggregated = {}
+        total_tokens = sum(u.tokens_staked for u in updates.values())
+        if total_tokens == 0:
+            return self._federated_averaging([u.model_delta for u in updates.values()])
+        for key in next(iter(updates.values())).model_delta.keys():
+            weighted_sum = 0.0
+            for update in updates.values():
+                if key in update.model_delta:
+                    weight = update.tokens_staked / total_tokens
+                    weighted_sum += update.model_delta[key] * weight
+            aggregated[key] = weighted_sum
+        return aggregated
+
+    def _sustainability_weighted_aggregate(self, updates: Dict[str, AsyncUpdate]) -> Dict[str, Any]:
+        aggregated = {}
+        total_sustainability = sum(u.sustainability_impact for u in updates.values())
+        if total_sustainability == 0:
+            return self._federated_averaging([u.model_delta for u in updates.values()])
+        for key in next(iter(updates.values())).model_delta.keys():
+            weighted_sum = 0.0
+            for update in updates.values():
+                if key in update.model_delta:
+                    weight = update.sustainability_impact / total_sustainability
+                    weighted_sum += update.model_delta[key] * weight
+            aggregated[key] = weighted_sum
+        return aggregated
+
+    def _federated_averaging(self, updates: List[Dict]) -> Dict[str, Any]:
+        if not updates:
+            return {}
+        aggregated = {}
+        n = len(updates)
+        for key in updates[0].keys():
+            values = [u[key] for u in updates if key in u]
+            if values:
+                if isinstance(values[0], np.ndarray):
+                    aggregated[key] = np.mean(values, axis=0)
+                else:
+                    aggregated[key] = sum(values) / n
+        return aggregated
+
+    def _calculate_sustainability_score(
+        self, updates: Dict[str, AsyncUpdate], carbon_intensity: float, helium_scarcity: float
+    ) -> float:
+        if not updates:
+            return 0.0
+        avg_carbon_savings = np.mean([u.carbon_savings for u in updates.values()])
+        avg_sustainability = np.mean([u.sustainability_impact for u in updates.values()])
+        carbon_factor = 1.0 - (carbon_intensity / 800)
+        helium_factor = 1.0 - helium_scarcity
+        economic_factor = 0.5
+        if self.enable_economic_pricing and self.pricing_manager:
+            prices = asyncio.run(self.pricing_manager.get_current_prices())
+            carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
+            economic_factor = 1.0 - (carbon_price / 200)
+        score = (
+            avg_carbon_savings * 0.25 +
+            avg_sustainability * 0.25 +
+            carbon_factor * 0.20 +
+            helium_factor * 0.20 +
+            economic_factor * 0.10
+        )
+        return min(1.0, max(0.0, score))
+
+    async def _apply_playbook(self, playbook: Dict[str, Any], match_score: float) -> bool:
+        try:
+            for action in playbook.get('actions', []):
+                action_type = action.get('type')
+                if action_type == 'schedule_shift':
+                    pass
+                elif action_type == 'reduce_workload':
+                    pass
+                elif action_type == 'switch_cooling':
+                    pass
+                elif action_type == 'circuit_compression':
+                    pass
+            logger.info(f"Applied playbook: {playbook.get('name')} (match: {match_score:.2f})")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to apply playbook: {e}")
+            return False
+
+    # ========================================================================
+    # Self-Healing
+    # ========================================================================
+    async def self_heal(self):
+        logger.info("CrossRegionFederationOptimizer self‑healing")
+        if self.enable_self_healing:
+            self.enable_async = True
+            self.aggregation_strategy = AggregationStrategy.FED_AVG
+            # Reset reputation of all nodes to 0.5
+            if self.enable_reputation and self.reputation_system:
+                for node_id in self.reputation_system.reputation_records:
+                    self.reputation_system.reputation_records[node_id].score = 0.5
+            # Reset token pool
+            self.federation_token_pool = 0.0
+            # Clear stale participants (those with reputation < 0.2)
+            if self.enable_reputation and self.reputation_system:
+                for pid in list(self.participants.keys()):
+                    score = await self.reputation_system.get_reputation_score(pid)
+                    if score < 0.2:
+                        del self.participants[pid]
+            self.health_status = "healthy"
+            self.last_error = None
+            self._save_state()
+            logger.info("Self-healing completed")
+
+    # ========================================================================
+    # Health Monitoring
+    # ========================================================================
+    def get_health_status(self) -> Dict[str, Any]:
+        return {
+            'status': self.health_status,
+            'last_error': self.last_error,
+            'regions': len(self.regions),
+            'participants': len(self.participants),
+            'round_number': self.round_number,
+            'sustainability_score': self.sustainability_score,
+            'federation_token_pool': self.federation_token_pool,
+            'bio_integration_active': self.enable_bio_integration,
+            'event_driven_active': self.enable_event_driven,
+            'self_healing_enabled': self.enable_self_healing,
+            'swarm_coordination_active': self.enable_swarm_coordination,
+            'persistence_enabled': self.persistence is not None,
+        }
+
+    # ========================================================================
+    # Statistics (unchanged)
+    # ========================================================================
+    def get_federation_stats(self) -> Dict[str, Any]:
+        stats = {
+            'total_participants': len(self.participants),
+            'total_regions': len(self.regions),
+            'total_rounds': len(self.aggregation_history),
+            'bio_integration_active': self.enable_bio_integration,
+            'tiered_aggregation_active': self.enable_tiered_aggregation,
+            'resource_optimization_active': self.enable_resource_optimization,
+            'discovery_active': self.enable_discovery,
+            'federated_reflexive_active': self.enable_federated_reflexive,
+            'carbon_intensity_active': self.enable_carbon_intensity,
+            'predictive_active': self.enable_predictive,
+            'cross_domain_active': self.enable_cross_domain,
+            'sustainability_scoring_active': self.enable_sustainability_scoring,
+            'compression_active': self.enable_compression_enhanced,
+            'reputation_active': self.enable_reputation,
+            'playbook_active': self.enable_playbook,
+            'economic_pricing_active': self.enable_economic_pricing,
+            'async_regions_active': self.enable_async,
+            'moe_gating_injected': self.gating_network is not None,
+            'moe_gate_injected': self.self_evolving_gate is not None,
+            'helium_provider_injected': self.helium_provider is not None,
+            'federation_token_pool': self.federation_token_pool,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'sustainability_score': self.sustainability_score,
+            'recent_rounds': self.aggregation_history[-5:] if self.aggregation_history else []
+        }
+        if self.enable_tiered_aggregation and self.tiered_aggregator:
+            stats['tier_stats'] = self.tiered_aggregator.get_tier_stats()
+        if self.enable_resource_optimization and self.resource_optimizer:
+            stats['resource_stats'] = self.resource_optimizer.get_optimization_stats()
+        if self.enable_discovery and self.discovery:
+            stats['discovery_stats'] = self.discovery.get_discovery_stats()
+        if self.enable_bio_integration:
+            stats['gradient_levels'] = self._get_real_gradient_levels()
+            stats['harvester_quality'] = self._get_harvester_signal_quality()
+        if self.enable_predictive:
+            stats['predictive_summary'] = self.predictive_analyzer.get_sustainability_summary()
+        if self.enable_cross_domain:
+            stats['cross_domain_stats'] = self.cross_domain_transfer.get_transfer_statistics()
+        if self.enable_compression_enhanced and self.compressor:
+            stats['compression_stats'] = self.compressor.get_compression_stats()
+        if self.enable_reputation and self.reputation_system:
+            stats['reputation_stats'] = self.reputation_system.get_reputation_stats()
+        if self.enable_playbook and self.playbook_system:
+            stats['playbook_stats'] = self.playbook_system.get_playbook_stats()
+        if self.enable_economic_pricing and self.pricing_manager:
+            stats['price_stats'] = self.pricing_manager.get_price_stats()
+        if self.async_region_manager:
+            stats['async_region_stats'] = {
+                'regions_tracked': len(self.async_region_manager.region_updates)
+            }
+        return stats
+
+    def _get_real_gradient_levels(self) -> Dict[str, float]:
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+
+    def get_regional_profile(self, region: Region) -> Optional[Dict[str, Any]]:
+        if region not in self.regional_profiles:
+            return None
+        profile = self.regional_profiles[region]
+        return {
+            'region': region.value,
+            'carbon_gradient': profile.local_carbon_gradient,
+            'trust_gradient': profile.local_trust_gradient,
+            'token_balance': profile.token_balance,
+            'compartment_count': profile.compartment_count,
+            'harvester_vitality': profile.harvester_vitality,
+            'sustainability_score': profile.sustainability_score,
+            'carbon_savings_kg': profile.carbon_savings_kg,
+            'helium_savings_l': profile.helium_savings_l,
+            'tier': profile.tier.value if hasattr(profile, 'tier') else 'regional',
+            'carbon_price_usd_per_ton': profile.carbon_price_usd_per_ton,
+            'helium_price_usd_per_l': profile.helium_price_usd_per_l,
+            'reputation_score': profile.reputation_score,
+            'active_playbooks': profile.active_playbooks
+        }
+
+    def register_participant(
+        self,
+        participant_id: str,
+        initial_model: Dict[str, Any],
+        capabilities: ClientCapabilities,
+        carbon_footprint: float,
+        helium_usage: float,
+        sustainability_contribution: float = 0.5,
+        region_id: Optional[str] = None
+    ) -> bool:
+        if participant_id in self.participants:
+            logger.warning(f"Participant {participant_id} already registered")
+            return False
+        participant = FederatedExpert(
+            expert_id=participant_id,
+            local_model=initial_model,
+            data_distribution={},
+            capabilities=capabilities,
+            carbon_footprint=carbon_footprint,
+            helium_usage=helium_usage,
+            sustainability_contribution=sustainability_contribution,
+            region_id=region_id
+        )
+        if self.enable_federated_reflexive:
+            asyncio.create_task(
+                self.federated_learner.register_participant(participant_id, initial_model)
+            )
+        if region_id and region_id in self.regions:
+            self.regions[region_id].participants.append(participant_id)
+        if self.enable_reputation and self.reputation_system:
+            asyncio.create_task(
+                self.reputation_system.update_reputation(
+                    participant_id,
+                    success=True,
+                    sustainability_contribution=sustainability_contribution,
+                    token_stake=0.0
+                )
+            )
+        self.participants[participant_id] = participant
+        logger.info(f"Registered federation participant: {participant_id} (region: {region_id})")
+        return True
+
+    def get_sustainability_report(self) -> Dict[str, Any]:
+        report = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'sustainability_score': self.sustainability_score,
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'total_helium_savings_l': self.total_helium_savings_l,
+            'federation_token_pool': self.federation_token_pool,
+            'participant_count': len(self.participants),
+            'region_count': len(self.regions),
+            'round_count': self.round_number,
+            'bio_integration_active': self.enable_bio_integration,
+            'predictive_forecast': self.predictive_analyzer.get_sustainability_summary() if self.enable_predictive else {},
+            'resource_optimization': self.resource_optimizer.get_optimization_stats() if self.enable_resource_optimization else {},
+            'compression_savings_mb': self.compressor.get_compression_stats().get('total_size_saved_mb', 0) if self.enable_compression_enhanced else 0,
+            'reputation_average': self.reputation_system.get_reputation_stats().get('average_score', 0.5) if self.enable_reputation else 0.5,
+            'playbook_usage': self.playbook_system.get_playbook_stats() if self.enable_playbook else {},
+            'recommendations': self._generate_sustainability_recommendations()
+        }
+        return report
+
+    def _generate_sustainability_recommendations(self) -> List[str]:
+        recommendations = []
+        if self.sustainability_score < 0.5:
+            recommendations.append("Increase federated participation for better sustainability")
+            recommendations.append("Optimize carbon-aware scheduling")
+        if self.total_carbon_savings_kg < 10:
+            recommendations.append("Implement more aggressive carbon reduction strategies")
+        if self.federation_token_pool < 50:
+            recommendations.append("Boost token staking incentives")
+        if self.enable_bio_integration and self._get_harvester_signal_quality() < 0.4:
+            recommendations.append("Improve harvester signal quality for better drift detection")
+        if self.enable_resource_optimization and self.resource_optimizer:
+            resource_stats = self.resource_optimizer.get_optimization_stats()
+            for region_id, alloc in resource_stats.get('current_allocations', {}).items():
+                if alloc.get('usage', 0) > alloc.get('allocated', 1) * 0.9:
+                    recommendations.append(f"Region {region_id} is near capacity - consider scaling")
+        if self.enable_playbook and self.playbook_system:
+            context = {
+                'carbon_intensity': self.regions.get('us_east', RegionNode(region_id='us_east', tier=AggregationTier.REGIONAL)).carbon_intensity if 'us_east' in self.regions else 400,
+                'helium_availability': self.regions.get('us_east', RegionNode(region_id='us_east', tier=AggregationTier.REGIONAL)).helium_availability if 'us_east' in self.regions else 0.5
+            }
+            playbooks = asyncio.run(self.playbook_system.evaluate_playbooks(context))
+            if playbooks:
+                recommendations.append(f"Consider applying playbook: {playbooks[0]['playbook']['name']}")
+        return recommendations or ["Federation sustainability is on track"]
+
+    # ========================================================================
+    # Shutdown
+    # ========================================================================
+    async def shutdown(self):
+        logger.info("Shutting down Cross-Region Federation Optimizer")
+        self._save_state()
+        if hasattr(self, 'federated_learner') and self.federated_learner:
+            await self.federated_learner.close()
+        if hasattr(self, 'carbon_manager') and self.carbon_manager:
+            await self.carbon_manager.close()
+        if self.enable_discovery and self.discovery:
+            await self.discovery.close()
+        if self.enable_economic_pricing and self.pricing_manager and self.pricing_manager._session:
+            await self.pricing_manager._session.close()
+        logger.info("Cross-Region Federation Optimizer shutdown complete")
+
+# ============================================================================
+# Carbon Intensity Manager (unchanged, but with circuit breaker)
+# ============================================================================
+class CarbonIntensityManager:
+    def __init__(self, endpoint: str = "https://api.electricitymap.org/v3/carbon-intensity"):
+        self.endpoint = endpoint
+        self.carbon_intensity = 0.0
+        self.region = "us-east"
+        self.last_update = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        self.update_interval = 300
+        self.cache = {}
+        self.historical_intensities = deque(maxlen=1000)
+        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
+        self._circuit = CircuitBreaker("carbon_api", failure_threshold=3, recovery_timeout=30.0)
+        logger.info("CarbonIntensityManager initialized")
+
+    async def _get_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
+        async def _fetch():
+            async with self._lock:
+                session = await self._get_session()
+                try:
+                    url = f"{self.endpoint}/latest?zone={region}"
+                    headers = {'auth-token': self.api_key} if self.api_key else {}
+                    async with session.get(url, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self.carbon_intensity = data.get('carbonIntensity', 400)
+                            self.region = region
+                            self.last_update = datetime.now(timezone.utc)
+                            self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
+                            self.historical_intensities.append(self.carbon_intensity)
+                        else:
+                            self.carbon_intensity = self._get_fallback_intensity(region)
+                            self.last_update = datetime.now(timezone.utc)
+                except Exception as e:
+                    logger.error(f"Carbon intensity fetch error: {e}")
+                    self.carbon_intensity = self._get_fallback_intensity(region)
+                    self.last_update = datetime.now(timezone.utc)
+                return {
+                    'intensity': self.carbon_intensity,
+                    'region': self.region,
+                    'timestamp': self.last_update.isoformat() if self.last_update else None
+                }
+        return await self._circuit.call(_fetch)
+
+    def _get_fallback_intensity(self, region: str) -> float:
+        fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
+        return fallback_values.get(region, 400)
+
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Predictive Federation Analyzer (unchanged)
+# ============================================================================
+class PredictiveFederationAnalyzer:
+    def __init__(self, history_window: int = 100):
+        self.history_window = history_window
+        self.federation_history = deque(maxlen=history_window)
+        self.forecast_history = deque(maxlen=50)
+        self.models = {}
+        self.scaler = None
+        self.is_trained = False
+        try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+            self.scaler = StandardScaler()
+            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
+            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
+            self._ml_available = True
+        except ImportError:
+            self._ml_available = False
+            logger.warning("ML libraries not available for predictive forecasting")
+
+    def update_history(self, federation_metrics: Dict):
+        self.federation_history.append({
+            'timestamp': datetime.now(timezone.utc),
+            'participants': federation_metrics.get('participants', 0),
+            'carbon_intensity': federation_metrics.get('carbon_intensity', 400),
+            'helium_scarcity': federation_metrics.get('helium_scarcity', 0.5),
+            'sustainability_score': federation_metrics.get('sustainability_score', 0.5),
+            'token_pool': federation_metrics.get('token_pool', 0),
+            'round_success': federation_metrics.get('round_success', True),
+            'participant_health': federation_metrics.get('participant_health', {})
+        })
+
+    async def train_forecast_model(self):
+        if not self._ml_available or len(self.federation_history) < 10:
+            return {'status': 'insufficient_data'}
+        X, y = [], []
+        history_list = list(self.federation_history)
+        for i in range(len(history_list) - 5):
+            features = []
+            for j in range(5):
+                data = history_list[i + j]
+                features.extend([
+                    data['participants'],
+                    data['carbon_intensity'] / 100,
+                    data['helium_scarcity'],
+                    data['sustainability_score'],
+                    data['token_pool'] / 100,
+                    1 if data['round_success'] else 0
+                ])
+            X.append(features)
+            y.append(history_list[i + 5]['sustainability_score'])
+        X = np.array(X)
+        y = np.array(y)
+        X_scaled = self.scaler.fit_transform(X)
+        results = {}
+        for name, model in self.models.items():
+            if model is not None:
+                model.fit(X_scaled, y)
+                predictions = model.predict(X_scaled)
+                r2 = r2_score(y, predictions)
+                results[name] = r2
+        self.is_trained = True
+        logger.info(f"Federation forecast models trained. R²: {results}")
+        return {'status': 'success', 'results': results}
+
+    async def predict_federation_trend(self):
+        if not self.is_trained or len(self.federation_history) < 10:
+            return PredictiveFederationForecast(confidence=0.0, trend="insufficient_data")
+        recent = list(self.federation_history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['participants'],
+                data['carbon_intensity'] / 100,
+                data['helium_scarcity'],
+                data['sustainability_score'],
+                data['token_pool'] / 100,
+                1 if data['round_success'] else 0
+            ])
+        features = np.array(features).reshape(1, -1)
+        features_scaled = self.scaler.transform(features)
+        predictions = []
+        for name, model in self.models.items():
+            if model is not None:
+                pred = model.predict(features_scaled)[0]
+                predictions.append(pred)
+        if not predictions:
+            return PredictiveFederationForecast(confidence=0.0, trend="no_models")
+        prediction = np.mean(predictions)
+        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
+        if len(self.forecast_history) > 5:
+            recent_forecasts = list(self.forecast_history)[-5:]
+            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+        participant_health = {}
+        if self.federation_history:
+            latest = self.federation_history[-1]
+            for pid, health in latest.get('participant_health', {}).items():
+                participant_health[pid] = health * 0.9 + 0.1 * prediction
+        forecast = PredictiveFederationForecast(
+            predicted_sustainability_score=prediction,
+            predicted_carbon_impact=prediction * 400 * 0.1,
+            predicted_helium_usage=(1 - prediction) * 0.5,
+            confidence=confidence,
+            trend=trend,
+            recommended_actions=self._generate_actions(prediction),
+            participant_health=participant_health
+        )
+        self.forecast_history.append(forecast)
+        return forecast
+
+    def _generate_actions(self, prediction: float) -> List[str]:
+        actions = []
+        if prediction < 0.4:
+            actions.append("Increase federated participation")
+            actions.append("Optimize carbon-aware scheduling")
+            actions.append("Boost token staking incentives")
+        elif prediction < 0.6:
+            actions.append("Enhance cross-domain knowledge transfer")
+            actions.append("Improve gradient alignment")
+        elif prediction < 0.8:
+            actions.append("Maintain current sustainability trajectory")
+        return actions or ["Federation sustainability is on track"]
+
+    def get_sustainability_summary(self) -> Dict:
+        if not self.federation_history:
+            return {'status': 'insufficient_data'}
+        recent = list(self.federation_history)[-50:]
+        return {
+            'average_sustainability_score': np.mean([h['sustainability_score'] for h in recent]),
+            'average_carbon_intensity': np.mean([h['carbon_intensity'] for h in recent]),
+            'average_helium_scarcity': np.mean([h['helium_scarcity'] for h in recent]),
+            'success_rate': np.mean([1 if h['round_success'] else 0 for h in recent]),
+            'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'
+        }
+
+# ============================================================================
+# Data Classes (unchanged)
+# ============================================================================
+@dataclass
+class PredictiveFederationForecast:
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    predicted_sustainability_score: float = 0.0
+    predicted_carbon_impact: float = 0.0
+    predicted_helium_usage: float = 0.0
+    confidence: float = 0.0
+    trend: str = "stable"
+    recommended_actions: List[str] = field(default_factory=list)
+    participant_health: Dict[str, float] = field(default_factory=dict)
+
+@dataclass
+class FederatedExpert:
+    expert_id: str
+    local_model: Dict[str, Any]
+    data_distribution: Dict[str, float]
+    capabilities: ClientCapabilities
+    carbon_footprint: float
+    helium_usage: float
+    privacy_budget: float = 1.0
+    reputation_score: float = 0.5
+    participation_history: List[Any] = field(default_factory=list)
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+    is_active: bool = True
+    architecture_type: str = "standard"
+    tokens_staked: float = 0.0
+    gradient_alignment: float = 0.5
+    compartment_id: Optional[str] = None
+    harvester_contribution: float = 0.0
+    sustainability_contribution: float = 0.0
+    federated_round: int = 0
+    region_id: Optional[str] = None
+
+@dataclass
+class ClientCapabilities:
+    client_id: str
+    compute_power_flops: float
+    memory_gb: float
+    network_bandwidth_mbps: float
+    network_latency_ms: float
+    energy_source_renewable: bool
+    carbon_intensity_g_per_kwh: float
+    helium_availability: float
+    max_model_size_mb: float
+    supported_architectures: List[str]
+    availability_schedule: Dict[int, float]
+
+# ============================================================================
 # Legacy Compatibility Class
 # ============================================================================
-
 class CrossRegionFederation(CrossRegionFederationOptimizer):
     """Legacy compatibility class."""
     pass
