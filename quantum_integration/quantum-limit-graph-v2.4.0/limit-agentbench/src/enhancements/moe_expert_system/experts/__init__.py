@@ -1,17 +1,17 @@
 """
-MoE Expert System – Expert Module
+MoE Expert System – Expert Module (Enhanced v2.0)
 
 This package provides the core experts used in the mixture‑of‑experts framework.
 Each expert implements a specific optimization domain (energy, data, IoT, quantum, helium).
 
 Usage:
-    from enhancements.moe_expert_system.experts import get_expert, create_expert, Expert
+    from enhancements.moe_expert_system.experts import get_expert, create_expert, BaseExpert
 
     # Get the EnergyExpert class directly
     EnergyExpert = get_expert('EnergyExpert')
 
-    # Or instantiate with configuration
-    expert = create_expert('EnergyExpert', config={'enable_forecasting': True})
+    # Or instantiate with configuration and optional bio_core
+    expert = create_expert('EnergyExpert', bio_core=my_core, config={'enable_forecasting': True})
 
     # Alternatively, import directly:
     from enhancements.moe_expert_system.experts import EnergyExpert
@@ -25,28 +25,81 @@ Available experts:
 """
 
 import logging
-import importlib
-from typing import Dict, Type, Optional, Any
+import inspect
+from typing import Dict, Type, Optional, Any, List
+from abc import ABC, abstractmethod
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------------
-# Registry of expert classes (lazily loaded)
-# ----------------------------------------------------------------------
-_EXPERT_REGISTRY: Dict[str, str] = {
-    'EnergyExpert': 'enhancements.moe_expert_system.experts.energy_expert',
-    'DataExpert':   'enhancements.moe_expert_system.experts.data_expert',
-    'IoTExpert':    'enhancements.moe_expert_system.experts.iot_expert',
-    'QuantumExpert':'enhancements.moe_expert_system.experts.quantum_expert',
-    'HeliumExpert': 'enhancements.moe_expert_system.experts.helium_expert',
-}
+# ============================================================================
+# Base Expert Interface (Abstract Base Class)
+# ============================================================================
+class BaseExpert(ABC):
+    """
+    Abstract base for all MoE experts.
+    All concrete experts must implement the methods defined here.
+    """
+    __expert_version__ = "0.0.0"          # Override per expert
+    __expert_description__ = ""           # Override per expert
 
-# ----------------------------------------------------------------------
-# Public API: get expert class by name
-# ----------------------------------------------------------------------
-def get_expert(name: str) -> Type:
+    @abstractmethod
+    async def propose(self, context: dict) -> dict:
+        """
+        Generate a recommendation based on the provided context.
+
+        Args:
+            context: A dictionary containing relevant input data.
+
+        Returns:
+            A dictionary containing:
+                - 'recommendations': single preferred action set
+                - 'options': list of trade‑off options
+                - 'explanation': natural‑language description
+        """
+        pass
+
+    @abstractmethod
+    def get_health_status(self) -> Dict[str, Any]:
+        """
+        Return health metrics of the expert.
+
+        Returns:
+            A dictionary with at least 'status' and optionally 'last_error',
+            'thresholds', 'persistence_enabled', etc.
+        """
+        pass
+
+    @abstractmethod
+    async def shutdown(self):
+        """
+        Gracefully shut down the expert and any background tasks.
+        """
+        pass
+
+# ============================================================================
+# Registry (dynamic registration)
+# ============================================================================
+_EXPERT_REGISTRY: Dict[str, Type[BaseExpert]] = {}
+
+def register_expert(name: str, expert_class: Type[BaseExpert]) -> None:
+    """
+    Register an expert class dynamically.
+
+    Args:
+        name: The unique name of the expert (e.g., 'EnergyExpert').
+        expert_class: The class that implements BaseExpert.
+
+    Raises:
+        TypeError: If expert_class does not inherit from BaseExpert.
+    """
+    if not issubclass(expert_class, BaseExpert):
+        raise TypeError(f"{expert_class} must inherit from BaseExpert")
+    _EXPERT_REGISTRY[name] = expert_class
+    logger.info(f"Registered expert '{name}' (v{expert_class.__expert_version__})")
+
+def get_expert(name: str) -> Type[BaseExpert]:
     """
     Retrieve an expert class by its registered name.
 
@@ -58,28 +111,32 @@ def get_expert(name: str) -> Type:
 
     Raises:
         ValueError: If the name is not registered.
-        ImportError: If the underlying module cannot be imported.
     """
-    module_path = _EXPERT_REGISTRY.get(name)
-    if module_path is None:
+    if name not in _EXPERT_REGISTRY:
         raise ValueError(f"Expert '{name}' is not registered.")
-    try:
-        module = importlib.import_module(module_path)
-        expert_class = getattr(module, name)
-        return expert_class
-    except ImportError as e:
-        logger.error(f"Failed to import expert '{name}' from {module_path}: {e}")
-        raise ImportError(f"Could not import expert '{name}'") from e
+    return _EXPERT_REGISTRY[name]
 
-# ----------------------------------------------------------------------
-# Factory: instantiate an expert with optional configuration
-# ----------------------------------------------------------------------
-def create_expert(name: str, config: Optional[Dict[str, Any]] = None) -> Any:
+def list_experts() -> List[str]:
+    """
+    Return a list of all registered expert names.
+    """
+    return list(_EXPERT_REGISTRY.keys())
+
+# ============================================================================
+# Factory: instantiate an expert with bio_core injection and config
+# ============================================================================
+def create_expert(
+    name: str,
+    bio_core: Optional[Any] = None,
+    config: Optional[Dict[str, Any]] = None
+) -> BaseExpert:
     """
     Create an instance of an expert.
 
     Args:
         name: The expert's class name.
+        bio_core: Optional reference to the bio‑inspired core for event subscriptions,
+                  circuit breakers, etc.
         config: Optional configuration dictionary passed to the expert's constructor.
 
     Returns:
@@ -87,71 +144,99 @@ def create_expert(name: str, config: Optional[Dict[str, Any]] = None) -> Any:
 
     Raises:
         ValueError: If the name is not registered.
-        ImportError: If the expert module cannot be imported.
     """
     expert_class = get_expert(name)
-    if config is not None:
-        return expert_class(config=config)
-    else:
-        return expert_class()
 
-# ----------------------------------------------------------------------
-# Lazy imports for direct access (optional)
-# ----------------------------------------------------------------------
-# To allow `from . import EnergyExpert` style imports, we keep the original
-# eager imports for backwards compatibility, but we wrap them in a try/except.
+    # Detect if the constructor accepts bio_core and/or config
+    sig = inspect.signature(expert_class.__init__)
+    params = sig.parameters
+
+    # Build argument dict
+    kwargs = {}
+    if 'bio_core' in params:
+        kwargs['bio_core'] = bio_core
+    if 'config' in params:
+        kwargs['config'] = config
+
+    # If the expert has a constructor with only self, instantiate without args
+    if len(params) == 1:  # only self
+        return expert_class()
+    else:
+        # Attempt to pass only the arguments that the constructor expects
+        # We'll use the kwargs we built
+        return expert_class(**{k: v for k, v in kwargs.items() if k in params})
+
+# ============================================================================
+# Helper: shutdown multiple experts
+# ============================================================================
+async def shutdown_all_experts(experts: List[BaseExpert]) -> None:
+    """
+    Gracefully shut down a list of experts.
+
+    Args:
+        experts: List of expert instances.
+    """
+    for expert in experts:
+        try:
+            await expert.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down expert {expert.__class__.__name__}: {e}")
+
+# ============================================================================
+# Backward Compatibility: eager imports for direct access
+# ============================================================================
+# We attempt to import each expert and register it if successful.
+# This maintains the old direct import style.
+
 try:
     from .energy_expert import EnergyExpert
-except ImportError:
-    logger.warning("EnergyExpert could not be imported (missing dependencies?)")
+    register_expert('EnergyExpert', EnergyExpert)
+except ImportError as e:
+    logger.warning(f"EnergyExpert could not be imported: {e}")
     EnergyExpert = None
 
 try:
     from .data_expert import DataExpert
-except ImportError:
-    logger.warning("DataExpert could not be imported")
+    register_expert('DataExpert', DataExpert)
+except ImportError as e:
+    logger.warning(f"DataExpert could not be imported: {e}")
     DataExpert = None
 
 try:
     from .iot_expert import IoTExpert
-except ImportError:
-    logger.warning("IoTExpert could not be imported")
+    register_expert('IoTExpert', IoTExpert)
+except ImportError as e:
+    logger.warning(f"IoTExpert could not be imported: {e}")
     IoTExpert = None
 
 try:
     from .quantum_expert import QuantumExpert
-except ImportError:
-    logger.warning("QuantumExpert could not be imported")
+    register_expert('QuantumExpert', QuantumExpert)
+except ImportError as e:
+    logger.warning(f"QuantumExpert could not be imported: {e}")
     QuantumExpert = None
 
 try:
     from .helium_expert import HeliumExpert
-except ImportError:
-    logger.warning("HeliumExpert could not be imported")
+    register_expert('HeliumExpert', HeliumExpert)
+except ImportError as e:
+    logger.warning(f"HeliumExpert could not be imported: {e}")
     HeliumExpert = None
 
-# ----------------------------------------------------------------------
-# Re-export base Expert class if it exists
-# ----------------------------------------------------------------------
-try:
-    from .base_expert import Expert
-except ImportError:
-    # If there is no base expert, we define a dummy for type hints.
-    class Expert:
-        """Base type for all experts (fallback if no base_expert module exists)."""
-        pass
-
-# ----------------------------------------------------------------------
+# ============================================================================
 # __all__ – control what is exported with 'from ... import *'
-# ----------------------------------------------------------------------
+# ============================================================================
 __all__ = [
+    'BaseExpert',
     'EnergyExpert',
     'DataExpert',
     'IoTExpert',
     'QuantumExpert',
     'HeliumExpert',
-    'Expert',
     'get_expert',
     'create_expert',
+    'list_experts',
+    'register_expert',
+    'shutdown_all_experts',
     '__version__',
 ]
