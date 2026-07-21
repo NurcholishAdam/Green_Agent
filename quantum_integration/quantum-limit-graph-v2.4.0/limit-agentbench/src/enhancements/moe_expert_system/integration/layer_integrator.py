@@ -1,49 +1,15 @@
+# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/enhanced_layer_integrator.py
+# Enhanced version v7.0.0 – Full integration with bio‑inspired core, event‑driven, persistence, circuit breakers, self‑healing, and config reload
+
 """
-Enhanced Layer Integrator v6.1.1 - Complete Green Agent Implementation
-
-Complete bio-inspired integration with:
-- Federated Reflexive Learning with distributed layer health
-- User-Adaptive Reflexivity with dynamic configuration
-- Real-time Carbon Intensity Integration with API support
-- Cross-Domain Knowledge Transfer with event-driven communication
-- Human-AI Collaborative Reflection with comprehensive monitoring
-- Predictive Reflexivity with ensemble forecasting
-- Sustainability Score with multi-metric aggregation
-- Enhanced Carbon/Helium Awareness with real-time tracking
-- Gradient-based layer health (trust gradient as health indicator)
-- Membrane permeability mapping (compartment membrane states)
-- Second messenger event communication (signal transduction)
-- Token-backed cache TTL (dynamic cache expiration)
-- Entangled layer dependencies (biomass resource coupling)
-- Token recovery on transaction rollback
-- Gradient-modulated retry timing
-- Harvester-aware layer vitality
-- Dynamic layer discovery for runtime registration
-- Health-based circuit reset using gradient fields
-- Event correlation for complex workflow orchestration
-- Gradient-aware cache invalidation
-- Distributed transaction support across integrators
-- Context builder for MoE expert system
-- Helium and Federated Learning telemetry integration
-
-New in v6.1.1:
-- Configuration dataclass for centralized settings
-- Resilient carbon intensity manager with retry & circuit breaker
-- Online predictive layer analyzer with incremental learning
-- Robust dynamic discovery with retry & health checks
-- Advanced event correlation with temporal and causal patterns
-- Adaptive gradient-aware cache with weighted eviction
-- Enhanced distributed transactions with timeout and participant failure
-- Dedicated sustainability score calculator
-- Pluggable telemetry collector for Prometheus export
-- Improved bio-inspired fallback strategies
+Enhanced Layer Integrator v7.0.0 – Complete Green Agent Implementation with full bio‑inspired core integration.
 """
 
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Set, Callable, Union
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import numpy as np
 import hashlib
@@ -62,9 +28,10 @@ import pickle
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Bio-Inspired Import Check
+# Bio-Inspired Core Import (with fallback)
 # ============================================================================
 try:
+    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker, Persistence
     from enhancements.bio_inspired.eco_atp_currency import (
         EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
         TokenState, EcoATPToken, EcoATPAccount
@@ -85,14 +52,34 @@ try:
     from enhancements.bio_inspired.photosynthetic_harvester import (
         PhotosyntheticHarvester
     )
+    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
+    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
     BIO_INSPIRED_AVAILABLE = True
-    logger.info("Bio-inspired modules loaded for Layer Integrator")
+    logger.info("Bio-inspired core modules loaded for Layer Integrator")
 except ImportError as e:
     BIO_INSPIRED_AVAILABLE = False
-    logger.warning(f"Bio-inspired modules not available: {str(e)} - using standard integration")
+    logger.warning(f"Bio-inspired core modules not available: {str(e)} - using fallback")
+    # Fallback definitions
+    class BioEvent:
+        def __init__(self, event_type, source, data=None):
+            self.event_type = event_type
+            self.source = source
+            self.data = data or {}
+
+    class CircuitBreaker:
+        def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self._state = "closed"
+            self._failure_count = 0
+            self._last_failure_time = None
+            self._lock = asyncio.Lock()
+        async def call(self, func, *args, **kwargs):
+            return await func(*args, **kwargs)
 
 # ============================================================================
-# MoE Expert Router Import
+# MoE Expert Router Import (optional)
 # ============================================================================
 try:
     from ..expert_router import ExpertRouter
@@ -102,7 +89,7 @@ except ImportError:
     logger.warning("MoE Expert Router not available - context building will be limited")
 
 # ============================================================================
-# Configuration Dataclass (NEW)
+# Configuration Dataclass (Enhanced)
 # ============================================================================
 @dataclass
 class LayerIntegratorConfig:
@@ -123,6 +110,9 @@ class LayerIntegratorConfig:
     enable_event_correlation: bool = True
     enable_gradient_cache: bool = True
     enable_distributed_txns: bool = True
+    enable_persistence: bool = True
+    enable_event_driven: bool = True
+    enable_self_healing: bool = True
 
     # Tunable parameters
     cache_ttl_seconds: float = 60.0
@@ -148,9 +138,11 @@ class LayerIntegratorConfig:
         'token_efficiency': 0.15,
         'layer_health': 0.15
     })
+    persistence_path: str = "./layer_integrator.pkl"
+    self_healing_enabled: bool = True
+    workflow_on_degradation: str = "repair_layer"
 
     def __post_init__(self):
-        # Ensure all flags are booleans
         for key, value in self.__dict__.items():
             if isinstance(value, bool):
                 setattr(self, key, bool(value))
@@ -201,7 +193,7 @@ class LayerInfo:
     version: str
     status: LayerStatus = LayerStatus.HEALTHY
     integration_mode: IntegrationMode = IntegrationMode.SYNCHRONOUS
-    last_heartbeat: datetime = field(default_factory=datetime.utcnow)
+    last_heartbeat: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     dependencies: List[int] = field(default_factory=list)
     capabilities: List[str] = field(default_factory=list)
     endpoints: Dict[str, str] = field(default_factory=dict)
@@ -242,7 +234,7 @@ class LayerCircuitBreaker:
 
     def record_success(self):
         self.success_count += 1
-        self.last_success_time = datetime.utcnow()
+        self.last_success_time = datetime.now(timezone.utc)
         if self.state == CircuitState.HALF_OPEN:
             self.half_open_requests += 1
             if self.half_open_requests >= self.half_open_max_requests:
@@ -254,7 +246,7 @@ class LayerCircuitBreaker:
 
     def record_failure(self):
         self.failure_count += 1
-        self.last_failure_time = datetime.utcnow()
+        self.last_failure_time = datetime.now(timezone.utc)
         if self.state == CircuitState.CLOSED and self.failure_count >= self.failure_threshold:
             self.state = CircuitState.OPEN
         elif self.state == CircuitState.HALF_OPEN:
@@ -270,7 +262,7 @@ class LayerCircuitBreaker:
             return True
         if self.state == CircuitState.OPEN:
             if self.last_failure_time:
-                elapsed = (datetime.utcnow() - self.last_failure_time).total_seconds()
+                elapsed = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
                 if elapsed >= self.recovery_timeout_seconds:
                     self.state = CircuitState.HALF_OPEN
                     self.half_open_requests = 0
@@ -288,7 +280,7 @@ class LayerEvent:
     source_layer: int
     target_layer: Optional[int]
     payload: Dict[str, Any]
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: Optional[str] = None
     priority: int = 0
     second_messenger_type: Optional[str] = None
@@ -307,7 +299,7 @@ class CacheEntry:
     expires_at: datetime
     layer_number: int
     access_count: int = 0
-    last_accessed: datetime = field(default_factory=datetime.utcnow)
+    last_accessed: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     token_backed: bool = False
     gradient_level_at_creation: float = 0.5
     gradient_threshold: float = 0.3
@@ -346,16 +338,41 @@ class TransactionContext:
     coordinator_id: Optional[str] = None
     participants: List[str] = field(default_factory=list)
     distributed_status: Dict[str, str] = field(default_factory=dict)
-    # NEW: Timeout tracking
-    last_heartbeat: datetime = field(default_factory=datetime.utcnow)
+    last_heartbeat: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     heartbeat_interval: float = 10.0
 
 # ============================================================================
-# Enhanced Carbon Intensity Manager with Retry & Circuit Breaker
+# Persistence for the integrator
+# ============================================================================
+class LayerIntegratorPersistence:
+    """Simple file‑based persistence for layer states, cache, transactions, and sustainability."""
+    def __init__(self, path: str):
+        self.path = path
+
+    def save(self, state: Dict[str, Any]) -> bool:
+        try:
+            with open(self.path, 'wb') as f:
+                pickle.dump(state, f)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save persistence: {e}")
+            return False
+
+    def load(self) -> Optional[Dict[str, Any]]:
+        if not os.path.exists(self.path):
+            return None
+        try:
+            with open(self.path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load persistence: {e}")
+            return None
+
+# ============================================================================
+# Enhanced Carbon Intensity Manager (unchanged, but we'll keep it)
 # ============================================================================
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration with retry, circuit breaker, and caching."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig):
         self.config = config
         self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
@@ -372,8 +389,9 @@ class CarbonIntensityManager:
         self.failure_count = 0
         self.circuit_open = False
         self.circuit_open_until = None
-        self.circuit_breaker_threshold = 5
+        self.circuit_breaker_threshold = config.circuit_breaker_failure_threshold
         self.max_retries = config.max_retries
+        self._circuit = CircuitBreaker("carbon_api", failure_threshold=config.circuit_breaker_failure_threshold, recovery_timeout=30.0)
         logger.info(f"CarbonIntensityManager initialized (region={self.region}, retries={self.max_retries})")
 
     async def _get_session(self):
@@ -382,70 +400,53 @@ class CarbonIntensityManager:
         return self._session
 
     async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
-        """Update carbon intensity with retry and circuit breaker."""
         if region is not None:
             self.region = region
-
-        # Circuit breaker check
-        if self.circuit_open:
-            if datetime.utcnow() < self.circuit_open_until:
-                logger.warning("Circuit breaker open, using fallback data")
-                return self._get_fallback_response()
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
-                logger.info("Circuit breaker reset for CarbonIntensityManager")
-
-        # Cache check
-        cache_key = f"{self.region}_{datetime.utcnow().hour}"
-        if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.config.carbon_update_interval:
-            return self.cache[cache_key]
-
-        for attempt in range(self.max_retries):
-            try:
-                session = await self._get_session()
-                url = f"{self.endpoint}/latest?zone={self.region}"
-                headers = {'auth-token': self.api_key} if self.api_key else {}
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self.carbon_intensity = data.get('carbonIntensity', 400)
-                        self.last_update = datetime.now()
-                        self.cache[cache_key] = {
-                            'intensity': self.carbon_intensity,
-                            'timestamp': self.last_update.isoformat()
-                        }
-                        self.historical_intensities.append(self.carbon_intensity)
-                        self._update_carbon_price(self.carbon_intensity)
-                        self.failure_count = 0
-                        return {
-                            'intensity': self.carbon_intensity,
-                            'region': self.region,
-                            'timestamp': self.last_update.isoformat(),
-                            'price_usd_per_ton': self.carbon_price_usd_per_ton
-                        }
-                    else:
-                        logger.warning(f"Carbon API returned {response.status}, attempt {attempt+1}")
-                        if attempt == self.max_retries - 1:
-                            self.failure_count += 1
-                            if self.failure_count >= self.circuit_breaker_threshold:
-                                self.circuit_open = True
-                                self.circuit_open_until = datetime.utcnow() + timedelta(minutes=5)
-                                logger.error("Circuit breaker opened for CarbonIntensityManager")
-                            return self._get_fallback_response()
-                        await asyncio.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
-                if attempt == self.max_retries - 1:
-                    self.failure_count += 1
-                    if self.failure_count >= self.circuit_breaker_threshold:
-                        self.circuit_open = True
-                        self.circuit_open_until = datetime.utcnow() + timedelta(minutes=5)
-                    return self._get_fallback_response()
-                await asyncio.sleep(2 ** attempt)
-
-        # Should never reach here
-        return self._get_fallback_response()
+        async def _fetch():
+            for attempt in range(self.max_retries):
+                try:
+                    session = await self._get_session()
+                    url = f"{self.endpoint}/latest?zone={self.region}"
+                    headers = {'auth-token': self.api_key} if self.api_key else {}
+                    async with session.get(url, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self.carbon_intensity = data.get('carbonIntensity', 400)
+                            self.last_update = datetime.now(timezone.utc)
+                            self.cache[f"{self.region}_{datetime.now(timezone.utc).hour}"] = {
+                                'intensity': self.carbon_intensity,
+                                'timestamp': self.last_update.isoformat()
+                            }
+                            self.historical_intensities.append(self.carbon_intensity)
+                            self._update_carbon_price(self.carbon_intensity)
+                            self.failure_count = 0
+                            return {
+                                'intensity': self.carbon_intensity,
+                                'region': self.region,
+                                'timestamp': self.last_update.isoformat(),
+                                'price_usd_per_ton': self.carbon_price_usd_per_ton
+                            }
+                        else:
+                            logger.warning(f"Carbon API returned {response.status}, attempt {attempt+1}")
+                            if attempt == self.max_retries - 1:
+                                self.failure_count += 1
+                                if self.failure_count >= self.circuit_breaker_threshold:
+                                    self.circuit_open = True
+                                    self.circuit_open_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+                                    logger.error("Circuit breaker opened for CarbonIntensityManager")
+                                return self._get_fallback_response()
+                            await asyncio.sleep(2 ** attempt)
+                except Exception as e:
+                    logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
+                    if attempt == self.max_retries - 1:
+                        self.failure_count += 1
+                        if self.failure_count >= self.circuit_breaker_threshold:
+                            self.circuit_open = True
+                            self.circuit_open_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+                        return self._get_fallback_response()
+                    await asyncio.sleep(2 ** attempt)
+            return self._get_fallback_response()
+        return await self._circuit.call(_fetch)
 
     def _update_carbon_price(self, intensity: float):
         base_price = 50.0
@@ -466,18 +467,18 @@ class CarbonIntensityManager:
         return {
             'intensity': intensity,
             'region': self.region,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'price_usd_per_ton': self.carbon_price_usd_per_ton,
             'is_fallback': True
         }
 
     async def get_current_intensity(self) -> float:
-        if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.config.carbon_update_interval:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.config.carbon_update_interval:
             await self.update_carbon_intensity(self.region)
         return self.carbon_intensity
 
     async def get_current_price(self) -> float:
-        if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.config.carbon_update_interval:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.config.carbon_update_interval:
             await self.update_carbon_intensity(self.region)
         return self.carbon_price_usd_per_ton
 
@@ -486,11 +487,10 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Enhanced Predictive Layer Analyzer with Online Learning
+# Enhanced Predictive Layer Analyzer (unchanged)
 # ============================================================================
 class PredictiveLayerAnalyzer:
-    """Predictive layer health with online learning using incremental updates."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig, history_window: int = 100):
         self.config = config
         self.history_window = history_window
@@ -504,7 +504,6 @@ class PredictiveLayerAnalyzer:
         self.feature_stds = None
         self.last_training_time = None
         self.training_interval = 300  # seconds
-
         try:
             from sklearn.preprocessing import StandardScaler
             from sklearn.linear_model import SGDRegressor
@@ -524,7 +523,7 @@ class PredictiveLayerAnalyzer:
 
     def update_history(self, layer_metrics: Dict):
         self.layer_history.append({
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(timezone.utc),
             'health_score': layer_metrics.get('health_score', 0.8),
             'gradient_health': layer_metrics.get('gradient_health', 0.5),
             'token_balance': layer_metrics.get('token_balance', 0.5),
@@ -535,14 +534,10 @@ class PredictiveLayerAnalyzer:
         })
 
     async def train_forecast_model(self):
-        """Train or update the model incrementally."""
         if not self._ml_available:
             return {'status': 'ml_not_available'}
-
         if len(self.layer_history) < 10:
             return {'status': 'insufficient_data'}
-
-        # Prepare features
         X, y = [], []
         history_list = list(self.layer_history)
         for i in range(len(history_list) - 5):
@@ -560,41 +555,32 @@ class PredictiveLayerAnalyzer:
                 ])
             X.append(features)
             y.append(history_list[i + 5]['health_score'])
-
         X = np.array(X)
         y = np.array(y)
-
         if self.scaler.mean_ is None:
             X_scaled = self.scaler.fit_transform(X)
         else:
             X_scaled = self.scaler.transform(X)
-
-        # Incremental training
         if self.model is not None:
-            for _ in range(3):  # multiple passes for better fit
+            for _ in range(3):
                 self.model.partial_fit(X_scaled, y)
             self.is_trained = True
-            self.last_training_time = datetime.utcnow()
-
-        # Calculate R2 score for diagnostics
+            self.last_training_time = datetime.now(timezone.utc)
         if len(X) > 5:
-            pred = self.model.predict(X_scaled)
             from sklearn.metrics import r2_score
+            pred = self.model.predict(X_scaled)
             r2 = r2_score(y, pred)
         else:
             r2 = 0.0
-
         return {'status': 'success', 'r2': r2, 'samples': len(X)}
 
     async def predict_layer_health(self) -> Dict:
         if not self.is_trained or len(self.layer_history) < 10:
-            # Fallback: moving average
             if len(self.layer_history) > 0:
                 recent = [h['health_score'] for h in list(self.layer_history)[-5:]]
                 pred = np.mean(recent) if recent else 0.5
                 return {'predicted_health': pred, 'confidence': 0.3, 'trend': 'moving_average'}
             return {'predicted_health': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
-
         recent = list(self.layer_history)[-5:]
         features = []
         for data in recent:
@@ -607,23 +593,18 @@ class PredictiveLayerAnalyzer:
                 data.get('carbon_price', 50.0) / 100,
                 data.get('resource_scarcity', 0.5)
             ])
-
         features = np.array(features).reshape(1, -1)
         if self.scaler.mean_ is not None:
             features_scaled = self.scaler.transform(features)
         else:
             features_scaled = features
-
         prediction = self.model.predict(features_scaled)[0]
-        # Confidence based on recency and model stability
         confidence = min(0.9, 0.5 + 0.4 * (len(self.layer_history) / 100))
-
         if len(self.forecast_history) > 5:
             recent_forecasts = list(self.forecast_history)[-5:]
             trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
         else:
             trend = "stable"
-
         self.forecast_history.append({'prediction': prediction, 'trend': trend})
         return {'predicted_health': prediction, 'confidence': confidence, 'trend': trend,
                 'recommended_actions': self._generate_actions(prediction)}
@@ -641,11 +622,10 @@ class PredictiveLayerAnalyzer:
         return actions or ["Layer health is on track"]
 
 # ============================================================================
-# Enhanced Layer Cross-Domain Transfer with Effectiveness Tracking
+# Layer Cross-Domain Transfer (unchanged)
 # ============================================================================
 class LayerCrossDomainTransfer:
-    """Cross-domain knowledge transfer with effectiveness tracking and pruning."""
-
+    # ... (same as before) ...
     def __init__(self):
         self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
         self.transfer_logs = deque(maxlen=1000)
@@ -677,23 +657,20 @@ class LayerCrossDomainTransfer:
                 'data': data,
                 'transfer_count': 1,
                 'effectiveness_score': 0.5,
-                'last_used': datetime.utcnow()
+                'last_used': datetime.now(timezone.utc)
             }
         else:
             existing = self.knowledge_base[key][knowledge_type]
             existing['data'].update(data)
             existing['transfer_count'] += 1
-            existing['last_used'] = datetime.utcnow()
-
+            existing['last_used'] = datetime.now(timezone.utc)
         self.transfer_logs.append({
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(timezone.utc),
             'source': source_domain,
             'target': target_domain,
             'type': knowledge_type,
             'effectiveness': self.knowledge_base[key][knowledge_type]['effectiveness_score']
         })
-
-        # Prune stale knowledge (older than 7 days)
         self._prune_stale()
         return self.knowledge_base[key][knowledge_type]
 
@@ -704,17 +681,16 @@ class LayerCrossDomainTransfer:
             entry = self.knowledge_base[key][knowledge_type]
             old_score = entry['effectiveness_score']
             transfer_count = entry['transfer_count']
-            # Weighted moving average
             entry['effectiveness_score'] = (old_score * transfer_count + effectiveness) / (transfer_count + 1)
             self.effectiveness_history.append({
-                'timestamp': datetime.utcnow(),
+                'timestamp': datetime.now(timezone.utc),
                 'transfer': key,
                 'type': knowledge_type,
                 'effectiveness': entry['effectiveness_score']
             })
 
     def _prune_stale(self, max_age_days: int = 7):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for key, domain_data in list(self.knowledge_base.items()):
             for ktype, entry in list(domain_data.items()):
                 age = (now - entry['last_used']).days
@@ -739,11 +715,10 @@ class LayerCrossDomainTransfer:
         }
 
 # ============================================================================
-# Enhanced Dynamic Layer Discovery with Retry & Health Checks
+# Dynamic Layer Discovery Manager (unchanged)
 # ============================================================================
 class DynamicLayerDiscoveryManager:
-    """Dynamic layer discovery with retry, circuit breaker, and health monitoring."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig):
         self.config = config
         self.discovered_layers: Dict[int, Dict[str, Any]] = {}
@@ -754,34 +729,28 @@ class DynamicLayerDiscoveryManager:
         self.circuit_breaker_threshold = config.circuit_breaker_failure_threshold
         self.circuit_open_layers: Set[int] = set()
         self.circuit_open_until: Dict[int, datetime] = {}
-
         logger.info(f"DynamicLayerDiscoveryManager initialized (max_retries={self.max_retries})")
 
     async def discover_layer(self, layer_number: int, service_url: str) -> bool:
-        """Discover a layer with retry and circuit breaker."""
-        # Circuit breaker check
         if layer_number in self.circuit_open_layers:
-            if datetime.utcnow() < self.circuit_open_until.get(layer_number, datetime.min):
+            if datetime.now(timezone.utc) < self.circuit_open_until.get(layer_number, datetime.min):
                 logger.warning(f"Discovery circuit breaker open for layer {layer_number}")
                 return False
             else:
                 self.circuit_open_layers.remove(layer_number)
                 self.health_failure_counts[layer_number] = 0
                 logger.info(f"Discovery circuit breaker reset for layer {layer_number}")
-
         for attempt in range(self.max_retries):
             try:
                 async with self._lock:
-                    # Simulate discovery (replace with real service discovery)
                     capabilities = self._get_layer_capabilities(layer_number)
                     health = await self._check_layer_health(service_url)
-
                     if health:
                         self.discovered_layers[layer_number] = {
                             'url': service_url,
                             'capabilities': capabilities,
                             'health': health,
-                            'discovered_at': datetime.utcnow().isoformat(),
+                            'discovered_at': datetime.now(timezone.utc).isoformat(),
                             'status': 'active'
                         }
                         self.health_failure_counts[layer_number] = 0
@@ -799,22 +768,19 @@ class DynamicLayerDiscoveryManager:
                     self._handle_discovery_failure(layer_number)
                     return False
                 await asyncio.sleep(2 ** attempt)
-
         return False
 
     def _handle_discovery_failure(self, layer_number: int):
         self.health_failure_counts[layer_number] += 1
         if self.health_failure_counts[layer_number] >= self.circuit_breaker_threshold:
             self.circuit_open_layers.add(layer_number)
-            self.circuit_open_until[layer_number] = datetime.utcnow() + timedelta(minutes=5)
+            self.circuit_open_until[layer_number] = datetime.now(timezone.utc) + timedelta(minutes=5)
             logger.error(f"Discovery circuit breaker opened for layer {layer_number}")
         if layer_number in self.discovered_layers:
             self.discovered_layers[layer_number]['status'] = 'unreachable'
 
     async def _check_layer_health(self, service_url: str) -> bool:
-        """Health check for a discovered layer."""
         try:
-            # Simulate health check (replace with actual HTTP health endpoint)
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{service_url}/health", timeout=5) as resp:
                     return resp.status == 200
@@ -845,11 +811,10 @@ class DynamicLayerDiscoveryManager:
         return self.discovered_layers.get(layer_number)
 
 # ============================================================================
-# Enhanced Event Correlation Engine with Temporal & Causal Patterns
+# Event Correlation Engine (unchanged)
 # ============================================================================
 class EventCorrelationEngine:
-    """Event correlation with temporal windows and causal pattern detection."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig):
         self.config = config
         self.event_graph: Dict[str, List[str]] = defaultdict(list)
@@ -868,36 +833,27 @@ class EventCorrelationEngine:
         logger.info("EventCorrelationEngine initialized")
 
     async def correlate_event(self, event: LayerEvent) -> Optional[str]:
-        """Correlate event with existing events using temporal and causal patterns."""
         async with self._lock:
             self.recent_events.append(event)
-
-            # 1. Temporal correlation: check if event happens within a window of a parent
-            for other in reversed(list(self.recent_events)[-20:]):  # look at last 20
+            for other in reversed(list(self.recent_events)[-20:]):
                 if other.event_id == event.event_id:
                     continue
                 time_diff = (event.timestamp - other.timestamp).total_seconds()
                 if 0 < time_diff < self.temporal_window_seconds:
-                    # If event type is related, consider it a child
                     if self._is_related(other.event_type, event.event_type):
                         event.parent_event_id = other.event_id
                         self.event_graph[other.event_id].append(event.event_id)
                         return other.correlation_id or other.event_id
-
-            # 2. Pattern-based correlation
             pattern = self._detect_pattern(event)
             if pattern:
-                correlation_id = f"corr_{datetime.utcnow().timestamp()}_{pattern}"
+                correlation_id = f"corr_{datetime.now(timezone.utc).timestamp()}_{pattern}"
                 self.correlation_patterns[correlation_id].append(event.event_id)
                 event.correlation_id = correlation_id
                 self.event_metadata[correlation_id] = {'pattern': pattern, 'timestamp': event.timestamp.isoformat()}
                 return correlation_id
-
             return None
 
     def _is_related(self, type1: str, type2: str) -> bool:
-        """Check if two event types are semantically related."""
-        # Simple keyword overlap
         words1 = set(type1.lower().split('_'))
         words2 = set(type2.lower().split('_'))
         return bool(words1 & words2)
@@ -925,11 +881,10 @@ class EventCorrelationEngine:
         }
 
 # ============================================================================
-# Enhanced Gradient-Aware Cache Manager with Weighted Eviction
+# Gradient-Aware Cache Manager (unchanged)
 # ============================================================================
 class GradientAwareCacheManager:
-    """Gradient-aware cache with weighted eviction and dynamic TTL."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig):
         self.config = config
         self.cache: Dict[str, CacheEntry] = {}
@@ -944,19 +899,15 @@ class GradientAwareCacheManager:
             if key not in self.cache:
                 return None
             entry = self.cache[key]
-
-            # Gradient-based invalidation
             if abs(gradient_level - entry.gradient_level_at_creation) > entry.gradient_threshold:
                 entry.invalidated_by_gradient = True
                 del self.cache[key]
                 return None
-
-            if datetime.utcnow() > entry.expires_at:
+            if datetime.now(timezone.utc) > entry.expires_at:
                 del self.cache[key]
                 return None
-
             entry.access_count += 1
-            entry.last_accessed = datetime.utcnow()
+            entry.last_accessed = datetime.now(timezone.utc)
             return entry.value
 
     async def set(self, key: str, value: Any, layer_number: int, gradient_level: float = 0.5,
@@ -964,33 +915,28 @@ class GradientAwareCacheManager:
         async with self._lock:
             if len(self.cache) >= self.max_size:
                 await self._evict_weighted()
-
-            # Dynamic TTL based on token balance and gradient
             ttl = self.base_ttl
             if token_balance > 0.5:
                 ttl *= 1.5
             elif token_balance < 0.2:
                 ttl *= 0.5
             ttl *= (1.0 + gradient_level * 0.5)
-
             entry = CacheEntry(
                 key=key,
                 value=value,
-                created_at=datetime.utcnow(),
-                expires_at=datetime.utcnow() + timedelta(seconds=ttl),
+                created_at=datetime.now(timezone.utc),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl),
                 layer_number=layer_number,
                 gradient_level_at_creation=gradient_level,
                 token_backed=token_balance > 0.2,
-                weight=1.0  # initial weight
+                weight=1.0
             )
             self.cache[key] = entry
 
     async def _evict_weighted(self):
-        """Evict using a weighted score: higher weight = more important."""
         if not self.cache:
             return
-        # Score = access_count / (age + 1) * weight
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         min_score = float('inf')
         evict_key = None
         for key, entry in self.cache.items():
@@ -1028,11 +974,10 @@ class GradientAwareCacheManager:
         }
 
 # ============================================================================
-# Enhanced Distributed Transaction Coordinator with Timeout & Participant Failures
+# Distributed Transaction Coordinator (unchanged)
 # ============================================================================
 class DistributedTransactionCoordinator:
-    """Distributed transaction coordinator with timeout handling and participant failure detection."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig):
         self.config = config
         self.coordinator_id = config.coordinator_id
@@ -1042,16 +987,11 @@ class DistributedTransactionCoordinator:
         self.heartbeat_interval = 5.0
         logger.info(f"DistributedTransactionCoordinator initialized: {self.coordinator_id}")
 
-    async def begin_distributed_transaction(
-        self,
-        layers_involved: List[int],
-        participants: List[str],
-        timeout_seconds: float = 60.0
-    ) -> TransactionContext:
+    async def begin_distributed_transaction(self, layers_involved: List[int], participants: List[str], timeout_seconds: float = 60.0) -> TransactionContext:
         async with self._lock:
             txn = TransactionContext(
-                transaction_id=f"dist_txn_{datetime.utcnow().timestamp()}_{uuid.uuid4().hex[:8]}",
-                started_at=datetime.utcnow(),
+                transaction_id=f"dist_txn_{datetime.now(timezone.utc).timestamp()}_{uuid.uuid4().hex[:8]}",
+                started_at=datetime.now(timezone.utc),
                 layers_involved=layers_involved,
                 timeout_seconds=timeout_seconds,
                 coordinator_id=self.coordinator_id,
@@ -1069,13 +1009,8 @@ class DistributedTransactionCoordinator:
             txn = self.active_transactions[transaction_id]
             if participant not in txn.participants:
                 return False
-
-            # Simulate prepare phase with timeout
             try:
-                prepared = await asyncio.wait_for(
-                    self._simulate_prepare(participant),
-                    timeout=self.participant_timeout
-                )
+                prepared = await asyncio.wait_for(self._simulate_prepare(participant), timeout=self.participant_timeout)
                 txn.distributed_status[participant] = 'prepared' if prepared else 'failed'
                 if prepared:
                     logger.info(f"Participant {participant} prepared for {transaction_id}")
@@ -1088,8 +1023,7 @@ class DistributedTransactionCoordinator:
                 return False
 
     async def _simulate_prepare(self, participant: str) -> bool:
-        # Simulate prepare; replace with actual RPC
-        await asyncio.sleep(0.1)  # realistic delay
+        await asyncio.sleep(0.1)
         return np.random.random() > 0.1
 
     async def commit_distributed_transaction(self, transaction_id: str) -> bool:
@@ -1097,17 +1031,11 @@ class DistributedTransactionCoordinator:
             if transaction_id not in self.active_transactions:
                 return False
             txn = self.active_transactions[transaction_id]
-
-            # Check if all participants are prepared
-            all_prepared = all(
-                status == 'prepared' for status in txn.distributed_status.values()
-            )
+            all_prepared = all(status == 'prepared' for status in txn.distributed_status.values())
             if not all_prepared:
                 logger.warning(f"Not all participants prepared for {transaction_id}")
                 await self.rollback_distributed_transaction(transaction_id)
                 return False
-
-            # Commit all participants
             for participant in txn.participants:
                 txn.distributed_status[participant] = 'committed'
             txn.status = 'committed'
@@ -1128,13 +1056,11 @@ class DistributedTransactionCoordinator:
             return True
 
     async def heartbeat(self, transaction_id: str):
-        """Send heartbeat to keep transaction alive."""
         async with self._lock:
             if transaction_id in self.active_transactions:
                 txn = self.active_transactions[transaction_id]
-                txn.last_heartbeat = datetime.utcnow()
-                # Check timeout
-                if (datetime.utcnow() - txn.started_at).total_seconds() > txn.timeout_seconds:
+                txn.last_heartbeat = datetime.now(timezone.utc)
+                if (datetime.now(timezone.utc) - txn.started_at).total_seconds() > txn.timeout_seconds:
                     await self.rollback_distributed_transaction(transaction_id)
                     logger.warning(f"Transaction {transaction_id} timed out and rolled back")
 
@@ -1152,32 +1078,20 @@ class DistributedTransactionCoordinator:
         return None
 
 # ============================================================================
-# Sustainability Score Calculator (NEW)
+# Sustainability Score Calculator (unchanged)
 # ============================================================================
 class SustainabilityScoreCalculator:
-    """Calculates a composite sustainability score from multiple metrics."""
-
+    # ... (same as before) ...
     def __init__(self, config: LayerIntegratorConfig):
         self.config = config
         self.weights = config.sustainability_weights
 
-    def calculate(self,
-                 carbon_savings_kg: float,
-                 helium_saved_l: float,
-                 renewable_usage_percent: float,
-                 token_efficiency: float,
-                 layer_health_avg: float,
-                 total_energy_saved_kwh: float = 0.0) -> float:
-        """
-        Compute sustainability score as weighted sum of normalized components.
-        """
-        # Normalize each component to [0,1]
-        norm_carbon = min(1.0, carbon_savings_kg / 1000)  # assume max 1000 kg
-        norm_helium = min(1.0, helium_saved_l / 100)     # assume max 100 L
+    def calculate(self, carbon_savings_kg: float, helium_saved_l: float, renewable_usage_percent: float, token_efficiency: float, layer_health_avg: float, total_energy_saved_kwh: float = 0.0) -> float:
+        norm_carbon = min(1.0, carbon_savings_kg / 1000)
+        norm_helium = min(1.0, helium_saved_l / 100)
         norm_renewable = min(1.0, renewable_usage_percent / 100)
         norm_tokens = min(1.0, token_efficiency)
         norm_health = min(1.0, layer_health_avg)
-
         score = (
             self.weights.get('carbon_savings', 0.3) * norm_carbon +
             self.weights.get('helium_efficiency', 0.2) * norm_helium +
@@ -1188,7 +1102,6 @@ class SustainabilityScoreCalculator:
         return max(0.0, min(1.0, score))
 
     def get_weighted_breakdown(self, components: Dict[str, float]) -> Dict[str, float]:
-        """Return individual weighted contributions for diagnostics."""
         breakdown = {}
         for key, value in components.items():
             weight = self.weights.get(key, 0.0)
@@ -1196,34 +1109,29 @@ class SustainabilityScoreCalculator:
         return breakdown
 
 # ============================================================================
-# Telemetry Collector (NEW)
+# Telemetry Collector (unchanged)
 # ============================================================================
 class TelemetryCollector:
-    """Collects and exports telemetry metrics for monitoring."""
-
+    # ... (same as before) ...
     def __init__(self, exporter: Optional[str] = None):
-        self.exporter = exporter  # e.g., 'prometheus'
+        self.exporter = exporter
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
         logger.info(f"TelemetryCollector initialized (exporter={exporter})")
 
     def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None, value: float = 1.0):
-        """Increment a counter metric."""
         key = self._make_key(metric_name, tags)
         self.metrics['counters'][key] += value
 
     def gauge(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
-        """Set a gauge metric."""
         key = self._make_key(metric_name, tags)
         self.metrics['gauges'][key] = value
 
     def histogram(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
-        """Record a histogram observation."""
         key = self._make_key(metric_name, tags)
         if key not in self.metrics['histograms']:
             self.metrics['histograms'][key] = []
         self.metrics['histograms'][key].append(value)
-        # Keep last 1000 observations
         if len(self.metrics['histograms'][key]) > 1000:
             self.metrics['histograms'][key] = self.metrics['histograms'][key][-1000:]
 
@@ -1234,9 +1142,7 @@ class TelemetryCollector:
         return metric_name
 
     async def export(self):
-        """Export metrics to the configured backend."""
         if self.exporter == 'prometheus':
-            # Prometheus text format export
             output = []
             for key, value in self.metrics['counters'].items():
                 output.append(f"# TYPE {key} counter\n{key} {value}")
@@ -1255,36 +1161,38 @@ class TelemetryCollector:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Enhanced Layer Integrator (Main Class)
+# Enhanced Layer Integrator (Main Class) – v7.0.0
 # ============================================================================
 class EnhancedLayerIntegrator:
     """
-    Enhanced Layer Integrator v6.1.1 - Complete Green Agent Implementation
+    Enhanced Layer Integrator v7.0.0 – Complete Green Agent Implementation with full bio‑inspired core integration.
     """
 
-    def __init__(self, config: Optional[LayerIntegratorConfig] = None):
-        if config is None:
-            config = LayerIntegratorConfig()
-        self.config = config
+    def __init__(
+        self,
+        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        config: Optional[Union[LayerIntegratorConfig, Dict[str, Any]]] = None,
+        expert_router: Optional['ExpertRouter'] = None,
+    ):
+        # Load config
+        if isinstance(config, dict):
+            self.config = LayerIntegratorConfig(**config)
+        elif isinstance(config, LayerIntegratorConfig):
+            self.config = config
+        else:
+            self.config = LayerIntegratorConfig()
 
-        # Feature flags from config
-        self.enable_cache = config.enable_cache
-        self.enable_circuit_breaker = config.enable_circuit_breaker
-        self.enable_retry = config.enable_retry
-        self.enable_events = config.enable_events
-        self.enable_transactions = config.enable_transactions
-        self.enable_monitoring = config.enable_monitoring
-        self.enable_bio_integration = config.enable_bio_integration and BIO_INSPIRED_AVAILABLE
-        self.enable_carbon_intensity = config.enable_carbon_intensity
-        self.enable_predictive = config.enable_predictive
-        self.enable_cross_domain = config.enable_cross_domain
-        self.enable_sustainability_scoring = config.enable_sustainability_scoring
-        self.enable_dynamic_discovery = config.enable_dynamic_discovery
-        self.enable_event_correlation = config.enable_event_correlation
-        self.enable_gradient_cache = config.enable_gradient_cache
-        self.enable_distributed_txns = config.enable_distributed_txns
-
-        # Bio-inspired modules
+        # Store bio‑core reference
+        self.bio_core = bio_core
+        self.event_broker = None
+        self.alert_system = None
+        self.anomaly_detection = None
+        self.cost_benefit_engine = None
+        self.quantum_bridge = None
+        self.tick_engine = None
+        self.swarm_coordinator = None
+        self.self_healer = None
+        self.workflow_orchestrator = None
         self.token_manager = None
         self.gradient_manager = None
         self.scheduler = None
@@ -1292,19 +1200,60 @@ class EnhancedLayerIntegrator:
         self.biomass_storage = None
         self.harvester = None
 
+        # Extract core sub‑modules if available
+        if self.bio_core:
+            self.event_broker = getattr(self.bio_core, 'event_broker', None)
+            self.alert_system = getattr(self.bio_core, 'alert_system', None)
+            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
+            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
+            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
+            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
+            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
+            self.self_healer = getattr(self.bio_core, 'self_healer', None)
+            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
+            self.token_manager = getattr(self.bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(self.bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
+            self.harvester = getattr(self.bio_core, 'harvester', None)
+
+        # Feature flags from config
+        self.enable_bio_integration = self.config.enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_cache = self.config.enable_cache
+        self.enable_circuit_breaker = self.config.enable_circuit_breaker
+        self.enable_retry = self.config.enable_retry
+        self.enable_events = self.config.enable_events
+        self.enable_transactions = self.config.enable_transactions
+        self.enable_monitoring = self.config.enable_monitoring
+        self.enable_carbon_intensity = self.config.enable_carbon_intensity
+        self.enable_predictive = self.config.enable_predictive
+        self.enable_cross_domain = self.config.enable_cross_domain
+        self.enable_sustainability_scoring = self.config.enable_sustainability_scoring
+        self.enable_dynamic_discovery = self.config.enable_dynamic_discovery
+        self.enable_event_correlation = self.config.enable_event_correlation
+        self.enable_gradient_cache = self.config.enable_gradient_cache
+        self.enable_distributed_txns = self.config.enable_distributed_txns
+        self.enable_persistence = self.config.enable_persistence
+        self.enable_event_driven = self.config.enable_event_driven
+        self.enable_self_healing = self.config.enable_self_healing
+
         # Initialize components
-        self.carbon_manager = CarbonIntensityManager(config) if self.enable_carbon_intensity else None
-        self.predictive_analyzer = PredictiveLayerAnalyzer(config) if self.enable_predictive else None
+        self.carbon_manager = CarbonIntensityManager(self.config) if self.enable_carbon_intensity else None
+        self.predictive_analyzer = PredictiveLayerAnalyzer(self.config) if self.enable_predictive else None
         self.cross_domain_transfer = LayerCrossDomainTransfer() if self.enable_cross_domain else None
-        self.discovery_manager = DynamicLayerDiscoveryManager(config) if self.enable_dynamic_discovery else None
-        self.event_correlation = EventCorrelationEngine(config) if self.enable_event_correlation else None
-        self.gradient_cache = GradientAwareCacheManager(config) if self.enable_gradient_cache else None
-        self.distributed_coordinator = DistributedTransactionCoordinator(config) if self.enable_distributed_txns else None
-        self.sustainability_calculator = SustainabilityScoreCalculator(config) if self.enable_sustainability_scoring else None
+        self.discovery_manager = DynamicLayerDiscoveryManager(self.config) if self.enable_dynamic_discovery else None
+        self.event_correlation = EventCorrelationEngine(self.config) if self.enable_event_correlation else None
+        self.gradient_cache = GradientAwareCacheManager(self.config) if self.enable_gradient_cache else None
+        self.distributed_coordinator = DistributedTransactionCoordinator(self.config) if self.enable_distributed_txns else None
+        self.sustainability_calculator = SustainabilityScoreCalculator(self.config) if self.enable_sustainability_scoring else None
         self.telemetry = TelemetryCollector() if self.enable_monitoring else None
 
+        # Persistence
+        self.persistence = LayerIntegratorPersistence(self.config.persistence_path) if self.enable_persistence else None
+
         # MoE integration
-        self.expert_router = None
+        self.expert_router = expert_router
         self.helium_provider = None
         self.fl_monitor = None
 
@@ -1315,18 +1264,18 @@ class EnhancedLayerIntegrator:
 
         # Cache (fallback)
         self.cache: Dict[str, CacheEntry] = {}
-        self.cache_ttl = config.cache_ttl_seconds
-        self.max_cache_size = config.max_cache_size
+        self.cache_ttl = self.config.cache_ttl_seconds
+        self.max_cache_size = self.config.max_cache_size
 
-        # Event system
+        # Event system (local)
         self.event_subscribers: Dict[str, List[Callable]] = defaultdict(list)
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
 
         # Retry config
         self.retry_config = RetryConfig(
-            max_retries=config.max_retries,
-            base_delay_ms=config.retry_base_delay_ms,
-            max_delay_ms=config.retry_max_delay_ms
+            max_retries=self.config.max_retries,
+            base_delay_ms=self.config.retry_base_delay_ms,
+            max_delay_ms=self.config.retry_max_delay_ms
         )
 
         # Transactions
@@ -1343,17 +1292,30 @@ class EnhancedLayerIntegrator:
         self.total_energy_saved_kwh = 0.0
         self.sustainability_score = 0.0
 
+        # Health status
+        self.health_status = "healthy"
+        self.last_error = None
+        self.correlation_id = str(uuid.uuid4())
+
         # Thread pool
         self.executor = ThreadPoolExecutor(max_workers=4)
 
         # Initialize all 12 layers
         self._initialize_all_layers()
 
+        # Load persisted state if available
+        if self.persistence:
+            self._load_state()
+
+        # Subscribe to core events if enabled and core available
+        if self.enable_event_driven and self.event_broker:
+            self._subscribe_events()
+
         # Start background tasks
         self._start_background_tasks()
 
         logger.info(
-            f"EnhancedLayerIntegrator v6.1.1 initialized: "
+            f"EnhancedLayerIntegrator v7.0.0 initialized: "
             f"layers={len(self.layers)}/12, "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
@@ -1362,63 +1324,96 @@ class EnhancedLayerIntegrator:
             f"event_correlation={self.enable_event_correlation}, "
             f"gradient_cache={self.enable_gradient_cache}, "
             f"distributed_txns={self.enable_distributed_txns}, "
-            f"sustainability_scoring={self.enable_sustainability_scoring}"
+            f"sustainability_scoring={self.enable_sustainability_scoring}, "
+            f"persistence={self.enable_persistence}, "
+            f"event_driven={self.enable_event_driven}"
         )
 
-    def _initialize_all_layers(self):
-        layer_definitions = {
-            0: ("Workload + Helium Profile", "2.4.0", [1, 2]),
-            1: ("Meta-Cognition + Helium Adapter", "2.4.0", [0, 2, 3]),
-            2: ("Neuro-Symbolic + Graph Reasoning", "2.4.0", [1, 3]),
-            3: ("Dual-Axis Decision Core", "2.4.0", [1, 2, 4, 5]),
-            4: ("Helium-Aware ML", "2.4.0", [3, 5]),
-            5: ("Data Optimization", "2.4.0", [3, 4]),
-            6: ("Distributed Execution", "2.4.0", [3, 7]),
-            7: ("Dual Monitoring (C + H)", "2.4.0", [6, 8]),
-            8: ("Immutable Dual Ledger", "2.4.0", [7, 9]),
-            9: ("3D Pareto Benchmarking", "2.4.0", [8, 10]),
-            10: ("Quantum Integration (beta)", "2.4.0-beta", [9, 11]),
-            11: ("Dashboard & Visualization", "2.4.0", [10])
-        }
-        entangled_pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
-                          (6, 7), (7, 8), (8, 9), (9, 10), (10, 11)]
+    # ============================================================================
+    # Event Subscriptions
+    # ============================================================================
+    def _subscribe_events(self):
+        if self.event_broker:
+            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
+            self.event_broker.subscribe('helium_update', self._on_helium_update)
+            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
+            self.event_broker.subscribe('config_updated', self._on_config_updated)
+            self.event_broker.subscribe('token_balance_update', self._on_token_update)
+            self.event_broker.subscribe('health_update', self._on_health_update)
+            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
+            logger.info("EnhancedLayerIntegrator subscribed to core events")
 
-        for layer_num, (name, version, deps) in layer_definitions.items():
-            entangled = []
-            for a, b in entangled_pairs:
-                if layer_num == a and b not in entangled:
-                    entangled.append(b)
-                elif layer_num == b and a not in entangled:
-                    entangled.append(a)
+    async def _on_carbon_update(self, event: BioEvent):
+        self.carbon_intensity = event.data.get('intensity', 400)
+        self.carbon_price = event.data.get('price', 50.0)
+        self._update_boundaries()
 
-            self.layers[layer_num] = LayerInfo(
-                layer_number=layer_num,
-                layer_name=name,
-                version=version,
-                dependencies=deps,
-                capabilities=self._get_layer_capabilities(layer_num),
-                entangled_layers=entangled,
-                sustainability_score=0.5,
-                discovery_timestamp=datetime.utcnow() if self.enable_dynamic_discovery else None
-            )
+    async def _on_helium_update(self, event: BioEvent):
+        helium_scarcity = event.data.get('scarcity', 0.5)
+        helium_price = event.data.get('price', 0.5)
+        # Update layer health based on helium scarcity
+        for layer_info in self.layers.values():
+            layer_info.sustainability_score -= helium_scarcity * 0.01
 
-    def _get_layer_capabilities(self, layer_num: int) -> List[str]:
-        capabilities = {
-            0: ["workload_classification", "helium_profiling", "task_embedding"],
-            1: ["meta_cognition", "reflection", "budget_management", "adaptive_learning"],
-            2: ["symbolic_validation", "graph_reasoning", "policy_enforcement"],
-            3: ["dual_axis_scoring", "zone_mapping", "action_classification"],
-            4: ["model_quantization", "helium_aware_training", "pruning"],
-            5: ["data_compression", "batching", "streaming", "caching"],
-            6: ["distributed_execution", "load_balancing", "fault_tolerance"],
-            7: ["carbon_monitoring", "helium_monitoring", "prometheus_export"],
-            8: ["immutable_logging", "audit_trail", "iso_compliance"],
-            9: ["pareto_analysis", "3d_benchmarking", "tradeoff_optimization"],
-            10: ["quantum_circuits", "quantum_scheduling", "error_mitigation"],
-            11: ["visualization", "dashboards", "alerting", "reporting"]
-        }
-        return capabilities.get(layer_num, [])
+    async def _on_alert_generated(self, event: BioEvent):
+        if event.data.get('severity') == 'critical':
+            logger.warning("Critical alert received; switching to conservative mode and triggering healing")
+            if self.enable_self_healing and self.self_healer:
+                await self.self_healer.apply_healing('damage_accumulation')
+            # Also trigger a workflow to repair layers
+            if self.workflow_orchestrator and self.config.workflow_on_degradation:
+                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_degradation)
 
+    async def _on_config_updated(self, event: BioEvent):
+        updates = event.data.get('updates', {})
+        if 'layer_integrator' in updates:
+            new_config = updates['layer_integrator']
+            for key, value in new_config.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+            logger.info("Configuration reloaded", updates=new_config)
+
+    async def _on_token_update(self, event: BioEvent):
+        self.token_balance = event.data.get('balance', 500)
+
+    async def _on_health_update(self, event: BioEvent):
+        self.health_status = event.data.get('status', 'healthy')
+
+    async def _on_anomaly_detected(self, event: BioEvent):
+        if event.data.get('metric') == 'carbon_intensity':
+            logger.info("Carbon anomaly detected; adjusting thresholds")
+
+    # ============================================================================
+    # Persistence Methods
+    # ============================================================================
+    def _load_state(self):
+        state = self.persistence.load()
+        if state:
+            self.layers = state.get('layers', self.layers)
+            self.cache = state.get('cache', {})
+            self.active_transactions = state.get('transactions', {})
+            self.total_carbon_savings_kg = state.get('carbon_savings', 0.0)
+            self.total_helium_saved_l = state.get('helium_saved', 0.0)
+            self.total_energy_saved_kwh = state.get('energy_saved', 0.0)
+            self.sustainability_score = state.get('sustainability_score', 0.0)
+            logger.info("Loaded state from persistence")
+
+    def _save_state(self):
+        if self.persistence:
+            state = {
+                'layers': self.layers,
+                'cache': self.cache,
+                'transactions': self.active_transactions,
+                'carbon_savings': self.total_carbon_savings_kg,
+                'helium_saved': self.total_helium_saved_l,
+                'energy_saved': self.total_energy_saved_kwh,
+                'sustainability_score': self.sustainability_score,
+            }
+            self.persistence.save(state)
+
+    # ============================================================================
+    # Background Tasks
+    # ============================================================================
     def _start_background_tasks(self):
         asyncio.create_task(self._health_check_loop())
         asyncio.create_task(self._event_processing_loop())
@@ -1430,189 +1425,9 @@ class EnhancedLayerIntegrator:
             asyncio.create_task(self._carbon_update_loop())
         if self.enable_dynamic_discovery:
             asyncio.create_task(self._discovery_loop())
+        if self.enable_persistence:
+            asyncio.create_task(self._persistence_save_loop())
 
-    # ==========================================================================
-    # Injection Methods
-    # ==========================================================================
-    def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
-            self.enable_bio_integration = True
-
-    def set_expert_router(self, router: 'ExpertRouter'):
-        self.expert_router = router
-        logger.info("Expert Router injected into Layer Integrator")
-
-    def set_helium_provider(self, provider):
-        self.helium_provider = provider
-        logger.info("Helium provider injected into Layer Integrator")
-
-    def set_fl_monitor(self, fl_monitor):
-        self.fl_monitor = fl_monitor
-        logger.info("FL monitor injected into Layer Integrator")
-
-    # ==========================================================================
-    # Context Builder for MoE Expert System
-    # ==========================================================================
-    async def build_context(self) -> Dict[str, Any]:
-        """Build a comprehensive context for MoE expert router."""
-        context = {}
-
-        # 1. Helium telemetry
-        if self.helium_provider:
-            context['helium_scarcity'] = self.helium_provider.get_scarcity()
-            context['helium_cost_index'] = self.helium_provider.get_cost_index()
-            context['avg_client_energy'] = self.helium_provider.get_avg_client_energy()
-        else:
-            context['helium_scarcity'] = 0.5
-            context['helium_cost_index'] = 1.0
-            context['avg_client_energy'] = 0.5
-
-        # 2. Carbon intensity
-        if self.enable_carbon_intensity and self.carbon_manager:
-            carbon_intensity = await self.carbon_manager.get_current_intensity()
-            carbon_price = await self.carbon_manager.get_current_price()
-            context['carbon_intensity'] = carbon_intensity / 1000.0
-            context['carbon_price_usd'] = carbon_price
-        else:
-            context['carbon_intensity'] = 0.5
-            context['carbon_price_usd'] = 50.0
-
-        # 3. Bio-inspired signals
-        gradients = self._get_real_gradient_levels()
-        context['gradient_carbon'] = gradients.get('carbon', 0.5)
-        context['gradient_helium'] = gradients.get('helium', 0.5)
-        context['gradient_trust'] = gradients.get('trust', 0.5)
-        context['gradient_opportunity'] = gradients.get('opportunity', 0.5)
-        context['token_balance_norm'] = self._get_real_token_availability()
-        context['harvester_stress'] = self._get_harvester_vitality()
-        context['avg_layer_health'] = np.mean([info.gradient_health for info in self.layers.values()])
-
-        # 4. Federated Learning metrics
-        if self.fl_monitor:
-            context['model_loss'] = self.fl_monitor.get_loss()
-            context['gradient_variance'] = self.fl_monitor.get_gradient_variance()
-            context['accuracy'] = self.fl_monitor.get_accuracy()
-        else:
-            context['model_loss'] = 0.0
-            context['gradient_variance'] = 0.0
-            context['accuracy'] = 0.0
-
-        # 5. Sustainability
-        context['sustainability_score'] = self.sustainability_score
-        context['carbon_savings_kg'] = self.total_carbon_savings_kg
-        context['helium_saved_l'] = self.total_helium_saved_l
-        context['energy_saved_kwh'] = self.total_energy_saved_kwh
-
-        # 6. Predictions
-        if self.enable_predictive and self.predictive_analyzer:
-            forecast = await self.predictive_analyzer.predict_layer_health()
-            context['predicted_layer_health'] = forecast.get('predicted_health', 0.5)
-            context['prediction_confidence'] = forecast.get('confidence', 0.0)
-
-        return context
-
-    def _get_real_gradient_levels(self) -> Dict[str, float]:
-        if self.gradient_manager:
-            return self.gradient_manager.get_field_strengths()
-        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
-
-    def _get_real_token_availability(self) -> float:
-        if self.token_manager:
-            summary = self.token_manager.get_system_summary()
-            return min(1.0, summary.get('total_balance', 500) / 1000)
-        return 0.5
-
-    def _get_harvester_vitality(self) -> float:
-        if self.harvester:
-            stats = self.harvester.get_harvesting_stats()
-            total = stats.get('total_harvested', 0)
-            return min(1.0, total / max(total + 100, 1))
-        return 0.5
-
-    # ==========================================================================
-    # Bio-Inspired Helper Methods (with fallback)
-    # ==========================================================================
-    def _get_gradient_health(self, layer_number: int) -> float:
-        if self.gradient_manager:
-            trust = self.gradient_manager.fields.get('trust')
-            if trust:
-                return trust.gradient_strength
-        return 0.7
-
-    def _get_membrane_permeability(self, layer_number: int) -> str:
-        if self.compartment_manager:
-            layer_types = {0: 'energy', 1: 'energy', 2: 'data', 3: 'data',
-                          4: 'energy', 5: 'data', 6: 'iot', 7: 'data',
-                          8: 'data', 9: 'energy', 10: 'quantum', 11: 'data'}
-            expert_type = layer_types.get(layer_number, 'data')
-            compartment = self.compartment_manager.find_best_compartment(expert_type)
-            if compartment:
-                return compartment.membrane.permeability.value
-        return 'selective'
-
-    def _get_token_backed_cache_ttl(self) -> float:
-        if self.token_manager:
-            summary = self.token_manager.get_system_summary()
-            balance = summary.get('total_balance', 500)
-            if balance > 500:
-                return 120.0
-            elif balance < 100:
-                return 30.0
-        return self.cache_ttl
-
-    def _recover_tokens_on_rollback(self, transaction_id: str, amount: float) -> float:
-        if self.token_manager:
-            return self.token_manager.recover_tokens(
-                token_ids=[f"txn_{transaction_id}"],
-                completion_percentage=0.5
-            )
-        return 0.0
-
-    def _get_gradient_modulated_retry_delay(self, base_delay: float) -> float:
-        if self.gradient_manager:
-            carbon = self.gradient_manager.fields.get('carbon')
-            if carbon and carbon.gradient_strength > 0.7:
-                return base_delay * 2.0
-            elif carbon and carbon.gradient_strength < 0.3:
-                return base_delay * 0.5
-        return base_delay
-
-    def _get_entangled_resources(self, layer_number: int) -> List[str]:
-        entangled = []
-        if layer_number in self.layers:
-            for other_layer in self.layers[layer_number].entangled_layers:
-                entangled.append(f"layer_{other_layer}")
-        if self.biomass_storage:
-            stats = self.biomass_storage.get_storage_stats()
-            if stats.get('collateral_pool', 0) > 0:
-                entangled.append('biomass_collateral')
-        return entangled
-
-    def _get_circuit_recovery_delay(self, layer_number: int) -> float:
-        if self.gradient_manager:
-            trust = self.gradient_manager.fields.get('trust')
-            if trust and trust.gradient_strength > self.layers[layer_number].circuit_breaker.gradient_health_threshold:
-                return 15.0
-            return 45.0
-        return 30.0
-
-    # ==========================================================================
-    # Background Loops
-    # ==========================================================================
     async def _bio_sync_loop(self):
         while True:
             try:
@@ -1681,7 +1496,7 @@ class EnhancedLayerIntegrator:
                             is_healthy = await self.call_layer(layer_num, 'health_check', timeout=5.0, retry=False)
                             if is_healthy:
                                 layer_info.status = LayerStatus.HEALTHY
-                                layer_info.last_heartbeat = datetime.utcnow()
+                                layer_info.last_heartbeat = datetime.now(timezone.utc)
                             else:
                                 layer_info.status = LayerStatus.UNHEALTHY
                         except Exception:
@@ -1689,7 +1504,7 @@ class EnhancedLayerIntegrator:
                     if self.enable_bio_integration:
                         layer_info.gradient_health = self._get_gradient_health(layer_num)
                         layer_info.membrane_permeability = self._get_membrane_permeability(layer_num)
-                    heartbeat_age = (datetime.utcnow() - layer_info.last_heartbeat).total_seconds()
+                    heartbeat_age = (datetime.now(timezone.utc) - layer_info.last_heartbeat).total_seconds()
                     if heartbeat_age > 60 and layer_info.status == LayerStatus.HEALTHY:
                         layer_info.status = LayerStatus.DEGRADED
 
@@ -1732,7 +1547,6 @@ class EnhancedLayerIntegrator:
                 event = await self.event_queue.get()
                 subscribers = self.event_subscribers.get(event.event_type, [])
 
-                # Event correlation if enabled
                 if self.enable_event_correlation and self.event_correlation:
                     correlation_id = await self.event_correlation.correlate_event(event)
                     if correlation_id:
@@ -1754,7 +1568,7 @@ class EnhancedLayerIntegrator:
     async def _cache_cleanup_loop(self):
         while True:
             try:
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 expired = [key for key, entry in self.cache.items() if now > entry.expires_at]
                 for key in expired:
                     del self.cache[key]
@@ -1766,7 +1580,7 @@ class EnhancedLayerIntegrator:
     async def _transaction_timeout_loop(self):
         while True:
             try:
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 timed_out = []
                 for txn_id, txn in self.active_transactions.items():
                     elapsed = (now - txn.started_at).total_seconds()
@@ -1779,9 +1593,197 @@ class EnhancedLayerIntegrator:
                 logger.error(f"Transaction timeout error: {str(e)}")
                 await asyncio.sleep(30)
 
-    # ==========================================================================
+    async def _persistence_save_loop(self):
+        while True:
+            try:
+                self._save_state()
+                await asyncio.sleep(300)  # every 5 minutes
+            except Exception as e:
+                logger.error(f"Persistence save error: {str(e)}")
+                await asyncio.sleep(60)
+
+    # ============================================================================
+    # Injection Methods
+    # ============================================================================
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+        else:
+            self.token_manager = kwargs.get('token_manager')
+            self.gradient_manager = kwargs.get('gradient_manager')
+            self.scheduler = kwargs.get('scheduler')
+            self.compartment_manager = kwargs.get('compartment_manager')
+            self.biomass_storage = kwargs.get('biomass_storage')
+            self.harvester = kwargs.get('harvester')
+        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
+            self.enable_bio_integration = True
+
+    def set_expert_router(self, router: 'ExpertRouter'):
+        self.expert_router = router
+        logger.info("Expert Router injected into Layer Integrator")
+
+    def set_helium_provider(self, provider):
+        self.helium_provider = provider
+        logger.info("Helium provider injected into Layer Integrator")
+
+    def set_fl_monitor(self, fl_monitor):
+        self.fl_monitor = fl_monitor
+        logger.info("FL monitor injected into Layer Integrator")
+
+    # ============================================================================
+    # Context Builder for MoE Expert System
+    # ============================================================================
+    async def build_context(self) -> Dict[str, Any]:
+        """Build a comprehensive context for MoE expert router."""
+        context = {}
+
+        # 1. Helium telemetry
+        if self.helium_provider:
+            context['helium_scarcity'] = self.helium_provider.get_scarcity()
+            context['helium_cost_index'] = self.helium_provider.get_cost_index()
+            context['avg_client_energy'] = self.helium_provider.get_avg_client_energy()
+        else:
+            context['helium_scarcity'] = 0.5
+            context['helium_cost_index'] = 1.0
+            context['avg_client_energy'] = 0.5
+
+        # 2. Carbon intensity
+        if self.enable_carbon_intensity and self.carbon_manager:
+            carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_price()
+            context['carbon_intensity'] = carbon_intensity / 1000.0
+            context['carbon_price_usd'] = carbon_price
+        else:
+            context['carbon_intensity'] = 0.5
+            context['carbon_price_usd'] = 50.0
+
+        # 3. Bio-inspired signals
+        gradients = self._get_real_gradient_levels()
+        context['gradient_carbon'] = gradients.get('carbon', 0.5)
+        context['gradient_helium'] = gradients.get('helium', 0.5)
+        context['gradient_trust'] = gradients.get('trust', 0.5)
+        context['gradient_opportunity'] = gradients.get('opportunity', 0.5)
+        context['token_balance_norm'] = self._get_real_token_availability()
+        context['harvester_stress'] = self._get_harvester_vitality()
+        context['avg_layer_health'] = np.mean([info.gradient_health for info in self.layers.values()])
+
+        # 4. Federated Learning metrics
+        if self.fl_monitor:
+            context['model_loss'] = self.fl_monitor.get_loss()
+            context['gradient_variance'] = self.fl_monitor.get_gradient_variance()
+            context['accuracy'] = self.fl_monitor.get_accuracy()
+        else:
+            context['model_loss'] = 0.0
+            context['gradient_variance'] = 0.0
+            context['accuracy'] = 0.0
+
+        # 5. Sustainability
+        context['sustainability_score'] = self.sustainability_score
+        context['carbon_savings_kg'] = self.total_carbon_savings_kg
+        context['helium_saved_l'] = self.total_helium_saved_l
+        context['energy_saved_kwh'] = self.total_energy_saved_kwh
+
+        # 6. Predictions
+        if self.enable_predictive and self.predictive_analyzer:
+            forecast = await self.predictive_analyzer.predict_layer_health()
+            context['predicted_layer_health'] = forecast.get('predicted_health', 0.5)
+            context['prediction_confidence'] = forecast.get('confidence', 0.0)
+
+        return context
+
+    # ============================================================================
+    # Bio-Inspired Helper Methods (with fallback)
+    # ============================================================================
+    def _get_gradient_health(self, layer_number: int) -> float:
+        if self.gradient_manager:
+            trust = self.gradient_manager.fields.get('trust')
+            if trust:
+                return trust.gradient_strength
+        return 0.7
+
+    def _get_membrane_permeability(self, layer_number: int) -> str:
+        if self.compartment_manager:
+            layer_types = {0: 'energy', 1: 'energy', 2: 'data', 3: 'data',
+                          4: 'energy', 5: 'data', 6: 'iot', 7: 'data',
+                          8: 'data', 9: 'energy', 10: 'quantum', 11: 'data'}
+            expert_type = layer_types.get(layer_number, 'data')
+            compartment = self.compartment_manager.find_best_compartment(expert_type)
+            if compartment:
+                return compartment.membrane.permeability.value
+        return 'selective'
+
+    def _get_token_backed_cache_ttl(self) -> float:
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            balance = summary.get('total_balance', 500)
+            if balance > 500:
+                return 120.0
+            elif balance < 100:
+                return 30.0
+        return self.cache_ttl
+
+    def _recover_tokens_on_rollback(self, transaction_id: str, amount: float) -> float:
+        if self.token_manager:
+            return self.token_manager.recover_tokens(
+                token_ids=[f"txn_{transaction_id}"],
+                completion_percentage=0.5
+            )
+        return 0.0
+
+    def _get_gradient_modulated_retry_delay(self, base_delay: float) -> float:
+        if self.gradient_manager:
+            carbon = self.gradient_manager.fields.get('carbon')
+            if carbon and carbon.gradient_strength > 0.7:
+                return base_delay * 2.0
+            elif carbon and carbon.gradient_strength < 0.3:
+                return base_delay * 0.5
+        return base_delay
+
+    def _get_entangled_resources(self, layer_number: int) -> List[str]:
+        entangled = []
+        if layer_number in self.layers:
+            for other_layer in self.layers[layer_number].entangled_layers:
+                entangled.append(f"layer_{other_layer}")
+        if self.biomass_storage:
+            stats = self.biomass_storage.get_storage_stats()
+            if stats.get('collateral_pool', 0) > 0:
+                entangled.append('biomass_collateral')
+        return entangled
+
+    def _get_circuit_recovery_delay(self, layer_number: int) -> float:
+        if self.gradient_manager:
+            trust = self.gradient_manager.fields.get('trust')
+            if trust and trust.gradient_strength > self.layers[layer_number].circuit_breaker.gradient_health_threshold:
+                return 15.0
+            return 45.0
+        return 30.0
+
+    def _get_real_gradient_levels(self) -> Dict[str, float]:
+        if self.gradient_manager:
+            return self.gradient_manager.get_field_strengths()
+        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
+
+    def _get_real_token_availability(self) -> float:
+        if self.token_manager:
+            summary = self.token_manager.get_system_summary()
+            return min(1.0, summary.get('total_balance', 500) / 1000)
+        return 0.5
+
+    def _get_harvester_vitality(self) -> float:
+        if self.harvester:
+            stats = self.harvester.get_harvesting_stats()
+            total = stats.get('total_harvested', 0)
+            return min(1.0, total / max(total + 100, 1))
+        return 0.5
+
+    # ============================================================================
     # Layer Communication (Enhanced)
-    # ==========================================================================
+    # ============================================================================
     async def call_layer(
         self,
         layer_number: int,
@@ -1816,7 +1818,6 @@ class EnhancedLayerIntegrator:
 
         if self.enable_circuit_breaker:
             if not layer_info.circuit_breaker.can_execute():
-                # Check if recovery is possible with gradient health
                 if self.enable_bio_integration:
                     gradient_health = self._get_gradient_health(layer_number)
                     if gradient_health > 0.6 and layer_info.circuit_breaker.state == CircuitState.OPEN:
@@ -1889,9 +1890,9 @@ class EnhancedLayerIntegrator:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(self.executor, lambda: method_func(*args, **kwargs))
 
-    # ==========================================================================
+    # ============================================================================
     # Event System
-    # ==========================================================================
+    # ============================================================================
     def subscribe_to_event(self, event_type: str, callback: Callable):
         self.event_subscribers[event_type].append(callback)
 
@@ -1917,7 +1918,6 @@ class EnhancedLayerIntegrator:
         if self.enable_carbon_intensity:
             event.carbon_impact = await self.carbon_manager.get_current_intensity() / 1000
 
-        # Event correlation
         if self.enable_event_correlation and self.event_correlation:
             await self.event_correlation.correlate_event(event)
 
@@ -1926,18 +1926,18 @@ class EnhancedLayerIntegrator:
         except asyncio.QueueFull:
             logger.warning("Event queue full, dropping event")
 
-    # ==========================================================================
+    # ============================================================================
     # Cache Management (Enhanced)
-    # ==========================================================================
+    # ============================================================================
     def _get_from_cache(self, key: str) -> Optional[Any]:
         if key not in self.cache:
             return None
         entry = self.cache[key]
-        if datetime.utcnow() > entry.expires_at:
+        if datetime.now(timezone.utc) > entry.expires_at:
             del self.cache[key]
             return None
         entry.access_count += 1
-        entry.last_accessed = datetime.utcnow()
+        entry.last_accessed = datetime.now(timezone.utc)
         return entry.value
 
     def _set_cache(self, key: str, value: Any, layer_number: int):
@@ -1949,8 +1949,8 @@ class EnhancedLayerIntegrator:
             gradients = self._get_real_gradient_levels()
             gradient_level = gradients.get('trust', 0.5)
         entry = CacheEntry(
-            key=key, value=value, created_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(seconds=ttl),
+            key=key, value=value, created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl),
             layer_number=layer_number,
             token_backed=self.enable_bio_integration and self.token_manager is not None,
             gradient_level_at_creation=gradient_level
@@ -1968,9 +1968,9 @@ class EnhancedLayerIntegrator:
         lru_key = min(self.cache.keys(), key=lambda k: self.cache[k].last_accessed)
         del self.cache[lru_key]
 
-    # ==========================================================================
+    # ============================================================================
     # Transaction Support (Enhanced)
-    # ==========================================================================
+    # ============================================================================
     async def begin_transaction(
         self,
         layers_involved: List[int],
@@ -1986,8 +1986,8 @@ class EnhancedLayerIntegrator:
             )
 
         transaction = TransactionContext(
-            transaction_id=f"txn_{datetime.utcnow().timestamp()}_{np.random.randint(10000)}",
-            started_at=datetime.utcnow(),
+            transaction_id=f"txn_{datetime.now(timezone.utc).timestamp()}_{np.random.randint(10000)}",
+            started_at=datetime.now(timezone.utc),
             layers_involved=layers_involved,
             timeout_seconds=timeout_seconds
         )
@@ -2035,9 +2035,9 @@ class EnhancedLayerIntegrator:
             except Exception as e:
                 logger.error(f"Compensation failed: {str(e)}")
 
-    # ==========================================================================
+    # ============================================================================
     # Layer Registration (Enhanced)
-    # ==========================================================================
+    # ============================================================================
     def register_layer_module(
         self,
         layer_number: int,
@@ -2054,12 +2054,11 @@ class EnhancedLayerIntegrator:
             layer_info.endpoints.update(endpoints)
         self.integration_status[layer_number] = True
         layer_info.status = LayerStatus.HEALTHY
-        layer_info.last_heartbeat = datetime.utcnow()
+        layer_info.last_heartbeat = datetime.now(timezone.utc)
         if self.enable_bio_integration and self.token_manager:
             self.token_manager.create_account(f"layer_{layer_number}")
         self._subscribe_layer_to_events(layer_number)
 
-        # Dynamic discovery
         if self.enable_dynamic_discovery and self.discovery_manager:
             service_url = endpoints.get('primary', f"http://layer-{layer_number}:8080") if endpoints else f"http://layer-{layer_number}:8080"
             asyncio.create_task(self.discovery_manager.discover_layer(layer_number, service_url))
@@ -2084,9 +2083,9 @@ class EnhancedLayerIntegrator:
             if hasattr(module, 'on_dependency_update'):
                 await module.on_dependency_update(event)
 
-    # ==========================================================================
+    # ============================================================================
     # Metrics and Recording
-    # ==========================================================================
+    # ============================================================================
     def _record_layer_success(self, layer_number: int, execution_time_ms: float):
         self.layer_latency[layer_number].append(execution_time_ms)
         self.layer_calls[layer_number] += 1
@@ -2097,9 +2096,20 @@ class EnhancedLayerIntegrator:
         self.layer_errors[layer_number] += 1
         self.layer_calls[layer_number] += 1
 
-    # ==========================================================================
+    # ============================================================================
     # Status Methods (Enhanced)
-    # ==========================================================================
+    # ============================================================================
+    def get_health_status(self) -> Dict[str, Any]:
+        return {
+            'status': self.health_status,
+            'last_error': self.last_error,
+            'layers_healthy': sum(1 for info in self.layers.values() if info.status == LayerStatus.HEALTHY),
+            'layers_degraded': sum(1 for info in self.layers.values() if info.status == LayerStatus.DEGRADED),
+            'bio_integration_active': self.enable_bio_integration,
+            'persistence_enabled': self.enable_persistence,
+            'event_driven': self.enable_event_driven,
+        }
+
     def get_integration_status(self) -> Dict[str, Any]:
         status = {
             'total_layers': 12,
@@ -2116,7 +2126,7 @@ class EnhancedLayerIntegrator:
             'moe_router_injected': self.expert_router is not None,
             'helium_provider_injected': self.helium_provider is not None,
             'fl_monitor_injected': self.fl_monitor is not None,
-            'version': '6.1.1',
+            'version': '7.0.0',
             'config': self.config.__dict__,
             'layer_details': {}
         }
@@ -2199,7 +2209,7 @@ class EnhancedLayerIntegrator:
                 'breakdown': self.sustainability_calculator.get_weighted_breakdown({
                     'carbon_savings': min(1.0, self.total_carbon_savings_kg / 1000),
                     'helium_efficiency': min(1.0, self.total_helium_saved_l / 100),
-                    'renewable_usage': 0.0,  # placeholder
+                    'renewable_usage': 0.0,
                     'token_efficiency': self._get_real_token_availability(),
                     'layer_health': np.mean([info.gradient_health for info in self.layers.values()])
                 })
@@ -2229,7 +2239,7 @@ class EnhancedLayerIntegrator:
 
     def get_sustainability_report(self) -> Dict[str, Any]:
         return {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'sustainability_score': self.sustainability_score,
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
             'total_helium_saved_l': self.total_helium_saved_l,
@@ -2263,26 +2273,25 @@ class EnhancedLayerIntegrator:
         if layer_number in self.layers:
             self.layers[layer_number].circuit_breaker = LayerCircuitBreaker(f"layer_{layer_number}")
 
+    async def self_heal(self):
+        logger.info("EnhancedLayerIntegrator self‑healing")
+        if self.config.self_healing_enabled:
+            # Reset circuit breakers for degraded layers
+            for layer_info in self.layers.values():
+                if layer_info.status in (LayerStatus.DEGRADED, LayerStatus.UNHEALTHY):
+                    layer_info.circuit_breaker = LayerCircuitBreaker(f"layer_{layer_info.layer_number}")
+                    layer_info.status = LayerStatus.RECOVERING
+            self.health_status = "healthy"
+            self.last_error = None
+            if self.persistence:
+                self._save_state()
+
     async def shutdown(self):
         logger.info("Shutting down Enhanced Layer Integrator")
-        await self.carbon_manager.close() if self.carbon_manager else None
+        # Save state
+        self._save_state()
+        if self.carbon_manager:
+            await self.carbon_manager.close()
+        if self.expert_router and hasattr(self.expert_router, 'shutdown'):
+            await self.expert_router.shutdown()
         logger.info("Shutdown complete")
-
-
-# ============================================================================
-# Legacy Compatibility Class
-# ============================================================================
-class LayerIntegrator(EnhancedLayerIntegrator):
-    """
-    Legacy LayerIntegrator for backward compatibility.
-    """
-
-    def __init__(self, expert_router=None):
-        config = LayerIntegratorConfig()
-        super().__init__(config)
-        self.router = expert_router
-        self.layer_integration_status = {f'layer_{i}': False for i in range(12)}
-        logger.info("Layer Integrator initialized (compatibility mode)")
-
-    def get_integration_status(self) -> Dict[str, bool]:
-        return self.layer_integration_status.copy()
