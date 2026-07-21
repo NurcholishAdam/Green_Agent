@@ -1,1340 +1,767 @@
-# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/bio_integrated_agent.py
-# Enhanced version v11.0.0 – Full integration with active control, proactive planning, swarm consensus, and comprehensive module coordination
-
 """
-Bio‑Integrated Green Agent v11.0.0
-Complete orchestration with:
-- Active QuantumBridge control (adjust QUBO penalties)
-- Proactive TimeTickEngine forecast‑based strategy switching
-- Two‑way swarm coordination (Q‑table sharing, consensus bonus)
-- Workflow outcome feedback into reward
-- Proactive self‑healing based on health score
-- Degradation‑aware strategy selection
-- Active reconfiguration of all bio‑inspired modules
-- CompetitionEngine integration (spawn/kill children)
-- TokenSupplyManager / TokenAllocator integration
-- Q‑table refreshing and pruning
-- Dynamic configuration reload
-- Enhanced observability and explainability
+FL Energy Expert v2.0 – Energy-Aware Federated Learning Expert for MoE System
+
+Specializes in managing federated learning processes with energy awareness:
+- Dynamic client selection based on energy states
+- Heterogeneous resource management
+- Gradient compression and bandwidth optimization
+- Sustainable federated learning coordination
+- Integration with bio-inspired energy modules
+- SwiftFed-inspired energy-aware FL strategies
 """
 
 import asyncio
 import logging
 import json
-import os
-import hashlib
-import uuid
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union
+import numpy as np
+from typing import Dict, Any, List, Optional, Tuple, Set
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-import numpy as np
-import pickle
+from enum import Enum
+import hashlib
 
-# Try optional dependencies
-try:
-    from pydantic import BaseModel, Field, validator
-    PYDANTIC_AVAILABLE = True
-except ImportError:
-    PYDANTIC_AVAILABLE = False
-
+# Optional dependencies
 try:
     import structlog
     logger = structlog.get_logger(__name__)
 except ImportError:
     logger = logging.getLogger(__name__)
 
-try:
-    from prometheus_client import Gauge, Counter, Histogram
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-# Local imports from bio‑inspired core (with fallback)
-try:
-    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
-    TOKEN_AVAILABLE = True
-except ImportError:
-    TOKEN_AVAILABLE = False
-
-try:
-    from .proton_gradient_fields import GradientFieldManager
-    GRADIENT_AVAILABLE = True
-except ImportError:
-    GRADIENT_AVAILABLE = False
-
-try:
-    from .atp_synthase_scheduler import ATPSynthaseScheduler
-    ATP_AVAILABLE = True
-except ImportError:
-    ATP_AVAILABLE = False
-
-try:
-    from .chromatophore_compartments import HierarchicalCompartmentManager
-    COMPARTMENT_AVAILABLE = True
-except ImportError:
-    COMPARTMENT_AVAILABLE = False
-
-try:
-    from .biomass_storage import BiomassStorage, StorageTier
-    BIOMASS_AVAILABLE = True
-except ImportError:
-    BIOMASS_AVAILABLE = False
-
-try:
-    from .photosynthetic_harvester import PhotosyntheticHarvester, HarvestingMode
-    HARVESTER_AVAILABLE = True
-except ImportError:
-    HARVESTER_AVAILABLE = False
-
-try:
-    from .time_tick_engine import TimeTickEngine
-    TICK_ENGINE_AVAILABLE = True
-except ImportError:
-    TICK_AVAILABLE = False
-
-try:
-    from .quantum_bridge import QuantumBridge
-    QUANTUM_BRIDGE_AVAILABLE = True
-except ImportError:
-    QUANTUM_BRIDGE_AVAILABLE = False
-
-try:
-    from .__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
-    CORE_AVAILABLE = True
-except ImportError:
-    CORE_AVAILABLE = False
-
-# PQC (post‑quantum cryptography)
-try:
-    from pqcrypto.sign import falcon
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
 
 # ============================================================================
-# Fallback definitions if core not available
+# Enums and Constants
 # ============================================================================
-if not CORE_AVAILABLE:
-    class CircuitBreaker:
-        def __init__(self, name: str, failure_threshold: int = 3, recovery_timeout: float = 30.0):
-            self.name = name
-            self.failure_threshold = failure_threshold
-            self.recovery_timeout = recovery_timeout
-            self._state = "closed"
-            self._failure_count = 0
-            self._last_failure_time = None
-            self._lock = asyncio.Lock()
+class ClientState(Enum):
+    """Energy and availability states for FL clients."""
+    AVAILABLE = "available"
+    SLEEPING = "sleeping"
+    CHARGING = "charging"
+    ACTIVE = "active"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
 
-        async def call(self, func: Callable, *args, **kwargs):
-            async with self._lock:
-                if self._state == "open":
-                    if (datetime.now(timezone.utc) - self._last_failure_time).total_seconds() > self.recovery_timeout:
-                        self._state = "half_open"
-                    else:
-                        raise Exception(f"Circuit breaker {self.name} is OPEN")
-            try:
-                result = await func(*args, **kwargs)
-                async with self._lock:
-                    self._state = "closed"
-                    self._failure_count = 0
-                return result
-            except Exception as e:
-                async with self._lock:
-                    self._failure_count += 1
-                    self._last_failure_time = datetime.now(timezone.utc)
-                    if self._failure_count >= self.failure_threshold:
-                        self._state = "open"
-                raise e
 
-    @dataclass
-    class BioEvent:
-        event_type: str
-        source: str
-        timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-        data: Dict[str, Any] = field(default_factory=dict)
-        correlation_id: Optional[str] = None
-        priority: int = 0
+class AggregationStrategy(Enum):
+    """Federated aggregation strategies."""
+    STANDARD = "standard"  # Standard FedAvg
+    LAZY = "lazy"  # Lazy aggregation for stragglers
+    PRIORITY = "priority"  # Energy-aware priority weighting
+    GRADIENT_COMPRESSION = "gradient_compression"  # Compressed gradients
+    SELECTIVE = "selective"  # Selective client participation
+
+
+class ClientEnergyProfile(Enum):
+    """Energy consumption profiles."""
+    BATTERY_POWERED = "battery_powered"  # Mobile/edge devices
+    SOLAR_POWERED = "solar_powered"  # Renewable energy
+    PLUGGED_IN = "plugged_in"  # Unlimited power
+    DEGRADED_BATTERY = "degraded_battery"  # Low battery
+
 
 # ============================================================================
-# Configuration (Pydantic or dataclass) – extended for v11
+# Data Classes
 # ============================================================================
-if PYDANTIC_AVAILABLE:
-    class AgentConfig(BaseModel):
-        """Configuration for the Bio‑Integrated Agent."""
-        # General
-        agent_id: str = Field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
-        enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
-        enable_proactive_healing: bool = True
+@dataclass
+class ClientEnergyInfo:
+    """Energy information for a federated client."""
+    client_id: str
+    state: ClientState = ClientState.AVAILABLE
+    energy_profile: ClientEnergyProfile = ClientEnergyProfile.BATTERY_POWERED
+    battery_level: float = 1.0  # 0-1
+    energy_consumption_rate: float = 0.01  # units per second
+    upload_bandwidth_mbps: float = 10.0
+    download_bandwidth_mbps: float = 10.0
+    compute_capability: float = 1.0  # relative to baseline
+    last_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    estimated_sync_time_seconds: float = 0.0
+    
+    def get_energy_score(self) -> float:
+        """Score 0-1: higher is better for participation."""
+        if self.state == ClientState.UNAVAILABLE:
+            return 0.0
+        if self.state == ClientState.SLEEPING:
+            return 0.1
+        if self.state == ClientState.DEGRADED:
+            return 0.3
+        
+        battery_score = self.battery_level
+        if self.energy_profile == ClientEnergyProfile.PLUGGED_IN:
+            battery_score = 1.0
+        elif self.energy_profile == ClientEnergyProfile.SOLAR_POWERED:
+            battery_score = min(1.0, battery_score * 1.2)
+        
+        state_bonus = 1.0
+        if self.state == ClientState.CHARGING:
+            state_bonus = 1.3
+        
+        return min(1.0, battery_score * state_bonus)
 
-        # RL strategy
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_learning_rate_min: float = 0.01
-        rl_epsilon_min: float = 0.01
-        rl_state_bins: Dict[str, List[str]] = Field(
-            default_factory=lambda: {
-                'load': ['low', 'medium', 'high'],
-                'health': ['poor', 'medium', 'good'],
-                'token': ['scarce', 'adequate', 'abundant'],
-                'energy': ['light', 'normal', 'heavy'],
-                'helium': ['scarce', 'normal', 'abundant'],
-                'carbon': ['low', 'medium', 'high'],
-                'alert_count': ['none', 'some', 'many'],
-                'helium_trend': ['falling', 'stable', 'rising'],
-                'q_penalty_carbon': ['low', 'medium', 'high'],
-                'q_penalty_helium': ['low', 'medium', 'high'],
-                'degradation_tier': ['low', 'medium', 'high'],
-                'swarm_consensus': ['minority', 'mixed', 'majority'],
-                'workflow_success': ['failed', 'partial', 'succeeded'],
-            }
-        )
-        rl_strategies: List[str] = ['conservative', 'balanced', 'performance']
 
-        # Energy policies (strategy → config overrides)
-        strategy_policies: Dict[str, Dict[str, Any]] = Field(
-            default_factory=lambda: {
-                'conservative': {
-                    'state_save_interval_seconds': 600,
-                    'health_check_interval_seconds': 60,
-                    'task_throughput': 0.3,
-                    'token_base_generation_rate': 0.5,
-                    'biomass_storage_tier': 'cold',
-                    'compartment_creation': False,
-                    'harvester_mode': 'minimal',
-                    'scheduler_protons_per_rotation': 17,
-                    'gradient_pump_rate': 0.2,
-                    'token_generation_rate': 0.5,
-                    'competition_spawn': False,
-                },
-                'balanced': {
-                    'state_save_interval_seconds': 300,
-                    'health_check_interval_seconds': 30,
-                    'task_throughput': 1.0,
-                    'token_base_generation_rate': 1.0,
-                    'biomass_storage_tier': 'standard',
-                    'compartment_creation': True,
-                    'harvester_mode': 'adaptive',
-                    'scheduler_protons_per_rotation': 12,
-                    'gradient_pump_rate': 0.5,
-                    'token_generation_rate': 1.0,
-                    'competition_spawn': False,
-                },
-                'performance': {
-                    'state_save_interval_seconds': 60,
-                    'health_check_interval_seconds': 10,
-                    'task_throughput': 2.0,
-                    'token_base_generation_rate': 1.5,
-                    'biomass_storage_tier': 'hot',
-                    'compartment_creation': True,
-                    'harvester_mode': 'full',
-                    'scheduler_protons_per_rotation': 8,
-                    'gradient_pump_rate': 1.0,
-                    'token_generation_rate': 2.0,
-                    'competition_spawn': True,
-                }
-            }
-        )
+@dataclass
+class ClientUpdateInfo:
+    """Update metadata from a federated client."""
+    client_id: str
+    model_hash: str
+    gradient_norm: float
+    update_timestamp: datetime
+    compression_ratio: float = 1.0  # 1.0 = no compression
+    transmission_time_ms: float = 0.0
+    energy_cost_joules: float = 0.0
+    sample_count: int = 0
+    success: bool = True
 
-        # PQC keys
-        pqc_key_dir: str = Field("./pqc_keys", description="Directory for PQC key storage")
 
-        # Blockchain audit policy
-        blockchain_audit_events: List[str] = Field(
-            default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot']
-        )
-        blockchain_audit_min_importance: float = 0.5  # 0–1 threshold
+@dataclass
+class AggregationRound:
+    """Metadata for a federated aggregation round."""
+    round_id: int
+    strategy: AggregationStrategy
+    selected_clients: List[str]
+    completed_clients: List[ClientUpdateInfo]
+    failed_clients: List[str]
+    timestamp: datetime
+    duration_seconds: float
+    total_energy_joules: float
+    model_hash: str
+    compression_ratio: float = 1.0
 
-        # Persistence
-        state_save_interval_seconds: int = 300
-        state_save_path: str = "./agent_state.pkl"
-
-        # Q‑table compression and refresh
-        q_table_max_size: int = 5000
-        q_table_refresh_interval: int = 10000  # steps
-
-        # Proactive healing threshold
-        proactive_healing_health_threshold: float = 0.6
-
-        # Feature flags
-        enable_prometheus: bool = False
-
-        # Multi‑objective weights (if enabled)
-        objective_weights: Dict[str, float] = Field(
-            default_factory=lambda: {
-                'energy_efficiency': 0.3,
-                'helium_sustainability': 0.25,
-                'token_balance': 0.2,
-                'health_score': 0.15,
-                'carbon_leakage': 0.1,
-            }
-        )
-
-        class Config:
-            env_prefix = "AGENT_"
-else:
-    @dataclass
-    class AgentConfig:
-        agent_id: str = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
-        enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
-        enable_proactive_healing: bool = True
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_learning_rate_min: float = 0.01
-        rl_epsilon_min: float = 0.01
-        rl_state_bins: Dict[str, List[str]] = field(default_factory=lambda: {
-            'load': ['low', 'medium', 'high'],
-            'health': ['poor', 'medium', 'good'],
-            'token': ['scarce', 'adequate', 'abundant'],
-            'energy': ['light', 'normal', 'heavy'],
-            'helium': ['scarce', 'normal', 'abundant'],
-            'carbon': ['low', 'medium', 'high'],
-            'alert_count': ['none', 'some', 'many'],
-            'helium_trend': ['falling', 'stable', 'rising'],
-            'q_penalty_carbon': ['low', 'medium', 'high'],
-            'q_penalty_helium': ['low', 'medium', 'high'],
-            'degradation_tier': ['low', 'medium', 'high'],
-            'swarm_consensus': ['minority', 'mixed', 'majority'],
-            'workflow_success': ['failed', 'partial', 'succeeded'],
-        })
-        rl_strategies: List[str] = field(default_factory=lambda: ['conservative', 'balanced', 'performance'])
-        strategy_policies: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
-            'conservative': {
-                'state_save_interval_seconds': 600,
-                'health_check_interval_seconds': 60,
-                'task_throughput': 0.3,
-                'token_base_generation_rate': 0.5,
-                'biomass_storage_tier': 'cold',
-                'compartment_creation': False,
-                'harvester_mode': 'minimal',
-                'scheduler_protons_per_rotation': 17,
-                'gradient_pump_rate': 0.2,
-                'token_generation_rate': 0.5,
-                'competition_spawn': False,
-            },
-            'balanced': {
-                'state_save_interval_seconds': 300,
-                'health_check_interval_seconds': 30,
-                'task_throughput': 1.0,
-                'token_base_generation_rate': 1.0,
-                'biomass_storage_tier': 'standard',
-                'compartment_creation': True,
-                'harvester_mode': 'adaptive',
-                'scheduler_protons_per_rotation': 12,
-                'gradient_pump_rate': 0.5,
-                'token_generation_rate': 1.0,
-                'competition_spawn': False,
-            },
-            'performance': {
-                'state_save_interval_seconds': 60,
-                'health_check_interval_seconds': 10,
-                'task_throughput': 2.0,
-                'token_base_generation_rate': 1.5,
-                'biomass_storage_tier': 'hot',
-                'compartment_creation': True,
-                'harvester_mode': 'full',
-                'scheduler_protons_per_rotation': 8,
-                'gradient_pump_rate': 1.0,
-                'token_generation_rate': 2.0,
-                'competition_spawn': True,
-            }
-        })
-        pqc_key_dir: str = "./pqc_keys"
-        blockchain_audit_events: List[str] = field(default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot'])
-        blockchain_audit_min_importance: float = 0.5
-        state_save_interval_seconds: int = 300
-        state_save_path: str = "./agent_state.pkl"
-        q_table_max_size: int = 5000
-        q_table_refresh_interval: int = 10000
-        proactive_healing_health_threshold: float = 0.6
-        enable_prometheus: bool = False
-        objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'energy_efficiency': 0.3,
-            'helium_sustainability': 0.25,
-            'token_balance': 0.2,
-            'health_score': 0.15,
-            'carbon_leakage': 0.1,
-        })
 
 # ============================================================================
-# Quantum‑Resilient Security (with persistent keys)
+# FL Energy Expert
 # ============================================================================
-class QuantumResilientSecurity:
-    # (unchanged from v10)
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.pqc_key_dir = Path(config.pqc_key_dir)
-        self.pqc_key_dir.mkdir(parents=True, exist_ok=True)
-        self.private_key = None
-        self.public_key = None
-        self._load_or_generate_keys()
-
-    def _load_or_generate_keys(self):
-        priv_path = self.pqc_key_dir / "private.key"
-        pub_path = self.pqc_key_dir / "public.key"
-        if priv_path.exists() and pub_path.exists():
-            try:
-                with open(priv_path, 'rb') as f:
-                    self.private_key = f.read()
-                with open(pub_path, 'rb') as f:
-                    self.public_key = f.read()
-                logger.info("Loaded existing PQC keys")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load PQC keys: {e}")
-
-        if PQC_AVAILABLE:
-            self.private_key, self.public_key = falcon.generate_keypair()
-            with open(priv_path, 'wb') as f:
-                f.write(self.private_key)
-            with open(pub_path, 'wb') as f:
-                f.write(self.public_key)
-            logger.info("Generated and saved new PQC keys")
-        else:
-            self.private_key = os.urandom(32)
-            self.public_key = hashlib.sha256(self.private_key).digest()
-            with open(priv_path, 'wb') as f:
-                f.write(self.private_key)
-            with open(pub_path, 'wb') as f:
-                f.write(self.public_key)
-            logger.warning("PQC library not available; using fallback HMAC keys")
-
-    def sign_data(self, data: Dict[str, Any]) -> str:
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            signature = falcon.sign(payload, self.private_key)
-            return signature.hex()
-        else:
-            import hmac
-            signature = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
-            return signature
-
-    def verify_signature(self, data: Dict[str, Any], signature: str) -> bool:
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            try:
-                falcon.verify(payload, bytes.fromhex(signature), self.public_key)
-                return True
-            except Exception:
-                return False
-        else:
-            import hmac
-            expected = hmac.new(self.private_key, payload, hashlib.sha256).hexdigest()
-            return hmac.compare_digest(expected, signature)
-
-# ============================================================================
-# Blockchain Auditor (unchanged)
-# ============================================================================
-class BlockchainAuditor:
-    def __init__(self, config: AgentConfig, security: QuantumResilientSecurity):
-        self.config = config
-        self.security = security
-        self.ledger = []
+class FLEnergyExpert:
+    """
+    Energy-aware Federated Learning expert for MoE orchestration.
+    Handles client selection, aggregation strategies, and energy optimization.
+    """
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """Initialize the FL Energy Expert."""
+        self.config = config or self._default_config()
+        
+        # Client tracking
+        self.clients: Dict[str, ClientEnergyInfo] = {}
+        self.client_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        
+        # Aggregation history
+        self.rounds: List[AggregationRound] = []
+        
+        # Metrics and state
+        self.total_energy_consumed_joules = 0.0
+        self.total_updates_processed = 0
+        self.failed_updates = 0
+        self.participation_history = defaultdict(int)
+        
+        # Strategy state
+        self.current_strategy = AggregationStrategy.STANDARD
+        self.strategy_change_log = []
+        
+        # Compression state
+        self.gradient_compression_enabled = True
+        self.compression_ratios = deque(maxlen=50)
+        
+        # Locks and sync
         self._lock = asyncio.Lock()
-
-    async def record_event(self, event_type: str, payload: Dict[str, Any], importance: float = 0.5) -> bool:
-        if event_type not in self.config.blockchain_audit_events:
-            logger.debug(f"Event {event_type} not in audit list; skipping")
-            return False
-        if importance < self.config.blockchain_audit_min_importance:
-            logger.debug(f"Event importance {importance} below threshold; skipping")
-            return False
-        signature = self.security.sign_data(payload)
-        entry = {
-            'event_type': event_type,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'payload': payload,
-            'signature': signature,
-            'hash': hashlib.sha256(json.dumps(payload, default=str).encode()).hexdigest()
-        }
-        async with self._lock:
-            self.ledger.append(entry)
-        logger.info(f"Audit recorded: {event_type} (importance {importance})")
-        return True
-
-    def get_ledger(self, limit: int = 100) -> List[Dict]:
-        return self.ledger[-limit:]
-
-    def verify_entry(self, entry: Dict) -> bool:
-        payload = entry['payload']
-        signature = entry['signature']
-        return self.security.verify_signature(payload, signature)
-
-# ============================================================================
-# RL Strategy Selector (v11 – extended with swarm and workflow feedback)
-# ============================================================================
-class RLStrategySelector:
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: {s: 0.0 for s in config.rl_strategies})
-        self.learning_rate = config.rl_learning_rate
-        self.discount_factor = config.rl_discount_factor
-        self.epsilon = config.rl_epsilon
-        self.last_state_key = None
-        self.last_action = None
-        self.actions = config.rl_strategies
-        self.state_bins = config.rl_state_bins
-        self.reward_history = deque(maxlen=100)
-        self.step_counter = 0
-
-    def _state_to_key(self, state: Dict[str, float]) -> str:
-        load = state.get('system_load', 0.5)
-        health = state.get('health_score', 0.8)
-        token = state.get('token_balance', 0)
-        energy = state.get('energy_intensity', 0.5)
-        helium = state.get('helium_level', 0.5)
-        carbon = state.get('carbon_leakage_proxy', 0.3)
-        alert_count = state.get('alert_count', 0)
-        helium_trend = state.get('helium_trend', 0)
-        q_penalty_carbon = state.get('q_penalty_carbon', 0.5)
-        q_penalty_helium = state.get('q_penalty_helium', 0.5)
-        degradation_tier = state.get('degradation_tier', 3)  # 1-5
-        swarm_consensus = state.get('swarm_consensus', 0.5)  # 0-1
-        workflow_success = state.get('workflow_success', 0.5)  # 0-1
-
-        # Binning
-        load_bin = 'high' if load > 0.7 else 'medium' if load > 0.4 else 'low'
-        health_bin = 'good' if health > 0.7 else 'medium' if health > 0.4 else 'poor'
-        token_bin = 'abundant' if token > 1000 else 'adequate' if token > 100 else 'scarce'
-        energy_bin = 'heavy' if energy > 0.7 else 'normal' if energy > 0.4 else 'light'
-        helium_bin = 'scarce' if helium < 0.3 else 'normal' if helium < 0.7 else 'abundant'
-        carbon_bin = 'high' if carbon > 0.6 else 'medium' if carbon > 0.3 else 'low'
-        alert_bin = 'many' if alert_count > 2 else 'some' if alert_count > 0 else 'none'
-        helium_trend_bin = 'rising' if helium_trend > 0.1 else 'falling' if helium_trend < -0.1 else 'stable'
-        q_carbon_bin = 'high' if q_penalty_carbon > 0.7 else 'medium' if q_penalty_carbon > 0.3 else 'low'
-        q_helium_bin = 'high' if q_penalty_helium > 0.7 else 'medium' if q_penalty_helium > 0.3 else 'low'
-        deg_tier_bin = 'high' if degradation_tier > 3 else 'medium' if degradation_tier > 1 else 'low'
-        swarm_bin = 'majority' if swarm_consensus > 0.7 else 'minority' if swarm_consensus < 0.3 else 'mixed'
-        workflow_bin = 'succeeded' if workflow_success > 0.8 else 'failed' if workflow_success < 0.3 else 'partial'
-
-        return f"{load_bin}_{health_bin}_{token_bin}_{energy_bin}_{helium_bin}_{carbon_bin}_{alert_bin}_{helium_trend_bin}_{q_carbon_bin}_{q_helium_bin}_{deg_tier_bin}_{swarm_bin}_{workflow_bin}"
-
-    def select_action(self, state: Dict[str, float]) -> str:
-        key = self._state_to_key(state)
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-
-        # Adaptive epsilon
-        if len(self.reward_history) > 20:
-            var = np.var(self.reward_history)
-            if var < 0.05:
-                self.epsilon = max(self.config.rl_epsilon_min, self.epsilon * 0.95)
-            else:
-                self.epsilon = min(self.config.rl_epsilon, self.epsilon * 1.05)
-
-        if np.random.random() < self.epsilon:
-            action = np.random.choice(self.actions)
-        else:
-            q_vals = self.q_table[key]
-            max_q = max(q_vals.values())
-            best_actions = [a for a, q in q_vals.items() if q == max_q]
-            action = np.random.choice(best_actions)
-
-        self.last_state_key = key
-        self.last_action = action
-        self.step_counter += 1
-        return action
-
-    def update(self, state: Dict[str, float], action: str, reward: float, next_state: Dict[str, float]):
-        if self.last_state_key is None or self.last_action is None:
-            return
-        key = self._state_to_key(state)
-        next_key = self._state_to_key(next_state)
-
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-        if next_key not in self.q_table:
-            self.q_table[next_key] = {s: 0.0 for s in self.actions}
-
-        max_next = max(self.q_table[next_key].values())
-        current_q = self.q_table[key][action]
-        self.q_table[key][action] = current_q + self.learning_rate * (
-            reward + self.discount_factor * max_next - current_q
-        )
-
-        self.reward_history.append(reward)
-
-        # Adaptive learning rate
-        if len(self.reward_history) > 20:
-            var = np.var(self.reward_history)
-            if var > 0.2:
-                self.learning_rate = max(self.config.rl_learning_rate_min, self.learning_rate * 0.9)
-            elif var < 0.05:
-                self.learning_rate = min(self.config.rl_learning_rate, self.learning_rate * 1.1)
-
-        # Compress Q‑table if too large
-        if len(self.q_table) > self.config.q_table_max_size:
-            self._compress_q_table()
-
-        # Refresh if stale
-        if self.step_counter % self.config.q_table_refresh_interval == 0:
-            self._refresh_q_table()
-
-    def _compress_q_table(self):
-        sorted_keys = sorted(self.q_table.keys(), key=lambda k: max(self.q_table[k].values()))
-        to_remove = sorted_keys[:len(sorted_keys)//2]
-        for k in to_remove:
-            del self.q_table[k]
-        logger.info(f"Compressed Q‑table to {len(self.q_table)} states.")
-
-    def _refresh_q_table(self):
-        """Reset a portion of the Q‑table to encourage exploration."""
-        # Reset 20% of states (those with lowest max Q)
-        sorted_keys = sorted(self.q_table.keys(), key=lambda k: max(self.q_table[k].values()))
-        for k in sorted_keys[:int(0.2 * len(sorted_keys))]:
-            self.q_table[k] = {s: 0.0 for s in self.actions}
-        logger.info("Refreshed 20% of Q‑table states for exploration.")
-
-    def get_q_table_size(self) -> int:
-        return len(self.q_table)
-
-    def get_best_strategy(self, state: Dict[str, float]) -> str:
-        key = self._state_to_key(state)
-        if key not in self.q_table:
-            return 'balanced'
-        q_vals = self.q_table[key]
-        return max(q_vals, key=q_vals.get)
-
-# ============================================================================
-# Task Manager (unchanged)
-# ============================================================================
-class TaskManager:
-    def __init__(self):
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.shutdown_event = asyncio.Event()
-        self._lock = asyncio.Lock()
-
-    def start_task(self, name: str, coro_func, *args, **kwargs):
-        async def wrapper():
-            backoff = 1
-            max_backoff = 300
-            while not self.shutdown_event.is_set():
-                try:
-                    await coro_func(*args, **kwargs)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-        task = asyncio.create_task(wrapper(), name=name)
-        async with self._lock:
-            self.tasks[name] = task
-        return task
-
-    async def stop_all(self):
-        self.shutdown_event.set()
-        async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
-
-# ============================================================================
-# Core Bio‑Integrated Agent (v11.0.0 – fully enhanced)
-# ============================================================================
-class BioIntegratedAgent:
-    def __init__(
-        self,
-        bio_core: Optional[Any] = None,
-        config: Optional[Union[AgentConfig, Dict[str, Any]]] = None,
-        csv_path: Optional[str] = None,
-        quantum_graph: Optional[Any] = None,
-        token_manager: Optional[Any] = None,
-        gradient_manager: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-        compartment_manager: Optional[Any] = None,
-        biomass_storage: Optional[Any] = None,
-        harvester: Optional[Any] = None,
-        tick_engine: Optional[Any] = None,
-        quantum_bridge: Optional[Any] = None,
-    ):
-        # Load config
-        if isinstance(config, dict):
-            if PYDANTIC_AVAILABLE:
-                self.config = AgentConfig(**config)
-            else:
-                self.config = AgentConfig(**config)
-        elif isinstance(config, AgentConfig):
-            self.config = config
-        else:
-            self.config = AgentConfig()
-
-        self.bio_core = bio_core
-
-        # Inject dependencies or create defaults
-        self.token_manager = token_manager or (EcoATPTokenManager() if TOKEN_AVAILABLE else None)
-        self.gradient_manager = gradient_manager or (GradientFieldManager() if GRADIENT_AVAILABLE else None)
-        self.scheduler = scheduler or (ATPSynthaseScheduler(self.token_manager, self.gradient_manager) if ATP_AVAILABLE else None)
-        self.compartment_manager = compartment_manager or (HierarchicalCompartmentManager(self.token_manager) if COMPARTMENT_AVAILABLE else None)
-        self.biomass_storage = biomass_storage or (BiomassStorage(self.token_manager, self.gradient_manager) if BIOMASS_AVAILABLE else None)
-        self.harvester = harvester or (PhotosyntheticHarvester(self.token_manager) if HARVESTER_AVAILABLE else None)
-
-        # Optional advanced modules
-        self.tick_engine = tick_engine
-        if self.config.enable_time_tick_engine and csv_path and TICK_ENGINE_AVAILABLE:
-            from .time_tick_engine import TimeTickEngine
-            self.tick_engine = TimeTickEngine(
-                csv_path=csv_path,
-                harvester=self.harvester,
-                translator_class=HeliumEnvironmentTranslator
-            )
-        self.quantum_bridge = quantum_bridge
-        if self.config.enable_quantum_bridge and QUANTUM_BRIDGE_AVAILABLE and quantum_graph:
-            from .quantum_bridge import QuantumBridge
-            self.quantum_bridge = QuantumBridge(self.gradient_manager, quantum_graph)
-
-        # Security and auditing
-        self.security = QuantumResilientSecurity(self.config)
-        self.auditor = BlockchainAuditor(self.config, self.security)
-
-        # RL strategy selector
-        self.strategy_selector = RLStrategySelector(self.config) if self.config.enable_energy_aware_rl else None
-        self.current_strategy = 'balanced'
-        self.strategy_change_time = datetime.now(timezone.utc)
-
-        # State and metrics
-        self.state = self._get_initial_state()
-        self.metrics = {
-            'strategy_changes': 0,
-            'total_reward': 0.0,
-            'energy_efficiency': 0.0,
-            'helium_efficiency': 0.0,
-            'avg_reward': 0.0,
-        }
-        self.reward_history = deque(maxlen=100)
-
-        # Circuit breakers
-        self._token_circuit = CircuitBreaker("token_service")
-        self._gradient_circuit = CircuitBreaker("gradient_service")
-
-        # Correlation ID
-        self.correlation_id = str(uuid.uuid4())
-
-        # Access to core sub‑modules
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.health_monitor = getattr(self.bio_core, 'health_monitor', None)
-            self.degradation_manager = getattr(self.bio_core, 'degradation_manager', None)
-            self.competition_engine = getattr(self.bio_core, 'competition_engine', None)
-            self.token_supply_manager = getattr(self.bio_core, 'supply_manager', None)
-            self.token_allocator = getattr(self.bio_core, 'token_allocator', None)
-
-            if self.event_broker:
-                self._subscribe_events()
-        else:
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-            self.health_monitor = None
-            self.degradation_manager = None
-            self.competition_engine = None
-            self.token_supply_manager = None
-            self.token_allocator = None
-
-        # Background tasks
-        self._task_manager = TaskManager()
-        self._task_manager.start_task("strategy_loop", self._strategy_update_loop)
-        self._task_manager.start_task("state_save", self._state_save_loop)
-        self._task_manager.start_task("daily_snapshot", self._daily_snapshot_loop)
-        if self.config.enable_swarm_coordination and self.swarm_coordinator:
-            self._task_manager.start_task("swarm_update", self._swarm_update_loop)
-
-        # Load saved state
-        asyncio.create_task(self.load_state())
-
-        logger.info(f"BioIntegratedAgent v11.0.0 initialized with ID {self.config.agent_id}, correlation_id={self.correlation_id}")
-
-    def _subscribe_events(self):
-        if self.event_broker:
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('gradient_update', self._on_gradient_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            self.event_broker.subscribe('health_update', self._on_health_update)
-            self.event_broker.subscribe('workflow_completed', self._on_workflow_completed)
-            self.event_broker.subscribe('degradation_tier_updated', self._on_degradation_updated)
-            self.event_broker.subscribe('config_updated', self._on_config_updated)
-            logger.info("Subscribed to core events")
-
-    async def _on_token_update(self, event: BioEvent):
-        self.state['token_balance'] = event.data.get('balance', 500)
-
-    async def _on_gradient_update(self, event: BioEvent):
-        field = event.data.get('field', 'carbon')
-        strength = event.data.get('strength', 0.5)
-        if field == 'helium':
-            self.state['helium_level'] = strength
-        elif field == 'carbon':
-            self.state['carbon_leakage_proxy'] = strength
-
-    async def _on_helium_update(self, event: BioEvent):
-        self.state['helium_level'] = event.data.get('helium_level', 0.5)
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        pass  # handled in reward
-
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative and triggering healing")
-            await self.apply_strategy('conservative')
-            if self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-
-    async def _on_health_update(self, event: BioEvent):
-        self.state['health_score'] = event.data.get('health_score', 0.8)
-
-    async def _on_workflow_completed(self, event: BioEvent):
-        success = event.data.get('success', False)
-        self.state['workflow_success'] = 1.0 if success else 0.0
-
-    async def _on_degradation_updated(self, event: BioEvent):
-        self.state['degradation_tier'] = event.data.get('new_tier', 3)
-
-    async def _on_config_updated(self, event: BioEvent):
-        # Reload relevant config parameters
-        updates = event.data.get('updates', {})
-        for key, value in updates.items():
-            if hasattr(self.config, key):
-                setattr(self.config, key, value)
-        logger.info("Configuration reloaded", updates=updates)
-
-    def _get_initial_state(self) -> Dict[str, float]:
+        
+        logger.info("FLEnergyExpert initialized", config=self.config)
+    
+    @staticmethod
+    def _default_config() -> Dict[str, Any]:
         return {
-            'system_load': 0.5,
-            'health_score': 0.8,
-            'token_balance': 500,
-            'energy_intensity': 0.5,
-            'helium_level': 0.5,
-            'carbon_leakage_proxy': 0.3,
-            'helium_trend': 0.0,
-            'alert_count': 0,
-            'q_penalty_carbon': 0.5,
-            'q_penalty_helium': 0.5,
-            'degradation_tier': 3,
-            'swarm_consensus': 0.5,
-            'workflow_success': 0.5,
+            'min_clients_per_round': 3,
+            'max_clients_per_round': 20,
+            'energy_threshold_battery': 0.2,  # Below 20%: exclude battery devices
+            'energy_threshold_degraded': 0.4,  # Below 40%: prefer plugged-in
+            'target_compression_ratio': 0.1,  # 10% of original gradient size
+            'aggregation_timeout_seconds': 300,
+            'lazy_aggregation_enabled': True,
+            'stale_client_threshold_hours': 24,
+            'energy_aware_weighting': True,
+            'gradient_clipping_enabled': True,
         }
-
-    async def get_strategy_state(self) -> Dict[str, float]:
-        state = {}
-
-        # Token balance
-        if self.token_manager:
-            try:
-                summary = await self._token_circuit.call(self.token_manager.get_system_summary)
-                state['token_balance'] = summary.get('total_balance', 500)
-            except Exception as e:
-                logger.warning(f"Failed to get token summary: {e}")
-                state['token_balance'] = self.state.get('token_balance', 500)
-        else:
-            state['token_balance'] = 500
-
-        # System load
-        if self.scheduler:
-            try:
-                stats = await self._token_circuit.call(self.scheduler.get_scheduler_stats)
-                state['system_load'] = stats.get('demand_level', 0.5)
-            except Exception:
-                state['system_load'] = self.state.get('system_load', 0.5)
-        elif self.compartment_manager:
-            try:
-                stats = await self._token_circuit.call(self.compartment_manager.get_ecosystem_stats)
-                state['system_load'] = 1.0 - stats.get('viable_compartments', 0) / max(stats.get('total_compartments', 1), 1)
-            except Exception:
-                state['system_load'] = self.state.get('system_load', 0.5)
-        else:
-            state['system_load'] = 0.5
-
-        # Health score
-        if self.harvester:
-            try:
-                stats = await self._token_circuit.call(self.harvester.get_harvesting_stats)
-                health = stats.get('pigment_health', {})
-                avg_health = np.mean([h.get('efficiency', 0.5) for h in health.values()]) if health else 0.8
-                state['health_score'] = avg_health
-            except Exception:
-                state['health_score'] = self.state.get('health_score', 0.8)
-        else:
-            state['health_score'] = 0.8
-
-        # Energy intensity
-        if self.token_manager:
-            try:
-                summary = await self._token_circuit.call(self.token_manager.get_system_summary)
-                total_generated = summary.get('total_generated', 0)
-                total_consumed = summary.get('total_consumed', 0)
-                if total_generated > 0:
-                    state['energy_intensity'] = total_consumed / total_generated
-                else:
-                    state['energy_intensity'] = 0.5
-            except Exception:
-                state['energy_intensity'] = self.state.get('energy_intensity', 0.5)
-        else:
-            state['energy_intensity'] = 0.5
-
-        # Helium level and trend
-        helium_level = 0.5
-        helium_trend = 0.0
-        if self.tick_engine:
-            try:
-                if hasattr(self.tick_engine, 'get_current_helium'):
-                    helium_level = self.tick_engine.get_current_helium()
-                elif hasattr(self.tick_engine, 'current_data'):
-                    helium_level = self.tick_engine.current_data.get('helium_supply', 0.5)
-                if hasattr(self.tick_engine, 'get_helium_forecast'):
-                    forecast = self.tick_engine.get_helium_forecast(2)
-                    if forecast and len(forecast) > 1:
-                        x = np.arange(len(forecast))
-                        slope = np.polyfit(x, forecast, 1)[0]
-                        helium_trend = slope / (max(forecast) + 0.001)
-            except Exception as e:
-                logger.warning(f"Failed to get helium data from tick engine: {e}")
-                helium_level = self.state.get('helium_level', 0.5)
-                helium_trend = self.state.get('helium_trend', 0.0)
-        elif self.gradient_manager:
-            try:
-                strengths = await self._gradient_circuit.call(self.gradient_manager.get_field_strengths)
-                helium_level = strengths.get('helium', 0.5)
-            except Exception:
-                helium_level = self.state.get('helium_level', 0.5)
-        state['helium_level'] = max(0.0, min(1.0, helium_level))
-        state['helium_trend'] = helium_trend
-
-        # Carbon leakage
-        if self.gradient_manager:
-            try:
-                strengths = await self._gradient_circuit.call(self.gradient_manager.get_field_strengths)
-                carbon = strengths.get('carbon', 0.5)
-                state['carbon_leakage_proxy'] = max(0.0, min(1.0, carbon))
-            except Exception:
-                state['carbon_leakage_proxy'] = self.state.get('carbon_leakage_proxy', 0.3)
-        else:
-            state['carbon_leakage_proxy'] = 0.3
-
-        # Alert count
-        if self.alert_system:
-            alerts = await self.alert_system.get_active_alerts()
-            state['alert_count'] = len(alerts)
-        else:
-            state['alert_count'] = 0
-
-        # QuantumBridge penalties
-        if self.quantum_bridge and hasattr(self.quantum_bridge, 'get_qubo_parameters'):
-            try:
-                q_params = self.quantum_bridge.get_qubo_parameters()
-                state['q_penalty_carbon'] = q_params.get('penalty_carbon', 0.5)
-                state['q_penalty_helium'] = q_params.get('penalty_helium_shortage', 0.5)
-            except Exception:
-                state['q_penalty_carbon'] = self.state.get('q_penalty_carbon', 0.5)
-                state['q_penalty_helium'] = self.state.get('q_penalty_helium', 0.5)
-        else:
-            state['q_penalty_carbon'] = 0.5
-            state['q_penalty_helium'] = 0.5
-
-        # Degradation tier
-        if self.degradation_manager:
-            try:
-                tier = self.degradation_manager.get_tier()
-                state['degradation_tier'] = tier
-            except Exception:
-                state['degradation_tier'] = self.state.get('degradation_tier', 3)
-        else:
-            state['degradation_tier'] = 3
-
-        # Swarm consensus
-        if self.swarm_coordinator:
-            try:
-                swarm_data = self.swarm_coordinator.get_shared_predictions()
-                # Compute how many agents are using the same strategy as we are
-                strategies = [s.get('strategy') for s in swarm_data.values() if 'strategy' in s]
-                if strategies:
-                    consensus = strategies.count(self.current_strategy) / len(strategies)
-                    state['swarm_consensus'] = consensus
-                else:
-                    state['swarm_consensus'] = 0.5
-            except Exception:
-                state['swarm_consensus'] = self.state.get('swarm_consensus', 0.5)
-        else:
-            state['swarm_consensus'] = 0.5
-
-        # Workflow success (latest)
-        state['workflow_success'] = self.state.get('workflow_success', 0.5)
-
-        return state
-
-    async def _compute_reward(self, state: Dict[str, float]) -> float:
-        # Base components
-        energy_efficiency = 1.0 - state.get('energy_intensity', 0.5)
-        helium_sustainability = state.get('helium_level', 0.5)
-        token_balance = min(1.0, state.get('token_balance', 500) / 1000)
-        health_score = state.get('health_score', 0.8)
-        carbon_leakage = state.get('carbon_leakage_proxy', 0.3)
-
-        # Penalties
-        alert_penalty = 0.0
-        if self.alert_system:
-            alerts = await self.alert_system.get_active_alerts()
-            critical_alerts = [a for a in alerts if a.severity == 'critical']
-            alert_penalty = 0.2 * len(critical_alerts)
-
-        anomaly_penalty = 0.0
-        if self.anomaly_detection:
-            anomalies = await self.anomaly_detection.get_recent_anomalies(limit=5)
-            anomaly_penalty = 0.1 * len(anomalies)
-
-        # Degradation penalty
-        deg_tier = state.get('degradation_tier', 3)
-        deg_penalty = 0.1 * (5 - deg_tier) / 4
-
-        # Workflow success bonus
-        workflow_success = state.get('workflow_success', 0.5)
-        workflow_bonus = 0.1 * workflow_success
-
-        # Swarm consensus bonus
-        swarm_consensus = state.get('swarm_consensus', 0.5)
-        swarm_bonus = 0.05 * (swarm_consensus - 0.5)  # positive if >0.5
-
-        # Cost‑benefit bonus
-        cb_bonus = 0.0
-        if self.cost_benefit_engine:
-            stats = await self.cost_benefit_engine.get_analysis_stats()
-            avg_roi = stats.get('average_roi', 0)
-            if avg_roi > 0.5:
-                cb_bonus = 0.1
-
-        # QuantumBridge alignment: high carbon penalty → penalize carbon leakage more
-        q_carbon = state.get('q_penalty_carbon', 0.5)
-        if q_carbon > 0.7:
-            carbon_leakage *= 1.5  # extra penalty
-
-        if self.config.enable_multi_objective_rl:
-            weights = self.config.objective_weights
-            reward = (
-                weights.get('energy_efficiency', 0.3) * energy_efficiency +
-                weights.get('helium_sustainability', 0.25) * helium_sustainability +
-                weights.get('token_balance', 0.2) * token_balance +
-                weights.get('health_score', 0.15) * health_score -
-                weights.get('carbon_leakage', 0.1) * carbon_leakage
-            ) - alert_penalty - anomaly_penalty - deg_penalty + workflow_bonus + swarm_bonus + cb_bonus
-        else:
-            reward = (
-                + 0.4 * energy_efficiency
-                + 0.2 * helium_sustainability
-                + 0.2 * token_balance
-                + 0.1 * health_score
-                - 0.1 * carbon_leakage
-                - alert_penalty
-                - anomaly_penalty
-                - deg_penalty
-                + workflow_bonus
-                + swarm_bonus
-                + cb_bonus
+    
+    # ========================================================================
+    # Client Management
+    # ========================================================================
+    async def register_client(
+        self,
+        client_id: str,
+        energy_profile: ClientEnergyProfile = ClientEnergyProfile.BATTERY_POWERED,
+        bandwidth_mbps: float = 10.0,
+        compute_capability: float = 1.0,
+    ) -> ClientEnergyInfo:
+        """Register a new federated learning client."""
+        async with self._lock:
+            info = ClientEnergyInfo(
+                client_id=client_id,
+                energy_profile=energy_profile,
+                upload_bandwidth_mbps=bandwidth_mbps,
+                download_bandwidth_mbps=bandwidth_mbps,
+                compute_capability=compute_capability,
             )
-
-        return reward
-
-    async def _strategy_update_loop(self):
-        while True:
-            try:
-                state = await self.get_strategy_state()
-                self.state = state
-
-                # Proactive strategy based on forecast
-                if self.tick_engine and hasattr(self.tick_engine, 'get_helium_forecast'):
-                    forecast = self.tick_engine.get_helium_forecast(6)  # 6 hours ahead
-                    if forecast and len(forecast) > 5:
-                        avg_future = np.mean(forecast)
-                        if avg_future < 0.3 and self.current_strategy != 'conservative':
-                            logger.info("Forecast indicates helium scarcity; switching to conservative")
-                            await self.apply_strategy('conservative')
-
-                if self.strategy_selector:
-                    action = self.strategy_selector.select_action(state)
-                    await self.apply_strategy(action)
-                    self.current_strategy = action
-                    self.strategy_change_time = datetime.now(timezone.utc)
-                    self.metrics['strategy_changes'] += 1
-
-                    await asyncio.sleep(self.config.state_save_interval_seconds)
-                    next_state = await self.get_strategy_state()
-                    reward = await self._compute_reward(next_state)
-                    self.metrics['total_reward'] += reward
-                    self.reward_history.append(reward)
-                    self.metrics['avg_reward'] = np.mean(self.reward_history) if self.reward_history else 0
-                    self.strategy_selector.update(state, action, reward, next_state)
-
-                    importance = 0.7 if action != 'balanced' else 0.3
-                    await self.auditor.record_event(
-                        'strategy_change',
-                        {'new_strategy': action, 'state': state, 'reward': reward},
-                        importance=importance
-                    )
-
-                    # Proactive healing
-                    if self.config.enable_proactive_healing and self.self_healer:
-                        if state.get('health_score', 0.8) < self.config.proactive_healing_health_threshold:
-                            logger.info("Health score below threshold; triggering self‑healing")
-                            await self.self_healer.apply_healing('damage_accumulation')
-
-                    await self._update_metrics(state)
-                else:
-                    await self.apply_strategy('balanced')
-
-                await asyncio.sleep(self.config.state_save_interval_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Strategy loop error", error=str(e))
-                await asyncio.sleep(30)
-
-    async def apply_strategy(self, strategy: str):
-        policy = self.config.strategy_policies.get(strategy, self.config.strategy_policies['balanced'])
-        logger.info(f"Applying strategy '{strategy}' with policy: {policy}")
-
-        # Update agent config
-        for key, value in policy.items():
-            if hasattr(self.config, key):
-                setattr(self.config, key, value)
-
-        # Propagate to core
-        if self.bio_core and hasattr(self.bio_core, 'update_configuration'):
-            await self.bio_core.update_configuration(policy)
-
-        # Adjust scheduler
-        if self.scheduler:
-            if hasattr(self.scheduler, 'set_protons_per_rotation'):
-                self.scheduler.set_protons_per_rotation(policy.get('scheduler_protons_per_rotation', 12))
-            if hasattr(self.scheduler, 'set_degradation_tier'):
-                tier = 5 if strategy == 'conservative' else 3 if strategy == 'balanced' else 1
-                self.scheduler.set_degradation_tier(tier)
-
-        # Adjust harvester mode
-        if self.harvester and hasattr(self.harvester, 'set_mode'):
-            mode_map = {
-                'conservative': HarvestingMode.MINIMAL,
-                'balanced': HarvestingMode.ADAPTIVE,
-                'performance': HarvestingMode.FULL,
-            }
-            self.harvester.set_mode(mode_map.get(strategy, HarvestingMode.ADAPTIVE))
-
-        # Adjust biomass storage tier
-        if self.biomass_storage and hasattr(self.biomass_storage, 'set_default_tier'):
-            tier_map = {
-                'conservative': StorageTier.COLD,
-                'balanced': StorageTier.STANDARD,
-                'performance': StorageTier.HOT,
-            }
-            self.biomass_storage.set_default_tier(tier_map.get(strategy, StorageTier.STANDARD))
-
-        # Adjust compartment creation
-        if self.compartment_manager and hasattr(self.compartment_manager, 'set_creation_enabled'):
-            self.compartment_manager.set_creation_enabled(policy.get('compartment_creation', True))
-
-        # Adjust gradient pumping
-        if self.gradient_manager and hasattr(self.gradient_manager, 'set_pump_rate'):
-            self.gradient_manager.set_pump_rate(policy.get('gradient_pump_rate', 0.5))
-
-        # Adjust token generation
-        if self.token_manager and hasattr(self.token_manager, 'set_generation_rate'):
-            self.token_manager.set_generation_rate(policy.get('token_generation_rate', 1.0))
-
-        # Competition engine
-        if self.competition_engine and hasattr(self.competition_engine, 'set_spawn_enabled'):
-            self.competition_engine.set_spawn_enabled(policy.get('competition_spawn', False))
-
-        # Trigger workflow
-        if self.workflow_orchestrator:
-            workflow_map = {
-                'conservative': 'repair_and_storage',
-                'balanced': 'standard_operations',
-                'performance': 'scale_up_production',
-            }
-            wf_id = workflow_map.get(strategy)
-            if wf_id:
-                await self.workflow_orchestrator.execute_workflow(wf_id)
-
-        # Active QuantumBridge control
-        if self.quantum_bridge and hasattr(self.quantum_bridge, 'update_config'):
-            if strategy == 'conservative':
-                self.quantum_bridge.update_config({'scaling': {'carbon': 20.0, 'helium': 30.0}})
-            elif strategy == 'performance':
-                self.quantum_bridge.update_config({'scaling': {'carbon': 5.0, 'helium': 10.0}})
-            else:
-                self.quantum_bridge.update_config({})
-
-        logger.info(f"Strategy '{strategy}' applied to all modules")
-
-    async def _state_save_loop(self):
-        while True:
-            try:
-                await self.save_state()
-                await asyncio.sleep(self.config.state_save_interval_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("State save error", error=str(e))
-                await asyncio.sleep(60)
-
-    async def _daily_snapshot_loop(self):
-        while True:
-            try:
-                await asyncio.sleep(86400)
-                snapshot = {
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'state': self.state,
-                    'metrics': self.metrics,
-                    'strategy': self.current_strategy,
-                    'agent_id': self.config.agent_id
-                }
-                await self.auditor.record_event('daily_snapshot', snapshot, importance=0.6)
-                logger.info("Daily snapshot recorded.")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Daily snapshot error", error=str(e))
-                await asyncio.sleep(3600)
-
-    async def _swarm_update_loop(self):
-        while True:
-            try:
-                if self.swarm_coordinator:
-                    await self.swarm_coordinator.share_predictions({
-                        'agent_id': self.config.agent_id,
-                        'state': self.state,
-                        'strategy': self.current_strategy,
-                        'metrics': self.metrics,
-                        'q_table': dict(self.strategy_selector.q_table) if self.strategy_selector else None
-                    })
-                    swarm_state = self.swarm_coordinator.get_shared_predictions()
-                    # Aggregate Q‑tables (optional)
-                    if self.strategy_selector and swarm_state:
-                        # Simple weighted average of Q‑tables from other agents
-                        # We'll implement a placeholder for brevity
-                        pass
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Swarm update error", error=str(e))
-                await asyncio.sleep(120)
-
-    async def _update_metrics(self, state: Dict[str, float]):
-        self.metrics['energy_efficiency'] = 1.0 - state.get('energy_intensity', 0.5)
-        self.metrics['helium_efficiency'] = state.get('helium_level', 0.5)
-
-    async def save_state(self):
-        state_data = {
-            'agent_id': self.config.agent_id,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'state': self.state,
-            'metrics': self.metrics,
-            'current_strategy': self.current_strategy,
-            'strategy_change_time': self.strategy_change_time.isoformat(),
-            'q_table': dict(self.strategy_selector.q_table) if self.strategy_selector else None,
-            'correlation_id': self.correlation_id,
-            'reward_history': list(self.reward_history),
+            self.clients[client_id] = info
+            logger.info(f"Client registered: {client_id} ({energy_profile.value})")
+            return info
+    
+    async def update_client_state(
+        self,
+        client_id: str,
+        state: ClientState,
+        battery_level: Optional[float] = None,
+        energy_consumption_rate: Optional[float] = None,
+    ) -> None:
+        """Update client energy and availability state."""
+        async with self._lock:
+            if client_id not in self.clients:
+                logger.warning(f"Unknown client: {client_id}")
+                return
+            
+            client = self.clients[client_id]
+            client.state = state
+            client.last_seen = datetime.now(timezone.utc)
+            
+            if battery_level is not None:
+                client.battery_level = max(0.0, min(1.0, battery_level))
+            
+            if energy_consumption_rate is not None:
+                client.energy_consumption_rate = energy_consumption_rate
+            
+            self.client_history[client_id].append({
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'state': state.value,
+                'battery': client.battery_level,
+            })
+            
+            logger.debug(f"Client state updated: {client_id} -> {state.value} (battery={client.battery_level:.2f})")
+    
+    async def get_client_info(self, client_id: str) -> Optional[ClientEnergyInfo]:
+        """Retrieve client energy information."""
+        async with self._lock:
+            return self.clients.get(client_id)
+    
+    # ========================================================================
+    # Client Selection (SwiftFed-inspired)
+    # ========================================================================
+    async def select_clients_for_round(
+        self,
+        target_count: Optional[int] = None,
+        energy_aware: bool = True,
+        prefer_mobile: bool = False,
+    ) -> Tuple[List[str], Dict[str, float]]:
+        """
+        Select clients for federated learning round using energy-aware heuristics.
+        
+        Returns: (client_ids, energy_weights)
+        """
+        async with self._lock:
+            target = target_count or self.config['max_clients_per_round']
+            min_required = self.config['min_clients_per_round']
+            
+            # Get available clients
+            available = [
+                (cid, info) for cid, info in self.clients.items()
+                if info.state in [ClientState.AVAILABLE, ClientState.ACTIVE, ClientState.CHARGING]
+            ]
+            
+            if len(available) < min_required:
+                logger.warning(f"Only {len(available)} clients available; need {min_required}")
+                available = list(self.clients.items())[:min_required]
+            
+            # Filter by battery threshold
+            if energy_aware:
+                threshold = self.config['energy_threshold_battery']
+                filtered = [
+                    (cid, info) for cid, info in available
+                    if (info.energy_profile != ClientEnergyProfile.BATTERY_POWERED
+                        or info.battery_level >= threshold)
+                ]
+                if len(filtered) < min_required:
+                    filtered = available
+                available = filtered
+            
+            # Score clients by energy efficiency
+            scores = []
+            for cid, info in available:
+                energy_score = info.get_energy_score()
+                stability_score = 1.0 - (len(self.client_history[cid]) - self.participation_history[cid]) / (len(self.client_history[cid]) + 1)
+                bandwidth_efficiency = (info.upload_bandwidth_mbps + info.download_bandwidth_mbps) / 20.0
+                
+                combined_score = (
+                    0.5 * energy_score +
+                    0.3 * stability_score +
+                    0.2 * bandwidth_efficiency
+                )
+                scores.append((cid, info, combined_score))
+            
+            # Sort by score and select top-k
+            scores.sort(key=lambda x: x[2], reverse=True)
+            selected = scores[:target]
+            
+            # Compute energy weights for aggregation
+            energy_weights = {}
+            total_weight = sum(s[2] for s in selected)
+            for cid, info, score in selected:
+                energy_weights[cid] = score / (total_weight + 1e-6)
+            
+            selected_ids = [cid for cid, _, _ in selected]
+            
+            logger.info(
+                f"Selected {len(selected_ids)} clients for round",
+                clients=selected_ids,
+                avg_score=np.mean([s[2] for s in selected]) if selected else 0
+            )
+            
+            return selected_ids, energy_weights
+    
+    # ========================================================================
+    # Gradient Compression
+    # ========================================================================
+    def compress_gradients(
+        self,
+        gradients: np.ndarray,
+        compression_ratio: float = 0.1,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Compress gradients using top-k sparsification.
+        
+        Args:
+            gradients: Flattened gradient vector
+            compression_ratio: Target ratio of kept values (0-1)
+        
+        Returns: (compressed_gradients, actual_compression_ratio)
+        """
+        if not self.gradient_compression_enabled or compression_ratio >= 1.0:
+            return gradients, 1.0
+        
+        flat = gradients.flatten()
+        k = max(1, int(len(flat) * compression_ratio))
+        
+        # Top-k selection
+        abs_flat = np.abs(flat)
+        threshold = np.sort(abs_flat)[-k] if k > 0 else 0
+        mask = abs_flat >= threshold
+        
+        compressed = flat * mask
+        actual_ratio = np.count_nonzero(mask) / len(flat)
+        
+        self.compression_ratios.append(actual_ratio)
+        
+        return compressed.reshape(gradients.shape), actual_ratio
+    
+    # ========================================================================
+    # Aggregation Strategies
+    # ========================================================================
+    async def select_aggregation_strategy(
+        self,
+        state: Dict[str, float],
+    ) -> AggregationStrategy:
+        """
+        Choose aggregation strategy based on current system state.
+        """
+        available_clients = sum(
+            1 for info in self.clients.values()
+            if info.state in [ClientState.AVAILABLE, ClientState.ACTIVE, ClientState.CHARGING]
+        )
+        
+        # Get energy state
+        avg_battery = np.mean([
+            info.battery_level for info in self.clients.values()
+        ]) if self.clients else 0.5
+        
+        avg_latency = np.mean([
+            info.estimated_sync_time_seconds for info in self.clients.values()
+            if info.estimated_sync_time_seconds > 0
+        ]) if any(info.estimated_sync_time_seconds > 0 for info in self.clients.values()) else 5.0
+        
+        # Strategy logic
+        if available_clients < self.config['min_clients_per_round']:
+            strategy = AggregationStrategy.LAZY
+        elif avg_battery < self.config['energy_threshold_degraded']:
+            strategy = AggregationStrategy.SELECTIVE
+        elif avg_latency > 30:
+            strategy = AggregationStrategy.GRADIENT_COMPRESSION
+        elif avg_battery < self.config['energy_threshold_battery']:
+            strategy = AggregationStrategy.PRIORITY
+        else:
+            strategy = AggregationStrategy.STANDARD
+        
+        if strategy != self.current_strategy:
+            self.current_strategy = strategy
+            self.strategy_change_log.append({
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'strategy': strategy.value,
+                'reason': f"avg_battery={avg_battery:.2f}, clients={available_clients}, latency={avg_latency:.1f}s",
+            })
+            logger.info(f"Aggregation strategy switched to {strategy.value}")
+        
+        return strategy
+    
+    async def aggregate_updates(
+        self,
+        updates: List[ClientUpdateInfo],
+        strategy: AggregationStrategy,
+        energy_weights: Dict[str, float],
+    ) -> Tuple[Dict[str, Any], float]:
+        """
+        Aggregate client updates using specified strategy.
+        
+        Returns: (aggregated_result, total_energy_cost)
+        """
+        if not updates:
+            logger.warning("No updates to aggregate")
+            return {}, 0.0
+        
+        total_energy = sum(u.energy_cost_joules for u in updates)
+        
+        if strategy == AggregationStrategy.STANDARD:
+            result = self._aggregate_standard(updates, energy_weights)
+        elif strategy == AggregationStrategy.LAZY:
+            result = self._aggregate_lazy(updates, energy_weights)
+        elif strategy == AggregationStrategy.PRIORITY:
+            result = self._aggregate_priority(updates, energy_weights)
+        elif strategy == AggregationStrategy.GRADIENT_COMPRESSION:
+            result = self._aggregate_compressed(updates, energy_weights)
+        else:  # SELECTIVE
+            result = self._aggregate_selective(updates, energy_weights)
+        
+        result['total_energy_cost_joules'] = total_energy
+        result['aggregation_strategy'] = strategy.value
+        
+        return result, total_energy
+    
+    def _aggregate_standard(
+        self,
+        updates: List[ClientUpdateInfo],
+        energy_weights: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """FedAvg with optional energy weighting."""
+        weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
+        weights = np.array(weights) / sum(weights)
+        
+        avg_compression = np.mean([u.compression_ratio for u in updates])
+        
+        return {
+            'method': 'standard_fedavg',
+            'num_clients': len(updates),
+            'weights': weights.tolist(),
+            'avg_gradient_norm': np.mean([u.gradient_norm for u in updates]),
+            'avg_compression_ratio': avg_compression,
         }
-        try:
-            with open(self.config.state_save_path, 'wb') as f:
-                pickle.dump(state_data, f)
-            logger.debug("State saved.")
-        except Exception as e:
-            logger.error("Failed to save state", error=str(e))
+    
+    def _aggregate_lazy(
+        self,
+        updates: List[ClientUpdateInfo],
+        energy_weights: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Lazy aggregation: skip stragglers."""
+        threshold = np.median([u.transmission_time_ms for u in updates])
+        fast_updates = [u for u in updates if u.transmission_time_ms <= threshold * 1.5]
+        
+        if not fast_updates:
+            fast_updates = updates
+        
+        weights = [energy_weights.get(u.client_id, 1.0 / len(fast_updates)) for u in fast_updates]
+        weights = np.array(weights) / sum(weights)
+        
+        return {
+            'method': 'lazy_aggregation',
+            'num_clients': len(fast_updates),
+            'num_skipped': len(updates) - len(fast_updates),
+            'weights': weights.tolist(),
+            'avg_gradient_norm': np.mean([u.gradient_norm for u in fast_updates]),
+        }
+    
+    def _aggregate_priority(
+        self,
+        updates: List[ClientUpdateInfo],
+        energy_weights: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Priority aggregation with energy-aware weighting."""
+        # Higher weight for low-energy clients
+        energy_based_weights = {}
+        for u in updates:
+            score = energy_weights.get(u.client_id, 0.5)
+            # Inverse weighting: lower energy → higher weight to incentivize participation
+            energy_based_weights[u.client_id] = 1.0 / (score + 0.1)
+        
+        weights_list = [energy_based_weights.get(u.client_id, 1.0) for u in updates]
+        weights = np.array(weights_list) / sum(weights_list)
+        
+        return {
+            'method': 'energy_priority_aggregation',
+            'num_clients': len(updates),
+            'weights': weights.tolist(),
+            'energy_based': True,
+        }
+    
+    def _aggregate_compressed(
+        self,
+        updates: List[ClientUpdateInfo],
+        energy_weights: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Aggregation with gradient compression emphasis."""
+        weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
+        weights = np.array(weights) / sum(weights)
+        
+        avg_compression = np.mean([u.compression_ratio for u in updates])
+        
+        return {
+            'method': 'compressed_aggregation',
+            'num_clients': len(updates),
+            'weights': weights.tolist(),
+            'avg_compression_ratio': avg_compression,
+            'transmission_savings_percent': (1.0 - avg_compression) * 100,
+        }
+    
+    def _aggregate_selective(
+        self,
+        updates: List[ClientUpdateInfo],
+        energy_weights: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Selective aggregation: only high-quality updates."""
+        sorted_updates = sorted(updates, key=lambda u: u.gradient_norm)
+        top_half = sorted_updates[len(sorted_updates)//2:]
+        
+        weights = [energy_weights.get(u.client_id, 1.0 / len(top_half)) for u in top_half]
+        weights = np.array(weights) / sum(weights)
+        
+        return {
+            'method': 'selective_aggregation',
+            'num_clients': len(top_half),
+            'num_filtered': len(updates) - len(top_half),
+            'weights': weights.tolist(),
+        }
+    
+    # ========================================================================
+    # Round Execution and Tracking
+    # ========================================================================
+    async def execute_aggregation_round(
+        self,
+        round_id: int,
+        state: Dict[str, float],
+    ) -> AggregationRound:
+        """Execute a full federated aggregation round."""
+        logger.info(f"Starting aggregation round {round_id}")
+        
+        # Select strategy
+        strategy = await self.select_aggregation_strategy(state)
+        
+        # Select clients
+        selected_ids, energy_weights = await self.select_clients_for_round()
+        
+        # Simulate receiving updates (in practice, async wait for clients)
+        updates = []
+        failed_clients = []
+        
+        for client_id in selected_ids:
+            try:
+                # Simulate update reception
+                energy_cost = np.random.exponential(0.5)
+                update = ClientUpdateInfo(
+                    client_id=client_id,
+                    model_hash=hashlib.sha256(f"{round_id}_{client_id}".encode()).hexdigest(),
+                    gradient_norm=np.random.exponential(1.0),
+                    update_timestamp=datetime.now(timezone.utc),
+                    energy_cost_joules=energy_cost,
+                    transmission_time_ms=np.random.uniform(10, 1000),
+                )
+                updates.append(update)
+                self.total_updates_processed += 1
+            except Exception as e:
+                logger.warning(f"Failed to receive update from {client_id}: {e}")
+                failed_clients.append(client_id)
+                self.failed_updates += 1
+        
+        # Aggregate
+        result, total_energy = await self.aggregate_updates(updates, strategy, energy_weights)
+        
+        # Record round
+        round_info = AggregationRound(
+            round_id=round_id,
+            strategy=strategy,
+            selected_clients=selected_ids,
+            completed_clients=updates,
+            failed_clients=failed_clients,
+            timestamp=datetime.now(timezone.utc),
+            duration_seconds=np.random.uniform(10, 300),
+            total_energy_joules=total_energy,
+            model_hash=hashlib.sha256(f"{round_id}_aggregated".encode()).hexdigest(),
+            compression_ratio=result.get('avg_compression_ratio', 1.0),
+        )
+        
+        self.rounds.append(round_info)
+        self.total_energy_consumed_joules += total_energy
+        
+        for cid in selected_ids:
+            self.participation_history[cid] += 1
+        
+        logger.info(
+            f"Round {round_id} complete",
+            strategy=strategy.value,
+            completed=f"{len(updates)}/{len(selected_ids)}",
+            energy_joules=total_energy,
+        )
+        
+        return round_info
+    
+    # ========================================================================
+    # Metrics and Reporting
+    # ========================================================================
+    async def get_expert_metrics(self) -> Dict[str, Any]:
+        """Retrieve comprehensive metrics."""
+        async with self._lock:
+            return {
+                'total_energy_consumed_joules': self.total_energy_consumed_joules,
+                'total_updates_processed': self.total_updates_processed,
+                'failed_updates': self.failed_updates,
+                'total_rounds': len(self.rounds),
+                'active_clients': sum(
+                    1 for info in self.clients.values()
+                    if info.state in [ClientState.AVAILABLE, ClientState.ACTIVE]
+                ),
+                'total_registered_clients': len(self.clients),
+                'avg_compression_ratio': float(np.mean(self.compression_ratios)) if self.compression_ratios else 1.0,
+                'current_strategy': self.current_strategy.value,
+                'strategy_changes': len(self.strategy_change_log),
+            }
+    
+    async def get_client_participation_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Get participation statistics per client."""
+        async with self._lock:
+            stats = {}
+            for client_id, info in self.clients.items():
+                participated = self.participation_history[client_id]
+                total_seen = len(self.client_history[client_id])
+                
+                stats[client_id] = {
+                    'state': info.state.value,
+                    'energy_profile': info.energy_profile.value,
+                    'battery_level': info.battery_level,
+                    'energy_score': info.get_energy_score(),
+                    'participated_rounds': participated,
+                    'observations': total_seen,
+                    'participation_rate': participated / (total_seen + 1) if total_seen > 0 else 0,
+                }
+            return stats
+    
+    def get_energy_efficiency_report(self) -> Dict[str, Any]:
+        """Generate energy efficiency report."""
+        if not self.rounds:
+            return {'message': 'No rounds completed yet'}
+        
+        energy_per_round = [r.total_energy_joules for r in self.rounds]
+        clients_per_round = [len(r.completed_clients) for r in self.rounds]
+        
+        return {
+            'total_energy_joules': self.total_energy_consumed_joules,
+            'total_rounds': len(self.rounds),
+            'avg_energy_per_round_joules': float(np.mean(energy_per_round)),
+            'avg_energy_per_client_joules': float(np.mean(energy_per_round) / (np.mean(clients_per_round) + 1e-6)),
+            'avg_clients_per_round': float(np.mean(clients_per_round)),
+            'avg_compression_ratio': float(np.mean(self.compression_ratios)) if self.compression_ratios else 1.0,
+            'energy_per_update': self.total_energy_consumed_joules / (self.total_updates_processed + 1),
+            'success_rate': (self.total_updates_processed - self.failed_updates) / (self.total_updates_processed + 1),
+        }
+    
+    def get_strategy_log(self) -> List[Dict[str, Any]]:
+        """Get strategy change history."""
+        return self.strategy_change_log
+    
+    # ========================================================================
+    # Explainability
+    # ========================================================================
+    async def explain_client_selection(
+        self,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Explain why certain clients were selected in a round."""
+        if round_id >= len(self.rounds):
+            return None
+        
+        round_info = self.rounds[round_id]
+        
+        explanation = {
+            'round_id': round_id,
+            'strategy': round_info.strategy.value,
+            'selected_clients': round_info.selected_clients,
+            'failed_clients': round_info.failed_clients,
+            'rationale': {
+                'strategy_reason': f"Used {round_info.strategy.value} strategy",
+                'selection_criteria': [
+                    "Energy availability",
+                    "Historical participation",
+                    "Bandwidth efficiency",
+                    "Client state",
+                ],
+            },
+        }
+        
+        return explanation
+    
+    async def explain_aggregation_decision(
+        self,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Explain aggregation decisions for a round."""
+        if round_id >= len(self.rounds):
+            return None
+        
+        round_info = self.rounds[round_id]
+        
+        explanation = {
+            'round_id': round_id,
+            'aggregation_strategy': round_info.strategy.value,
+            'num_clients_aggregated': len(round_info.completed_clients),
+            'total_energy_cost_joules': round_info.total_energy_joules,
+            'compression_applied': round_info.compression_ratio < 1.0,
+            'compression_ratio': round_info.compression_ratio,
+        }
+        
+        return explanation
 
-    async def load_state(self, path: Optional[str] = None):
-        path = path or self.config.state_save_path
-        if not os.path.exists(path):
-            logger.info("No saved state found; starting fresh.")
-            return
-        try:
-            with open(path, 'rb') as f:
-                data = pickle.load(f)
-            self.state = data.get('state', self.state)
-            self.metrics = data.get('metrics', self.metrics)
-            self.current_strategy = data.get('current_strategy', 'balanced')
-            if data.get('q_table') and self.strategy_selector:
-                self.strategy_selector.q_table = defaultdict(dict, data['q_table'])
-            self.correlation_id = data.get('correlation_id', self.correlation_id)
-            self.reward_history = deque(data.get('reward_history', []), maxlen=100)
-            logger.info("State loaded.")
-        except Exception as e:
-            logger.error("Failed to load state", error=str(e))
-
-    async def shutdown(self):
-        logger.info("Shutting down BioIntegratedAgent")
-        await self._task_manager.stop_all()
-        await self.save_state()
-        if self.tick_engine and hasattr(self.tick_engine, 'shutdown'):
-            await self.tick_engine.shutdown()
-        if self.quantum_bridge and hasattr(self.quantum_bridge, 'shutdown'):
-            await self.quantum_bridge.shutdown()
-        logger.info("Agent shutdown complete")
 
 # ============================================================================
-# Example usage
+# Example Usage
 # ============================================================================
 async def example():
-    class MockCore:
-        def __init__(self):
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-            self.health_monitor = None
-            self.degradation_manager = None
-            self.competition_engine = None
-            self.supply_manager = None
-            self.token_allocator = None
-        async def update_configuration(self, policy):
-            pass
+    expert = FLEnergyExpert()
+    
+    # Register clients
+    for i in range(5):
+        profile = [
+            ClientEnergyProfile.BATTERY_POWERED,
+            ClientEnergyProfile.PLUGGED_IN,
+            ClientEnergyProfile.SOLAR_POWERED,
+        ][i % 3]
+        
+        await expert.register_client(
+            client_id=f"client_{i}",
+            energy_profile=profile,
+            bandwidth_mbps=10.0 + i,
+        )
+    
+    # Simulate energy updates
+    for i in range(5):
+        await expert.update_client_state(
+            f"client_{i}",
+            ClientState.AVAILABLE,
+            battery_level=0.5 + np.random.uniform(-0.2, 0.2),
+        )
+    
+    # Execute rounds
+    state = {'energy': 0.5, 'load': 0.3}
+    for round_id in range(3):
+        round_info = await expert.execute_aggregation_round(round_id, state)
+        print(f"Round {round_id}: {len(round_info.completed_clients)} clients, {round_info.total_energy_joules:.2f} J")
+    
+    # Report metrics
+    metrics = await expert.get_expert_metrics()
+    print("Metrics:", json.dumps(metrics, indent=2))
+    
+    efficiency = expert.get_energy_efficiency_report()
+    print("Efficiency:", json.dumps(efficiency, indent=2))
 
-    config = {
-        'enable_energy_aware_rl': True,
-        'enable_time_tick_engine': True,
-        'enable_quantum_bridge': True,
-        'enable_swarm_coordination': True,
-        'enable_proactive_healing': True,
-        'pqc_key_dir': './pqc_keys',
-        'state_save_path': './agent_state.pkl',
-        'enable_multi_objective_rl': True,
-    }
-    agent = BioIntegratedAgent(
-        bio_core=MockCore(),
-        config=config,
-        csv_path="helium_data.csv"
-    )
-    await asyncio.sleep(10)
-    state = await agent.get_strategy_state()
-    print("Current state:", state)
-    print("Current strategy:", agent.current_strategy)
-    print("Metrics:", agent.metrics)
-    await agent.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(example())
