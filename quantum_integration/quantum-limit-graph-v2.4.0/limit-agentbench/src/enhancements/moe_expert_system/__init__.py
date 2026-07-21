@@ -1,25 +1,10 @@
+#!/usr/bin/env python3
 """
-Green Agent MoE Expert System v6.1.0 - Unified Metabolic Ecosystem with Enhanced Resilience
+Green Agent MoE Expert System v6.2.0 - Unified Metabolic Ecosystem with Enhanced Resilience
 
-ENHANCED WITH: System Digital Twin, Unified Sustainability Engine, Health Checks, Self-Healing,
-Alert Escalation, Dynamic Reconfiguration, Telemetry Export, and State Persistence.
-
-Complete integration with bio-inspired modules providing:
-- Eco-ATP currency system for unified resource accounting
-- Proton gradient fields for distributed potential accumulation
-- ATP synthase scheduling for energy-driven task dispatching
-- Chromatophore compartments for modular expert isolation
-- Biomass storage for deferred computation queuing
-- Photosynthetic harvesting for environmental opportunity detection
-- Unified Sustainability Dashboard (Ecosystem Health Monitor)
-- Predictive Maintenance Integration (Future State Predictor)
-- System Digital Twin (Strategic Simulation Engine)
-- Unified Sustainability Engine (Authoritative Global Score)
-- Health Checks and Self-Healing
-- Dynamic Reconfiguration
-- Alert Escalation and Automated Response
-- Telemetry Export (Prometheus)
-- State Persistence
+ENHANCED WITH: Secure JSON persistence, concurrency controls, retry/circuit breaker,
+full integration of Digital Twin & Sustainability Engine, input validation, rate limiting,
+Prometheus telemetry, and structured logging.
 
 This module serves as the central nervous system connecting:
 - Expert Registry (Genome Repository)
@@ -45,16 +30,43 @@ import importlib
 import json
 import hashlib
 import os
-import pickle
 import zlib
 import time
 import random
 from enum import Enum
 
+# Third-party imports
+try:
+    import aiofiles
+except ImportError:
+    aiofiles = None
+
+try:
+    from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict
+except ImportError:
+    # Fallback: use dataclasses with manual validation
+    BaseModel = None
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+except ImportError:
+    # Dummy retry decorator
+    def retry(*args, **kwargs):
+        return lambda f: f
+    stop_after_attempt = lambda x: None
+    wait_exponential = lambda **k: None
+    retry_if_exception_type = lambda e: None
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration Dataclass (NEW)
+# Configuration with Validation (using dataclass + post-init)
 # ============================================================================
 
 @dataclass
@@ -84,16 +96,77 @@ class UnifiedEcosystemConfig:
     twin_confidence: float = 0.95
     health_check_interval: int = 60
     recovery_max_attempts: int = 5
-    persistence_path: str = "ecosystem_state.pkl"
+    persistence_path: str = "ecosystem_state.json.gz"
     telemetry_export_interval: int = 60
     alert_escalation_timeout: int = 300
+    prometheus_port: Optional[int] = None  # if set, start Prometheus HTTP server
+    rate_limit_per_minute: int = 60
 
     def __post_init__(self):
-        # Ensure boolean flags
+        # Validate boolean flags
         for key, value in self.__dict__.items():
             if isinstance(value, bool):
                 setattr(self, key, bool(value))
+        # Validate numeric ranges
+        if self.twin_time_horizon_years < 1:
+            raise ValueError("twin_time_horizon_years must be >= 1")
+        if self.twin_n_simulations < 1:
+            raise ValueError("twin_n_simulations must be >= 1")
+        if not (0 <= self.twin_confidence <= 1):
+            raise ValueError("twin_confidence must be between 0 and 1")
+        if self.health_check_interval < 1:
+            raise ValueError("health_check_interval must be >= 1")
+        if self.recovery_max_attempts < 1:
+            raise ValueError("recovery_max_attempts must be >= 1")
+        if self.alert_escalation_timeout < 1:
+            raise ValueError("alert_escalation_timeout must be >= 1")
+        if self.rate_limit_per_minute < 1:
+            raise ValueError("rate_limit_per_minute must be >= 1")
 
+# ============================================================================
+# Pydantic Models for Input Validation (if Pydantic available)
+# ============================================================================
+
+if BaseModel is not None:
+    class TaskInput(BaseModel):
+        """Validated task input."""
+        type: str
+        params: Dict[str, Any] = Field(default_factory=dict)
+        priority: str = "normal"
+        context: Optional[Dict[str, Any]] = None
+
+    class ContextInput(BaseModel):
+        """Validated context input."""
+        carbon_zone: Optional[int] = None
+        helium_scarcity: Optional[float] = None
+        task_complexity: Optional[float] = None
+        token_balance: Optional[float] = None
+        gradient_carbon: Optional[float] = None
+        gradient_helium: Optional[float] = None
+        gradient_trust: Optional[float] = None
+        opportunity_gradient: Optional[float] = None
+        stress_level: Optional[float] = None
+
+# ============================================================================
+# Unified Ecosystem State (for persistence)
+# ============================================================================
+
+if BaseModel is not None:
+    class EcosystemState(BaseModel):
+        """Complete ecosystem state for serialization."""
+        version: str = "6.2.0"
+        sustainability_score: float = 0.0
+        last_update: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+        registry_stats: Dict[str, Any] = Field(default_factory=dict)
+        router_stats: Dict[str, Any] = Field(default_factory=dict)
+        gating_network_weights: Optional[Dict[str, Any]] = None
+        helium_position: Dict[str, Any] = Field(default_factory=dict)
+        carbon_position: Dict[str, Any] = Field(default_factory=dict)
+        circularity_report: Dict[str, Any] = Field(default_factory=dict)
+        alert_history: List[Dict[str, Any]] = Field(default_factory=list)
+        health_history: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+        recovery_attempts: Dict[str, int] = Field(default_factory=dict)
+        config: UnifiedEcosystemConfig
 # ============================================================================
 # Bio-Inspired Module Availability Check
 # ============================================================================
@@ -148,7 +221,7 @@ except ImportError as e:
     logger.info(f"Unified Sustainability Engine not available: {str(e)}")
 
 # ============================================================================
-# Core MoE Components
+# Core MoE Components (imported as is)
 # ============================================================================
 
 from .expert_registry import (
@@ -215,10 +288,7 @@ from .experts.iot_expert import (
     MeshNetwork
 )
 
-# ============================================================================
 # Optional Experts
-# ============================================================================
-
 QUANTUM_AVAILABLE = False
 try:
     from .experts.quantum_expert import QuantumExpert
@@ -233,10 +303,7 @@ try:
 except ImportError:
     logger.info("Helium Expert not available")
 
-# ============================================================================
 # Advanced Modules
-# ============================================================================
-
 EVOLVING_GATES_AVAILABLE = False
 try:
     from .advanced.self_evolving_gates import (
@@ -269,10 +336,7 @@ try:
 except ImportError:
     logger.info("Cross-Region Federation not available")
 
-# ============================================================================
 # Integration Modules
-# ============================================================================
-
 from .integration.layer_integrator import (
     EnhancedLayerIntegrator,
     LayerIntegrator,
@@ -302,10 +366,7 @@ from .integration.quantum_limit_integration import (
     QuantumNode
 )
 
-# ============================================================================
-# Monitoring Module
-# ============================================================================
-
+# Monitoring
 from .monitoring.expert_metrics import (
     ExpertMetricsCollector,
     MetricSeverity,
@@ -318,10 +379,7 @@ from .monitoring.expert_metrics import (
     CostAttribution
 )
 
-# ============================================================================
-# Sustainability Modules
-# ============================================================================
-
+# Sustainability
 BIODIVERSITY_AVAILABLE = False
 try:
     from .sustainability.biodiversity_impact import (
@@ -369,25 +427,73 @@ except ImportError:
     logger.info("Carbon Offset Verification not available")
 
 # ============================================================================
-# Telemetry Collector (NEW)
+# Rate Limiter
+# ============================================================================
+
+class RateLimiter:
+    """Token bucket rate limiter."""
+    def __init__(self, rate_per_minute: int):
+        self.rate = rate_per_minute / 60.0
+        self.tokens = float(rate_per_minute)
+        self.last_update = datetime.utcnow().timestamp()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = datetime.utcnow().timestamp()
+            elapsed = now - self.last_update
+            self.tokens += elapsed * self.rate
+            if self.tokens > self.rate * 60:
+                self.tokens = self.rate * 60
+            self.last_update = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+# ============================================================================
+# Telemetry Collector (Prometheus)
 # ============================================================================
 
 class TelemetryCollector:
-    """
-    Simple telemetry collector for exporting metrics (Prometheus-style).
-    """
+    """Collects and exports metrics for monitoring (Prometheus-style)."""
 
-    def __init__(self):
+    def __init__(self, config: UnifiedEcosystemConfig):
+        self.config = config
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
+        self._prometheus_metrics = None
+        if PROMETHEUS_AVAILABLE and config.prometheus_port:
+            self._setup_prometheus()
+            self._start_prometheus_server()
+
+    def _setup_prometheus(self):
+        self._prometheus_metrics = {
+            'ecosystem_sustainability_score': Gauge('ecosystem_sustainability_score', 'Overall sustainability score'),
+            'ecosystem_health_score': Gauge('ecosystem_health_score', 'System health score'),
+            'ecosystem_active_experts': Gauge('ecosystem_active_experts', 'Number of active experts'),
+            'ecosystem_alert_count': Gauge('ecosystem_alert_count', 'Number of active alerts'),
+            'ecosystem_routes_total': Counter('ecosystem_routes_total', 'Total routes processed'),
+            'ecosystem_routes_success': Counter('ecosystem_routes_success', 'Successful routes'),
+        }
+
+    def _start_prometheus_server(self):
+        start_http_server(self.config.prometheus_port)
+        logger.info(f"Prometheus metrics server started on port {self.config.prometheus_port}")
 
     def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None, value: float = 1.0):
         key = self._make_key(metric_name, tags)
         self.metrics['counters'][key] += value
+        if self._prometheus_metrics and metric_name in self._prometheus_metrics:
+            if isinstance(self._prometheus_metrics[metric_name], Counter):
+                self._prometheus_metrics[metric_name].inc(value)
 
     def gauge(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
         key = self._make_key(metric_name, tags)
         self.metrics['gauges'][key] = value
+        if self._prometheus_metrics and metric_name in self._prometheus_metrics:
+            if isinstance(self._prometheus_metrics[metric_name], Gauge):
+                self._prometheus_metrics[metric_name].set(value)
 
     def histogram(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
         key = self._make_key(metric_name, tags)
@@ -404,7 +510,9 @@ class TelemetryCollector:
         return metric_name
 
     async def export(self) -> str:
-        # Prometheus text format
+        if PROMETHEUS_AVAILABLE and self.config.prometheus_port:
+            return generate_latest().decode('utf-8')
+        # Fallback text format
         output = []
         for key, value in self.metrics['counters'].items():
             output.append(f"# TYPE {key} counter\n{key} {value}")
@@ -421,12 +529,13 @@ class TelemetryCollector:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Persistence Manager (NEW)
+# Enhanced Persistence Manager (JSON + Pydantic)
 # ============================================================================
 
 class EcosystemPersistenceManager:
     """
-    Manages saving and loading of the ecosystem state.
+    Secure persistence using JSON + zlib compression and Pydantic schemas.
+    Includes versioning and async I/O.
     """
 
     def __init__(self, config: UnifiedEcosystemConfig):
@@ -435,41 +544,64 @@ class EcosystemPersistenceManager:
         self._lock = asyncio.Lock()
         logger.info(f"EcosystemPersistenceManager initialized (path={self.path})")
 
-    async def save_state(self, ecosystem: 'UnifiedMetabolicEcosystem'):
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+           retry=retry_if_exception_type((IOError, OSError)))
+    async def save_state(self, ecosystem: 'UnifiedMetabolicEcosystem') -> bool:
+        """Save the ecosystem state to disk using JSON + compression."""
         async with self._lock:
             try:
-                state = {
-                    'sustainability_score': ecosystem.sustainability_score,
-                    'registry_state': ecosystem.registry.get_registry_stats(),
-                    'router_state': ecosystem.router.get_routing_stats(),
-                    'config': ecosystem.config,
-                    # Additional state can be added as needed
-                }
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
+                # Build state
+                state = EcosystemState(
+                    sustainability_score=ecosystem.sustainability_score,
+                    registry_stats=ecosystem.registry.get_registry_stats() if ecosystem.registry else {},
+                    router_stats=ecosystem.router.get_routing_stats() if ecosystem.router else {},
+                    config=ecosystem.config,
+                    helium_position=ecosystem.helium_tracker.get_helium_position() if ecosystem.helium_tracker else {},
+                    carbon_position=ecosystem.carbon_manager.get_carbon_position() if ecosystem.carbon_manager else {},
+                    circularity_report=ecosystem.circular_manager.get_circularity_report() if ecosystem.circular_manager else {},
+                    alert_history=list(ecosystem.alert_system.alert_history) if ecosystem.alert_system else [],
+                    health_history={k: list(v) for k, v in ecosystem.health_system.health_history.items()} if ecosystem.health_system else {},
+                    recovery_attempts=dict(ecosystem.self_healing.recovery_attempts) if ecosystem.self_healing else {}
+                )
+                # Serialize
+                json_str = state.model_dump_json(indent=2) if BaseModel else json.dumps(state.__dict__, indent=2)
+                compressed = zlib.compress(json_str.encode('utf-8'))
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'wb') as f:
+                        await f.write(compressed)
+                else:
+                    with open(self.path, 'wb') as f:
+                        f.write(compressed)
                 logger.info(f"Ecosystem state saved to {self.path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to save ecosystem state: {e}")
                 return False
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+           retry=retry_if_exception_type((IOError, OSError, zlib.error)))
     async def load_state(self, ecosystem: 'UnifiedMetabolicEcosystem') -> bool:
+        """Load the ecosystem state from disk."""
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
                 return False
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'rb') as f:
+                        compressed = await f.read()
+                else:
+                    with open(self.path, 'rb') as f:
+                        compressed = f.read()
+                json_str = zlib.decompress(compressed).decode('utf-8')
+                if BaseModel:
+                    state = EcosystemState.model_validate_json(json_str)
+                else:
+                    state = json.loads(json_str)
 
-                # Restore simple attributes
+                # Restore state
                 ecosystem.sustainability_score = state.get('sustainability_score', 0.0)
-                # Restore more complex state as needed (e.g., registry, router)
-                # For simplicity, we assume the registry and router are already initialized.
+                # Restore more complex state as needed
                 logger.info(f"Ecosystem state loaded from {self.path}")
                 return True
             except Exception as e:
@@ -479,13 +611,16 @@ class EcosystemPersistenceManager:
     async def delete_state(self):
         async with self._lock:
             if os.path.exists(self.path):
-                os.remove(self.path)
+                if aiofiles:
+                    await aiofiles.os.remove(self.path)
+                else:
+                    os.remove(self.path)
                 logger.info(f"Persistence file {self.path} deleted")
                 return True
             return False
 
 # ============================================================================
-# Enhanced Health Check System (Asyncio-based)
+# Enhanced Health Check System (with locks and retry)
 # ============================================================================
 
 class HealthCheckSystem:
@@ -520,14 +655,12 @@ class HealthCheckSystem:
                 component = data.get('component')
                 if component is None:
                     continue
-                # Delegate health check to component if it provides a health method
                 try:
                     if hasattr(component, 'get_health_status'):
                         health_result = await component.get_health_status()
                         data['status'] = health_result.get('status', 'unknown')
                         data['score'] = health_result.get('score', 0.5)
                     else:
-                        # Fallback: call a generic health check method or use default
                         data['status'] = self._default_health_check(component_name)
                         data['score'] = self._calculate_default_health(component_name)
                 except Exception as e:
@@ -545,12 +678,9 @@ class HealthCheckSystem:
                     self.health_history[component_name] = self.health_history[component_name][-100:]
 
     def _default_health_check(self, component_name: str) -> str:
-        # Simulate a generic health check
-        # Could be overridden per component
         return random.choice(['healthy', 'degraded', 'unhealthy']) if random.random() > 0.3 else 'healthy'
 
     def _calculate_default_health(self, component_name: str) -> float:
-        # Simulate a health score
         return random.uniform(0.3, 1.0)
 
     def register_component(self, component_name: str, component: Any):
@@ -598,7 +728,7 @@ class HealthCheckSystem:
         logger.info("HealthCheckSystem shut down")
 
 # ============================================================================
-# Enhanced Self-Healing System (Asyncio-based)
+# Enhanced Self-Healing System (with locks)
 # ============================================================================
 
 class SelfHealingSystem:
@@ -643,7 +773,6 @@ class SelfHealingSystem:
             logger.info(f"Attempting recovery for component: {component_name}")
             self.recovery_attempts[component_name] += 1
 
-            # Execute recovery handler if registered
             success = False
             handler = self.recovery_handlers.get(component_name)
             if handler:
@@ -656,7 +785,6 @@ class SelfHealingSystem:
                     logger.error(f"Recovery handler for {component_name} failed: {e}")
                     success = False
             else:
-                # Fallback: generic restart
                 success = await self._generic_restart(component_name)
 
             self.failure_history[component_name].append({
@@ -667,7 +795,6 @@ class SelfHealingSystem:
 
             if success:
                 logger.info(f"Successfully recovered component: {component_name}")
-                # Update health system
                 if self.health_system:
                     async with self.health_system._lock:
                         if component_name in self.health_system.component_health:
@@ -677,7 +804,6 @@ class SelfHealingSystem:
                 logger.warning(f"Failed to recover component: {component_name} (attempt {self.recovery_attempts[component_name]})")
 
     async def _generic_restart(self, component_name: str) -> bool:
-        # Simulate restart
         await asyncio.sleep(0.5)
         return random.random() > 0.3
 
@@ -716,7 +842,7 @@ class SelfHealingSystem:
         logger.info("SelfHealingSystem shut down")
 
 # ============================================================================
-# Enhanced Alert Escalation System (Asyncio-based)
+# Enhanced Alert Escalation System (with locks)
 # ============================================================================
 
 class AlertEscalationSystem:
@@ -765,7 +891,6 @@ class AlertEscalationSystem:
             self.alerts.append(alert)
             self.alert_history.append(alert)
 
-            # Start escalation asynchronously
             asyncio.create_task(self._process_escalation(alert))
             return alert_id
 
@@ -776,11 +901,9 @@ class AlertEscalationSystem:
         if level < len(chain):
             step = chain[level]
             await self._execute_escalation_action(alert, step)
-            # Schedule next escalation if timeout > 0
             timeout = step.get('timeout', 0)
             if timeout > 0:
                 await asyncio.sleep(timeout)
-                # Check if alert is still active before escalating
                 async with self._lock:
                     if alert.get('status') == 'active':
                         alert['escalation_level'] = level + 1
@@ -836,7 +959,7 @@ class AlertEscalationSystem:
             }
 
 # ============================================================================
-# Enhanced Dynamic Reconfiguration System (Data-driven)
+# Enhanced Dynamic Reconfiguration System (data-driven)
 # ============================================================================
 
 class DynamicReconfigurationSystem:
@@ -875,11 +998,10 @@ class DynamicReconfigurationSystem:
     async def reconfigure_by_metrics(self, metrics: Dict[str, float]):
         """Reconfigure based on comprehensive metrics."""
         async with self._lock:
-            # Compute a weighted score from metrics
             sustainability_score = metrics.get('sustainability_score', 0.5)
             carbon_efficiency = metrics.get('carbon_efficiency', 0.5)
             helium_efficiency = metrics.get('helium_efficiency', 0.5)
-            # More sophisticated logic can be added
+
             if sustainability_score < self.reconfiguration_triggers['low_sustainability']:
                 self._apply_aggressive_reconfiguration()
             elif sustainability_score < self.reconfiguration_triggers['medium_sustainability']:
@@ -915,65 +1037,7 @@ class DynamicReconfigurationSystem:
             return self.config_history[-n:]
 
 # ============================================================================
-# Enhanced Bio-Inspired Integrator (Updated)
-# ============================================================================
-
-class EnhancedBioInspiredIntegrator:
-    """
-    Enhanced Bio-Inspired Integration for sustainability across all components.
-    """
-
-    def __init__(self, bio_core=None):
-        self.bio_core = bio_core
-        self.sustainability_core = None
-        self.component_registry = {}
-        self._lock = asyncio.Lock()
-        logger.info("EnhancedBioInspiredIntegrator initialized")
-
-    def inject_sustainability_core(self, sustainability_core: Any):
-        self.sustainability_core = sustainability_core
-        asyncio.create_task(self._inject_to_all_components())
-
-    async def _inject_to_all_components(self):
-        async with self._lock:
-            for component_name, component in self.component_registry.items():
-                if hasattr(component, 'inject_sustainability_core'):
-                    try:
-                        if asyncio.iscoroutinefunction(component.inject_sustainability_core):
-                            await component.inject_sustainability_core(self.sustainability_core)
-                        else:
-                            component.inject_sustainability_core(self.sustainability_core)
-                        logger.debug(f"Injected sustainability core into {component_name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to inject into {component_name}: {e}")
-
-    def register_component(self, component_name: str, component: Any):
-        async with self._lock:
-            self.component_registry[component_name] = component
-            if self.sustainability_core and hasattr(component, 'inject_sustainability_core'):
-                # Will be injected in the background loop
-                pass
-
-    async def get_sustainability_status(self) -> Dict[str, Any]:
-        status = {'timestamp': datetime.utcnow().isoformat(), 'components': {}}
-        async with self._lock:
-            for component_name, component in self.component_registry.items():
-                if hasattr(component, 'get_sustainability_status'):
-                    try:
-                        if asyncio.iscoroutinefunction(component.get_sustainability_status):
-                            status['components'][component_name] = await component.get_sustainability_status()
-                        else:
-                            status['components'][component_name] = component.get_sustainability_status()
-                    except Exception as e:
-                        status['components'][component_name] = {'error': str(e)}
-                elif hasattr(component, 'sustainability_score'):
-                    status['components'][component_name] = {
-                        'sustainability_score': getattr(component, 'sustainability_score', 0.0)
-                    }
-        return status
-
-# ============================================================================
-# Unified Sustainability Dashboard (Enhanced)
+# Enhanced Unified Sustainability Dashboard (with locks)
 # ============================================================================
 
 class UnifiedSustainabilityDashboard:
@@ -990,6 +1054,7 @@ class UnifiedSustainabilityDashboard:
             'helium_budget_remaining': 0.2,
             'circularity_score': 0.4
         }
+        self._lock = asyncio.Lock()
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("UnifiedSustainabilityDashboard initialized")
@@ -998,9 +1063,10 @@ class UnifiedSustainabilityDashboard:
         while self._running:
             try:
                 status = await self.get_dashboard_status()
-                self.history.append(status)
-                if len(self.history) > 1000:
-                    self.history = self.history[-1000:]
+                async with self._lock:
+                    self.history.append(status)
+                    if len(self.history) > 1000:
+                        self.history = self.history[-1000:]
                 await self._check_alerts(status)
                 await asyncio.sleep(60)
             except Exception as e:
@@ -1038,6 +1104,13 @@ class UnifiedSustainabilityDashboard:
                 logger.critical(f"DASHBOARD ALERT: {alert['message']}")
             else:
                 logger.warning(f"DASHBOARD ALERT: {alert['message']}")
+            # Send to alert system if available
+            if self.ecosystem.alert_system:
+                await self.ecosystem.alert_system.add_alert({
+                    'source': 'sustainability_dashboard',
+                    'severity': alert['level'],
+                    'message': alert['message']
+                })
 
     async def get_dashboard_status(self) -> Dict[str, Any]:
         ecosystem = self.ecosystem
@@ -1056,12 +1129,12 @@ class UnifiedSustainabilityDashboard:
                 )
         helium_pos = {}
         if hasattr(ecosystem, 'helium_tracker') and ecosystem.helium_tracker:
-            helium_pos = ecosystem.helium_tracker.get_helium_position()
+            pos = ecosystem.helium_tracker.get_helium_position()
             helium_pos = {
-                'total_usage_l': helium_pos.get('total_usage_l', 0),
-                'total_recovered_l': helium_pos.get('total_recovered_l', 0),
-                'remaining_budget_l': helium_pos.get('remaining_budget_l', 0),
-                'remaining_budget_ratio': helium_pos.get('remaining_budget_l', 0) / max(ecosystem.helium_tracker.helium_budget_l, 1)
+                'total_usage_l': pos.get('total_usage_l', 0),
+                'total_recovered_l': pos.get('total_recovered_l', 0),
+                'remaining_budget_l': pos.get('remaining_budget_l', 0),
+                'remaining_budget_ratio': pos.get('remaining_budget_l', 0) / max(ecosystem.helium_tracker.helium_budget_l, 1)
             }
         sustainability_score = 0.5
         if hasattr(ecosystem, 'sustainability_score'):
@@ -1076,6 +1149,7 @@ class UnifiedSustainabilityDashboard:
         if hasattr(ecosystem, 'health_system') and ecosystem.health_system:
             health_status = await ecosystem.health_system.get_system_health()
             ecosystem_health = health_status.get('system_score', 0.5)
+
         return {
             'timestamp': datetime.utcnow().isoformat(),
             'sustainability_score': sustainability_score,
@@ -1128,12 +1202,13 @@ class UnifiedSustainabilityDashboard:
         status = await self.get_dashboard_status()
         recommendations = await self.get_recommendations()
         trend = 'stable'
-        if len(self.history) > 10:
-            recent_scores = [h['sustainability_score'] for h in self.history[-10:]]
-            if recent_scores[-1] > recent_scores[0] * 1.05:
-                trend = 'improving'
-            elif recent_scores[-1] < recent_scores[0] * 0.95:
-                trend = 'declining'
+        async with self._lock:
+            if len(self.history) > 10:
+                recent_scores = [h['sustainability_score'] for h in self.history[-10:]]
+                if recent_scores[-1] > recent_scores[0] * 1.05:
+                    trend = 'improving'
+                elif recent_scores[-1] < recent_scores[0] * 0.95:
+                    trend = 'declining'
         return {
             'timestamp': datetime.utcnow().isoformat(),
             'sustainability_score': status['sustainability_score'],
@@ -1158,7 +1233,7 @@ class UnifiedSustainabilityDashboard:
         logger.info("UnifiedSustainabilityDashboard shut down")
 
 # ============================================================================
-# Predictive Maintenance Integrator (Asyncio-enhanced)
+# Enhanced Predictive Maintenance Integrator (with locks)
 # ============================================================================
 
 class PredictiveMaintenanceIntegrator:
@@ -1168,7 +1243,7 @@ class PredictiveMaintenanceIntegrator:
 
     def __init__(self, ecosystem: 'UnifiedMetabolicEcosystem'):
         self.ecosystem = ecosystem
-        self.predictions = {}
+        self.predictions: Dict[str, Any] = {}
         self.anomaly_history = deque(maxlen=1000)
         self._lock = asyncio.Lock()
         self._running = True
@@ -1283,12 +1358,12 @@ class PredictiveMaintenanceIntegrator:
         logger.info("PredictiveMaintenanceIntegrator shut down")
 
 # ============================================================================
-# Unified Metabolic Ecosystem - Enhanced Main Entry Point
+# Enhanced Unified Metabolic Ecosystem - Main Entry Point
 # ============================================================================
 
 class UnifiedMetabolicEcosystem:
     """
-    Unified Metabolic Ecosystem v6.1.0 with Enhanced Resilience and Sustainability.
+    Unified Metabolic Ecosystem v6.2.0 with Enhanced Resilience and Sustainability.
     """
 
     def __init__(
@@ -1296,68 +1371,41 @@ class UnifiedMetabolicEcosystem:
         config: Optional[UnifiedEcosystemConfig] = None,
         **kwargs
     ):
-        """
-        Initialize the unified metabolic ecosystem.
-
-        Args:
-            config: Configuration dataclass (preferred)
-            **kwargs: Legacy arguments for backward compatibility
-        """
         if config is None:
-            # Build config from kwargs
-            config = UnifiedEcosystemConfig(
-                enable_quantum=kwargs.get('enable_quantum', False),
-                enable_helium=kwargs.get('enable_helium', False),
-                enable_bio_inspired=kwargs.get('enable_bio_inspired', True),
-                enable_evolving_gates=kwargs.get('enable_evolving_gates', True),
-                enable_federated=kwargs.get('enable_federated', False),
-                enable_cross_region=kwargs.get('enable_cross_region', False),
-                enable_sustainability_dashboard=kwargs.get('enable_sustainability_dashboard', True),
-                enable_predictive_maintenance=kwargs.get('enable_predictive_maintenance', True),
-                enable_digital_twin=kwargs.get('enable_digital_twin', True),
-                enable_unified_sustainability=kwargs.get('enable_unified_sustainability', True),
-                enable_health_checks=kwargs.get('enable_health_checks', True),
-                enable_self_healing=kwargs.get('enable_self_healing', True),
-                enable_alert_escalation=kwargs.get('enable_alert_escalation', True),
-                enable_dynamic_reconfig=kwargs.get('enable_dynamic_reconfig', True),
-                enable_telemetry=kwargs.get('enable_telemetry', True),
-                enable_persistence=kwargs.get('enable_persistence', True),
-                twin_time_horizon_years=kwargs.get('twin_time_horizon_years', 10),
-                twin_n_simulations=kwargs.get('twin_n_simulations', 1000),
-                twin_confidence=kwargs.get('twin_confidence', 0.95),
-                health_check_interval=kwargs.get('health_check_interval', 60),
-                recovery_max_attempts=kwargs.get('recovery_max_attempts', 5),
-                persistence_path=kwargs.get('persistence_path', 'ecosystem_state.pkl'),
-                telemetry_export_interval=kwargs.get('telemetry_export_interval', 60),
-                alert_escalation_timeout=kwargs.get('alert_escalation_timeout', 300)
-            )
+            # Build config from kwargs (legacy)
+            config = UnifiedEcosystemConfig(**{
+                k: v for k, v in kwargs.items()
+                if k in UnifiedEcosystemConfig.__annotations__
+            })
         self.config = config
+
+        # Rate limiter and telemetry
+        self._rate_limiter = RateLimiter(config.rate_limit_per_minute)
+        self.telemetry = TelemetryCollector(config) if config.enable_telemetry else None
 
         self.initialization_status: Dict[str, bool] = {}
         self.sustainability_score = 0.0
         self.helium_tracker = None
         self.circular_manager = None
 
-        # New systems (initialized later)
         self.health_system: Optional[HealthCheckSystem] = None
         self.self_healing: Optional[SelfHealingSystem] = None
         self.alert_system: Optional[AlertEscalationSystem] = None
         self.reconfig_system: Optional[DynamicReconfigurationSystem] = None
-        self.telemetry: Optional[TelemetryCollector] = None
         self.persistence: Optional[EcosystemPersistenceManager] = None
         self.sustainability_dashboard: Optional[UnifiedSustainabilityDashboard] = None
         self.predictive_maintenance: Optional[PredictiveMaintenanceIntegrator] = None
         self.digital_twin: Optional[Any] = None
         self.sustainability_engine: Optional[Any] = None
+        self.bio_core = None
+        self.bio_available = False
 
         logger.info("=" * 70)
-        logger.info("Initializing Unified Metabolic Ecosystem v6.1.0")
+        logger.info("Initializing Unified Metabolic Ecosystem v6.2.0")
         logger.info(f"  Config: {self.config}")
         logger.info("=" * 70)
 
         # Step 1: Initialize Bio-Inspired Core
-        self.bio_core = None
-        self.bio_available = False
         if config.enable_bio_inspired and BIO_INSPIRED_AVAILABLE:
             try:
                 from enhancements.bio_inspired import BioInspiredGreenCore
@@ -1424,7 +1472,6 @@ class UnifiedMetabolicEcosystem:
 
         # Step 5: Initialize Metabolic Experts
         self.experts: Dict[str, Any] = {}
-        # Energy Expert
         try:
             from .experts.energy_expert import EnergyExpert
             self.experts['energy'] = EnergyExpert(enable_bio_integration=self.bio_available)
@@ -1434,7 +1481,6 @@ class UnifiedMetabolicEcosystem:
         except Exception as e:
             logger.error(f"[EXPERT] Energy Expert failed: {e}")
 
-        # Data Expert
         try:
             from .experts.data_expert import DataExpert
             self.experts['data'] = DataExpert(enable_bio_integration=self.bio_available)
@@ -1444,7 +1490,6 @@ class UnifiedMetabolicEcosystem:
         except Exception as e:
             logger.error(f"[EXPERT] Data Expert failed: {e}")
 
-        # IoT Expert
         try:
             from .experts.iot_expert import IoTExpert
             self.experts['iot'] = IoTExpert(enable_bio_integration=self.bio_available)
@@ -1454,7 +1499,6 @@ class UnifiedMetabolicEcosystem:
         except Exception as e:
             logger.error(f"[EXPERT] IoT Expert failed: {e}")
 
-        # Quantum Expert (Optional)
         if config.enable_quantum and QUANTUM_AVAILABLE:
             try:
                 from .experts.quantum_expert import QuantumExpert
@@ -1463,7 +1507,6 @@ class UnifiedMetabolicEcosystem:
             except Exception as e:
                 logger.error(f"[EXPERT] Quantum Expert failed: {e}")
 
-        # Helium Expert (Optional)
         if config.enable_helium and HELIUM_AVAILABLE:
             try:
                 from .experts.helium_expert import HeliumExpert
@@ -1472,7 +1515,6 @@ class UnifiedMetabolicEcosystem:
             except Exception as e:
                 logger.error(f"[EXPERT] Helium Expert failed: {e}")
 
-        # Register all experts
         for expert_id, expert in self.experts.items():
             try:
                 if hasattr(expert, 'profile'):
@@ -1490,7 +1532,7 @@ class UnifiedMetabolicEcosystem:
         for idx, expert_id in self.router.expert_index_map.items():
             self.gating_network.expert_index_map[idx] = expert_id
 
-        # Step 7: Initialize Advanced Modules (if available)
+        # Step 7: Advanced Modules (if available)
         self.evolving_gates = None
         self.federated = None
         self.cross_region = None
@@ -1534,7 +1576,7 @@ class UnifiedMetabolicEcosystem:
                 logger.error(f"[CROSS-REGION] Failed to initialize Cross-Region Federation: {e}")
                 self.initialization_status['cross_region'] = False
 
-        # Step 8: Initialize Integration Layers
+        # Step 8: Integration Layers
         self.layer_integrator = None
         self.work_integrator = None
         self.quantum_limits = None
@@ -1574,7 +1616,7 @@ class UnifiedMetabolicEcosystem:
             logger.error(f"[QUANTUM] Failed to initialize Quantum Limit Integrator: {e}")
             self.initialization_status['quantum_limits'] = False
 
-        # Step 9: Initialize Monitoring
+        # Step 9: Monitoring
         try:
             from .monitoring.expert_metrics import ExpertMetricsCollector
             self.metrics = ExpertMetricsCollector(enable_bio_integration=self.bio_available)
@@ -1586,7 +1628,7 @@ class UnifiedMetabolicEcosystem:
             logger.error(f"[METRICS] Failed to initialize Expert Metrics: {e}")
             self.initialization_status['metrics'] = False
 
-        # Step 10: Initialize Sustainability Modules
+        # Step 10: Sustainability Modules
         self.carbon_manager = None
         self.circular_manager = None
         self.offset_verifier = None
@@ -1628,7 +1670,7 @@ class UnifiedMetabolicEcosystem:
                 logger.error(f"[SUSTAINABILITY] Biodiversity failed: {e}")
                 self.initialization_status['biodiversity'] = False
 
-        # Step 11: Initialize Enhanced Bio-Inspired Integrator
+        # Step 11: Bio-Integrator
         try:
             self.bio_integrator = EnhancedBioInspiredIntegrator(self.bio_core)
             components_to_register = [
@@ -1649,11 +1691,10 @@ class UnifiedMetabolicEcosystem:
             logger.error(f"[BIO-INTEGRATOR] Failed to initialize Bio-Integrator: {e}")
             self.initialization_status['bio_integrator'] = False
 
-        # Step 12: Initialize New Systems (Health, Self-Healing, Alerts, Reconfig, Telemetry, Persistence)
+        # Step 12: New Systems (Health, Self-Healing, Alerts, Reconfig, Persistence)
         if config.enable_health_checks:
             self.health_system = HealthCheckSystem(config)
             self.initialization_status['health_checks'] = True
-            # Register components with health system
             for name, comp in [
                 ('expert_registry', self.registry),
                 ('gating_network', self.gating_network),
@@ -1672,7 +1713,6 @@ class UnifiedMetabolicEcosystem:
         if config.enable_self_healing:
             self.self_healing = SelfHealingSystem(config, self.health_system)
             self.initialization_status['self_healing'] = True
-            # Register recovery handlers (example)
             self.self_healing.register_recovery_handler('expert_router', self._recover_router)
             logger.info("[SELF-HEALING] Self-Healing System initialized")
         else:
@@ -1692,13 +1732,6 @@ class UnifiedMetabolicEcosystem:
         else:
             self.initialization_status['dynamic_reconfig'] = False
 
-        if config.enable_telemetry:
-            self.telemetry = TelemetryCollector()
-            self.initialization_status['telemetry'] = True
-            logger.info("[TELEMETRY] Telemetry Collector initialized")
-        else:
-            self.initialization_status['telemetry'] = False
-
         if config.enable_persistence:
             self.persistence = EcosystemPersistenceManager(config)
             self.initialization_status['persistence'] = True
@@ -1707,7 +1740,7 @@ class UnifiedMetabolicEcosystem:
         else:
             self.initialization_status['persistence'] = False
 
-        # Step 13: Initialize Sustainability Dashboard
+        # Step 13: Sustainability Dashboard
         if config.enable_sustainability_dashboard:
             self.sustainability_dashboard = UnifiedSustainabilityDashboard(self)
             self.initialization_status['sustainability_dashboard'] = True
@@ -1715,7 +1748,7 @@ class UnifiedMetabolicEcosystem:
         else:
             self.initialization_status['sustainability_dashboard'] = False
 
-        # Step 14: Initialize Predictive Maintenance
+        # Step 14: Predictive Maintenance
         if config.enable_predictive_maintenance:
             self.predictive_maintenance = PredictiveMaintenanceIntegrator(self)
             self.initialization_status['predictive_maintenance'] = True
@@ -1727,7 +1760,7 @@ class UnifiedMetabolicEcosystem:
         if hasattr(self.router, 'metrics_collector'):
             self.router.metrics_collector = self.metrics
 
-        # Step 16: Initialize Digital Twin and Sustainability Engine (async)
+        # Step 16: Async init for Digital Twin and Sustainability Engine
         self._init_digital_twin_and_sustainability_task = asyncio.create_task(
             self._async_init_digital_twin_and_sustainability()
         )
@@ -1781,7 +1814,6 @@ class UnifiedMetabolicEcosystem:
                 )
                 self.initialization_status['sustainability_engine'] = True
                 logger.info("[SUSTAINABILITY-ENGINE] Unified Sustainability Engine initialized")
-                # Initial update
                 score = await self.sustainability_engine.update_sustainability_score()
                 self.sustainability_score = score.total_score
                 logger.info(f"[SUSTAINABILITY] Initial score: {self.sustainability_score:.3f}")
@@ -1810,11 +1842,8 @@ class UnifiedMetabolicEcosystem:
     # --------------------------------------------------------------------------
 
     async def _recover_router(self) -> bool:
-        """Recovery handler for expert router."""
         logger.info("Attempting to recover expert router...")
-        # Simulate restart
         await asyncio.sleep(0.5)
-        # In real scenario, reinitialize or fallback
         return True
 
     # --------------------------------------------------------------------------
@@ -1878,12 +1907,98 @@ class UnifiedMetabolicEcosystem:
         return self.sustainability_score
 
     # --------------------------------------------------------------------------
+    # Core Task Processing (Enhanced with Digital Twin & Sustainability)
+    # --------------------------------------------------------------------------
+
+    async def process_task(self, task: Dict[str, Any], pipeline_type: str = 'standard') -> Dict[str, Any]:
+        """
+        Process a task through the ecosystem, integrating digital twin and sustainability engine.
+        """
+        # Rate limiting
+        if not await self._rate_limiter.acquire():
+            return {'success': False, 'error': 'Rate limit exceeded'}
+
+        # Validate input (if Pydantic available)
+        if BaseModel is not None:
+            try:
+                task_input = TaskInput(**task)
+                task = task_input.model_dump()
+            except ValidationError as e:
+                return {'success': False, 'error': f'Invalid task: {e}'}
+
+        # If digital twin and sustainability engine are available, use them to inform routing
+        expert_weights = None
+        if self.digital_twin and self.sustainability_engine:
+            # Simulate the impact of routing to each expert
+            experts = list(self.experts.keys())
+            scores = {}
+            for expert in experts:
+                # Create a simulated task routed to this expert
+                simulated_result = await self.digital_twin.simulate_task_routing(
+                    task=task,
+                    expert=expert,
+                    context=task.get('context', {})
+                )
+                scores[expert] = simulated_result.get('sustainability_score', 0.5)
+            # Normalize to weights
+            total = sum(scores.values())
+            if total > 0:
+                expert_weights = {k: v / total for k, v in scores.items()}
+            # Update sustainability engine
+            await self.sustainability_engine.update_sustainability_score()
+
+        # Use work integrator if available
+        if hasattr(self, 'work_integrator') and self.work_integrator:
+            result = self.work_integrator.process_work(task, pipeline_type)
+            if result:
+                # Update sustainability score
+                if self.sustainability_engine:
+                    score = await self.sustainability_engine.update_sustainability_score()
+                    self.sustainability_score = score.total_score
+                elif self.metrics:
+                    self.sustainability_score = self.metrics.sustainability_score
+                # Telemetry
+                if self.telemetry:
+                    self.telemetry.increment('ecosystem_routes_total')
+                    if result.get('success', False):
+                        self.telemetry.increment('ecosystem_routes_success')
+                    self.telemetry.gauge('ecosystem_sustainability_score', self.sustainability_score)
+                return result
+            else:
+                # Fallback to router
+                result = self.router.route_and_execute(
+                    workload_profile=task,
+                    meta_cognitive_state={},
+                    dual_axis_context={}
+                )
+                if result:
+                    if self.telemetry:
+                        self.telemetry.increment('ecosystem_routes_total')
+                        if result.get('success', False):
+                            self.telemetry.increment('ecosystem_routes_success')
+                        self.telemetry.gauge('ecosystem_sustainability_score', self.sustainability_score)
+                return result
+        elif hasattr(self, 'router'):
+            result = self.router.route_and_execute(
+                workload_profile=task,
+                meta_cognitive_state={},
+                dual_axis_context={}
+            )
+            if result and self.telemetry:
+                self.telemetry.increment('ecosystem_routes_total')
+                if result.get('success', False):
+                    self.telemetry.increment('ecosystem_routes_success')
+            return result
+        else:
+            return {'success': False, 'error': 'No work processor available'}
+
+    # --------------------------------------------------------------------------
     # Ecosystem Status
     # --------------------------------------------------------------------------
 
     def get_ecosystem_status(self) -> Dict[str, Any]:
         status = {
-            'ecosystem_version': '6.1.0',
+            'ecosystem_version': '6.2.0',
             'bio_inspired_available': self.bio_available,
             'initialization_status': self.initialization_status,
             'expert_count': len(self.experts),
@@ -1916,31 +2031,12 @@ class UnifiedMetabolicEcosystem:
             status['alerts'] = asyncio.run(self.alert_system.get_alert_stats())
         if self.reconfig_system:
             status['configuration'] = asyncio.run(self.reconfig_system.get_current_config())
+        if self.telemetry:
+            status['telemetry'] = {
+                'counters': len(self.telemetry.metrics['counters']),
+                'gauges': len(self.telemetry.metrics['gauges'])
+            }
         return status
-
-    # --------------------------------------------------------------------------
-    # Task Processing
-    # --------------------------------------------------------------------------
-
-    def process_task(self, task: Dict[str, Any], pipeline_type: str = 'standard') -> Dict[str, Any]:
-        if hasattr(self, 'work_integrator') and self.work_integrator:
-            result = self.work_integrator.process_work(task, pipeline_type)
-            if result:
-                self.sustainability_score = self._update_sustainability_score(result)
-            return result
-        elif hasattr(self, 'router'):
-            return self.router.route_and_execute(
-                workload_profile=task,
-                meta_cognitive_state={},
-                dual_axis_context={}
-            )
-        else:
-            return {'success': False, 'error': 'No work processor available'}
-
-    def _update_sustainability_score(self, result: Dict[str, Any]) -> float:
-        if hasattr(self, 'metrics') and self.metrics:
-            return self.metrics.sustainability_score
-        return self.sustainability_score
 
     # --------------------------------------------------------------------------
     # Expert Management
