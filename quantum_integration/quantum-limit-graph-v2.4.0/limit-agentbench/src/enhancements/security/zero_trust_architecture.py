@@ -1,15 +1,25 @@
+#!/usr/bin/env python3
 """
-Zero Trust Security Architecture for Green Agent v3.0.0
+Zero Trust Security Architecture for Green Agent v3.1.0
 Implements complete zero-trust security model for expert routing and execution.
-ENHANCED WITH: Configuration Dataclass, Persistence, Telemetry, Health Checks,
-Improved Price Forecasting, Robust Online Learning, Retry and Circuit Breaker,
-Carbon Price Awareness, Helium Price Forecasting, Adaptive Rate Limiting,
-Immutable Ledger Integration.
+ENHANCED WITH: Secure JSON persistence, fine-grained concurrency controls,
+unified circuit breaker (half-open), Prometheus telemetry, thread-offloaded ML training,
+configuration validation, and full type hints.
+
+Features:
+- Carbon-aware authentication & authorization
+- Helium efficiency tracking
+- Predictive risk analysis (online SGD with persistence)
+- Adaptive rate limiting
+- Immutable ledger for audit integrity
+- Sustainability dashboard
+- Health checks
+- Telemetry (Prometheus)
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, Protocol
+from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
@@ -25,19 +35,50 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import jwt
 import numpy as np
 from collections import deque, defaultdict
-import aiohttp
 import os
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import SGDRegressor
 from sklearn.metrics import r2_score, mean_absolute_error
-import pickle
-import zlib
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+# Optional dependencies
+try:
+    import aiofiles
+except ImportError:
+    aiofiles = None
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+except ImportError:
+    # Dummy retry decorator
+    def retry(*args, **kwargs):
+        return lambda f: f
+    stop_after_attempt = lambda x: None
+    wait_exponential = lambda **k: None
+    retry_if_exception_type = lambda e: None
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
+    from pydantic import BaseModel, Field, ValidationError
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration Dataclass (NEW)
+# Configuration with Validation
 # ============================================================================
 
 @dataclass
@@ -72,14 +113,15 @@ class ZeroTrustConfig:
     max_retries: int = 3
     retry_base_delay_ms: float = 100.0
     retry_max_delay_ms: float = 5000.0
-    circuit_breaker_threshold: int = 5
+    circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout: float = 30.0
 
     # Persistence
-    persistence_path: str = "zero_trust_state.pkl"
+    persistence_path: str = "zero_trust_state.json.gz"
 
     # Telemetry
     telemetry_export_interval: int = 60
+    prometheus_port: Optional[int] = None  # if set, start HTTP server
 
     # Rate limiting
     base_rate_limits: Dict[str, int] = field(default_factory=lambda: {
@@ -96,47 +138,170 @@ class ZeroTrustConfig:
         'critical': 0.1
     })
 
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        if self.carbon_update_interval < 10:
+            raise ValueError("carbon_update_interval must be >= 10")
+        if self.helium_budget_l < 0:
+            raise ValueError("helium_budget_l must be >= 0")
+        if self.carbon_price_forecast_window < 5:
+            raise ValueError("carbon_price_forecast_window must be >= 5")
+        if self.helium_price_forecast_window < 5:
+            raise ValueError("helium_price_forecast_window must be >= 5")
+        if self.predictive_history_window < 10:
+            raise ValueError("predictive_history_window must be >= 10")
+        if self.predictive_online_learning_rate <= 0:
+            raise ValueError("predictive_online_learning_rate must be > 0")
+        if self.predictive_retrain_threshold < 10:
+            raise ValueError("predictive_retrain_threshold must be >= 10")
+        if self.circuit_breaker_failure_threshold < 1:
+            raise ValueError("circuit_breaker_failure_threshold must be >= 1")
+        if self.circuit_breaker_recovery_timeout < 0:
+            raise ValueError("circuit_breaker_recovery_timeout must be >= 0")
+        if self.telemetry_export_interval < 1:
+            raise ValueError("telemetry_export_interval must be >= 1")
+        if self.prometheus_port is not None and self.prometheus_port < 1024:
+            raise ValueError("prometheus_port must be >= 1024 or None")
+
 # ============================================================================
-# Retry Helper (NEW)
+# Circuit Breaker with Half-Open State
 # ============================================================================
 
-async def retry_async(
-    func: Callable,
-    max_retries: int,
-    base_delay_ms: float,
-    max_delay_ms: float,
-    *args,
-    **kwargs
-) -> Any:
-    """Retry an async function with exponential backoff."""
-    for attempt in range(max_retries):
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class CircuitBreaker:
+    """Circuit breaker with half-open state for external calls."""
+    def __init__(self, failure_threshold: int, recovery_timeout: float):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute the given async function with circuit breaker protection."""
+        async with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if self.last_failure_time:
+                    elapsed = (datetime.utcnow() - self.last_failure_time).total_seconds()
+                    if elapsed >= self.recovery_timeout:
+                        self.state = CircuitBreakerState.HALF_OPEN
+                        self.failure_count = 0
+                        logger.info("Circuit breaker entered HALF_OPEN state")
+                    else:
+                        raise RuntimeError(f"Circuit breaker OPEN (recovery in {self.recovery_timeout - elapsed:.1f}s)")
+                else:
+                    raise RuntimeError("Circuit breaker OPEN (no failure time)")
+
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
+            async with self._lock:
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+                    logger.info("Circuit breaker closed after successful half-open call")
+                elif self.state == CircuitBreakerState.CLOSED:
+                    self.failure_count = 0
+            return result
         except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
-            await asyncio.sleep(delay)
-    raise RuntimeError("Max retries exceeded")
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = datetime.utcnow()
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.OPEN
+                    logger.warning(f"Circuit breaker opened due to failure in half-open state: {e}")
+                elif self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+                    logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+            raise e
+
+    @property
+    def is_open(self) -> bool:
+        return self.state == CircuitBreakerState.OPEN
+
+    async def reset(self):
+        async with self._lock:
+            self.state = CircuitBreakerState.CLOSED
+            self.failure_count = 0
+            self.last_failure_time = None
+            logger.info("Circuit breaker manually reset")
 
 # ============================================================================
-# Telemetry Collector (NEW)
+# Retry Helper (using tenacity if available)
+# ============================================================================
+
+def is_retryable_exception(e: Exception) -> bool:
+    """Check if an exception is retryable."""
+    return isinstance(e, (IOError, TimeoutError, ConnectionError, aiohttp.ClientError))
+
+# Use tenacity if available, else custom
+if 'retry' in globals() and stop_after_attempt and wait_exponential:
+    retry_decorator = retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(is_retryable_exception)
+    )
+else:
+    def retry_decorator(func):
+        async def wrapper(*args, **kwargs):
+            for attempt in range(3):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
+            raise RuntimeError("Max retries exceeded")
+        return wrapper
+
+# ============================================================================
+# Telemetry Collector (Prometheus)
 # ============================================================================
 
 class ZeroTrustTelemetry:
     """Collects telemetry for the zero trust architecture."""
 
-    def __init__(self):
+    def __init__(self, config: ZeroTrustConfig):
+        self.config = config
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
+        self._prometheus_metrics = None
+        if PROMETHEUS_AVAILABLE and config.prometheus_port:
+            self._setup_prometheus()
+            self._start_prometheus_server()
+
+    def _setup_prometheus(self):
+        self._prometheus_metrics = {
+            'zt_authentications_total': Counter('zt_authentications_total', 'Total authentications'),
+            'zt_authorizations_total': Counter('zt_authorizations_total', 'Total authorizations'),
+            'zt_security_violations': Gauge('zt_security_violations', 'Current security violations'),
+            'zt_risk_score': Gauge('zt_risk_score', 'Current risk score'),
+            'zt_carbon_intensity': Gauge('zt_carbon_intensity', 'Current carbon intensity (gCO2/kWh)'),
+            'zt_helium_remaining_l': Gauge('zt_helium_remaining_l', 'Remaining helium budget (L)'),
+            'zt_sustainability_score': Gauge('zt_sustainability_score', 'Overall sustainability score'),
+        }
+
+    def _start_prometheus_server(self):
+        start_http_server(self.config.prometheus_port)
+        logger.info(f"Prometheus metrics server started on port {self.config.prometheus_port}")
 
     def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None, value: float = 1.0):
         key = self._make_key(metric_name, tags)
         self.metrics['counters'][key] += value
+        if self._prometheus_metrics and metric_name in self._prometheus_metrics:
+            if isinstance(self._prometheus_metrics[metric_name], Counter):
+                self._prometheus_metrics[metric_name].inc(value)
 
     def gauge(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
         key = self._make_key(metric_name, tags)
         self.metrics['gauges'][key] = value
+        if self._prometheus_metrics and metric_name in self._prometheus_metrics:
+            if isinstance(self._prometheus_metrics[metric_name], Gauge):
+                self._prometheus_metrics[metric_name].set(value)
 
     def histogram(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
         key = self._make_key(metric_name, tags)
@@ -153,7 +318,9 @@ class ZeroTrustTelemetry:
         return metric_name
 
     async def export(self) -> str:
-        # Prometheus text format
+        if PROMETHEUS_AVAILABLE and self.config.prometheus_port:
+            return generate_latest().decode('utf-8')
+        # Fallback text format
         output = []
         for key, value in self.metrics['counters'].items():
             output.append(f"# TYPE {key} counter\n{key} {value}")
@@ -170,39 +337,52 @@ class ZeroTrustTelemetry:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Persistence Manager (NEW)
+# Persistence Manager (JSON + zlib + async I/O)
 # ============================================================================
 
 class ZeroTrustPersistenceManager:
-    """Saves and loads the zero trust architecture state."""
+    """Saves and loads the zero trust architecture state using JSON + compression."""
 
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
         logger.info(f"ZeroTrustPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, zta: 'ZeroTrustArchitecture') -> bool:
+        """Save the zero trust state to disk."""
         async with self._lock:
             try:
                 state = {
+                    'version': '3.1.0',
                     'identities': zta.identities,
                     'role_assignments': zta.role_assignments,
                     'access_policies': zta.access_policies,
                     'active_sessions': zta.active_sessions,
-                    'audit_log': zta.audit_log,
-                    'security_events': zta.security_events,
+                    'audit_log': zta.audit_log[-5000:],  # keep recent
+                    'security_events': zta.security_events[-1000:],
                     'carbon_price_history': list(zta.carbon_manager.price_history) if zta.carbon_manager else [],
                     'helium_price_history': list(zta.helium_tracker.price_history) if zta.helium_tracker else [],
                     'sustainability_score': zta.sustainability_score,
                     'total_carbon_savings_kg': zta.total_carbon_savings_kg,
                     'rate_limits': zta.rate_limits,
                     'ledger_chain': zta.ledger.chain if zta.ledger else [],
+                    # Predictive model state
+                    'predictive_model_version': zta.predictive_analyzer.model_version if zta.predictive_analyzer else 0,
+                    'predictive_model_weights': zta.predictive_analyzer._serialize_model() if zta.predictive_analyzer else {},
                 }
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
+                json_str = json.dumps(state, default=str, indent=2)
+                compressed = zlib.compress(json_str.encode('utf-8'))
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'wb') as f:
+                        await f.write(compressed)
+                else:
+                    with open(self.path, 'wb') as f:
+                        f.write(compressed)
                 logger.info(f"Zero trust state saved to {self.path}")
                 return True
             except Exception as e:
@@ -210,16 +390,27 @@ class ZeroTrustPersistenceManager:
                 return False
 
     async def load_state(self, zta: 'ZeroTrustArchitecture') -> bool:
+        """Load the zero trust state from disk."""
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
                 return False
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'rb') as f:
+                        compressed = await f.read()
+                else:
+                    with open(self.path, 'rb') as f:
+                        compressed = f.read()
+                json_str = zlib.decompress(compressed).decode('utf-8')
+                state = json.loads(json_str)
 
+                # Version check
+                version = state.get('version', '1.0.0')
+                if version != '3.1.0':
+                    logger.warning(f"State version mismatch: {version} != 3.1.0; attempting to load anyway")
+
+                # Restore state
                 zta.identities = state.get('identities', {})
                 zta.role_assignments = state.get('role_assignments', {})
                 zta.access_policies = state.get('access_policies', {})
@@ -235,6 +426,9 @@ class ZeroTrustPersistenceManager:
                 zta.rate_limits = state.get('rate_limits', {})
                 if zta.ledger:
                     zta.ledger.chain = state.get('ledger_chain', [])
+                if zta.predictive_analyzer:
+                    zta.predictive_analyzer.model_version = state.get('predictive_model_version', 0)
+                    zta.predictive_analyzer._deserialize_model(state.get('predictive_model_weights', {}))
 
                 logger.info(f"Zero trust state loaded from {self.path}")
                 return True
@@ -245,13 +439,16 @@ class ZeroTrustPersistenceManager:
     async def delete_state(self):
         async with self._lock:
             if os.path.exists(self.path):
-                os.remove(self.path)
+                if aiofiles:
+                    await aiofiles.os.remove(self.path)
+                else:
+                    os.remove(self.path)
                 logger.info(f"Persistence file {self.path} deleted")
                 return True
             return False
 
 # ============================================================================
-# Carbon Intensity Manager (Enhanced with retry, circuit breaker, and better forecasting)
+# Carbon Intensity Manager (Enhanced with unified circuit breaker)
 # ============================================================================
 
 class CarbonIntensityManager:
@@ -262,9 +459,9 @@ class CarbonIntensityManager:
         self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
         self.region = config.carbon_api_region
         self.carbon_intensity = 0.0
-        self.last_update = None
+        self.last_update: Optional[datetime] = None
         self._lock = asyncio.Lock()
-        self._session = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self.update_interval = config.carbon_update_interval
         self.cache = {}
         self.historical_intensities = deque(maxlen=1000)
@@ -272,10 +469,10 @@ class CarbonIntensityManager:
         self.total_carbon_savings_kg = 0.0
         self.carbon_price_usd_per_ton = 50.0
         self.price_history = deque(maxlen=1000)
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
-        self.max_retries = config.max_retries
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
 
         # Regional profiles for fallback
         self.region_profiles = {
@@ -293,70 +490,54 @@ class CarbonIntensityManager:
 
         logger.info("Carbon Intensity Manager initialized with improved forecasting")
 
-    async def _get_session(self):
+    async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
         """Fetch real-time carbon intensity with retry and circuit breaker."""
+
+        async def _do_fetch():
+            session = await self._get_session()
+            url = f"{self.endpoint}/latest?zone={self.region}"
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status != 200:
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=f"API returned {response.status}"
+                    )
+                data = await response.json()
+                return data.get('carbonIntensity',
+                              self.region_profiles.get(self.region, {}).get('base_intensity', 400))
+
         if region is not None:
             self.region = region
-
-        # Circuit breaker check
-        if self.circuit_open:
-            if datetime.utcnow() < self.circuit_open_until:
-                logger.warning("Circuit breaker open, using fallback")
-                return self._get_fallback_response()
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
 
         cache_key = f"{self.region}_{datetime.utcnow().hour}"
         if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.update_interval:
             return self.cache[cache_key]
 
-        for attempt in range(self.max_retries):
-            try:
-                session = await self._get_session()
-                url = f"{self.endpoint}/latest?zone={self.region}"
-                headers = {'auth-token': self.api_key} if self.api_key else {}
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self.carbon_intensity = data.get('carbonIntensity', 
-                            self.region_profiles.get(self.region, {}).get('base_intensity', 400))
-                        self.last_update = datetime.now()
-                        self.cache[cache_key] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
-                        self.historical_intensities.append(self.carbon_intensity)
-                        self._update_carbon_price(self.carbon_intensity)
-                        self.failure_count = 0
-                        logger.info(f"Carbon intensity updated: {self.region} = {self.carbon_intensity} gCO2/kWh")
-                        return {'intensity': self.carbon_intensity, 'region': self.region}
-                    else:
-                        logger.warning(f"Carbon API returned {response.status}, attempt {attempt+1}")
-                        if attempt == self.max_retries - 1:
-                            self.failure_count += 1
-                            if self.failure_count >= self.config.circuit_breaker_threshold:
-                                self.circuit_open = True
-                                self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                            return self._get_fallback_response()
-                        await asyncio.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
-                if attempt == self.max_retries - 1:
-                    self.failure_count += 1
-                    if self.failure_count >= self.config.circuit_breaker_threshold:
-                        self.circuit_open = True
-                        self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                    return self._get_fallback_response()
-                await asyncio.sleep(2 ** attempt)
-
-        return self._get_fallback_response()
+        try:
+            intensity = await self._circuit_breaker.call(_do_fetch)
+            self.carbon_intensity = intensity
+            self.last_update = datetime.utcnow()
+            self.cache[cache_key] = {'intensity': intensity, 'timestamp': self.last_update}
+            self.historical_intensities.append(intensity)
+            self._update_carbon_price(intensity)
+            logger.info(f"Carbon intensity updated: {self.region} = {intensity} gCO2/kWh")
+            return {'intensity': intensity, 'region': self.region}
+        except Exception as e:
+            logger.warning(f"Carbon API error: {e}, using fallback")
+            fallback = self._get_fallback_response()
+            return fallback
 
     def _get_fallback_response(self) -> Dict:
         self.carbon_intensity = self.region_profiles.get(self.region, {}).get('base_intensity', 400)
-        self.last_update = datetime.now()
+        self.last_update = datetime.utcnow()
         self._update_carbon_price(self.carbon_intensity)
         return {'intensity': self.carbon_intensity, 'region': self.region, 'is_fallback': True}
 
@@ -369,6 +550,16 @@ class CarbonIntensityManager:
             'timestamp': self.last_update.isoformat() if self.last_update else None,
             'price': self.carbon_price_usd_per_ton
         })
+
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+
+    async def get_current_carbon_price(self) -> float:
+        if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.update_interval:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_price_usd_per_ton
 
     async def forecast_carbon_prices(self, hours: int = 24) -> Dict[str, Any]:
         """Forecast carbon prices using exponential smoothing."""
@@ -419,7 +610,7 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Helium Security Tracker (Enhanced with better forecasting)
+# Helium Security Tracker (Enhanced)
 # ============================================================================
 
 class HeliumSecurityTracker:
@@ -428,8 +619,8 @@ class HeliumSecurityTracker:
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.helium_budget_l = config.helium_budget_l
-        self.helium_usage: Dict[str, float] = {}
-        self.operation_helium: Dict[str, float] = {}
+        self.helium_usage: Dict[str, float] = defaultdict(float)
+        self.operation_helium: Dict[str, float] = defaultdict(float)
         self.total_usage_l = 0.0
         self._lock = asyncio.Lock()
         self.history = deque(maxlen=10000)
@@ -507,7 +698,7 @@ class HeliumSecurityTracker:
             'total_usage_l': self.total_usage_l,
             'remaining_budget_l': self.helium_budget_l - self.total_usage_l,
             'operation_efficiencies': self.operation_efficiency,
-            'operation_usage': self.operation_helium,
+            'operation_usage': dict(self.operation_helium),
             'current_price_usd_per_l': self.helium_price_usd_per_l,
             'status': 'critical' if self.total_usage_l > self.helium_budget_l * 0.8 else 'healthy'
         }
@@ -518,7 +709,7 @@ class HeliumSecurityTracker:
         return saved
 
 # ============================================================================
-# Predictive Security Analyzer (Enhanced with SGDRegressor online learning)
+# Predictive Security Analyzer (Enhanced with thread offloading and persistence)
 # ============================================================================
 
 class PredictiveSecurityAnalyzer:
@@ -534,8 +725,9 @@ class PredictiveSecurityAnalyzer:
         self.model_version = 0
         self.samples_since_last_train = 0
         self.retrain_threshold = config.predictive_retrain_threshold
-        self.model = None
+        self.model: Optional[SGDRegressor] = None
         self._ml_available = False
+        self._executor = ThreadPoolExecutor(max_workers=1)
         self._init_model()
 
     def _init_model(self):
@@ -553,6 +745,24 @@ class PredictiveSecurityAnalyzer:
         except ImportError:
             logger.warning("SGDRegressor not available; using fallback moving average")
 
+    def _serialize_model(self) -> Dict:
+        """Serialize model weights for persistence."""
+        if not self._ml_available or self.model is None:
+            return {}
+        return {
+            'coef_': self.model.coef_.tolist() if hasattr(self.model, 'coef_') else [],
+            'intercept_': self.model.intercept_.tolist() if hasattr(self.model, 'intercept_') else 0.0,
+        }
+
+    def _deserialize_model(self, weights: Dict):
+        """Deserialize model weights from persistence."""
+        if not self._ml_available or self.model is None or not weights:
+            return
+        if 'coef_' in weights:
+            self.model.coef_ = np.array(weights['coef_'])
+        if 'intercept_' in weights:
+            self.model.intercept_ = np.array(weights['intercept_'])
+
     def update_history(self, security_data: Dict):
         self.security_history.append({
             'timestamp': datetime.utcnow(),
@@ -562,9 +772,7 @@ class PredictiveSecurityAnalyzer:
             'violation_count': security_data.get('violation_count', 0),
             'request_volume': security_data.get('request_volume', 100)
         })
-
         self.samples_since_last_train += 1
-
         if self.samples_since_last_train >= self.retrain_threshold and self.is_trained and self._ml_available:
             asyncio.create_task(self._online_learning_update())
 
@@ -574,8 +782,11 @@ class PredictiveSecurityAnalyzer:
             if len(recent_data) > 10:
                 X, y = self._prepare_training_data(recent_data)
                 if len(X) > 0:
-                    X_scaled = self.scaler.transform(X)
-                    self.model.partial_fit(X_scaled, y)
+                    def train():
+                        X_scaled = self.scaler.transform(X)
+                        self.model.partial_fit(X_scaled, y)
+                        return True
+                    await asyncio.to_thread(train)
                     self.model_version += 1
                     self.samples_since_last_train = 0
                     logger.info(f"Online learning update complete (version {self.model_version})")
@@ -585,10 +796,8 @@ class PredictiveSecurityAnalyzer:
     def _prepare_training_data(self, data: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
         X = []
         y = []
-
         if len(data) < 5:
             return np.array(X), np.array(y)
-
         for i in range(len(data) - 1):
             features = [
                 data[i]['threat_level'],
@@ -599,26 +808,25 @@ class PredictiveSecurityAnalyzer:
             ]
             X.append(features)
             y.append(data[i + 1]['threat_level'])
-
         return np.array(X), np.array(y)
 
     async def train_prediction_model(self):
         if not self._ml_available or len(self.security_history) < 10:
             return {'status': 'insufficient_data', 'samples': len(self.security_history)}
-
         X, y = self._prepare_training_data(list(self.security_history))
-
         if len(X) < 10:
             return {'status': 'insufficient_training_data', 'samples': len(X)}
 
-        X_scaled = self.scaler.fit_transform(X)
-        for _ in range(5):
-            self.model.partial_fit(X_scaled, y)
+        def train():
+            X_scaled = self.scaler.fit_transform(X)
+            for _ in range(5):
+                self.model.partial_fit(X_scaled, y)
+            return True
 
+        await asyncio.to_thread(train)
         self.is_trained = True
         self.model_version += 1
         self.samples_since_last_train = 0
-
         # Compute R2 for diagnostics
         pred = self.model.predict(X_scaled)
         r2 = r2_score(y, pred) if len(y) > 5 else 0.0
@@ -639,13 +847,15 @@ class PredictiveSecurityAnalyzer:
                 data['violation_count'] / 10,
                 data['request_volume'] / 1000
             ])
-
         features = np.array(features).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
 
-        prediction = self.model.predict(features_scaled)[0]
+        def predict():
+            features_scaled = self.scaler.transform(features)
+            pred = self.model.predict(features_scaled)[0]
+            return pred
+
+        prediction = await asyncio.to_thread(predict)
         confidence = 0.7 if len(self.security_history) > 50 else 0.5
-
         return {
             'predicted_risk': max(0.0, min(1.0, prediction)),
             'confidence': confidence,
@@ -656,7 +866,6 @@ class PredictiveSecurityAnalyzer:
     def _calculate_trend(self) -> str:
         if len(self.security_history) < 10:
             return 'stable'
-
         recent = list(self.security_history)[-10:]
         risks = [h['risk_score'] for h in recent]
         if len(risks) > 5:
@@ -670,16 +879,13 @@ class PredictiveSecurityAnalyzer:
     async def forecast_security_threats(self, hours: int = 24) -> Dict:
         if len(self.security_history) < 10:
             return {'forecast': [], 'confidence': 0.0}
-
         recent = list(self.security_history)[-20:]
         threat_levels = [h['threat_level'] for h in recent]
-
         if len(threat_levels) > 5:
             slope = np.polyfit(range(len(threat_levels)), threat_levels, 1)[0]
             forecast = [threat_levels[-1] + slope * i for i in range(12)]
         else:
             forecast = [threat_levels[-1]] * 12
-
         return {
             'forecast': [max(0.0, min(1.0, v)) for v in forecast],
             'trend': 'increasing' if slope > 0.01 else 'decreasing' if slope < -0.01 else 'stable',
@@ -706,6 +912,9 @@ class PredictiveSecurityAnalyzer:
             'online_learning_rate': self.online_learning_rate,
             'ml_available': self._ml_available,
         }
+
+    async def close(self):
+        self._executor.shutdown(wait=True)
 
 # ============================================================================
 # Immutable Security Ledger (Preserved)
@@ -780,7 +989,7 @@ class ImmutableSecurityLedger:
         }
 
 # ============================================================================
-# Adaptive Rate Limiter (Enhanced with config)
+# Adaptive Rate Limiter (Enhanced)
 # ============================================================================
 
 class AdaptiveRateLimiter:
@@ -788,19 +997,18 @@ class AdaptiveRateLimiter:
 
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
-        self.rate_limits = {}
+        self.rate_limits: Dict[str, Dict] = {}
         self.threat_multipliers = config.threat_multipliers
         self.base_limits = config.base_rate_limits
         self.threat_history = deque(maxlen=100)
+        self._lock = asyncio.Lock()
         logger.info("Adaptive Rate Limiter initialized")
 
     def get_current_threat_multiplier(self) -> float:
         if not self.threat_history:
             return 1.0
-
         recent = list(self.threat_history)[-10:]
         avg_threat = np.mean(recent)
-
         if avg_threat > 0.7:
             return self.threat_multipliers['critical']
         elif avg_threat > 0.5:
@@ -822,23 +1030,20 @@ class AdaptiveRateLimiter:
     def update_threat_level(self, threat_level: float):
         self.threat_history.append(threat_level)
 
-    def check_rate_limit(self, identity_id: str, action: str, threat_level: float = 0.3) -> bool:
-        key = f"{identity_id}:{action}"
-        limit = self.get_rate_limit(action, threat_level)
-
-        if key not in self.rate_limits:
-            self.rate_limits[key] = {'count': 0, 'reset_at': datetime.utcnow() + timedelta(minutes=1)}
-
-        limit_info = self.rate_limits[key]
-        if datetime.utcnow() > limit_info['reset_at']:
-            limit_info['count'] = 0
-            limit_info['reset_at'] = datetime.utcnow() + timedelta(minutes=1)
-
-        if limit_info['count'] >= limit:
-            return False
-
-        limit_info['count'] += 1
-        return True
+    async def check_rate_limit(self, identity_id: str, action: str, threat_level: float = 0.3) -> bool:
+        async with self._lock:
+            key = f"{identity_id}:{action}"
+            limit = self.get_rate_limit(action, threat_level)
+            if key not in self.rate_limits:
+                self.rate_limits[key] = {'count': 0, 'reset_at': datetime.utcnow() + timedelta(minutes=1)}
+            limit_info = self.rate_limits[key]
+            if datetime.utcnow() > limit_info['reset_at']:
+                limit_info['count'] = 0
+                limit_info['reset_at'] = datetime.utcnow() + timedelta(minutes=1)
+            if limit_info['count'] >= limit:
+                return False
+            limit_info['count'] += 1
+            return True
 
     def get_rate_limit_status(self) -> Dict:
         return {
@@ -850,32 +1055,281 @@ class AdaptiveRateLimiter:
         }
 
 # ============================================================================
+# Enums and Data Classes
+# ============================================================================
+
+class SecurityLevel(Enum):
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    CONFIDENTIAL = "confidential"
+    RESTRICTED = "restricted"
+    CRITICAL = "critical"
+
+class TrustLevel(Enum):
+    UNTRUSTED = 0
+    BASIC = 1
+    VERIFIED = 2
+    TRUSTED = 3
+    PRIVILEGED = 4
+
+@dataclass
+class SecurityContext:
+    request_id: str
+    source_identity: str
+    security_level: SecurityLevel
+    trust_level: TrustLevel = TrustLevel.UNTRUSTED
+    authentication_token: Optional[str] = None
+    authorization_grants: List[str] = field(default_factory=list)
+    encryption_key: Optional[bytes] = None
+    session_id: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(hours=1))
+    carbon_impact: float = 0.0
+    sustainability_score: float = 0.0
+
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+
+    def has_grant(self, grant: str) -> bool:
+        return grant in self.authorization_grants
+
+# ============================================================================
+# Carbon-Aware Authenticator (Preserved)
+# ============================================================================
+
+class CarbonAwareAuthenticator:
+    def __init__(self, carbon_manager: Optional[CarbonIntensityManager] = None):
+        self.carbon_manager = carbon_manager
+        self.auth_history = deque(maxlen=1000)
+        self._lock = asyncio.Lock()
+        logger.info("Carbon-Aware Authenticator initialized with price awareness")
+
+    async def authenticate_with_carbon_awareness(
+        self,
+        request: Dict,
+        credentials: Dict,
+        carbon_intensity: Optional[float] = None,
+        carbon_price: Optional[float] = None,
+        helium_price: Optional[float] = None
+    ) -> Dict:
+        if carbon_intensity is None and self.carbon_manager:
+            carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_price = await self.carbon_manager.get_current_carbon_price()
+        else:
+            carbon_intensity = carbon_intensity or 400
+            carbon_price = carbon_price or 50
+        helium_price = helium_price or 0.5
+
+        price_factor = min(2.0, carbon_price / 50.0)
+        helium_price_factor = min(2.0, helium_price / 0.5)
+        combined_price_factor = (price_factor + helium_price_factor) / 2
+
+        if carbon_intensity > 500 or combined_price_factor > 1.5:
+            auth_level = 'light'
+            auth_factors = 1
+            sustainability_score = 0.8
+        elif carbon_intensity > 300 or combined_price_factor > 1.0:
+            auth_level = 'standard'
+            auth_factors = 2
+            sustainability_score = 0.6
+        else:
+            auth_level = 'enhanced'
+            auth_factors = 3
+            sustainability_score = 0.4
+
+        if combined_price_factor > 1.5:
+            session_duration = 7200
+        elif combined_price_factor > 1.0:
+            session_duration = 3600
+        else:
+            session_duration = 1800
+
+        async with self._lock:
+            self.auth_history.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'auth_level': auth_level,
+                'carbon_intensity': carbon_intensity,
+                'carbon_price': carbon_price,
+                'helium_price': helium_price,
+                'sustainability_score': sustainability_score
+            })
+
+        return {
+            'authenticated': True,
+            'auth_level': auth_level,
+            'carbon_intensity': carbon_intensity,
+            'carbon_price': carbon_price,
+            'helium_price': helium_price,
+            'carbon_impact': 'low' if auth_level == 'light' else 'medium' if auth_level == 'standard' else 'high',
+            'auth_factors': auth_factors,
+            'session_duration': session_duration,
+            'sustainability_score': sustainability_score,
+            'price_factor': combined_price_factor
+        }
+
+    def get_carbon_auth_stats(self) -> Dict:
+        if not self.auth_history:
+            return {'total_auths': 0}
+        return {
+            'total_auths': len(self.auth_history),
+            'light_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'light'),
+            'standard_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'standard'),
+            'enhanced_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'enhanced'),
+            'average_sustainability': np.mean([a.get('sustainability_score', 0.5) for a in self.auth_history]),
+            'average_carbon_price': np.mean([a.get('carbon_price', 50) for a in self.auth_history]),
+            'average_helium_price': np.mean([a.get('helium_price', 0.5) for a in self.auth_history])
+        }
+
+# ============================================================================
+# Sustainability Security Dashboard (Preserved)
+# ============================================================================
+
+class SecuritySustainabilityDashboard:
+    def __init__(self):
+        self.history = []
+        self.alert_thresholds = {
+            'carbon_intensity': 500,
+            'helium_remaining': 0.2,
+            'security_overhead': 0.3,
+            'threat_level': 0.7
+        }
+        self._lock = asyncio.Lock()
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("Security Sustainability Dashboard initialized")
+
+    async def _monitor_loop(self):
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Sustainability monitor error: {e}")
+                await asyncio.sleep(300)
+
+    async def get_dashboard_status(
+        self,
+        carbon_manager: Optional[CarbonIntensityManager] = None,
+        helium_tracker: Optional[HeliumSecurityTracker] = None,
+        security_analyzer: Optional[PredictiveSecurityAnalyzer] = None,
+        zero_trust: Optional['ZeroTrustArchitecture'] = None
+    ) -> Dict:
+        status = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': 0.5
+        }
+
+        if carbon_manager:
+            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
+            status['carbon_price'] = await carbon_manager.get_current_carbon_price()
+            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
+
+        if helium_tracker:
+            helium_pos = helium_tracker.get_helium_position()
+            status['helium_position'] = helium_pos
+            status['helium_price'] = helium_pos.get('current_price_usd_per_l', 0.5)
+            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
+
+        if zero_trust:
+            posture = zero_trust.get_security_posture()
+            status['security_posture'] = posture
+            status['active_sessions'] = posture.get('active_sessions', 0)
+            status['security_violations'] = posture.get('security_violations', 0)
+
+        if security_analyzer:
+            risk = await security_analyzer.predict_security_risk({})
+            status['predicted_risk'] = risk.get('predicted_risk', 0.5)
+            status['risk_trend'] = risk.get('trend', 'stable')
+            status['model_version'] = risk.get('model_version', 0)
+
+        score = 0.5
+        if status.get('carbon_intensity', 400) < 300:
+            score += 0.15
+        if status.get('helium_remaining_ratio', 0.5) > 0.5:
+            score += 0.15
+        if status.get('security_violations', 100) < 10:
+            score += 0.15
+        if status.get('predicted_risk', 0.5) < 0.3:
+            score += 0.15
+
+        status['sustainability_score'] = min(1.0, max(0.0, score))
+
+        alerts = []
+        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
+            alerts.append("High carbon intensity detected")
+        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
+            alerts.append("Helium budget critically low")
+        if status.get('predicted_risk', 0.5) > self.alert_thresholds['threat_level']:
+            alerts.append("Elevated security risk predicted")
+        status['alerts'] = alerts
+
+        async with self._lock:
+            self.history.append(status)
+            if len(self.history) > 1000:
+                self.history = self.history[-1000:]
+
+        return status
+
+    def generate_sustainability_report(self, status: Dict) -> Dict:
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'sustainability_score': status.get('sustainability_score', 0.5),
+            'carbon_status': {
+                'intensity': status.get('carbon_intensity', 0),
+                'price_usd_per_ton': status.get('carbon_price', 50),
+                'savings_kg': status.get('carbon_savings_kg', 0)
+            },
+            'helium_status': {
+                'remaining_ratio': status.get('helium_remaining_ratio', 0.5),
+                'price_usd_per_l': status.get('helium_price', 0.5)
+            },
+            'security_status': status.get('security_posture', {}),
+            'predictive_insights': {
+                'risk': status.get('predicted_risk', 0.5),
+                'trend': status.get('risk_trend', 'stable'),
+                'model_version': status.get('model_version', 0)
+            },
+            'alerts': status.get('alerts', []),
+            'recommendations': self._generate_recommendations(status)
+        }
+
+    def _generate_recommendations(self, status: Dict) -> List[str]:
+        recommendations = []
+        if status.get('carbon_intensity', 0) > 400:
+            recommendations.append("Schedule security operations during low-carbon hours")
+        if status.get('helium_remaining_ratio', 1.0) < 0.3:
+            recommendations.append("Implement helium recovery for security operations")
+        if status.get('predicted_risk', 0.5) > 0.6:
+            recommendations.append("Review and enhance security measures")
+        if status.get('security_violations', 0) > 20:
+            recommendations.append("Investigate security violation patterns")
+        return recommendations or ["All security sustainability metrics are within acceptable ranges"]
+
+    async def shutdown(self):
+        self._running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("SecuritySustainabilityDashboard shut down")
+
+# ============================================================================
 # Enhanced Zero Trust Architecture (Main Class)
 # ============================================================================
 
 class ZeroTrustArchitecture:
     """
-    Enhanced Zero Trust Security Architecture v3.0.0.
+    Enhanced Zero Trust Security Architecture v3.1.0.
     """
 
     def __init__(self, config: Optional[ZeroTrustConfig] = None, **kwargs):
         if config is None:
             # Build config from kwargs for backward compatibility
-            config = ZeroTrustConfig(
-                enable_carbon_intensity=kwargs.get('enable_carbon_intensity', True),
-                enable_helium_tracking=kwargs.get('enable_helium_tracking', True),
-                enable_predictive=kwargs.get('enable_predictive', True),
-                enable_sustainability_dashboard=kwargs.get('enable_sustainability_dashboard', True),
-                enable_carbon_auth=kwargs.get('enable_carbon_auth', True),
-                enable_immutable_ledger=kwargs.get('enable_immutable_ledger', True),
-                enable_adaptive_ratelimit=kwargs.get('enable_adaptive_ratelimit', True),
-                enable_persistence=kwargs.get('enable_persistence', True),
-                enable_telemetry=kwargs.get('enable_telemetry', True),
-                carbon_api_region=kwargs.get('carbon_api_region', 'us-east'),
-                helium_budget_l=kwargs.get('helium_budget_l', 50.0),
-                max_retries=kwargs.get('max_retries', 3),
-                persistence_path=kwargs.get('persistence_path', "zero_trust_state.pkl"),
-            )
+            config = ZeroTrustConfig(**{
+                k: v for k, v in kwargs.items()
+                if k in ZeroTrustConfig.__annotations__
+            })
         self.config = config
 
         # Feature flags
@@ -889,6 +1343,12 @@ class ZeroTrustArchitecture:
         self.enable_persistence = config.enable_persistence
         self.enable_telemetry = config.enable_telemetry
 
+        # Concurrency locks
+        self._identity_lock = asyncio.Lock()
+        self._session_lock = asyncio.Lock()
+        self._audit_lock = asyncio.Lock()
+        self._rate_limit_lock = asyncio.Lock()
+
         # New modules with config
         self.carbon_manager = CarbonIntensityManager(config) if self.enable_carbon_intensity else None
         self.helium_tracker = HeliumSecurityTracker(config) if self.enable_helium_tracking else None
@@ -900,7 +1360,7 @@ class ZeroTrustArchitecture:
 
         # Persistence and telemetry
         self.persistence = ZeroTrustPersistenceManager(config) if self.enable_persistence else None
-        self.telemetry = ZeroTrustTelemetry() if self.enable_telemetry else None
+        self.telemetry = ZeroTrustTelemetry(config) if self.enable_telemetry else None
 
         # Core security components
         self.identities: Dict[str, Dict[str, Any]] = {}
@@ -929,7 +1389,7 @@ class ZeroTrustArchitecture:
         if self.enable_persistence and self.persistence:
             asyncio.create_task(self._load_state())
 
-        logger.info("Enhanced Zero Trust Architecture v3.0.0 initialized")
+        logger.info("Enhanced Zero Trust Architecture v3.1.0 initialized")
 
     def _start_background_tasks(self):
         if self.enable_carbon_intensity:
@@ -951,7 +1411,7 @@ class ZeroTrustArchitecture:
 
     async def get_health_status(self) -> Dict[str, Any]:
         return {
-            'status': 'healthy',
+            'status': 'healthy' if self.sustainability_score > 0.5 else 'degraded',
             'score': min(1.0, self.sustainability_score),
             'details': {
                 'modules': {
@@ -978,7 +1438,7 @@ class ZeroTrustArchitecture:
                     await self.carbon_manager.update_carbon_intensity()
                     if self.telemetry:
                         intensity = await self.carbon_manager.get_current_intensity()
-                        self.telemetry.gauge('carbon_intensity', intensity)
+                        self.telemetry.gauge('zt_carbon_intensity', intensity)
                         price = await self.carbon_manager.get_current_carbon_price()
                         self.telemetry.gauge('carbon_price_usd', price)
                 await asyncio.sleep(self.carbon_manager.update_interval if self.carbon_manager else 300)
@@ -1083,11 +1543,9 @@ class ZeroTrustArchitecture:
     async def _calculate_risk_score(self) -> float:
         if not self.audit_log:
             return 0.3
-
         recent = self.audit_log[-100:]
         violations = sum(1 for e in recent if e.get('event_type') in ['unauthorized_access', 'policy_violation'])
         auth_failures = sum(1 for e in recent if e.get('event_type') == 'authentication_failure')
-
         risk = (violations * 0.6 + auth_failures * 0.4) / max(len(recent), 1)
         return min(1.0, risk)
 
@@ -1203,8 +1661,8 @@ class ZeroTrustArchitecture:
 
         # Telemetry
         if self.telemetry:
-            self.telemetry.increment('authentications_total')
-            self.telemetry.gauge('risk_score', risk_score)
+            self.telemetry.increment('zt_authentications_total')
+            self.telemetry.gauge('zt_risk_score', risk_score)
 
         return context
 
@@ -1227,7 +1685,7 @@ class ZeroTrustArchitecture:
 
         # Check adaptive rate limit
         if self.rate_limiter:
-            if not self.rate_limiter.check_rate_limit(context.source_identity, action, threat_level):
+            if not await self.rate_limiter.check_rate_limit(context.source_identity, action, threat_level):
                 await self._log_security_event(
                     'rate_limit_exceeded',
                     context.request_id,
@@ -1298,7 +1756,7 @@ class ZeroTrustArchitecture:
 
         # Telemetry
         if self.telemetry:
-            self.telemetry.increment('authorizations_total')
+            self.telemetry.increment('zt_authorizations_total')
 
         return True
 
@@ -1310,7 +1768,6 @@ class ZeroTrustArchitecture:
         required_fields = ['identity', 'authentication_method']
         if not all(field in credentials for field in required_fields):
             return False
-
         auth_method = credentials['authentication_method']
         if auth_method == 'token':
             return await self._validate_token(credentials.get('token'))
@@ -1390,32 +1847,25 @@ class ZeroTrustArchitecture:
 
     async def _assess_risk(self, request: Dict, identity: Dict) -> float:
         risk_factors = []
-
         origin = request.get('origin', 'unknown')
         if origin not in identity.get('trusted_origins', []):
             risk_factors.append(0.3)
-
         hour = datetime.utcnow().hour
         if hour < 6 or hour > 22:
             risk_factors.append(0.2)
-
         recent_requests = self._count_recent_requests(identity['id'])
         if recent_requests > 100:
             risk_factors.append(0.4)
-
         requested_level = self._determine_security_level(request)
         if requested_level.value in ['restricted', 'critical']:
             risk_factors.append(0.5)
-
         violation_count = self._count_violations(identity['id'])
         if violation_count > 0:
             risk_factors.append(min(violation_count * 0.2, 1.0))
-
         if risk_factors:
             risk_score = sum(risk_factors) / len(risk_factors)
         else:
             risk_score = 0.0
-
         return min(risk_score, 1.0)
 
     async def _perform_step_up_auth(self, identity: Dict) -> bool:
@@ -1446,11 +1896,12 @@ class ZeroTrustArchitecture:
 
     def _create_session(self, identity: Dict) -> str:
         session_id = secrets.token_hex(32)
-        self.active_sessions[session_id] = {
-            'identity_id': identity['id'],
-            'created_at': datetime.utcnow(),
-            'expires_at': datetime.utcnow() + timedelta(hours=1)
-        }
+        async with self._session_lock:
+            self.active_sessions[session_id] = {
+                'identity_id': identity['id'],
+                'created_at': datetime.utcnow(),
+                'expires_at': datetime.utcnow() + timedelta(hours=1)
+            }
         return session_id
 
     async def _validate_context(self, context: SecurityContext) -> bool:
@@ -1633,9 +2084,10 @@ class ZeroTrustArchitecture:
             'timestamp': datetime.utcnow().isoformat(),
             'details': details
         }
-        self.audit_log.append(event)
-        if len(self.audit_log) > 10000:
-            self.audit_log = self.audit_log[-10000:]
+        async with self._audit_lock:
+            self.audit_log.append(event)
+            if len(self.audit_log) > 10000:
+                self.audit_log = self.audit_log[-10000:]
 
         # Add to immutable ledger
         if self.ledger:
@@ -1723,15 +2175,12 @@ class ZeroTrustArchitecture:
 
     def get_price_forecasts(self) -> Dict:
         forecasts = {}
-
         if self.carbon_manager:
             carbon_forecast = asyncio.run(self.carbon_manager.forecast_carbon_prices())
             forecasts['carbon'] = carbon_forecast
-
         if self.helium_tracker:
             helium_forecast = asyncio.run(self.helium_tracker.forecast_helium_prices())
             forecasts['helium'] = helium_forecast
-
         return forecasts
 
     def get_ledger_status(self) -> Dict:
@@ -1754,246 +2203,16 @@ class ZeroTrustArchitecture:
             return json.dumps(self.audit_log[-1000:], default=str)
 
     async def shutdown(self):
-        logger.info("Shutting down Zero Trust Architecture v3.0.0")
+        logger.info("Shutting down Zero Trust Architecture v3.1.0")
         if self.enable_persistence:
             await self.save_state()
         if self.carbon_manager:
             await self.carbon_manager.close()
+        if self.predictive_analyzer:
+            await self.predictive_analyzer.close()
+        if self.sustainability_dashboard:
+            await self.sustainability_dashboard.shutdown()
         logger.info("Shutdown complete")
-
-# ============================================================================
-# Enums and Data Classes (Preserved)
-# ============================================================================
-
-class SecurityLevel(Enum):
-    PUBLIC = "public"
-    INTERNAL = "internal"
-    CONFIDENTIAL = "confidential"
-    RESTRICTED = "restricted"
-    CRITICAL = "critical"
-
-class TrustLevel(Enum):
-    UNTRUSTED = 0
-    BASIC = 1
-    VERIFIED = 2
-    TRUSTED = 3
-    PRIVILEGED = 4
-
-@dataclass
-class SecurityContext:
-    request_id: str
-    source_identity: str
-    security_level: SecurityLevel
-    trust_level: TrustLevel = TrustLevel.UNTRUSTED
-    authentication_token: Optional[str] = None
-    authorization_grants: List[str] = field(default_factory=list)
-    encryption_key: Optional[bytes] = None
-    session_id: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(hours=1))
-    carbon_impact: float = 0.0
-    sustainability_score: float = 0.0
-
-    def is_expired(self) -> bool:
-        return datetime.utcnow() > self.expires_at
-
-    def has_grant(self, grant: str) -> bool:
-        return grant in self.authorization_grants
-
-# ============================================================================
-# Sustainability Security Dashboard (Preserved)
-# ============================================================================
-
-class SecuritySustainabilityDashboard:
-    def __init__(self):
-        self.history = []
-        self.alert_thresholds = {
-            'carbon_intensity': 500,
-            'helium_remaining': 0.2,
-            'security_overhead': 0.3,
-            'threat_level': 0.7
-        }
-        self._running = True
-        logger.info("Security Sustainability Dashboard initialized")
-
-    async def get_dashboard_status(self, carbon_manager=None, helium_tracker=None, 
-                                   security_analyzer=None, zero_trust=None) -> Dict:
-        status = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': 0.5
-        }
-
-        if carbon_manager:
-            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
-            status['carbon_price'] = await carbon_manager.get_current_carbon_price()
-            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
-
-        if helium_tracker:
-            helium_pos = helium_tracker.get_helium_position()
-            status['helium_position'] = helium_pos
-            status['helium_price'] = helium_pos.get('current_price_usd_per_l', 0.5)
-            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
-
-        if zero_trust:
-            posture = zero_trust.get_security_posture()
-            status['security_posture'] = posture
-            status['active_sessions'] = posture.get('active_sessions', 0)
-            status['security_violations'] = posture.get('security_violations', 0)
-
-        if security_analyzer:
-            risk = await security_analyzer.predict_security_risk({})
-            status['predicted_risk'] = risk.get('predicted_risk', 0.5)
-            status['risk_trend'] = risk.get('trend', 'stable')
-            status['model_version'] = risk.get('model_version', 0)
-
-        score = 0.5
-        if status.get('carbon_intensity', 400) < 300:
-            score += 0.15
-        if status.get('helium_remaining_ratio', 0.5) > 0.5:
-            score += 0.15
-        if status.get('security_violations', 100) < 10:
-            score += 0.15
-        if status.get('predicted_risk', 0.5) < 0.3:
-            score += 0.15
-
-        status['sustainability_score'] = min(1.0, max(0.0, score))
-
-        alerts = []
-        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
-            alerts.append("High carbon intensity detected")
-        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
-            alerts.append("Helium budget critically low")
-        if status.get('predicted_risk', 0.5) > self.alert_thresholds['threat_level']:
-            alerts.append("Elevated security risk predicted")
-        status['alerts'] = alerts
-
-        return status
-
-    def generate_sustainability_report(self, status: Dict) -> Dict:
-        return {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': status.get('sustainability_score', 0.5),
-            'carbon_status': {
-                'intensity': status.get('carbon_intensity', 0),
-                'price_usd_per_ton': status.get('carbon_price', 50),
-                'savings_kg': status.get('carbon_savings_kg', 0)
-            },
-            'helium_status': {
-                'remaining_ratio': status.get('helium_remaining_ratio', 0.5),
-                'price_usd_per_l': status.get('helium_price', 0.5)
-            },
-            'security_status': status.get('security_posture', {}),
-            'predictive_insights': {
-                'risk': status.get('predicted_risk', 0.5),
-                'trend': status.get('risk_trend', 'stable'),
-                'model_version': status.get('model_version', 0)
-            },
-            'alerts': status.get('alerts', []),
-            'recommendations': self._generate_recommendations(status)
-        }
-
-    def _generate_recommendations(self, status: Dict) -> List[str]:
-        recommendations = []
-
-        if status.get('carbon_intensity', 0) > 400:
-            recommendations.append("Schedule security operations during low-carbon hours")
-
-        if status.get('helium_remaining_ratio', 1.0) < 0.3:
-            recommendations.append("Implement helium recovery for security operations")
-
-        if status.get('predicted_risk', 0.5) > 0.6:
-            recommendations.append("Review and enhance security measures")
-
-        if status.get('security_violations', 0) > 20:
-            recommendations.append("Investigate security violation patterns")
-
-        return recommendations or ["All security sustainability metrics are within acceptable ranges"]
-
-# ============================================================================
-# Carbon-Aware Authenticator (Preserved)
-# ============================================================================
-
-class CarbonAwareAuthenticator:
-    def __init__(self, carbon_manager=None):
-        self.carbon_manager = carbon_manager
-        self.auth_history = deque(maxlen=1000)
-        logger.info("Carbon-Aware Authenticator initialized with price awareness")
-
-    async def authenticate_with_carbon_awareness(
-        self,
-        request: Dict,
-        credentials: Dict,
-        carbon_intensity: Optional[float] = None,
-        carbon_price: Optional[float] = None,
-        helium_price: Optional[float] = None
-    ) -> Dict:
-        if carbon_intensity is None and self.carbon_manager:
-            carbon_intensity = await self.carbon_manager.get_current_intensity()
-            carbon_price = await self.carbon_manager.get_current_carbon_price()
-        else:
-            carbon_intensity = carbon_intensity or 400
-            carbon_price = carbon_price or 50
-        helium_price = helium_price or 0.5
-
-        price_factor = min(2.0, carbon_price / 50.0)
-        helium_price_factor = min(2.0, helium_price / 0.5)
-        combined_price_factor = (price_factor + helium_price_factor) / 2
-
-        if carbon_intensity > 500 or combined_price_factor > 1.5:
-            auth_level = 'light'
-            auth_factors = 1
-            sustainability_score = 0.8
-        elif carbon_intensity > 300 or combined_price_factor > 1.0:
-            auth_level = 'standard'
-            auth_factors = 2
-            sustainability_score = 0.6
-        else:
-            auth_level = 'enhanced'
-            auth_factors = 3
-            sustainability_score = 0.4
-
-        if combined_price_factor > 1.5:
-            session_duration = 7200
-        elif combined_price_factor > 1.0:
-            session_duration = 3600
-        else:
-            session_duration = 1800
-
-        self.auth_history.append({
-            'timestamp': datetime.utcnow().isoformat(),
-            'auth_level': auth_level,
-            'carbon_intensity': carbon_intensity,
-            'carbon_price': carbon_price,
-            'helium_price': helium_price,
-            'sustainability_score': sustainability_score
-        })
-
-        return {
-            'authenticated': True,
-            'auth_level': auth_level,
-            'carbon_intensity': carbon_intensity,
-            'carbon_price': carbon_price,
-            'helium_price': helium_price,
-            'carbon_impact': 'low' if auth_level == 'light' else 'medium' if auth_level == 'standard' else 'high',
-            'auth_factors': auth_factors,
-            'session_duration': session_duration,
-            'sustainability_score': sustainability_score,
-            'price_factor': combined_price_factor
-        }
-
-    def get_carbon_auth_stats(self) -> Dict:
-        if not self.auth_history:
-            return {'total_auths': 0}
-
-        return {
-            'total_auths': len(self.auth_history),
-            'light_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'light'),
-            'standard_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'standard'),
-            'enhanced_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'enhanced'),
-            'average_sustainability': np.mean([a.get('sustainability_score', 0.5) for a in self.auth_history]),
-            'average_carbon_price': np.mean([a.get('carbon_price', 50) for a in self.auth_history]),
-            'average_helium_price': np.mean([a.get('helium_price', 0.5) for a in self.auth_history])
-        }
 
 # ============================================================================
 # Singleton Accessor
