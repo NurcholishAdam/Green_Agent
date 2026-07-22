@@ -1,14 +1,24 @@
+#!/usr/bin/env python3
 """
-Cold Start Optimizer for Green Agent MoE System v3.1.0
+Cold Start Optimizer for Green Agent MoE System v3.2.0
 Eliminates expert warmup latency through pre-initialization and transfer learning.
-ENHANCED WITH: Federated Checkpoint Sharing, ML-Based Demand Prediction,
-Carbon-Aware Strategy Selection, Helium Efficiency Dashboard,
-Differential Privacy for Secure Checkpoint Sharing,
-Online Learning for Continuous Model Improvement,
-Real-time Carbon API Integration,
-Predictive Helium Forecasting,
-Intelligent Eviction Based on Predicted Future Demand,
-Configuration Dataclass, Persistence, Telemetry, Health Checks.
+ENHANCED WITH: Secure JSON persistence, concurrency controls, unified circuit breaker,
+Prometheus telemetry, async carbon API, threaded ML training, and full type hints.
+
+Features:
+- Federated Checkpoint Sharing
+- ML-Based Demand Prediction (persisted, thread‑offloaded)
+- Carbon-Aware Strategy Selection (async)
+- Helium Efficiency Dashboard (with forecasting)
+- Differential Privacy for Secure Checkpoint Sharing
+- Online Learning for Continuous Model Improvement
+- Real-time Carbon API Integration
+- Predictive Helium Forecasting
+- Intelligent Eviction Based on Predicted Future Demand
+- Configuration Dataclass with Validation
+- Persistence (JSON + zlib + async I/O)
+- Telemetry (Prometheus)
+- Health Checks
 """
 
 import asyncio
@@ -20,10 +30,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from collections import OrderedDict, defaultdict, deque
-import pickle
-import hashlib
 import json
-import aiohttp
+import hashlib
 import os
 import zlib
 from sklearn.preprocessing import StandardScaler
@@ -32,10 +40,43 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+# Optional dependencies
+try:
+    import aiofiles
+except ImportError:
+    aiofiles = None
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+except ImportError:
+    # Dummy retry decorator
+    def retry(*args, **kwargs):
+        return lambda f: f
+    stop_after_attempt = lambda x: None
+    wait_exponential = lambda **k: None
+    retry_if_exception_type = lambda e: None
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
+    from pydantic import BaseModel, Field, ValidationError
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration Dataclass (NEW)
+# Configuration with Validation
 # ============================================================================
 
 @dataclass
@@ -61,7 +102,7 @@ class ColdStartConfig:
     # Federated learning
     federated_server_url: Optional[str] = None
     privacy_epsilon: float = 1.0
-    federated_sparsity_ratio: float = 0.1  # top-k% of checkpoint data to keep
+    federated_sparsity_ratio: float = 0.1
 
     # ML demand predictor
     ml_history_window: int = 1000
@@ -70,82 +111,204 @@ class ColdStartConfig:
 
     # Carbon-aware strategy
     carbon_intensity_thresholds: Dict[str, float] = field(default_factory=lambda: {
-        'low': 200,
-        'medium': 350,
-        'high': 500
+        'low': 200, 'medium': 350, 'high': 500
     })
     strategy_weights: Dict[str, float] = field(default_factory=lambda: {
-        'priority': 0.2,
-        'resource_cost': 0.3,
-        'carbon_efficiency': 0.3,
-        'urgency': 0.2
+        'priority': 0.2, 'resource_cost': 0.3, 'carbon_efficiency': 0.3, 'urgency': 0.2
     })
 
     # Helium forecasting
-    helium_forecast_model: str = "exponential_smoothing"  # or 'linear'
+    helium_forecast_model: str = "exponential_smoothing"
 
     # Eviction manager
     eviction_weights: Dict[str, float] = field(default_factory=lambda: {
-        'usage_count': 0.25,
-        'age': 0.20,
-        'predicted_demand': 0.35,
-        'sustainability': 0.20
+        'usage_count': 0.25, 'age': 0.20, 'predicted_demand': 0.35, 'sustainability': 0.20
     })
 
     # Retry and circuit breaker
     max_retries: int = 3
     retry_base_delay_ms: float = 100.0
     retry_max_delay_ms: float = 5000.0
-    circuit_breaker_threshold: int = 5
+    circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout: float = 30.0
 
     # Persistence
-    persistence_path: str = "cold_start_state.pkl"
+    persistence_path: str = "cold_start_state.json.gz"
 
     # Telemetry
     telemetry_export_interval: int = 60
+    prometheus_port: Optional[int] = None  # if set, start HTTP server
+
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        if self.cache_size < 1:
+            raise ValueError("cache_size must be >= 1")
+        if not (0 <= self.preload_threshold <= 1):
+            raise ValueError("preload_threshold must be between 0 and 1")
+        if self.privacy_epsilon < 0:
+            raise ValueError("privacy_epsilon must be >= 0")
+        if not (0 <= self.federated_sparsity_ratio <= 1):
+            raise ValueError("federated_sparsity_ratio must be between 0 and 1")
+        if self.ml_history_window < 10:
+            raise ValueError("ml_history_window must be >= 10")
+        if self.ml_online_learning_rate <= 0:
+            raise ValueError("ml_online_learning_rate must be > 0")
+        if self.ml_retrain_threshold < 10:
+            raise ValueError("ml_retrain_threshold must be >= 10")
+        if self.circuit_breaker_failure_threshold < 1:
+            raise ValueError("circuit_breaker_failure_threshold must be >= 1")
+        if self.circuit_breaker_recovery_timeout < 0:
+            raise ValueError("circuit_breaker_recovery_timeout must be >= 0")
+        if self.telemetry_export_interval < 1:
+            raise ValueError("telemetry_export_interval must be >= 1")
+        if self.prometheus_port is not None and self.prometheus_port < 1024:
+            raise ValueError("prometheus_port must be >= 1024 or None")
+        total_weight = sum(self.eviction_weights.values())
+        if abs(total_weight - 1.0) > 0.01:
+            raise ValueError("eviction_weights must sum to approximately 1.0")
+        total_strat_weight = sum(self.strategy_weights.values())
+        if abs(total_strat_weight - 1.0) > 0.01:
+            raise ValueError("strategy_weights must sum to approximately 1.0")
 
 # ============================================================================
-# Retry Helper (NEW)
+# Circuit Breaker with Half‑Open State
 # ============================================================================
 
-async def retry_async(
-    func: Callable,
-    max_retries: int,
-    base_delay_ms: float,
-    max_delay_ms: float,
-    *args,
-    **kwargs
-) -> Any:
-    """Retry an async function with exponential backoff."""
-    for attempt in range(max_retries):
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class CircuitBreaker:
+    """Circuit breaker with half-open state."""
+    def __init__(self, failure_threshold: int, recovery_timeout: float):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute the given async function with circuit breaker protection."""
+        async with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if self.last_failure_time:
+                    elapsed = (datetime.utcnow() - self.last_failure_time).total_seconds()
+                    if elapsed >= self.recovery_timeout:
+                        self.state = CircuitBreakerState.HALF_OPEN
+                        self.failure_count = 0
+                        logger.info("Circuit breaker entered HALF_OPEN state")
+                    else:
+                        raise RuntimeError(f"Circuit breaker OPEN (recovery in {self.recovery_timeout - elapsed:.1f}s)")
+                else:
+                    raise RuntimeError("Circuit breaker OPEN (no failure time)")
+
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
+            async with self._lock:
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+                    logger.info("Circuit breaker closed after successful half-open call")
+                elif self.state == CircuitBreakerState.CLOSED:
+                    self.failure_count = 0
+            return result
         except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
-            await asyncio.sleep(delay)
-    raise RuntimeError("Max retries exceeded")
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = datetime.utcnow()
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.OPEN
+                    logger.warning(f"Circuit breaker opened due to failure in half-open state: {e}")
+                elif self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+                    logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+            raise e
+
+    @property
+    def is_open(self) -> bool:
+        return self.state == CircuitBreakerState.OPEN
+
+    async def reset(self):
+        async with self._lock:
+            self.state = CircuitBreakerState.CLOSED
+            self.failure_count = 0
+            self.last_failure_time = None
+            logger.info("Circuit breaker manually reset")
 
 # ============================================================================
-# Telemetry Collector (NEW)
+# Retry Helper (using tenacity if available)
+# ============================================================================
+
+def is_retryable_exception(e: Exception) -> bool:
+    """Check if an exception is retryable."""
+    return isinstance(e, (IOError, TimeoutError, ConnectionError, aiohttp.ClientError))
+
+# Use tenacity if available, else custom
+if 'retry' in globals() and stop_after_attempt and wait_exponential:
+    retry_decorator = retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(is_retryable_exception)
+    )
+else:
+    def retry_decorator(func):
+        async def wrapper(*args, **kwargs):
+            for attempt in range(3):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
+            raise RuntimeError("Max retries exceeded")
+        return wrapper
+
+# ============================================================================
+# Telemetry Collector (Prometheus)
 # ============================================================================
 
 class ColdStartTelemetry:
     """Collects telemetry for the cold start optimizer."""
 
-    def __init__(self):
+    def __init__(self, config: ColdStartConfig):
+        self.config = config
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
+        self._prometheus_metrics = None
+        if PROMETHEUS_AVAILABLE and config.prometheus_port:
+            self._setup_prometheus()
+            self._start_prometheus_server()
+
+    def _setup_prometheus(self):
+        self._prometheus_metrics = {
+            'cs_cache_size': Gauge('cs_cache_size', 'Number of cached checkpoints'),
+            'cs_hit_rate': Gauge('cs_hit_rate', 'Cache hit rate'),
+            'cs_sustainability_score': Gauge('cs_sustainability_score', 'Overall sustainability score'),
+            'cs_carbon_saved_kg': Gauge('cs_carbon_saved_kg', 'Carbon saved (kg)'),
+            'cs_time_saved_ms': Gauge('cs_time_saved_ms', 'Time saved (ms)'),
+            'cs_scenarios_run': Counter('cs_scenarios_run', 'Total scenarios run'),
+            'cs_helium_used_l': Gauge('cs_helium_used_l', 'Total helium used (L)'),
+        }
+
+    def _start_prometheus_server(self):
+        start_http_server(self.config.prometheus_port)
+        logger.info(f"Prometheus metrics server started on port {self.config.prometheus_port}")
 
     def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None, value: float = 1.0):
         key = self._make_key(metric_name, tags)
         self.metrics['counters'][key] += value
+        if self._prometheus_metrics and metric_name in self._prometheus_metrics:
+            if isinstance(self._prometheus_metrics[metric_name], Counter):
+                self._prometheus_metrics[metric_name].inc(value)
 
     def gauge(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
         key = self._make_key(metric_name, tags)
         self.metrics['gauges'][key] = value
+        if self._prometheus_metrics and metric_name in self._prometheus_metrics:
+            if isinstance(self._prometheus_metrics[metric_name], Gauge):
+                self._prometheus_metrics[metric_name].set(value)
 
     def histogram(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
         key = self._make_key(metric_name, tags)
@@ -162,7 +325,9 @@ class ColdStartTelemetry:
         return metric_name
 
     async def export(self) -> str:
-        # Prometheus text format
+        if PROMETHEUS_AVAILABLE and self.config.prometheus_port:
+            return generate_latest().decode('utf-8')
+        # Fallback text format
         output = []
         for key, value in self.metrics['counters'].items():
             output.append(f"# TYPE {key} counter\n{key} {value}")
@@ -179,50 +344,84 @@ class ColdStartTelemetry:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Persistence Manager (NEW)
+# Persistence Manager (JSON + zlib + async I/O)
 # ============================================================================
 
 class ColdStartPersistenceManager:
-    """Saves and loads the cold start optimizer state."""
+    """Saves and loads the cold start optimizer state using JSON + compression."""
 
     def __init__(self, config: ColdStartConfig):
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
         logger.info(f"ColdStartPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, optimizer: 'ColdStartOptimizer') -> bool:
+        """Save the optimizer state to disk."""
         async with self._lock:
             try:
                 state = {
-                    'checkpoint_cache': {k: v for k, v in optimizer.checkpoint_cache.items()},
+                    'version': '3.2.0',
+                    'checkpoint_cache': {
+                        k: {
+                            'expert_id': v.expert_id,
+                            'expert_type': v.expert_type,
+                            'model_state': v.model_state,
+                            'optimizer_state': v.optimizer_state,
+                            'feature_distribution': v.feature_distribution,
+                            'performance_metrics': v.performance_metrics,
+                            'created_at': v.created_at.isoformat(),
+                            'last_used': v.last_used.isoformat(),
+                            'usage_count': v.usage_count,
+                            'carbon_footprint_kg': v.carbon_footprint_kg,
+                            'helium_usage_l': v.helium_usage_l,
+                            'sustainability_score': v.sustainability_score,
+                            'federated_consensus': v.federated_consensus,
+                            'peer_count': v.peer_count,
+                        }
+                        for k, v in optimizer.checkpoint_cache.items()
+                    },
                     'warmup_history': optimizer.warmup_history,
                     'sustainability_score': optimizer.sustainability_score,
                     'cold_start_events': optimizer.cold_start_events,
                     'expert_similarity_matrix': optimizer.expert_similarity_matrix,
                 }
-                # Save sub-module states if they exist
+                # Save sub-module states
                 if optimizer.ml_predictor:
                     state['ml_predictor'] = {
                         'demand_history': optimizer.ml_predictor.demand_history,
                         'model_version': optimizer.ml_predictor.model_version,
                         'feature_importance': optimizer.ml_predictor.feature_importance,
                         'training_samples': optimizer.ml_predictor.training_samples,
+                        # Save model weights if possible (convert to list)
+                        'model_weights': optimizer.ml_predictor._serialize_model(),
                     }
                 if optimizer.helium_dashboard:
                     state['helium_dashboard'] = {
                         'usage_history': optimizer.helium_dashboard.usage_history,
                         'total_helium_used': optimizer.helium_dashboard.total_helium_used,
                         'total_helium_saved': optimizer.helium_dashboard.total_helium_saved,
+                        'helium_usage': optimizer.helium_dashboard.helium_usage,
+                        'efficiency_scores': optimizer.helium_dashboard.efficiency_scores,
                     }
                 if optimizer.eviction_manager:
                     state['eviction_manager'] = {
                         'eviction_history': optimizer.eviction_manager.eviction_history,
                     }
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
+
+                # Serialize to JSON
+                json_str = json.dumps(state, default=str, indent=2)
+                compressed = zlib.compress(json_str.encode('utf-8'))
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'wb') as f:
+                        await f.write(compressed)
+                else:
+                    with open(self.path, 'wb') as f:
+                        f.write(compressed)
                 logger.info(f"Cold start state saved to {self.path}")
                 return True
             except Exception as e:
@@ -230,19 +429,48 @@ class ColdStartPersistenceManager:
                 return False
 
     async def load_state(self, optimizer: 'ColdStartOptimizer') -> bool:
+        """Load the optimizer state from disk."""
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
                 return False
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
+                if aiofiles:
+                    async with aiofiles.open(self.path, 'rb') as f:
+                        compressed = await f.read()
+                else:
+                    with open(self.path, 'rb') as f:
+                        compressed = f.read()
+                json_str = zlib.decompress(compressed).decode('utf-8')
+                state = json.loads(json_str)
 
-                # Restore main state
-                checkpoint_cache = state.get('checkpoint_cache', {})
-                optimizer.checkpoint_cache = OrderedDict(checkpoint_cache)
+                # Version check
+                version = state.get('version', '1.0.0')
+                if version != '3.2.0':
+                    logger.warning(f"State version mismatch: {version} != 3.2.0; attempting to load anyway")
+
+                # Restore checkpoint cache
+                cache_data = state.get('checkpoint_cache', {})
+                optimizer.checkpoint_cache = OrderedDict()
+                for k, v_data in cache_data.items():
+                    cp = ExpertCheckpoint(
+                        expert_id=v_data['expert_id'],
+                        expert_type=v_data['expert_type'],
+                        model_state=v_data['model_state'],
+                        optimizer_state=v_data['optimizer_state'],
+                        feature_distribution=v_data['feature_distribution'],
+                        performance_metrics=v_data['performance_metrics'],
+                        created_at=datetime.fromisoformat(v_data['created_at']),
+                        last_used=datetime.fromisoformat(v_data['last_used']),
+                        usage_count=v_data['usage_count'],
+                        carbon_footprint_kg=v_data['carbon_footprint_kg'],
+                        helium_usage_l=v_data['helium_usage_l'],
+                        sustainability_score=v_data['sustainability_score'],
+                        federated_consensus=v_data['federated_consensus'],
+                        peer_count=v_data['peer_count'],
+                    )
+                    optimizer.checkpoint_cache[k] = cp
+
                 optimizer.warmup_history = state.get('warmup_history', [])
                 optimizer.sustainability_score = state.get('sustainability_score', 0.0)
                 optimizer.cold_start_events = state.get('cold_start_events', [])
@@ -255,12 +483,15 @@ class ColdStartPersistenceManager:
                     optimizer.ml_predictor.model_version = ml_state.get('model_version', 0)
                     optimizer.ml_predictor.feature_importance = ml_state.get('feature_importance', {})
                     optimizer.ml_predictor.training_samples = ml_state.get('training_samples', 0)
+                    optimizer.ml_predictor._deserialize_model(ml_state.get('model_weights', {}))
 
                 he_state = state.get('helium_dashboard')
                 if he_state and optimizer.helium_dashboard:
                     optimizer.helium_dashboard.usage_history = he_state.get('usage_history', [])
                     optimizer.helium_dashboard.total_helium_used = he_state.get('total_helium_used', 0.0)
                     optimizer.helium_dashboard.total_helium_saved = he_state.get('total_helium_saved', 0.0)
+                    optimizer.helium_dashboard.helium_usage = he_state.get('helium_usage', {})
+                    optimizer.helium_dashboard.efficiency_scores = he_state.get('efficiency_scores', {})
 
                 ev_state = state.get('eviction_manager')
                 if ev_state and optimizer.eviction_manager:
@@ -275,13 +506,16 @@ class ColdStartPersistenceManager:
     async def delete_state(self):
         async with self._lock:
             if os.path.exists(self.path):
-                os.remove(self.path)
+                if aiofiles:
+                    await aiofiles.os.remove(self.path)
+                else:
+                    os.remove(self.path)
                 logger.info(f"Persistence file {self.path} deleted")
                 return True
             return False
 
 # ============================================================================
-# Federated Checkpoint Manager (Enhanced with compression & retry)
+# Federated Checkpoint Manager (Enhanced with unified circuit breaker)
 # ============================================================================
 
 class FederatedCheckpointManager:
@@ -297,16 +531,17 @@ class FederatedCheckpointManager:
         self.peer_checkpoints: Dict[str, Dict] = {}
         self.consensus_threshold = 0.6
         self._lock = asyncio.Lock()
-        self._session = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self.sync_history = deque(maxlen=1000)
         self.noise_scale = 0.001
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
 
         logger.info(f"Federated Checkpoint Manager initialized (ε={self.privacy_epsilon})")
 
-    async def _get_session(self):
+    async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None and self.server_url:
             self._session = aiohttp.ClientSession()
         return self._session
@@ -353,73 +588,66 @@ class FederatedCheckpointManager:
         if not self.server_url:
             return {'status': 'local'}
 
-        # Circuit breaker check
-        if self.circuit_open:
-            if datetime.utcnow() < self.circuit_open_until:
-                logger.warning("Circuit breaker open, skipping share")
-                return {'status': 'circuit_open'}
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
+        async def _do_share():
+            session = await self._get_session()
+            private = self._add_differential_privacy(checkpoint)
+            compressed = self._compress_checkpoint(private)
+            checkpoint_data = {
+                'expert_id': expert_id,
+                'checkpoint': compressed,
+                'performance': performance_metric,
+                'privacy_epsilon': self.privacy_epsilon,
+                'sparsity_ratio': self.sparsity_ratio,
+                'timestamp': datetime.utcnow().isoformat(),
+                'version': '1.0'
+            }
+            async with session.post(
+                f"{self.server_url}/federated/checkpoint",
+                json=checkpoint_data,
+                timeout=30
+            ) as response:
+                if response.status != 200:
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=f"API returned {response.status}"
+                    )
+                return await response.json()
 
-        for attempt in range(self.config.max_retries):
-            try:
-                async with self._lock:
-                    session = await self._get_session()
-                    private = self._add_differential_privacy(checkpoint)
-                    compressed = self._compress_checkpoint(private)
-                    checkpoint_data = {
-                        'expert_id': expert_id,
-                        'checkpoint': compressed,
-                        'performance': performance_metric,
-                        'privacy_epsilon': self.privacy_epsilon,
-                        'sparsity_ratio': self.sparsity_ratio,
-                        'timestamp': datetime.utcnow().isoformat(),
-                        'version': '1.0'
-                    }
-                    async with session.post(
-                        f"{self.server_url}/federated/checkpoint",
-                        json=checkpoint_data,
-                        timeout=30
-                    ) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            self.failure_count = 0
-                            logger.info(f"Shared checkpoint for {expert_id} with federation (ε={self.privacy_epsilon})")
-                            return result
-                        else:
-                            logger.warning(f"Checkpoint sharing failed (attempt {attempt+1}): {response.status}")
-            except Exception as e:
-                logger.error(f"Checkpoint sharing error (attempt {attempt+1}): {e}")
-            await asyncio.sleep(2 ** attempt)
-
-        self.failure_count += 1
-        if self.failure_count >= self.config.circuit_breaker_threshold:
-            self.circuit_open = True
-            self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-            logger.error("Circuit breaker opened for FederatedCheckpointManager")
-        return {'status': 'failed'}
+        try:
+            result = await self._circuit_breaker.call(_do_share)
+            logger.info(f"Shared checkpoint for {expert_id} with federation (ε={self.privacy_epsilon})")
+            return result
+        except Exception as e:
+            logger.error(f"Checkpoint sharing failed: {e}")
+            return {'status': 'failed'}
 
     async def get_peer_checkpoints(self, expert_id: str) -> List[Dict]:
         if not self.server_url:
             return []
-        for attempt in range(self.config.max_retries):
-            try:
-                async with self._lock:
-                    session = await self._get_session()
-                    async with session.get(
-                        f"{self.server_url}/federated/checkpoints/{expert_id}",
-                        timeout=30
-                    ) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            return data.get('checkpoints', [])
-                        else:
-                            logger.warning(f"Peer checkpoints fetch failed (attempt {attempt+1}): {response.status}")
-            except Exception as e:
-                logger.error(f"Peer checkpoints fetch error (attempt {attempt+1}): {e}")
-            await asyncio.sleep(2 ** attempt)
-        return []
+
+        async def _do_fetch():
+            session = await self._get_session()
+            async with session.get(
+                f"{self.server_url}/federated/checkpoints/{expert_id}",
+                timeout=30
+            ) as response:
+                if response.status != 200:
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=f"API returned {response.status}"
+                    )
+                data = await response.json()
+                return data.get('checkpoints', [])
+
+        try:
+            return await self._circuit_breaker.call(_do_fetch)
+        except Exception as e:
+            logger.error(f"Peer checkpoints fetch failed: {e}")
+            return []
 
     async def aggregate_checkpoints(
         self,
@@ -463,38 +691,44 @@ class FederatedCheckpointManager:
     async def sync_cache_with_peers(self, local_cache: Dict) -> Dict:
         if not self.server_url:
             return local_cache
-        for attempt in range(self.config.max_retries):
-            try:
-                async with self._lock:
-                    session = await self._get_session()
-                    cache_summary = {
-                        'expert_ids': list(local_cache.keys()),
-                        'size': len(local_cache),
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                    async with session.post(
-                        f"{self.server_url}/federated/cache/sync",
-                        json=cache_summary,
-                        timeout=30
-                    ) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            peer_experts = data.get('expert_ids', [])
-                            missing = [eid for eid in peer_experts if eid not in local_cache]
-                            for expert_id in missing:
-                                peer_cps = await self.get_peer_checkpoints(expert_id)
-                                if peer_cps:
-                                    aggregated = await self.aggregate_checkpoints(peer_cps)
-                                    if aggregated:
-                                        local_cache[expert_id] = aggregated
-                            logger.info(f"Cache sync completed: {len(missing)} experts added")
-                            return local_cache
-                        else:
-                            logger.warning(f"Cache sync failed (attempt {attempt+1}): {response.status}")
-            except Exception as e:
-                logger.error(f"Cache sync error (attempt {attempt+1}): {e}")
-            await asyncio.sleep(2 ** attempt)
-        return local_cache
+
+        async def _do_sync():
+            session = await self._get_session()
+            cache_summary = {
+                'expert_ids': list(local_cache.keys()),
+                'size': len(local_cache),
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            async with session.post(
+                f"{self.server_url}/federated/cache/sync",
+                json=cache_summary,
+                timeout=30
+            ) as response:
+                if response.status != 200:
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=f"API returned {response.status}"
+                    )
+                data = await response.json()
+                return data
+
+        try:
+            data = await self._circuit_breaker.call(_do_sync)
+            peer_experts = data.get('expert_ids', [])
+            missing = [eid for eid in peer_experts if eid not in local_cache]
+            for expert_id in missing:
+                peer_cps = await self.get_peer_checkpoints(expert_id)
+                if peer_cps:
+                    aggregated = await self.aggregate_checkpoints(peer_cps)
+                    if aggregated:
+                        local_cache[expert_id] = aggregated
+            logger.info(f"Cache sync completed: {len(missing)} experts added")
+            return local_cache
+        except Exception as e:
+            logger.error(f"Cache sync failed: {e}")
+            return local_cache
 
     def get_federated_stats(self) -> Dict:
         return {
@@ -504,7 +738,7 @@ class FederatedCheckpointManager:
             'privacy_epsilon': self.privacy_epsilon,
             'sparsity_ratio': self.sparsity_ratio,
             'last_sync': list(self.sync_history)[-1] if self.sync_history else None,
-            'circuit_open': self.circuit_open
+            'circuit_open': self._circuit_breaker.is_open
         }
 
     async def close(self):
@@ -512,7 +746,7 @@ class FederatedCheckpointManager:
             await self._session.close()
 
 # ============================================================================
-# ML Demand Predictor (Enhanced with online learning and better features)
+# ML Demand Predictor (Enhanced with persistence and thread offloading)
 # ============================================================================
 
 class MLDemandPredictor:
@@ -532,9 +766,10 @@ class MLDemandPredictor:
         self.model_version = 0
         self.samples_since_last_train = 0
         self.retrain_threshold = config.ml_retrain_threshold
-        self.model = None
+        self.model: Optional[SGDRegressor] = None
         self._ml_available = False
         self._init_model()
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     def _init_model(self):
         try:
@@ -550,6 +785,24 @@ class MLDemandPredictor:
             self._ml_available = True
         except ImportError:
             logger.warning("SGDRegressor not available; using fallback frequency-based prediction")
+
+    def _serialize_model(self) -> Dict:
+        """Serialize model weights for persistence."""
+        if not self._ml_available or self.model is None:
+            return {}
+        return {
+            'coef_': self.model.coef_.tolist() if hasattr(self.model, 'coef_') else [],
+            'intercept_': self.model.intercept_.tolist() if hasattr(self.model, 'intercept_') else 0.0,
+        }
+
+    def _deserialize_model(self, weights: Dict):
+        """Deserialize model weights from persistence."""
+        if not self._ml_available or self.model is None or not weights:
+            return
+        if 'coef_' in weights:
+            self.model.coef_ = np.array(weights['coef_'])
+        if 'intercept_' in weights:
+            self.model.intercept_ = np.array(weights['intercept_'])
 
     def record_demand(self, expert_id: str, timestamp: datetime, context: Dict = None):
         self.demand_history.append({
@@ -572,8 +825,12 @@ class MLDemandPredictor:
             if len(recent_data) > 10:
                 X, y = self._prepare_training_data(recent_data)
                 if len(X) > 0:
-                    X_scaled = self.scaler.transform(X)
-                    self.model.partial_fit(X_scaled, y)
+                    # Offload scaling and training to thread
+                    def train():
+                        X_scaled = self.scaler.fit_transform(X) if not self.scaler.mean_ else self.scaler.transform(X)
+                        self.model.partial_fit(X_scaled, y)
+                        return True
+                    await asyncio.to_thread(train)
                     self.model_version += 1
                     self.samples_since_last_train = 0
                     logger.info(f"Online learning update complete (version {self.model_version})")
@@ -627,7 +884,7 @@ class MLDemandPredictor:
         features['hours_since_last'] = min(hours_since_last / 24.0, 1.0)
         return features
 
-    async def train_model(self):
+    async def train_model(self) -> Dict:
         if len(self.demand_history) < 50:
             return {'status': 'insufficient_data', 'samples': len(self.demand_history)}
         if not self._ml_available:
@@ -635,10 +892,14 @@ class MLDemandPredictor:
         X, y = self._prepare_training_data(self.demand_history)
         if len(X) < 20:
             return {'status': 'insufficient_training_data', 'samples': len(X)}
-        X_scaled = self.scaler.fit_transform(X)
-        # Train with multiple passes
-        for _ in range(5):
-            self.model.partial_fit(X_scaled, y)
+
+        def train():
+            X_scaled = self.scaler.fit_transform(X)
+            for _ in range(5):
+                self.model.partial_fit(X_scaled, y)
+            return True
+
+        await asyncio.to_thread(train)
         self.is_trained = True
         self.training_samples = len(X)
         self.model_version += 1
@@ -655,8 +916,11 @@ class MLDemandPredictor:
         for expert_id in experts:
             features = self._extract_features(expert_id, now)
             features_array = np.array([list(features.values())])
-            features_scaled = self.scaler.transform(features_array)
-            pred = self.model.predict(features_scaled)[0]
+            def predict():
+                features_scaled = self.scaler.transform(features_array)
+                pred = self.model.predict(features_scaled)[0]
+                return pred
+            pred = await asyncio.to_thread(predict)
             predictions[expert_id] = max(0.0, min(1.0, pred))
         return predictions
 
@@ -683,8 +947,11 @@ class MLDemandPredictor:
             'ml_available': self._ml_available,
         }
 
+    async def close(self):
+        self._executor.shutdown(wait=True)
+
 # ============================================================================
-# Carbon-Aware Strategy Selector (Enhanced with configurable weights & caching)
+# Carbon-Aware Strategy Selector (Enhanced: async)
 # ============================================================================
 
 class CarbonAwareStrategySelector:
@@ -699,67 +966,52 @@ class CarbonAwareStrategySelector:
         self.strategy_history = deque(maxlen=1000)
         self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
         self.api_endpoint = "https://api.electricitymap.org/v3"
-        self._session = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self.cache = {}
-        self.last_update = None
+        self.last_update: Optional[datetime] = None
         self.update_interval = 300
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
 
         logger.info("Carbon-Aware Strategy Selector initialized with real-time API")
 
-    async def _get_session(self):
+    async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def get_realtime_carbon_intensity(self, region: str = "US-CAL-CISO") -> float:
         """Get real-time carbon intensity with retry and circuit breaker."""
-        if self.circuit_open:
-            if datetime.utcnow() < self.circuit_open_until:
-                logger.warning("Circuit breaker open, using fallback")
-                return self._get_fallback_intensity()
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
+
+        async def _do_fetch():
+            session = await self._get_session()
+            url = f"{self.api_endpoint}/carbon-intensity/latest?zone={region}"
+            headers = {'auth-token': self.api_key} if self.api_key else {}
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status != 200:
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=f"API returned {response.status}"
+                    )
+                data = await response.json()
+                return data.get('carbonIntensity', 400)
 
         cache_key = f"{region}_{datetime.utcnow().hour}"
         if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < self.update_interval:
             return self.cache[cache_key]
 
-        for attempt in range(self.config.max_retries):
-            try:
-                session = await self._get_session()
-                url = f"{self.api_endpoint}/carbon-intensity/latest?zone={region}"
-                headers = {'auth-token': self.api_key} if self.api_key else {}
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        intensity = data.get('carbonIntensity', 400)
-                        self.cache[cache_key] = intensity
-                        self.last_update = datetime.utcnow()
-                        self.failure_count = 0
-                        return intensity
-                    else:
-                        logger.warning(f"Carbon API returned {response.status}, attempt {attempt+1}")
-                        if attempt == self.config.max_retries - 1:
-                            self.failure_count += 1
-                            if self.failure_count >= self.config.circuit_breaker_threshold:
-                                self.circuit_open = True
-                                self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                            return self._get_fallback_intensity()
-                        await asyncio.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
-                if attempt == self.config.max_retries - 1:
-                    self.failure_count += 1
-                    if self.failure_count >= self.config.circuit_breaker_threshold:
-                        self.circuit_open = True
-                        self.circuit_open_until = datetime.utcnow() + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                    return self._get_fallback_intensity()
-                await asyncio.sleep(2 ** attempt)
-        return self._get_fallback_intensity()
+        try:
+            intensity = await self._circuit_breaker.call(_do_fetch)
+            self.cache[cache_key] = intensity
+            self.last_update = datetime.utcnow()
+            return intensity
+        except Exception as e:
+            logger.warning(f"Carbon API error: {e}, using fallback")
+            return self._get_fallback_intensity()
 
     def _get_fallback_intensity(self) -> float:
         # Simulate diurnal pattern
@@ -768,7 +1020,7 @@ class CarbonAwareStrategySelector:
         diurnal = 50 * np.sin((hour - 8) / 12 * np.pi)
         return max(200, min(500, base + diurnal))
 
-    def select_strategy(
+    async def select_strategy(
         self,
         strategies: Dict[str, Any],
         carbon_intensity: Optional[float] = None,
@@ -776,16 +1028,7 @@ class CarbonAwareStrategySelector:
         carbon_budget: float = None
     ) -> str:
         if carbon_intensity is None:
-            # Try to get from API synchronously (might fail, fallback)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # In async context, create task and wait
-                    carbon_intensity = asyncio.run(self.get_realtime_carbon_intensity())
-                else:
-                    carbon_intensity = self._get_fallback_intensity()
-            except:
-                carbon_intensity = self._get_fallback_intensity()
+            carbon_intensity = await self.get_realtime_carbon_intensity()
 
         # Determine carbon regime
         if carbon_intensity > self.carbon_intensity_thresholds['high']:
@@ -870,7 +1113,7 @@ class CarbonAwareStrategySelector:
             await self._session.close()
 
 # ============================================================================
-# Helium Efficiency Dashboard (Enhanced with better forecasting)
+# Helium Efficiency Dashboard (Enhanced with persistence)
 # ============================================================================
 
 class HeliumEfficiencyDashboard:
@@ -888,9 +1131,9 @@ class HeliumEfficiencyDashboard:
         self.usage_history: List[Dict] = []
         self.forecast_model = None
         self.forecast_trained = False
-        self.alpha = 0.3  # smoothing factor for exponential smoothing
+        self.alpha = 0.3
 
-        logger.info("Helium Efficiency Dashboard initialized with exponential smoothing")
+        logger.info("Helium Efficiency Dashboard initialized")
 
     async def record_helium_usage(
         self,
@@ -914,7 +1157,6 @@ class HeliumEfficiencyDashboard:
                 'expert_id': expert_id,
                 'operation': operation
             })
-            # Train forecast if enough data
             if len(self.usage_history) > 20:
                 self._train_forecast()
             logger.debug(f"Helium usage recorded: {expert_id} = {amount_l}L ({operation})")
@@ -923,7 +1165,6 @@ class HeliumEfficiencyDashboard:
         """Train helium usage forecast model using exponential smoothing."""
         if len(self.usage_history) < 20:
             return
-        # Simple exponential smoothing
         values = [h['amount_l'] for h in self.usage_history[-50:]]
         if not values:
             return
@@ -931,7 +1172,6 @@ class HeliumEfficiencyDashboard:
         for v in values[1:]:
             smoothed = self.alpha * v + (1 - self.alpha) * smoothed
         self.forecast_trained = True
-        # Store the smoothed value as forecast
         self._last_smoothed = smoothed
         self._last_values = values
 
@@ -941,13 +1181,12 @@ class HeliumEfficiencyDashboard:
                 'status': 'not_trained',
                 'prediction': self.total_helium_used / max(len(self.usage_history), 1) * hours
             }
-        # Simple projection: average of recent values
         recent = [h['amount_l'] for h in self.usage_history[-min(20, len(self.usage_history)):]]
         hourly_avg = np.mean(recent) if recent else 0.0
         total_predicted = hourly_avg * hours
         return {
             'status': 'success',
-            'predictions': [hourly_avg] * hours,  # flat prediction
+            'predictions': [hourly_avg] * hours,
             'total_predicted_usage': total_predicted,
             'hourly_average': hourly_avg,
             'confidence': 0.7 if len(self.usage_history) > 50 else 0.5,
@@ -1018,7 +1257,7 @@ class HeliumEfficiencyDashboard:
         return recommendations or ["Helium usage is within acceptable ranges"]
 
 # ============================================================================
-# Intelligent Eviction Manager (Enhanced with configurable weights)
+# Intelligent Eviction Manager (Enhanced)
 # ============================================================================
 
 class IntelligentEvictionManager:
@@ -1087,7 +1326,7 @@ class IntelligentEvictionManager:
         }
 
 # ============================================================================
-# Data Classes (Enhanced)
+# Data Classes
 # ============================================================================
 
 @dataclass
@@ -1129,31 +1368,16 @@ class WarmupStrategy:
 
 class ColdStartOptimizer:
     """
-    Enhanced Cold Start Optimizer v3.1.0 with configuration, persistence, and telemetry.
+    Enhanced Cold Start Optimizer v3.2.0 with configuration, persistence, and telemetry.
     """
 
     def __init__(self, config: Optional[ColdStartConfig] = None, **kwargs):
         # If config is provided, use it; otherwise build from kwargs for backward compatibility
         if config is None:
-            config = ColdStartConfig(
-                cache_size=kwargs.get('cache_size', 100),
-                preload_threshold=kwargs.get('preload_threshold', 0.7),
-                checkpoint_dir=kwargs.get('checkpoint_dir', "./expert_checkpoints"),
-                federated_server_url=kwargs.get('federated_server_url', None),
-                enable_federated=kwargs.get('enable_federated', True),
-                enable_ml_demand=kwargs.get('enable_ml_demand', True),
-                enable_carbon_aware=kwargs.get('enable_carbon_aware', True),
-                enable_helium_tracking=kwargs.get('enable_helium_tracking', True),
-                privacy_epsilon=kwargs.get('privacy_epsilon', 1.0),
-                enable_online_learning=kwargs.get('enable_online_learning', True),
-                enable_realtime_carbon_api=kwargs.get('enable_realtime_carbon_api', True),
-                enable_predictive_helium=kwargs.get('enable_predictive_helium', True),
-                enable_intelligent_eviction=kwargs.get('enable_intelligent_eviction', True),
-                enable_persistence=kwargs.get('enable_persistence', True),
-                enable_telemetry=kwargs.get('enable_telemetry', True),
-                max_retries=kwargs.get('max_retries', 3),
-                persistence_path=kwargs.get('persistence_path', "cold_start_state.pkl"),
-            )
+            config = ColdStartConfig(**{
+                k: v for k, v in kwargs.items()
+                if k in ColdStartConfig.__annotations__
+            })
         self.config = config
 
         self.cache_size = config.cache_size
@@ -1170,6 +1394,11 @@ class ColdStartOptimizer:
         self.enable_persistence = config.enable_persistence
         self.enable_telemetry = config.enable_telemetry
 
+        # Concurrency locks
+        self._cache_lock = asyncio.Lock()
+        self._history_lock = asyncio.Lock()
+        self._similarity_lock = asyncio.Lock()
+
         # Initialize sub-modules with config
         self.federated_manager = FederatedCheckpointManager(config) if self.enable_federated else None
         self.ml_predictor = MLDemandPredictor(config) if self.enable_ml_demand else None
@@ -1179,7 +1408,7 @@ class ColdStartOptimizer:
 
         # Persistence and telemetry
         self.persistence = ColdStartPersistenceManager(config) if self.enable_persistence else None
-        self.telemetry = ColdStartTelemetry() if self.enable_telemetry else None
+        self.telemetry = ColdStartTelemetry(config) if self.enable_telemetry else None
 
         # Expert checkpoint cache (LRU)
         self.checkpoint_cache: OrderedDict[str, ExpertCheckpoint] = OrderedDict()
@@ -1196,7 +1425,7 @@ class ColdStartOptimizer:
         self.cold_start_events: List[Dict] = []
         self.sustainability_score = 0.0
 
-        # Thread pool for background tasks
+        # Thread pool for background tasks (if any CPU-bound)
         self.executor = ThreadPoolExecutor(max_workers=4)
 
         # Start background preloader
@@ -1206,7 +1435,7 @@ class ColdStartOptimizer:
         if self.enable_persistence and self.persistence:
             asyncio.create_task(self._load_state())
 
-        logger.info(f"Enhanced Cold Start Optimizer v3.1.0 initialized with cache size {self.cache_size}")
+        logger.info(f"Enhanced Cold Start Optimizer v3.2.0 initialized with cache size {self.cache_size}")
 
     def _initialize_strategies(self):
         self.warmup_strategies = {
@@ -1259,16 +1488,18 @@ class ColdStartOptimizer:
                     predictions = await self.ml_predictor.predict_demand(horizon_minutes=5)
 
                 # Preload high-probability experts
-                for expert_id, probability in predictions.items():
-                    if probability > self.preload_threshold:
-                        if expert_id not in self.checkpoint_cache:
-                            await self.preload_expert(expert_id)
+                async with self._cache_lock:
+                    for expert_id, probability in predictions.items():
+                        if probability > self.preload_threshold:
+                            if expert_id not in self.checkpoint_cache:
+                                await self.preload_expert(expert_id)
 
                 # Federated cache sync
                 if self.enable_federated and self.federated_manager:
-                    self.checkpoint_cache = await self.federated_manager.sync_cache_with_peers(
-                        self.checkpoint_cache
-                    )
+                    async with self._cache_lock:
+                        self.checkpoint_cache = await self.federated_manager.sync_cache_with_peers(
+                            self.checkpoint_cache
+                        )
 
                 # Intelligent eviction
                 if self.enable_intelligent_eviction and self.eviction_manager:
@@ -1277,22 +1508,27 @@ class ColdStartOptimizer:
                         candidates = await self.eviction_manager.select_eviction_candidates(
                             self.checkpoint_cache, predictions, num_to_evict
                         )
-                        for expert_id in candidates:
-                            if expert_id in self.checkpoint_cache:
-                                del self.checkpoint_cache[expert_id]
-                                logger.info(f"Intelligently evicted {expert_id}")
-                                self.eviction_manager.eviction_history.append({
-                                    'expert_id': expert_id,
-                                    'timestamp': datetime.utcnow().isoformat()
-                                })
+                        async with self._cache_lock:
+                            for expert_id in candidates:
+                                if expert_id in self.checkpoint_cache:
+                                    del self.checkpoint_cache[expert_id]
+                                    logger.info(f"Intelligently evicted {expert_id}")
+                                    self.eviction_manager.eviction_history.append({
+                                        'expert_id': expert_id,
+                                        'timestamp': datetime.utcnow().isoformat()
+                                    })
 
                 # Clean old checkpoints
                 await self._cleanup_checkpoints()
 
                 # Telemetry
                 if self.telemetry:
-                    self.telemetry.gauge('cache_size', len(self.checkpoint_cache))
-                    self.telemetry.gauge('hit_rate', self._calculate_hit_rate())
+                    async with self._cache_lock:
+                        self.telemetry.gauge('cs_cache_size', len(self.checkpoint_cache))
+                        self.telemetry.gauge('cs_hit_rate', self._calculate_hit_rate())
+                        self.telemetry.gauge('cs_sustainability_score', self.sustainability_score)
+                        self.telemetry.gauge('cs_carbon_saved_kg', self._calculate_carbon_saved())
+                        self.telemetry.gauge('cs_time_saved_ms', self._calculate_time_saved())
 
                 await asyncio.sleep(60)
             except Exception as e:
@@ -1362,7 +1598,7 @@ class ColdStartOptimizer:
 
         # Select carbon-aware strategy
         if self.enable_carbon_aware and self.strategy_selector:
-            selected_strategy = self.strategy_selector.select_strategy(
+            selected_strategy = await self.strategy_selector.select_strategy(
                 self.warmup_strategies,
                 carbon_intensity,
                 urgency,
@@ -1392,24 +1628,27 @@ class ColdStartOptimizer:
                 )
 
         # Step 1: Check cache for existing checkpoint
-        if expert_id in self.checkpoint_cache:
-            logger.info(f"Cache hit for {expert_id}")
-            checkpoint = self.checkpoint_cache[expert_id]
-            checkpoint.last_used = datetime.utcnow()
-            checkpoint.usage_count += 1
-            self.checkpoint_cache.move_to_end(expert_id)
-            checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(checkpoint)
-            return await self._load_from_checkpoint(checkpoint, max_latency_ms)
+        async with self._cache_lock:
+            if expert_id in self.checkpoint_cache:
+                logger.info(f"Cache hit for {expert_id}")
+                checkpoint = self.checkpoint_cache[expert_id]
+                checkpoint.last_used = datetime.utcnow()
+                checkpoint.usage_count += 1
+                self.checkpoint_cache.move_to_end(expert_id)
+                checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(checkpoint)
+                return await self._load_from_checkpoint(checkpoint, max_latency_ms)
 
         # Step 2: Try transfer learning from similar expert
         similar_expert = self._find_similar_expert(expert_id, expert_type)
         if similar_expert and similar_expert in self.checkpoint_cache:
-            logger.info(f"Transfer learning from {similar_expert} to {expert_id}")
-            return await self._transfer_initialize(
-                expert_id, expert_type,
-                self.checkpoint_cache[similar_expert],
-                max_latency_ms
-            )
+            async with self._cache_lock:
+                source_checkpoint = self.checkpoint_cache[similar_expert]
+                logger.info(f"Transfer learning from {similar_expert} to {expert_id}")
+                return await self._transfer_initialize(
+                    expert_id, expert_type,
+                    source_checkpoint,
+                    max_latency_ms
+                )
 
         # Step 3: Check federated checkpoints
         if self.enable_federated and self.federated_manager:
@@ -1434,7 +1673,8 @@ class ColdStartOptimizer:
                         federated_consensus=True,
                         peer_count=len(peer_cps)
                     )
-                    self._add_to_cache(expert_id, checkpoint)
+                    async with self._cache_lock:
+                        self._add_to_cache(expert_id, checkpoint)
                     return await self._load_from_checkpoint(checkpoint, max_latency_ms)
 
         # Step 4: Progressive initialization with selected strategy
@@ -1472,13 +1712,14 @@ class ColdStartOptimizer:
         load_time = (datetime.utcnow() - load_start).total_seconds() * 1000
         checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(checkpoint)
 
-        self.warmup_history.append({
-            'expert_id': checkpoint.expert_id,
-            'method': 'checkpoint',
-            'load_time_ms': load_time,
-            'sustainability_score': checkpoint.sustainability_score,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        async with self._history_lock:
+            self.warmup_history.append({
+                'expert_id': checkpoint.expert_id,
+                'method': 'checkpoint',
+                'load_time_ms': load_time,
+                'sustainability_score': checkpoint.sustainability_score,
+                'timestamp': datetime.utcnow().isoformat()
+            })
 
         if load_time > max_latency_ms:
             logger.warning(f"Checkpoint load exceeded latency budget: {load_time:.2f}ms > {max_latency_ms}ms")
@@ -1527,16 +1768,19 @@ class ColdStartOptimizer:
             carbon_footprint_kg=source_checkpoint.carbon_footprint_kg * 0.8
         )
         target_checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(target_checkpoint)
-        self._add_to_cache(target_id, target_checkpoint)
 
-        self.warmup_history.append({
-            'expert_id': target_id,
-            'method': 'transfer_learning',
-            'source_expert': source_checkpoint.expert_id,
-            'transfer_time_ms': transfer_time,
-            'sustainability_score': target_checkpoint.sustainability_score,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        async with self._cache_lock:
+            self._add_to_cache(target_id, target_checkpoint)
+
+        async with self._history_lock:
+            self.warmup_history.append({
+                'expert_id': target_id,
+                'method': 'transfer_learning',
+                'source_expert': source_checkpoint.expert_id,
+                'transfer_time_ms': transfer_time,
+                'sustainability_score': target_checkpoint.sustainability_score,
+                'timestamp': datetime.utcnow().isoformat()
+            })
 
         return {
             'expert_id': target_id,
@@ -1603,16 +1847,19 @@ class ColdStartOptimizer:
                 'performance_metrics': {'expected_accuracy': full_capability['accuracy']}
             })
         )
-        self._add_to_cache(expert_id, checkpoint)
 
-        self.warmup_history.append({
-            'expert_id': expert_id,
-            'method': 'progressive',
-            'strategy': strategy_type,
-            'total_time_ms': total_time,
-            'sustainability_score': checkpoint.sustainability_score,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        async with self._cache_lock:
+            self._add_to_cache(expert_id, checkpoint)
+
+        async with self._history_lock:
+            self.warmup_history.append({
+                'expert_id': expert_id,
+                'method': 'progressive',
+                'strategy': strategy_type,
+                'total_time_ms': total_time,
+                'sustainability_score': checkpoint.sustainability_score,
+                'timestamp': datetime.utcnow().isoformat()
+            })
 
         return {
             'expert_id': expert_id,
@@ -1639,7 +1886,7 @@ class ColdStartOptimizer:
         return 0.5 * carbon_score + 0.5 * performance_score
 
     # ============================================================================
-    # Helper Methods (Preserved)
+    # Helper Methods
     # ============================================================================
 
     def _initialize_model_state(self, expert_id: str, expert_config: Optional[Dict]) -> Dict:
@@ -1684,8 +1931,9 @@ class ColdStartOptimizer:
         return adapted_state
 
     def _find_similar_expert(self, expert_id: str, expert_type: str) -> Optional[str]:
-        if not self.checkpoint_cache:
-            return None
+        async with self._cache_lock:
+            if not self.checkpoint_cache:
+                return None
         best_similarity = 0.0
         best_expert = None
         for cached_id, checkpoint in self.checkpoint_cache.items():
@@ -1712,18 +1960,23 @@ class ColdStartOptimizer:
     def _add_to_cache(self, expert_id: str, checkpoint: ExpertCheckpoint):
         if len(self.checkpoint_cache) >= self.cache_size:
             if self.enable_intelligent_eviction and self.eviction_manager:
-                predictions = {}
-                if self.enable_ml_demand and self.ml_predictor:
-                    predictions = asyncio.run(self.ml_predictor.predict_demand())
-                eviction_candidates = asyncio.run(
-                    self.eviction_manager.select_eviction_candidates(
+                # Use async but we are inside a lock already (called with lock held)
+                # We'll run the eviction synchronously; we need to ensure we have a running event loop
+                # Since we are called from async context, we can use asyncio.run or create_task, but we are in async.
+                # Instead, we'll schedule a background task for eviction
+                async def evict():
+                    predictions = {}
+                    if self.enable_ml_demand and self.ml_predictor:
+                        predictions = await self.ml_predictor.predict_demand()
+                    candidates = await self.eviction_manager.select_eviction_candidates(
                         self.checkpoint_cache, predictions, 1
                     )
-                )
-                if eviction_candidates:
-                    oldest_id = eviction_candidates[0]
-                    self.checkpoint_cache.pop(oldest_id, None)
-                    logger.info(f"Intelligently evicted {oldest_id} from cache")
+                    if candidates:
+                        oldest_id = candidates[0]
+                        self.checkpoint_cache.pop(oldest_id, None)
+                        logger.info(f"Intelligently evicted {oldest_id} from cache")
+                # Since we are in an async context, we can create_task
+                asyncio.create_task(evict())
             else:
                 oldest_id, _ = self.checkpoint_cache.popitem(last=False)
                 logger.info(f"Evicted {oldest_id} from cache (LRU)")
@@ -1744,10 +1997,11 @@ class ColdStartOptimizer:
     async def _cleanup_checkpoints(self):
         now = datetime.utcnow()
         max_age = timedelta(hours=24)
-        expired = [eid for eid, cp in self.checkpoint_cache.items() if now - cp.last_used > max_age]
-        for eid in expired:
-            del self.checkpoint_cache[eid]
-            logger.info(f"Cleaned up expired checkpoint: {eid}")
+        async with self._cache_lock:
+            expired = [eid for eid, cp in self.checkpoint_cache.items() if now - cp.last_used > max_age]
+            for eid in expired:
+                del self.checkpoint_cache[eid]
+                logger.info(f"Cleaned up expired checkpoint: {eid}")
 
     # ============================================================================
     # Statistics Methods (Enhanced)
@@ -1815,13 +2069,14 @@ class ColdStartOptimizer:
 
     async def preload_expert(self, expert_id: str, expert_config: Optional[Dict] = None) -> bool:
         try:
-            if expert_id in self.checkpoint_cache:
-                logger.debug(f"Expert {expert_id} already cached")
+            async with self._cache_lock:
+                if expert_id in self.checkpoint_cache:
+                    logger.debug(f"Expert {expert_id} already cached")
+                    return True
+                checkpoint = await self._create_checkpoint(expert_id, expert_config)
+                self._add_to_cache(expert_id, checkpoint)
+                logger.info(f"Preloaded expert {expert_id} into cache")
                 return True
-            checkpoint = await self._create_checkpoint(expert_id, expert_config)
-            self._add_to_cache(expert_id, checkpoint)
-            logger.info(f"Preloaded expert {expert_id} into cache")
-            return True
         except Exception as e:
             logger.error(f"Failed to preload expert {expert_id}: {e}")
             return False
@@ -1906,6 +2161,8 @@ class ColdStartOptimizer:
             await self.federated_manager.close()
         if self.strategy_selector:
             await self.strategy_selector.close()
+        if self.ml_predictor:
+            await self.ml_predictor.close()
         self.executor.shutdown(wait=True)
         logger.info("Shutdown complete")
 
