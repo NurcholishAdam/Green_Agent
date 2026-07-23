@@ -1931,6 +1931,15 @@ async def main():
             logger.info("Received interrupt signal")
         except Exception as e:
             logger.error(f"Runtime error: {e}")
+from material_lca import create_material_lca_integration
+
+# Pass your existing NodeRegistry instance
+integration = create_material_lca_integration(your_node_registry)
+
+# Access components
+lca_client = integration["lca_client"]
+simulator = integration["simulator"]
+cost_function = integration["cost_function"]
 
 if __name__ == "__main__":
     try:
