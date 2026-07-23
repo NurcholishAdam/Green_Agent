@@ -876,6 +876,28 @@ class HeliumDeFiIntegration:
         self._initialize_protocols()
         logger.info("HeliumDeFiIntegration initialized")
 
+class BlockchainCarbonCredits:
+    # Add to BlockchainCarbonCredits class
+
+async def mint_credit_token(self, project_id: str, amount_kg: float, owner: str) -> Dict:
+    """
+    Mint a new carbon credit token on blockchain.
+    Returns dict with tx_hash and block_number.
+    """
+    # Use web3 to call your smart contract
+    # Example:
+    tx_hash = self.web3.eth.send_transaction(...)
+    return {'tx_hash': tx_hash.hex(), 'block_number': receipt.blockNumber}
+
+    if self.blockchain:
+    blockchain_result = await self.blockchain.mint_credit_token(
+        project_id=request.project_id,
+        amount_kg=request.amount_kg,
+        owner=self.config.get('default_owner', 'green_agent')
+    )
+    tx.blockchain_tx_hash = blockchain_result['tx_hash']
+
+    
     def _initialize_protocols(self):
         # Stubs for DeFi protocols – replace with actual integrations
         class AaveIntegrationStub:
