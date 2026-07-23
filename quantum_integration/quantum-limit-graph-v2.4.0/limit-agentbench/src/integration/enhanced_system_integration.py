@@ -250,7 +250,29 @@ await adaptive_cost.start_validation_loop(interval_seconds=3600)
         # Wait a bit to let evolution run (optional)
         await asyncio.sleep(10)
 
+    # Example usage in integration
 
+async def simulate_policy(policy_config: Dict[str, Any]):
+    generator = SyntheticDataGenerator()
+    dataset = generator.generate_dataset(num_tasks=500, include_edge_cases=True)
+    exported = generator.export_for_simulation(dataset)
+
+    # Assume digital_twin has a simulate_routing method that takes a dataset
+    results = await digital_twin.simulate_routing(exported, policy_config)
+    return results
+
+# In your MLOps pipeline
+
+async def train_expert_on_synthetic_data(domain: str, num_samples: int = 1000):
+    generator = SyntheticDataGenerator()
+    # Generate tasks of a specific type
+    tasks = generator.generate_task_batch(
+        num_samples,
+        task_type=domain,
+        priority='balanced'
+    )
+    # Prepare training data (e.g., text + labels)
+    # ... call MLOpsPipeline.train_expert() ...
 
 async def main():
     # Load configuration (could be from environment, file, etc.)
