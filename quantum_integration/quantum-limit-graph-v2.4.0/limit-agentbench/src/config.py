@@ -41,6 +41,15 @@ class GreenAgentConfig(BaseSettings):
     asyncio.create_task(marketplace.start_auto_offset_loop())
 
 # Store marketplace instance globally for use in API or routing decisions
+
+    from explainable_ui import create_explainable_ui
+
+    ui = create_explainable_ui()
+    dashboard = ui["dashboard"]
+    api_ext = ui["api_extension"]
+
+# Register the API routes on your existing FastAPI/Flask app
+    api_ext.register_routes(Green_Agent)
     
     class Config:
         env_prefix = "GREEN_AGENT_"
