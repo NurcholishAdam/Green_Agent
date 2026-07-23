@@ -1948,6 +1948,11 @@ system = create_anomaly_detection_system(config=your_config)
 detector = system["detector"]
 telemetry = system["telemetry_collector"]
 
+from predictive_maintenance import create_predictive_maintenance_system
+
+system = create_predictive_maintenance_system(config=your_config)
+engine = system["engine"]
+engine.update_node(node_id, flops, energy_joules)
 
 if __name__ == "__main__":
     try:
