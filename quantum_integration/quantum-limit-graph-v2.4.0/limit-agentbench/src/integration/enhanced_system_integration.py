@@ -34,7 +34,8 @@ from src.enhancements.tokenization_optimizer import TokenizationOptimizer
 from src.enhancements.expert_router_harvester import ExpertRouterWithHarvester
 from src.enhancements.adaptive_cost_function import AdaptiveCostFunction
 from src.enhancements.feedback_collector import FeedbackCollector
-
+from src.enhancements.pareto_router import ParetoRouter
+from src.user_preferences import UserPreferences
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ class EnhancedSystemIntegrator:
         self.router = ExpertRouter(self.config.get('router', {}))
 
         logger.info("Core components initialised.")
+        adaptive_cost = AdaptiveCostFunction(...)
 
     # 1. Create adaptive cost function
         cost_config = {
@@ -166,7 +168,22 @@ await adaptive_cost.start_validation_loop(interval_seconds=3600)
         # Use the enhanced router from now on
         self.router = self.enhanced_router
 
-        # 4. Tokenization Optimizer
+        
+        pareto_router = ParetoRouter(
+        config=router_config,
+        cost_function=adaptive_cost,
+        node_registry=node_registry,
+        user_preferences=user_prefs
+    )
+        pareto_router.registry = registry
+
+    # Use pareto_router for all routing calls
+    #Example: get frontier for visualisation
+     
+        frontier = await pareto_router.get_frontier(task, context)
+        logger.info(f"Pareto frontier: {frontier}")
+       
+# 4. Tokenization Optimizer
         token_config = self.config.get('tokenization', {})
         self.token_optimizer = TokenizationOptimizer(token_config)
 
@@ -194,6 +211,16 @@ await adaptive_cost.start_validation_loop(interval_seconds=3600)
         )
 
         logger.info("All enhancements set up and started.")
+
+        user_prefs = UserPreferences({
+        'alpha': 0.5,
+        'beta': 2.0,
+        'gamma': 0.5,
+        'delta': 0.3,
+        'epsilon': 0.1,
+        'zeta': -0.1
+    })
+        
 
     async def shutdown(self):
         """Gracefully shut down all enhanced components."""
