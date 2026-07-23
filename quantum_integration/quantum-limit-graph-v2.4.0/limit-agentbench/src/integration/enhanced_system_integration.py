@@ -32,6 +32,9 @@ from src.enhancements.sustainability_cost import SustainabilityCostFunction
 from src.enhancements.node_registry import NodeRegistry
 from src.enhancements.tokenization_optimizer import TokenizationOptimizer
 from src.enhancements.expert_router_harvester import ExpertRouterWithHarvester
+from src.enhancements.adaptive_cost_function import AdaptiveCostFunction
+from src.enhancements.feedback_collector import FeedbackCollector
+
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,47 @@ class EnhancedSystemIntegrator:
 
         logger.info("Core components initialised.")
 
+    # 1. Create adaptive cost function
+        cost_config = {
+        'alpha': 1.0, 'beta': 2.0, 'gamma': 0.5, 'delta': 0.3,
+        'epsilon': 0.1, 'zeta': -0.1,
+        'learning_rate': 0.01,
+        'normalisation_window': 1000,
+        'mae_threshold': 1.0,
+        'rollback_enabled': True
+    }
+        adaptive_cost = AdaptiveCostFunction(cost_config)
+        adaptive_cost.inject_dependencies(
+        db_manager=db_manager,
+        registry=registry,
+        carbon_manager=carbon_manager,
+        helium_dashboard=helium_dashboard,
+        node_registry=node_registry
+    )
+
+# 2. Start validation loop
+await adaptive_cost.start_validation_loop(interval_seconds=3600)
+
+    # 3. Create feedback collector
+    feedback_collector = FeedbackCollector(
+    cost_function=adaptive_cost,
+    registry=registry
+    )
+
+# 4. In your router, after executing a task, call:
+# await feedback_collector.record(
+#     request_id=request_id,
+#     expert_id=selected_expert.expert_id,
+#     node_id=node_id,
+#     actual_energy_joules=measured_energy,
+#     actual_carbon_kg=measured_carbon,
+#     actual_helium_units=measured_helium,
+#     actual_latency_ms=measured_latency,
+#     actual_accuracy=measured_accuracy,
+# )
+
+# 5. On shutdown:
+# await adaptive_cost.stop()
     async def setup_enhancements(self):
         """Create and inject all enhanced modules."""
         logger.info("Setting up enhancements...")
@@ -178,6 +222,7 @@ class EnhancedSystemIntegrator:
 
         # Wait a bit to let evolution run (optional)
         await asyncio.sleep(10)
+
 
 
 async def main():
