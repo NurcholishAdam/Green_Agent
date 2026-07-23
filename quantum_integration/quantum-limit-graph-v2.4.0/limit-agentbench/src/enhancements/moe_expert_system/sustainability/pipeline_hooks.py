@@ -20,3 +20,25 @@ class MLOpsPipelineExtension:
                 print(f"[SUSTAINABILITY] Expert {expert_id} compressed. New Energy: {profile.energy_per_inference_compressed:.4f} J")
             else:
                 print(f"[SUSTAINABILITY] Expert {expert_id} cannot be compressed without violating accuracy threshold.")
+
+class SustainabilityAwareRouter:
+    def route(self, query, required_accuracy=0.90):
+        candidates = self.get_all_experts(query)
+        
+        # 1. Filter by minimum accuracy
+        valid_candidates = []
+        for exp in candidates:
+            acc = exp.accuracy_compressed if exp.compressed_flag else exp.accuracy_full
+            if acc >= required_accuracy:
+                valid_candidates.append(exp)
+        
+        # 2. Select based on Sustainability Fitness Score (Higher = Better)
+        # This automatically prefers compressed versions because they have 
+        # lower energy (better normalized_energy) and get a compression bonus.
+        best_expert = max(valid_candidates, key=lambda x: x.sustainability_fitness_score)
+        
+        # 3. Load the correct model version
+        if best_expert.compressed_flag:
+            return self.load_compressed_model(best_expert.expert_id)
+        else:
+            return self.load_full_model(best_expert.expert_id)
