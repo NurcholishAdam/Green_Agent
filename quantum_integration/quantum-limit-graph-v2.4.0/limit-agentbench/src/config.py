@@ -28,5 +28,19 @@ class GreenAgentConfig(BaseSettings):
         'auto_offset_enabled': True,
         'auto_offset_threshold_kg': 100.0,}
     }  
+    # After core modules are created (db_manager, blockchain, carbon_manager, sustainability_engine)
+
+    marketplace = CarbonCreditMarketplace(
+        config=config.carbon_marketplace,
+        db_manager=db_manager,
+        blockchain=blockchain,  # your existing blockchain module
+        carbon_manager=carbon_manager,
+        sustainability_engine=sustainability_engine
+    )
+    # Start auto‑offset loop (optional)
+    asyncio.create_task(marketplace.start_auto_offset_loop())
+
+# Store marketplace instance globally for use in API or routing decisions
+    
     class Config:
         env_prefix = "GREEN_AGENT_"
