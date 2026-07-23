@@ -754,6 +754,18 @@ class UnifiedSustainabilityEngine:
             )
         self.config = config
 
+        # Add these methods to UnifiedSustainabilityEngine
+
+        async def get_recent_emissions(self, hours: int = 24) -> float:
+            """Return total emissions (kg CO₂) recorded in the last N hours."""
+            # Query your emission_records table
+        pass
+
+        async def record_offset(self, kg: float, source: str = None):
+            """Record that credits were retired."""
+            # Update internal metrics, e.g., store in a table
+        pass
+        
         # Feature flags
         self.enable_event_driven = config.enable_event_driven
         self.enable_self_healing = config.enable_self_healing
