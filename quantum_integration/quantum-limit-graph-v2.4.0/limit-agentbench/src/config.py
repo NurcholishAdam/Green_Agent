@@ -1,0 +1,28 @@
+# src/config.py
+from pydantic import BaseSettings, Field
+
+class GreenAgentConfig(BaseSettings):
+    # General
+    instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+    log_level: str = "INFO"
+
+    # Synthetic data
+    synthetic_seed: int = 42
+    synthetic_token_mean: float = 5.5
+    synthetic_token_std: float = 1.2
+
+    synthetic_data: Dict[str, Any] = {
+        'seed': 42,
+        'token_mean': 5.5,
+        'token_std': 1.2,
+        'task_type_distribution': {
+            'summarization': 0.25,
+            'classification': 0.20,
+            'translation': 0.15,
+            'question_answering': 0.15,
+            'text_generation': 0.15,
+            'sentiment_analysis': 0.10
+        }
+    }  
+    class Config:
+        env_prefix = "GREEN_AGENT_"
