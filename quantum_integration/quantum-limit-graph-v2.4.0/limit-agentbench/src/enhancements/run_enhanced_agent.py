@@ -1931,6 +1931,7 @@ async def main():
             logger.info("Received interrupt signal")
         except Exception as e:
             logger.error(f"Runtime error: {e}")
+
 from material_lca import create_material_lca_integration
 
 # Pass your existing NodeRegistry instance
@@ -1940,6 +1941,13 @@ integration = create_material_lca_integration(your_node_registry)
 lca_client = integration["lca_client"]
 simulator = integration["simulator"]
 cost_function = integration["cost_function"]
+
+from anomaly_detection import create_anomaly_detection_system
+
+system = create_anomaly_detection_system(config=your_config)
+detector = system["detector"]
+telemetry = system["telemetry_collector"]
+
 
 if __name__ == "__main__":
     try:
