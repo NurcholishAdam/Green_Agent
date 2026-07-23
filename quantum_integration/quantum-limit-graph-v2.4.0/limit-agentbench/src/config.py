@@ -23,6 +23,10 @@ class GreenAgentConfig(BaseSettings):
             'text_generation': 0.15,
             'sentiment_analysis': 0.10
         }
+    carbon_marketplace: Dict[str, Any] = {
+        'refresh_interval_seconds': 3600,
+        'auto_offset_enabled': True,
+        'auto_offset_threshold_kg': 100.0,}
     }  
     class Config:
         env_prefix = "GREEN_AGENT_"
