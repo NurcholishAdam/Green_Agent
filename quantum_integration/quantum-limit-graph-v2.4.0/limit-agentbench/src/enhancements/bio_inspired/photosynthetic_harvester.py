@@ -441,6 +441,27 @@ class LSTMPersistence:
                 logger.error("Failed to load LSTM model", pigment=pigment_name, error=str(e))
         return None
 
+
+from ..data_integration.bio_parameter_catalog import BioParameterCatalog
+
+class PhotosyntheticHarvester:
+    """Harvester that uses bio‑inspired parameters from catalog."""
+    def __init__(self, catalog: BioParameterCatalog, organism_type: str = "high_efficiency"):
+        self.catalog = catalog
+        self.organism_type = organism_type
+        self.params = self.catalog.get_parameters(organism_type)
+        self.energy_store = 0.0
+
+    def harvest(self, illumination: float) -> float:
+        """Produce ATP based on illumination and efficiency."""
+        efficiency = self.params.get("photosynthetic_efficiency", 0.5)
+        return illumination * efficiency
+
+    def respond_to_stress(self, stress_level: float) -> float:
+        """Return a resilience factor (0-1)."""
+        resilience = self.params.get("resilience_to_stress", 0.5)
+        return max(0, 1 - stress_level * (1 - resilience))
+        
 # ============================================================================
 # Fallback Prediction Models
 # ============================================================================
