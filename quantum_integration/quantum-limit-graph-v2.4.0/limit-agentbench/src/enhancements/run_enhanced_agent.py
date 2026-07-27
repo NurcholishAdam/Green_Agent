@@ -36,6 +36,12 @@ import gc
 import warnings
 import heapq
 import signal
+from .enhancements.cache.cache_manager import CacheManager
+from .enhancements.data_integration.carbon_intensity import CarbonIntensityFetcher
+from .enhancements.data_integration.helium_collector import HeliumCollector
+from .enhancements.data_integration.material_footprint import MaterialFootprintUpdater
+from .enhancements.data_integration.bio_parameter_catalog import BioParameterCatalog
+from .enhancements.cost_function.sustainability_cost import SustainabilityCostFunction
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +93,18 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature, decode_dss_signature
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 from cryptography.hazmat.backends import default_backend
+
+
+# During initialization:
+self.cache = CacheManager()
+self.carbon_fetcher = CarbonIntensityFetcher(self.cache)
+self.helium_collector = HeliumCollector(self.cache)
+self.material_updater = MaterialFootprintUpdater()
+self.cost_function = SustainabilityCostFunction(
+    self.carbon_fetcher, self.material_updater, self.helium_collector
+)
+self.bio_catalog = BioParameterCatalog()
+
 
 # Retry library
 try:
