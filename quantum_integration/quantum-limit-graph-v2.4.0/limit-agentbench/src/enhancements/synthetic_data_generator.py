@@ -25,6 +25,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple, Union
 import numpy as np
+import random
+import numpy as np
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from .schemas.node_descriptor import NodeDescriptor
+from .schemas.workload_descriptor import WorkloadDescriptor
+
 
 # ---------- Pydantic ----------
 try:
@@ -769,6 +776,42 @@ def test_persistence(tmp_path):
     assert len(loaded) == len(dataset)
     assert loaded[0]['task'].task_id == dataset[0]['task'].task_id
 
+
+class SyntheticDataGenerator:
+    """Generates synthetic tasks, environments, descriptors for testing."""
+    def __init__(self, seed: int = 42):
+        random.seed(seed)
+        np.random.seed(seed)
+
+    def generate_node_descriptor(self) -> NodeDescriptor:
+        regions = ['us-east', 'us-west', 'eu-west', 'eu-north', 'asia-east', 'asia-southeast']
+        return NodeDescriptor(
+            id=f"synth_node_{random.randint(1, 1000)}",
+            type=random.choice(["edge", "hotspot", "cloud", "lab"]),
+            region=random.choice(regions),
+            region_carbon_intensity=random.uniform(0.2, 0.6),
+            energy_per_token=random.uniform(0.00001, 0.0001),
+            helium_connectivity_score=random.uniform(0.5, 1.0),
+            material_footprint_id=random.choice(["gpu-a100", "gpu-h100", "edge-device"])
+        )
+
+    def generate_workload_descriptor(self) -> WorkloadDescriptor:
+        return WorkloadDescriptor(
+            task_type=random.choice(["inference", "training", "edge_sensing"]),
+            tokens=random.randint(100, 2000),
+            latency_target=random.uniform(50, 500),
+            sector_emission_factor=random.uniform(0.01, 0.05),
+            bio_mode=random.choice(["photosynthetic", "chemotactic", "none"]),
+            priority=random.choice(["accuracy", "green", "balanced"])
+        )
+
+    def generate_dataset(self, num_samples: int = 100) -> List[Dict[str, Any]]:
+        """Return a list of dicts with 'node' and 'workload' descriptors."""
+        return [
+            {'node': self.generate_node_descriptor(),
+             'workload': self.generate_workload_descriptor()}
+            for _ in range(num_samples)
+        ]
 # ============================================================================
 # 5. EXAMPLE USAGE
 # ============================================================================
