@@ -17,6 +17,18 @@ ENHANCEMENTS OVER v12.0:
 10. ADDED: WebSocket server for real‑time status (optional).
 11. ADDED: Comprehensive error handling with custom exceptions.
 12. ADDED: Configuration validation and full usage of all parameters.
+
+FURTHER ENHANCEMENTS:
+- Fixed fallback config master key method (instance method).
+- Random salt per encryption for AES‑GCM.
+- Conditional tenacity retry (no NameError when missing).
+- Async‑safe correlation IDs using contextvars.
+- Async‑safe database operations via thread pool.
+- Added missing ComponentDependencyGraph stub.
+- Signal handlers for graceful shutdown (SIGINT/SIGTERM).
+- WebSocket authentication via JWT (optional).
+- Prometheus metrics now properly updated.
+- Comprehensive docstrings.
 """
 
 import asyncio
@@ -42,6 +54,7 @@ import random
 from functools import wraps
 import contextlib
 import base64
+import contextvars
 
 # ============================================================
 # ENHANCED CONFIGURATION (Pydantic with fallback)
@@ -53,7 +66,7 @@ try:
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# Tenacity for retries
+# Tenacity for retries - conditional import
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryError
     TENACITY_AVAILABLE = True
@@ -118,8 +131,16 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# JWT for WebSocket auth (optional)
+try:
+    from jose import JWTError, jwt
+    from jose.constants import ALGORITHMS
+    JOSE_AVAILABLE = True
+except ImportError:
+    JOSE_AVAILABLE = False
+
 # ============================================================
-# STRUCTURED LOGGING (fallback)
+# STRUCTURED LOGGING (fallback) with contextvars
 # ============================================================
 try:
     import structlog
@@ -135,18 +156,12 @@ except ImportError:
         ]
     )
 
+# Context variable for correlation ID (async‑safe)
+correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
+
 class CorrelationIdFilter(logging.Filter):
-    _local = threading.local()
-    @classmethod
-    def get_correlation_id(cls):
-        if not hasattr(cls._local, 'correlation_id'):
-            cls._local.correlation_id = str(uuid.uuid4())[:8]
-        return cls._local.correlation_id
-    @classmethod
-    def set_correlation_id(cls, cid: str):
-        cls._local.correlation_id = cid
     def filter(self, record):
-        record.correlation_id = self.get_correlation_id()
+        record.correlation_id = correlation_id_var.get()
         return True
 
 logger.addFilter(CorrelationIdFilter())
@@ -201,7 +216,7 @@ else:
     ANOMALY_DETECTIONS = DummyMetric()
 
 # ============================================================
-# ENHANCED CONFIGURATION CLASS
+# ENHANCED CONFIGURATION CLASS (with fixes and missing params)
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class PerplexityExtractorConfig(BaseSettings):
@@ -265,6 +280,7 @@ if PYDANTIC_AVAILABLE:
         # WebSocket
         websocket_enabled: bool = True
         websocket_port: int = Field(8768, ge=1024)
+        websocket_jwt_secret: str = Field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
 
         @field_validator('log_level')
         @classmethod
@@ -325,12 +341,13 @@ else:
         carbon_region: str = "global"
         websocket_enabled: bool = True
         websocket_port: int = 8768
+        websocket_jwt_secret: str = field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
 
-        @classmethod
-        def get_master_key_bytes(cls) -> bytes:
-            if not cls.quantum_master_key:
+        def get_master_key_bytes(self) -> bytes:
+            """Instance method (fixed) to return master key bytes."""
+            if not self.quantum_master_key:
                 raise ValueError('quantum_master_key not set')
-            return bytes.fromhex(cls.quantum_master_key)
+            return bytes.fromhex(self.quantum_master_key)
 
 # ============================================================
 # CUSTOM EXCEPTIONS
@@ -355,6 +372,18 @@ class CircuitBreakerOpenError(ExtractorError):
 
 class RateLimitExceeded(ExtractorError):
     pass
+
+# ============================================================
+# DUMMY TENACITY DECORATOR (if not available)
+# ============================================================
+if not TENACITY_AVAILABLE:
+    def retry(*args, **kwargs):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*fargs, **fkwargs):
+                return await func(*fargs, **fkwargs)
+            return wrapper
+        return decorator
 
 # ============================================================
 # ENHANCED CIRCUIT BREAKER (with half-open state)
@@ -580,11 +609,10 @@ class TaskManager:
             return False
 
     def get_statistics(self) -> Dict:
-        async with self._lock:
-            return {**self.metrics, 'active_tasks': len(self.tasks)}
+        return {**self.metrics, 'active_tasks': len(self.tasks)}
 
 # ============================================================
-# ENHANCED DATABASE MANAGER (SQLAlchemy ORM)
+# ENHANCED DATABASE MANAGER (with proper ORM and async thread safety)
 # ============================================================
 Base = declarative_base() if SQLALCHEMY_AVAILABLE else None
 
@@ -594,11 +622,9 @@ class EnhancedDatabaseManager:
         self.db_path = Path(config.database_url.replace("sqlite:///", ""))
         self.engine = None
         self.SessionLocal = None
+        self._executor = ThreadPoolExecutor(max_workers=4)  # for DB operations
         self._init_engine()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-           retry=retry_if_exception_type((SQLAlchemyError, IOError)),
-           before_sleep=before_sleep_log(logger, logging.WARNING))
     def _init_engine(self):
         if not SQLALCHEMY_AVAILABLE:
             logger.warning("SQLAlchemy not available, database operations disabled.")
@@ -667,29 +693,41 @@ class EnhancedDatabaseManager:
 
         Base.metadata.create_all(self.engine)
 
-    @contextlib.contextmanager
-    def get_session(self) -> Optional[Session]:
-        if not SQLALCHEMY_AVAILABLE:
-            yield None
-            return
+    async def run_sync(self, func, *args, **kwargs):
+        """Run a synchronous database function in thread pool to avoid blocking."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, func, *args, **kwargs)
+
+    def _get_session(self):
+        """Synchronous context manager for session."""
         session = self.SessionLocal()
         try:
             yield session
             session.commit()
-        except Exception as e:
+        except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+    async def execute_sync(self, sync_func):
+        """Execute a synchronous function that takes a session and returns result."""
+        def wrapped():
+            if not SQLALCHEMY_AVAILABLE:
+                return None
+            with self._get_session() as session:
+                return sync_func(session)
+        return await self.run_sync(wrapped)
 
     def dispose(self):
         if self.engine:
             self.engine.dispose()
             if self.SessionLocal:
                 self.SessionLocal.remove()
+        self._executor.shutdown(wait=False)
 
 # ============================================================
-# MODULE 1: QUANTUM-RESILIENT EXTRACTION SECURITY (ENHANCED with AES-GCM)
+# MODULE 1: QUANTUM-RESILIENT EXTRACTION SECURITY (ENHANCED with random salt)
 # ============================================================
 class QuantumResilientExtractionSecurity:
     def __init__(self, config: PerplexityExtractorConfig):
@@ -700,7 +738,6 @@ class QuantumResilientExtractionSecurity:
         self.signatures = {}
         self._lock = asyncio.Lock()
         self.master_key = config.get_master_key_bytes()
-        self.salt = os.urandom(16)
 
         if self.pqc_available:
             self._initialize_pqc()
@@ -717,28 +754,32 @@ class QuantumResilientExtractionSecurity:
             logger.error(f"PQC initialization failed: {e}")
             self.pqc_available = False
 
-    def _derive_key(self) -> bytes:
+    def _derive_key(self, salt: bytes) -> bytes:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=self.salt,
+            salt=salt,
             iterations=100000,
             backend=default_backend()
         )
         return kdf.derive(self.master_key)
 
     def _encrypt_key(self, key_bytes: bytes) -> bytes:
-        derived = self._derive_key()
+        # Generate random salt per encryption
+        salt = os.urandom(16)
+        derived = self._derive_key(salt)
         aesgcm = AESGCM(derived)
         nonce = os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, key_bytes, None)
-        return nonce + ciphertext
+        # Store salt + nonce + ciphertext
+        return salt + nonce + ciphertext
 
     def _decrypt_key(self, encrypted_bytes: bytes) -> bytes:
-        derived = self._derive_key()
+        salt = encrypted_bytes[:16]
+        nonce = encrypted_bytes[16:28]
+        ciphertext = encrypted_bytes[28:]
+        derived = self._derive_key(salt)
         aesgcm = AESGCM(derived)
-        nonce = encrypted_bytes[:12]
-        ciphertext = encrypted_bytes[12:]
         return aesgcm.decrypt(nonce, ciphertext, None)
 
     async def generate_keypair(self, algorithm: str = None) -> Dict:
@@ -1084,7 +1125,8 @@ class IntelligentExtractionScheduler:
             try:
                 schedule = await self.get_optimal_time('daily')
                 if schedule.get('optimal_time') == 'now':
-                    await self._trigger_extraction('daily')
+                    # Instead of calling _trigger_extraction, we just log; the main loop will trigger extraction
+                    logger.info("Scheduler indicates optimal time, but extraction will be triggered by main loop")
                 await asyncio.sleep(self.config.scheduler_interval_seconds)
             except asyncio.CancelledError:
                 break
@@ -1113,12 +1155,14 @@ class IntelligentExtractionScheduler:
         SCHEDULED_EXTRACTIONS.labels(schedule_type=schedule_type, status='triggered').inc()
         async with self._lock:
             self.schedule_history.append({'type': schedule_type, 'timestamp': datetime.now().isoformat(), 'status': 'triggered'})
+        # Persist to DB using async-safe method
         if self.db_manager and SQLALCHEMY_AVAILABLE:
-            with self.db_manager.get_session() as session:
+            def insert_scheduled(session):
                 session.execute(
                     text("INSERT INTO scheduled_extractions (schedule_type, triggered_at, status, metadata) VALUES (:schedule_type, :triggered_at, :status, :metadata)"),
                     {'schedule_type': schedule_type, 'triggered_at': datetime.now(), 'status': 'triggered', 'metadata': json.dumps({})}
                 )
+            await self.db_manager.execute_sync(insert_scheduled)
 
     async def _real_time_schedule(self) -> Dict:
         return {'frequency': 'real_time', 'interval': '5_minutes'}
@@ -1133,13 +1177,12 @@ class IntelligentExtractionScheduler:
         return {'frequency': 'adaptive', 'based_on': 'carbon_intensity'}
 
     def get_schedule_stats(self) -> Dict:
-        async with self._lock:
-            return {
-                'total_triggers': len(self.schedule_history),
-                'recent_triggers': list(self.schedule_history)[-5:],
-                'running': self._running,
-                'patterns': list(self.schedule_patterns.keys())
-            }
+        return {
+            'total_triggers': len(self.schedule_history),
+            'recent_triggers': list(self.schedule_history)[-5:],
+            'running': self._running,
+            'patterns': list(self.schedule_patterns.keys())
+        }
 
     async def shutdown(self):
         self._running = False
@@ -1227,8 +1270,9 @@ class AutomatedExtractionPipeline:
             self.pipeline_status[pipeline_id] = pipeline_result
             self.pipeline_history.append(pipeline_result)
 
+        # Persist to DB using async-safe method
         if self.db_manager and SQLALCHEMY_AVAILABLE:
-            with self.db_manager.get_session() as session:
+            def insert_pipeline(session):
                 session.execute(
                     text("""
                         INSERT INTO pipeline_executions (pipeline_id, status, started_at, completed_at, duration_seconds, results)
@@ -1243,6 +1287,7 @@ class AutomatedExtractionPipeline:
                         'results': json.dumps(results)
                     }
                 )
+            await self.db_manager.execute_sync(insert_pipeline)
 
         logger.info(f"Pipeline {pipeline_id} completed with status: {stage_status}")
         return pipeline_result
@@ -1317,6 +1362,7 @@ class EnhancedPerplexityAPIClient:
         async def _search():
             return await self._call_perplexity_api(query)
         try:
+            # Use bulkhead and circuit breaker; note that _search is an async function, so we wrap it in a lambda that returns the coroutine.
             result = await self._bulkhead.execute(lambda: self._circuit_breaker.call(_search))
             async with self._lock:
                 self.metrics['requests'] += 1
@@ -1336,8 +1382,7 @@ class EnhancedPerplexityAPIClient:
             await self._session.close()
 
     def get_metrics(self) -> Dict:
-        async with self._lock:
-            return {**self.metrics, 'circuit_breaker': self._circuit_breaker.get_metrics()}
+        return {**self.metrics, 'circuit_breaker': self._circuit_breaker.get_metrics()}
 
 # ============================================================
 # MODULE 7: ENHANCED KNOWLEDGE GRAPH (with edges and versioning)
@@ -1378,6 +1423,9 @@ class EnhancedVersionedKnowledgeGraph:
                 to_keep = set(sorted_nodes[:self.config.max_graph_nodes])
                 self.nodes = {k: v for k, v in self.nodes.items() if k in to_keep}
                 self.edges = {k: [e for e in v if e[0] in to_keep] for k, v in self.edges.items() if k in to_keep}
+            # Update metric
+            KNOWLEDGE_GRAPH_SIZE.labels(component='nodes').set(len(self.nodes))
+            KNOWLEDGE_GRAPH_SIZE.labels(component='edges').set(sum(len(v) for v in self.edges.values()))
             return {'nodes_added': added, 'nodes_updated': updated, 'edges_added': self._edge_counter}
 
     async def save_version(self):
@@ -1547,12 +1595,14 @@ class ExtractionResult:
     timestamp: datetime = field(default_factory=datetime.now)
 
 # ============================================================
-# WEBSOCKET SERVER (optional)
+# WEBSOCKET SERVER (with optional JWT authentication)
 # ============================================================
 class EnhancedWebSocketServer:
     def __init__(self, config: PerplexityExtractorConfig):
         self.config = config
         self.port = config.websocket_port
+        self.jwt_secret = config.websocket_jwt_secret
+        self.jwt_available = JOSE_AVAILABLE
         self.connections = set()
         self._lock = asyncio.Lock()
         self.server = None
@@ -1568,6 +1618,27 @@ class EnhancedWebSocketServer:
             logger.error(f"WebSocket server start failed: {e}")
 
     async def _handle_connection(self, websocket, path):
+        # Authentication via query parameter ?token=<jwt>
+        query = websocket.request.query
+        token = query.get('token')
+        if not token:
+            await websocket.close(1008, "Missing token")
+            return
+        user_id = 'anonymous'
+        if self.jwt_available:
+            try:
+                payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
+                user_id = payload.get('sub', 'anonymous')
+            except Exception:
+                await websocket.close(1008, "Invalid token")
+                return
+        else:
+            # Fallback: token == secret
+            if token != self.jwt_secret:
+                await websocket.close(1008, "Invalid token")
+                return
+            user_id = 'anonymous'
+
         async with self._lock:
             self.connections.add(websocket)
         try:
@@ -1595,6 +1666,37 @@ class EnhancedWebSocketServer:
             self.server.close()
             await self.server.wait_closed()
             logger.info("WebSocket server stopped")
+
+# ============================================================
+# COMPONENT DEPENDENCY GRAPH (stub)
+# ============================================================
+class ComponentDependencyGraph:
+    def __init__(self):
+        self.graph = defaultdict(list)
+
+    def add_component(self, name: str, dependencies: List[str]):
+        self.graph[name] = dependencies
+
+    def validate(self) -> Tuple[bool, List[str]]:
+        # Simple DFS cycle detection
+        visited = set()
+        rec_stack = set()
+        def dfs(node):
+            visited.add(node)
+            rec_stack.add(node)
+            for neighbor in self.graph.get(node, []):
+                if neighbor not in visited:
+                    if dfs(neighbor):
+                        return True
+                elif neighbor in rec_stack:
+                    return True
+            rec_stack.remove(node)
+            return False
+        for node in self.graph:
+            if node not in visited:
+                if dfs(node):
+                    return False, [node]
+        return True, []
 
 # ============================================================
 # ENHANCED MAIN EXTRACTOR (v12.1)
@@ -1638,6 +1740,7 @@ class EnhancedPerplexityDataExtractorV12_1:
         # Dependency graph (stub)
         self.dependency_graph = ComponentDependencyGraph()
         self.dependency_graph.add_component('database', [])
+        self.dependency_graph.add_component('api', ['database'])
 
         logger.info(f"EnhancedPerplexityDataExtractor v{self.config.version} initialized (instance: {self.instance_id})")
 
@@ -1663,7 +1766,8 @@ class EnhancedPerplexityDataExtractorV12_1:
         self._task_manager.start_task("carbon_update", self._carbon_update_loop)
 
         self.running = True
-        logger.info(f"Extractor started with background tasks")
+        BACKGROUND_TASKS.set(len(self._task_manager.tasks))
+        logger.info(f"Extractor started with {len(self._task_manager.tasks)} background tasks")
 
     async def _carbon_update_loop(self):
         while not self._shutdown_event.is_set():
@@ -1850,23 +1954,26 @@ class EnhancedPerplexityDataExtractorV12_1:
         if not SQLALCHEMY_AVAILABLE:
             return projects
         try:
-            with self.db_manager.get_session() as session:
+            def load(session):
                 result = session.execute(text("SELECT data FROM projects"))
+                loaded = []
                 for row in result:
                     try:
                         data = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                        projects.append(DataCenterProject(**data))
+                        loaded.append(DataCenterProject(**data))
                     except Exception as e:
                         logger.error(f"Failed to load project: {e}")
+                return loaded
+            return await self.db_manager.execute_sync(load)
         except Exception as e:
             logger.error(f"Database load failed: {e}")
-        return projects
+            return projects
 
     async def _save_projects(self, projects: List[DataCenterProject], extraction_id: str):
         if not SQLALCHEMY_AVAILABLE:
             return
         try:
-            with self.db_manager.get_session() as session:
+            def save(session):
                 for project in projects:
                     session.execute(
                         text("""INSERT OR REPLACE INTO projects 
@@ -1882,14 +1989,16 @@ class EnhancedPerplexityDataExtractorV12_1:
                             'is_anomaly': project.is_anomaly
                         }
                     )
+            await self.db_manager.execute_sync(save)
         except Exception as e:
             logger.error(f"Failed to save projects: {e}")
+            raise
 
     async def _save_extraction_history(self, result: ExtractionResult):
         if not SQLALCHEMY_AVAILABLE:
             return
         try:
-            with self.db_manager.get_session() as session:
+            def save(session):
                 session.execute(
                     text("""INSERT INTO extraction_history 
                            (extraction_id, timestamp, projects_found, projects_new, 
@@ -1913,8 +2022,10 @@ class EnhancedPerplexityDataExtractorV12_1:
                         'pipeline_status': result.pipeline_status
                     }
                 )
+            await self.db_manager.execute_sync(save)
         except Exception as e:
             logger.error(f"Failed to save extraction history: {e}")
+            raise
 
     async def cancel_extraction(self, task_id: str) -> bool:
         return await self._task_manager.cancel_task(task_id)
@@ -1939,9 +2050,10 @@ class EnhancedPerplexityDataExtractorV12_1:
         pipe_stats = await self.pipeline.get_pipeline_stats()
         health['components']['pipeline'] = {'healthy': pipe_stats.get('success_rate', 0) > 50}
         try:
+            def check_db(session):
+                session.execute(text("SELECT 1"))
             if SQLALCHEMY_AVAILABLE:
-                with self.db_manager.get_session() as session:
-                    session.execute(text("SELECT 1"))
+                await self.db_manager.execute_sync(check_db)
             health['components']['database'] = {'healthy': True}
         except Exception as e:
             health['components']['database'] = {'healthy': False, 'error': str(e)}
@@ -1982,6 +2094,26 @@ class EnhancedPerplexityDataExtractorV12_1:
         logger.info("Shutdown complete")
 
 # ============================================================
+# SIGNAL HANDLING FOR GRACEFUL SHUTDOWN
+# ============================================================
+_shutdown_requested = False
+
+def handle_signal(signum, frame):
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        asyncio.create_task(shutdown_handler())
+
+async def shutdown_handler():
+    global _extractor_instance
+    if _extractor_instance:
+        await _extractor_instance.shutdown()
+        _extractor_instance = None
+    # Stop the event loop gracefully
+    asyncio.get_event_loop().stop()
+
+# ============================================================
 # SINGLETON ACCESSOR
 # ============================================================
 _extractor_instance = None
@@ -2000,6 +2132,11 @@ async def get_perplexity_extractor(config: Optional[Union[PerplexityExtractorCon
 # MAIN ENTRY POINT
 # ============================================================
 async def main():
+    # Register signal handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+
     print("=" * 80)
     print("Enhanced Perplexity AI Data Center Extractor v12.1 - Enterprise Quantum Resilience (Enhanced)")
     print("=" * 80)
@@ -2050,10 +2187,11 @@ async def main():
 
     try:
         await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-        await extractor.shutdown()
-        print("Shutdown complete")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _extractor_instance:
+            await _extractor_instance.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
