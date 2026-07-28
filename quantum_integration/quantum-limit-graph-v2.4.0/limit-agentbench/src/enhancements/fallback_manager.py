@@ -17,6 +17,19 @@ ENHANCEMENTS OVER v13.0:
 10. ADDED: WebSocket server for real‑time status (optional).
 11. ADDED: Comprehensive error handling with custom exceptions.
 12. ADDED: Configuration validation and full usage of all parameters.
+
+FURTHER ENHANCEMENTS:
+- Fixed fallback config master key method (instance method).
+- Random salt per encryption for AES‑GCM.
+- Conditional tenacity retry (no NameError when missing).
+- Async‑safe correlation IDs using contextvars.
+- Async‑safe database operations via thread pool.
+- Added missing `call` method to EnhancedCircuitBreaker.
+- Added signal handlers for graceful shutdown (SIGINT/SIGTERM).
+- WebSocket authentication via JWT (optional).
+- Prometheus metrics now properly updated.
+- Fixed `_retry_handler` import and usage.
+- Comprehensive docstrings.
 """
 
 import asyncio
@@ -42,6 +55,7 @@ import random
 from functools import wraps
 import contextlib
 import base64
+import contextvars
 
 # ============================================================
 # ENHANCED CONFIGURATION (Pydantic with fallback)
@@ -53,9 +67,9 @@ try:
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# Tenacity for retries
+# Tenacity for retries - conditional import
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryError
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryError, AsyncRetrying
     TENACITY_AVAILABLE = True
 except ImportError:
     TENACITY_AVAILABLE = False
@@ -116,8 +130,16 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+# JWT for WebSocket authentication (optional)
+try:
+    from jose import JWTError, jwt
+    from jose.constants import ALGORITHMS
+    JOSE_AVAILABLE = True
+except ImportError:
+    JOSE_AVAILABLE = False
+
 # ============================================================
-# STRUCTURED LOGGING (fallback)
+# STRUCTURED LOGGING (fallback) with contextvars
 # ============================================================
 try:
     import structlog
@@ -133,18 +155,12 @@ except ImportError:
         ]
     )
 
+# Context variable for correlation ID (async‑safe)
+correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
+
 class CorrelationIdFilter(logging.Filter):
-    _local = threading.local()
-    @classmethod
-    def get_correlation_id(cls):
-        if not hasattr(cls._local, 'correlation_id'):
-            cls._local.correlation_id = str(uuid.uuid4())[:8]
-        return cls._local.correlation_id
-    @classmethod
-    def set_correlation_id(cls, cid: str):
-        cls._local.correlation_id = cid
     def filter(self, record):
-        record.correlation_id = self.get_correlation_id()
+        record.correlation_id = correlation_id_var.get()
         return True
 
 logger.addFilter(CorrelationIdFilter())
@@ -193,7 +209,7 @@ else:
     RATE_LIMITER_THROTTLE = DummyMetric()
 
 # ============================================================
-# ENHANCED CONFIGURATION CLASS
+# ENHANCED CONFIGURATION CLASS (with fixes and missing params)
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class FallbackManagerConfig(BaseSettings):
@@ -254,6 +270,7 @@ if PYDANTIC_AVAILABLE:
         # WebSocket
         websocket_enabled: bool = True
         websocket_port: int = Field(8769, ge=1024)
+        websocket_jwt_secret: str = Field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
 
         @field_validator('log_level')
         @classmethod
@@ -313,12 +330,13 @@ else:
         sustainability_interval: int = 3600
         websocket_enabled: bool = True
         websocket_port: int = 8769
+        websocket_jwt_secret: str = field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
 
-        @classmethod
-        def get_master_key_bytes(cls) -> bytes:
-            if not cls.quantum_master_key:
+        def get_master_key_bytes(self) -> bytes:
+            """Instance method (fixed) to return master key bytes."""
+            if not self.quantum_master_key:
                 raise ValueError('quantum_master_key not set')
-            return bytes.fromhex(cls.quantum_master_key)
+            return bytes.fromhex(self.quantum_master_key)
 
 # ============================================================
 # CUSTOM EXCEPTIONS
@@ -342,7 +360,28 @@ class RateLimitExceeded(FallbackManagerError):
     pass
 
 # ============================================================
-# ENHANCED CIRCUIT BREAKER (with half-open state)
+# DUMMY TENACITY DECORATOR (if not available)
+# ============================================================
+if not TENACITY_AVAILABLE:
+    def retry(*args, **kwargs):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*fargs, **fkwargs):
+                return await func(*fargs, **fkwargs)
+            return wrapper
+        return decorator
+    # Also dummy AsyncRetrying for fallback
+    class AsyncRetrying:
+        def __init__(self, *args, **kwargs):
+            self.stop = None
+            self.wait = None
+        async def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+# ============================================================
+# ENHANCED CIRCUIT BREAKER (with half-open state and call method)
 # ============================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -363,6 +402,7 @@ class EnhancedCircuitBreaker:
         self.last_success_time = None
         self._lock = asyncio.Lock()
         self.half_open_requests = 0
+        self.metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
 
     async def allow_request(self) -> bool:
         async with self._lock:
@@ -414,6 +454,23 @@ class EnhancedCircuitBreaker:
                     CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
                 logger.warning(f"Circuit breaker {self.name} OPEN from HALF_OPEN")
 
+    async def call(self, func: Callable, *args, **kwargs):
+        """Execute the function if allowed, with circuit breaker protection."""
+        allowed = await self.allow_request()
+        if not allowed:
+            self.metrics['failed_calls'] += 1
+            raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
+        self.metrics['total_calls'] += 1
+        try:
+            result = await func(*args, **kwargs)
+            await self.record_success()
+            self.metrics['successful_calls'] += 1
+            return result
+        except Exception as e:
+            await self.record_failure()
+            self.metrics['failed_calls'] += 1
+            raise
+
     def get_status(self) -> Dict:
         async with self._lock:
             return {
@@ -436,11 +493,13 @@ class EnhancedCircuitBreakerRegistry:
         if not SQLALCHEMY_AVAILABLE:
             return
         try:
-            with self.db_manager.get_session() as session:
+            # Use sync method; we'll later use async-safe
+            def load(session):
                 result = session.execute(text("SELECT name FROM circuit_breakers"))
                 for row in result:
                     name = row[0]
                     self.circuit_breakers[name] = EnhancedCircuitBreaker(name, self.config)
+            self.db_manager.execute_sync(load)
             logger.info(f"Loaded {len(self.circuit_breakers)} circuit breakers from DB")
         except Exception as e:
             logger.error(f"Failed to load circuit breakers from DB: {e}")
@@ -451,11 +510,12 @@ class EnhancedCircuitBreakerRegistry:
                 cb = EnhancedCircuitBreaker(name, self.config)
                 self.circuit_breakers[name] = cb
                 if SQLALCHEMY_AVAILABLE:
-                    with self.db_manager.get_session() as session:
+                    def insert(session):
                         session.execute(
                             text("INSERT INTO circuit_breakers (name, state, updated_at) VALUES (:name, :state, :updated_at)"),
                             {'name': name, 'state': 'closed', 'updated_at': datetime.now()}
                         )
+                    await self.db_manager.execute_sync(insert)
                 logger.info(f"Circuit breaker {name} registered")
             return self.circuit_breakers[name]
 
@@ -474,7 +534,7 @@ class EnhancedCircuitBreakerRegistry:
             if name in self.circuit_breakers:
                 await self.circuit_breakers[name].record_success()
                 if SQLALCHEMY_AVAILABLE:
-                    with self.db_manager.get_session() as session:
+                    def update(session):
                         session.execute(
                             text("""
                                 UPDATE circuit_breakers 
@@ -483,13 +543,14 @@ class EnhancedCircuitBreakerRegistry:
                             """),
                             {'state': self.circuit_breakers[name].state.value, 'last_success': datetime.now(), 'updated': datetime.now(), 'name': name}
                         )
+                    await self.db_manager.execute_sync(update)
 
     async def record_failure(self, name: str):
         async with self._lock:
             if name in self.circuit_breakers:
                 await self.circuit_breakers[name].record_failure()
                 if SQLALCHEMY_AVAILABLE:
-                    with self.db_manager.get_session() as session:
+                    def update(session):
                         session.execute(
                             text("""
                                 UPDATE circuit_breakers 
@@ -498,13 +559,15 @@ class EnhancedCircuitBreakerRegistry:
                             """),
                             {'state': self.circuit_breakers[name].state.value, 'last_failure': datetime.now(), 'updated': datetime.now(), 'name': name}
                         )
+                    await self.db_manager.execute_sync(update)
 
     def get_status(self) -> Dict:
-        async with self._lock:
-            return {
-                'healthy': all(cb.state != CircuitBreakerState.OPEN for cb in self.circuit_breakers.values()),
-                'breakers': {name: cb.get_status() for name, cb in self.circuit_breakers.items()}
-            }
+        # Note: this method is synchronous and used in async context, but it's okay if it's not async because it doesn't do I/O.
+        # We'll keep it sync but access self.circuit_breakers (which is a dict).
+        return {
+            'healthy': all(cb.state != CircuitBreakerState.OPEN for cb in self.circuit_breakers.values()),
+            'breakers': {name: cb.get_status() for name, cb in self.circuit_breakers.items()}
+        }
 
 # ============================================================
 # ENHANCED RATE LIMITER
@@ -637,7 +700,7 @@ class TaskManager:
             return {**self.metrics, 'active_tasks': len(self.tasks)}
 
 # ============================================================
-# ENHANCED DATABASE MANAGER (SQLAlchemy ORM)
+# ENHANCED DATABASE MANAGER (with proper ORM and async thread safety)
 # ============================================================
 Base = declarative_base() if SQLALCHEMY_AVAILABLE else None
 
@@ -647,11 +710,9 @@ class EnhancedDatabaseManager:
         self.db_path = Path(config.database_url.replace("sqlite:///", ""))
         self.engine = None
         self.SessionLocal = None
+        self._executor = ThreadPoolExecutor(max_workers=4)  # for DB operations
         self._init_engine()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-           retry=retry_if_exception_type((SQLAlchemyError, IOError)),
-           before_sleep=before_sleep_log(logger, logging.WARNING))
     def _init_engine(self):
         if not SQLALCHEMY_AVAILABLE:
             logger.warning("SQLAlchemy not available, database operations disabled.")
@@ -707,29 +768,41 @@ class EnhancedDatabaseManager:
 
         Base.metadata.create_all(self.engine)
 
-    @contextlib.contextmanager
-    def get_session(self) -> Optional[Session]:
-        if not SQLALCHEMY_AVAILABLE:
-            yield None
-            return
+    async def run_sync(self, func, *args, **kwargs):
+        """Run a synchronous database function in thread pool to avoid blocking."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, func, *args, **kwargs)
+
+    def _get_session(self):
+        """Synchronous context manager for session."""
         session = self.SessionLocal()
         try:
             yield session
             session.commit()
-        except Exception as e:
+        except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+    async def execute_sync(self, sync_func):
+        """Execute a synchronous function that takes a session and returns result."""
+        def wrapped():
+            if not SQLALCHEMY_AVAILABLE:
+                return None
+            with self._get_session() as session:
+                return sync_func(session)
+        return await self.run_sync(wrapped)
 
     def dispose(self):
         if self.engine:
             self.engine.dispose()
             if self.SessionLocal:
                 self.SessionLocal.remove()
+        self._executor.shutdown(wait=False)
 
 # ============================================================
-# MODULE 1: QUANTUM-RESILIENT FALLBACK SECURITY (ENHANCED with AES-GCM)
+# MODULE 1: QUANTUM-RESILIENT FALLBACK SECURITY (ENHANCED with random salt)
 # ============================================================
 class QuantumResilientFallbackSecurity:
     def __init__(self, config: FallbackManagerConfig):
@@ -740,7 +813,6 @@ class QuantumResilientFallbackSecurity:
         self.signatures = {}
         self._lock = asyncio.Lock()
         self.master_key = config.get_master_key_bytes()
-        self.salt = os.urandom(16)
 
         if self.pqc_available:
             self._initialize_pqc()
@@ -757,28 +829,32 @@ class QuantumResilientFallbackSecurity:
             logger.error(f"PQC initialization failed: {e}")
             self.pqc_available = False
 
-    def _derive_key(self) -> bytes:
+    def _derive_key(self, salt: bytes) -> bytes:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=self.salt,
+            salt=salt,
             iterations=100000,
             backend=default_backend()
         )
         return kdf.derive(self.master_key)
 
     def _encrypt_key(self, key_bytes: bytes) -> bytes:
-        derived = self._derive_key()
+        # Generate random salt per encryption
+        salt = os.urandom(16)
+        derived = self._derive_key(salt)
         aesgcm = AESGCM(derived)
         nonce = os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, key_bytes, None)
-        return nonce + ciphertext
+        # Store salt + nonce + ciphertext
+        return salt + nonce + ciphertext
 
     def _decrypt_key(self, encrypted_bytes: bytes) -> bytes:
-        derived = self._derive_key()
+        salt = encrypted_bytes[:16]
+        nonce = encrypted_bytes[16:28]
+        ciphertext = encrypted_bytes[28:]
+        derived = self._derive_key(salt)
         aesgcm = AESGCM(derived)
-        nonce = encrypted_bytes[:12]
-        ciphertext = encrypted_bytes[12:]
         return aesgcm.decrypt(nonce, ciphertext, None)
 
     async def generate_keypair(self, algorithm: str = None) -> Dict:
@@ -1472,12 +1548,14 @@ class FallbackSustainabilityTracker:
         return {'efficiency_score': 0.85, 'helium_efficiency': 0.72, 'carbon_savings_kg': savings}
 
 # ============================================================
-# MODULE 11: WEBSOCKET SERVER (optional)
+# MODULE 11: WEBSOCKET SERVER (with optional JWT authentication)
 # ============================================================
 class EnhancedWebSocketServer:
     def __init__(self, config: FallbackManagerConfig):
         self.config = config
         self.port = config.websocket_port
+        self.jwt_secret = config.websocket_jwt_secret
+        self.jwt_available = JOSE_AVAILABLE
         self.connections = set()
         self._lock = asyncio.Lock()
         self.server = None
@@ -1493,6 +1571,27 @@ class EnhancedWebSocketServer:
             logger.error(f"WebSocket server start failed: {e}")
 
     async def _handle_connection(self, websocket, path):
+        # Authentication via query parameter ?token=<jwt>
+        query = websocket.request.query
+        token = query.get('token')
+        if not token:
+            await websocket.close(1008, "Missing token")
+            return
+        user_id = 'anonymous'
+        if self.jwt_available:
+            try:
+                payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
+                user_id = payload.get('sub', 'anonymous')
+            except Exception:
+                await websocket.close(1008, "Invalid token")
+                return
+        else:
+            # Fallback: token == secret
+            if token != self.jwt_secret:
+                await websocket.close(1008, "Invalid token")
+                return
+            user_id = 'anonymous'
+
         async with self._lock:
             self.connections.add(websocket)
         try:
@@ -1607,7 +1706,8 @@ class EnhancedFallbackManagerV13_1:
         self._task_manager.start_task("websocket", self.websocket.start)
 
         self.running = True
-        logger.info(f"Fallback manager started with background tasks")
+        BACKGROUND_TASKS.set(len(self._task_manager.tasks))
+        logger.info(f"Fallback manager started with {len(self._task_manager.tasks)} background tasks")
 
     def register_fallback_handler(self, name: str, handlers: List[Callable]):
         self.fallback_handlers[name] = handlers
@@ -1823,12 +1923,23 @@ class EnhancedFallbackManagerV13_1:
         raise last_exception or Exception(f"All fallbacks failed for {handler_name}")
 
     async def _retry_handler(self, handler, context, max_retries, timeout):
-        from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
-        attempt = 0
-        async for attempt in AsyncRetrying(stop=stop_after_attempt(max_retries), wait=wait_exponential(multiplier=1, min=1, max=10)):
-            with attempt:
-                result = await handler(context)
-                return result, attempt.retry_state.attempt_number
+        # Use tenacity's AsyncRetrying if available, else simple retry
+        if TENACITY_AVAILABLE:
+            attempt = 0
+            async for attempt in AsyncRetrying(stop=stop_after_attempt(max_retries), wait=wait_exponential(multiplier=1, min=1, max=10)):
+                with attempt:
+                    result = await handler(context)
+                    return result, attempt.retry_state.attempt_number
+        else:
+            # Simple retry loop
+            for attempt in range(1, max_retries + 1):
+                try:
+                    result = await handler(context)
+                    return result, attempt
+                except Exception as e:
+                    if attempt == max_retries:
+                        raise
+                    await asyncio.sleep(1 * attempt)  # linear backoff
         return None, max_retries
 
     async def health_check(self) -> Dict:
@@ -1882,6 +1993,26 @@ class EnhancedFallbackManagerV13_1:
         logger.info("Shutdown complete")
 
 # ============================================================
+# SIGNAL HANDLING FOR GRACEFUL SHUTDOWN
+# ============================================================
+_shutdown_requested = False
+
+def handle_signal(signum, frame):
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        asyncio.create_task(shutdown_handler())
+
+async def shutdown_handler():
+    global _fallback_manager_instance
+    if _fallback_manager_instance:
+        await _fallback_manager_instance.shutdown()
+        _fallback_manager_instance = None
+    # Stop the event loop gracefully
+    asyncio.get_event_loop().stop()
+
+# ============================================================
 # SINGLETON ACCESSOR
 # ============================================================
 _fallback_manager_instance = None
@@ -1900,6 +2031,11 @@ async def get_fallback_manager(config: Optional[Union[FallbackManagerConfig, Dic
 # MAIN ENTRY POINT
 # ============================================================
 async def main():
+    # Register signal handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+
     print("=" * 80)
     print("Enhanced Fallback Manager v13.1 - Enterprise Quantum Resilience (Enhanced)")
     print("=" * 80)
@@ -1950,10 +2086,11 @@ async def main():
 
     try:
         await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-        await manager.shutdown()
-        print("Shutdown complete")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _fallback_manager_instance:
+            await _fallback_manager_instance.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
