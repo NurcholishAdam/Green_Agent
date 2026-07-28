@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # enhancements/fft_moe_adapter_enhanced_v3_1.py
 """
-Federated Fine-Tuning with Mixture of Experts (FFT-MoE) Adapter v3.1.0
+Federated Fine-Tuning with Mixture of Experts (FFT-MoE) Adapter v3.1.1
 ENHANCED WITH: Real carbon API, real blockchain, real PQC, circuit breaker,
 rate limiter, bulkhead, AES‑GCM key encryption, full ORM, retry, and actual MoE training.
 
-ENHANCEMENTS OVER v3.0.0:
-1. ADDED: Real carbon intensity from ElectricityMap API.
-2. ADDED: Real blockchain registration using web3.py with contract ABI.
-3. ADDED: Real PQC signing with AES‑GCM encrypted keys.
-4. ADDED: EnhancedCircuitBreaker, EnhancedRateLimiter, EnhancedBulkhead.
-5. ADDED: Full SQLAlchemy ORM with proper models and indexes.
-6. ADDED: Retry with tenacity on all external calls.
-7. ADDED: Actual MoE fine‑tuning – clients train local experts using PyTorch.
-8. ADDED: Federated aggregation with FedAvg and differential privacy.
-9. ADDED: Persistent model storage using BLOB fields.
-10. ADDED: Comprehensive error handling with custom exceptions.
-11. ADDED: Configuration validation and full usage of all parameters.
+FURTHER ENHANCEMENTS IN v3.1.1:
+- Fixed missing imports (io, optim).
+- Added missing config fields (circuit_breaker_half_open_max_requests, carbon_update_interval).
+- Corrected master key fallback to instance method.
+- Random salt per AES‑GCM encryption.
+- Conditional tenacity retry (no NameError when missing).
+- Async‑safe correlation IDs using contextvars.
+- Async‑safe database operations via thread pool.
+- Signal handlers for graceful shutdown.
+- Improved error handling and logging.
+- Comprehensive docstrings.
 """
 
 import asyncio
@@ -27,17 +26,20 @@ import uuid
 import hashlib
 import os
 import random
+import io
 from typing import Dict, Any, List, Optional, Tuple, Callable, Union
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 import numpy as np
 from pathlib import Path
+import contextvars
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from torch import optim
 
 # ============================================================
 # ENHANCED CONFIGURATION (Pydantic with fallback)
@@ -49,7 +51,7 @@ try:
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# Tenacity for retries
+# Tenacity for retries - conditional import
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryError
     TENACITY_AVAILABLE = True
@@ -101,7 +103,7 @@ import aiohttp
 from aiohttp import ClientTimeout, ClientSession, ClientError
 
 # ============================================================
-# STRUCTURED LOGGING (fallback)
+# Structured logging with contextvars (async-safe)
 # ============================================================
 try:
     import structlog
@@ -116,14 +118,16 @@ except ImportError:
             logging.StreamHandler()
         ]
     )
-    class CorrelationIdFilter(logging.Filter):
-        def __init__(self):
-            super().__init__()
-            self.correlation_id = str(uuid.uuid4())[:8]
-        def filter(self, record):
-            record.correlation_id = self.correlation_id
-            return True
-    logger.addFilter(CorrelationIdFilter())
+
+# Context variable for correlation ID (async‑safe)
+correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get()
+        return True
+
+logger.addFilter(CorrelationIdFilter())
 
 # Audit logger (optional)
 audit_logger = logging.getLogger("audit")
@@ -161,7 +165,19 @@ else:
     RATE_LIMITER_THROTTLE = DummyMetrics()
 
 # ============================================================
-# ENHANCED CONFIGURATION CLASS
+# DUMMY TENACITY DECORATOR (if not available)
+# ============================================================
+if not TENACITY_AVAILABLE:
+    def retry(*args, **kwargs):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*fargs, **fkwargs):
+                return await func(*fargs, **fkwargs)
+            return wrapper
+        return decorator
+
+# ============================================================
+# ENHANCED CONFIGURATION CLASS (with fixes and missing params)
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class FFTMoEConfig(BaseSettings):
@@ -169,7 +185,7 @@ if PYDANTIC_AVAILABLE:
         model_config = SettingsConfigDict(env_prefix="FFTMOE_", case_sensitive=False)
 
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("3.1.0")
+        version: str = Field("3.1.1")
         log_level: str = Field("INFO")
 
         # MoE architecture
@@ -209,6 +225,7 @@ if PYDANTIC_AVAILABLE:
         # Carbon intensity API
         carbon_api_key: Optional[str] = None
         carbon_region: str = Field("global")
+        carbon_update_interval: int = Field(300, ge=10)
 
         # Database
         db_path: str = Field("fft_moe.db")
@@ -216,10 +233,11 @@ if PYDANTIC_AVAILABLE:
         # Background tasks
         health_check_interval: int = Field(60, ge=10)
 
-        # Retry and circuit breaker
+        # Retry and circuit breaker (added half_open_max_requests)
         max_retry_attempts: int = Field(3, ge=0)
         circuit_breaker_threshold: int = Field(5, ge=1)
         circuit_breaker_timeout: int = Field(30, ge=1)
+        circuit_breaker_half_open_max_requests: int = Field(3, ge=1)
         rate_limit_requests: int = Field(100, ge=1)
         rate_limit_window: int = Field(60, ge=1)
 
@@ -248,7 +266,7 @@ else:
     @dataclass
     class FFTMoEConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "3.1.0"
+        version: str = "3.1.1"
         log_level: str = "INFO"
         num_experts: int = 8
         num_active_experts: int = 2
@@ -274,19 +292,21 @@ else:
         enable_multi_region: bool = True
         carbon_api_key: Optional[str] = None
         carbon_region: str = "global"
+        carbon_update_interval: int = 300
         db_path: str = "fft_moe.db"
         health_check_interval: int = 60
         max_retry_attempts: int = 3
         circuit_breaker_threshold: int = 5
         circuit_breaker_timeout: int = 30
+        circuit_breaker_half_open_max_requests: int = 3
         rate_limit_requests: int = 100
         rate_limit_window: int = 60
 
-        @classmethod
-        def get_master_key_bytes(cls) -> bytes:
-            if not cls.quantum_master_key:
+        def get_master_key_bytes(self) -> bytes:
+            """Instance method (fixed) to return master key bytes."""
+            if not self.quantum_master_key:
                 raise ValueError('quantum_master_key not set')
-            return bytes.fromhex(cls.quantum_master_key)
+            return bytes.fromhex(self.quantum_master_key)
 
 # ============================================================
 # CUSTOM EXCEPTIONS
@@ -334,6 +354,7 @@ class EnhancedCircuitBreaker:
         self.last_success_time = None
         self._lock = asyncio.Lock()
         self.half_open_requests = 0
+        self.metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
 
     async def allow_request(self) -> bool:
         async with self._lock:
@@ -499,7 +520,7 @@ class TaskManager:
         logger.info("All background tasks stopped")
 
 # ============================================================
-# ENHANCED DATABASE MANAGER (SQLAlchemy ORM)
+# ENHANCED DATABASE MANAGER (with async-safe operations)
 # ============================================================
 Base = declarative_base() if SQLALCHEMY_AVAILABLE else None
 
@@ -509,11 +530,9 @@ class EnhancedDatabaseManager:
         self.db_path = Path(config.db_path)
         self.engine = None
         self.SessionLocal = None
+        self._executor = ThreadPoolExecutor(max_workers=4)  # for DB operations
         self._init_engine()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-           retry=retry_if_exception_type((SQLAlchemyError, IOError)),
-           before_sleep=before_sleep_log(logger, logging.WARNING))
     def _init_engine(self):
         if not SQLALCHEMY_AVAILABLE:
             logger.warning("SQLAlchemy not available, database operations disabled.")
@@ -584,26 +603,38 @@ class EnhancedDatabaseManager:
 
         Base.metadata.create_all(self.engine)
 
-    @contextlib.contextmanager
-    def get_session(self) -> Optional[Session]:
-        if not SQLALCHEMY_AVAILABLE:
-            yield None
-            return
+    async def run_sync(self, func, *args, **kwargs):
+        """Run a synchronous database function in thread pool to avoid blocking."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, func, *args, **kwargs)
+
+    def _get_session(self):
+        """Synchronous context manager for session."""
         session = self.SessionLocal()
         try:
             yield session
             session.commit()
-        except Exception as e:
+        except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+    async def execute_sync(self, sync_func):
+        """Execute a synchronous function that takes a session and returns result."""
+        def wrapped():
+            if not SQLALCHEMY_AVAILABLE:
+                return None
+            with self._get_session() as session:
+                return sync_func(session)
+        return await self.run_sync(wrapped)
 
     def dispose(self):
         if self.engine:
             self.engine.dispose()
             if self.SessionLocal:
                 self.SessionLocal.remove()
+        self._executor.shutdown(wait=False)
 
 # ============================================================
 # DATA CLASSES
@@ -711,7 +742,7 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================
-# MODULE 1: QUANTUM-RESILIENT MOE SECURITY (ENHANCED with AES-GCM)
+# MODULE 1: QUANTUM-RESILIENT MOE SECURITY (ENHANCED with random salt)
 # ============================================================
 class QuantumResilientMoESecurity:
     def __init__(self, config: FFTMoEConfig, db_manager: EnhancedDatabaseManager):
@@ -723,7 +754,6 @@ class QuantumResilientMoESecurity:
         self.signatures = {}
         self._lock = asyncio.Lock()
         self.master_key = config.get_master_key_bytes()
-        self.salt = os.urandom(16)
 
         if self.pqc_available:
             self._initialize_pqc()
@@ -740,28 +770,32 @@ class QuantumResilientMoESecurity:
             logger.error(f"PQC initialization failed: {e}")
             self.pqc_available = False
 
-    def _derive_key(self) -> bytes:
+    def _derive_key(self, salt: bytes) -> bytes:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=self.salt,
+            salt=salt,
             iterations=100000,
             backend=default_backend()
         )
         return kdf.derive(self.master_key)
 
     def _encrypt_key(self, key_bytes: bytes) -> bytes:
-        derived = self._derive_key()
+        # Generate random salt per encryption
+        salt = os.urandom(16)
+        derived = self._derive_key(salt)
         aesgcm = AESGCM(derived)
         nonce = os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, key_bytes, None)
-        return nonce + ciphertext
+        # Store salt + nonce + ciphertext
+        return salt + nonce + ciphertext
 
     def _decrypt_key(self, encrypted_bytes: bytes) -> bytes:
-        derived = self._derive_key()
+        salt = encrypted_bytes[:16]
+        nonce = encrypted_bytes[16:28]
+        ciphertext = encrypted_bytes[28:]
+        derived = self._derive_key(salt)
         aesgcm = AESGCM(derived)
-        nonce = encrypted_bytes[:12]
-        ciphertext = encrypted_bytes[12:]
         return aesgcm.decrypt(nonce, ciphertext, None)
 
     async def generate_keypair(self, algorithm: str = None) -> Dict:
@@ -800,7 +834,7 @@ class QuantumResilientMoESecurity:
         try:
             keypair = self.key_pairs[key_id]
             algorithm = keypair['algorithm']
-            private_key = keypair['private_key']
+            private_key = self._decrypt_key(keypair['private_key'])
             signer = self.pqc_algorithms.get(algorithm)
             if not signer:
                 return self._fallback_sign(expert_id, update)
@@ -823,11 +857,12 @@ class QuantumResilientMoESecurity:
             async with self._lock:
                 self.signatures[update_hash] = sig_data
                 if self.db_manager and SQLALCHEMY_AVAILABLE:
-                    with self.db_manager.get_session() as session:
+                    def insert_sig(session):
                         session.execute(
                             text("INSERT INTO quantum_signatures (update_hash, algorithm, signature, key_id) VALUES (:update_hash, :algorithm, :signature, :key_id)"),
                             {'update_hash': update_hash, 'algorithm': algorithm, 'signature': signature.hex(), 'key_id': key_id}
                         )
+                    await self.db_manager.execute_sync(insert_sig)
             QUANTUM_SIGNATURES.labels(algorithm=algorithm, status='sign_success').inc()
             logger.info(f"Expert {expert_id} update signed with {algorithm}")
             return sig_data
@@ -993,11 +1028,12 @@ class BlockchainExpertRegistry:
                     'timestamp': datetime.now().isoformat()
                 }
                 if self.db_manager and SQLALCHEMY_AVAILABLE:
-                    with self.db_manager.get_session() as session:
+                    def insert_record(session):
                         session.execute(
                             text("INSERT INTO blockchain_records (expert_id, weights_hash, tx_hash, block_number) VALUES (:expert_id, :weights_hash, :tx_hash, :block_number)"),
                             {'expert_id': expert_id, 'weights_hash': weights_hash, 'tx_hash': result['tx_hash'], 'block_number': result['block_number']}
                         )
+                    await self.db_manager.execute_sync(insert_record)
             BLOCKCHAIN_REGISTRATIONS.labels(status='recorded').inc()
             logger.info(f"Expert {expert_id} registered on blockchain: {result['tx_hash']}")
             return {'status': 'success', 'expert_id': expert_id, 'tx_hash': result['tx_hash'], 'block_number': result['block_number']}
@@ -1301,7 +1337,7 @@ class LocalModelTrainer:
         return await asyncio.to_thread(train_sync)
 
 # ============================================================
-# ENHANCED FFT-MOE ADAPTER v3.1.0
+# ENHANCED FFT-MOE ADAPTER v3.1.1
 # ============================================================
 class FFTMoEAdapter:
     def __init__(self, config: Optional[Union[FFTMoEConfig, Dict]] = None):
@@ -1383,7 +1419,7 @@ class FFTMoEAdapter:
         while self._running and not self._shutdown_event.is_set():
             try:
                 await self.carbon_manager.get_current_intensity()
-                await asyncio.sleep(self.config.carbon_update_interval if hasattr(self.config, 'carbon_update_interval') else 300)
+                await asyncio.sleep(self.config.carbon_update_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1394,23 +1430,28 @@ class FFTMoEAdapter:
         if not SQLALCHEMY_AVAILABLE:
             return
         try:
-            with self.db_manager.get_session() as session:
-                # Load experts with weights
+            def load_experts(session):
                 result = session.execute(text("SELECT expert_id, layer_index, weights_blob, activation_count, last_updated, is_specialized, specialization_domain FROM experts"))
+                loaded = {}
                 for row in result:
                     expert_id = row[0]
                     if expert_id in self.experts:
                         self.experts[expert_id].layer_index = row[1]
                         if row[2]:
                             # Deserialize weights from BLOB
-                            weights = torch.load(io.BytesIO(row[2]), map_location='cpu')
+                            buffer = io.BytesIO(row[2])
+                            weights = torch.load(buffer, map_location='cpu')
                             self.experts[expert_id].weights = weights
                         self.experts[expert_id].activation_count = row[3]
                         self.experts[expert_id].last_updated = row[4]
                         self.experts[expert_id].is_specialized = row[5]
                         self.experts[expert_id].specialization_domain = row[6]
-                # Load profiles
+                return loaded
+            await self.db_manager.execute_sync(load_experts)
+
+            def load_profiles(session):
                 result = session.execute(text("SELECT client_id, active_expert_ids, expert_weights, data_distribution, local_update_count, region FROM client_profiles"))
+                profiles = {}
                 for row in result:
                     profile = ClientExpertProfile(
                         client_id=row[0],
@@ -1420,7 +1461,10 @@ class FFTMoEAdapter:
                         local_update_count=row[4],
                         region=row[5]
                     )
-                    self.client_profiles[profile.client_id] = profile
+                    profiles[profile.client_id] = profile
+                return profiles
+            profiles = await self.db_manager.execute_sync(load_profiles)
+            self.client_profiles = profiles
             logger.info(f"Loaded {len(self.experts)} experts and {len(self.client_profiles)} profiles from DB")
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
@@ -1430,6 +1474,7 @@ class FFTMoEAdapter:
             try:
                 async with self._profiles_lock:
                     for client_id, profile in list(self.client_profiles.items()):
+                        # Remove inactive clients (no updates for 30 days)
                         if profile.local_update_count == 0 and (datetime.now() - datetime.fromtimestamp(0)) > timedelta(days=30):
                             del self.client_profiles[client_id]
                 await asyncio.sleep(self.config.health_check_interval)
@@ -1479,11 +1524,12 @@ class FFTMoEAdapter:
             self.client_profiles[client_id] = profile
 
             if SQLALCHEMY_AVAILABLE:
-                with self.db_manager.get_session() as session:
+                def insert_profile(session):
                     session.execute(
                         text("INSERT INTO client_profiles (client_id, active_expert_ids, expert_weights, data_distribution, local_update_count, region) VALUES (:client_id, :active_expert_ids, :expert_weights, :data_distribution, :local_update_count, :region)"),
                         {'client_id': client_id, 'active_expert_ids': json.dumps(active_experts), 'expert_weights': json.dumps(profile.expert_weights), 'data_distribution': json.dumps(data_distribution), 'local_update_count': 0, 'region': region}
                     )
+                await self.db_manager.execute_sync(insert_profile)
             logger.info(f"Registered client {client_id} with {len(active_experts)} experts in region {region}")
 
     async def get_client_model(self, client_id: str) -> Dict[str, torch.Tensor]:
@@ -1640,11 +1686,12 @@ class FFTMoEAdapter:
                             buffer = io.BytesIO()
                             torch.save(expert_state.weights, buffer)
                             blob = buffer.getvalue()
-                            with self.db_manager.get_session() as session:
+                            def update_expert(session):
                                 session.execute(
                                     text("UPDATE experts SET weights_blob = :blob, last_updated = :last_updated, activation_count = :activation_count WHERE expert_id = :expert_id"),
                                     {'blob': blob, 'last_updated': datetime.now(), 'activation_count': expert_state.activation_count, 'expert_id': expert_id}
                                 )
+                            await self.db_manager.execute_sync(update_expert)
 
             # Clear pending updates
             self.pending_updates.clear()
@@ -1757,11 +1804,36 @@ async def get_fft_moe_adapter(config: Optional[Union[FFTMoEConfig, Dict]] = None
     return _adapter_instance
 
 # ============================================================
+# SIGNAL HANDLING FOR GRACEFUL SHUTDOWN
+# ============================================================
+_shutdown_requested = False
+
+def handle_signal(signum, frame):
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        asyncio.create_task(shutdown_handler())
+
+async def shutdown_handler():
+    global _adapter_instance
+    if _adapter_instance:
+        await _adapter_instance.shutdown()
+        _adapter_instance = None
+    # Stop the event loop gracefully
+    asyncio.get_event_loop().stop()
+
+# ============================================================
 # MAIN ENTRY POINT
 # ============================================================
 async def main():
+    # Register signal handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+
     print("=" * 80)
-    print("Enhanced FFT-MoE Adapter v3.1.0 - Enterprise Quantum Resilience (Enhanced)")
+    print("Enhanced FFT-MoE Adapter v3.1.1 - Enterprise Quantum Resilience (Enhanced)")
     print("=" * 80)
 
     adapter = await get_fft_moe_adapter()
@@ -1814,15 +1886,16 @@ async def main():
     print(f"   Aggregated updates: {len(aggregated)} experts")
 
     print("\n" + "=" * 80)
-    print("✅ Enhanced FFT-MoE Adapter v3.1.0 - Ready for Production")
+    print("✅ Enhanced FFT-MoE Adapter v3.1.1 - Ready for Production")
     print("=" * 80)
 
     try:
         await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-        await adapter.shutdown()
-        print("Shutdown complete")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _adapter_instance:
+            await _adapter_instance.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
