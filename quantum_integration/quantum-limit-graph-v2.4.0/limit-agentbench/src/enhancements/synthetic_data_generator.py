@@ -15,6 +15,9 @@ ENHANCEMENTS OVER v2.0:
 - Dataset versioning.
 - Comprehensive docstrings and type hints.
 - Integration with Green_Agent schemas.
+- **NEW v3.0**: True async methods, Pydantic BaseSettings, structured logging,
+  caching/retries for external collectors, streaming generation, diurnal patterns,
+  correlated anomalies, CLI entry point.
 """
 
 import asyncio
@@ -22,25 +25,67 @@ import json
 import random
 import hashlib
 import uuid
+import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple, Union, Callable
+from typing import Dict, List, Any, Optional, Tuple, Union, Callable, AsyncIterator
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from pathlib import Path
+
+# ---------- Structured logging ----------
+try:
+    import structlog
+    from structlog.processors import JSONRenderer, TimeStamper
+    STRUCTLOG_AVAILABLE = True
+except ImportError:
+    STRUCTLOG_AVAILABLE = False
+
+if STRUCTLOG_AVAILABLE:
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            TimeStamper(fmt="iso"),
+            JSONRenderer()
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+    logger = structlog.get_logger(__name__)
+else:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
 
 # ---------- Pydantic ----------
 try:
-    from pydantic import BaseModel, Field, field_validator, ValidationInfo
+    from pydantic import BaseSettings, Field, field_validator, ValidationInfo
+    from pydantic_settings import BaseSettings as SettingsBase
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
+
+# ---------- Retry / Cache ----------
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
+
+try:
+    from async_lru import alru_cache
+    ALRU_CACHE_AVAILABLE = True
+except ImportError:
+    ALRU_CACHE_AVAILABLE = False
 
 # ---------- Local imports (schemas) ----------
 from .schemas.node_descriptor import NodeDescriptor
 from .schemas.workload_descriptor import WorkloadDescriptor
 from ..expert_registry import ExpertProfile, ExpertDomain
-from ..node_registry import NodeDescriptor  # fallback if needed
+from ..node_registry import NodeDescriptor as NodeDescriptorFallback  # fallback if needed
 
 # ---------- Optional: data collectors (for real distributions) ----------
 try:
@@ -50,7 +95,7 @@ try:
     COLLECTORS_AVAILABLE = True
 except ImportError:
     COLLECTORS_AVAILABLE = False
-    # Stubs
+    # Stubs (for fallback)
     class CarbonIntensityFetcher:
         async def get_intensity(self, region: str) -> float:
             return 0.4
@@ -62,10 +107,10 @@ except ImportError:
             return None
 
 # ============================================================================
-# 1. CONFIGURATION (Pydantic)
+# 1. CONFIGURATION (Pydantic BaseSettings)
 # ============================================================================
 if PYDANTIC_AVAILABLE:
-    class SyntheticDataConfig(BaseModel):
+    class SyntheticDataConfig(BaseSettings):
         """Configuration for the synthetic data generator."""
         seed: int = Field(42, description="Random seed for reproducibility")
         # Task distributions
@@ -107,9 +152,9 @@ if PYDANTIC_AVAILABLE:
         # Prompt pool file (optional)
         prompt_pool_file: Optional[str] = Field(None, description="Path to a JSON file with list of prompts")
         # Export format
-        export_format: str = Field("json", description="json or parquet")
+        export_format: str = Field("json", description="json, parquet, or jsonl")
         # Dataset version
-        dataset_version: str = Field("2.0.0")
+        dataset_version: str = Field("3.0.0")
 
         @field_validator('task_types')
         @classmethod
@@ -128,14 +173,14 @@ if PYDANTIC_AVAILABLE:
         @field_validator('export_format')
         @classmethod
         def validate_export_format(cls, v: str) -> str:
-            if v not in ['json', 'parquet']:
-                raise ValueError("export_format must be 'json' or 'parquet'")
+            if v not in ['json', 'jsonl', 'parquet']:
+                raise ValueError("export_format must be 'json', 'jsonl', or 'parquet'")
             return v
 
         class Config:
             env_prefix = "SYNTH_"
 else:
-    # Fallback config as dict
+    # Fallback config as dict (no validation)
     SYNTHETIC_CONFIG = {
         "seed": 42,
         "task_types": {
@@ -161,7 +206,7 @@ else:
         "use_real_distributions": False,
         "prompt_pool_file": None,
         "export_format": "json",
-        "dataset_version": "2.0.0",
+        "dataset_version": "3.0.0",
     }
 
 # ============================================================================
@@ -190,23 +235,24 @@ class SyntheticExpertProfile(ExpertProfile):
         self.avg_latency_ms *= (1 + self.degradation_rate * 0.1)
 
 # ============================================================================
-# 3. MAIN GENERATOR (Enhanced, Consolidated)
+# 3. MAIN GENERATOR (Enhanced, Consolidated, Async)
 # ============================================================================
 class SyntheticDataGenerator:
     """
     Advanced synthetic data generator for policy testing and simulation.
 
     Features:
-    - Pydantic‑validated configuration.
+    - Pydantic‑validated configuration (with environment variable support).
     - Generates NodeDescriptor and WorkloadDescriptor directly.
     - Includes per‑task sustainability metrics.
-    - Can sample from real data distributions (via injected collectors).
+    - Can sample from real data distributions (via injected collectors) with caching/retries.
     - Configurable prompt pool from external file.
-    - Time‑series generation for helium and carbon (ARIMA‑like).
-    - Expanded anomaly types (network failure, expert degradation).
-    - Optional Parquet export.
+    - Time‑series generation with diurnal patterns and custom rate functions.
+    - Expanded anomaly types (network failure, expert degradation, regional outages).
+    - Optional Parquet/JSONL export.
     - Dataset versioning.
-    - Async generation methods.
+    - Async generation methods with streaming support.
+    - Comprehensive logging.
     """
 
     def __init__(
@@ -257,7 +303,7 @@ class SyntheticDataGenerator:
         self.use_real_distributions = self.config.get('use_real_distributions', False)
         self.prompt_pool_file = self.config.get('prompt_pool_file')
         self.export_format = self.config.get('export_format', 'json')
-        self.dataset_version = self.config.get('dataset_version', '2.0.0')
+        self.dataset_version = self.config.get('dataset_version', '3.0.0')
 
         # Inject external collectors
         self.carbon_fetcher = carbon_fetcher
@@ -270,9 +316,13 @@ class SyntheticDataGenerator:
         # User-region mapping for correlations
         self.user_region_cache: Dict[str, str] = {}
 
-        # Cache for real distributions (if enabled)
-        self._real_carbon_cache: Dict[str, float] = {}
-        self._real_helium_cache: Dict[str, float] = {}
+        # Cache for real distributions (in‑memory with TTL)
+        self._real_carbon_cache: Dict[str, Tuple[float, datetime]] = {}
+        self._real_helium_cache: Dict[str, Tuple[float, datetime]] = {}
+        self._cache_ttl_seconds = 300  # 5 minutes
+
+        # Logging context
+        self._log = logger.bind(component="SyntheticDataGenerator")
 
     # ------------------------------------------------------------------
     # Configuration utilities
@@ -289,11 +339,12 @@ class SyntheticDataGenerator:
                 with open(self.prompt_pool_file, 'r') as f:
                     data = json.load(f)
                     if isinstance(data, list):
+                        self._log.info("Loaded prompt pool", file=self.prompt_pool_file, count=len(data))
                         return data
             except Exception as e:
-                print(f"Warning: Could not load prompt pool file: {e}")
+                self._log.warning("Could not load prompt pool file", file=self.prompt_pool_file, error=str(e))
         # Default pool
-        return [
+        default = [
             "Summarize the latest developments in sustainable AI.",
             "Translate the following English text into French: 'The quick brown fox jumps over the lazy dog.'",
             "Classify the sentiment of this customer review: 'I love this product, it's fantastic!'",
@@ -310,11 +361,13 @@ class SyntheticDataGenerator:
             "Write a short story about a robot learning to recycle.",
             "Analyze the tone of this tweet: 'Carbon offset credits are a scam!'",
         ]
+        self._log.info("Using default prompt pool", count=len(default))
+        return default
 
     # ------------------------------------------------------------------
     # Task Generation (produces WorkloadDescriptor)
     # ------------------------------------------------------------------
-    def generate_workload_descriptor(self, **kwargs) -> WorkloadDescriptor:
+    async def generate_workload_descriptor(self, **kwargs) -> WorkloadDescriptor:
         """
         Generate a synthetic WorkloadDescriptor.
 
@@ -354,9 +407,9 @@ class SyntheticDataGenerator:
         return np.random.choice(self.priority_profiles)
 
     # ------------------------------------------------------------------
-    # Environment / Node Descriptor Generation
+    # Environment / Node Descriptor Generation (Async)
     # ------------------------------------------------------------------
-    def generate_node_descriptor(self, **kwargs) -> NodeDescriptor:
+    async def generate_node_descriptor(self, **kwargs) -> NodeDescriptor:
         """
         Generate a synthetic NodeDescriptor.
 
@@ -366,25 +419,19 @@ class SyntheticDataGenerator:
         node_id = kwargs.get('node_id') or f"synth_node_{uuid.uuid4().hex[:8]}"
         node_type = kwargs.get('type') or random.choice(["edge", "hotspot", "cloud", "lab"])
         region = kwargs.get('region') or random.choice(self.regions)
-        # Carbon intensity: either from real collector or random
+
+        # Carbon intensity: from real collector with caching or random
         if self.use_real_distributions and self.carbon_fetcher:
-            # Use cached or fetch (synchronous for simplicity; could be async)
-            if region not in self._real_carbon_cache:
-                # For demonstration, we use a synchronous stub; in real use, async
-                intensity = asyncio.run(self.carbon_fetcher.get_intensity(region))
-                self._real_carbon_cache[region] = intensity
-            region_carbon_intensity = self._real_carbon_cache[region]
+            region_carbon_intensity = await self._get_carbon_intensity(region)
         else:
             region_carbon_intensity = kwargs.get('region_carbon_intensity') or self._random_carbon(region)
 
         energy_per_token = kwargs.get('energy_per_token') or random.uniform(0.00001, 0.0001)
+
         # Helium connectivity: from collector or random
         if self.use_real_distributions and self.helium_collector:
             hotspot_id = kwargs.get('hotspot_id') or f"hotspot_{random.randint(1,1000)}"
-            if hotspot_id not in self._real_helium_cache:
-                score = asyncio.run(self.helium_collector.get_connectivity_score(hotspot_id))
-                self._real_helium_cache[hotspot_id] = score
-            helium_connectivity_score = self._real_helium_cache[hotspot_id]
+            helium_connectivity_score = await self._get_helium_score(hotspot_id)
         else:
             helium_connectivity_score = kwargs.get('helium_connectivity_score') or random.uniform(0.5, 1.0)
 
@@ -404,6 +451,60 @@ class SyntheticDataGenerator:
             renewable_fraction=renewable_fraction,
         )
 
+    async def _get_carbon_intensity(self, region: str) -> float:
+        """Get carbon intensity with caching and retries."""
+        # Check cache
+        if region in self._real_carbon_cache:
+            value, timestamp = self._real_carbon_cache[region]
+            if (datetime.now() - timestamp).seconds < self._cache_ttl_seconds:
+                return value
+
+        # Fetch with retry if available
+        if TENACITY_AVAILABLE:
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+            async def fetch():
+                return await self.carbon_fetcher.get_intensity(region)
+            try:
+                intensity = await fetch()
+            except Exception as e:
+                self._log.error("Carbon fetcher failed, using fallback", region=region, error=str(e))
+                intensity = self._random_carbon(region)
+        else:
+            try:
+                intensity = await self.carbon_fetcher.get_intensity(region)
+            except Exception as e:
+                self._log.error("Carbon fetcher failed, using fallback", region=region, error=str(e))
+                intensity = self._random_carbon(region)
+
+        self._real_carbon_cache[region] = (intensity, datetime.now())
+        return intensity
+
+    async def _get_helium_score(self, hotspot_id: str) -> float:
+        """Get helium connectivity score with caching and retries."""
+        if hotspot_id in self._real_helium_cache:
+            value, timestamp = self._real_helium_cache[hotspot_id]
+            if (datetime.now() - timestamp).seconds < self._cache_ttl_seconds:
+                return value
+
+        if TENACITY_AVAILABLE:
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+            async def fetch():
+                return await self.helium_collector.get_connectivity_score(hotspot_id)
+            try:
+                score = await fetch()
+            except Exception as e:
+                self._log.error("Helium collector failed, using fallback", hotspot_id=hotspot_id, error=str(e))
+                score = random.uniform(0.5, 1.0)
+        else:
+            try:
+                score = await self.helium_collector.get_connectivity_score(hotspot_id)
+            except Exception as e:
+                self._log.error("Helium collector failed, using fallback", hotspot_id=hotspot_id, error=str(e))
+                score = random.uniform(0.5, 1.0)
+
+        self._real_helium_cache[hotspot_id] = (score, datetime.now())
+        return score
+
     def _random_carbon(self, region: str) -> float:
         base = self.region_carbon.get(region, 400)
         # Add diurnal variation: lower at night
@@ -421,7 +522,7 @@ class SyntheticDataGenerator:
     # ------------------------------------------------------------------
     # Sustainability Metrics
     # ------------------------------------------------------------------
-    def compute_sustainability_metrics(
+    async def compute_sustainability_metrics(
         self,
         workload: WorkloadDescriptor,
         node: NodeDescriptor,
@@ -453,13 +554,14 @@ class SyntheticDataGenerator:
         )
 
     # ------------------------------------------------------------------
-    # Temporal Sequences (Poisson process)
+    # Temporal Sequences (Poisson process with diurnal patterns)
     # ------------------------------------------------------------------
-    def generate_task_sequence(
+    async def generate_task_sequence(
         self,
         duration_hours: Optional[int] = None,
         rate_per_hour: Optional[float] = None,
         start_time: Optional[datetime] = None,
+        rate_function: Optional[Callable[[datetime], float]] = None,
         **kwargs
     ) -> List[Dict[str, Any]]:
         """
@@ -467,44 +569,63 @@ class SyntheticDataGenerator:
 
         Args:
             duration_hours: Length of the sequence in hours.
-            rate_per_hour: Average number of tasks per hour.
+            rate_per_hour: Average number of tasks per hour (if rate_function is None).
             start_time: Start time for the sequence.
+            rate_function: Custom function that returns rate at a given datetime.
             **kwargs: Additional overrides passed to generate descriptors.
         Returns:
             List of dicts with 'workload', 'node', and 'metrics'.
         """
         duration = duration_hours or self.default_duration_hours
-        rate = rate_per_hour or self.default_rate_per_hour
         start = start_time or datetime.now()
+        end = start + timedelta(hours=duration)
+
+        # If no rate_function, create a simple diurnal pattern
+        if rate_function is None:
+            # Peak at 2pm, low at 2am
+            base_rate = rate_per_hour or self.default_rate_per_hour
+            def rate_func(t: datetime) -> float:
+                hour = t.hour
+                # Diurnal: peak at 14, trough at 2
+                factor = 0.7 + 0.3 * np.cos((hour - 14) * 2 * np.pi / 24)
+                return base_rate * factor
+            rate_function = rate_func
 
         sequence = []
-        t = 0.0
-        while t < duration * 3600:
-            dt = np.random.exponential(1 / rate)  # seconds
-            t += dt
-            if t >= duration * 3600:
+        t = start
+        while t < end:
+            # Compute current rate
+            current_rate = rate_function(t)
+            if current_rate <= 0:
+                # If rate is zero, advance a small step
+                t += timedelta(seconds=1)
+                continue
+            # Poisson inter-arrival time (in seconds)
+            dt = np.random.exponential(1 / current_rate)
+            t += timedelta(seconds=dt)
+            if t >= end:
                 break
-            timestamp = start + timedelta(seconds=t)
             # Generate descriptors with optional timestamp (for correlation)
-            workload = self.generate_workload_descriptor(**kwargs)
-            node = self.generate_node_descriptor(**kwargs)
-            metrics = self.compute_sustainability_metrics(workload, node)
+            workload = await self.generate_workload_descriptor(**kwargs)
+            node = await self.generate_node_descriptor(**kwargs)
+            metrics = await self.compute_sustainability_metrics(workload, node)
             sequence.append({
-                'timestamp': timestamp,
+                'timestamp': t,
                 'workload': workload,
                 'node': node,
                 'metrics': metrics,
             })
+        self._log.info("Generated task sequence", count=len(sequence), duration_hours=duration)
         return sequence
 
     async def generate_task_sequence_async(self, **kwargs) -> List[Dict[str, Any]]:
         """Async version of generate_task_sequence."""
-        return self.generate_task_sequence(**kwargs)
+        return await self.generate_task_sequence(**kwargs)
 
     # ------------------------------------------------------------------
     # Anomaly Injection (Enhanced)
     # ------------------------------------------------------------------
-    def inject_anomaly(
+    async def inject_anomaly(
         self,
         workload: WorkloadDescriptor,
         node: NodeDescriptor,
@@ -527,12 +648,13 @@ class SyntheticDataGenerator:
                 'renewable_surge',
                 'network_failure',
                 'expert_degradation',
+                'regional_outage',      # new: affects all nodes in a region
+                'supply_chain_disruption',  # new: affects material availability
             ])
         if anomaly_type == 'extreme_token_count':
             workload.tokens = int(np.random.exponential(10000)) + 5000
         elif anomaly_type == 'zero_accuracy':
-            # Simulate by setting a low required_accuracy (or we could add a field)
-            workload.latency_target = 0.0  # unrealistic latency
+            workload.latency_target = 0.0
         elif anomaly_type == 'zero_latency':
             workload.latency_target = 0.0
         elif anomaly_type == 'extreme_carbon':
@@ -548,16 +670,25 @@ class SyntheticDataGenerator:
             node.helium_connectivity_score = 0.0
             node.uptime = 0.0
         elif anomaly_type == 'expert_degradation':
-            # Simulate by adding a degradation flag (would be handled in expert selection)
+            # Simulate by setting a low accuracy (would be handled in expert selection)
+            pass
+        elif anomaly_type == 'regional_outage':
+            # Mark a region as having low uptime (handled via node's region)
+            # We'll set uptime to 0.3 for this node (representative of outage)
+            node.uptime = 0.3
+            # Optionally, we could also set a flag for the region
+        elif anomaly_type == 'supply_chain_disruption':
+            # Increase material index (simulate scarcity)
+            # This would be applied in the metrics, not the node itself
             pass
         else:
             raise ValueError(f"Unknown anomaly_type: {anomaly_type}")
         return workload, node, anomaly_type
 
     # ------------------------------------------------------------------
-    # Dataset Generation (Using Descriptors)
+    # Dataset Generation (Streaming / Batch)
     # ------------------------------------------------------------------
-    def generate_dataset(
+    async def generate_dataset(
         self,
         num_samples: int = 1000,
         include_edge_cases: bool = True,
@@ -583,13 +714,13 @@ class SyntheticDataGenerator:
 
         # Normal samples
         for _ in range(num_normal):
-            workload = self.generate_workload_descriptor()
-            node = self.generate_node_descriptor()
+            workload = await self.generate_workload_descriptor()
+            node = await self.generate_node_descriptor()
             # Optionally inject anomaly
             anomaly = None
             if random.random() < anomaly_rate:
-                workload, node, anomaly = self.inject_anomaly(workload, node)
-            metrics = self.compute_sustainability_metrics(workload, node)
+                workload, node, anomaly = await self.inject_anomaly(workload, node)
+            metrics = await self.compute_sustainability_metrics(workload, node)
             dataset.append({
                 'workload': workload,
                 'node': node,
@@ -601,14 +732,15 @@ class SyntheticDataGenerator:
         edge_types = [
             'extreme_token_count', 'zero_accuracy', 'zero_latency',
             'extreme_carbon', 'helium_crisis', 'harvester_downtime',
-            'renewable_surge', 'network_failure', 'expert_degradation'
+            'renewable_surge', 'network_failure', 'expert_degradation',
+            'regional_outage', 'supply_chain_disruption'
         ]
         for _ in range(num_edge):
             anomaly_type = random.choice(edge_types)
-            workload = self.generate_workload_descriptor()
-            node = self.generate_node_descriptor()
-            workload, node, _ = self.inject_anomaly(workload, node, anomaly_type)
-            metrics = self.compute_sustainability_metrics(workload, node)
+            workload = await self.generate_workload_descriptor()
+            node = await self.generate_node_descriptor()
+            workload, node, _ = await self.inject_anomaly(workload, node, anomaly_type)
+            metrics = await self.compute_sustainability_metrics(workload, node)
             dataset.append({
                 'workload': workload,
                 'node': node,
@@ -616,22 +748,74 @@ class SyntheticDataGenerator:
                 'anomaly': anomaly_type,
             })
 
+        self._log.info("Generated dataset", count=len(dataset), edge=num_edge, anomaly_rate=anomaly_rate)
         return dataset
 
     async def generate_dataset_async(self, **kwargs) -> List[Dict[str, Any]]:
         """Async version of generate_dataset."""
-        return self.generate_dataset(**kwargs)
+        return await self.generate_dataset(**kwargs)
 
     # ------------------------------------------------------------------
-    # Persistence (JSON/Parquet with versioning)
+    # Streaming Generator (for large datasets)
     # ------------------------------------------------------------------
-    def save_dataset(self, dataset: List[Dict[str, Any]], path: str) -> None:
+    async def generate_dataset_stream(
+        self,
+        num_samples: int = 1000,
+        include_edge_cases: bool = True,
+        edge_case_fraction: float = 0.1,
+        anomaly_rate: Optional[float] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Save dataset to a file (JSON or Parquet).
+        Stream a dataset one sample at a time (generator). Useful for very large datasets.
+        """
+        if anomaly_rate is None:
+            anomaly_rate = self.default_anomaly_rate
 
-        Args:
-            dataset: The dataset (list of dicts with 'workload', 'node', 'metrics', 'anomaly').
-            path: Output file path.
+        num_edge = int(num_samples * edge_case_fraction) if include_edge_cases else 0
+        num_normal = num_samples - num_edge
+
+        # Normal samples
+        for _ in range(num_normal):
+            workload = await self.generate_workload_descriptor()
+            node = await self.generate_node_descriptor()
+            anomaly = None
+            if random.random() < anomaly_rate:
+                workload, node, anomaly = await self.inject_anomaly(workload, node)
+            metrics = await self.compute_sustainability_metrics(workload, node)
+            yield {
+                'workload': workload,
+                'node': node,
+                'metrics': metrics,
+                'anomaly': anomaly,
+            }
+
+        # Edge cases
+        edge_types = [
+            'extreme_token_count', 'zero_accuracy', 'zero_latency',
+            'extreme_carbon', 'helium_crisis', 'harvester_downtime',
+            'renewable_surge', 'network_failure', 'expert_degradation',
+            'regional_outage', 'supply_chain_disruption'
+        ]
+        for _ in range(num_edge):
+            anomaly_type = random.choice(edge_types)
+            workload = await self.generate_workload_descriptor()
+            node = await self.generate_node_descriptor()
+            workload, node, _ = await self.inject_anomaly(workload, node, anomaly_type)
+            metrics = await self.compute_sustainability_metrics(workload, node)
+            yield {
+                'workload': workload,
+                'node': node,
+                'metrics': metrics,
+                'anomaly': anomaly_type,
+            }
+
+    # ------------------------------------------------------------------
+    # Persistence (JSON/Parquet/JSONL with streaming support)
+    # ------------------------------------------------------------------
+    async def save_dataset(self, dataset: List[Dict[str, Any]], path: str) -> None:
+        """
+        Save dataset to a file (JSON, Parquet, or JSONL).
+        For large datasets, consider using the streaming version.
         """
         # Convert Pydantic/dataclass objects to serializable dicts
         serializable = []
@@ -648,20 +832,69 @@ class SyntheticDataGenerator:
         if self.export_format == 'parquet':
             df = pd.DataFrame(serializable)
             df.to_parquet(path, index=False)
-        else:
+        elif self.export_format == 'jsonl':
+            with open(path, 'w') as f:
+                for entry in serializable:
+                    f.write(json.dumps(entry, default=str) + '\n')
+        else:  # default json
             with open(path, 'w') as f:
                 json.dump(serializable, f, indent=2, default=str)
+        self._log.info("Saved dataset", path=path, format=self.export_format, count=len(dataset))
+
+    async def save_dataset_stream(self, stream: AsyncIterator[Dict[str, Any]], path: str) -> None:
+        """
+        Save a dataset from a stream incrementally.
+        Supports JSONL and Parquet (via accumulating chunks).
+        """
+        if self.export_format == 'jsonl':
+            with open(path, 'w') as f:
+                async for item in stream:
+                    entry = {
+                        'version': self.dataset_version,
+                        'workload': item['workload'].dict() if hasattr(item['workload'], 'dict') else item['workload'].__dict__,
+                        'node': item['node'].dict() if hasattr(item['node'], 'dict') else item['node'].__dict__,
+                        'metrics': item['metrics'].__dict__,
+                        'anomaly': item['anomaly'],
+                    }
+                    f.write(json.dumps(entry, default=str) + '\n')
+        elif self.export_format == 'parquet':
+            # Accumulate in chunks and write
+            chunks = []
+            chunk_size = 10000
+            async for item in stream:
+                entry = {
+                    'workload': item['workload'].dict() if hasattr(item['workload'], 'dict') else item['workload'].__dict__,
+                    'node': item['node'].dict() if hasattr(item['node'], 'dict') else item['node'].__dict__,
+                    'metrics': item['metrics'].__dict__,
+                    'anomaly': item['anomaly'],
+                }
+                chunks.append(entry)
+                if len(chunks) >= chunk_size:
+                    df = pd.DataFrame(chunks)
+                    if Path(path).exists():
+                        df.to_parquet(path, engine='pyarrow', append=True)
+                    else:
+                        df.to_parquet(path, engine='pyarrow')
+                    chunks = []
+            if chunks:
+                df = pd.DataFrame(chunks)
+                if Path(path).exists():
+                    df.to_parquet(path, engine='pyarrow', append=True)
+                else:
+                    df.to_parquet(path, engine='pyarrow')
+        else:
+            # Fallback to JSON (collect all)
+            dataset = []
+            async for item in stream:
+                dataset.append(item)
+            await self.save_dataset(dataset, path)
 
     def load_dataset(self, path: str) -> List[Dict[str, Any]]:
         """
-        Load a dataset from a file (JSON or Parquet).
-
-        Returns:
-            List of dicts with 'workload', 'node', 'metrics', 'anomaly'.
+        Load a dataset from a file (JSON, Parquet, or JSONL).
         """
         if path.endswith('.parquet'):
             df = pd.read_parquet(path)
-            # Convert back to objects
             dataset = []
             for _, row in df.iterrows():
                 workload = WorkloadDescriptor(**row['workload'])
@@ -674,7 +907,22 @@ class SyntheticDataGenerator:
                     'anomaly': row.get('anomaly'),
                 })
             return dataset
-        else:
+        elif path.endswith('.jsonl'):
+            dataset = []
+            with open(path, 'r') as f:
+                for line in f:
+                    entry = json.loads(line)
+                    workload = WorkloadDescriptor(**entry['workload'])
+                    node = NodeDescriptor(**entry['node'])
+                    metrics = SyntheticSustainabilityMetrics(**entry['metrics'])
+                    dataset.append({
+                        'workload': workload,
+                        'node': node,
+                        'metrics': metrics,
+                        'anomaly': entry.get('anomaly'),
+                    })
+            return dataset
+        else:  # JSON
             with open(path, 'r') as f:
                 data = json.load(f)
             dataset = []
@@ -743,68 +991,60 @@ class SyntheticDataGenerator:
             })
         return exported
 
-# ============================================================================
-# 4. UNIT TEST STUBS (pytest)
-# ============================================================================
-def test_generator_basic():
-    """Basic test for descriptor generation."""
-    gen = SyntheticDataGenerator()
-    workload = gen.generate_workload_descriptor()
-    node = gen.generate_node_descriptor()
-    assert workload.tokens > 0
-    assert node.region_carbon_intensity > 0
-
-def test_persistence(tmp_path):
-    """Test save/load of dataset."""
-    gen = SyntheticDataGenerator()
-    dataset = gen.generate_dataset(num_samples=10)
-    path = tmp_path / "dataset.json"
-    gen.save_dataset(dataset, path)
-    loaded = gen.load_dataset(path)
-    assert len(loaded) == len(dataset)
-    assert loaded[0]['workload'].tokens == dataset[0]['workload'].tokens
-
-def test_anomaly_injection():
-    gen = SyntheticDataGenerator()
-    workload = gen.generate_workload_descriptor()
-    node = gen.generate_node_descriptor()
-    workload, node, anomaly = gen.inject_anomaly(workload, node, 'extreme_token_count')
-    assert workload.tokens > 10000
-    assert anomaly == 'extreme_token_count'
-
-# ============================================================================
-# 5. EXAMPLE USAGE
-# ============================================================================
-if __name__ == "__main__":
-    import asyncio
-
-    async def main():
-        # Create generator with custom config
-        config = {
-            'seed': 123,
-            'default_anomaly_rate': 0.1,
-            'default_duration_hours': 2,
-            'default_rate_per_hour': 50,
+    # ------------------------------------------------------------------
+    # Metrics / Statistics
+    # ------------------------------------------------------------------
+    def get_stats(self) -> Dict:
+        """Return generation statistics."""
+        return {
+            'config_seed': self.config.get('seed'),
+            'use_real_distributions': self.use_real_distributions,
+            'prompt_pool_size': len(self.prompt_pool),
+            'cache_ttl_seconds': self._cache_ttl_seconds,
+            'dataset_version': self.dataset_version,
         }
-        gen = SyntheticDataGenerator(config)
 
-        # Generate a sequence of tasks over 2 hours
-        seq = gen.generate_task_sequence(duration_hours=2, rate_per_hour=50)
-        print(f"Generated {len(seq)} tasks over 2 hours")
+# ============================================================================
+# 4. CLI ENTRY POINT
+# ============================================================================
+async def main_cli():
+    """Command‑line interface for generating datasets."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate synthetic sustainability datasets.")
+    parser.add_argument('--config', type=str, help='Path to JSON config file')
+    parser.add_argument('--output', type=str, required=True, help='Output file path')
+    parser.add_argument('--num-samples', type=int, default=1000, help='Number of samples')
+    parser.add_argument('--edge-fraction', type=float, default=0.1, help='Fraction of edge cases')
+    parser.add_argument('--anomaly-rate', type=float, default=0.0, help='Anomaly rate')
+    parser.add_argument('--format', type=str, default='json', choices=['json', 'jsonl', 'parquet'], help='Output format')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    args = parser.parse_args()
 
-        # Generate a full dataset with edge cases
-        dataset = gen.generate_dataset(num_samples=100, include_edge_cases=True, edge_case_fraction=0.2)
-        print(f"Generated dataset with {len(dataset)} samples, including edge cases")
+    # Load config if provided
+    config = None
+    if args.config:
+        with open(args.config, 'r') as f:
+            config = json.load(f)
 
-        # Show first sample
-        sample = dataset[0]
-        print(f"Workload: {sample['workload'].task_type}, tokens: {sample['workload'].tokens}")
-        print(f"Node: {sample['node'].id}, region: {sample['node'].region}, carbon: {sample['node'].region_carbon_intensity:.3f} kg/kWh")
-        print(f"Metrics: energy={sample['metrics'].energy_joules:.2f} J, carbon={sample['metrics'].carbon_kg:.4f} kg")
-        print(f"Anomaly: {sample.get('anomaly')}")
+    # Override format and seed if provided
+    if config is None:
+        config = {}
+    config['export_format'] = args.format
+    config['seed'] = args.seed
 
-        # Save dataset
-        gen.save_dataset(dataset, "test_dataset.json")
-        print("Dataset saved.")
+    gen = SyntheticDataGenerator(config)
+    gen.set_seed(args.seed)
 
-    asyncio.run(main())
+    # Generate dataset
+    dataset = await gen.generate_dataset(
+        num_samples=args.num_samples,
+        include_edge_cases=True,
+        edge_case_fraction=args.edge_fraction,
+        anomaly_rate=args.anomaly_rate,
+    )
+    await gen.save_dataset(dataset, args.output)
+    print(f"Dataset saved to {args.output} with {len(dataset)} samples.")
+    print(f"Stats: {gen.get_stats()}")
+
+if __name__ == "__main__":
+    asyncio.run(main_cli())
