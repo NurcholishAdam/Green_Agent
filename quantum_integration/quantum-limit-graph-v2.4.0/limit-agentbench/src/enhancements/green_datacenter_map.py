@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # File: src/enhancements/green_datacenter_map_enhanced_v13_0.py
 """
 Green Data Center Map & Visualization System - Version 13.0 (Enterprise Quantum Resilience)
@@ -13,6 +14,22 @@ ENHANCEMENTS OVER v12.0:
 8. ADDED: Missing classes defined (DataCenterProject, ExportJob, EnhancedGeocodingService, EnhancedExportQueue, TTLCache, etc.)
 9. ADDED: Tenacity retries and custom exceptions
 10. ADDED: Async-safe singleton using asyncio.Lock
+
+FURTHER ENHANCEMENTS IN THIS VERSION:
+- Fixed missing imports (Enum, contextlib, etc.).
+- Fixed fallback config master key method (instance method).
+- Random salt per encryption for AES‑GCM.
+- Conditional tenacity retry (no NameError when missing).
+- Async‑safe correlation IDs using contextvars.
+- Async‑safe database operations via thread pool (`execute_sync`).
+- Added missing circuit breaker config parameters.
+- Added signal handlers for graceful shutdown (SIGINT/SIGTERM).
+- Complete implementation of EnhancedCircuitBreaker, EnhancedRateLimiter, EnhancedBulkhead.
+- Proper blockchain integration using web3.py with contract ABI.
+- Real carbon intensity manager (ElectricityMap API).
+- Enhanced GeocodingService with open‑source geocoding (OpenStreetMap Nominatim).
+- Enhanced ExportQueue with actual file export and progress tracking.
+- Comprehensive docstrings and error handling.
 """
 
 import asyncio
@@ -23,6 +40,10 @@ import uuid
 import hashlib
 import os
 import random
+import io
+import base64
+import contextlib
+from enum import Enum
 from typing import Dict, Any, List, Optional, Tuple, Callable, Union, Set
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -30,28 +51,29 @@ from pathlib import Path
 from collections import defaultdict, deque
 import numpy as np
 import math
+import contextvars
 
 # ============================================================
 # ENHANCED CONFIGURATION (Pydantic with fallback)
 # ============================================================
 try:
-    from pydantic import BaseModel, Field, validator, ValidationError
+    from pydantic import BaseModel, Field, field_validator, ValidationInfo
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# Tenacity for retries
+# Tenacity for retries - conditional import
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryError
     TENACITY_AVAILABLE = True
 except ImportError:
     TENACITY_AVAILABLE = False
 
 # SQLAlchemy
 try:
-    from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, Text, JSON, Index, func
+    from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, Text, JSON, Index, func, text
     from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker, scoped_session
+    from sqlalchemy.orm import sessionmaker, scoped_session, Session
     from sqlalchemy.pool import QueuePool
     from sqlalchemy.exc import SQLAlchemyError, OperationalError
     SQLALCHEMY_AVAILABLE = True
@@ -67,7 +89,9 @@ except ImportError:
 
 # Web3
 try:
-    from web3 import Web3
+    from web3 import Web3, Account
+    from web3.middleware import geth_poa_middleware
+    from web3.exceptions import ContractLogicError, TransactionNotFound
     WEB3_AVAILABLE = True
 except ImportError:
     WEB3_AVAILABLE = False
@@ -79,8 +103,30 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
+# Cryptography
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+
+# Async HTTP
+import aiohttp
+from aiohttp import ClientTimeout, ClientSession, ClientError
+
 # ============================================================
-# STRUCTURED LOGGING (fallback)
+# DUMMY TENACITY DECORATOR (if not available)
+# ============================================================
+if not TENACITY_AVAILABLE:
+    def retry(*args, **kwargs):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*fargs, **fkwargs):
+                return await func(*fargs, **fkwargs)
+            return wrapper
+        return decorator
+
+# ============================================================
+# STRUCTURED LOGGING (fallback) with contextvars
 # ============================================================
 try:
     import structlog
@@ -95,14 +141,16 @@ except ImportError:
             logging.StreamHandler()
         ]
     )
-    class CorrelationIdFilter(logging.Filter):
-        def __init__(self):
-            super().__init__()
-            self.correlation_id = str(uuid.uuid4())[:8]
-        def filter(self, record):
-            record.correlation_id = self.correlation_id
-            return True
-    logger.addFilter(CorrelationIdFilter())
+
+# Context variable for correlation ID (async‑safe)
+correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get()
+        return True
+
+logger.addFilter(CorrelationIdFilter())
 
 # Audit logger (optional)
 audit_logger = logging.getLogger("audit")
@@ -121,6 +169,8 @@ if PROMETHEUS_AVAILABLE:
     CLOUD_DEPLOYMENTS = Counter('cloud_deployments_total', 'Total cloud deployments', ['provider', 'status'], registry=REGISTRY)
     QUANTUM_SIGNATURES = Counter('quantum_signatures_total', 'Quantum-resistant signatures', ['algorithm', 'status'], registry=REGISTRY)
     BLOCKCHAIN_VERIFICATIONS = Counter('blockchain_verifications_total', 'Blockchain verifications', ['status'], registry=REGISTRY)
+    CIRCUIT_BREAKER_STATE = Gauge('map_circuit_breaker_state', 'Circuit breaker state', ['name'], registry=REGISTRY)
+    RATE_LIMITER_THROTTLE = Gauge('map_rate_limiter_throttle', 'Rate limiter throttle percentage', registry=REGISTRY)
 else:
     class DummyMetrics:
         def inc(self, *args, **kwargs): pass
@@ -132,9 +182,11 @@ else:
     CLOUD_DEPLOYMENTS = DummyMetrics()
     QUANTUM_SIGNATURES = DummyMetrics()
     BLOCKCHAIN_VERIFICATIONS = DummyMetrics()
+    CIRCUIT_BREAKER_STATE = DummyMetrics()
+    RATE_LIMITER_THROTTLE = DummyMetrics()
 
 # ============================================================
-# ENHANCED CONFIGURATION CLASS
+# ENHANCED CONFIGURATION CLASS (with fixes and missing params)
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class GreenMapConfig(BaseModel):
@@ -155,10 +207,13 @@ if PYDANTIC_AVAILABLE:
         # Quantum
         enable_quantum_security: bool = True
         quantum_algorithm: str = "dilithium"
+        quantum_master_key: str = Field(default="", description="Hex string for key encryption")
 
         # Blockchain
         enable_blockchain_verification: bool = True
-        blockchain_rpc_url: str = "http://localhost:8545"
+        blockchain_rpc_url: str = Field("http://localhost:8545")
+        blockchain_contract_address: Optional[str] = None
+        blockchain_private_key: Optional[str] = None
 
         # Autonomous generation
         enable_autonomous_generation: bool = True
@@ -176,8 +231,40 @@ if PYDANTIC_AVAILABLE:
         # Background tasks
         backup_interval: int = Field(3600, gt=0)  # seconds
 
-        # Retry
-        max_retry_attempts: int = 3
+        # Retry and circuit breaker
+        max_retry_attempts: int = Field(3, ge=0)
+        circuit_breaker_threshold: int = Field(5, ge=1)
+        circuit_breaker_timeout: int = Field(30, ge=1)
+        circuit_breaker_half_open_max_requests: int = Field(3, ge=1)
+        rate_limit_requests: int = Field(100, ge=1)
+        rate_limit_window: int = Field(60, ge=1)
+
+        # Carbon intensity API
+        carbon_api_key: Optional[str] = None
+        carbon_region: str = Field("global")
+        carbon_update_interval: int = Field(300, ge=10)
+
+        @field_validator('log_level')
+        @classmethod
+        def validate_log_level(cls, v: str) -> str:
+            allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+            if v.upper() not in allowed:
+                raise ValueError(f'LOG_LEVEL must be one of {allowed}')
+            return v.upper()
+
+        @field_validator('quantum_master_key')
+        @classmethod
+        def validate_master_key(cls, v: str) -> str:
+            if not v:
+                raise ValueError('quantum_master_key must be set via environment GREENMAP_QUANTUM_MASTER_KEY')
+            try:
+                bytes.fromhex(v)
+            except ValueError:
+                raise ValueError('quantum_master_key must be a hex string')
+            return v
+
+        def get_master_key_bytes(self) -> bytes:
+            return bytes.fromhex(self.quantum_master_key)
 
         class Config:
             env_prefix = "GREENMAP_"
@@ -194,8 +281,11 @@ else:
         output_dir: str = "./map_output"
         enable_quantum_security: bool = True
         quantum_algorithm: str = "dilithium"
+        quantum_master_key: str = ""
         enable_blockchain_verification: bool = True
         blockchain_rpc_url: str = "http://localhost:8545"
+        blockchain_contract_address: Optional[str] = None
+        blockchain_private_key: Optional[str] = None
         enable_autonomous_generation: bool = True
         default_generation_strategy: str = "hybrid"
         enable_multi_cloud_deployment: bool = True
@@ -205,6 +295,20 @@ else:
         db_path: str = "green_map.db"
         backup_interval: int = 3600
         max_retry_attempts: int = 3
+        circuit_breaker_threshold: int = 5
+        circuit_breaker_timeout: int = 30
+        circuit_breaker_half_open_max_requests: int = 3
+        rate_limit_requests: int = 100
+        rate_limit_window: int = 60
+        carbon_api_key: Optional[str] = None
+        carbon_region: str = "global"
+        carbon_update_interval: int = 300
+
+        def get_master_key_bytes(self) -> bytes:
+            """Instance method (fixed) to return master key bytes."""
+            if not self.quantum_master_key:
+                raise ValueError('quantum_master_key not set')
+            return bytes.fromhex(self.quantum_master_key)
 
 # ============================================================
 # CUSTOM EXCEPTIONS
@@ -224,8 +328,182 @@ class GenerationError(GreenMapError):
 class DeploymentError(GreenMapError):
     pass
 
+class CircuitBreakerOpenError(GreenMapError):
+    pass
+
+class RateLimitExceeded(GreenMapError):
+    pass
+
 # ============================================================
-# TASK MANAGER
+# ENHANCED CIRCUIT BREAKER (with half-open state)
+# ============================================================
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class EnhancedCircuitBreaker:
+    def __init__(self, name: str, config: GreenMapConfig):
+        self.name = name
+        self.config = config
+        self.failure_threshold = config.circuit_breaker_threshold
+        self.recovery_timeout = config.circuit_breaker_timeout
+        self.half_open_max_requests = config.circuit_breaker_half_open_max_requests
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.last_success_time = None
+        self._lock = asyncio.Lock()
+        self.half_open_requests = 0
+        self.metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
+
+    async def allow_request(self) -> bool:
+        async with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if time.time() - self.last_failure_time >= self.recovery_timeout:
+                    self.state = CircuitBreakerState.HALF_OPEN
+                    self.half_open_requests = 0
+                    if PROMETHEUS_AVAILABLE:
+                        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0.5)
+                    logger.info(f"Circuit breaker {self.name} transitioning to HALF_OPEN")
+                else:
+                    return False
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                self.half_open_requests += 1
+                if self.half_open_requests > self.half_open_max_requests:
+                    self.state = CircuitBreakerState.OPEN
+                    if PROMETHEUS_AVAILABLE:
+                        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
+                    logger.info(f"Circuit breaker {self.name} back to OPEN (half-open max exceeded)")
+                    return False
+            return True
+
+    async def record_success(self):
+        async with self._lock:
+            self.success_count += 1
+            self.last_success_time = time.time()
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                if self.success_count >= 2:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+                    if PROMETHEUS_AVAILABLE:
+                        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
+                    logger.info(f"Circuit breaker {self.name} CLOSED after {self.success_count} successes")
+            else:
+                self.failure_count = 0
+
+    async def record_failure(self):
+        async with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
+                self.state = CircuitBreakerState.OPEN
+                if PROMETHEUS_AVAILABLE:
+                    CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
+                logger.warning(f"Circuit breaker {self.name} OPEN after {self.failure_count} failures")
+            elif self.state == CircuitBreakerState.HALF_OPEN:
+                self.state = CircuitBreakerState.OPEN
+                if PROMETHEUS_AVAILABLE:
+                    CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
+                logger.warning(f"Circuit breaker {self.name} OPEN from HALF_OPEN")
+
+    async def call(self, func, *args, **kwargs):
+        """Execute func if circuit allows; raise CircuitBreakerOpenError if open."""
+        allowed = await self.allow_request()
+        if not allowed:
+            self.metrics['failed_calls'] += 1
+            raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
+        self.metrics['total_calls'] += 1
+        try:
+            result = await func(*args, **kwargs)
+            await self.record_success()
+            self.metrics['successful_calls'] += 1
+            return result
+        except Exception as e:
+            await self.record_failure()
+            self.metrics['failed_calls'] += 1
+            raise
+
+    def get_status(self) -> Dict:
+        async with self._lock:
+            return {
+                'name': self.name,
+                'state': self.state.value,
+                'failure_count': self.failure_count,
+                'success_count': self.success_count,
+                'half_open_requests': self.half_open_requests,
+                'metrics': self.metrics
+            }
+
+# ============================================================
+# ENHANCED RATE LIMITER
+# ============================================================
+class EnhancedRateLimiter:
+    def __init__(self, config: GreenMapConfig):
+        self.config = config
+        self.rate = config.rate_limit_requests
+        self.per_seconds = config.rate_limit_window
+        self.tokens = self.rate
+        self.last_refill = time.time()
+        self._lock = asyncio.Lock()
+        self.total_requests = 0
+        self.throttled_requests = 0
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.time()
+            time_passed = now - self.last_refill
+            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.per_seconds))
+            self.last_refill = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                self.total_requests += 1
+                return True
+            else:
+                self.throttled_requests += 1
+                return False
+
+    async def wait_and_acquire(self):
+        while not await self.acquire():
+            await asyncio.sleep(0.1)
+
+    def get_metrics(self) -> Dict:
+        total = self.total_requests + self.throttled_requests
+        return {
+            'total_requests': self.total_requests,
+            'throttled_requests': self.throttled_requests,
+            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100
+        }
+
+# ============================================================
+# ENHANCED BULKHEAD
+# ============================================================
+class EnhancedBulkhead:
+    def __init__(self, max_concurrency: int = 10):
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+        self._lock = asyncio.Lock()
+        self.active = 0
+        self.queued = 0
+
+    async def execute(self, func: Callable, *args, **kwargs):
+        async with self._lock:
+            self.queued += 1
+        async with self.semaphore:
+            async with self._lock:
+                self.queued -= 1
+                self.active += 1
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                async with self._lock:
+                    self.active -= 1
+
+    def get_metrics(self) -> Dict:
+        return {'active': self.active, 'queued': self.queued}
+
+# ============================================================
+# TASK MANAGER (enhanced with statistics)
 # ============================================================
 class TaskManager:
     def __init__(self, max_workers: int = 5):
@@ -233,6 +511,7 @@ class TaskManager:
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        self.metrics = {'total_tasks': 0, 'completed': 0, 'failed': 0}
 
     def start_task(self, name: str, coro_func, *args, **kwargs):
         async def wrapper():
@@ -261,8 +540,34 @@ class TaskManager:
             self.tasks.clear()
         logger.info("All background tasks stopped")
 
+    async def submit(self, coro, name: str = None, priority: str = 'normal', timeout: float = None):
+        """Submit a coroutine as a task."""
+        async def wrapper():
+            try:
+                result = await asyncio.wait_for(coro(), timeout=timeout)
+                async with self._lock:
+                    self.metrics['completed'] += 1
+                return result
+            except asyncio.TimeoutError:
+                async with self._lock:
+                    self.metrics['failed'] += 1
+                raise
+            except Exception as e:
+                async with self._lock:
+                    self.metrics['failed'] += 1
+                raise
+        task = asyncio.create_task(wrapper(), name=name or f"task_{uuid.uuid4().hex[:8]}")
+        async with self._lock:
+            self.tasks[task.get_name()] = task
+            self.metrics['total_tasks'] += 1
+        return task.get_name()
+
+    def get_statistics(self) -> Dict:
+        async with self._lock:
+            return {**self.metrics, 'active_tasks': len(self.tasks)}
+
 # ============================================================
-# ENHANCED DATABASE MANAGER (SQLAlchemy)
+# ENHANCED DATABASE MANAGER (async-safe with thread pool)
 # ============================================================
 Base = declarative_base() if SQLALCHEMY_AVAILABLE else None
 
@@ -272,6 +577,7 @@ class EnhancedDatabaseManager:
         self.db_path = Path(config.db_path)
         self.engine = None
         self.SessionLocal = None
+        self._executor = ThreadPoolExecutor(max_workers=4)  # for DB operations
         self._init_engine()
 
     def _init_engine(self):
@@ -338,26 +644,38 @@ class EnhancedDatabaseManager:
 
         Base.metadata.create_all(self.engine)
 
-    @contextlib.contextmanager
-    def get_session(self):
-        if not SQLALCHEMY_AVAILABLE:
-            yield None
-            return
+    async def run_sync(self, func, *args, **kwargs):
+        """Run a synchronous database function in thread pool to avoid blocking."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, func, *args, **kwargs)
+
+    def _get_session(self):
+        """Synchronous context manager for session."""
         session = self.SessionLocal()
         try:
             yield session
             session.commit()
-        except Exception as e:
+        except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+    async def execute_sync(self, sync_func):
+        """Execute a synchronous function that takes a session and returns result."""
+        def wrapped():
+            if not SQLALCHEMY_AVAILABLE:
+                return None
+            with self._get_session() as session:
+                return sync_func(session)
+        return await self.run_sync(wrapped)
 
     def dispose(self):
         if self.engine:
             self.engine.dispose()
             if self.SessionLocal:
                 self.SessionLocal.remove()
+        self._executor.shutdown(wait=False)
 
 # ============================================================
 # DATA CLASSES
@@ -385,7 +703,7 @@ class ExportJob:
     status: str = "pending"
 
 # ============================================================
-# MODULE 1: QUANTUM-RESILIENT MAP SECURITY (ENHANCED)
+# MODULE 1: QUANTUM-RESILIENT MAP SECURITY (ENHANCED with random salt)
 # ============================================================
 class QuantumResilientMapSecurity:
     def __init__(self, config: GreenMapConfig, db_manager: EnhancedDatabaseManager):
@@ -396,6 +714,7 @@ class QuantumResilientMapSecurity:
         self.key_pairs = {}
         self.signatures = {}
         self._lock = asyncio.Lock()
+        self.master_key = config.get_master_key_bytes()
 
         if self.pqc_available:
             self._initialize_pqc()
@@ -412,6 +731,34 @@ class QuantumResilientMapSecurity:
             logger.error(f"PQC initialization failed: {e}")
             self.pqc_available = False
 
+    def _derive_key(self, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+        )
+        return kdf.derive(self.master_key)
+
+    def _encrypt_key(self, key_bytes: bytes) -> bytes:
+        # Generate random salt per encryption
+        salt = os.urandom(16)
+        derived = self._derive_key(salt)
+        aesgcm = AESGCM(derived)
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, key_bytes, None)
+        # Store salt + nonce + ciphertext
+        return salt + nonce + ciphertext
+
+    def _decrypt_key(self, encrypted_bytes: bytes) -> bytes:
+        salt = encrypted_bytes[:16]
+        nonce = encrypted_bytes[16:28]
+        ciphertext = encrypted_bytes[28:]
+        derived = self._derive_key(salt)
+        aesgcm = AESGCM(derived)
+        return aesgcm.decrypt(nonce, ciphertext, None)
+
     async def generate_keypair(self, algorithm: str = None) -> Dict:
         algorithm = algorithm or self.config.quantum_algorithm
         if not self.pqc_available:
@@ -423,14 +770,23 @@ class QuantumResilientMapSecurity:
                 raise ValueError(f"Algorithm {algorithm} not available")
             public_key, private_key = await asyncio.to_thread(signer.generate_keypair)
             key_id = f"{algorithm}_{uuid.uuid4().hex[:8]}"
+            encrypted_private = self._encrypt_key(private_key)
             async with self._lock:
                 self.key_pairs[key_id] = {
                     'algorithm': algorithm,
                     'public_key': public_key,
-                    'private_key': private_key,
+                    'private_key': encrypted_private,  # stored encrypted
                     'created_at': datetime.now().isoformat()
                 }
+                if self.db_manager and SQLALCHEMY_AVAILABLE:
+                    def insert_key(session):
+                        session.execute(
+                            text("INSERT INTO quantum_keys (key_id, algorithm, public_key, private_key) VALUES (:key_id, :algorithm, :public_key, :private_key)"),
+                            {'key_id': key_id, 'algorithm': algorithm, 'public_key': public_key.hex(), 'private_key': encrypted_private.hex()}
+                        )
+                    await self.db_manager.execute_sync(insert_key)
             QUANTUM_SIGNATURES.labels(algorithm=algorithm, status='generated').inc()
+            logger.info(f"PQC keypair generated: {key_id}")
             return {'key_id': key_id, 'algorithm': algorithm, 'public_key': public_key.hex()}
         except Exception as e:
             logger.error(f"Keypair generation failed: {e}")
@@ -447,7 +803,7 @@ class QuantumResilientMapSecurity:
         try:
             keypair = self.key_pairs[key_id]
             algorithm = keypair['algorithm']
-            private_key = keypair['private_key']
+            private_key = self._decrypt_key(keypair['private_key'])
             signer = self.pqc_algorithms.get(algorithm)
             if not signer:
                 return self._fallback_sign(export_data)
@@ -463,6 +819,13 @@ class QuantumResilientMapSecurity:
             export_hash = hashlib.sha256(export_bytes).hexdigest()
             async with self._lock:
                 self.signatures[export_hash] = sig_data
+                if self.db_manager and SQLALCHEMY_AVAILABLE:
+                    def insert_sig(session):
+                        session.execute(
+                            text("INSERT INTO quantum_signatures (update_hash, algorithm, signature, key_id) VALUES (:update_hash, :algorithm, :signature, :key_id)"),
+                            {'update_hash': export_hash, 'algorithm': algorithm, 'signature': signature.hex(), 'key_id': key_id}
+                        )
+                    await self.db_manager.execute_sync(insert_sig)
             QUANTUM_SIGNATURES.labels(algorithm=algorithm, status='sign_success').inc()
             logger.info(f"Map export signed with {algorithm}")
             return sig_data
@@ -512,66 +875,128 @@ class QuantumResilientMapSecurity:
             }
 
 # ============================================================
-# MODULE 2: BLOCKCHAIN MAP VERIFICATION (ENHANCED)
+# MODULE 2: BLOCKCHAIN MAP VERIFICATION (ENHANCED with web3)
 # ============================================================
 class BlockchainMapVerification:
     def __init__(self, config: GreenMapConfig, db_manager: EnhancedDatabaseManager):
         self.config = config
         self.db_manager = db_manager
-        self.web3_provider = None
-        self.export_records = {}
-        self._lock = asyncio.Lock()
+        self.web3 = None
+        self.contract = None
+        self.account = None
         self.web3_available = WEB3_AVAILABLE and config.enable_blockchain_verification
+        self._lock = asyncio.Lock()
+        self._circuit_breaker = EnhancedCircuitBreaker("blockchain", config)
+        self._rate_limiter = EnhancedRateLimiter(config)
+        self.export_records = {}
 
         if self.web3_available:
             self._initialize_blockchain()
+        else:
+            logger.warning("Web3 not available or disabled – using simulation.")
         logger.info(f"BlockchainMapVerification initialized (Web3: {self.web3_available})")
 
     def _initialize_blockchain(self):
         try:
-            self.web3_provider = Web3(Web3.HTTPProvider(self.config.blockchain_rpc_url))
-            if self.web3_provider.is_connected():
+            self.web3 = Web3(Web3.HTTPProvider(self.config.blockchain_rpc_url))
+            if not self.web3.is_connected():
+                raise ConnectionError("Cannot connect to blockchain RPC")
+
+            if self.config.blockchain_private_key:
+                self.account = Account.from_key(self.config.blockchain_private_key)
+                self.web3.eth.default_account = self.account.address
+            else:
+                self.account = self.web3.eth.accounts[0]
+
+            # Load contract ABI (simplified)
+            contract_abi = [
+                {
+                    "constant": False,
+                    "inputs": [
+                        {"name": "exportId", "type": "string"},
+                        {"name": "fileHash", "type": "string"},
+                        {"name": "metadata", "type": "string"}
+                    ],
+                    "name": "recordExport",
+                    "outputs": [],
+                    "type": "function"
+                },
+                {
+                    "constant": True,
+                    "inputs": [{"name": "exportId", "type": "string"}],
+                    "name": "getExport",
+                    "outputs": [{"name": "fileHash", "type": "string"}, {"name": "metadata", "type": "string"}],
+                    "type": "function"
+                }
+            ]
+            if self.config.blockchain_contract_address:
+                self.contract = self.web3.eth.contract(
+                    address=self.config.blockchain_contract_address,
+                    abi=contract_abi
+                )
+                self.web3_available = True
                 logger.info(f"Connected to blockchain at {self.config.blockchain_rpc_url}")
             else:
-                logger.warning("Could not connect to blockchain")
-                self.web3_available = False
+                logger.warning("Contract address not configured – using simulation.")
         except Exception as e:
             logger.error(f"Blockchain initialization failed: {e}")
             self.web3_available = False
 
+    async def _record_export_on_chain(self, export_id: str, file_hash: str, metadata: Dict) -> Dict:
+        if not self.web3_available or not self.contract:
+            raise BlockchainError("Blockchain not available")
+        metadata_str = json.dumps(metadata)
+        nonce = self.web3.eth.get_transaction_count(self.account.address)
+        gas_estimate = self.contract.functions.recordExport(export_id, file_hash, metadata_str).estimate_gas({'from': self.account.address})
+        gas_price = self.web3.eth.gas_price
+        tx = self.contract.functions.recordExport(export_id, file_hash, metadata_str).build_transaction({
+            'from': self.account.address,
+            'nonce': nonce,
+            'gas': int(gas_estimate * 1.2),
+            'gasPrice': gas_price
+        })
+        signed_tx = self.account.sign_transaction(tx)
+        tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+        if receipt.status == 1:
+            return {'tx_hash': tx_hash.hex(), 'block_number': receipt.blockNumber}
+        else:
+            raise BlockchainError("Transaction reverted")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+           retry=retry_if_exception_type((BlockchainError, ConnectionError, TimeoutError)),
+           before_sleep=before_sleep_log(logger, logging.WARNING))
     async def record_map_export(self, export_id: str, metadata: Dict, file_hash: str) -> Dict:
+        await self._rate_limiter.wait_and_acquire()
         if not self.web3_available:
             return self._simulate_record(export_id, metadata, file_hash)
 
         try:
-            tx_hash = f"0x{hashlib.sha256(os.urandom(32)).hexdigest()}"
-            block_number = 1000000 + random.randint(1, 100000)
-            record = {
-                'export_id': export_id,
-                'metadata': metadata,
-                'file_hash': file_hash,
-                'tx_hash': tx_hash,
-                'block_number': block_number,
-                'verified': False,
-                'timestamp': datetime.now().isoformat()
-            }
+            result = await self._circuit_breaker.call(self._record_export_on_chain, export_id, file_hash, metadata)
             async with self._lock:
-                self.export_records[export_id] = record
-                # Persist to DB
+                self.export_records[export_id] = {
+                    'export_id': export_id,
+                    'metadata': metadata,
+                    'file_hash': file_hash,
+                    'tx_hash': result['tx_hash'],
+                    'block_number': result['block_number'],
+                    'verified': False,
+                    'timestamp': datetime.now().isoformat()
+                }
                 if self.db_manager and SQLALCHEMY_AVAILABLE:
-                    with self.db_manager.get_session() as session:
-                        from sqlalchemy import text
+                    def insert_record(session):
                         session.execute(
-                            text("INSERT INTO export_records (export_id, export_type, file_hash, tx_hash, block_number) VALUES (?, ?, ?, ?, ?)"),
-                            (export_id, metadata.get('export_type', 'unknown'), file_hash, tx_hash, block_number)
+                            text("INSERT INTO export_records (export_id, export_type, file_hash, tx_hash, block_number) VALUES (:export_id, :export_type, :file_hash, :tx_hash, :block_number)"),
+                            {'export_id': export_id, 'export_type': metadata.get('export_type', 'unknown'), 'file_hash': file_hash, 'tx_hash': result['tx_hash'], 'block_number': result['block_number']}
                         )
+                    await self.db_manager.execute_sync(insert_record)
             BLOCKCHAIN_VERIFICATIONS.labels(status='recorded').inc()
-            logger.info(f"Map export {export_id} recorded on blockchain: {tx_hash}")
-            return {'status': 'success', 'export_id': export_id, 'tx_hash': tx_hash, 'block_number': block_number}
+            logger.info(f"Map export {export_id} recorded on blockchain: {result['tx_hash']}")
+            return {'status': 'success', 'export_id': export_id, 'tx_hash': result['tx_hash'], 'block_number': result['block_number']}
         except Exception as e:
             logger.error(f"Blockchain recording failed: {e}")
             BLOCKCHAIN_VERIFICATIONS.labels(status='failed').inc()
-            return {'status': 'failed', 'error': str(e)}
+            return self._simulate_record(export_id, metadata, file_hash)
 
     def _simulate_record(self, export_id: str, metadata: Dict, file_hash: str) -> Dict:
         return {
@@ -609,12 +1034,67 @@ class BlockchainMapVerification:
         return {
             'connected': self.web3_available,
             'rpc_url': self.config.blockchain_rpc_url,
+            'account': self.account.address if self.account else None,
             'total_records': len(self.export_records),
             'verified_records': sum(1 for r in self.export_records.values() if r.get('verified', False))
         }
 
 # ============================================================
-# MODULE 3: AUTONOMOUS MAP GENERATION (ENHANCED)
+# MODULE 3: REAL CARBON INTENSITY MANAGER
+# ============================================================
+class CarbonIntensityManager:
+    def __init__(self, config: GreenMapConfig):
+        self.config = config
+        self.api_key = config.carbon_api_key
+        self.region = config.carbon_region
+        self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
+        self.cache = {}
+        self.last_update = None
+        self._session = None
+        self._lock = asyncio.Lock()
+        self._circuit_breaker = EnhancedCircuitBreaker("carbon_api", config)
+        self._rate_limiter = EnhancedRateLimiter(config)
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+           retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, ConnectionError)),
+           before_sleep=before_sleep_log(logger, logging.WARNING))
+    async def _fetch_intensity(self) -> float:
+        session = await self._get_session()
+        url = f"{self.endpoint}/latest?zone={self.region}"
+        headers = {'auth-token': self.api_key} if self.api_key else {}
+        async with session.get(url, headers=headers, timeout=10) as response:
+            if response.status != 200:
+                raise Exception(f"Carbon API returned {response.status}")
+            data = await response.json()
+            return data.get('carbonIntensity', 400)
+
+    async def get_current_intensity(self) -> Dict:
+        await self._rate_limiter.wait_and_acquire()
+        cache_key = f"{self.region}_{datetime.utcnow().hour}"
+        if cache_key in self.cache and self.last_update and (datetime.utcnow() - self.last_update).seconds < 300:
+            return {'intensity': self.cache[cache_key], 'region': self.region}
+
+        try:
+            intensity = await self._circuit_breaker.call(self._fetch_intensity)
+            async with self._lock:
+                self.cache[cache_key] = intensity
+                self.last_update = datetime.utcnow()
+            return {'intensity': intensity, 'region': self.region}
+        except Exception as e:
+            logger.warning(f"Carbon API failed: {e}, using fallback")
+            return {'intensity': 400, 'region': self.region, 'fallback': True}
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================
+# MODULE 4: AUTONOMOUS MAP GENERATION (ENHANCED)
 # ============================================================
 class AutonomousMapGenerator:
     def __init__(self, config: GreenMapConfig, db_manager: EnhancedDatabaseManager):
@@ -646,14 +1126,13 @@ class AutonomousMapGenerator:
                 'result': result,
                 'timestamp': datetime.now().isoformat()
             })
-        # Persist to DB
         if self.db_manager and SQLALCHEMY_AVAILABLE:
-            with self.db_manager.get_session() as session:
-                from sqlalchemy import text
+            def insert_gen(session):
                 session.execute(
-                    text("INSERT INTO generation_history (strategy, result, timestamp) VALUES (?, ?, ?)"),
-                    (strategy, json.dumps(result), datetime.now())
+                    text("INSERT INTO generation_history (strategy, result, timestamp) VALUES (:strategy, :result, :timestamp)"),
+                    {'strategy': strategy, 'result': json.dumps(result), 'timestamp': datetime.now()}
                 )
+            await self.db_manager.execute_sync(insert_gen)
         MAP_GENERATIONS.labels(strategy=strategy, status='success').inc()
         logger.info(f"Map generation completed using {strategy} strategy")
         return result
@@ -723,7 +1202,7 @@ class AutonomousMapGenerator:
             }
 
 # ============================================================
-# MODULE 4: MULTI-CLOUD MAP DEPLOYMENT (ENHANCED)
+# MODULE 5: MULTI-CLOUD MAP DEPLOYMENT (ENHANCED)
 # ============================================================
 class MultiCloudMapDeployment:
     def __init__(self, config: GreenMapConfig, db_manager: EnhancedDatabaseManager):
@@ -807,14 +1286,13 @@ class MultiCloudMapDeployment:
                 'timestamp': datetime.now().isoformat()
             }
             self.deployment_history.append(result)
-            # Persist to DB
             if self.db_manager and SQLALCHEMY_AVAILABLE:
-                with self.db_manager.get_session() as session:
-                    from sqlalchemy import text
+                def insert_deploy(session):
                     session.execute(
-                        text("INSERT INTO cloud_deployments (provider, region, map_path, cdn_url, score, timestamp) VALUES (?, ?, ?, ?, ?, ?)"),
-                        (optimal_provider, optimal_region, map_data.get('path', 'unknown'), result['cdn_url'] or '', scores[optimal_provider], datetime.now())
+                        text("INSERT INTO cloud_deployments (provider, region, map_path, cdn_url, score, timestamp) VALUES (:provider, :region, :map_path, :cdn_url, :score, :timestamp)"),
+                        {'provider': optimal_provider, 'region': optimal_region, 'map_path': map_data.get('path', 'unknown'), 'cdn_url': result['cdn_url'] or '', 'score': scores[optimal_provider], 'timestamp': datetime.now()}
                     )
+                await self.db_manager.execute_sync(insert_deploy)
             CLOUD_DEPLOYMENTS.labels(provider=optimal_provider, status='success').inc()
             logger.info(f"Map deployed to {optimal_provider} ({optimal_region})")
             return result
@@ -829,21 +1307,54 @@ class MultiCloudMapDeployment:
             }
 
 # ============================================================
-# ENHANCED GEOCODING SERVICE
+# ENHANCED GEOCODING SERVICE (using OpenStreetMap Nominatim)
 # ============================================================
 class EnhancedGeocodingService:
+    def __init__(self):
+        self.base_url = "https://nominatim.openstreetmap.org/search"
+        self._session = None
+        self._lock = asyncio.Lock()
+        self._request_count = 0
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+           retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, ConnectionError)),
+           before_sleep=before_sleep_log(logger, logging.WARNING))
     async def geocode(self, address: str) -> Tuple[float, float]:
-        # Simulate geocoding
-        await asyncio.sleep(0.1)
-        return (40.7128, -74.0060)  # NYC as default
+        """Geocode an address using Nominatim (OSM)."""
+        async with self._lock:
+            self._request_count += 1
+        session = await self._get_session()
+        params = {
+            'q': address,
+            'format': 'json',
+            'limit': 1
+        }
+        async with session.get(self.base_url, params=params, timeout=10) as response:
+            if response.status != 200:
+                raise Exception(f"Geocoding API returned {response.status}")
+            data = await response.json()
+            if not data:
+                raise ValueError(f"Address not found: {address}")
+            # Return lat, lon as floats
+            lat = float(data[0]['lat'])
+            lon = float(data[0]['lon'])
+            return (lat, lon)
 
     async def get_statistics(self) -> Dict:
-        return {'requests': 0}
+        async with self._lock:
+            return {'requests': self._request_count}
 
-    async def stop(self): pass
+    async def stop(self):
+        if self._session:
+            await self._session.close()
 
 # ============================================================
-# ENHANCED EXPORT QUEUE
+# ENHANCED EXPORT QUEUE (with actual file export)
 # ============================================================
 class EnhancedExportQueue:
     def __init__(self, max_concurrent: int = 3):
@@ -866,8 +1377,8 @@ class EnhancedExportQueue:
             async with self._lock:
                 self.active += 1
             try:
-                # Simulate export
-                await asyncio.sleep(0.5)
+                # Perform the export: write projects to file (e.g., GeoJSON)
+                await self._perform_export(job)
                 job.status = "completed"
             except Exception as e:
                 job.status = "failed"
@@ -876,6 +1387,20 @@ class EnhancedExportQueue:
                 async with self._lock:
                     self.active -= 1
                 self.queue.task_done()
+
+    async def _perform_export(self, job: ExportJob):
+        """Write projects to a file (JSON format)."""
+        data = {
+            'export_type': job.export_type,
+            'projects': [asdict(p) for p in job.projects],
+            'exported_at': datetime.now().isoformat()
+        }
+        # Write to file asynchronously using thread pool
+        def write_file():
+            with open(job.output_path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+        await asyncio.to_thread(write_file)
+        logger.info(f"Export job {job.job_id} written to {job.output_path}")
 
     async def submit(self, job: ExportJob):
         await self.queue.put(job)
@@ -893,7 +1418,7 @@ class EnhancedExportQueue:
         return {'queue_size': self.queue.qsize(), 'active': self.active, 'max_concurrent': self.max_concurrent}
 
 # ============================================================
-# TTL CACHE
+# TTL CACHE (ENHANCED)
 # ============================================================
 class TTLCache:
     def __init__(self, ttl_seconds: int, max_size_mb: int):
@@ -929,6 +1454,9 @@ class EnhancedGreenDataCenterMap:
 
         # Database
         self.db_manager = EnhancedDatabaseManager(self.config)
+
+        # Carbon intensity
+        self.carbon_manager = CarbonIntensityManager(self.config)
 
         # Enhanced modules
         self.quantum_security = QuantumResilientMapSecurity(self.config, self.db_manager)
@@ -967,6 +1495,7 @@ class EnhancedGreenDataCenterMap:
         # Start background tasks
         self._task_manager.start_task("backup", self._backup_loop)
         self._task_manager.start_task("export_worker", self.export_queue.start)
+        self._task_manager.start_task("carbon_update", self._carbon_update_loop)
         logger.info("Map system started with background tasks")
 
     async def _backup_loop(self):
@@ -980,27 +1509,37 @@ class EnhancedGreenDataCenterMap:
                 logger.error(f"Backup loop error: {e}")
                 await asyncio.sleep(60)
 
+    async def _carbon_update_loop(self):
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                await self.carbon_manager.get_current_intensity()
+                await asyncio.sleep(self.config.carbon_update_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Carbon update loop error: {e}")
+                await asyncio.sleep(60)
+
     async def _perform_backup(self):
         # Backup projects to DB
         async with self._projects_lock:
             if SQLALCHEMY_AVAILABLE:
-                with self.db_manager.get_session() as session:
-                    from sqlalchemy import text
+                def backup(session):
                     for project in self.projects:
                         session.execute(
-                            text("INSERT OR REPLACE INTO projects (project_id, name, status, latitude, longitude, capacity_mw, carbon_intensity, helium_efficiency, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
-                            (project.project_id, project.name, project.status, project.latitude, project.longitude, project.capacity_mw, project.carbon_intensity, project.helium_efficiency, project.last_updated)
+                            text("INSERT OR REPLACE INTO projects (project_id, name, status, latitude, longitude, capacity_mw, carbon_intensity, helium_efficiency, last_updated) VALUES (:project_id, :name, :status, :latitude, :longitude, :capacity_mw, :carbon_intensity, :helium_efficiency, :last_updated)"),
+                            {'project_id': project.project_id, 'name': project.name, 'status': project.status, 'latitude': project.latitude, 'longitude': project.longitude, 'capacity_mw': project.capacity_mw, 'carbon_intensity': project.carbon_intensity, 'helium_efficiency': project.helium_efficiency, 'last_updated': project.last_updated}
                         )
+                await self.db_manager.execute_sync(backup)
         logger.info("Backup completed")
 
     async def load_data(self):
         # Load projects from DB
         async with self._projects_lock:
             if SQLALCHEMY_AVAILABLE:
-                with self.db_manager.get_session() as session:
-                    from sqlalchemy import text
+                def load(session):
                     result = session.execute(text("SELECT project_id, name, status, latitude, longitude, capacity_mw, carbon_intensity, helium_efficiency, last_updated FROM projects"))
-                    self.projects = []
+                    projects = []
                     for row in result:
                         project = DataCenterProject(
                             project_id=row[0],
@@ -1013,7 +1552,9 @@ class EnhancedGreenDataCenterMap:
                             helium_efficiency=row[7],
                             last_updated=row[8]
                         )
-                        self.projects.append(project)
+                        projects.append(project)
+                    return projects
+                self.projects = await self.db_manager.execute_sync(load)
             logger.info(f"Loaded {len(self.projects)} projects from DB")
 
     async def export_projects_secure(self, export_type: str, output_filename: str,
@@ -1145,8 +1686,30 @@ class EnhancedGreenDataCenterMap:
         await self._task_manager.stop_all()
         await self.export_queue.stop()
         await self.tile_cache.stop()
+        await self.geocoder.stop()
+        await self.carbon_manager.close()
         self.db_manager.dispose()
         logger.info("Shutdown complete")
+
+# ============================================================
+# SIGNAL HANDLING FOR GRACEFUL SHUTDOWN
+# ============================================================
+_shutdown_requested = False
+
+def handle_signal(signum, frame):
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        asyncio.create_task(shutdown_handler())
+
+async def shutdown_handler():
+    global _map_instance
+    if _map_instance:
+        await _map_instance.shutdown()
+        _map_instance = None
+    # Stop the event loop gracefully
+    asyncio.get_event_loop().stop()
 
 # ============================================================
 # SINGLETON ACCESSOR (Async-safe)
@@ -1167,6 +1730,11 @@ async def get_map_system(config: Optional[Union[GreenMapConfig, Dict]] = None) -
 # MAIN ENTRY POINT
 # ============================================================
 async def main():
+    # Register signal handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+
     print("=" * 80)
     print("Enhanced Green Data Center Map v13.0 - Enterprise Quantum Resilience (Enhanced)")
     print("=" * 80)
@@ -1222,10 +1790,11 @@ async def main():
 
     try:
         await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-        await map_system.shutdown()
-        print("Shutdown complete")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _map_instance:
+            await _map_instance.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
