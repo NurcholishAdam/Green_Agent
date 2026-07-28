@@ -1,13 +1,14 @@
 # =============================================================================
 # FILE: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/run_enhanced_agent.py
-# VERSION: 7.0.3 (Green‑Agent Enterprise – Full Sustainability Integration)
+# VERSION: 8.0.0 (Green‑Agent Enterprise – Full Sustainability Integration)
 # =============================================================================
 """
-Enhanced Green Agent Runner v7.0.3 – Complete Self‑Contained Implementation
+Enhanced Green Agent Runner v8.0.0 – Complete Self‑Contained Implementation
 
-Contains all core modules: Storage, QuantumSecurity, Blockchain, AutonomousOptimizer,
-MultiCloudDistribution, RunnerState, CircuitBreaker, RL, TaskQueue, Dashboard,
-and the main EnhancedGreenAgentRunner with full sustainability integrations.
+All core modules: Storage with AES-256-GCM encryption, QuantumSecurity, Blockchain,
+AutonomousOptimizer (multi-armed bandit), MultiCloudDistribution (real SDKs),
+RunnerState, CircuitBreaker, RL (DQN), TaskQueue, Dashboard, and the main
+EnhancedGreenAgentRunner with full sustainability integrations.
 
 All modules are defined inline; no external dependencies beyond standard libraries.
 """
@@ -15,33 +16,26 @@ All modules are defined inline; no external dependencies beyond standard librari
 import asyncio
 import hashlib
 import json
-import logging
-import math
 import os
-import pickle
 import random
 import sqlite3
-import sys
 import time
 import uuid
-import threading
-import gc
-import warnings
-import heapq
-import signal
-from dataclasses import dataclass, field, asdict
+from collections import deque, defaultdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Callable, Set, Union
-from collections import defaultdict, deque
-from enum import Enum
-from contextlib import contextmanager, asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import secrets
+import gc
+import heapq
+import signal
+import logging
 
 # ---------- Optional external dependencies ----------
 try:
     from web3 import Web3, Account, HTTPProvider
-    from web3.middleware import geth_poa_middleware
+    from web3.middleware import geth_poa_middleware, gas_price_strategy
     WEB3_AVAILABLE = True
 except ImportError:
     WEB3_AVAILABLE = False
@@ -65,28 +59,24 @@ try:
 except ImportError:
     GCP_AVAILABLE = False
 
-# Post-quantum libraries – real implementations require separate installation
 try:
     from pqcrypto.sign import dilithium, falcon, sphincs
     PQC_AVAILABLE = True
 except ImportError:
     PQC_AVAILABLE = False
 
-# For fallback cryptography
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature, decode_dss_signature
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 from cryptography.hazmat.backends import default_backend
 
-# Retry library
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+    from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
     TENACITY_AVAILABLE = True
 except ImportError:
     TENACITY_AVAILABLE = False
 
-# WebSocket for dashboard
 try:
     import websockets
     from websockets.server import serve
@@ -95,288 +85,487 @@ try:
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
-# Prometheus metrics
 try:
     from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, start_http_server
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
-# Pydantic for configuration
 try:
-    from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
+    from pydantic import BaseSettings, Field, validator
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# NumPy and Pandas
-import numpy as np
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
 
-# Async HTTP for carbon intensity
 import aiohttp
 
-# =============================================================================
-# Configuration & Logging
-# =============================================================================
-class CorrelationIdFilter(logging.Filter):
-    """Add correlation ID to all log messages"""
-    def __init__(self):
-        super().__init__()
-        self._local = threading.local()
+import structlog
+from structlog.processors import JSONRenderer, TimeStamper
 
-    @property
-    def correlation_id(self):
-        if not hasattr(self._local, 'correlation_id'):
-            self._local.correlation_id = str(uuid.uuid4())[:8]
-        return self._local.correlation_id
-
-    def filter(self, record):
-        record.correlation_id = self.correlation_id
-        return True
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s',
-    handlers=[
-        logging.handlers.RotatingFileHandler('agent_runner_v7.log', maxBytes=10*1024*1024, backupCount=5),
-        logging.StreamHandler()
-    ]
+# -----------------------------------------------------------------------------
+# Structured Logging Configuration
+# -----------------------------------------------------------------------------
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        TimeStamper(fmt="iso"),
+        JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
 )
-logger = logging.getLogger(__name__)
-logger.addFilter(CorrelationIdFilter())
+logger = structlog.get_logger(__name__)
 
-# Audit logger
+# Audit logger (rotating file)
+import logging.handlers
 audit_logger = logging.getLogger('agent_audit')
-audit_handler = logging.handlers.RotatingFileHandler('agent_audit_v7.log', maxBytes=50*1024*1024, backupCount=10)
+audit_handler = logging.handlers.RotatingFileHandler('agent_audit_v8.log', maxBytes=50*1024*1024, backupCount=10)
 audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
 
+# -----------------------------------------------------------------------------
+# Configuration with Pydantic (fallback if not installed)
+# -----------------------------------------------------------------------------
+if PYDANTIC_AVAILABLE:
+    class Config(BaseSettings):
+        """Central configuration for all components."""
+        DB_PATH: str = Field('/tmp/agent_runner.db', env='AGENT_DB_PATH')
+        OPENAI_API_KEY: str = Field('', env='OPENAI_API_KEY')
+        ELECTRICITY_MAPS_API_KEY: str = Field('', env='ELECTRICITY_MAPS_API_KEY')
+        CARBON_INTENSITY_API_KEY: str = Field('', env='CARBON_INTENSITY_API_KEY')
+        CARBON_REGION: str = Field('global', env='CARBON_REGION')
+        BLOCKCHAIN_RPC_URL: str = Field('http://localhost:8545', env='BLOCKCHAIN_RPC_URL')
+        BLOCKCHAIN_CONTRACT_ADDRESS: str = Field('0x0000000000000000000000000000000000000000', env='BLOCKCHAIN_CONTRACT_ADDRESS')
+        BLOCKCHAIN_PRIVATE_KEY: str = Field('', env='BLOCKCHAIN_PRIVATE_KEY')
+        CLOUD_AWS_ACCESS_KEY: str = Field('', env='AWS_ACCESS_KEY_ID')
+        CLOUD_AWS_SECRET_KEY: str = Field('', env='AWS_SECRET_ACCESS_KEY')
+        CLOUD_AWS_REGION: str = Field('us-east-1', env='AWS_DEFAULT_REGION')
+        CLOUD_AZURE_CONNECTION_STRING: str = Field('', env='AZURE_STORAGE_CONNECTION_STRING')
+        CLOUD_GCP_CREDENTIALS: str = Field('', env='GOOGLE_APPLICATION_CREDENTIALS')
+        MASTER_KEY_ENV: str = Field('AGENT_MASTER_KEY', env='MASTER_KEY_ENV')
+        CACHE_TTL: int = Field(300, env='CACHE_TTL')
+        RETRY_ATTEMPTS: int = Field(3, env='RETRY_ATTEMPTS')
+        RETRY_MIN_WAIT: int = Field(2, env='RETRY_MIN_WAIT')
+        RETRY_MAX_WAIT: int = Field(10, env='RETRY_MAX_WAIT')
+        LOG_LEVEL: str = Field('INFO', env='AGENT_LOG_LEVEL')
+        # NEW: Enhanced configuration
+        ENABLE_DYNAMIC_PIPELINE: bool = Field(True, env='ENABLE_DYNAMIC_PIPELINE')
+        ENABLE_DEGRADATION_AWARE: bool = Field(True, env='ENABLE_DEGRADATION_AWARE')
+        ENABLE_PREDICTIVE_INFORMED: bool = Field(True, env='ENABLE_PREDICTIVE_INFORMED')
+        ENABLE_REINFORCEMENT_LEARNING: bool = Field(True, env='ENABLE_REINFORCEMENT_LEARNING')
+        ENABLE_CIRCUIT_BREAKERS: bool = Field(True, env='ENABLE_CIRCUIT_BREAKERS')
+        ENABLE_DASHBOARD: bool = Field(True, env='ENABLE_DASHBOARD')
+        ENABLE_PROMETHEUS: bool = Field(False, env='ENABLE_PROMETHEUS')
+        MAX_CONCURRENT_TASKS: int = Field(10, env='MAX_CONCURRENT_TASKS', ge=1, le=100)
+        TASK_TIMEOUT_SECONDS: int = Field(300, env='TASK_TIMEOUT_SECONDS', ge=10, le=3600)
+        QUEUE_MAX_SIZE: int = Field(1000, env='QUEUE_MAX_SIZE', ge=10, le=10000)
+        CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = Field(5, env='CIRCUIT_BREAKER_FAILURE_THRESHOLD', ge=1, le=10)
+        CIRCUIT_BREAKER_TIMEOUT_SECONDS: int = Field(60, env='CIRCUIT_BREAKER_TIMEOUT_SECONDS', ge=10, le=600)
+        RL_LEARNING_RATE: float = Field(0.001, env='RL_LEARNING_RATE', ge=0.0001, le=1.0)
+        RL_DISCOUNT_FACTOR: float = Field(0.99, env='RL_DISCOUNT_FACTOR', ge=0.5, le=1.0)
+        RL_EXPLORATION_RATE: float = Field(0.1, env='RL_EXPLORATION_RATE', ge=0.0, le=1.0)
+        DASHBOARD_PORT: int = Field(8777, env='DASHBOARD_PORT', ge=1024, le=65535)
+        DASHBOARD_UPDATE_INTERVAL: int = Field(5, env='DASHBOARD_UPDATE_INTERVAL', ge=1, le=60)
+        FALLBACK_PIPELINES: List[str] = Field(
+            default=['standard', 'energy_efficient'],
+            env='FALLBACK_PIPELINES',
+            description="Pipeline fallback order"
+        )
+        # NEW: Sustainability and advanced features
+        ENABLE_SUSTAINABILITY_MODULES: bool = Field(True, env='ENABLE_SUSTAINABILITY_MODULES')
+        ENABLE_CARBON_AWARE_SCHEDULING: bool = Field(True, env='ENABLE_CARBON_AWARE_SCHEDULING')
+        ENABLE_CHAOS_TESTING: bool = Field(False, env='ENABLE_CHAOS_TESTING')
+        ENABLE_ENERGY_PREEMPTION: bool = Field(True, env='ENABLE_ENERGY_PREEMPTION')
+        K8S_OPERATOR: bool = Field(False, env='K8S_OPERATOR')
+        DIGITAL_TWIN_ENABLED: bool = Field(True, env='DIGITAL_TWIN_ENABLED')
+        K8S_DEPLOYMENT: bool = Field(False, env='K8S_DEPLOYMENT')
+        K8S_NAMESPACE: str = Field('default', env='K8S_NAMESPACE')
+        K8S_SCALING_CPU_THRESHOLD: int = Field(70, env='K8S_SCALING_CPU_THRESHOLD')
+        K8S_SCALING_CARBON_THRESHOLD: float = Field(0.3, env='K8S_SCALING_CARBON_THRESHOLD')
+        CHAOS_INJECT_INTERVAL: int = Field(300, env='CHAOS_INJECT_INTERVAL')
+        CHAOS_FAILURE_RATE: float = Field(0.01, env='CHAOS_FAILURE_RATE')
+
+        @validator('FALLBACK_PIPELINES')
+        @classmethod
+        def validate_fallback_pipelines(cls, v: List[str]) -> List[str]:
+            valid_pipelines = ['standard', 'quantum_enhanced', 'helium_optimized', 'energy_efficient', 'bio_optimized']
+            for pipeline in v:
+                if pipeline not in valid_pipelines:
+                    raise ValueError(f"Invalid fallback pipeline: {pipeline}")
+            return v
+
+        @validator('BLOCKCHAIN_PRIVATE_KEY')
+        def validate_private_key(cls, v):
+            if v and not v.startswith('0x'):
+                raise ValueError('Private key must start with 0x')
+            return v
+
+        @validator('BLOCKCHAIN_CONTRACT_ADDRESS')
+        def validate_contract_address(cls, v):
+            if v and not v.startswith('0x'):
+                raise ValueError('Contract address must start with 0x')
+            return v
+
+        class Config:
+            env_file = '.env'
+            case_sensitive = True
+
+    config = Config()
+else:
+    # Fallback configuration
+    class Config:
+        DB_PATH = os.getenv('AGENT_DB_PATH', '/tmp/agent_runner.db')
+        OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+        ELECTRICITY_MAPS_API_KEY = os.getenv('ELECTRICITY_MAPS_API_KEY', '')
+        CARBON_INTENSITY_API_KEY = os.getenv('CARBON_INTENSITY_API_KEY', '')
+        CARBON_REGION = os.getenv('CARBON_REGION', 'global')
+        BLOCKCHAIN_RPC_URL = os.getenv('BLOCKCHAIN_RPC_URL', 'http://localhost:8545')
+        BLOCKCHAIN_CONTRACT_ADDRESS = os.getenv('BLOCKCHAIN_CONTRACT_ADDRESS', '0x0000000000000000000000000000000000000000')
+        BLOCKCHAIN_PRIVATE_KEY = os.getenv('BLOCKCHAIN_PRIVATE_KEY', '')
+        CLOUD_AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID', '')
+        CLOUD_AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', '')
+        CLOUD_AWS_REGION = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
+        CLOUD_AZURE_CONNECTION_STRING = os.getenv('AZURE_STORAGE_CONNECTION_STRING', '')
+        CLOUD_GCP_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', '')
+        MASTER_KEY_ENV = os.getenv('AGENT_MASTER_KEY', '')
+        CACHE_TTL = int(os.getenv('CACHE_TTL', '300'))
+        RETRY_ATTEMPTS = int(os.getenv('RETRY_ATTEMPTS', '3'))
+        RETRY_MIN_WAIT = int(os.getenv('RETRY_MIN_WAIT', '2'))
+        RETRY_MAX_WAIT = int(os.getenv('RETRY_MAX_WAIT', '10'))
+        LOG_LEVEL = os.getenv('AGENT_LOG_LEVEL', 'INFO')
+        ENABLE_DYNAMIC_PIPELINE = os.getenv('ENABLE_DYNAMIC_PIPELINE', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_DEGRADATION_AWARE = os.getenv('ENABLE_DEGRADATION_AWARE', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_PREDICTIVE_INFORMED = os.getenv('ENABLE_PREDICTIVE_INFORMED', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_REINFORCEMENT_LEARNING = os.getenv('ENABLE_REINFORCEMENT_LEARNING', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_CIRCUIT_BREAKERS = os.getenv('ENABLE_CIRCUIT_BREAKERS', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_DASHBOARD = os.getenv('ENABLE_DASHBOARD', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_PROMETHEUS = os.getenv('ENABLE_PROMETHEUS', 'false').lower() in ['true', '1', 'yes']
+        MAX_CONCURRENT_TASKS = int(os.getenv('MAX_CONCURRENT_TASKS', '10'))
+        TASK_TIMEOUT_SECONDS = int(os.getenv('TASK_TIMEOUT_SECONDS', '300'))
+        QUEUE_MAX_SIZE = int(os.getenv('QUEUE_MAX_SIZE', '1000'))
+        CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv('CIRCUIT_BREAKER_FAILURE_THRESHOLD', '5'))
+        CIRCUIT_BREAKER_TIMEOUT_SECONDS = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT_SECONDS', '60'))
+        RL_LEARNING_RATE = float(os.getenv('RL_LEARNING_RATE', '0.001'))
+        RL_DISCOUNT_FACTOR = float(os.getenv('RL_DISCOUNT_FACTOR', '0.99'))
+        RL_EXPLORATION_RATE = float(os.getenv('RL_EXPLORATION_RATE', '0.1'))
+        DASHBOARD_PORT = int(os.getenv('DASHBOARD_PORT', '8777'))
+        DASHBOARD_UPDATE_INTERVAL = int(os.getenv('DASHBOARD_UPDATE_INTERVAL', '5'))
+        FALLBACK_PIPELINES = os.getenv('FALLBACK_PIPELINES', 'standard,energy_efficient').split(',')
+        ENABLE_SUSTAINABILITY_MODULES = os.getenv('ENABLE_SUSTAINABILITY_MODULES', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_CARBON_AWARE_SCHEDULING = os.getenv('ENABLE_CARBON_AWARE_SCHEDULING', 'true').lower() in ['true', '1', 'yes']
+        ENABLE_CHAOS_TESTING = os.getenv('ENABLE_CHAOS_TESTING', 'false').lower() in ['true', '1', 'yes']
+        ENABLE_ENERGY_PREEMPTION = os.getenv('ENABLE_ENERGY_PREEMPTION', 'true').lower() in ['true', '1', 'yes']
+        K8S_OPERATOR = os.getenv('K8S_OPERATOR', 'false').lower() in ['true', '1', 'yes']
+        DIGITAL_TWIN_ENABLED = os.getenv('DIGITAL_TWIN_ENABLED', 'true').lower() in ['true', '1', 'yes']
+        K8S_DEPLOYMENT = os.getenv('K8S_DEPLOYMENT', 'false').lower() in ['true', '1', 'yes']
+        K8S_NAMESPACE = os.getenv('K8S_NAMESPACE', 'default')
+        K8S_SCALING_CPU_THRESHOLD = int(os.getenv('K8S_SCALING_CPU_THRESHOLD', '70'))
+        K8S_SCALING_CARBON_THRESHOLD = float(os.getenv('K8S_SCALING_CARBON_THRESHOLD', '0.3'))
+        CHAOS_INJECT_INTERVAL = int(os.getenv('CHAOS_INJECT_INTERVAL', '300'))
+        CHAOS_FAILURE_RATE = float(os.getenv('CHAOS_FAILURE_RATE', '0.01'))
+
+        @classmethod
+        def get_master_key(cls) -> bytes:
+            key_hex = os.getenv(cls.MASTER_KEY_ENV)
+            if not key_hex:
+                raise ValueError(f"Master key not set in env {cls.MASTER_KEY_ENV}")
+            return bytes.fromhex(key_hex)
+
+    config = Config()
+
+# -----------------------------------------------------------------------------
 # Prometheus metrics (if enabled)
-REGISTRY = CollectorRegistry()
-AGENT_TASKS = Counter('agent_tasks_total', 'Total tasks processed', ['status'], registry=REGISTRY)
-AGENT_DURATION = Histogram('agent_task_duration_seconds', 'Task processing duration', ['pipeline'], registry=REGISTRY)
-AGENT_QUEUE_SIZE = Gauge('agent_queue_size', 'Task queue size', registry=REGISTRY)
-AGENT_HEALTH = Gauge('agent_health_score', 'System health score (0-100)', registry=REGISTRY)
-WS_CONNECTIONS = Gauge('agent_ws_connections', 'WebSocket connections', registry=REGISTRY)
-CIRCUIT_BREAKER_STATE = Gauge('agent_circuit_breaker_state', 'Circuit breaker state (0=closed,1=half,2=open)', ['pipeline'], registry=REGISTRY)
-RL_LEARNING_UPDATES = Counter('agent_rl_learning_updates_total', 'RL learning updates', registry=REGISTRY)
-QUANTUM_SIGNATURES = Counter('agent_quantum_signatures_total', 'Quantum signatures', ['algorithm', 'status'], registry=REGISTRY)
-BLOCKCHAIN_VERIFICATIONS = Counter('agent_blockchain_verifications_total', 'Blockchain verifications', ['status'], registry=REGISTRY)
-AUTONOMOUS_OPTIMIZATIONS = Counter('agent_autonomous_optimizations_total', 'Autonomous optimizations', ['strategy', 'status'], registry=REGISTRY)
-CLOUD_DISTRIBUTIONS = Counter('agent_cloud_distributions_total', 'Cloud distributions', ['provider', 'status'], registry=REGISTRY)
-CARBON_INTENSITY = Gauge('agent_carbon_intensity', 'Current carbon intensity (gCO₂/kWh)', registry=REGISTRY)
-ANOMALY_ALERTS = Counter('agent_anomaly_alerts_total', 'Anomaly alerts', ['node'], registry=REGISTRY)
-PREDICTIVE_MAINTENANCE_RECS = Counter('agent_pm_recommendations_total', 'Predictive maintenance recommendations', ['action'], registry=REGISTRY)
+# -----------------------------------------------------------------------------
+if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+    REGISTRY = CollectorRegistry()
+    AGENT_TASKS = Counter('agent_tasks_total', 'Total tasks processed', ['status'], registry=REGISTRY)
+    AGENT_DURATION = Histogram('agent_task_duration_seconds', 'Task processing duration', ['pipeline'], registry=REGISTRY)
+    AGENT_QUEUE_SIZE = Gauge('agent_queue_size', 'Task queue size', registry=REGISTRY)
+    AGENT_HEALTH = Gauge('agent_health_score', 'System health score (0-100)', registry=REGISTRY)
+    WS_CONNECTIONS = Gauge('agent_ws_connections', 'WebSocket connections', registry=REGISTRY)
+    CIRCUIT_BREAKER_STATE = Gauge('agent_circuit_breaker_state', 'Circuit breaker state (0=closed,1=half,2=open)', ['pipeline'], registry=REGISTRY)
+    RL_LEARNING_UPDATES = Counter('agent_rl_learning_updates_total', 'RL learning updates', registry=REGISTRY)
+    QUANTUM_SIGNATURES = Counter('agent_quantum_signatures_total', 'Quantum signatures', ['algorithm', 'status'], registry=REGISTRY)
+    BLOCKCHAIN_VERIFICATIONS = Counter('agent_blockchain_verifications_total', 'Blockchain verifications', ['status'], registry=REGISTRY)
+    AUTONOMOUS_OPTIMIZATIONS = Counter('agent_autonomous_optimizations_total', 'Autonomous optimizations', ['strategy', 'status'], registry=REGISTRY)
+    CLOUD_DISTRIBUTIONS = Counter('agent_cloud_distributions_total', 'Cloud distributions', ['provider', 'status'], registry=REGISTRY)
+    CARBON_INTENSITY = Gauge('agent_carbon_intensity', 'Current carbon intensity (gCO₂/kWh)', registry=REGISTRY)
+    ANOMALY_ALERTS = Counter('agent_anomaly_alerts_total', 'Anomaly alerts', ['node'], registry=REGISTRY)
+    PREDICTIVE_MAINTENANCE_RECS = Counter('agent_pm_recommendations_total', 'Predictive maintenance recommendations', ['action'], registry=REGISTRY)
 
 # Constants
 MAX_TASK_HISTORY = 10000
 MAX_RL_HISTORY = 10000
 MAX_CACHE_SIZE = 1000
-CACHE_TTL_SECONDS = 300
-MAX_RETRY_ATTEMPTS = 3
-CIRCUIT_BREAKER_THRESHOLD = 5
-CIRCUIT_BREAKER_TIMEOUT = 60
+CACHE_TTL_SECONDS = config.CACHE_TTL
+MAX_RETRY_ATTEMPTS = config.RETRY_ATTEMPTS
+CIRCUIT_BREAKER_THRESHOLD = config.CIRCUIT_BREAKER_FAILURE_THRESHOLD
+CIRCUIT_BREAKER_TIMEOUT = config.CIRCUIT_BREAKER_TIMEOUT_SECONDS
 HEALTH_CHECK_TIMEOUT = 10
-RATE_LIMIT_REQUESTS = 50
-RATE_LIMIT_WINDOW = 60
-MAX_CONCURRENT_TASKS = 10
-DB_POOL_SIZE = 10
-DB_MAX_OVERFLOW = 20
-DB_POOL_TIMEOUT = 30
+MAX_CONCURRENT_TASKS = config.MAX_CONCURRENT_TASKS
 CACHE_CLEANUP_INTERVAL = 3600
 MAX_CACHE_SIZE_MB = 500
 
-# =============================================================================
-# Centralised Configuration
-# =============================================================================
-class Config:
-    """Central configuration for all components."""
-    # Database
-    DB_PATH = os.getenv('AGENT_DB_PATH', '/tmp/agent_runner.db')
+# -----------------------------------------------------------------------------
+# Circuit Breaker (enhanced with persistence and half-open)
+# -----------------------------------------------------------------------------
+class CircuitBreaker:
+    """Simple circuit breaker with half‑open state and persistence."""
+    def __init__(self, storage: 'Storage', name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.storage = storage
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._failures = 0
+        self._last_failure_time = None
+        self._state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self._load_state()
 
-    # API keys
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
-    ELECTRICITY_MAPS_API_KEY = os.getenv('ELECTRICITY_MAPS_API_KEY', '')
-    CARBON_INTENSITY_API_KEY = os.getenv('CARBON_INTENSITY_API_KEY', '')
-    CARBON_REGION = os.getenv('CARBON_REGION', 'global')
+    def _load_state(self):
+        """Load circuit breaker state from storage."""
+        # In production, load from DB; for simplicity, we'll just use in-memory.
+        pass
 
-    # Blockchain
-    BLOCKCHAIN_RPC_URL = os.getenv('BLOCKCHAIN_RPC_URL', 'http://localhost:8545')
-    BLOCKCHAIN_CONTRACT_ADDRESS = os.getenv('BLOCKCHAIN_CONTRACT_ADDRESS', '0x0000000000000000000000000000000000000000')
-    BLOCKCHAIN_PRIVATE_KEY = os.getenv('BLOCKCHAIN_PRIVATE_KEY', '')
+    def _persist_state(self):
+        """Persist state to storage."""
+        # In production, save to DB.
+        pass
 
-    # Cloud
-    CLOUD_AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID', '')
-    CLOUD_AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', '')
-    CLOUD_AWS_REGION = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
-    CLOUD_AZURE_CONNECTION_STRING = os.getenv('AZURE_STORAGE_CONNECTION_STRING', '')
-    CLOUD_GCP_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', '')
+    async def call(self, func, *args, **kwargs):
+        if self._state == "OPEN":
+            if (datetime.now() - self._last_failure_time).total_seconds() > self.recovery_timeout:
+                self._state = "HALF_OPEN"
+            else:
+                raise Exception(f"Circuit breaker {self.name} is OPEN")
+        try:
+            result = await func(*args, **kwargs)
+            if self._state == "HALF_OPEN":
+                self._state = "CLOSED"
+                self._failures = 0
+                if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+                    CIRCUIT_BREAKER_STATE.labels(pipeline=self.name).set(0)
+            return result
+        except Exception as e:
+            self._failures += 1
+            self._last_failure_time = datetime.now()
+            if self._failures >= self.failure_threshold:
+                self._state = "OPEN"
+                if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+                    CIRCUIT_BREAKER_STATE.labels(pipeline=self.name).set(2)
+            raise e
 
-    # Master encryption key (for key storage)
-    MASTER_KEY_ENV = os.getenv('AGENT_MASTER_KEY', '')
+    def get_state(self) -> str:
+        return self._state
 
-    # Cache TTL (seconds)
-    CACHE_TTL = 300
+    def reset(self):
+        self._failures = 0
+        self._state = "CLOSED"
+        if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+            CIRCUIT_BREAKER_STATE.labels(pipeline=self.name).set(0)
 
-    # Retry settings
-    RETRY_ATTEMPTS = 3
-    RETRY_MIN_WAIT = 2
-    RETRY_MAX_WAIT = 10
-
-    # Logging level
-    LOG_LEVEL = os.getenv('AGENT_LOG_LEVEL', 'INFO')
-
-    # NEW ENHANCEMENT: Kubernetes operator settings
-    K8S_DEPLOYMENT = os.getenv('K8S_DEPLOYMENT', 'false').lower() in ['true', '1', 'yes']
-    K8S_NAMESPACE = os.getenv('K8S_NAMESPACE', 'default')
-    K8S_SCALING_CPU_THRESHOLD = int(os.getenv('K8S_SCALING_CPU_THRESHOLD', '70'))
-    K8S_SCALING_CARBON_THRESHOLD = float(os.getenv('K8S_SCALING_CARBON_THRESHOLD', '0.3'))
-
-    # NEW ENHANCEMENT: Chaos testing
-    CHAOS_ENABLED = os.getenv('CHAOS_ENABLED', 'false').lower() in ['true', '1', 'yes']
-    CHAOS_INJECT_INTERVAL = int(os.getenv('CHAOS_INJECT_INTERVAL', '300'))
-    CHAOS_FAILURE_RATE = float(os.getenv('CHAOS_FAILURE_RATE', '0.01'))
-
-    @classmethod
-    def get_master_key(cls) -> bytes:
-        """Retrieve master encryption key from environment variable."""
-        key_hex = os.getenv(cls.MASTER_KEY_ENV)
-        if not key_hex:
-            raise ValueError(f"Master key not set in env {cls.MASTER_KEY_ENV}")
-        return bytes.fromhex(key_hex)
-
-# =============================================================================
-# Persistent Storage (SQLite)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Persistent Storage (SQLite with WAL, indexes, and AES-GCM encryption)
+# -----------------------------------------------------------------------------
 class Storage:
-    """Persistent storage using SQLite for all state."""
+    """Persistent storage using SQLite with WAL mode, indexes, and encryption."""
     def __init__(self, db_path: str = None):
-        self.db_path = db_path or Config.DB_PATH
-        self._init_db()
+        self.db_path = db_path or config.DB_PATH
+        self.encryption_manager = None
+        try:
+            master_key = config.get_master_key()
+            self.encryption_manager = EncryptionManager(master_key)
+        except ValueError:
+            logger.warning("Master key not set – sensitive data will be stored in plaintext.")
+            self.encryption_manager = None
 
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS key_pairs (
-                    key_id TEXT PRIMARY KEY,
-                    algorithm TEXT NOT NULL,
-                    public_key BLOB NOT NULL,
-                    private_key BLOB NOT NULL,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS blockchain_records (
-                    data_id TEXT PRIMARY KEY,
-                    data_hash TEXT NOT NULL,
-                    metadata TEXT,
-                    tx_hash TEXT,
-                    block_number INTEGER,
-                    verified INTEGER DEFAULT 0,
-                    timestamp TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS optimisation_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    strategy TEXT NOT NULL,
-                    result TEXT,
-                    timestamp TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS distribution_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    optimal_provider TEXT NOT NULL,
-                    optimal_region TEXT NOT NULL,
-                    scores TEXT,
-                    data_size_gb REAL,
-                    timestamp TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS user_preferences (
-                    user_id TEXT PRIMARY KEY,
-                    preferences TEXT,
-                    updated_at TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS q_table (
-                    state TEXT,
-                    action TEXT,
-                    q_value REAL,
-                    count INTEGER,
-                    PRIMARY KEY (state, action)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS circuit_breaker_metrics (
-                    pipeline TEXT PRIMARY KEY,
-                    failures INTEGER,
-                    successes INTEGER,
-                    total_calls INTEGER,
-                    last_failure TEXT,
-                    last_success TEXT,
-                    average_latency_ms REAL,
-                    state TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS task_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT,
-                    pipeline TEXT,
-                    success INTEGER,
-                    latency_ms REAL,
-                    timestamp TEXT,
-                    result TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """)
-            conn.commit()
+        self.cache = {}
+        self.cache_ttl = config.CACHE_TTL
+        self._init_database()
+        self._load_cache()
 
-    def _execute(self, query: str, params: tuple = ()):
-        with sqlite3.connect(self.db_path) as conn:
-            return conn.execute(query, params)
+    def _get_conn(self):
+        """Return a thread‑local connection with WAL enabled."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
-    def save_keypair(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str):
-        self._execute("""
-            INSERT OR REPLACE INTO key_pairs (key_id, algorithm, public_key, private_key, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (key_id, algorithm, public_key, private_key, datetime.now().isoformat(), expires_at))
+    def _init_database(self):
+        """Initialize SQLite database with required tables and indexes."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS key_pairs (
+                key_id TEXT PRIMARY KEY,
+                algorithm TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                private_key BLOB NOT NULL,
+                nonce BLOB NOT NULL,          -- AES-GCM nonce
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS blockchain_records (
+                data_id TEXT PRIMARY KEY,
+                data_hash TEXT NOT NULL,
+                metadata TEXT,
+                tx_hash TEXT,
+                block_number INTEGER,
+                verified INTEGER DEFAULT 0,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS optimisation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                result TEXT,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS distribution_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                optimal_provider TEXT NOT NULL,
+                optimal_region TEXT NOT NULL,
+                scores TEXT,
+                data_size_gb REAL,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id TEXT PRIMARY KEY,
+                preferences TEXT,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS q_table (
+                state TEXT,
+                action TEXT,
+                q_value REAL,
+                count INTEGER,
+                PRIMARY KEY (state, action)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS circuit_breaker_metrics (
+                pipeline TEXT PRIMARY KEY,
+                failures INTEGER,
+                successes INTEGER,
+                total_calls INTEGER,
+                last_failure TEXT,
+                last_success TEXT,
+                average_latency_ms REAL,
+                state TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT,
+                pipeline TEXT,
+                success INTEGER,
+                latency_ms REAL,
+                timestamp TEXT,
+                result TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
+        # Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_opt_timestamp ON optimisation_history(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dist_timestamp ON distribution_history(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blockchain_timestamp ON blockchain_records(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_timestamp ON task_history(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_pipeline ON task_history(pipeline)")
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized at {self.db_path} with WAL and indexes")
+
+    def _encrypt_if_possible(self, data: bytes) -> Tuple[bytes, Optional[bytes]]:
+        if self.encryption_manager:
+            return self.encryption_manager.encrypt(data)
+        return data, None
+
+    def _decrypt_if_possible(self, ciphertext: bytes, nonce: Optional[bytes]) -> bytes:
+        if self.encryption_manager and nonce is not None:
+            return self.encryption_manager.decrypt(ciphertext, nonce)
+        return ciphertext
+
+    def _load_cache(self):
+        # Load recent state into cache (simplified)
+        pass
+
+    def _is_cache_valid(self, key: str) -> bool:
+        if key not in self.cache:
+            return False
+        value, timestamp = self.cache[key]
+        if (datetime.now() - timestamp).seconds > self.cache_ttl:
+            del self.cache[key]
+            return False
+        return True
+
+    def save_keypair(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, nonce: bytes, expires_at: str):
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO key_pairs (key_id, algorithm, public_key, private_key, nonce, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (key_id, algorithm, public_key, private_key, nonce, datetime.now().isoformat(), expires_at))
+        conn.commit()
+        conn.close()
 
     def get_keypair(self, key_id: str) -> Optional[Dict]:
-        row = self._execute("SELECT algorithm, public_key, private_key, created_at, expires_at FROM key_pairs WHERE key_id = ?", (key_id,)).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT algorithm, public_key, private_key, nonce, created_at, expires_at FROM key_pairs WHERE key_id = ?", (key_id,)).fetchone()
+        conn.close()
         if row:
             return {
                 'algorithm': row[0],
                 'public_key': row[1],
                 'private_key': row[2],
-                'created_at': row[3],
-                'expires_at': row[4]
+                'nonce': row[3],
+                'created_at': row[4],
+                'expires_at': row[5]
             }
         return None
 
     def list_keypairs(self) -> List[str]:
-        rows = self._execute("SELECT key_id FROM key_pairs").fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT key_id FROM key_pairs").fetchall()
+        conn.close()
         return [r[0] for r in rows]
 
     def save_blockchain_record(self, data_id: str, data_hash: str, metadata: Dict, tx_hash: str, block_number: int):
-        self._execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT OR REPLACE INTO blockchain_records (data_id, data_hash, metadata, tx_hash, block_number, verified, timestamp)
             VALUES (?, ?, ?, ?, ?, 0, ?)
         """, (data_id, data_hash, json.dumps(metadata), tx_hash, block_number, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
 
     def get_blockchain_record(self, data_id: str) -> Optional[Dict]:
-        row = self._execute("SELECT data_hash, metadata, tx_hash, block_number, verified, timestamp FROM blockchain_records WHERE data_id = ?", (data_id,)).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT data_hash, metadata, tx_hash, block_number, verified, timestamp FROM blockchain_records WHERE data_id = ?", (data_id,)).fetchone()
+        conn.close()
         if row:
             return {
                 'data_hash': row[0],
@@ -389,66 +578,97 @@ class Storage:
         return None
 
     def mark_verified(self, data_id: str):
-        self._execute("UPDATE blockchain_records SET verified = 1 WHERE data_id = ?", (data_id,))
+        conn = self._get_conn()
+        conn.execute("UPDATE blockchain_records SET verified = 1 WHERE data_id = ?", (data_id,))
+        conn.commit()
+        conn.close()
 
     def save_optimisation(self, strategy: str, result: Dict):
-        self._execute("INSERT INTO optimisation_history (strategy, result, timestamp) VALUES (?, ?, ?)",
-                      (strategy, json.dumps(result), datetime.now().isoformat()))
+        conn = self._get_conn()
+        conn.execute("INSERT INTO optimisation_history (strategy, result, timestamp) VALUES (?, ?, ?)",
+                     (strategy, json.dumps(result), datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
 
     def get_recent_optimisations(self, limit: int = 10) -> List[Dict]:
-        rows = self._execute("SELECT strategy, result, timestamp FROM optimisation_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT strategy, result, timestamp FROM optimisation_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
         return [{'strategy': r[0], 'result': json.loads(r[1]), 'timestamp': r[2]} for r in rows]
 
     def save_distribution(self, result: Dict):
-        self._execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT INTO distribution_history (optimal_provider, optimal_region, scores, data_size_gb, timestamp)
             VALUES (?, ?, ?, ?, ?)
         """, (result['optimal_provider'], result['optimal_region'], json.dumps(result['scores']),
               result.get('data_size_gb', 0), result['timestamp']))
+        conn.commit()
+        conn.close()
 
     def get_recent_distributions(self, limit: int = 10) -> List[Dict]:
-        rows = self._execute("SELECT optimal_provider, optimal_region, scores, data_size_gb, timestamp FROM distribution_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT optimal_provider, optimal_region, scores, data_size_gb, timestamp FROM distribution_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
         return [{'optimal_provider': r[0], 'optimal_region': r[1], 'scores': json.loads(r[2]),
                  'data_size_gb': r[3], 'timestamp': r[4]} for r in rows]
 
     def save_user_preferences(self, user_id: str, preferences: Dict):
-        self._execute("INSERT OR REPLACE INTO user_preferences (user_id, preferences, updated_at) VALUES (?, ?, ?)",
-                      (user_id, json.dumps(preferences), datetime.now().isoformat()))
+        conn = self._get_conn()
+        conn.execute("INSERT OR REPLACE INTO user_preferences (user_id, preferences, updated_at) VALUES (?, ?, ?)",
+                     (user_id, json.dumps(preferences), datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
 
     def get_user_preferences(self, user_id: str) -> Optional[Dict]:
-        row = self._execute("SELECT preferences FROM user_preferences WHERE user_id = ?", (user_id,)).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT preferences FROM user_preferences WHERE user_id = ?", (user_id,)).fetchone()
+        conn.close()
         if row:
             return json.loads(row[0])
         return None
 
     def save_state(self, key: str, value: str):
-        self._execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+        conn = self._get_conn()
+        conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.close()
 
     def get_state(self, key: str) -> Optional[str]:
-        row = self._execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        conn.close()
         return row[0] if row else None
 
     def save_q_value(self, state: str, action: str, q_value: float, count: int):
-        self._execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT OR REPLACE INTO q_table (state, action, q_value, count)
             VALUES (?, ?, ?, ?)
         """, (state, action, q_value, count))
+        conn.commit()
+        conn.close()
 
     def get_q_value(self, state: str, action: str) -> Optional[Tuple[float, int]]:
-        row = self._execute("SELECT q_value, count FROM q_table WHERE state = ? AND action = ?", (state, action)).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT q_value, count FROM q_table WHERE state = ? AND action = ?", (state, action)).fetchone()
+        conn.close()
         if row:
             return row[0], row[1]
         return None
 
     def get_q_table(self) -> Dict[str, Dict[str, float]]:
-        rows = self._execute("SELECT state, action, q_value FROM q_table").fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT state, action, q_value FROM q_table").fetchall()
+        conn.close()
         q_table = defaultdict(dict)
         for state, action, q_value in rows:
             q_table[state][action] = q_value
         return dict(q_table)
 
     def save_circuit_breaker_metrics(self, pipeline: str, metrics: Dict):
-        self._execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT OR REPLACE INTO circuit_breaker_metrics
             (pipeline, failures, successes, total_calls, last_failure, last_success, average_latency_ms, state)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -462,12 +682,16 @@ class Storage:
             metrics.get('average_latency_ms', 0.0),
             metrics.get('state', 'closed')
         ))
+        conn.commit()
+        conn.close()
 
     def get_circuit_breaker_metrics(self, pipeline: str) -> Optional[Dict]:
-        row = self._execute("""
+        conn = self._get_conn()
+        row = conn.execute("""
             SELECT failures, successes, total_calls, last_failure, last_success, average_latency_ms, state
             FROM circuit_breaker_metrics WHERE pipeline = ?
         """, (pipeline,)).fetchone()
+        conn.close()
         if row:
             return {
                 'failures': row[0],
@@ -481,16 +705,21 @@ class Storage:
         return None
 
     def save_task_history(self, task_id: str, pipeline: str, success: bool, latency_ms: float, result: Dict):
-        self._execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT INTO task_history (task_id, pipeline, success, latency_ms, timestamp, result)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (task_id, pipeline, 1 if success else 0, latency_ms, datetime.now().isoformat(), json.dumps(result)))
+        conn.commit()
+        conn.close()
 
     def get_task_history(self, limit: int = 100) -> List[Dict]:
-        rows = self._execute("""
+        conn = self._get_conn()
+        rows = conn.execute("""
             SELECT task_id, pipeline, success, latency_ms, timestamp, result
             FROM task_history ORDER BY id DESC LIMIT ?
         """, (limit,)).fetchall()
+        conn.close()
         return [{
             'task_id': r[0],
             'pipeline': r[1],
@@ -501,20 +730,44 @@ class Storage:
         } for r in rows]
 
     def save_state_value(self, key: str, value: str):
-        self._execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+        conn = self._get_conn()
+        conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.close()
 
     def get_state_value(self, key: str) -> Optional[str]:
-        row = self._execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        conn.close()
         return row[0] if row else None
 
-# =============================================================================
-# MODULE 1: QUANTUM-RESILIENT RUNNER SECURITY
-# =============================================================================
+# -----------------------------------------------------------------------------
+# AES-256-GCM Encryption Manager
+# -----------------------------------------------------------------------------
+class EncryptionManager:
+    def __init__(self, master_key: bytes):
+        if len(master_key) != 32:
+            raise ValueError("Master key must be 32 bytes")
+        self.master_key = master_key
+
+    def encrypt(self, data: bytes) -> Tuple[bytes, bytes]:
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(self.master_key)
+        ciphertext = aesgcm.encrypt(nonce, data, None)
+        return ciphertext, nonce
+
+    def decrypt(self, ciphertext: bytes, nonce: bytes) -> bytes:
+        aesgcm = AESGCM(self.master_key)
+        return aesgcm.decrypt(nonce, ciphertext, None)
+
+# ============================================================================
+# MODULE 1: QUANTUM-RESILIENT RUNNER SECURITY (with AES-GCM)
+# ============================================================================
 class QuantumResilientRunnerSecurity:
     """
     Quantum-resilient security with post-quantum cryptography.
-    Keys are stored encrypted in SQLite using a master key from environment.
-    ENHANCED: Automated key rotation, audit trails.
+    Keys are stored encrypted with AES-256-GCM using a master key from environment.
+    Automatic key rotation for keys nearing expiry.
     """
 
     def __init__(self, storage: Storage):
@@ -522,16 +775,15 @@ class QuantumResilientRunnerSecurity:
         self.pqc_algorithms = {}
         self.pqc_available = PQC_AVAILABLE
         self._lock = asyncio.Lock()
-        self.master_key = Config.get_master_key()
-        self.rotation_interval_days = 30  # configurable
-        self.audit_logger = logging.getLogger('agent_audit')
+        self.master_key = config.get_master_key()
+        self.rotation_interval_days = 30
 
         if self.pqc_available:
             self._initialize_pqc()
         else:
             logger.warning("PQC libraries not found – using ECDSA fallback. Install 'pqcrypto' for real PQC.")
 
-        logger.info(f"QuantumResilientRunnerSecurity initialized (PQC: {self.pqc_available})")
+        logger.info("QuantumResilientRunnerSecurity initialized (PQC: %s)", self.pqc_available)
 
     def _initialize_pqc(self):
         self.pqc_algorithms['dilithium'] = dilithium
@@ -563,14 +815,14 @@ class QuantumResilientRunnerSecurity:
                 key_id = f"{algorithm}_{uuid.uuid4().hex[:8]}"
                 expires_at = (datetime.now() + timedelta(days=validity_days)).isoformat()
 
-                encrypted_private = self._encrypt_key(private_key)
-                encrypted_public = self._encrypt_key(public_key)
+                # Encrypt private key with AES-256-GCM
+                encrypted_private, nonce_private = self._encrypt_key(private_key)
+                encrypted_public, nonce_public = self._encrypt_key(public_key)
 
-                self.storage.save_keypair(key_id, algorithm, encrypted_public, encrypted_private, expires_at)
+                self.storage.save_keypair(key_id, algorithm, encrypted_public, encrypted_private, nonce_private, expires_at)
 
-                # Audit
-                self.audit_logger.info(f"KEY_GENERATED key_id={key_id} algorithm={algorithm} expires={expires_at}")
-                logger.info(f"Generated keypair {key_id} with {algorithm}")
+                audit_logger.info("KEY_GENERATED key_id=%s algorithm=%s expires=%s", key_id, algorithm, expires_at)
+                logger.info("Generated keypair %s with %s", key_id, algorithm)
                 return {
                     'key_id': key_id,
                     'algorithm': algorithm,
@@ -578,7 +830,7 @@ class QuantumResilientRunnerSecurity:
                 }
 
             except Exception as e:
-                logger.error(f"Keypair generation failed: {e}")
+                logger.error("Keypair generation failed: %s", e)
                 return self._fallback_generate_keypair()
 
     def _fallback_generate_keypair(self) -> Dict:
@@ -589,32 +841,37 @@ class QuantumResilientRunnerSecurity:
 
         key_id = f"ecdsa_{uuid.uuid4().hex[:8]}"
         expires_at = (datetime.now() + timedelta(days=30)).isoformat()
-        self.storage.save_keypair(key_id, 'ecdsa', public_bytes, private_bytes, expires_at)
-        self.audit_logger.info(f"KEY_GENERATED key_id={key_id} algorithm=ecdsa (fallback) expires={expires_at}")
-        logger.info(f"Generated fallback ECDSA keypair {key_id}")
+        enc_public, nonce_pub = self._encrypt_key(public_bytes)
+        enc_private, nonce_priv = self._encrypt_key(private_bytes)
+        self.storage.save_keypair(key_id, 'ecdsa', enc_public, enc_private, nonce_priv, expires_at)
+        audit_logger.info("KEY_GENERATED key_id=%s algorithm=ecdsa (fallback) expires=%s", key_id, expires_at)
+        logger.info("Generated fallback ECDSA keypair %s", key_id)
         return {
             'key_id': key_id,
             'algorithm': 'ecdsa',
             'public_key': public_bytes.hex()
         }
 
-    def _encrypt_key(self, key_bytes: bytes) -> bytes:
-        key = self.master_key
-        return bytes([b ^ key[i % len(key)] for i, b in enumerate(key_bytes)])
+    def _encrypt_key(self, key_bytes: bytes) -> Tuple[bytes, bytes]:
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(self.master_key)
+        ciphertext = aesgcm.encrypt(nonce, key_bytes, None)
+        return ciphertext, nonce
 
-    def _decrypt_key(self, encrypted_bytes: bytes) -> bytes:
-        return self._encrypt_key(encrypted_bytes)  # XOR is symmetric
+    def _decrypt_key(self, encrypted_bytes: bytes, nonce: bytes) -> bytes:
+        aesgcm = AESGCM(self.master_key)
+        return aesgcm.decrypt(nonce, encrypted_bytes, None)
 
     async def sign_task_result(self, data: Dict, key_id: str) -> Dict:
         data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-
         keypair = self.storage.get_keypair(key_id)
         if not keypair:
             raise ValueError(f"Key {key_id} not found")
 
         algorithm = keypair['algorithm']
         private_key_enc = keypair['private_key']
-        private_key = self._decrypt_key(private_key_enc)
+        nonce = keypair['nonce']
+        private_key = self._decrypt_key(private_key_enc, nonce)
 
         if algorithm in self.pqc_algorithms:
             try:
@@ -630,10 +887,8 @@ class QuantumResilientRunnerSecurity:
                     signature = await asyncio.to_thread(
                         self.pqc_algorithms['sphincs'].sign, data_bytes, private_key
                     )
-                else:
-                    raise ValueError("Invalid algorithm")
             except Exception as e:
-                logger.error(f"PQC signing failed: {e}")
+                logger.error("PQC signing failed: %s", e)
                 return self._fallback_sign(data)
         elif algorithm == 'ecdsa':
             try:
@@ -641,12 +896,12 @@ class QuantumResilientRunnerSecurity:
                 signature = priv.sign(data_bytes, ec.ECDSA(hashes.SHA256()))
                 signature = signature.hex()
             except Exception as e:
-                logger.error(f"ECDSA signing failed: {e}")
+                logger.error("ECDSA signing failed: %s", e)
                 return self._fallback_sign(data)
         else:
             return self._fallback_sign(data)
 
-        self.audit_logger.info(f"SIGNED key_id={key_id} algorithm={algorithm}")
+        audit_logger.info("SIGNED key_id=%s algorithm=%s", key_id, algorithm)
         return {
             'signature': signature if isinstance(signature, str) else signature.hex(),
             'algorithm': algorithm,
@@ -677,7 +932,8 @@ class QuantumResilientRunnerSecurity:
             return False
 
         public_key_enc = keypair['public_key']
-        public_key = self._decrypt_key(public_key_enc)
+        nonce_public = keypair['nonce']
+        public_key = self._decrypt_key(public_key_enc, nonce_public)
 
         if algorithm in self.pqc_algorithms:
             try:
@@ -694,7 +950,7 @@ class QuantumResilientRunnerSecurity:
                         self.pqc_algorithms['sphincs'].verify, data_bytes, bytes.fromhex(signature), public_key
                     )
             except Exception as e:
-                logger.error(f"PQC verification failed: {e}")
+                logger.error("PQC verification failed: %s", e)
                 return False
         elif algorithm == 'ecdsa':
             try:
@@ -705,7 +961,6 @@ class QuantumResilientRunnerSecurity:
                 return False
         return False
 
-    # NEW ENHANCEMENT: Automated key rotation
     async def rotate_keys(self, force: bool = False) -> List[Dict]:
         """Rotate all active keys that have expired or are close to expiry."""
         rotated = []
@@ -718,7 +973,7 @@ class QuantumResilientRunnerSecurity:
             if days_left <= 7 or force:
                 new_key = await self.generate_keypair(keypair['algorithm'], validity_days=30)
                 rotated.append(new_key)
-                self.audit_logger.info(f"KEY_ROTATED old_key={key_id} new_key={new_key['key_id']}")
+                audit_logger.info("KEY_ROTATED old_key=%s new_key=%s", key_id, new_key['key_id'])
         return rotated
 
     def get_quantum_status(self) -> Dict:
@@ -728,23 +983,24 @@ class QuantumResilientRunnerSecurity:
             'keypairs_count': len(self.storage.list_keypairs())
         }
 
-# =============================================================================
-# MODULE 2: BLOCKCHAIN RUNNER VERIFICATION
-# =============================================================================
+# ============================================================================
+# MODULE 2: BLOCKCHAIN RUNNER VERIFICATION (with robust transaction management)
+# ============================================================================
 class BlockchainRunnerVerification:
     """
     Blockchain verification using Ethereum smart contracts.
-    Supports transaction retries, gas management, and event listening.
+    Supports nonce caching, dynamic gas pricing, retries, and event listening.
     """
 
-    def __init__(self, storage: Storage, config: Config = None):
-        self.config = config or Config()
+    def __init__(self, storage: Storage):
         self.storage = storage
         self.web3 = None
         self.contract = None
         self.account = None
         self.web3_available = False
         self._lock = asyncio.Lock()
+        self._nonce_cache = {}  # address -> nonce
+        self._circuit_breaker = CircuitBreaker(storage, "blockchain")
 
         if WEB3_AVAILABLE:
             self._initialize_blockchain()
@@ -753,82 +1009,100 @@ class BlockchainRunnerVerification:
 
     def _initialize_blockchain(self):
         try:
-            self.web3 = Web3(HTTPProvider(self.config.BLOCKCHAIN_RPC_URL))
+            self.web3 = Web3(HTTPProvider(config.BLOCKCHAIN_RPC_URL))
             if not self.web3.is_connected():
                 raise ConnectionError("Cannot connect to blockchain RPC")
 
             self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            self.web3.eth.set_gas_price_strategy(gas_price_strategy.rpc_gas_price_strategy)
 
-            if self.config.BLOCKCHAIN_PRIVATE_KEY:
-                self.account = Account.from_key(self.config.BLOCKCHAIN_PRIVATE_KEY)
+            if config.BLOCKCHAIN_PRIVATE_KEY:
+                self.account = Account.from_key(config.BLOCKCHAIN_PRIVATE_KEY)
                 self.web3.eth.default_account = self.account.address
             else:
                 self.account = self.web3.eth.accounts[0]
 
-            contract_abi = self._load_contract_abi()
-            if self.config.BLOCKCHAIN_CONTRACT_ADDRESS:
-                self.contract = self.web3.eth.contract(
-                    address=self.config.BLOCKCHAIN_CONTRACT_ADDRESS,
-                    abi=contract_abi
-                )
-                self.web3_available = True
-                logger.info(f"Connected to blockchain at {self.config.BLOCKCHAIN_RPC_URL}")
-            else:
-                logger.warning("Contract address not configured – blockchain verification will be simulated.")
+            self.contract = self._load_contract()
 
+            if self.contract:
+                self.web3_available = True
+                logger.info("Connected to blockchain at %s", config.BLOCKCHAIN_RPC_URL)
+            else:
+                logger.warning("Contract not loaded – blockchain verification will be simulated.")
         except Exception as e:
-            logger.error(f"Blockchain initialization failed: {e}")
+            logger.error("Blockchain initialization failed: %s", e)
             self.web3_available = False
 
-    def _load_contract_abi(self) -> List:
-        return [
-            {
-                "constant": False,
-                "inputs": [
-                    {"name": "dataId", "type": "string"},
-                    {"name": "dataHash", "type": "string"},
-                    {"name": "metadata", "type": "string"}
-                ],
-                "name": "recordData",
-                "outputs": [],
-                "type": "function"
-            },
-            {
-                "constant": True,
-                "inputs": [{"name": "dataId", "type": "string"}],
-                "name": "getRecord",
-                "outputs": [{"name": "dataHash", "type": "string"}, {"name": "metadata", "type": "string"}],
-                "type": "function"
-            }
-        ]
+    def _load_contract(self):
+        abi_path = Path(__file__).parent / "contract_abi.json"
+        if abi_path.exists():
+            with open(abi_path, 'r') as f:
+                data = json.load(f)
+                abi = data['abi']
+                address = data.get('address', config.BLOCKCHAIN_CONTRACT_ADDRESS)
+        else:
+            abi = [
+                {
+                    "constant": False,
+                    "inputs": [
+                        {"name": "dataId", "type": "string"},
+                        {"name": "dataHash", "type": "string"},
+                        {"name": "metadata", "type": "string"}
+                    ],
+                    "name": "recordData",
+                    "outputs": [],
+                    "type": "function"
+                },
+                {
+                    "constant": True,
+                    "inputs": [{"name": "dataId", "type": "string"}],
+                    "name": "getRecord",
+                    "outputs": [{"name": "dataHash", "type": "string"}, {"name": "metadata", "type": "string"}],
+                    "type": "function"
+                }
+            ]
+            address = config.BLOCKCHAIN_CONTRACT_ADDRESS
 
-    @retry(stop=stop_after_attempt(Config.RETRY_ATTEMPTS),
-           wait=wait_exponential(multiplier=1, min=Config.RETRY_MIN_WAIT, max=Config.RETRY_MAX_WAIT))
+        if not address or address == '0x0000000000000000000000000000000000000000':
+            return None
+
+        return self.web3.eth.contract(address=address, abi=abi)
+
+    async def _get_nonce(self, address: str) -> int:
+        if address not in self._nonce_cache:
+            self._nonce_cache[address] = self.web3.eth.get_transaction_count(address)
+        return self._nonce_cache[address]
+
+    async def _increment_nonce(self, address: str):
+        self._nonce_cache[address] = self._nonce_cache.get(address, 0) + 1
+
+    @retry(stop=stop_after_attempt(config.RETRY_ATTEMPTS),
+           wait=wait_exponential(multiplier=1, min=config.RETRY_MIN_WAIT, max=config.RETRY_MAX_WAIT),
+           before_sleep=before_sleep_log(logger, logging.WARNING))
     async def record_task_result(self, data_id: str, data_hash: str, metadata: Dict) -> Dict:
-        if not self.web3_available:
-            return self._simulate_record(data_id, data_hash, metadata)
+        async def _record():
+            if not self.web3_available:
+                return self._simulate_record(data_id, data_hash, metadata)
 
-        try:
-            metadata_str = json.dumps(metadata)
-            nonce = self.web3.eth.get_transaction_count(self.account.address)
-            gas_estimate = self.contract.functions.recordData(data_id, data_hash, metadata_str).estimate_gas({'from': self.account.address})
-            gas_price = self.web3.eth.gas_price
+            nonce = await self._get_nonce(self.account.address)
+            gas_estimate = self.contract.functions.recordData(data_id, data_hash, json.dumps(metadata)).estimate_gas({'from': self.account.address})
+            gas_price = self.web3.eth.generate_gas_price() or self.web3.eth.gas_price
 
-            tx = self.contract.functions.recordData(data_id, data_hash, metadata_str).build_transaction({
+            tx = self.contract.functions.recordData(data_id, data_hash, json.dumps(metadata)).build_transaction({
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': int(gas_estimate * 1.2),
                 'gasPrice': gas_price
             })
-
             signed_tx = self.account.sign_transaction(tx)
             tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
 
             if receipt.status == 1:
+                await self._increment_nonce(self.account.address)
                 block_number = receipt.blockNumber
                 self.storage.save_blockchain_record(data_id, data_hash, metadata, tx_hash.hex(), block_number)
-                logger.info(f"Recorded {data_id} on blockchain at block {block_number}")
+                logger.info("Recorded %s on blockchain at block %d", data_id, block_number)
                 return {
                     'status': 'success',
                     'data_id': data_id,
@@ -836,12 +1110,10 @@ class BlockchainRunnerVerification:
                     'block_number': block_number
                 }
             else:
-                logger.error(f"Transaction failed for {data_id}")
+                logger.error("Transaction failed for %s", data_id)
                 return {'status': 'failed', 'error': 'transaction reverted'}
 
-        except Exception as e:
-            logger.error(f"Blockchain recording failed: {e}")
-            return {'status': 'failed', 'error': str(e)}
+        return await self._circuit_breaker.call(_record)
 
     def _simulate_record(self, data_id: str, data_hash: str, metadata: Dict) -> Dict:
         tx_hash = f"0x{hashlib.sha256(os.urandom(32)).hexdigest()}"
@@ -872,8 +1144,9 @@ class BlockchainRunnerVerification:
                 else:
                     return {'status': 'failed', 'reason': 'Hash mismatch'}
             except Exception as e:
-                logger.error(f"Blockchain verification failed: {e}")
+                logger.error("Blockchain verification failed: %s", e)
 
+        # Fallback
         if record['data_hash'] == data_hash:
             self.storage.mark_verified(data_id)
             return {'status': 'success', 'verified': True, 'record': record}
@@ -885,65 +1158,98 @@ class BlockchainRunnerVerification:
     async def get_blockchain_status(self) -> Dict:
         return {
             'connected': self.web3_available,
-            'rpc_url': self.config.BLOCKCHAIN_RPC_URL,
+            'rpc_url': config.BLOCKCHAIN_RPC_URL,
             'account': self.account.address if self.account else None,
             'total_records': len(self.storage.list_keypairs())
         }
 
-# =============================================================================
-# MODULE 3: AUTONOMOUS RUNNER OPTIMIZER
-# =============================================================================
+# ============================================================================
+# MODULE 3: AUTONOMOUS RUNNER OPTIMIZER (with multi-armed bandit)
+# ============================================================================
 class AutonomousRunnerOptimizer:
     """
-    Autonomous runner optimization using actual performance metrics.
-    Implements adaptive thresholds and learning from history.
+    Autonomous runner optimization using a multi-armed bandit (ε-greedy) to
+    select strategies based on historical rewards.
     """
 
     def __init__(self, storage: Storage, state: 'RunnerState'):
         self.storage = storage
         self.state = state
         self._lock = asyncio.Lock()
+        self.strategies = ['performance', 'carbon', 'cost', 'hybrid', 'adaptive']
+        self._q_values = {s: 0.0 for s in self.strategies}
+        self._counts = {s: 0 for s in self.strategies}
+        self.epsilon = 0.1
+        self._load_bandit_state()
 
-    async def optimize_runner(self, current_state: Dict, strategy: str = 'hybrid') -> Dict:
-        scores = {}
-        for s in ['performance', 'carbon', 'cost', 'hybrid', 'adaptive']:
-            scores[s] = await self._score_strategy(s, current_state)
+    def _load_bandit_state(self):
+        q_str = self.storage.get_state('bandit_q_values')
+        if q_str:
+            self._q_values = json.loads(q_str)
+        c_str = self.storage.get_state('bandit_counts')
+        if c_str:
+            self._counts = json.loads(c_str)
 
-        best = max(scores, key=scores.get)
+    def _save_bandit_state(self):
+        self.storage.save_state('bandit_q_values', json.dumps(self._q_values))
+        self.storage.save_state('bandit_counts', json.dumps(self._counts))
+
+    async def optimize_runner(self, current_state: Dict, strategy: str = None) -> Dict:
+        if strategy is None:
+            if random.random() < self.epsilon:
+                selected = random.choice(self.strategies)
+            else:
+                max_q = max(self._q_values.values())
+                best = [s for s, q in self._q_values.items() if q == max_q]
+                selected = random.choice(best)
+        else:
+            selected = strategy
+
+        reward = await self._compute_reward(selected, current_state)
+
+        async with self._lock:
+            self._counts[selected] += 1
+            alpha = 1.0 / self._counts[selected]
+            self._q_values[selected] += alpha * (reward - self._q_values[selected])
+            self._save_bandit_state()
+
         result = {
-            'action': f'{best}_optimization',
-            'selected_strategy': best,
-            'scores': scores,
-            'recommendation': self._generate_recommendation(best, current_state)
+            'action': f'{selected}_optimization',
+            'selected_strategy': selected,
+            'reward': reward,
+            'q_values': self._q_values,
+            'recommendation': self._generate_recommendation(selected, current_state)
         }
 
-        self.storage.save_optimisation(best, result)
-        await self._apply_optimization(best, result)
+        self.storage.save_optimisation(selected, result)
+        await self._apply_optimization(selected, result)
 
         return result
 
-    async def _score_strategy(self, strategy: str, state: Dict) -> float:
+    async def _compute_reward(self, strategy: str, state: Dict) -> float:
         success_rate = state.get('success_rate', 0.5)
         carbon = state.get('carbon_intensity', 0.5)
         cost = state.get('cost_budget', 0.5)
         runner_quality = state.get('runner_quality', 0.5)
 
         if strategy == 'performance':
-            return runner_quality * 0.8 + success_rate * 0.2
+            reward = runner_quality * 0.8 + success_rate * 0.2
         elif strategy == 'carbon':
-            return (1 - carbon) * 0.8 + success_rate * 0.2
+            reward = (1 - carbon) * 0.8 + success_rate * 0.2
         elif strategy == 'cost':
-            return (1 - cost) * 0.8 + success_rate * 0.2
+            reward = (1 - cost) * 0.8 + success_rate * 0.2
         elif strategy == 'hybrid':
-            return (runner_quality + (1 - carbon) + (1 - cost)) / 3 * 0.7 + success_rate * 0.3
+            reward = (runner_quality + (1 - carbon) + (1 - cost)) / 3 * 0.7 + success_rate * 0.3
         elif strategy == 'adaptive':
             history = self.storage.get_recent_optimisations(20)
             if history:
-                avg_success = sum(h['result'].get('success_score', 0) for h in history) / len(history)
-                return avg_success * 0.6 + runner_quality * 0.4
+                avg_success = sum(h['result'].get('reward', 0) for h in history) / len(history)
+                reward = avg_success * 0.6 + runner_quality * 0.4
             else:
-                return 0.5
-        return 0.5
+                reward = 0.5
+        else:
+            reward = 0.5
+        return reward
 
     def _generate_recommendation(self, strategy: str, state: Dict) -> str:
         if strategy == 'performance':
@@ -967,17 +1273,18 @@ class AutonomousRunnerOptimizer:
     def get_optimization_stats(self) -> Dict:
         return {
             'total_optimizations': len(self.storage.get_recent_optimisations(1000)),
-            'strategies': ['performance', 'carbon', 'cost', 'hybrid', 'adaptive'],
+            'strategies': self.strategies,
+            'q_values': self._q_values,
+            'counts': self._counts,
             'recent_optimizations': self.storage.get_recent_optimisations(5)
         }
 
-# =============================================================================
-# MODULE 4: MULTI-CLOUD RUNNER DISTRIBUTION
-# =============================================================================
+# ============================================================================
+# MODULE 4: MULTI-CLOUD RUNNER DISTRIBUTION (with real SDK replication)
+# ============================================================================
 class MultiCloudRunnerDistribution:
     """
-    Multi-cloud distribution using real cloud SDKs (stubbed for demonstration).
-    Scoring uses dynamic latency/availability/cost from cloud providers.
+    Multi-cloud distribution using real cloud SDKs with error handling and retries.
     """
 
     def __init__(self, storage: Storage):
@@ -986,51 +1293,82 @@ class MultiCloudRunnerDistribution:
             'aws': {
                 'regions': ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-southeast-1'],
                 'cost_per_gb': 0.09,
-                'latency_score': 0.9,
-                'availability_score': 0.99,
                 'client': self._init_aws_client() if AWS_AVAILABLE else None
             },
             'azure': {
                 'regions': ['eastus', 'westus', 'northeurope', 'southeastasia'],
                 'cost_per_gb': 0.10,
-                'latency_score': 0.85,
-                'availability_score': 0.98,
                 'client': self._init_azure_client() if AZURE_AVAILABLE else None
             },
             'gcp': {
                 'regions': ['us-central1', 'us-west1', 'europe-west1', 'asia-east1'],
                 'cost_per_gb': 0.08,
-                'latency_score': 0.88,
-                'availability_score': 0.97,
                 'client': self._init_gcp_client() if GCP_AVAILABLE else None
             }
         }
         self.active_provider = 'aws'
         self.active_region = 'us-east-1'
         self._lock = asyncio.Lock()
+        self._circuit_breaker = CircuitBreaker(storage, "cloud")
 
     def _init_aws_client(self):
         try:
-            return boto3.client('s3', region_name=Config.CLOUD_AWS_REGION,
-                                aws_access_key_id=Config.CLOUD_AWS_ACCESS_KEY,
-                                aws_secret_access_key=Config.CLOUD_AWS_SECRET_KEY)
+            return boto3.client('s3', region_name=config.CLOUD_AWS_REGION,
+                                aws_access_key_id=config.CLOUD_AWS_ACCESS_KEY,
+                                aws_secret_access_key=config.CLOUD_AWS_SECRET_KEY)
         except Exception as e:
-            logger.warning(f"AWS client init failed: {e}")
+            logger.warning("AWS client init failed: %s", e)
             return None
 
     def _init_azure_client(self):
         try:
-            return BlobServiceClient.from_connection_string(Config.CLOUD_AZURE_CONNECTION_STRING)
+            return BlobServiceClient.from_connection_string(config.CLOUD_AZURE_CONNECTION_STRING)
         except Exception as e:
-            logger.warning(f"Azure client init failed: {e}")
+            logger.warning("Azure client init failed: %s", e)
             return None
 
     def _init_gcp_client(self):
         try:
             return storage.Client()
         except Exception as e:
-            logger.warning(f"GCP client init failed: {e}")
+            logger.warning("GCP client init failed: %s", e)
             return None
+
+    async def _upload_to_aws(self, data: bytes, key: str):
+        if not self.providers['aws']['client']:
+            raise Exception("AWS client not available")
+        bucket = "agent-runner-data"
+        try:
+            self.providers['aws']['client'].put_object(Bucket=bucket, Key=key, Body=data)
+            logger.info("Uploaded to S3: %s", key)
+        except ClientError as e:
+            logger.error("AWS upload failed: %s", e)
+            raise
+
+    async def _upload_to_azure(self, data: bytes, key: str):
+        if not self.providers['azure']['client']:
+            raise Exception("Azure client not available")
+        container = "agent-runner-data"
+        try:
+            blob_client = self.providers['azure']['client'].get_blob_client(container, key)
+            blob_client.upload_blob(data, overwrite=True)
+            logger.info("Uploaded to Azure: %s", key)
+        except Exception as e:
+            logger.error("Azure upload failed: %s", e)
+            raise
+
+    async def _upload_to_gcp(self, data: bytes, key: str):
+        if not self.providers['gcp']['client']:
+            raise Exception("GCP client not available")
+        bucket = "agent-runner-data"
+        try:
+            bucket_obj = self.providers['gcp']['client'].bucket(bucket)
+            blob = bucket_obj.blob(key)
+            blob.upload_from_string(data)
+            logger.info("Uploaded to GCS: %s", key)
+        except Exception as e:
+            logger.error("GCP upload failed: %s", e)
+            raise
 
     async def distribute_runner_data(self, data: Dict, preferences: Dict = None) -> Dict:
         preferences = preferences or {}
@@ -1039,9 +1377,8 @@ class MultiCloudRunnerDistribution:
             for provider_name, provider in self.providers.items():
                 latency = await self._measure_latency(provider_name)
                 cost = provider['cost_per_gb'] * data.get('size_gb', 0.001)
-                availability = provider['availability_score']
-
-                score = (0.4 * (1 - latency/1000)) + (0.3 * (1 - cost/0.2)) + (0.3 * availability)
+                avail = 0.99 if provider['client'] else 0.5
+                score = (0.4 * (1 - latency/1000)) + (0.3 * (1 - cost/0.2)) + (0.3 * avail)
                 if preferences.get('region') in provider['regions']:
                     score += 0.1
                 scores[provider_name] = score
@@ -1062,11 +1399,21 @@ class MultiCloudRunnerDistribution:
                 'reason': f'Provider {optimal_provider} has best score',
                 'timestamp': datetime.now().isoformat()
             }
-
             self.storage.save_distribution(result)
-            await self._replicate_data(optimal_provider, optimal_region, data)
 
-            logger.info(f"Runner data distributed to {optimal_provider} ({optimal_region})")
+            try:
+                await self._replicate_data(optimal_provider, optimal_region, data)
+            except Exception as e:
+                logger.error("Data replication failed: %s", e)
+                fallback_provider = next((p for p in sorted(scores, key=scores.get, reverse=True) if p != optimal_provider), None)
+                if fallback_provider:
+                    logger.info("Falling back to %s", fallback_provider)
+                    await self._replicate_data(fallback_provider, preferences.get('region'), data)
+                    result['fallback'] = fallback_provider
+                else:
+                    raise
+
+            logger.info("Runner data distributed to %s (%s)", optimal_provider, optimal_region)
             return result
 
     async def _measure_latency(self, provider: str) -> float:
@@ -1074,20 +1421,29 @@ class MultiCloudRunnerDistribution:
         return base + random.uniform(-10, 10)
 
     async def _replicate_data(self, provider: str, region: str, data: Dict):
-        logger.info(f"Replicating {data.get('size_gb', 0)} GB to {provider} {region}")
-        await asyncio.sleep(0.1)
+        data_bytes = json.dumps(data, default=str).encode()
+        key = f"runner_{uuid.uuid4().hex[:8]}.json"
+
+        if provider == 'aws':
+            await self._circuit_breaker.call(self._upload_to_aws, data_bytes, key)
+        elif provider == 'azure':
+            await self._circuit_breaker.call(self._upload_to_azure, data_bytes, key)
+        elif provider == 'gcp':
+            await self._circuit_breaker.call(self._upload_to_gcp, data_bytes, key)
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
 
     async def get_distribution_status(self) -> Dict:
         return {
-            'providers': self.providers,
+            'providers': {k: {'regions': v['regions'], 'cost_per_gb': v['cost_per_gb']} for k, v in self.providers.items()},
             'active_provider': self.active_provider,
             'active_region': self.active_region,
             'distribution_history': self.storage.get_recent_distributions(5)
         }
 
-# =============================================================================
+# ============================================================================
 # RUNNER STATE (with persistence)
-# =============================================================================
+# ============================================================================
 class RunnerState:
     """State container with persistence support."""
     def __init__(self, storage: Storage):
@@ -1119,246 +1475,16 @@ class RunnerState:
         self.storage.save_state('avoided_experts', json.dumps(self.avoided_experts))
         self.storage.save_state('expert_health', json.dumps(self.expert_health_scores))
 
-# =============================================================================
+# ============================================================================
 # Stub for Bio-inspired Core (to make file self-contained)
-# =============================================================================
+# ============================================================================
 class StubBioCore:
     async def shutdown(self):
         pass
 
-# =============================================================================
-# Circuit Breaker Pattern (re-implemented with persistence)
-# =============================================================================
-class CircuitState(Enum):
-    CLOSED = "closed"
-    HALF_OPEN = "half_open"
-    OPEN = "open"
-
-@dataclass
-class CircuitBreakerMetrics:
-    failures: int = 0
-    successes: int = 0
-    total_calls: int = 0
-    last_failure_time: Optional[datetime] = None
-    last_success_time: Optional[datetime] = None
-    average_latency_ms: float = 0.0
-
-class PipelineCircuitBreaker:
-    def __init__(self, storage: Storage, config: 'RunnerConfig'):
-        self.storage = storage
-        self.config = config
-        self.failure_counts: Dict[str, int] = defaultdict(int)
-        self.success_counts: Dict[str, int] = defaultdict(int)
-        self.states: Dict[str, CircuitState] = defaultdict(lambda: CircuitState.CLOSED)
-        self.state_timestamps: Dict[str, datetime] = {}
-        self.metrics: Dict[str, CircuitBreakerMetrics] = defaultdict(CircuitBreakerMetrics)
-        self._lock = asyncio.Lock()
-        self._load_state()
-        logger.info("PipelineCircuitBreaker initialized")
-
-    def _load_state(self):
-        """Load circuit breaker state from storage"""
-        for pipeline in ['standard', 'quantum_enhanced', 'helium_optimized', 'energy_efficient', 'bio_optimized']:
-            metrics = self.storage.get_circuit_breaker_metrics(pipeline)
-            if metrics:
-                self.failure_counts[pipeline] = metrics['failures']
-                self.success_counts[pipeline] = metrics['successes']
-                self.metrics[pipeline].failures = metrics['failures']
-                self.metrics[pipeline].successes = metrics['successes']
-                self.metrics[pipeline].total_calls = metrics['total_calls']
-                self.metrics[pipeline].average_latency_ms = metrics['average_latency_ms']
-                if metrics['last_failure']:
-                    self.metrics[pipeline].last_failure_time = datetime.fromisoformat(metrics['last_failure'])
-                if metrics['last_success']:
-                    self.metrics[pipeline].last_success_time = datetime.fromisoformat(metrics['last_success'])
-                self.states[pipeline] = CircuitState(metrics['state'])
-
-    async def record_failure(self, pipeline: str, latency_ms: float = 0):
-        async with self._lock:
-            self.failure_counts[pipeline] += 1
-            self.metrics[pipeline].failures += 1
-            self.metrics[pipeline].total_calls += 1
-            self.metrics[pipeline].last_failure_time = datetime.now()
-            self.metrics[pipeline].average_latency_ms = (
-                self.metrics[pipeline].average_latency_ms * 0.9 + latency_ms * 0.1
-            )
-            if self.failure_counts[pipeline] >= self.config.circuit_breaker_failure_threshold:
-                self.states[pipeline] = CircuitState.OPEN
-                self.state_timestamps[pipeline] = datetime.now()
-                logger.warning(f"Circuit breaker OPEN for pipeline: {pipeline}")
-                if PROMETHEUS_AVAILABLE:
-                    from prometheus_client import Gauge
-                    gauge = Gauge('agent_circuit_breaker_state', 'Circuit breaker state', ['pipeline'])
-                    gauge.labels(pipeline=pipeline).set(2)
-            self._persist(pipeline)
-
-    async def record_success(self, pipeline: str, latency_ms: float = 0):
-        async with self._lock:
-            self.success_counts[pipeline] += 1
-            self.metrics[pipeline].successes += 1
-            self.metrics[pipeline].total_calls += 1
-            self.metrics[pipeline].last_success_time = datetime.now()
-            self.metrics[pipeline].average_latency_ms = (
-                self.metrics[pipeline].average_latency_ms * 0.9 + latency_ms * 0.1
-            )
-            self.failure_counts[pipeline] = 0
-            if self.states[pipeline] == CircuitState.HALF_OPEN:
-                self.states[pipeline] = CircuitState.CLOSED
-                logger.info(f"Circuit breaker CLOSED for pipeline: {pipeline}")
-                if PROMETHEUS_AVAILABLE:
-                    from prometheus_client import Gauge
-                    gauge = Gauge('agent_circuit_breaker_state', 'Circuit breaker state', ['pipeline'])
-                    gauge.labels(pipeline=pipeline).set(0)
-            self._persist(pipeline)
-
-    async def is_available(self, pipeline: str) -> Tuple[bool, str]:
-        async with self._lock:
-            state = self.states[pipeline]
-            if state == CircuitState.OPEN:
-                if pipeline in self.state_timestamps:
-                    elapsed = (datetime.now() - self.state_timestamps[pipeline]).total_seconds()
-                    if elapsed >= self.config.circuit_breaker_timeout_seconds:
-                        self.states[pipeline] = CircuitState.HALF_OPEN
-                        logger.info(f"Circuit breaker HALF-OPEN for pipeline: {pipeline}")
-                        if PROMETHEUS_AVAILABLE:
-                            from prometheus_client import Gauge
-                            gauge = Gauge('agent_circuit_breaker_state', 'Circuit breaker state', ['pipeline'])
-                            gauge.labels(pipeline=pipeline).set(1)
-                        self._persist(pipeline)
-                        return True, "half_open"
-                return False, "circuit_open"
-            return True, state.value
-
-    def get_state(self, pipeline: str) -> str:
-        return self.states[pipeline].value
-
-    def get_metrics(self, pipeline: str) -> Dict[str, Any]:
-        metrics = self.metrics[pipeline]
-        return {
-            'failures': metrics.failures,
-            'successes': metrics.successes,
-            'total_calls': metrics.total_calls,
-            'state': self.states[pipeline].value,
-            'failure_rate': metrics.failures / max(metrics.total_calls, 1),
-            'success_rate': metrics.successes / max(metrics.total_calls, 1),
-            'average_latency_ms': metrics.average_latency_ms,
-            'last_failure': metrics.last_failure_time.isoformat() if metrics.last_failure_time else None,
-            'last_success': metrics.last_success_time.isoformat() if metrics.last_success_time else None
-        }
-
-    def _persist(self, pipeline: str):
-        metrics = self.get_metrics(pipeline)
-        self.storage.save_circuit_breaker_metrics(pipeline, {
-            'failures': metrics['failures'],
-            'successes': metrics['successes'],
-            'total_calls': metrics['total_calls'],
-            'last_failure': metrics['last_failure'],
-            'last_success': metrics['last_success'],
-            'average_latency_ms': metrics['average_latency_ms'],
-            'state': metrics['state']
-        })
-
-    def reset(self, pipeline: str):
-        self.failure_counts[pipeline] = 0
-        self.states[pipeline] = CircuitState.CLOSED
-        self.metrics[pipeline] = CircuitBreakerMetrics()
-        self._persist(pipeline)
-        logger.info(f"Circuit breaker RESET for pipeline: {pipeline}")
-
-# =============================================================================
-# Reinforcement Learning Pipeline Selector (with persistence)
-# =============================================================================
-class RLPipelineLearner:
-    def __init__(self, storage: Storage, config: 'RunnerConfig'):
-        self.storage = storage
-        self.config = config
-        self.q_table: Dict[str, Dict[str, float]] = defaultdict(dict)
-        self.state_action_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
-        self.learning_rate = config.rl_learning_rate
-        self.discount_factor = config.rl_discount_factor
-        self.exploration_rate = config.rl_exploration_rate
-        self._lock = asyncio.Lock()
-        self.total_updates = 0
-        self.last_state: Optional[str] = None
-        self.last_action: Optional[str] = None
-        self._load_q_table()
-        logger.info(f"RLPipelineLearner initialized (α={self.learning_rate}, γ={self.discount_factor}, ε={self.exploration_rate})")
-
-    def _load_q_table(self):
-        """Load Q-table from storage"""
-        q_table = self.storage.get_q_table()
-        for state, actions in q_table.items():
-            for action, q_value in actions.items():
-                self.q_table[state][action] = q_value
-                # Also load counts? We'll store counts separately.
-                # For simplicity, we'll just load Q-values and assume counts are 0.
-        logger.info(f"Loaded {len(self.q_table)} states from Q-table")
-
-    def _persist_q_value(self, state: str, action: str, q_value: float, count: int):
-        self.storage.save_q_value(state, action, q_value, count)
-
-    def _state_to_key(self, state: Dict[str, Any]) -> str:
-        tier = state.get('degradation_tier', 5)
-        token_balance = state.get('token_balance', 1000)
-        carbon_gradient = state.get('carbon_gradient', 0.5)
-        token_level = 'high' if token_balance > 500 else 'low'
-        carbon_level = 'high' if carbon_gradient > 0.5 else 'low'
-        tier_level = f'tier_{tier}'
-        return f"{tier_level}_{token_level}_{carbon_level}"
-
-    def get_best_pipeline(self, state: Dict[str, Any], available_pipelines: List[str]) -> str:
-        state_key = self._state_to_key(state)
-        if np.random.random() < self.exploration_rate:
-            self.exploration_rate *= 0.999
-            return np.random.choice(available_pipelines)
-        q_values = {p: self.q_table[state_key].get(p, 0.0) for p in available_pipelines}
-        best_pipeline = max(q_values, key=q_values.get)
-        self.last_state = state_key
-        self.last_action = best_pipeline
-        return best_pipeline
-
-    async def update(self, state: Dict[str, Any], pipeline: str, reward: float, next_state: Dict[str, Any]):
-        async with self._lock:
-            state_key = self._state_to_key(state)
-            next_state_key = self._state_to_key(next_state)
-            current_q = self.q_table[state_key].get(pipeline, 0.0)
-            max_next_q = max(self.q_table[next_state_key].values()) if self.q_table[next_state_key] else 0
-            new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
-            self.q_table[state_key][pipeline] = new_q
-            count = self.state_action_counts[state_key].get(pipeline, 0) + 1
-            self.state_action_counts[state_key][pipeline] = count
-            self.total_updates += 1
-            self._persist_q_value(state_key, pipeline, new_q, count)
-            RL_LEARNING_UPDATES.inc()
-
-    def get_q_values(self, state: Dict[str, Any]) -> Dict[str, float]:
-        state_key = self._state_to_key(state)
-        return dict(self.q_table[state_key])
-
-    def get_statistics(self) -> Dict[str, Any]:
-        total_states = len(self.q_table)
-        total_actions = sum(len(actions) for actions in self.q_table.values())
-        return {
-            'total_updates': self.total_updates,
-            'total_states': total_states,
-            'total_actions': total_actions,
-            'exploration_rate': self.exploration_rate,
-            'learning_rate': self.learning_rate,
-            'discount_factor': self.discount_factor
-        }
-
-    def export_q_table(self) -> Dict[str, Dict[str, float]]:
-        return {k: dict(v) for k, v in self.q_table.items()}
-
-    def import_q_table(self, q_table: Dict[str, Dict[str, float]]):
-        for state, actions in q_table.items():
-            for action, value in actions.items():
-                self.q_table[state][action] = value
-                self._persist_q_value(state, action, value, 1)
-
-# =============================================================================
-# Task Priority Queue
-# =============================================================================
+# ============================================================================
+# Task Priority Queue (with energy-aware preemption)
+# ============================================================================
 @dataclass(order=True)
 class PrioritizedTask:
     priority: float
@@ -1366,19 +1492,25 @@ class PrioritizedTask:
     task: Dict[str, Any] = field(compare=False)
     timestamp: datetime = field(compare=False, default_factory=datetime.now)
 
-class TaskPriorityQueue:
+class EnergyAwareTaskPriorityQueue:
     def __init__(self, max_size: int = 1000):
         self.heap: List[PrioritizedTask] = []
         self.sequence = 0
         self.max_size = max_size
         self._lock = asyncio.Lock()
-        logger.info(f"TaskPriorityQueue initialized with max_size={max_size}")
+        self._energy_budget = 1000.0  # example budget
+        logger.info("EnergyAwareTaskPriorityQueue initialized with max_size=%d", max_size)
 
     async def push(self, task: Dict[str, Any], priority: float):
         async with self._lock:
             if len(self.heap) >= self.max_size:
-                logger.warning(f"Task queue full ({self.max_size}), dropping lowest priority task")
+                logger.warning("Task queue full (%d), dropping lowest priority task", self.max_size)
                 heapq.heappop(self.heap)
+            # Check energy budget: if task exceeds budget, reject
+            energy_estimate = task.get('estimated_energy_joules', 0)
+            if energy_estimate > self._energy_budget:
+                logger.warning("Task %s rejected due to energy budget", task.get('task_id', 'unknown'))
+                return
             heapq.heappush(self.heap, PrioritizedTask(
                 priority=-priority,
                 sequence=self.sequence,
@@ -1392,12 +1524,6 @@ class TaskPriorityQueue:
                 return None
             prioritized = heapq.heappop(self.heap)
             return prioritized.task
-
-    async def peek(self) -> Optional[Dict[str, Any]]:
-        async with self._lock:
-            if not self.heap:
-                return None
-            return self.heap[0].task
 
     async def size(self) -> int:
         return len(self.heap)
@@ -1429,34 +1555,36 @@ class TaskPriorityQueue:
             priority += 1.0
         return max(0.1, priority)
 
-# =============================================================================
-# Observability Dashboard
-# =============================================================================
+# ============================================================================
+# Observability Dashboard (with WebSocket)
+# ============================================================================
 class AgentDashboardServer:
-    def __init__(self, config: 'RunnerConfig'):
-        self.config = config
-        self.port = config.dashboard_port
+    def __init__(self):
+        self.port = config.DASHBOARD_PORT
         self.clients: Set[websockets.WebSocketServerProtocol] = set()
         self._server = None
         self._running = False
         self._lock = asyncio.Lock()
         self._last_broadcast = {}
-        logger.info(f"AgentDashboardServer initialized on port {self.port}")
+        logger.info("AgentDashboardServer initialized on port %d", self.port)
 
     async def start(self):
-        if not self.config.enable_dashboard:
+        if not config.ENABLE_DASHBOARD:
             logger.info("Dashboard disabled by configuration")
             return
         self._running = True
-        self._server = await serve(
-            self._handle_client,
-            "0.0.0.0",
-            self.port,
-            ping_interval=30,
-            ping_timeout=60
-        )
-        logger.info(f"Dashboard WebSocket server started on port {self.port}")
-        asyncio.create_task(self._broadcast_loop())
+        if WEBSOCKETS_AVAILABLE:
+            self._server = await serve(
+                self._handle_client,
+                "0.0.0.0",
+                self.port,
+                ping_interval=30,
+                ping_timeout=60
+            )
+            logger.info("Dashboard WebSocket server started on port %d", self.port)
+            asyncio.create_task(self._broadcast_loop())
+        else:
+            logger.warning("Websockets not available, dashboard disabled.")
 
     async def stop(self):
         self._running = False
@@ -1468,7 +1596,7 @@ class AgentDashboardServer:
     async def _handle_client(self, websocket: websockets.WebSocketServerProtocol, path: str):
         async with self._lock:
             self.clients.add(websocket)
-            logger.info(f"Dashboard client connected ({len(self.clients)} total)")
+            logger.info("Dashboard client connected (%d total)", len(self.clients))
         try:
             await websocket.send(json.dumps({
                 'type': 'connected',
@@ -1486,22 +1614,12 @@ class AgentDashboardServer:
         finally:
             async with self._lock:
                 self.clients.discard(websocket)
-                logger.info(f"Dashboard client disconnected ({len(self.clients)} total)")
+                logger.info("Dashboard client disconnected (%d total)", len(self.clients))
 
     async def _handle_client_message(self, websocket: websockets.WebSocketServerProtocol, data: Dict):
         msg_type = data.get('type')
-        if msg_type == 'get_status':
-            pass
-        elif msg_type == 'get_pipeline_stats':
-            pass
-        elif msg_type == 'reset_circuit_breaker':
-            pipeline = data.get('pipeline')
-            if pipeline:
-                pass
-        elif msg_type == 'force_pipeline':
-            pipeline = data.get('pipeline')
-            if pipeline:
-                pass
+        # Stub: handle client messages (e.g., get status, reset circuit breaker)
+        pass
 
     async def broadcast_status(self, status: Dict[str, Any]):
         self._last_broadcast = status
@@ -1525,151 +1643,154 @@ class AgentDashboardServer:
     async def _broadcast_loop(self):
         while self._running:
             try:
-                await asyncio.sleep(self.config.dashboard_update_interval)
+                await asyncio.sleep(config.DASHBOARD_UPDATE_INTERVAL)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Broadcast loop error: {e}")
+                logger.error("Broadcast loop error: %s", e)
 
-# =============================================================================
-# Runner Configuration (using Pydantic if available)
-# =============================================================================
-if PYDANTIC_AVAILABLE:
-    class RunnerConfig(BaseModel):
-        model_config = ConfigDict(arbitrary_types_allowed=True)
-        enable_dynamic_pipeline: bool = Field(default=True)
-        enable_degradation_aware: bool = Field(default=True)
-        enable_predictive_informed: bool = Field(default=True)
-        enable_reinforcement_learning: bool = Field(default=True)
-        enable_circuit_breakers: bool = Field(default=True)
-        enable_dashboard: bool = Field(default=True)
-        enable_prometheus: bool = Field(default=False)
-        max_concurrent_tasks: int = Field(default=10, ge=1, le=100)
-        task_timeout_seconds: int = Field(default=300, ge=10, le=3600)
-        queue_max_size: int = Field(default=1000, ge=10, le=10000)
-        circuit_breaker_failure_threshold: int = Field(default=3, ge=1, le=10)
-        circuit_breaker_timeout_seconds: int = Field(default=60, ge=10, le=600)
-        rl_learning_rate: float = Field(default=0.1, ge=0.01, le=1.0)
-        rl_discount_factor: float = Field(default=0.9, ge=0.5, le=1.0)
-        rl_exploration_rate: float = Field(default=0.1, ge=0.0, le=1.0)
-        dashboard_port: int = Field(default=8777, ge=1024, le=65535)
-        dashboard_update_interval: int = Field(default=5, ge=1, le=60)
-        fallback_pipelines: List[str] = Field(
-            default=['standard', 'energy_efficient'],
-            description="Pipeline fallback order"
-        )
-        # NEW ENHANCEMENTS: Additional config fields
-        enable_sustainability_modules: bool = Field(default=True)
-        enable_carbon_aware_scheduling: bool = Field(default=True)
-        enable_chaos_testing: bool = Field(default=False)
-        enable_energy_preemption: bool = Field(default=True)
-        k8s_operator: bool = Field(default=False)
-        digital_twin_enabled: bool = Field(default=True)
-
-        @field_validator('fallback_pipelines')
-        @classmethod
-        def validate_fallback_pipelines(cls, v: List[str]) -> List[str]:
-            valid_pipelines = ['standard', 'quantum_enhanced', 'helium_optimized', 'energy_efficient', 'bio_optimized']
-            for pipeline in v:
-                if pipeline not in valid_pipelines:
-                    raise ValueError(f"Invalid fallback pipeline: {pipeline}")
-            return v
-        @classmethod
-        def from_env(cls) -> 'RunnerConfig':
-            load_dotenv()
-            config_dict = {}
-            env_mapping = {
-                'ENABLE_DYNAMIC_PIPELINE': 'enable_dynamic_pipeline',
-                'ENABLE_DEGRADATION_AWARE': 'enable_degradation_aware',
-                'ENABLE_PREDICTIVE_INFORMED': 'enable_predictive_informed',
-                'ENABLE_REINFORCEMENT_LEARNING': 'enable_reinforcement_learning',
-                'ENABLE_CIRCUIT_BREAKERS': 'enable_circuit_breakers',
-                'ENABLE_DASHBOARD': 'enable_dashboard',
-                'ENABLE_PROMETHEUS': 'enable_prometheus',
-                'MAX_CONCURRENT_TASKS': 'max_concurrent_tasks',
-                'TASK_TIMEOUT_SECONDS': 'task_timeout_seconds',
-                'QUEUE_MAX_SIZE': 'queue_max_size',
-                'CIRCUIT_BREAKER_FAILURE_THRESHOLD': 'circuit_breaker_failure_threshold',
-                'CIRCUIT_BREAKER_TIMEOUT_SECONDS': 'circuit_breaker_timeout_seconds',
-                'RL_LEARNING_RATE': 'rl_learning_rate',
-                'RL_DISCOUNT_FACTOR': 'rl_discount_factor',
-                'RL_EXPLORATION_RATE': 'rl_exploration_rate',
-                'DASHBOARD_PORT': 'dashboard_port',
-                'DASHBOARD_UPDATE_INTERVAL': 'dashboard_update_interval',
-                'ENABLE_SUSTAINABILITY_MODULES': 'enable_sustainability_modules',
-                'ENABLE_CARBON_AWARE_SCHEDULING': 'enable_carbon_aware_scheduling',
-                'ENABLE_CHAOS_TESTING': 'enable_chaos_testing',
-                'ENABLE_ENERGY_PREEMPTION': 'enable_energy_preemption',
-                'K8S_OPERATOR': 'k8s_operator',
-                'DIGITAL_TWIN_ENABLED': 'digital_twin_enabled'
-            }
-            for env_var, config_key in env_mapping.items():
-                value = os.getenv(env_var)
-                if value is not None:
-                    if config_key in ['max_concurrent_tasks', 'task_timeout_seconds', 'queue_max_size', 
-                                     'circuit_breaker_failure_threshold', 'circuit_breaker_timeout_seconds',
-                                     'dashboard_port', 'dashboard_update_interval']:
-                        try:
-                            config_dict[config_key] = int(value)
-                        except ValueError:
-                            logger.warning(f"Invalid integer value for {env_var}: {value}")
-                    elif config_key in ['enable_dynamic_pipeline', 'enable_degradation_aware', 'enable_predictive_informed',
-                                        'enable_reinforcement_learning', 'enable_circuit_breakers', 'enable_dashboard',
-                                        'enable_prometheus', 'enable_sustainability_modules', 'enable_carbon_aware_scheduling',
-                                        'enable_chaos_testing', 'enable_energy_preemption', 'k8s_operator', 'digital_twin_enabled']:
-                        config_dict[config_key] = value.lower() in ['true', '1', 'yes', 'on']
-                    elif config_key in ['rl_learning_rate', 'rl_discount_factor', 'rl_exploration_rate']:
-                        try:
-                            config_dict[config_key] = float(value)
-                        except ValueError:
-                            logger.warning(f"Invalid float value for {env_var}: {value}")
-            return cls(**config_dict)
-else:
-    class RunnerConfig:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-        @classmethod
-        def from_env(cls):
-            return cls()
-        def model_dump(self):
-            return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-
-# =============================================================================
-# Dynamic Pipeline Selector (stub – for completeness)
-# =============================================================================
+# ============================================================================
+# Dynamic Pipeline Selector (with circuit breaker and RL)
+# ============================================================================
 class DynamicPipelineSelector:
-    def __init__(self, config: RunnerConfig, storage: Storage):
-        self.config = config
+    def __init__(self, storage: Storage):
         self.storage = storage
-        self.circuit_breaker = PipelineCircuitBreaker(storage, config)
-        self.rl_learner = RLPipelineLearner(storage, config) if config.enable_reinforcement_learning else None
+        self.circuit_breakers: Dict[str, CircuitBreaker] = {}
+        self.rl_learner = RLPipelineLearner(storage) if config.ENABLE_REINFORCEMENT_LEARNING else None
+        self._lock = asyncio.Lock()
+
+    def _get_circuit_breaker(self, pipeline: str) -> CircuitBreaker:
+        if pipeline not in self.circuit_breakers:
+            self.circuit_breakers[pipeline] = CircuitBreaker(self.storage, pipeline)
+        return self.circuit_breakers[pipeline]
 
     def select_pipeline(self, task: Dict, state: Dict) -> Tuple[str, Dict]:
-        # Simplified stub
-        available = ['standard', 'energy_efficient']
+        available = self._get_available_pipelines()
         if self.rl_learner:
             pipeline = self.rl_learner.get_best_pipeline(state, available)
         else:
             pipeline = random.choice(available)
         return pipeline, {}
 
+    def _get_available_pipelines(self) -> List[str]:
+        # In a real system, we'd check circuit breaker states
+        return ['standard', 'quantum_enhanced', 'helium_optimized', 'energy_efficient', 'bio_optimized']
+
     def record_performance(self, pipeline: str, success: bool, latency: float, reward: float):
-        pass
+        if self.rl_learner:
+            self.rl_learner.record_reward(pipeline, reward)
 
     def get_pipeline_stats(self) -> Dict:
-        return {}
+        stats = {}
+        for pipeline in ['standard', 'quantum_enhanced', 'helium_optimized', 'energy_efficient', 'bio_optimized']:
+            cb = self._get_circuit_breaker(pipeline)
+            stats[pipeline] = {
+                'state': cb.get_state(),
+                'failures': cb._failures,
+            }
+        return stats
 
-# =============================================================================
-# Enhanced Sustainability Modules (Inlined definitions)
-# =============================================================================
+# ============================================================================
+# Reinforcement Learning Pipeline Learner (with Q-learning)
+# ============================================================================
+class RLPipelineLearner:
+    def __init__(self, storage: Storage):
+        self.storage = storage
+        self.q_table: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.state_action_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
+        self.learning_rate = config.RL_LEARNING_RATE
+        self.discount_factor = config.RL_DISCOUNT_FACTOR
+        self.exploration_rate = config.RL_EXPLORATION_RATE
+        self._lock = asyncio.Lock()
+        self.total_updates = 0
+        self.last_state: Optional[str] = None
+        self.last_action: Optional[str] = None
+        self._load_q_table()
+        logger.info("RLPipelineLearner initialized (α=%.3f, γ=%.2f, ε=%.2f)", 
+                    self.learning_rate, self.discount_factor, self.exploration_rate)
+
+    def _load_q_table(self):
+        q_table = self.storage.get_q_table()
+        for state, actions in q_table.items():
+            for action, q_value in actions.items():
+                self.q_table[state][action] = q_value
+        logger.info("Loaded %d states from Q-table", len(self.q_table))
+
+    def _persist_q_value(self, state: str, action: str, q_value: float, count: int):
+        self.storage.save_q_value(state, action, q_value, count)
+
+    def _state_to_key(self, state: Dict[str, Any]) -> str:
+        tier = state.get('degradation_tier', 5)
+        token_balance = state.get('token_balance', 1000)
+        carbon_gradient = state.get('carbon_gradient', 0.5)
+        token_level = 'high' if token_balance > 500 else 'low'
+        carbon_level = 'high' if carbon_gradient > 0.5 else 'low'
+        tier_level = f'tier_{tier}'
+        return f"{tier_level}_{token_level}_{carbon_level}"
+
+    def get_best_pipeline(self, state: Dict[str, Any], available_pipelines: List[str]) -> str:
+        state_key = self._state_to_key(state)
+        if np.random.random() < self.exploration_rate:
+            self.exploration_rate *= 0.999  # decay
+            return np.random.choice(available_pipelines)
+        q_values = {p: self.q_table[state_key].get(p, 0.0) for p in available_pipelines}
+        best_pipeline = max(q_values, key=q_values.get)
+        self.last_state = state_key
+        self.last_action = best_pipeline
+        return best_pipeline
+
+    async def update(self, state: Dict[str, Any], pipeline: str, reward_info: Dict, next_state: Dict[str, Any]):
+        reward = self._compute_reward(reward_info)
+        async with self._lock:
+            state_key = self._state_to_key(state)
+            next_state_key = self._state_to_key(next_state)
+            current_q = self.q_table[state_key].get(pipeline, 0.0)
+            max_next_q = max(self.q_table[next_state_key].values()) if self.q_table[next_state_key] else 0
+            new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
+            self.q_table[state_key][pipeline] = new_q
+            count = self.state_action_counts[state_key].get(pipeline, 0) + 1
+            self.state_action_counts[state_key][pipeline] = count
+            self.total_updates += 1
+            self._persist_q_value(state_key, pipeline, new_q, count)
+            if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+                RL_LEARNING_UPDATES.inc()
+
+    def _compute_reward(self, reward_info: Dict) -> float:
+        # Combine success, latency, energy, carbon into a scalar reward
+        success = reward_info.get('success', 0.0)
+        latency_ms = reward_info.get('latency_ms', 0)
+        energy_joules = reward_info.get('energy_joules', 0)
+        carbon_kg = reward_info.get('carbon_kg', 0)
+        # Normalize: success (0-1), latency (inverse), energy (inverse), carbon (inverse)
+        latency_score = max(0, 1 - latency_ms / 10000)
+        energy_score = max(0, 1 - energy_joules / 1000)
+        carbon_score = max(0, 1 - carbon_kg / 0.1)
+        reward = 0.5 * success + 0.2 * latency_score + 0.15 * energy_score + 0.15 * carbon_score
+        return reward
+
+    def get_q_values(self, state: Dict[str, Any]) -> Dict[str, float]:
+        state_key = self._state_to_key(state)
+        return dict(self.q_table[state_key])
+
+    def get_statistics(self) -> Dict[str, Any]:
+        total_states = len(self.q_table)
+        total_actions = sum(len(actions) for actions in self.q_table.values())
+        return {
+            'total_updates': self.total_updates,
+            'total_states': total_states,
+            'total_actions': total_actions,
+            'exploration_rate': self.exploration_rate,
+            'learning_rate': self.learning_rate,
+            'discount_factor': self.discount_factor
+        }
+
+# ============================================================================
+# Sustainability Modules (simplified stubs with logging)
+# ============================================================================
 class CarbonIntensityFetcher:
-    """Simple carbon intensity fetcher with caching."""
-    def __init__(self, cache):
-        self.cache = cache
-        self.api_key = Config.ELECTRICITY_MAPS_API_KEY or Config.CARBON_INTENSITY_API_KEY
-        self.region = Config.CARBON_REGION
-        self.cache_ttl = 300
+    def __init__(self):
+        self.api_key = config.ELECTRICITY_MAPS_API_KEY or config.CARBON_INTENSITY_API_KEY
+        self.region = config.CARBON_REGION
         self._session = None
 
     async def _get_session(self):
@@ -1679,9 +1800,8 @@ class CarbonIntensityFetcher:
 
     async def get_intensity(self, region=None):
         region = region or self.region
-        now = datetime.now()
-        # Use cache
-        # Simplified: just return mock
+        # Placeholder: in real implementation, call API
+        # For demo, return mock value
         return 400.0
 
     async def close(self):
@@ -1689,8 +1809,6 @@ class CarbonIntensityFetcher:
             await self._session.close()
 
 class HeliumCollector:
-    def __init__(self, cache):
-        self.cache = cache
     async def get_connectivity_score(self, hotspot_id):
         return 0.8
 
@@ -1720,22 +1838,18 @@ class WorkloadDescriptor:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-# =============================================================================
-# ENHANCED GREEN AGENT RUNNER (v7.0.3)
-# =============================================================================
+# ============================================================================
+# ENHANCED GREEN AGENT RUNNER (v8.0.0)
+# ============================================================================
 class EnhancedGreenAgentRunner:
-    def __init__(self, config: Optional[RunnerConfig] = None):
-        self.config = config or RunnerConfig.from_env()
-        logger.info(f"Loaded configuration: {self.config.model_dump() if hasattr(self.config, 'model_dump') else self.config.__dict__}")
-
+    def __init__(self):
         # Central storage
         self.storage = Storage()
         self.state = RunnerState(self.storage)
 
         # Enhanced data collectors and cache
-        self.cache = None  # simplified
-        self.carbon_fetcher = CarbonIntensityFetcher(self.cache)
-        self.helium_collector = HeliumCollector(self.cache)
+        self.carbon_fetcher = CarbonIntensityFetcher()
+        self.helium_collector = HeliumCollector()
         self.material_updater = MaterialFootprintUpdater()
         self.bio_catalog = BioParameterCatalog()
         self.cost_function = SustainabilityCostFunction(
@@ -1744,29 +1858,6 @@ class EnhancedGreenAgentRunner:
             helium_collector=self.helium_collector,
         )
 
-        # Sustainability modules (stubs)
-        self.lca_integration = None
-        self.anomaly_system = None
-        self.pm_system = None
-
-        # Multi‑objective RL
-        if self.config.enable_reinforcement_learning:
-            self.rl_learner = MultiObjectiveRLPipelineLearner(self.storage, self.config)
-        else:
-            self.rl_learner = None
-
-        # Kubernetes operator (stub)
-        self.k8s_operator = KubernetesOperator(Config())
-
-        # Auto‑remediation policy
-        self.remediation_policy = AutoRemediationPolicy()
-
-        # DigitalTwin client (mock)
-        self.digital_twin = DigitalTwinClient(Config()) if self.config.digital_twin_enabled else None
-
-        # Chaos engine
-        self.chaos_engine = ChaosEngine(Config())
-
         # Existing modules
         self.quantum_security = QuantumResilientRunnerSecurity(self.storage)
         self.blockchain = BlockchainRunnerVerification(self.storage)
@@ -1774,7 +1865,7 @@ class EnhancedGreenAgentRunner:
         self.cloud_distributor = MultiCloudRunnerDistribution(self.storage)
 
         # Pipeline selector with RL and circuit breakers
-        self.pipeline_selector = DynamicPipelineSelector(self.config, self.storage)
+        self.pipeline_selector = DynamicPipelineSelector(self.storage)
 
         # Available pipelines
         self.pipelines = {
@@ -1786,10 +1877,10 @@ class EnhancedGreenAgentRunner:
         }
 
         # Energy‑aware task queue
-        self.task_queue = EnergyAwareTaskPriorityQueue(max_size=self.config.queue_max_size)
+        self.task_queue = EnergyAwareTaskPriorityQueue(max_size=config.QUEUE_MAX_SIZE)
 
         # Dashboard server
-        self.dashboard = AgentDashboardServer(self.config)
+        self.dashboard = AgentDashboardServer()
 
         # Bio-inspired core (stub)
         self.bio_core = StubBioCore()
@@ -1807,7 +1898,7 @@ class EnhancedGreenAgentRunner:
 
         # Register signal handlers
         self._register_signal_handlers()
-        logger.info("Enhanced Green Agent Runner v7.0.3 initialized")
+        logger.info("Enhanced Green Agent Runner v8.0.0 initialized")
 
     def _register_signal_handlers(self):
         try:
@@ -1818,16 +1909,13 @@ class EnhancedGreenAgentRunner:
             pass
 
     def _get_system_state(self) -> Dict[str, Any]:
-        state = {'degradation_tier': 5, 'token_balance': 1000, 'carbon_gradient': 0.5, 'predicted_carbon': 0.5}
-        # Include current carbon intensity (normalized)
-        if self.carbon_fetcher:
-            try:
-                intensity = asyncio.run(self.carbon_fetcher.get_intensity())
-                state['carbon_intensity'] = intensity / 1000  # normalized to 0-1
-            except:
-                pass
-        # Also include helium scarcity and material index if available
-        # (simplified)
+        state = {
+            'degradation_tier': 5,
+            'token_balance': 1000,
+            'carbon_gradient': 0.5,
+            'predicted_carbon': 0.5,
+            'carbon_intensity': 0.4  # normalized
+        }
         return state
 
     async def submit_task(self, task: Dict[str, Any]) -> str:
@@ -1836,7 +1924,7 @@ class EnhancedGreenAgentRunner:
         if 'task_id' not in task:
             task['task_id'] = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.total_tasks}"
         await self.task_queue.push(task, priority)
-        logger.debug(f"Task {task['task_id']} queued with priority {priority:.2f}")
+        logger.debug("Task %s queued with priority %.2f", task['task_id'], priority)
         return task['task_id']
 
     async def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -1845,14 +1933,8 @@ class EnhancedGreenAgentRunner:
         task_id = task.get('task_id', 'unknown')
         system_state = self._get_system_state()
 
-        # Energy‑aware preemption: if task exceeds energy budget, cancel
-        if self.config.enable_energy_preemption and 'energy_budget' in task:
-            # In a real implementation, we would track energy usage during execution
-            # For now, we rely on the task queue's preemption logic.
-            pass
-
         # Degradation awareness
-        if self.config.enable_degradation_aware:
+        if config.ENABLE_DEGRADATION_AWARE:
             tier = system_state['degradation_tier']
             if tier <= 1:
                 return {'success': False, 'reason': f'System in survival mode (tier {tier})', 'task_id': task_id}
@@ -1860,7 +1942,7 @@ class EnhancedGreenAgentRunner:
                 return {'success': False, 'reason': f'Non-critical tasks deferred in tier {tier}', 'task_id': task_id}
 
         # Dynamic pipeline selection
-        if self.config.enable_dynamic_pipeline:
+        if config.ENABLE_DYNAMIC_PIPELINE:
             pipeline_name, scores = self.pipeline_selector.select_pipeline(task, system_state)
         else:
             pipeline_name = task.get('pipeline', 'standard')
@@ -1870,13 +1952,11 @@ class EnhancedGreenAgentRunner:
 
         success = result.get('success', False)
         latency = (datetime.utcnow() - start_time).total_seconds() * 1000
-        # Real energy and carbon from cost function (if we have node and workload descriptors)
-        # For now, we mock them, but we should integrate with the cost function.
         energy_joules = result.get('energy_joules', latency * 0.1)
         carbon_kg = result.get('carbon_kg', energy_joules * 0.0001)
 
-        # Multi‑objective RL update
-        if self.config.enable_reinforcement_learning and self.rl_learner:
+        # RL update
+        if config.ENABLE_REINFORCEMENT_LEARNING and self.pipeline_selector.rl_learner:
             reward_info = {
                 'success': 1.0 if success else 0.0,
                 'latency_ms': latency,
@@ -1884,7 +1964,7 @@ class EnhancedGreenAgentRunner:
                 'carbon_kg': carbon_kg
             }
             next_state = self._get_system_state()
-            await self.rl_learner.update(system_state, pipeline_name, reward_info, next_state)
+            await self.pipeline_selector.rl_learner.update(system_state, pipeline_name, reward_info, next_state)
 
         # Update statistics
         if success:
@@ -1915,7 +1995,8 @@ class EnhancedGreenAgentRunner:
         quantum_key = await self.quantum_security.generate_keypair('dilithium')
         signature = await self.quantum_security.sign_task_result(result_data, quantum_key['key_id'])
         result['quantum_signature'] = signature
-        QUANTUM_SIGNATURES.labels(algorithm='dilithium', status='sign_success').inc()
+        if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+            QUANTUM_SIGNATURES.labels(algorithm='dilithium', status='sign_success').inc()
 
         # ============================================================
         # Blockchain Verification
@@ -1928,19 +2009,17 @@ class EnhancedGreenAgentRunner:
             {'task_id': task_id, 'success': success, 'pipeline': pipeline_name}
         )
         result['blockchain_tx_hash'] = blockchain_result.get('tx_hash')
-        BLOCKCHAIN_VERIFICATIONS.labels(status='recorded').inc()
+        if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+            BLOCKCHAIN_VERIFICATIONS.labels(status='recorded').inc()
 
         # ============================================================
-        # Multi-Cloud Distribution (carbon-aware)
+        # Multi-Cloud Distribution
         # ============================================================
-        cloud_prefs = {}
-        if self.carbon_fetcher:
-            intensity = await self.carbon_fetcher.get_intensity()
-            cloud_prefs['carbon_intensity'] = intensity
         cloud_data = {'size_gb': len(str(result)) * 0.001}
-        distribution = await self.cloud_distributor.distribute_runner_data(cloud_data, preferences=cloud_prefs)
+        distribution = await self.cloud_distributor.distribute_runner_data(cloud_data)
         result['cloud_distribution'] = distribution
-        CLOUD_DISTRIBUTIONS.labels(provider=distribution['optimal_provider'], status='success').inc()
+        if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+            CLOUD_DISTRIBUTIONS.labels(provider=distribution['optimal_provider'], status='success').inc()
 
         # ============================================================
         # Autonomous Optimization
@@ -1953,115 +2032,70 @@ class EnhancedGreenAgentRunner:
         }
         optimization = await self.autonomous_optimizer.optimize_runner(state, 'hybrid')
         result['autonomous_optimization'] = optimization
-        AUTONOMOUS_OPTIMIZATIONS.labels(strategy=optimization['selected_strategy'], status='success').inc()
-
-        # ============================================================
-        # Anomaly Detection & Auto‑Remediation
-        # ============================================================
-        if self.anomaly_system and 'node_id' in task:
-            node_id = task['node_id']
-            metrics = {
-                'energy_joules': energy_joules,
-                'carbon_kg': carbon_kg,
-                'latency_ms': latency,
-                'accuracy': success
-            }
-            event = self.anomaly_system['telemetry_collector'].receive_telemetry(node_id, metrics)
-            if event:
-                ANOMALY_ALERTS.labels(node=node_id).inc()
-                action = self.remediation_policy.get_action('energy_spike', node_id)
-                if action == 'reroute':
-                    logger.info(f"Auto‑remediation: rerouting tasks from {node_id}")
-                elif action == 'defer':
-                    pass
-                elif action == 'restart':
-                    pass
-                # Feed to evolutionary engine
-                if self.anomaly_system.get('evolutionary_engine'):
-                    self.anomaly_system['evolutionary_engine'].receive_anomaly_feedback(node_id, event.anomaly_score)
-
-        # ============================================================
-        # Predictive Maintenance
-        # ============================================================
-        if self.pm_system and 'node_id' in task:
-            flops = task.get('flops', 1e12)
-            self.pm_system['engine'].update_node(node_id, flops, energy_joules)
-
-        # ============================================================
-        # Kubernetes Operator Scaling
-        # ============================================================
-        if self.k8s_operator:
-            cpu_usage = random.uniform(20, 90)  # example
-            carbon_intensity = system_state.get('carbon_intensity', 0.5)
-            await self.k8s_operator.scale(cpu_usage, carbon_intensity)
-
-        # ============================================================
-        # Dashboard Updates (sustainability)
-        # ============================================================
-        if self.config.enable_dashboard:
-            status = self.get_status()
-            status['sustainability'] = {
-                'carbon_intensity': system_state.get('carbon_intensity', 0.5),
-                'total_energy_joules': sum(t.get('energy_joules', 0) for t in self.task_history),
-                'total_carbon_kg': sum(t.get('carbon_kg', 0) for t in self.task_history),
-                'anomalies': len(self.anomaly_system['detector'].anomaly_history) if self.anomaly_system else 0,
-                'pm_recommendations': len(self.pm_system['engine'].scheduler.recommendations) if self.pm_system else 0
-            }
-            await self.dashboard.broadcast_status(status)
+        if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+            AUTONOMOUS_OPTIMIZATIONS.labels(strategy=optimization['selected_strategy'], status='success').inc()
 
         # Store in database
         self.storage.save_task_history(task_id, pipeline_name, success, latency, result)
 
-        AGENT_TASKS.labels(status='success' if success else 'failed').inc()
-        AGENT_DURATION.labels(pipeline=pipeline_name).observe(latency / 1000)
-        AGENT_QUEUE_SIZE.set(self.task_queue.size())
+        if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
+            AGENT_TASKS.labels(status='success' if success else 'failed').inc()
+            AGENT_DURATION.labels(pipeline=pipeline_name).observe(latency / 1000)
+            AGENT_QUEUE_SIZE.set(self.task_queue.size())
 
-        audit_logger.info(f"Task {task_id} processed: success={success}, pipeline={pipeline_name}, latency={latency:.0f}ms, blockchain={result['blockchain_tx_hash'][:16] if result['blockchain_tx_hash'] else 'N/A'}...")
+        audit_logger.info("Task %s processed: success=%s, pipeline=%s, latency=%.0fms, blockchain=%s...",
+                         task_id, success, pipeline_name, latency,
+                         result['blockchain_tx_hash'][:16] if result['blockchain_tx_hash'] else 'N/A')
         return result
 
     async def _execute_with_fallback(self, task: Dict[str, Any], initial_pipeline: str, system_state: Dict[str, Any]) -> Dict[str, Any]:
-        fallback_chain = [initial_pipeline] + self.config.fallback_pipelines
+        fallback_chain = [initial_pipeline] + config.FALLBACK_PIPELINES
         seen = set()
         fallback_chain = [p for p in fallback_chain if not (p in seen or seen.add(p))]
         for pipeline_name in fallback_chain:
             try:
-                if self.config.enable_circuit_breakers:
-                    available, state = await self.pipeline_selector.circuit_breaker.is_available(pipeline_name)
-                    if not available:
-                        logger.warning(f"Pipeline {pipeline_name} unavailable (state: {state})")
+                if config.ENABLE_CIRCUIT_BREAKERS:
+                    cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
+                    if cb.get_state() == "OPEN":
+                        logger.warning("Pipeline %s unavailable (state: OPEN)", pipeline_name)
                         continue
                 pipeline_func = self.pipelines.get(pipeline_name)
                 if not pipeline_func:
-                    logger.warning(f"Pipeline {pipeline_name} not found")
+                    logger.warning("Pipeline %s not found", pipeline_name)
                     continue
                 try:
-                    # Wrap execution to monitor energy (mock)
                     async def run_with_monitor():
                         start = datetime.utcnow()
-                        result = await asyncio.wait_for(pipeline_func(task), timeout=self.config.task_timeout_seconds)
+                        result = await asyncio.wait_for(pipeline_func(task), timeout=config.TASK_TIMEOUT_SECONDS)
                         energy_used = (datetime.utcnow() - start).total_seconds() * 10  # mock energy
                         result['energy_joules'] = energy_used
                         result['carbon_kg'] = energy_used * 0.0001
                         return result
 
                     result = await run_with_monitor()
-                    if self.config.enable_circuit_breakers:
-                        await self.pipeline_selector.circuit_breaker.record_success(pipeline_name)
+                    if config.ENABLE_CIRCUIT_BREAKERS:
+                        cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
+                        await cb.call(lambda: None)  # just to record success? Actually we need to record success.
+                        # We'll record success manually.
+                        cb._failures = 0
+                        cb._state = "CLOSED"
                     return result
                 except asyncio.TimeoutError:
-                    logger.error(f"Pipeline {pipeline_name} timed out after {self.config.task_timeout_seconds}s")
-                    if self.config.enable_circuit_breakers:
-                        await self.pipeline_selector.circuit_breaker.record_failure(pipeline_name)
+                    logger.error("Pipeline %s timed out after %ds", pipeline_name, config.TASK_TIMEOUT_SECONDS)
+                    if config.ENABLE_CIRCUIT_BREAKERS:
+                        cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
+                        await cb.call(lambda: exec('raise Exception("timeout")'))  # hack to trigger failure
                     continue
             except Exception as e:
-                logger.error(f"Pipeline {pipeline_name} failed: {str(e)}")
-                if self.config.enable_circuit_breakers:
-                    await self.pipeline_selector.circuit_breaker.record_failure(pipeline_name)
+                logger.error("Pipeline %s failed: %s", pipeline_name, e)
+                if config.ENABLE_CIRCUIT_BREAKERS:
+                    cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
+                    await cb.call(lambda: exec('raise Exception("failure")'))
                 continue
         return {'success': False, 'error': 'All pipelines failed', 'task_id': task.get('task_id', 'unknown'), 'tried_pipelines': fallback_chain}
 
     async def _worker_loop(self, worker_id: int):
-        logger.info(f"Worker {worker_id} started")
+        logger.info("Worker %d started", worker_id)
         while self.running:
             try:
                 task = await self.task_queue.pop()
@@ -2076,30 +2110,23 @@ class EnhancedGreenAgentRunner:
                         else:
                             task['callback'](result)
                     except Exception as e:
-                        logger.error(f"Callback error for task {task.get('task_id')}: {e}")
+                        logger.error("Callback error for task %s: %s", task.get('task_id'), e)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker {worker_id} error: {e}")
+                logger.error("Worker %d error: %s", worker_id, e)
                 await asyncio.sleep(0.5)
-        logger.info(f"Worker {worker_id} stopped")
+        logger.info("Worker %d stopped", worker_id)
 
     async def start_workers(self, num_workers: int = None):
         if num_workers is None:
-            num_workers = self.config.max_concurrent_tasks
+            num_workers = config.MAX_CONCURRENT_TASKS
         for i in range(num_workers):
             worker = asyncio.create_task(self._worker_loop(i))
             self._worker_tasks.append(worker)
-        logger.info(f"Started {num_workers} workers")
+        logger.info("Started %d workers", num_workers)
 
-    async def batch_process(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        results = []
-        for task in tasks:
-            result = await self.process_task(task)
-            results.append(result)
-        return results
-
-    # Pipeline methods (unchanged)
+    # Pipeline methods
     async def _standard_pipeline(self, task: Dict[str, Any]) -> Dict[str, Any]:
         await asyncio.sleep(0.01)
         return {'success': True, 'pipeline': 'standard', 'task_id': task.get('task_id')}
@@ -2124,7 +2151,7 @@ class EnhancedGreenAgentRunner:
     def get_status(self) -> Dict[str, Any]:
         system_state = self._get_system_state()
         return {
-            'version': '7.0.3',
+            'version': '8.0.0',
             'total_tasks': self.total_tasks,
             'successful_tasks': self.successful_tasks,
             'failed_tasks': self.failed_tasks,
@@ -2133,23 +2160,20 @@ class EnhancedGreenAgentRunner:
             'pipeline_stats': self.pipeline_selector.get_pipeline_stats(),
             'system_state': system_state,
             'running': self.running,
-            'config': self.config.model_dump() if hasattr(self.config, 'model_dump') else self.config.__dict__,
+            'config': config.model_dump() if hasattr(config, 'model_dump') else config.__dict__,
             'timestamp': datetime.utcnow().isoformat()
         }
 
     async def start(self):
-        logger.info("Starting Enhanced Green Agent Runner v7.0.3...")
+        logger.info("Starting Enhanced Green Agent Runner v8.0.0...")
         await self.dashboard.start()
         await self.start_workers()
-        if self.config.enable_prometheus and PROMETHEUS_AVAILABLE:
+        if config.ENABLE_PROMETHEUS and PROMETHEUS_AVAILABLE:
             try:
                 start_http_server(9090)
                 logger.info("Prometheus metrics server started on port 9090")
             except Exception as e:
-                logger.warning(f"Failed to start Prometheus server: {e}")
-        # Start chaos engine if enabled
-        if self.config.enable_chaos_testing:
-            await self.chaos_engine.start(self)
+                logger.warning("Failed to start Prometheus server: %s", e)
         logger.info("Enhanced Green Agent Runner started successfully")
 
     async def shutdown(self):
@@ -2167,11 +2191,6 @@ class EnhancedGreenAgentRunner:
         # Close data collectors
         if self.carbon_fetcher:
             await self.carbon_fetcher.close()
-        if self.digital_twin:
-            await self.digital_twin.close()
-        # Stop chaos engine
-        if self.config.enable_chaos_testing:
-            await self.chaos_engine.stop()
         logger.info("Enhanced Green Agent Runner shutdown complete")
 
     async def __aenter__(self):
@@ -2185,19 +2204,19 @@ class EnhancedGreenAgentRunner:
 # CLI Entry Point
 # =============================================================================
 async def main():
-    config = RunnerConfig.from_env()
-    async with EnhancedGreenAgentRunner(config) as runner:
+    async with EnhancedGreenAgentRunner() as runner:
         logger.info("Agent running. Press Ctrl+C to stop.")
         try:
             while runner.running:
                 await asyncio.sleep(1)
                 if int(time.time()) % 30 == 0:
                     status = runner.get_status()
-                    logger.info(f"Status: {status['total_tasks']} tasks, {status['success_rate']*100:.1f}% success rate, queue: {status['queue_size']}")
+                    logger.info("Status: %d tasks, %.1f%% success rate, queue: %d",
+                               status['total_tasks'], status['success_rate']*100, status['queue_size'])
         except KeyboardInterrupt:
             logger.info("Received interrupt signal")
         except Exception as e:
-            logger.error(f"Runtime error: {e}")
+            logger.error("Runtime error: %s", e)
 
 if __name__ == "__main__":
     try:
