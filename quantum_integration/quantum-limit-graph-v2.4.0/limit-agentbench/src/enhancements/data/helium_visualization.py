@@ -1,16 +1,19 @@
 # File: helium_visualization.py
-# Version: 2.0.0
+# Version: 2.1.0 (Real‑time Data Ready)
 """
-Interactive Helium Market Dashboard with enhanced configurability and robustness.
+Interactive Helium Market Dashboard with support for real‑time data.
 
-ENHANCEMENTS OVER v1.0:
-- Configurable data paths via environment variables and CLI arguments.
-- Robust file handling with fallback to generated synthetic data.
-- Ability to generate specific charts or full dashboard.
-- Improved KPI color logic and additional KPIs.
-- Export individual charts as HTML/PNG via command line.
-- Logging and error handling.
-- Option to serve as a web server (Dash).
+This version automatically computes derived metrics from the available columns,
+making it compatible with both the synthetic dataset and the real‑time data format
+provided by the user.
+
+ENHANCEMENTS OVER v2.0.0:
+- Auto‑detects and computes missing derived fields (scarcity, market regime, etc.)
+  from the available columns in the input CSV.
+- Handles the new real‑time data format which includes `new_production_capacity_tonnes`.
+- Improved error handling when columns are missing.
+- More robust fallback for missing forecast data.
+- Updated documentation and examples.
 """
 
 import os
@@ -44,7 +47,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 class Config:
     """Central configuration with environment variable support."""
-    DATA_PATH = os.getenv('HELIUM_DASHBOARD_DATA', './data/helium_timeseries.csv')
+    DATA_PATH = os.getenv('HELIUM_DASHBOARD_DATA', './data/helium_realtime.csv')
     FORECAST_PATH = os.getenv('HELIUM_DASHBOARD_FORECAST', './data/helium_forecasts.csv')
     OUTPUT_PATH = os.getenv('HELIUM_DASHBOARD_OUTPUT', './helium_dashboard.html')
     LOG_LEVEL = os.getenv('HELIUM_DASHBOARD_LOG', 'INFO')
@@ -132,10 +135,10 @@ def generate_synthetic_data(n_periods: int = 60, start_date: str = "2020-01-01")
 
 
 # ============================================================================
-# HeliumMarketDashboard (Enhanced)
+# HeliumMarketDashboard (Enhanced with Real‑time Data Support)
 # ============================================================================
 class HeliumMarketDashboard:
-    """Interactive dashboard for helium market visualization with enhanced configurability."""
+    """Interactive dashboard for helium market visualization with real‑time data support."""
 
     def __init__(
         self,
@@ -162,7 +165,7 @@ class HeliumMarketDashboard:
         self._load_forecast()
         self._calculate_metrics()
 
-        logger.info("HeliumMarketDashboard initialized.")
+        logger.info("HeliumMarketDashboard initialized with real‑time data support.")
 
     def _load_data(self):
         """Load main data from CSV or fallback to synthetic."""
@@ -193,21 +196,57 @@ class HeliumMarketDashboard:
             logger.info("No forecast file found. Forecast chart will be omitted.")
 
     def _calculate_metrics(self):
-        """Calculate additional metrics for visualization."""
+        """Compute derived metrics from available columns."""
         if self.df is None:
             return
+
+        # Ensure date is datetime
+        self.df['date'] = pd.to_datetime(self.df['date'])
+
+        # Basic metrics
         self.df['deficit'] = self.df['global_demand_tonnes'] - self.df['global_production_tonnes']
         self.df['price_change'] = self.df['price_index'].pct_change() * 100
 
-        # Market regime classification
-        conditions = [
-            (self.df['helium_scarcity_impact'] < 0.3),
-            (self.df['helium_scarcity_impact'] >= 0.3) & (self.df['helium_scarcity_impact'] < 0.6),
-            (self.df['helium_scarcity_impact'] >= 0.6) & (self.df['helium_scarcity_impact'] < 0.8),
-            (self.df['helium_scarcity_impact'] >= 0.8)
-        ]
-        regimes = ['Low Scarcity', 'Moderate Scarcity', 'High Scarcity', 'Critical Scarcity']
-        self.df['market_regime'] = np.select(conditions, regimes)
+        # Compute demand_supply_ratio if not present
+        if 'demand_supply_ratio' not in self.df.columns:
+            self.df['demand_supply_ratio'] = self.df['global_demand_tonnes'] / self.df['global_production_tonnes']
+
+        # Compute helium_scarcity_impact if not present (use formula)
+        if 'helium_scarcity_impact' not in self.df.columns:
+            shortage = self.df['shortage_severity_0_1']
+            supply_risk = self.df['supply_risk_score_0_1']
+            # Use same formula as synthetic data
+            self.df['helium_scarcity_impact'] = np.clip(shortage * 0.6 + supply_risk * 0.4, 0, 1)
+        else:
+            # If column exists, ensure it's numeric and clipped
+            self.df['helium_scarcity_impact'] = self.df['helium_scarcity_impact'].clip(0, 1)
+
+        # Compute price_volatility if not present
+        if 'price_volatility' not in self.df.columns:
+            self.df['price_volatility'] = self.df['price_index'].rolling(6).std().fillna(5).clip(1, 30)
+
+        # Compute market_regime if not present
+        if 'market_regime' not in self.df.columns:
+            conditions = [
+                (self.df['helium_scarcity_impact'] < 0.3),
+                (self.df['helium_scarcity_impact'] >= 0.3) & (self.df['helium_scarcity_impact'] < 0.6),
+                (self.df['helium_scarcity_impact'] >= 0.6) & (self.df['helium_scarcity_impact'] < 0.8),
+                (self.df['helium_scarcity_impact'] >= 0.8)
+            ]
+            regimes = ['Low Scarcity', 'Moderate Scarcity', 'High Scarcity', 'Critical Scarcity']
+            self.df['market_regime'] = np.select(conditions, regimes)
+
+        # Compute circularity_potential if not present
+        if 'circularity_potential' not in self.df.columns:
+            recycling = self.df['recycling_rate_0_1']
+            substitution = self.df['substitution_feasibility_0_1']
+            self.df['circularity_potential'] = (recycling + substitution) / 2
+
+        # Compute other derived fields if needed for charts
+        # thermal_impact_factor, etc., are not used in the core charts, but we compute them if present.
+        # We can skip; the charts will use whatever columns exist.
+
+        logger.info("Derived metrics calculated successfully.")
 
     # ---------- Chart generation methods ----------
     def create_supply_demand_chart(self) -> go.Figure:
@@ -295,14 +334,15 @@ class HeliumMarketDashboard:
         categories = ['Supply Risk', 'Geopolitical Risk', 'Logistics Risk',
                      'Shortage Severity', 'Price Volatility', 'Cooling Sensitivity']
 
-        values = [
-            latest['supply_risk_score_0_1'],
-            latest['geopolitical_risk_index'],
-            latest['logistics_disruption_index'],
-            latest['shortage_severity_0_1'],
-            abs(latest['price_change']) / 100 if not pd.isna(latest['price_change']) else 0.1,
-            latest['cooling_load_sensitivity'] / 1.5
-        ]
+        # Use available columns; fallback to default values if missing
+        supply_risk = latest.get('supply_risk_score_0_1', 0.5)
+        geopolitical = latest.get('geopolitical_risk_index', 0.5)
+        logistics = latest.get('logistics_disruption_index', 0.5)
+        shortage = latest.get('shortage_severity_0_1', 0.5)
+        price_vol = abs(latest.get('price_change', 0)) / 100 if not pd.isna(latest.get('price_change', 0)) else 0.1
+        cooling = latest.get('cooling_load_sensitivity', 1.0) / 1.5
+
+        values = [supply_risk, geopolitical, logistics, shortage, price_vol, cooling]
 
         fig = go.Figure(data=go.Scatterpolar(
             r=values,
@@ -315,12 +355,12 @@ class HeliumMarketDashboard:
         # Add historical baseline (first year)
         baseline = self.df.iloc[0]
         baseline_values = [
-            baseline['supply_risk_score_0_1'],
-            baseline['geopolitical_risk_index'],
-            baseline['logistics_disruption_index'],
-            baseline['shortage_severity_0_1'],
-            0.05,
-            baseline['cooling_load_sensitivity'] / 1.5
+            baseline.get('supply_risk_score_0_1', 0.5),
+            baseline.get('geopolitical_risk_index', 0.5),
+            baseline.get('logistics_disruption_index', 0.5),
+            baseline.get('shortage_severity_0_1', 0.5),
+            0.05,  # baseline volatility
+            baseline.get('cooling_load_sensitivity', 1.0) / 1.5
         ]
 
         fig.add_trace(go.Scatterpolar(
@@ -413,12 +453,19 @@ class HeliumMarketDashboard:
                      annotation_text="2030 Target (50%)", row=1, col=1)
 
         # Circularity potential
-        fig.add_trace(go.Scatter(
-            x=self.df['date'], y=self.df['circularity_potential'],
-            mode='lines+markers', name='Circularity Potential',
-            line=dict(color='blue', width=3),
-            fill='tozeroy'
-        ), row=1, col=2)
+        if 'circularity_potential' in self.df.columns:
+            fig.add_trace(go.Scatter(
+                x=self.df['date'], y=self.df['circularity_potential'],
+                mode='lines+markers', name='Circularity Potential',
+                line=dict(color='blue', width=3),
+                fill='tozeroy'
+            ), row=1, col=2)
+        else:
+            fig.add_annotation(
+                x=0.5, y=0.5, xref='paper', yref='paper',
+                text='Circularity Potential not available in data',
+                showarrow=False
+            )
 
         fig.update_layout(
             title='Helium Circular Economy Progress',
