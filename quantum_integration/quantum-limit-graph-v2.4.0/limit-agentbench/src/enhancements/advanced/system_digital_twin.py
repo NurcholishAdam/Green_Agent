@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-System-Wide Digital Twin for Green Agent v2.2.0
+System-Wide Digital Twin for Green Agent v2.3.0
 Simulates the entire agent network, expert interactions, and material flows
 to forecast long-term sustainability implications.
 
-Enhanced Features (v2.2.0):
+Enhanced Features (v2.3.0):
 - Secure JSON persistence with versioning and async I/O
 - Fine-grained concurrency controls (asyncio locks)
 - Proper circuit breaker with half-open state
@@ -15,6 +15,8 @@ Enhanced Features (v2.2.0):
 - Configurable correlation matrix and substitution parameters
 - Predictive model integration (stubs now callable)
 - Structured logging with context
+- Fixed scipy import fallback, async initialization, configurable variances,
+  improved error handling, and per‑resource substitution effects.
 """
 
 import asyncio
@@ -29,7 +31,6 @@ import hashlib
 import json
 import os
 import zlib
-from scipy.stats import multivariate_normal
 
 # Optional imports with fallbacks
 try:
@@ -43,6 +44,19 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
+try:
+    from scipy.stats import multivariate_normal
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+    # Fallback: use independent normal distributions
+    def multivariate_normal(mean, cov, size):
+        # Generate independent samples (ignoring correlation)
+        if size == 1:
+            return np.random.normal(mean, np.sqrt(np.diag(cov)))
+        else:
+            return np.random.normal(mean, np.sqrt(np.diag(cov)), size=size)
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -51,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DigitalTwinConfig:
-    """Configuration for the digital twin simulation (v2.2.0)."""
+    """Configuration for the digital twin simulation (v2.3.0)."""
     # Core simulation
     time_horizon_years: int = 10
     time_step_days: int = 30
@@ -103,6 +117,18 @@ class DigitalTwinConfig:
     substitution_ramp_start_step: int = 10
     substitution_ramp_rate: float = 0.05
 
+    # New in v2.3.0: configurable resource variances for correlated uncertainty
+    resource_variances: Dict[str, float] = field(default_factory=lambda: {
+        'carbon': 0.02,
+        'helium': 0.02,
+        'energy': 0.01,
+        'circularity': 0.01,
+        'biodiversity': 0.01
+    })
+
+    # Volatility window for risk detection
+    volatility_window_size: int = 10
+
     def __post_init__(self):
         # Validate numeric ranges
         if self.time_horizon_years < 1:
@@ -125,10 +151,13 @@ class DigitalTwinConfig:
             raise ValueError("telemetry_export_interval must be >= 1")
         if self.prometheus_port is not None and self.prometheus_port < 1024:
             raise ValueError("prometheus_port must be >= 1024 or None")
-        # Validate user priorities sum to ~1.0
+        # Validate user priorities sum to ~1.0 and keys are known
         total = sum(self.user_priorities.values())
         if abs(total - 1.0) > 0.01:
             raise ValueError("user_priorities must sum to approximately 1.0")
+        allowed_keys = {'carbon', 'helium', 'energy', 'circularity', 'biodiversity'}
+        if not set(self.user_priorities.keys()).issubset(allowed_keys):
+            raise ValueError(f"user_priorities keys must be a subset of {allowed_keys}")
 
 # ============================================================================
 # Enums and Data Classes (Enhanced)
@@ -291,7 +320,7 @@ class DigitalTwinPersistenceManager:
         async with self._lock:
             try:
                 state = {
-                    'version': '2.2.0',
+                    'version': '2.3.0',
                     'config': twin.config.__dict__,
                     'scenario_results': [
                         {
@@ -310,10 +339,7 @@ class DigitalTwinPersistenceManager:
                         }
                         for r in twin.scenario_results
                     ],
-                    'simulation_cache': {
-                        k: {'scenario_id': v.scenario_id, 'timestamp': v.timestamp}
-                        for k, v in twin.simulation_cache.items()
-                    },
+                    # We skip caching simulation_cache to avoid stale placeholders; will recompute on demand.
                     'resource_projections': {
                         k: {
                             'resource_type': v.resource_type,
@@ -366,8 +392,8 @@ class DigitalTwinPersistenceManager:
 
                 # Version check
                 version = state.get('version', '1.0.0')
-                if version != '2.2.0':
-                    logger.warning(f"State version mismatch: {version} != 2.2.0; attempting to load anyway")
+                if version != '2.3.0':
+                    logger.warning(f"State version mismatch: {version} != 2.3.0; attempting to load anyway")
 
                 # Restore simple attributes
                 twin.priority_weights = state.get('priority_weights', twin.config.user_priorities)
@@ -407,12 +433,6 @@ class DigitalTwinPersistenceManager:
                         alternative_resources=v_data['alternative_resources']
                     )
                     twin.resource_projections[k] = proj
-
-                # Restore simulation cache (only metadata, not full results)
-                # We'll rebuild cache on demand if needed
-                for cache_key, meta in state.get('simulation_cache', {}).items():
-                    # placeholder to indicate cache exists; results will be recomputed
-                    twin.simulation_cache[cache_key] = None
 
                 logger.info(f"Digital twin state loaded from {self.path}")
                 return True
@@ -586,7 +606,7 @@ class ScenarioParameterValidator:
 
 class SystemDigitalTwin:
     """
-    System-Wide Digital Twin v2.2.0 for Green Agent.
+    System-Wide Digital Twin v2.3.0 for Green Agent.
     """
 
     def __init__(self, config: Optional[DigitalTwinConfig] = None):
@@ -629,10 +649,14 @@ class SystemDigitalTwin:
             recovery_timeout=self.config.circuit_breaker_recovery_timeout
         )
 
-        # Load state if persistence enabled
-        asyncio.create_task(self._load_state())
+        # No background loading in __init__; use initialize() instead.
+        logger.info("System Digital Twin v2.3.0 initialized (call initialize() to load state)")
 
-        logger.info("System Digital Twin v2.2.0 initialized")
+    async def initialize(self):
+        """Load persisted state asynchronously. Must be called before running scenarios."""
+        if self.persistence:
+            await self.persistence.load_state(self)
+            logger.info("Digital twin state loaded")
 
     def _init_correlation_matrix(self) -> Dict[str, Dict[str, float]]:
         """Initialize correlation matrix, possibly from config override."""
@@ -652,10 +676,6 @@ class SystemDigitalTwin:
             'carbon': ['renewable_energy', 'carbon_offset', 'carbon_capture'],
             'energy': ['solar', 'wind', 'geothermal', 'nuclear']
         }
-
-    async def _load_state(self):
-        if self.persistence:
-            await self.persistence.load_state(self)
 
     async def save_state(self):
         if self.persistence:
@@ -731,8 +751,7 @@ class SystemDigitalTwin:
                         self.simulation_cache.move_to_end(scenario_id)
                         return cached
                     else:
-                        # Cache entry exists but result not yet computed (placeholder)
-                        # Recompute
+                        # Cache entry exists but result not yet computed (should not happen)
                         self.simulation_cache.pop(scenario_id, None)
 
             self.telemetry.increment('cache_misses')
@@ -762,9 +781,13 @@ class SystemDigitalTwin:
             self.telemetry.increment('scenarios_run')
             self.telemetry.gauge('sustainability_score', result.sustainability_score)
             self.telemetry.gauge('weighted_score', result.weighted_score)
-            self.telemetry.gauge('circuit_breaker_state', 
-                0 if self._circuit_breaker.state == CircuitBreakerState.CLOSED else
-                1 if self._circuit_breaker.state == CircuitBreakerState.OPEN else 2)
+            # Circuit breaker state gauge: 0=CLOSED, 1=OPEN, 2=HALF_OPEN
+            state_val = 0
+            if self._circuit_breaker.state == CircuitBreakerState.OPEN:
+                state_val = 1
+            elif self._circuit_breaker.state == CircuitBreakerState.HALF_OPEN:
+                state_val = 2
+            self.telemetry.gauge('circuit_breaker_state', state_val)
 
             logger.info(f"Completed scenario: {scenario_id}")
             return result
@@ -782,13 +805,24 @@ class SystemDigitalTwin:
             for i in range(n_steps)
         ]
 
-        # Run Monte Carlo simulations in parallel using asyncio.gather
+        # Run Monte Carlo simulations in parallel using asyncio.gather with return_exceptions
         tasks = []
         for sim_idx in range(n_simulations):
             tasks.append(self._run_single_simulation_correlated(
                 scenario_type, parameters, timestamps, sim_idx, n_simulations
             ))
-        all_simulations = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Filter out failed simulations and log errors
+        all_simulations = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error(f"Simulation failed: {r}")
+            else:
+                all_simulations.append(r)
+
+        if not all_simulations:
+            raise RuntimeError("All simulations failed")
 
         # Aggregate results
         projections = {
@@ -887,7 +921,7 @@ class SystemDigitalTwin:
         current_circularity = await self._get_current_circularity_with_fallback()
 
         # Generate correlated noise
-        if self.config.correlated_uncertainty:
+        if self.config.correlated_uncertainty and HAS_SCIPY:
             resources = ['carbon', 'helium', 'energy', 'circularity', 'biodiversity']
             mean = np.zeros(len(resources))
             cov_matrix = self._build_covariance_matrix(resources)
@@ -920,19 +954,28 @@ class SystemDigitalTwin:
                 scenario_type, parameters, i
             )
 
-            # Apply substitution effects
-            substitution_factor = 1.0
+            # Apply substitution effects (resource-specific)
+            substitution_factors = {}
             if self.config.resource_substitution_enabled:
-                substitution_factor = self._apply_substitution_effects(i, parameters)
+                for resource in ['carbon', 'helium', 'energy']:
+                    substitution_factors[resource] = self._apply_substitution_effects(
+                        resource, i, parameters
+                    )
 
             # Update state with correlated noise
             noise_factor_carbon = 1.0 + carbon_noise[i] * 0.1
             noise_factor_helium = 1.0 + helium_noise[i] * 0.1
             noise_factor_energy = 1.0 + energy_noise[i] * 0.05
 
-            carbon_val = current_carbon * carbon_effect * noise_factor_carbon * substitution_factor
-            helium_val = current_helium * helium_effect * noise_factor_helium * substitution_factor
-            energy_val = current_energy * energy_effect * noise_factor_energy * substitution_factor
+            carbon_val = current_carbon * carbon_effect * noise_factor_carbon
+            if 'carbon' in substitution_factors:
+                carbon_val *= substitution_factors['carbon']
+            helium_val = current_helium * helium_effect * noise_factor_helium
+            if 'helium' in substitution_factors:
+                helium_val *= substitution_factors['helium']
+            energy_val = current_energy * energy_effect * noise_factor_energy
+            if 'energy' in substitution_factors:
+                energy_val *= substitution_factors['energy']
 
             carbon_emissions.append(carbon_val)
             helium_depletion.append(helium_val)
@@ -957,7 +1000,7 @@ class SystemDigitalTwin:
         }
 
     def _build_covariance_matrix(self, resources: List[str]) -> np.ndarray:
-        """Build covariance matrix from correlation matrix."""
+        """Build covariance matrix from correlation matrix and configurable variances."""
         n = len(resources)
         corr_matrix = np.zeros((n, n))
 
@@ -965,9 +1008,9 @@ class SystemDigitalTwin:
             for j, res_j in enumerate(resources):
                 corr_matrix[i, j] = self.resource_correlation.get(res_i, {}).get(res_j, 0.0)
 
-        # Standard deviations (can be made configurable)
-        variances = [0.02, 0.02, 0.01, 0.01, 0.01]
-        std_matrix = np.diag(variances[:n])
+        # Use configurable variances
+        variances = [self.config.resource_variances.get(res, 0.02) for res in resources]
+        std_matrix = np.diag(np.sqrt(variances))
         cov_matrix = std_matrix @ corr_matrix @ std_matrix
 
         return cov_matrix
@@ -1061,7 +1104,7 @@ class SystemDigitalTwin:
         return carbon_effect, helium_effect, energy_effect
 
     # ========================================================================
-    # Substitution Modeling (Enhanced)
+    # Substitution Modeling (Enhanced with resource-specific effects)
     # ========================================================================
 
     def _get_substitution_effects(self, resource_type: str) -> Dict[str, float]:
@@ -1073,16 +1116,29 @@ class SystemDigitalTwin:
         }
         return default
 
-    def _apply_substitution_effects(self, step: int, parameters: Dict) -> float:
-        """Apply substitution effects based on step and parameters."""
-        substitution_start = parameters.get('substitution_start_step', self.config.substitution_ramp_start_step)
-        substitution_rate = parameters.get('substitution_rate', self.config.substitution_ramp_rate)
+    def _apply_substitution_effects(self, resource: str, step: int, parameters: Dict) -> float:
+        """
+        Apply resource‑specific substitution effects based on step and parameters.
+        Returns a multiplier (1.0 = no substitution, lower = more substitution).
+        """
+        # Get resource‑specific substitution availability and cost factor
+        subst_availability = self.config.substitution_availability_default.get(resource, 0.0)
+        subst_cost_factor = self.config.substitution_cost_factor_default.get(resource, 1.0)
+        # In this simple model, substitution reduces resource usage proportionally to availability
+        # and cost factor. Higher availability and lower cost mean more substitution.
+        # We also consider a ramp-up based on step.
+        ramp_start = self.config.substitution_ramp_start_step
+        ramp_rate = self.config.substitution_ramp_rate
 
-        if step < substitution_start:
+        if step < ramp_start:
             return 1.0
 
-        ramp_steps = step - substitution_start
-        return 1.0 - min(0.5, substitution_rate * ramp_steps)
+        # Ramp factor: increases from 0 to 1 over time
+        ramp_progress = min(1.0, ramp_rate * (step - ramp_start))
+        # Substitution effect: reduce usage by (availability * ramp_progress * cost_factor)
+        # but cap at 0.5 to avoid unrealistic extreme reductions
+        reduction = min(0.5, subst_availability * ramp_progress * subst_cost_factor)
+        return 1.0 - reduction
 
     def _get_substitution_effects_all(self) -> Dict[str, Dict]:
         """Get substitution effects for all resources."""
@@ -1456,8 +1512,9 @@ class SystemDigitalTwin:
                         risks.append(f"Declining {key} - helium scarcity risk")
 
         for key, values in projections.items():
-            if values and len(values) > 10:
-                volatility = np.std(values[-10:])
+            if values and len(values) > self.config.volatility_window_size:
+                recent = values[-self.config.volatility_window_size:]
+                volatility = np.std(recent)
                 if volatility > 0.1:
                     risks.append(f"High volatility in {key}")
 
@@ -1507,6 +1564,9 @@ class SystemDigitalTwin:
         total = sum(new_priorities.values())
         if abs(total - 1.0) > 0.01:
             raise ValueError("new_priorities must sum to approximately 1.0")
+        allowed_keys = {'carbon', 'helium', 'energy', 'circularity', 'biodiversity'}
+        if not set(new_priorities.keys()).issubset(allowed_keys):
+            raise ValueError(f"new_priorities keys must be a subset of {allowed_keys}")
         self.priority_weights.update(new_priorities)
         logger.info(f"User priorities updated: {self.priority_weights}")
 
@@ -1541,6 +1601,6 @@ class SystemDigitalTwin:
 
     async def shutdown(self):
         """Graceful shutdown."""
-        logger.info("Shutting down System Digital Twin v2.2.0")
+        logger.info("Shutting down System Digital Twin v2.3.0")
         await self.save_state()
         logger.info("Shutdown complete")
