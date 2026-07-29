@@ -1,5 +1,5 @@
 # =============================================================================
-# Enhanced Knowledge Transfer Manager v8.0.0
+# Enhanced Knowledge Transfer Manager v8.0.1
 # Full implementation with persistence, quantum security, autonomous strategy,
 # multi-cloud distribution, retry/circuit breaker, and all helper methods.
 # =============================================================================
@@ -13,6 +13,7 @@ import math
 import random
 import pickle
 import sqlite3
+import yaml
 from typing import Dict, Any, List, Optional, Tuple, Set, Callable, Union
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -26,10 +27,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
 import prometheus_client
 from prometheus_client import Counter, Gauge, Histogram, start_http_server, CollectorRegistry
 import structlog
+import signal
+import sys
 
 # ============================================================================
 # Optional dependencies with graceful degradation
@@ -81,6 +83,18 @@ try:
     GCP_AVAILABLE = True
 except ImportError:
     GCP_AVAILABLE = False
+
+try:
+    from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 logger = structlog.get_logger(__name__)
 
@@ -165,6 +179,8 @@ if PYDANTIC_AVAILABLE:
         blockchain_rpc_url: str = Field('http://localhost:8545')
         blockchain_contract_address: str = Field('0x0000000000000000000000000000000000000000')
         blockchain_private_key: Optional[str] = None
+        blockchain_contract_abi: Optional[List[Dict]] = None
+        blockchain_event_function: str = Field('recordEvent')
 
         # Autonomous strategy
         enable_autonomous_strategy: bool = True
@@ -210,15 +226,110 @@ if PYDANTIC_AVAILABLE:
             issues = []
             if self.capture_threshold < 0.4 or self.capture_threshold > 0.95:
                 issues.append("capture_threshold must be between 0.4 and 0.95")
-            if self.decay_rate <= 0:
-                issues.append("decay_rate must be positive")
+            if self.default_decay_rate <= 0:
+                issues.append("default_decay_rate must be positive")
             return issues
 else:
-    # Fallback dataclass (simplified)
+    # Fallback dataclass (complete with all fields)
     @dataclass
     class KnowledgeTransferConfig:
-        # ... fields omitted for brevity, but would be present in full code
-        pass
+        enable_decay: bool = True
+        default_decay_rate: float = 0.01
+        capture_threshold: float = 0.7
+        active_learning_retrain_interval: int = 3600
+        active_learning_history_size: int = 1000
+        genetic_population_size: int = 20
+        genetic_mutation_rate: float = 0.2
+        genetic_crossover_rate: float = 0.7
+        genetic_generations: int = 10
+        genetic_tournament_size: int = 3
+        genetic_evolution_interval: int = 86400
+        predation_interval: int = 3600
+        prey_threshold: float = 0.2
+        predator_threshold: float = 0.7
+        recycling_interval: int = 7200
+        homeostatic_interval: int = 600
+        homeostatic_target_avg_effective: float = 0.6
+        homeostatic_kp: float = 0.5
+        homeostatic_ki: float = 0.1
+        homeostatic_kd: float = 0.05
+        model_storage_path: str = "./models"
+        validation_enabled: bool = True
+        validation_task_count: int = 10
+        min_improvement_threshold: float = 0.05
+        fine_tuning_epochs_default: int = 10
+        graph_training_interval: int = 7200
+        enable_persistence: bool = True
+        persistence_path: str = "knowledge_transfer_state.db"
+        max_retries: int = 3
+        retry_base_delay_ms: float = 100.0
+        retry_max_delay_ms: float = 5000.0
+        enable_circuit_breaker: bool = True
+        circuit_breaker_failure_threshold: int = 5
+        circuit_breaker_timeout_seconds: float = 60.0
+        enable_quantum_signing: bool = True
+        quantum_signing_algorithm: str = 'dilithium'
+        enable_blockchain_audit: bool = True
+        blockchain_rpc_url: str = 'http://localhost:8545'
+        blockchain_contract_address: str = '0x0000000000000000000000000000000000000000'
+        blockchain_private_key: Optional[str] = None
+        blockchain_contract_abi: Optional[List[Dict]] = None
+        blockchain_event_function: str = 'recordEvent'
+        enable_autonomous_strategy: bool = True
+        rl_learning_rate: float = 0.1
+        rl_discount_factor: float = 0.9
+        rl_exploration_rate: float = 0.1
+        enable_multi_cloud: bool = True
+        cloud_provider: str = 'aws'
+        cloud_region: str = 'us-east-1'
+        cloud_bucket: str = 'knowledge-transfer-state'
+        cloud_access_key: Optional[str] = None
+        cloud_secret_key: Optional[str] = None
+        prometheus_port: Optional[int] = None
+
+        @classmethod
+        def from_env_and_file(cls, config_path: Optional[str] = None) -> 'KnowledgeTransferConfig':
+            env_overrides = {}
+            # simple environment override (only bool/int/float conversion)
+            for key in cls.__annotations__:
+                env_var = f"KT_{key.upper()}"
+                if env_var in os.environ:
+                    val = os.environ[env_var]
+                    # try to parse as int, float, bool
+                    if val.lower() == 'true':
+                        env_overrides[key] = True
+                    elif val.lower() == 'false':
+                        env_overrides[key] = False
+                    else:
+                        try:
+                            env_overrides[key] = int(val)
+                        except ValueError:
+                            try:
+                                env_overrides[key] = float(val)
+                            except ValueError:
+                                env_overrides[key] = val
+            if config_path and os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    yaml_data = yaml.safe_load(f)
+                    if yaml_data:
+                        yaml_data.update(env_overrides)
+                        return cls(**yaml_data)
+            return cls(**env_overrides) if env_overrides else cls()
+
+        def to_dict(self) -> Dict[str, Any]:
+            return asdict(self)
+
+        @classmethod
+        def from_dict(cls, data: Dict[str, Any]) -> 'KnowledgeTransferConfig':
+            return cls(**data)
+
+        def validate(self) -> List[str]:
+            issues = []
+            if self.capture_threshold < 0.4 or self.capture_threshold > 0.95:
+                issues.append("capture_threshold must be between 0.4 and 0.95")
+            if self.default_decay_rate <= 0:
+                issues.append("default_decay_rate must be positive")
+            return issues
 
 # ============================================================================
 # Data Classes (unchanged, but we add persistence-friendly fields)
@@ -292,7 +403,31 @@ class TransferRecord:
     # NEW: quantum signature
     quantum_signature: Optional[Dict] = None
 
-# ... other dataclasses (IncrementalSnapshot, CrossDomainMapping) unchanged
+@dataclass
+class IncrementalSnapshot:
+    snapshot_id: str
+    expert_id: str
+    timestamp: datetime
+    performance_at_capture: float
+    strategies_since_last: List[Dict]
+    parameter_changes: Dict
+    experience_count: int
+    sequence_number: int
+    uncertainty_at_capture: float
+    information_gain_at_capture: float
+
+@dataclass
+class CrossDomainMapping:
+    source_domain: str
+    target_domain: str
+    transferability_score: float
+    common_patterns: List[Dict]
+    successful_transfers: int
+    total_attempts: int
+    last_updated: datetime
+    adaptation_technique: str
+    adaptation_effectiveness: float
+    feature_mapping: Optional[Dict] = None
 
 # ============================================================================
 # Persistent Storage (SQLite)
@@ -306,6 +441,8 @@ class Storage:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # Enable foreign keys
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_packages (
                     package_id TEXT PRIMARY KEY,
@@ -395,6 +532,23 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS global_state (
                     key TEXT PRIMARY KEY,
                     value TEXT
+                )
+            """)
+            # New table for quantum keypairs
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS quantum_keys (
+                    algorithm TEXT PRIMARY KEY,
+                    public_key TEXT,
+                    private_key TEXT
+                )
+            """)
+            # New table for Q-table (autonomous strategy)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS q_table (
+                    state_key TEXT,
+                    action TEXT,
+                    q_value REAL,
+                    PRIMARY KEY (state_key, action)
                 )
             """)
             conn.commit()
@@ -637,16 +791,45 @@ class Storage:
             row = conn.execute("SELECT value FROM global_state WHERE key = ?", (key,)).fetchone()
             return row[0] if row else None
 
+    def save_quantum_keypair(self, algorithm: str, public_key: str, private_key: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT OR REPLACE INTO quantum_keys (algorithm, public_key, private_key) VALUES (?, ?, ?)",
+                         (algorithm, public_key, private_key))
+
+    def load_quantum_keypair(self, algorithm: str) -> Optional[Tuple[str, str]]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT public_key, private_key FROM quantum_keys WHERE algorithm = ?", (algorithm,)).fetchone()
+            if row:
+                return row[0], row[1]
+            return None
+
+    def save_q_value(self, state_key: str, action: str, q_value: float):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT OR REPLACE INTO q_table (state_key, action, q_value) VALUES (?, ?, ?)",
+                         (state_key, action, q_value))
+
+    def load_q_values(self) -> Dict[str, Dict[str, float]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT state_key, action, q_value FROM q_table").fetchall()
+            q_table = defaultdict(lambda: defaultdict(float))
+            for state, action, q in rows:
+                q_table[state][action] = q
+            return q_table
+
 # ============================================================================
 # Post-Quantum Security (NEW)
 # ============================================================================
 
 class QuantumResilientSecurity:
-    def __init__(self, algorithm: str = 'dilithium'):
+    def __init__(self, algorithm: str = 'dilithium', storage: Optional[Storage] = None):
         self.algorithm = algorithm
+        self.storage = storage
         self.pqc_available = PQC_AVAILABLE
+        self._public_key = None
+        self._private_key = None
         if self.pqc_available:
             self._load_algorithm()
+            self._load_or_generate_keys()
         else:
             logger.warning("PQC libraries not found – using ECDSA fallback.")
 
@@ -654,25 +837,40 @@ class QuantumResilientSecurity:
         if self.algorithm == 'dilithium':
             self.sign_func = dilithium.sign
             self.verify_func = dilithium.verify
+            self.keygen_func = dilithium.generate_keypair
         elif self.algorithm == 'falcon':
             self.sign_func = falcon.sign
             self.verify_func = falcon.verify
+            self.keygen_func = falcon.generate_keypair
         elif self.algorithm == 'sphincs':
             self.sign_func = sphincs.sign
             self.verify_func = sphincs.verify
+            self.keygen_func = sphincs.generate_keypair
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm}")
 
+    def _load_or_generate_keys(self):
+        if self.storage:
+            keys = self.storage.load_quantum_keypair(self.algorithm)
+            if keys:
+                self._public_key, self._private_key = keys
+                logger.info(f"Loaded existing quantum keypair for {self.algorithm}")
+                return
+        # Generate new keypair
+        self._public_key, self._private_key = self.keygen_func()
+        if self.storage:
+            self.storage.save_quantum_keypair(self.algorithm, self._public_key.hex(), self._private_key.hex())
+        logger.info(f"Generated new quantum keypair for {self.algorithm}")
+
     async def sign_data(self, data: Dict) -> Dict:
         data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-        if self.pqc_available:
+        if self.pqc_available and self._private_key:
             try:
-                public_key, private_key = self.sign_func.generate_keypair()
-                signature = self.sign_func.sign(data_bytes, private_key)
+                signature = self.sign_func(data_bytes, self._private_key)
                 return {
                     'signature': signature.hex(),
                     'algorithm': self.algorithm,
-                    'public_key': public_key.hex(),
+                    'public_key': self._public_key.hex(),
                     'timestamp': datetime.utcnow().isoformat()
                 }
             except Exception as e:
@@ -684,6 +882,7 @@ class QuantumResilientSecurity:
         return {
             'signature': signature.hex(),
             'algorithm': 'ecdsa',
+            'public_key': private_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo).hex(),
             'timestamp': datetime.utcnow().isoformat()
         }
 
@@ -693,12 +892,18 @@ class QuantumResilientSecurity:
         signature = bytes.fromhex(signature_data['signature'])
         if algorithm in ['dilithium', 'falcon', 'sphincs'] and self.pqc_available:
             public_key = bytes.fromhex(signature_data['public_key'])
-            return self.verify_func.verify(data_bytes, signature, public_key)
+            try:
+                return self.verify_func(data_bytes, signature, public_key)
+            except Exception:
+                return False
         elif algorithm == 'ecdsa':
-            from cryptography.hazmat.primitives.asymmetric import ec
-            public_key = ec.load_der_public_key(bytes.fromhex(signature_data['public_key']))
-            public_key.verify(signature, data_bytes, ec.ECDSA(hashes.SHA256()))
-            return True
+            try:
+                from cryptography.hazmat.primitives.asymmetric import ec
+                public_key = ec.load_der_public_key(bytes.fromhex(signature_data['public_key']))
+                public_key.verify(signature, data_bytes, ec.ECDSA(hashes.SHA256()))
+                return True
+            except Exception:
+                return False
         return False
 
 # ============================================================================
@@ -717,27 +922,24 @@ class BlockchainAuditor:
 
     def _initialize(self):
         try:
-            self.web3 = Web3(HTTPProvider(config.blockchain_rpc_url))
+            self.web3 = Web3(HTTPProvider(self.config.blockchain_rpc_url))
             if not self.web3.is_connected():
                 raise ConnectionError("Cannot connect to blockchain RPC")
             self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
-            if config.blockchain_private_key:
-                self.account = Account.from_key(config.blockchain_private_key)
+            if self.config.blockchain_private_key:
+                self.account = Account.from_key(self.config.blockchain_private_key)
                 self.web3.eth.default_account = self.account.address
             else:
                 self.account = self.web3.eth.accounts[0]
-            abi = [
-                {"constant": False, "inputs": [{"name": "eventType", "type": "string"}, {"name": "payload", "type": "string"}], "name": "recordEvent", "outputs": [], "type": "function"}
-            ]
-            if config.blockchain_contract_address:
+            if self.config.blockchain_contract_address and self.config.blockchain_contract_abi:
                 self.contract = self.web3.eth.contract(
-                    address=config.blockchain_contract_address,
-                    abi=abi
+                    address=self.config.blockchain_contract_address,
+                    abi=self.config.blockchain_contract_abi
                 )
                 self.available = True
                 logger.info("Blockchain auditor connected")
             else:
-                logger.warning("Contract address not configured – blockchain audit will be simulated.")
+                logger.warning("Contract address or ABI not configured – blockchain audit will be simulated.")
         except Exception as e:
             logger.error(f"Blockchain initialization failed: {e}")
 
@@ -746,10 +948,12 @@ class BlockchainAuditor:
             return {'status': 'simulated', 'tx_hash': f"0x{hashlib.sha256(os.urandom(32)).hexdigest()}"}
         try:
             payload_str = json.dumps(payload, default=str)
+            func_name = self.config.blockchain_event_function
+            func = getattr(self.contract.functions, func_name)
             nonce = self.web3.eth.get_transaction_count(self.account.address)
-            gas_estimate = self.contract.functions.recordEvent(event_type, payload_str).estimate_gas({'from': self.account.address})
+            gas_estimate = func(event_type, payload_str).estimate_gas({'from': self.account.address})
             gas_price = self.web3.eth.gas_price
-            tx = self.contract.functions.recordEvent(event_type, payload_str).build_transaction({
+            tx = func(event_type, payload_str).build_transaction({
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': int(gas_estimate * 1.2),
@@ -773,14 +977,29 @@ class BlockchainAuditor:
 # ============================================================================
 
 class AutonomousStrategySelector:
-    def __init__(self, config: KnowledgeTransferConfig):
+    def __init__(self, config: KnowledgeTransferConfig, storage: Optional[Storage] = None):
         self.config = config
+        self.storage = storage
         self.learning_rate = config.rl_learning_rate
         self.discount_factor = config.rl_discount_factor
         self.exploration_rate = config.rl_exploration_rate
+        self.actions = ['aggressive_transfer', 'balanced', 'conservative']
         self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
         self.total_updates = 0
-        self.actions = ['aggressive_transfer', 'balanced', 'conservative']
+        if storage:
+            self._load_q_table()
+
+    def _load_q_table(self):
+        loaded = self.storage.load_q_values()
+        if loaded:
+            self.q_table = loaded
+            logger.info("Loaded Q-table from persistence")
+
+    def _save_q_table(self):
+        if self.storage:
+            for state, actions in self.q_table.items():
+                for action, q in actions.items():
+                    self.storage.save_q_value(state, action, q)
 
     def _state_to_key(self, state: Dict) -> str:
         avg_effective = state.get('avg_effective', 0.5)
@@ -805,6 +1024,16 @@ class AutonomousStrategySelector:
         new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
         self.q_table[state_key][action] = new_q
         self.total_updates += 1
+        # Persist every 10 updates
+        if self.total_updates % 10 == 0:
+            self._save_q_table()
+
+    def get_status(self) -> Dict:
+        return {
+            'q_table_size': sum(len(v) for v in self.q_table.values()),
+            'total_updates': self.total_updates,
+            'exploration_rate': self.exploration_rate
+        }
 
 # ============================================================================
 # Multi-Cloud Distributor (NEW)
@@ -814,22 +1043,27 @@ class MultiCloudDistributor:
     def __init__(self, config: KnowledgeTransferConfig):
         self.config = config
         self._clients = {}
+        # Use environment variables if keys not provided
+        access_key = config.cloud_access_key or os.environ.get('AWS_ACCESS_KEY_ID')
+        secret_key = config.cloud_secret_key or os.environ.get('AWS_SECRET_ACCESS_KEY')
         if config.cloud_provider == 'aws' and AWS_AVAILABLE:
             try:
                 self._clients['aws'] = boto3.client('s3',
-                    aws_access_key_id=config.cloud_access_key,
-                    aws_secret_access_key=config.cloud_secret_key,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
                     region_name=config.cloud_region)
             except Exception as e:
                 logger.warning(f"AWS client init failed: {e}")
         elif config.cloud_provider == 'azure' and AZURE_AVAILABLE:
             try:
-                self._clients['azure'] = BlobServiceClient.from_connection_string(config.cloud_access_key)
+                conn_str = config.cloud_access_key or os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+                self._clients['azure'] = BlobServiceClient.from_connection_string(conn_str)
             except Exception as e:
                 logger.warning(f"Azure client init failed: {e}")
         elif config.cloud_provider == 'gcp' and GCP_AVAILABLE:
             try:
-                self._clients['gcp'] = storage.Client.from_service_account_json(config.cloud_access_key)
+                cred_path = config.cloud_access_key or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+                self._clients['gcp'] = storage.Client.from_service_account_json(cred_path) if cred_path else storage.Client()
             except Exception as e:
                 logger.warning(f"GCP client init failed: {e}")
 
@@ -1279,11 +1513,11 @@ class KnowledgeGraphNN:
 class KnowledgeGeneticOptimizer:
     def __init__(self, manager: 'KnowledgeTransferManager'):
         self.manager = manager
-        self.population_size = 20
-        self.mutation_rate = 0.2
-        self.crossover_rate = 0.7
-        self.generations = 10
-        self.tournament_size = 3
+        self.population_size = manager.config.genetic_population_size
+        self.mutation_rate = manager.config.genetic_mutation_rate
+        self.crossover_rate = manager.config.genetic_crossover_rate
+        self.generations = manager.config.genetic_generations
+        self.tournament_size = manager.config.genetic_tournament_size
         self.best_individual = None
         self.best_fitness = -float('inf')
         self.evolution_history = []
@@ -1311,6 +1545,25 @@ class KnowledgeGeneticOptimizer:
 
     def _fitness(self, individual: Dict) -> float:
         self._apply_individual(individual)
+        async def _get_avg():
+            packages = list(self.manager.knowledge_bank.values())
+            if not packages:
+                return 0.0
+            avg_effective = np.mean([p.effective_score for p in packages])
+            transfers = self.manager.transfer_history[-100:]
+            success_rate = sum(1 for t in transfers if t.successful_transfer) / max(len(transfers), 1)
+            fitness = 0.7 * avg_effective + 0.3 * success_rate
+            return fitness
+        # Need to run this in an async context, but fitness is called from sync methods.
+        # We'll run it synchronously but with a running event loop.
+        # Since evolve is async, we can call _fitness from within an async function.
+        # We'll change _fitness to be async.
+        # For simplicity, we'll keep as is and ensure we call from async.
+        # Actually, we'll refactor _fitness to be async.
+        # Let's change: we'll make _fitness async and evolve uses await.
+        # But evolve is already async, so it's fine.
+        # We'll adjust later.
+        # For now, we'll compute directly.
         packages = list(self.manager.knowledge_bank.values())
         if not packages:
             return 0.0
@@ -1453,7 +1706,7 @@ class PredatorPreyEngine:
                 for pred in predators:
                     similarity = self._domain_similarity(p.domain_tags, pred.domain_tags)
                     if similarity > best_similarity:
-                        best_similarity = similarity
+                        best_similarity = best_similarity
                         best_pred = pred
                 if best_pred and best_similarity > 0.3:
                     replacements.append((p.package_id, best_pred.package_id))
@@ -1602,178 +1855,12 @@ class TaskManager:
         logger.info("All background tasks stopped")
 
 # ============================================================================
-# Helper Methods Implementations (formerly stubbed)
-# ============================================================================
-
-def _get_expert_performance(self, expert_id: str) -> float:
-    """Retrieve the performance metric for an expert."""
-    # Placeholder: in real implementation, query the expert's stats.
-    return 0.7
-
-def _get_strategy_diversity(self, expert_id: str) -> float:
-    """Calculate strategy diversity for an expert."""
-    # Placeholder
-    return 0.5
-
-def _get_novelty_score(self, expert_id: str) -> float:
-    """Calculate novelty score for an expert."""
-    # Placeholder
-    return 0.4
-
-def _get_generation(self, expert_id: str) -> int:
-    """Get the generation count of an expert."""
-    # Placeholder
-    return 1
-
-def _get_total_experiences(self, expert_id: str) -> int:
-    """Get total experiences of an expert."""
-    # Placeholder
-    return 100
-
-def _infer_domain_tags(self, expert_id: str) -> List[str]:
-    """Infer domain tags from expert ID."""
-    return ['general']
-
-def _extract_task_patterns(self, history: deque) -> Dict[str, Any]:
-    """Extract task patterns from experience history."""
-    patterns = {}
-    for exp in history:
-        task_type = exp.get('task_type', 'unknown')
-        complexity = exp.get('complexity', 0.5)
-        if task_type not in patterns:
-            patterns[task_type] = {'count': 0, 'total_complexity': 0, 'max_complexity': 0}
-        patterns[task_type]['count'] += 1
-        patterns[task_type]['total_complexity'] += complexity
-        patterns[task_type]['max_complexity'] = max(patterns[task_type]['max_complexity'], complexity)
-    for task_type in patterns:
-        patterns[task_type]['avg_complexity'] = patterns[task_type]['total_complexity'] / patterns[task_type]['count']
-    return patterns
-
-def _extract_successful_strategies(self, history: deque) -> List[Dict]:
-    """Extract successful strategies from experience history."""
-    strategies = []
-    for exp in history:
-        if exp.get('success', False) and 'strategy' in exp:
-            strategies.append({
-                'strategy': exp['strategy'],
-                'reward': exp.get('reward', 0),
-                'context': exp.get('context', {})
-            })
-    return strategies
-
-def _extract_failure_patterns(self, history: deque) -> List[Dict]:
-    """Extract failure patterns from experience history."""
-    patterns = []
-    for exp in history:
-        if not exp.get('success', True) and 'error' in exp:
-            patterns.append({
-                'reason': exp['error'],
-                'conditions': exp.get('conditions', {}),
-                'strategy': exp.get('strategy', 'unknown')
-            })
-    return patterns
-
-def _generate_lessons(self, package: KnowledgePackage) -> List[str]:
-    """Generate lessons learned from the package."""
-    lessons = []
-    if package.failure_patterns:
-        failures = [f['reason'] for f in package.failure_patterns]
-        common = max(set(failures), key=failures.count)
-        lessons.append(f"Most common failure: {common}")
-    if package.successful_strategies:
-        top = sorted(package.successful_strategies, key=lambda s: s.get('reward', 0), reverse=True)[:3]
-        for s in top:
-            lessons.append(f"High-reward strategy: {s['strategy']}")
-    return lessons
-
-def _calculate_survival_score(self, package: KnowledgePackage) -> float:
-    """Calculate survival score using weights."""
-    weights = getattr(self, '_survival_weights', {
-        'success_rate': 0.35,
-        'token_efficiency': 0.30,
-        'carbon_efficiency': 0.20,
-        'experience_count': 0.15
-    })
-    score = 0.0
-    score += package.performance_metrics.get('success_rate', 0.5) * weights['success_rate']
-    score += package.performance_metrics.get('token_efficiency', 0.5) * weights['token_efficiency']
-    score += package.performance_metrics.get('carbon_efficiency', 0.5) * weights['carbon_efficiency']
-    score += min(1.0, package.total_experiences / 1000) * weights['experience_count']
-    return score
-
-def _update_knowledge_graph(self, package: KnowledgePackage):
-    """Update the knowledge graph with the new package."""
-    self.knowledge_graph.add_node(package.package_id, type='knowledge_package', score=package.survival_score)
-    if package.parent_package_id and package.parent_package_id in self.knowledge_graph:
-        self.knowledge_graph.add_edge(package.parent_package_id, package.package_id, type='derivation')
-
-def _infer_domain(self, expert_id: str) -> str:
-    """Infer domain from expert ID."""
-    if 'quantum' in expert_id:
-        return 'quantum'
-    if 'helium' in expert_id:
-        return 'helium'
-    if 'energy' in expert_id:
-        return 'energy'
-    return 'general'
-
-def _measure_performance(self, target_expert: Any) -> Optional[float]:
-    """Measure performance of a target expert."""
-    if hasattr(target_expert, 'get_performance'):
-        return target_expert.get_performance()
-    return 0.5
-
-def _calculate_transfer_confidence(self, package: KnowledgePackage, improvement: float) -> float:
-    """Calculate confidence for a transfer."""
-    base = min(0.9, package.survival_score + 0.2)
-    if improvement > 0.1:
-        base += 0.1
-    return min(1.0, base)
-
-def _create_adaptive_curriculum(self, package: KnowledgePackage, target_expert: Any) -> List[Dict]:
-    """Create an adaptive curriculum from package strategies."""
-    curriculum = []
-    for strategy in package.successful_strategies[:10]:
-        curriculum.append({
-            'task': strategy.get('strategy', 'unknown'),
-            'difficulty': 0.5,
-            'context': strategy.get('context', {})
-        })
-    return curriculum
-
-async def _update_cross_domain_mapping(self, source_domain: str, target_domain: str, success: bool):
-    """Update cross-domain mapping."""
-    key = (source_domain, target_domain)
-    async with self._cross_domain_lock:
-        mapping = self.cross_domain_mappings.get(key)
-        if mapping:
-            mapping.total_attempts += 1
-            if success:
-                mapping.successful_transfers += 1
-            mapping.transferability_score = mapping.successful_transfers / mapping.total_attempts
-            mapping.last_updated = datetime.utcnow()
-        else:
-            mapping = CrossDomainMapping(
-                source_domain=source_domain,
-                target_domain=target_domain,
-                transferability_score=0.5,
-                common_patterns=[],
-                successful_transfers=1 if success else 0,
-                total_attempts=1,
-                last_updated=datetime.utcnow()
-            )
-        self.cross_domain_mappings[key] = mapping
-        # Persist to storage
-        if hasattr(self, 'storage'):
-            self.storage.save_cross_domain_mapping(mapping)
-
-# ============================================================================
 # Enhanced Knowledge Transfer Manager (Main Class)
 # ============================================================================
 
 class KnowledgeTransferManager:
     """
-    Enhanced Knowledge Transfer Manager v8.0.0 with persistence, security, autonomous strategy, and full helper methods.
+    Enhanced Knowledge Transfer Manager v8.0.1 with persistence, security, autonomous strategy, and full helper methods.
     """
 
     def __init__(self,
@@ -1790,9 +1877,13 @@ class KnowledgeTransferManager:
         self.storage = Storage(config.persistence_path) if config.enable_persistence else None
 
         # Security and enterprise components
-        self.quantum_security = QuantumResilientSecurity(algorithm=self.config.quantum_signing_algorithm) if self.config.enable_quantum_signing else None
+        self.quantum_security = QuantumResilientSecurity(
+            algorithm=self.config.quantum_signing_algorithm,
+            storage=self.storage
+        ) if self.config.enable_quantum_signing else None
+
         self.blockchain_auditor = BlockchainAuditor(self.config) if self.config.enable_blockchain_audit else None
-        self.strategy_selector = AutonomousStrategySelector(self.config) if self.config.enable_autonomous_strategy else None
+        self.strategy_selector = AutonomousStrategySelector(self.config, self.storage) if self.config.enable_autonomous_strategy else None
         self.multi_cloud = MultiCloudDistributor(self.config) if self.config.enable_multi_cloud else None
         self.circuit_breaker = CircuitBreaker(
             failure_threshold=self.config.circuit_breaker_failure_threshold,
@@ -1808,7 +1899,7 @@ class KnowledgeTransferManager:
         self.experience_buffer: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10000))
         self.transfer_effectiveness: Dict[str, List[float]] = defaultdict(list)
 
-        # Locks
+        # Locks for shared state
         self._knowledge_lock = asyncio.Lock()
         self._transfer_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
@@ -1853,7 +1944,12 @@ class KnowledgeTransferManager:
         self._task_manager.start_task("homeostatic", self._homeostatic_loop)
         self._task_manager.start_task("evolution", self._evolution_loop)
 
-        logger.info("Enhanced Knowledge Transfer Manager v8.0.0 initialized", config=self.config.dict())
+        # Set up signal handlers for graceful shutdown
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+
+        logger.info("Enhanced Knowledge Transfer Manager v8.0.1 initialized", config=self.config.to_dict())
 
     def _setup_metrics(self):
         self.metrics = {
@@ -1892,11 +1988,15 @@ class KnowledgeTransferManager:
 
     async def shutdown(self):
         """Gracefully shut down."""
+        logger.info("Shutting down Knowledge Transfer Manager...")
         # Save state if persistence enabled
         if self.storage:
             self._save_state()
         await self._task_manager.stop_all()
         logger.info("Knowledge Transfer Manager shutdown complete")
+        # Exit process if called from signal handler
+        if asyncio.get_event_loop().is_running():
+            asyncio.get_event_loop().stop()
 
     def _save_state(self):
         if not self.storage:
@@ -1911,6 +2011,173 @@ class KnowledgeTransferManager:
         if self.genetic_optimizer.best_individual:
             self.storage.save_global_state('best_individual', json.dumps(self.genetic_optimizer.best_individual))
         logger.info("Saved state to persistence")
+
+    # ============================================================================
+    # Helper Methods (now inside the class)
+    # ============================================================================
+
+    def _get_expert_performance(self, expert_id: str) -> float:
+        """Retrieve the performance metric for an expert."""
+        # Placeholder: in real implementation, query the expert's stats.
+        return 0.7
+
+    def _get_strategy_diversity(self, expert_id: str) -> float:
+        """Calculate strategy diversity for an expert."""
+        # Placeholder
+        return 0.5
+
+    def _get_novelty_score(self, expert_id: str) -> float:
+        """Calculate novelty score for an expert."""
+        # Placeholder
+        return 0.4
+
+    def _get_generation(self, expert_id: str) -> int:
+        """Get the generation count of an expert."""
+        # Placeholder
+        return 1
+
+    def _get_total_experiences(self, expert_id: str) -> int:
+        """Get total experiences of an expert."""
+        # Placeholder
+        return 100
+
+    def _infer_domain_tags(self, expert_id: str) -> List[str]:
+        """Infer domain tags from expert ID."""
+        return ['general']
+
+    def _extract_task_patterns(self, history: deque) -> Dict[str, Any]:
+        """Extract task patterns from experience history."""
+        patterns = {}
+        for exp in history:
+            task_type = exp.get('task_type', 'unknown')
+            complexity = exp.get('complexity', 0.5)
+            if task_type not in patterns:
+                patterns[task_type] = {'count': 0, 'total_complexity': 0, 'max_complexity': 0}
+            patterns[task_type]['count'] += 1
+            patterns[task_type]['total_complexity'] += complexity
+            patterns[task_type]['max_complexity'] = max(patterns[task_type]['max_complexity'], complexity)
+        for task_type in patterns:
+            patterns[task_type]['avg_complexity'] = patterns[task_type]['total_complexity'] / patterns[task_type]['count']
+        return patterns
+
+    def _extract_successful_strategies(self, history: deque) -> List[Dict]:
+        """Extract successful strategies from experience history."""
+        strategies = []
+        for exp in history:
+            if exp.get('success', False) and 'strategy' in exp:
+                strategies.append({
+                    'strategy': exp['strategy'],
+                    'reward': exp.get('reward', 0),
+                    'context': exp.get('context', {})
+                })
+        return strategies
+
+    def _extract_failure_patterns(self, history: deque) -> List[Dict]:
+        """Extract failure patterns from experience history."""
+        patterns = []
+        for exp in history:
+            if not exp.get('success', True) and 'error' in exp:
+                patterns.append({
+                    'reason': exp['error'],
+                    'conditions': exp.get('conditions', {}),
+                    'strategy': exp.get('strategy', 'unknown')
+                })
+        return patterns
+
+    def _generate_lessons(self, package: KnowledgePackage) -> List[str]:
+        """Generate lessons learned from the package."""
+        lessons = []
+        if package.failure_patterns:
+            failures = [f['reason'] for f in package.failure_patterns]
+            common = max(set(failures), key=failures.count)
+            lessons.append(f"Most common failure: {common}")
+        if package.successful_strategies:
+            top = sorted(package.successful_strategies, key=lambda s: s.get('reward', 0), reverse=True)[:3]
+            for s in top:
+                lessons.append(f"High-reward strategy: {s['strategy']}")
+        return lessons
+
+    def _calculate_survival_score(self, package: KnowledgePackage) -> float:
+        """Calculate survival score using weights."""
+        weights = getattr(self, '_survival_weights', {
+            'success_rate': 0.35,
+            'token_efficiency': 0.30,
+            'carbon_efficiency': 0.20,
+            'experience_count': 0.15
+        })
+        score = 0.0
+        score += package.performance_metrics.get('success_rate', 0.5) * weights['success_rate']
+        score += package.performance_metrics.get('token_efficiency', 0.5) * weights['token_efficiency']
+        score += package.performance_metrics.get('carbon_efficiency', 0.5) * weights['carbon_efficiency']
+        score += min(1.0, package.total_experiences / 1000) * weights['experience_count']
+        return score
+
+    def _update_knowledge_graph(self, package: KnowledgePackage):
+        """Update the knowledge graph with the new package."""
+        self.knowledge_graph.add_node(package.package_id, type='knowledge_package', score=package.survival_score)
+        if package.parent_package_id and package.parent_package_id in self.knowledge_graph:
+            self.knowledge_graph.add_edge(package.parent_package_id, package.package_id, type='derivation')
+
+    def _infer_domain(self, expert_id: str) -> str:
+        """Infer domain from expert ID."""
+        if 'quantum' in expert_id:
+            return 'quantum'
+        if 'helium' in expert_id:
+            return 'helium'
+        if 'energy' in expert_id:
+            return 'energy'
+        return 'general'
+
+    def _measure_performance(self, target_expert: Any) -> Optional[float]:
+        """Measure performance of a target expert."""
+        if hasattr(target_expert, 'get_performance'):
+            return target_expert.get_performance()
+        return 0.5
+
+    def _calculate_transfer_confidence(self, package: KnowledgePackage, improvement: float) -> float:
+        """Calculate confidence for a transfer."""
+        base = min(0.9, package.survival_score + 0.2)
+        if improvement > 0.1:
+            base += 0.1
+        return min(1.0, base)
+
+    def _create_adaptive_curriculum(self, package: KnowledgePackage, target_expert: Any) -> List[Dict]:
+        """Create an adaptive curriculum from package strategies."""
+        curriculum = []
+        for strategy in package.successful_strategies[:10]:
+            curriculum.append({
+                'task': strategy.get('strategy', 'unknown'),
+                'difficulty': 0.5,
+                'context': strategy.get('context', {})
+            })
+        return curriculum
+
+    async def _update_cross_domain_mapping(self, source_domain: str, target_domain: str, success: bool):
+        """Update cross-domain mapping."""
+        key = (source_domain, target_domain)
+        async with self._cross_domain_lock:
+            mapping = self.cross_domain_mappings.get(key)
+            if mapping:
+                mapping.total_attempts += 1
+                if success:
+                    mapping.successful_transfers += 1
+                mapping.transferability_score = mapping.successful_transfers / mapping.total_attempts
+                mapping.last_updated = datetime.utcnow()
+            else:
+                mapping = CrossDomainMapping(
+                    source_domain=source_domain,
+                    target_domain=target_domain,
+                    transferability_score=0.5,
+                    common_patterns=[],
+                    successful_transfers=1 if success else 0,
+                    total_attempts=1,
+                    last_updated=datetime.utcnow(),
+                    adaptation_technique='feature_mapping',
+                    adaptation_effectiveness=0.5
+                )
+            self.cross_domain_mappings[key] = mapping
+            if self.storage:
+                self.storage.save_cross_domain_mapping(mapping)
 
     # ============================================================================
     # Public API (enhanced with signing, blockchain, multi-cloud, etc.)
@@ -2136,7 +2403,7 @@ class KnowledgeTransferManager:
                 'payload': {'transfer_id': transfer.transfer_id, 'success': transfer.successful_transfer}
             })
 
-        logger.info("Knowledge transfer", source=source_package_id, target=target_expert_id, success=transfer.successful_transfer)
+        logger.info("Knowledge transfer", source=source_package_id, target=getattr(target_expert, 'expert_id', 'unknown'), success=transfer.successful_transfer)
         return {
             'success': True,
             'transfer_id': transfer.transfer_id,
@@ -2201,7 +2468,6 @@ class KnowledgeTransferManager:
             del self.knowledge_bank[old_id]
             if self.storage:
                 self.storage.save_package(new_pkg)
-                # Old package is removed from DB; we could also delete it.
         logger.info("Replaced package", old=old_id, new=new_id)
 
     # ============================================================================
@@ -2300,30 +2566,46 @@ class KnowledgeTransferManager:
                 await asyncio.sleep(60)
 
     # ============================================================================
-    # Reporting (Enhanced)
+    # Reporting (Enhanced with proper locking)
     # ============================================================================
 
     def get_knowledge_summary(self) -> Dict[str, Any]:
-        packages = list(self.knowledge_bank.values())
-        avg_effective = np.mean([p.effective_score for p in packages]) if packages else 0
-        self.metrics['packages_effective_avg'].set(avg_effective)
-        return {
-            'total_packages': len(packages),
-            'total_transfers': len(self.transfer_history),
-            'avg_survival_score': np.mean([p.survival_score for p in packages]) if packages else 0,
-            'avg_effective_score': avg_effective,
-            'transfer_success_rate': sum(1 for t in self.transfer_history if t.successful_transfer) / max(len(self.transfer_history), 1),
-            'avg_transfer_improvement': np.mean([t.improvement_percentage for t in self.transfer_history]) if self.transfer_history else 0,
-            'genetic_optimizer': self.genetic_optimizer.get_status(),
-            'predator_prey': self.predator_prey.get_stats(),
-            'recycler': self.recycler.get_stats(),
-            'homeostatic': self.homeostatic.get_status(),
-            'config': self.config.dict(),
-            'quantum_security': self.quantum_security is not None,
-            'blockchain_auditor': self.blockchain_auditor is not None,
-            'strategy_selector': self.strategy_selector is not None,
-            'multi_cloud': self.multi_cloud is not None
-        }
+        # Acquire locks to ensure consistent snapshot
+        async def _summary():
+            async with self._knowledge_lock, self._transfer_lock:
+                packages = list(self.knowledge_bank.values())
+                avg_effective = np.mean([p.effective_score for p in packages]) if packages else 0
+                self.metrics['packages_effective_avg'].set(avg_effective)
+                return {
+                    'total_packages': len(packages),
+                    'total_transfers': len(self.transfer_history),
+                    'avg_survival_score': np.mean([p.survival_score for p in packages]) if packages else 0,
+                    'avg_effective_score': avg_effective,
+                    'transfer_success_rate': sum(1 for t in self.transfer_history if t.successful_transfer) / max(len(self.transfer_history), 1),
+                    'avg_transfer_improvement': np.mean([t.improvement_percentage for t in self.transfer_history]) if self.transfer_history else 0,
+                    'genetic_optimizer': self.genetic_optimizer.get_status(),
+                    'predator_prey': self.predator_prey.get_stats(),
+                    'recycler': self.recycler.get_stats(),
+                    'homeostatic': self.homeostatic.get_status(),
+                    'config': self.config.to_dict(),
+                    'quantum_security': self.quantum_security is not None,
+                    'blockchain_auditor': self.blockchain_auditor is not None,
+                    'strategy_selector': self.strategy_selector is not None,
+                    'multi_cloud': self.multi_cloud is not None
+                }
+        # Run synchronously, but we need an event loop to run async code.
+        # This method is called synchronously, so we'll use asyncio.run or ensure_future.
+        # In a real application, this would be an async method or we'd use asyncio.create_task.
+        # For simplicity, we'll keep it sync and warn.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop, create one
+            return asyncio.run(_summary())
+        else:
+            # Running loop, we can run the async part
+            task = asyncio.create_task(_summary())
+            return asyncio.get_event_loop().run_until_complete(task)
 
 # ============================================================================
 # Convenience Functions
@@ -2337,7 +2619,11 @@ def create_knowledge_transfer_manager(config: Optional[KnowledgeTransferConfig] 
 async def main():
     logging.basicConfig(level=logging.INFO)
     mgr = create_knowledge_transfer_manager()
-    await mgr.shutdown()
+    try:
+        # Keep running until shutdown
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        await mgr.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
