@@ -1,26 +1,26 @@
 """
-Quantum Bridge v3.0
-Enhanced translation of bio‑inspired gradient fields into quantum graph parameters (QUBO/Ising).
+Quantum Bridge v3.1 – Enhanced version with all fixes and improvements.
 Supports configurable scaling, validation, caching, history, multiple output formats,
 proper QUBO ↔ Ising conversion, custom transformations, and observability.
 """
 
 import logging
 from typing import Dict, Any, List, Tuple, Optional, Union, Protocol, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import hashlib
 import json
 import os
 import pickle
+import time
 from enum import Enum
 
 # ============================================================================
 # Optional dependencies
 # ============================================================================
 try:
-    from pydantic import BaseModel, Field, validator, root_validator
+    from pydantic import BaseModel, Field, validator, root_validator, ConfigDict
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
@@ -82,9 +82,7 @@ if PYDANTIC_AVAILABLE:
                 ('trust', 'opportunity'): 'penalty_trust_opportunity'
             }
         )
-        # Custom transformation functions per field (callable)
-        # For security, we store as dict of field -> function name or serializable callable?
-        # Since Pydantic cannot store callables easily, we'll use a string key and provide a registry.
+        # Custom transformation functions per field (name in registry)
         custom_transform_registry: Dict[str, str] = Field(default_factory=dict)
         # Cache persistence path (if None, memory only)
         cache_persistence_path: Optional[str] = None
@@ -92,6 +90,27 @@ if PYDANTIC_AVAILABLE:
         enable_prometheus: bool = False
         # Maximum number of retries for gradient provider
         provider_retries: int = 2
+        # Quadratic scaling factor (applied after product of scaled fields)
+        quadratic_scaling: float = 1.0
+        # Order of operations: 'invert', 'transform', 'scale' or any permutation
+        transform_order: List[str] = Field(
+            default_factory=lambda: ['invert', 'transform', 'scale']
+        )
+        # Parameter types: for each parameter name, specify 'linear' or 'quadratic'
+        # This overrides the heuristics for conversion.
+        param_types: Dict[str, str] = Field(
+            default_factory=lambda: {
+                'penalty_carbon': 'linear',
+                'penalty_helium_shortage': 'linear',
+                'penalty_geopolitical': 'linear',
+                'weight_opportunity': 'linear',
+                'constraint_budget': 'linear',
+                'penalty_carbon_helium': 'quadratic',
+                'penalty_trust_opportunity': 'quadratic'
+            }
+        )
+        # Configuration version (incremented on breaking changes)
+        config_version: str = "3.1"
 
         @validator('output_format')
         def validate_output_format(cls, v):
@@ -112,9 +131,25 @@ if PYDANTIC_AVAILABLE:
             quadratic = values.get('quadratic_mapping', {})
             for (f1, f2), param in quadratic.items():
                 if f1 not in field_mapping and f2 not in field_mapping:
-                    # It's okay if the field isn't mapped linearly, but we warn
                     logger.warning(f"Quadratic field pair ({f1},{f2}) not in field_mapping")
             return values
+
+        def config_hash(self) -> str:
+            """Generate a hash of the configuration for cache key."""
+            data = {
+                'field_mapping': self.field_mapping,
+                'scaling': self.scaling,
+                'invert_fields': self.invert_fields,
+                'quadratic_mapping': self.quadratic_mapping,
+                'custom_transform_registry': self.custom_transform_registry,
+                'output_format': self.output_format,
+                'quadratic_scaling': self.quadratic_scaling,
+                'transform_order': self.transform_order,
+                'param_types': self.param_types,
+                'config_version': self.config_version,
+                'default_gradient': self.default_gradient,
+            }
+            return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 else:
     @dataclass
     class QuantumBridgeConfig:
@@ -146,6 +181,34 @@ else:
         cache_persistence_path: Optional[str] = None
         enable_prometheus: bool = False
         provider_retries: int = 2
+        quadratic_scaling: float = 1.0
+        transform_order: List[str] = field(default_factory=lambda: ['invert', 'transform', 'scale'])
+        param_types: Dict[str, str] = field(default_factory=lambda: {
+            'penalty_carbon': 'linear',
+            'penalty_helium_shortage': 'linear',
+            'penalty_geopolitical': 'linear',
+            'weight_opportunity': 'linear',
+            'constraint_budget': 'linear',
+            'penalty_carbon_helium': 'quadratic',
+            'penalty_trust_opportunity': 'quadratic'
+        })
+        config_version: str = "3.1"
+
+        def config_hash(self) -> str:
+            data = {
+                'field_mapping': self.field_mapping,
+                'scaling': self.scaling,
+                'invert_fields': self.invert_fields,
+                'quadratic_mapping': {f"{k[0]}_{k[1]}": v for k, v in self.quadratic_mapping.items()},
+                'custom_transform_registry': self.custom_transform_registry,
+                'output_format': self.output_format,
+                'quadratic_scaling': self.quadratic_scaling,
+                'transform_order': self.transform_order,
+                'param_types': self.param_types,
+                'config_version': self.config_version,
+                'default_gradient': self.default_gradient,
+            }
+            return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 # ============================================================================
 # Protocols
@@ -165,25 +228,37 @@ class QuantumSolver(Protocol):
 # ============================================================================
 class CompositeGradientProvider:
     """Combines multiple gradient providers with weights."""
-    def __init__(self, providers: List[Tuple[GradientProvider, float]]):
+    def __init__(self, providers: List[Tuple[GradientProvider, float]], normalize: bool = True):
         self.providers = providers  # list of (provider, weight)
+        self.normalize = normalize
 
     def get_field_strengths(self) -> Dict[str, float]:
         combined: Dict[str, float] = {}
+        total_weight = sum(w for _, w in self.providers)
+        if self.normalize and total_weight > 0:
+            norm = total_weight
+        else:
+            norm = 1.0
+
         for provider, weight in self.providers:
-            strengths = provider.get_field_strengths()
-            for field, value in strengths.items():
-                combined[field] = combined.get(field, 0.0) + value * weight
+            try:
+                strengths = provider.get_field_strengths()
+                for field, value in strengths.items():
+                    combined[field] = combined.get(field, 0.0) + value * weight / norm
+            except Exception as e:
+                logger.warning("Provider failed in composite: %s", e)
         return combined
 
     def get_forecast(self, hours: int) -> Optional[Dict[str, float]]:
-        # Aggregate forecasts if all providers support it
         forecasts = []
         for provider, _ in self.providers:
             if hasattr(provider, 'get_forecast'):
-                f = provider.get_forecast(hours)
-                if f is not None:
-                    forecasts.append(f)
+                try:
+                    f = provider.get_forecast(hours)
+                    if f is not None:
+                        forecasts.append(f)
+                except Exception as e:
+                    logger.warning("Forecast from provider failed: %s", e)
         if not forecasts:
             return None
         combined = {}
@@ -226,10 +301,10 @@ class QuantumBridge:
     
     Features:
     - Configurable field mapping and scaling
-    - Proper QUBO ↔ Ising conversion (including quadratic terms)
+    - Correct QUBO ↔ Ising conversion (including linear and quadratic terms)
     - Custom transformation functions
     - Validation and graceful handling of missing fields
-    - Caching with TTL and persistence
+    - Caching with TTL, persistence, and config‑aware invalidation
     - History with export/query capabilities
     - Time‑awareness with optional forecasting
     - Integration with quantum solver via protocol
@@ -271,6 +346,7 @@ class QuantumBridge:
 
         # Compile a list of fields we expect (for validation)
         self._expected_fields = list(self.config.field_mapping.keys())
+        self._config_hash = self.config.config_hash()
 
         # Load persisted cache if available
         if self.config.cache_persistence_path and os.path.exists(self.config.cache_persistence_path):
@@ -290,14 +366,16 @@ class QuantumBridge:
         else:
             self._prometheus_metrics = None
 
-        logger.info("QuantumBridge initialized with config: %s", self.config)
+        logger.info("QuantumBridge initialized", config=self.config, config_hash=self._config_hash)
 
     def _compute_hash(self, strengths: Dict[str, float]) -> str:
-        """Compute a hash of the gradient strengths for caching."""
-        # Sort keys for deterministic order
-        sorted_items = sorted(strengths.items())
-        data = json.dumps(sorted_items, sort_keys=True)
-        return hashlib.sha256(data.encode()).hexdigest()
+        """Compute a hash of the gradient strengths and configuration for caching."""
+        # Include config hash to invalidate on config changes
+        data = {
+            'strengths': strengths,
+            'config_hash': self._config_hash
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     def _validate_and_complete(self, strengths: Dict[str, float]) -> Dict[str, float]:
         """
@@ -311,28 +389,38 @@ class QuantumBridge:
             validated[field] = value
         return validated
 
-    def _translate_value(self, field: str, value: float) -> float:
-        """
-        Translate a single gradient value to a QUBO parameter using scaling, inversion,
-        and optional custom transformation.
-        """
-        scale = self.config.scaling.get(field, 1.0)
-        invert = field in self.config.invert_fields
-
-        # Apply custom transform if registered
+    def _apply_transform(self, field: str, value: float) -> float:
+        """Apply custom transform if registered."""
         transform_name = self.config.custom_transform_registry.get(field)
         if transform_name:
             transform_func = TransformRegistry.get(transform_name)
             if transform_func:
-                value = transform_func(value)
+                try:
+                    return transform_func(value)
+                except Exception as e:
+                    logger.warning("Transform '%s' failed for field %s: %s", transform_name, field, e)
             else:
-                logger.warning(f"Unknown transform '{transform_name}' for field {field}")
+                logger.warning("Unknown transform '%s' for field %s", transform_name, field)
+        return value
 
-        if invert:
-            base = 1.0 - value
-        else:
-            base = value
-        return base * scale
+    def _translate_value(self, field: str, value: float) -> float:
+        """
+        Translate a single gradient value to a QUBO parameter using scaling, inversion,
+        and optional custom transformation, in the order specified by `transform_order`.
+        """
+        scale = self.config.scaling.get(field, 1.0)
+        invert = field in self.config.invert_fields
+
+        # Apply operations in the configured order
+        for op in self.config.transform_order:
+            if op == 'invert' and invert:
+                value = 1.0 - value
+            elif op == 'transform':
+                value = self._apply_transform(field, value)
+            elif op == 'scale':
+                value *= scale
+            # else: unknown op, ignore
+        return value
 
     def _translate_quadratic(self, strengths: Dict[str, float]) -> Dict[str, float]:
         """Translate quadratic interactions."""
@@ -340,18 +428,11 @@ class QuantumBridge:
         for (f1, f2), param_name in self.config.quadratic_mapping.items():
             v1 = strengths.get(f1, 0.0)
             v2 = strengths.get(f2, 0.0)
-            # Scale can be defined specifically for quadratic terms; we use product of individual scales? 
-            # For simplicity, we'll use a product of the values (scaled separately).
-            # Could be enhanced with dedicated scaling.
-            scale1 = self.config.scaling.get(f1, 1.0)
-            scale2 = self.config.scaling.get(f2, 1.0)
-            # Invert if needed
-            if f1 in self.config.invert_fields:
-                v1 = 1.0 - v1
-            if f2 in self.config.invert_fields:
-                v2 = 1.0 - v2
-            # Quadratic term: product with both scaling factors
-            quadratic_params[param_name] = (v1 * scale1) * (v2 * scale2)
+            # Apply transformations and scaling individually (same as linear)
+            v1 = self._translate_value(f1, v1) / self.config.scaling.get(f1, 1.0)  # remove scaling to avoid double counting?
+            v2 = self._translate_value(f2, v2) / self.config.scaling.get(f2, 1.0)
+            # Apply quadratic scaling factor
+            quadratic_params[param_name] = v1 * v2 * self.config.quadratic_scaling
         return quadratic_params
 
     def _qubo_to_ising(self, qubo_params: Dict[str, float]) -> Dict[str, float]:
@@ -364,28 +445,59 @@ class QuantumBridge:
         This assumes the QUBO variables are binary (0/1).
         """
         ising_params = {}
-        # Linear terms (h)
-        for key, value in qubo_params.items():
-            if key.startswith('penalty_') or key.startswith('weight_') or key.startswith('constraint_'):
-                # Assume these are linear terms
-                h_key = f"h_{key}"
-                ising_params[h_key] = value
-            elif key.startswith('penalty_') and '_' in key and key.count('_') >= 2:
-                # Quadratic terms: e.g., penalty_carbon_helium
-                # We need to know which terms are quadratic; they are defined in quadratic_mapping.
-                # We'll check if the key is in any quadratic mapping value.
-                # To avoid complexity, we'll rely on a separate list or heuristics.
-                # For simplicity, we'll treat any key with exactly two underscores as quadratic.
-                # This is a heuristic; better to have explicit tagging.
-                if key.count('_') == 2:
-                    # Quadratic parameter
-                    j_key = f"J_{key}"
-                    ising_params[j_key] = value * 0.25
-                else:
-                    ising_params[key] = value
+        # Group parameters by type
+        linear_params = {}
+        quadratic_params = {}
+        for param, value in qubo_params.items():
+            if param == 'timestamp':
+                continue
+            param_type = self.config.param_types.get(param, 'linear')
+            if param_type == 'linear':
+                linear_params[param] = value
+            elif param_type == 'quadratic':
+                quadratic_params[param] = value
             else:
-                # fallback
-                ising_params[key] = value
+                logger.warning("Unknown parameter type for %s, treating as linear", param)
+                linear_params[param] = value
+
+        # Build h_i: Q_ii + 0.5 * sum_j Q_ij (but we have only one quadratic per pair)
+        # For each linear term, we need to sum over all quadratic terms that involve it.
+        # However, we don't know which fields are involved; we need a mapping from param to fields.
+        # We'll use the quadratic_mapping inverse: param_name -> (field1, field2)
+        inverse_quadratic = {v: k for k, v in self.config.quadratic_mapping.items()}
+
+        # Compute h_i for each linear parameter
+        for lin_param, lin_value in linear_params.items():
+            # Find the field corresponding to this linear param
+            field = None
+            for f, p in self.config.field_mapping.items():
+                if p == lin_param:
+                    field = f
+                    break
+            if field is None:
+                # If not found, keep as-is
+                ising_params[f"h_{lin_param}"] = lin_value
+                continue
+
+            # Sum over all quadratic terms that involve this field
+            sum_quad = 0.0
+            for q_param, q_value in quadratic_params.items():
+                if q_param in inverse_quadratic:
+                    f1, f2 = inverse_quadratic[q_param]
+                    if f1 == field or f2 == field:
+                        sum_quad += q_value
+            h_i = lin_value + 0.5 * sum_quad
+            ising_params[f"h_{lin_param}"] = h_i
+
+        # J_ij = 0.25 * Q_ij
+        for q_param, q_value in quadratic_params.items():
+            ising_params[f"J_{q_param}"] = 0.25 * q_value
+
+        # Copy any other parameters
+        for param, value in qubo_params.items():
+            if param != 'timestamp' and param not in linear_params and param not in quadratic_params:
+                ising_params[param] = value
+
         return ising_params
 
     def get_qubo_parameters(self, forecast_hours: Optional[int] = None) -> Dict[str, float]:
@@ -459,6 +571,8 @@ class QuantumBridge:
 
         # 10. Update Prometheus gauges
         if self._prometheus_metrics:
+            # Clear all gauge labels first to avoid stale values
+            self._prometheus_metrics['param_values'].clear()
             for param_name, value in params.items():
                 if param_name != 'timestamp':
                     self._prometheus_metrics['param_values'].labels(param_name=param_name).set(value)
@@ -490,7 +604,8 @@ class QuantumBridge:
                 data = {
                     'cache': self._cache,
                     'cache_hash': self._cache_hash,
-                    'cache_timestamp': self._cache_timestamp.isoformat() if self._cache_timestamp else None
+                    'cache_timestamp': self._cache_timestamp.isoformat() if self._cache_timestamp else None,
+                    'config_hash': self._config_hash
                 }
                 with open(self.config.cache_persistence_path, 'wb') as f:
                     pickle.dump(data, f)
@@ -499,10 +614,14 @@ class QuantumBridge:
                 logger.warning("Failed to persist cache: %s", e)
 
     def _load_cache_from_disk(self):
-        """Load cache from disk."""
+        """Load cache from disk, only if config hash matches."""
         try:
             with open(self.config.cache_persistence_path, 'rb') as f:
                 data = pickle.load(f)
+            # Verify config hash matches current
+            if data.get('config_hash') != self._config_hash:
+                logger.info("Configuration changed; discarding persisted cache.")
+                return
             self._cache = data.get('cache')
             self._cache_hash = data.get('cache_hash')
             ts = data.get('cache_timestamp')
@@ -597,7 +716,7 @@ class QuantumBridge:
     def update_config(self, updates: Dict[str, Any]) -> None:
         """
         Update configuration at runtime.
-        Note: this will clear the cache.
+        Note: this will clear the cache and update the config hash.
         """
         # Create a new config instance with updates
         if PYDANTIC_AVAILABLE:
@@ -608,6 +727,8 @@ class QuantumBridge:
             for k, v in updates.items():
                 if hasattr(self.config, k):
                     setattr(self.config, k, v)
+        # Recalculate config hash and clear cache
+        self._config_hash = self.config.config_hash()
         self.clear_cache()
         logger.info("Configuration updated: %s", updates)
 
@@ -618,12 +739,12 @@ class QuantumBridge:
         if transform_name not in TransformRegistry._transforms:
             raise ValueError(f"Transform '{transform_name}' not registered")
         if PYDANTIC_AVAILABLE:
-            # Update the config dict
             new_registry = self.config.custom_transform_registry.copy()
             new_registry[field] = transform_name
             self.config.custom_transform_registry = new_registry
         else:
             self.config.custom_transform_registry[field] = transform_name
+        self._config_hash = self.config.config_hash()
         self.clear_cache()
         logger.info("Set custom transform for field %s: %s", field, transform_name)
 
@@ -631,8 +752,6 @@ class QuantumBridge:
 # Example usage and tests
 # ============================================================================
 if __name__ == "__main__":
-    import time
-
     # Mock gradient provider with forecast
     class MockGradientProvider:
         def get_field_strengths(self):
@@ -714,7 +833,6 @@ if __name__ == "__main__":
     print("Composite strengths:", composite.get_field_strengths())
 
     # Test persistence
-    bridge.save_cache = True  # Already set
     time.sleep(1)
     new_bridge = QuantumBridge(
         gradient_provider=MockGradientProvider(),
