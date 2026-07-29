@@ -1,4 +1,4 @@
-# anomaly_detection.py (or anomaly_detection/__init__.py)
+# anomaly_detection.py (Enhanced)
 """
 Enhanced Anomaly Detection for Sustainability Metrics
 ======================================================
@@ -20,6 +20,7 @@ ENHANCEMENTS OVER v1.0:
 - Alert routing via webhooks.
 - Integration callbacks for AdaptiveCostFunction, PredictiveMaintenance, etc.
 - Unit test stubs.
+- Fixed config handling, added node‑level locks, improved error handling.
 """
 
 import asyncio
@@ -33,7 +34,7 @@ import hashlib
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Callable, Tuple, Union
+from typing import Dict, List, Any, Optional, Callable, Tuple, Union, Awaitable
 import numpy as np
 
 # ---------- Pydantic ----------
@@ -74,10 +75,17 @@ except ImportError:
 # ---------- FastAPI ----------
 try:
     from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
+
+# ---------- aiohttp for webhooks ----------
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 # ---------- Structlog ----------
 try:
@@ -265,10 +273,15 @@ class TelemetryBuffer:
 # ============================================================================
 class PersistenceManager:
     """Stores telemetry and trained models in SQLite."""
-    def __init__(self, config: 'AnomalyConfig'):
+    def __init__(self, config: Union['AnomalyConfig', Dict[str, Any]]):
         self.config = config
-        self.db_path = config.persistence_path
-        self.model_path = config.model_save_path
+        # If config is Pydantic, convert to dict
+        if hasattr(config, 'dict'):
+            self.config_dict = config.dict()
+        else:
+            self.config_dict = config
+        self.db_path = self.config_dict.get('persistence_path', './anomaly_state.db')
+        self.model_path = self.config_dict.get('model_save_path', './models/')
         os.makedirs(self.model_path, exist_ok=True)
         self._init_db()
 
@@ -344,7 +357,7 @@ class PersistenceManager:
             model.__class__.__name__,
             model_blob,
             time.time(),
-            json.dumps(self.config.dict() if hasattr(self.config, 'dict') else self.config)
+            json.dumps(self.config_dict)
         ))
         conn.commit()
         conn.close()
@@ -368,10 +381,10 @@ class PersistenceManager:
 # ============================================================================
 class BaseAnomalyModel:
     """Abstract base for anomaly detection models."""
-    def __init__(self, config: 'AnomalyConfig'):
+    def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.is_trained = False
-        self.feature_names = config.metrics_features
+        self.feature_names = config.get('metrics_features', [])
 
     def train(self, data: np.ndarray) -> None:
         raise NotImplementedError
@@ -389,10 +402,10 @@ class BaseAnomalyModel:
 
 class IsolationForestModel(BaseAnomalyModel):
     """Isolation Forest wrapper."""
-    def __init__(self, config: AnomalyConfig):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.model = None
-        self.contamination = config.contamination
+        self.contamination = config.get('contamination', 0.05)
 
     def train(self, data: np.ndarray) -> None:
         if data.shape[0] < 10:
@@ -432,10 +445,10 @@ class IsolationForestModel(BaseAnomalyModel):
 
 class OnlineSVM(BaseAnomalyModel):
     """Online One-Class SVM using SGD."""
-    def __init__(self, config: AnomalyConfig):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.model = None
-        self.nu = config.contamination
+        self.nu = config.get('contamination', 0.05)
         self.initialized = False
 
     def train(self, data: np.ndarray) -> None:
@@ -472,11 +485,11 @@ class OnlineSVM(BaseAnomalyModel):
 
 class AutoencoderModel(BaseAnomalyModel):
     """Simple autoencoder using PyTorch."""
-    def __init__(self, config: AnomalyConfig):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.model = None
         self.input_dim = None
-        self.hidden_dims = config.autoencoder_hidden
+        self.hidden_dims = config.get('autoencoder_hidden', [16, 8, 16])
         self.reconstruction_threshold = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.encoder = None
@@ -563,9 +576,9 @@ class AutoencoderModel(BaseAnomalyModel):
 
 class ThresholdModel(BaseAnomalyModel):
     """Simple threshold‑based anomaly detection using rolling mean and std."""
-    def __init__(self, config: AnomalyConfig):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.threshold_multiplier = config.energy_spike_threshold
+        self.threshold_multiplier = config.get('energy_spike_threshold', 2.0)
         self.means = None
         self.stds = None
 
@@ -611,15 +624,12 @@ class AnomalyDetector:
 
     def __init__(self, config: Optional[Union['AnomalyConfig', Dict]] = None):
         if config is None:
-            config = ANOMALY_CONFIG
-        if isinstance(config, dict):
-            # Try to load as Pydantic if available, else use dict
-            if PYDANTIC_AVAILABLE:
-                self.config = AnomalyConfig(**config)
-            else:
-                self.config = config
+            config = ANOMALY_CONFIG.copy() if isinstance(ANOMALY_CONFIG, dict) else ANOMALY_CONFIG
+        # Convert to dict for uniform access
+        if hasattr(config, 'dict'):
+            self.config = config.dict()
         else:
-            self.config = config
+            self.config = config.copy() if isinstance(config, dict) else dict(config)
 
         # Persistence
         self.persistence = None
@@ -627,7 +637,7 @@ class AnomalyDetector:
             self.persistence = PersistenceManager(self.config)
 
         # Buffer
-        self.buffer = TelemetryBuffer(self.config.get("window_size", 100), self.persistence)
+        self.buffer = TelemetryBuffer(self.config.get('window_size', 100), self.persistence)
 
         # Models
         self.models: Dict[str, BaseAnomalyModel] = {}  # node_id -> model
@@ -637,9 +647,11 @@ class AnomalyDetector:
         self.persistent_anomaly_count: Dict[str, int] = {}
         # Concept drift tracking
         self.drift_scores: Dict[str, deque] = {}
+        # Per-node locks
+        self._node_locks: Dict[str, asyncio.Lock] = {}
 
         # Model factory
-        model_type = self.config.get("model_type", "isolation_forest")
+        model_type = self.config.get('model_type', 'isolation_forest')
         if model_type == "isolation_forest":
             self.ModelClass = IsolationForestModel
         elif model_type == "autoencoder":
@@ -650,11 +662,11 @@ class AnomalyDetector:
             self.ModelClass = ThresholdModel
 
         # External integration hooks
-        self.alert_callback: Optional[Callable[[AnomalyEvent], None]] = None
-        self.auto_response_callback: Optional[Callable[[AnomalyEvent], None]] = None
-        self.evolutionary_engine_callback: Optional[Callable[[str, float], None]] = None
-        self.adaptive_cost_callback: Optional[Callable[[float], None]] = None
-        self.predictive_maintenance_callback: Optional[Callable[[str, float], None]] = None
+        self.alert_callback: Optional[Callable[[AnomalyEvent], Any]] = None
+        self.auto_response_callback: Optional[Callable[[AnomalyEvent], Any]] = None
+        self.evolutionary_engine_callback: Optional[Callable[[str, float], Any]] = None
+        self.adaptive_cost_callback: Optional[Callable[[float], Any]] = None
+        self.predictive_maintenance_callback: Optional[Callable[[str, float], Any]] = None
 
         # Prometheus metrics
         if PROMETHEUS_AVAILABLE:
@@ -672,19 +684,19 @@ class AnomalyDetector:
         logger.info("Enhanced AnomalyDetector initialized with config: %s", self.config)
 
     # Callback registration
-    def register_alert_callback(self, callback: Callable[[AnomalyEvent], None]):
+    def register_alert_callback(self, callback: Callable[[AnomalyEvent], Any]):
         self.alert_callback = callback
 
-    def register_auto_response_callback(self, callback: Callable[[AnomalyEvent], None]):
+    def register_auto_response_callback(self, callback: Callable[[AnomalyEvent], Any]):
         self.auto_response_callback = callback
 
-    def register_evolutionary_engine_callback(self, callback: Callable[[str, float], None]):
+    def register_evolutionary_engine_callback(self, callback: Callable[[str, float], Any]):
         self.evolutionary_engine_callback = callback
 
-    def register_adaptive_cost_callback(self, callback: Callable[[float], None]):
+    def register_adaptive_cost_callback(self, callback: Callable[[float], Any]):
         self.adaptive_cost_callback = callback
 
-    def register_predictive_maintenance_callback(self, callback: Callable[[str, float], None]):
+    def register_predictive_maintenance_callback(self, callback: Callable[[str, float], Any]):
         self.predictive_maintenance_callback = callback
 
     # ----- Model management -----
@@ -704,6 +716,7 @@ class AnomalyDetector:
             self.models[node_id] = model
             self.anomaly_history[node_id] = []
             self.drift_scores[node_id] = deque(maxlen=100)
+            self._node_locks[node_id] = asyncio.Lock()
         return self.models[node_id]
 
     def _should_retrain(self, node_id: str) -> bool:
@@ -711,7 +724,7 @@ class AnomalyDetector:
         if node_id not in self.last_training:
             return True
         elapsed = time.time() - self.last_training[node_id]
-        return elapsed > self.config.get("retrain_interval_seconds", 3600)
+        return elapsed > self.config.get('retrain_interval_seconds', 3600)
 
     def _update_model(self, node_id: str, data: np.ndarray) -> None:
         """Train or retrain the model for a node if conditions met."""
@@ -730,7 +743,7 @@ class AnomalyDetector:
     # ----- Missing data imputation -----
     def _impute_missing(self, metrics: Dict[str, float], node_id: str) -> Dict[str, float]:
         """Fill missing values with forward fill from history."""
-        features = self.config.get("metrics_features", [])
+        features = self.config.get('metrics_features', [])
         imputed = {}
         for feat in features:
             if feat in metrics and metrics[feat] is not None:
@@ -750,7 +763,7 @@ class AnomalyDetector:
     # ----- Concept drift detection -----
     def _check_concept_drift(self, node_id: str, reconstruction_error: float) -> bool:
         """Check if reconstruction error distribution has shifted."""
-        if not self.config.get("concept_drift_enabled", True):
+        if not self.config.get('concept_drift_enabled', True):
             return False
         if node_id not in self.drift_scores:
             self.drift_scores[node_id] = deque(maxlen=100)
@@ -760,7 +773,7 @@ class AnomalyDetector:
         scores = list(self.drift_scores[node_id])
         mean = np.mean(scores)
         std = np.std(scores)
-        if reconstruction_error > mean + self.config.get("drift_threshold_multiplier", 2.0) * std:
+        if reconstruction_error > mean + self.config.get('drift_threshold_multiplier', 2.0) * std:
             logger.warning(f"Concept drift detected for node {node_id}, retraining model")
             return True
         return False
@@ -776,7 +789,7 @@ class AnomalyDetector:
         metrics = self._impute_missing(metrics, node_id)
 
         # Filter to configured features
-        features = self.config.get("metrics_features", ["energy_joules", "carbon_kg", "helium_usage", "latency_ms", "accuracy"])
+        features = self.config.get('metrics_features', ["energy_joules", "carbon_kg", "helium_usage", "latency_ms", "accuracy"])
         filtered_metrics = {k: v for k, v in metrics.items() if k in features}
 
         # Update buffer (and persistence)
@@ -807,7 +820,7 @@ class AnomalyDetector:
         prediction = model.predict(latest_reshaped)[0]
 
         # Check for concept drift (reconstruction error for autoencoder)
-        if self.config.get("concept_drift_enabled", True) and isinstance(model, AutoencoderModel):
+        if self.config.get('concept_drift_enabled', True) and isinstance(model, AutoencoderModel):
             # Compute reconstruction error for latest
             data_tensor = torch.tensor(latest_reshaped, dtype=torch.float32).to(model.device)
             model.model.eval()
@@ -823,7 +836,7 @@ class AnomalyDetector:
 
         # Anomaly detection
         if prediction == 1:
-            event = self._create_event(node_id, filtered_metrics, model)
+            event = self._create_event(node_id, filtered_metrics, model, prediction)
             self._handle_anomaly(event)
             # Record metrics
             if PROMETHEUS_AVAILABLE:
@@ -832,14 +845,20 @@ class AnomalyDetector:
             return event
         else:
             # Reset persistent count if normal
-            if node_id in self.persistent_anomaly_count:
+            async with self._get_node_lock(node_id):
                 self.persistent_anomaly_count[node_id] = 0
             return None
 
-    # ----- Event creation and handling (unchanged but enhanced) -----
-    def _create_event(self, node_id: str, metrics: Dict[str, float], model: BaseAnomalyModel) -> AnomalyEvent:
+    def _get_node_lock(self, node_id: str) -> asyncio.Lock:
+        """Get or create a lock for a node."""
+        if node_id not in self._node_locks:
+            self._node_locks[node_id] = asyncio.Lock()
+        return self._node_locks[node_id]
+
+    # ----- Event creation and handling -----
+    def _create_event(self, node_id: str, metrics: Dict[str, float], model: BaseAnomalyModel, prediction: int) -> AnomalyEvent:
         """Create an AnomalyEvent object with explanation."""
-        features = self.config.get("metrics_features", [])
+        features = self.config.get('metrics_features', [])
         # Determine which metric is most anomalous
         if isinstance(model, ThresholdModel):
             means = model.means
@@ -851,10 +870,10 @@ class AnomalyDetector:
                 metric_name = features[idx]
                 metric_value = metrics.get(metric_name, 0.0)
             else:
-                metric_name = features[0]
+                metric_name = features[0] if features else "unknown"
                 metric_value = metrics.get(metric_name, 0.0)
         else:
-            metric_name = features[0]
+            metric_name = features[0] if features else "unknown"
             metric_value = metrics.get(metric_name, 0.0)
 
         # Anomaly score: for Isolation Forest, -1 normal, 1 anomaly
@@ -862,7 +881,7 @@ class AnomalyDetector:
 
         # Generate explanation
         explanation = None
-        if self.config.get("enable_explanation", True):
+        if self.config.get('enable_explanation', True):
             try:
                 latest = self.buffer.get_latest(node_id, features)
                 latest_reshaped = latest.reshape(1, -1)
@@ -886,67 +905,84 @@ class AnomalyDetector:
     def _handle_anomaly(self, event: AnomalyEvent) -> None:
         """Process an anomaly: alert, auto‑response, evolutionary feedback, and callbacks."""
         node_id = event.node_id
-        self.persistent_anomaly_count[node_id] = self.persistent_anomaly_count.get(node_id, 0) + 1
+        # Use per-node lock to avoid race conditions
+        lock = self._get_node_lock(node_id)
+        async def _locked_handle():
+            async with lock:
+                self.persistent_anomaly_count[node_id] = self.persistent_anomaly_count.get(node_id, 0) + 1
 
-        # Send alert (respect cooldown)
-        now = time.time()
-        if node_id in self.alert_cooldown and (now - self.alert_cooldown[node_id]) < self.config.get("alert_cooldown_seconds", 300):
-            event.alert_sent = False
-        else:
-            event.alert_sent = True
-            self.alert_cooldown[node_id] = now
-            if self.alert_callback:
-                self.alert_callback(event)
-            else:
-                logger.warning(f"ALERT: {event.description}")
+                # Send alert (respect cooldown)
+                now = time.time()
+                if node_id in self.alert_cooldown and (now - self.alert_cooldown[node_id]) < self.config.get('alert_cooldown_seconds', 300):
+                    event.alert_sent = False
+                else:
+                    event.alert_sent = True
+                    self.alert_cooldown[node_id] = now
+                    if self.alert_callback:
+                        self._safe_call_callback(self.alert_callback, event)
+                    else:
+                        logger.warning(f"ALERT: {event.description}")
 
-        # Trigger auto‑response if configured
-        if self.config.get("auto_reroute_on_anomaly", True):
-            event.auto_response_taken = "reroute"
-            if self.auto_response_callback:
-                self.auto_response_callback(event)
-            else:
-                logger.info(f"AUTO‑REROUTE for {node_id} due to anomaly.")
-        elif (self.config.get("auto_restart_on_persistent", True) and
-              self.persistent_anomaly_count[node_id] >= self.config.get("persistent_anomaly_threshold", 3)):
-            event.auto_response_taken = "restart"
-            if self.auto_response_callback:
-                self.auto_response_callback(event)
-            else:
-                logger.info(f"AUTO‑RESTART for {node_id} due to persistent anomalies.")
-            self.persistent_anomaly_count[node_id] = 0
+                # Trigger auto‑response if configured
+                if self.config.get('auto_reroute_on_anomaly', True):
+                    event.auto_response_taken = "reroute"
+                    if self.auto_response_callback:
+                        self._safe_call_callback(self.auto_response_callback, event)
+                    else:
+                        logger.info(f"AUTO‑REROUTE for {node_id} due to anomaly.")
+                elif (self.config.get('auto_restart_on_persistent', True) and
+                      self.persistent_anomaly_count[node_id] >= self.config.get('persistent_anomaly_threshold', 3)):
+                    event.auto_response_taken = "restart"
+                    if self.auto_response_callback:
+                        self._safe_call_callback(self.auto_response_callback, event)
+                    else:
+                        logger.info(f"AUTO‑RESTART for {node_id} due to persistent anomalies.")
+                    self.persistent_anomaly_count[node_id] = 0
 
-        # Feed anomaly information to EvolutionaryEngine (pruning)
-        if self.evolutionary_engine_callback:
-            severity = event.anomaly_score
-            self.evolutionary_engine_callback(node_id, severity)
-        else:
-            logger.debug(f"EvolutionaryEngine feedback for {node_id}: severity={event.anomaly_score}")
+                # Feed anomaly information to EvolutionaryEngine (pruning)
+                if self.evolutionary_engine_callback:
+                    severity = event.anomaly_score
+                    self._safe_call_callback(self.evolutionary_engine_callback, node_id, severity)
+                else:
+                    logger.debug(f"EvolutionaryEngine feedback for {node_id}: severity={event.anomaly_score}")
 
-        # Additional callbacks
-        if self.adaptive_cost_callback:
-            # Pass anomaly severity to adjust weights
-            self.adaptive_cost_callback(event.anomaly_score)
-        if self.predictive_maintenance_callback:
-            # Trigger predictive maintenance analysis
-            self.predictive_maintenance_callback(node_id, event.anomaly_score)
+                # Additional callbacks
+                if self.adaptive_cost_callback:
+                    # Pass anomaly severity to adjust weights
+                    self._safe_call_callback(self.adaptive_cost_callback, event.anomaly_score)
+                if self.predictive_maintenance_callback:
+                    # Trigger predictive maintenance analysis
+                    self._safe_call_callback(self.predictive_maintenance_callback, node_id, event.anomaly_score)
 
-        # Store in history
-        if node_id not in self.anomaly_history:
-            self.anomaly_history[node_id] = []
-        self.anomaly_history[node_id].append(event)
-        if len(self.anomaly_history[node_id]) > 100:
-            self.anomaly_history[node_id] = self.anomaly_history[node_id][-100:]
+                # Store in history
+                if node_id not in self.anomaly_history:
+                    self.anomaly_history[node_id] = []
+                self.anomaly_history[node_id].append(event)
+                if len(self.anomaly_history[node_id]) > 100:
+                    self.anomaly_history[node_id] = self.anomaly_history[node_id][-100:]
 
-        # Send webhook if configured
-        webhook_url = self.config.get("webhook_url")
-        if webhook_url:
-            asyncio.create_task(self._send_webhook(event, webhook_url))
+                # Send webhook if configured
+                webhook_url = self.config.get('webhook_url')
+                if webhook_url:
+                    asyncio.create_task(self._send_webhook(event, webhook_url))
+
+        asyncio.create_task(_locked_handle())
+
+    def _safe_call_callback(self, callback: Callable, *args, **kwargs):
+        """Call a callback safely, supporting both sync and async."""
+        try:
+            result = callback(*args, **kwargs)
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+        except Exception as e:
+            logger.error("Callback execution failed", error=str(e))
 
     async def _send_webhook(self, event: AnomalyEvent, url: str):
         """Send anomaly event to a webhook URL."""
         try:
-            import aiohttp
+            if not AIOHTTP_AVAILABLE:
+                logger.warning("aiohttp not installed; cannot send webhook.")
+                return
             payload = {
                 'event': 'anomaly_detected',
                 'node_id': event.node_id,
@@ -968,7 +1004,7 @@ class AnomalyDetector:
     async def load_persisted_data(self, node_id: str):
         """Load historical telemetry from DB into buffer."""
         if self.persistence:
-            self.buffer.load_from_persistence(node_id, self.config.get("metrics_features", []))
+            self.buffer.load_from_persistence(node_id, self.config.get('metrics_features', []))
 
     def get_anomaly_history(self, node_id: str, limit: int = 100) -> List[AnomalyEvent]:
         return self.anomaly_history.get(node_id, [])[-limit:]
@@ -983,6 +1019,13 @@ class AnomalyDetector:
             "last_training": self.last_training.get(node_id, 0),
             "buffer_size": sum(len(q) for q in self.buffer.buffers.get(node_id, {}).values()) if node_id in self.buffer.buffers else 0,
         }
+
+    async def shutdown(self):
+        """Save models and close persistence."""
+        if self.persistence:
+            for node_id, model in self.models.items():
+                self.persistence.save_model(node_id, model)
+        logger.info("AnomalyDetector shutdown complete.")
 
 # ============================================================================
 # 7. INTEGRATION WITH TELEMETRYCOLLECTOR (async)
@@ -1001,16 +1044,30 @@ class TelemetryCollector:
         self.is_running = False
         logger.info("TelemetryCollector stopped.")
 
-    async def receive_telemetry(self, node_id: str, metrics: Dict[str, float]):
+    async def receive_telemetry(self, node_id: str, metrics: Dict[str, float]) -> Optional[AnomalyEvent]:
         """Async receive telemetry."""
         if not self.is_running:
             logger.warning("TelemetryCollector not running; ignoring sample.")
-            return
+            return None
         event = await self.detector.ingest(node_id, metrics)
         return event
 
 # ============================================================================
-# 8. CONVENIENCE FACTORY
+# 8. STUB COMPONENTS FOR INTEGRATION (AlertEscalation, EvolutionaryEngine)
+# ============================================================================
+class AlertEscalationSystem:
+    """Stub for alert escalation."""
+    async def send_alert(self, event: AnomalyEvent):
+        logger.info(f"AlertEscalationSystem: {event.description}")
+        # In real implementation, send via email/Slack/PagerDuty
+
+class EvolutionaryEngine:
+    """Stub for evolutionary engine that prunes based on anomalies."""
+    async def receive_anomaly_feedback(self, node_id: str, severity: float):
+        logger.info(f"EvolutionaryEngine: node {node_id} severity {severity}")
+
+# ============================================================================
+# 9. CONVENIENCE FACTORY
 # ============================================================================
 def create_anomaly_detection_system(config: Optional[Union[Dict, 'AnomalyConfig']] = None) -> Dict[str, Any]:
     """
@@ -1020,7 +1077,7 @@ def create_anomaly_detection_system(config: Optional[Union[Dict, 'AnomalyConfig'
         if PYDANTIC_AVAILABLE:
             config = AnomalyConfig()
         else:
-            config = ANOMALY_CONFIG
+            config = ANOMALY_CONFIG.copy()
 
     detector = AnomalyDetector(config)
     telemetry_collector = TelemetryCollector(detector)
@@ -1045,11 +1102,15 @@ def create_anomaly_detection_system(config: Optional[Union[Dict, 'AnomalyConfig'
     }
 
 # ============================================================================
-# 9. REST API (FastAPI) – Optional
+# 10. REST API (FastAPI) – Optional
 # ============================================================================
 if FASTAPI_AVAILABLE:
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
+    from fastapi.responses import Response
+
     app = FastAPI(title="Anomaly Detection API", version="2.0.0")
     detector: Optional[AnomalyDetector] = None
+    REGISTRY = CollectorRegistry() if PROMETHEUS_AVAILABLE else None
 
     @app.get("/metrics")
     async def get_metrics():
@@ -1087,23 +1148,28 @@ if FASTAPI_AVAILABLE:
         if PYDANTIC_AVAILABLE:
             config = AnomalyConfig()
         else:
-            config = ANOMALY_CONFIG
+            config = ANOMALY_CONFIG.copy()
         detector = AnomalyDetector(config)
         logger.info("FastAPI startup complete")
 
     @app.on_event("shutdown")
     async def shutdown():
         if detector:
-            # Save models/state if needed
-            pass
+            await detector.shutdown()
         logger.info("FastAPI shutdown complete")
 
 # ============================================================================
-# 10. UNIT TEST STUBS (pytest)
+# 11. UNIT TEST STUBS (pytest)
 # ============================================================================
 def test_anomaly_detector():
     """Example test stub."""
-    config = AnomalyConfig(model_type="threshold", window_size=10)
+    # Create a config with a simple threshold model
+    if PYDANTIC_AVAILABLE:
+        config = AnomalyConfig(model_type="threshold", window_size=10)
+    else:
+        config = ANOMALY_CONFIG.copy()
+        config["model_type"] = "threshold"
+        config["window_size"] = 10
     detector = AnomalyDetector(config)
     # Simulate data
     for i in range(20):
@@ -1116,7 +1182,7 @@ def test_anomaly_detector():
     assert event.metric_name == "energy_joules"
 
 # ============================================================================
-# 11. EXAMPLE USAGE (if run directly)
+# 12. EXAMPLE USAGE (if run directly)
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
@@ -1127,8 +1193,10 @@ if __name__ == "__main__":
         if PYDANTIC_AVAILABLE:
             config = AnomalyConfig(model_type="online_svm", window_size=20, persistence_enabled=False)
         else:
-            config = ANOMALY_CONFIG
+            config = ANOMALY_CONFIG.copy()
             config["model_type"] = "online_svm"
+            config["window_size"] = 20
+            config["persistence_enabled"] = False
 
         detector = AnomalyDetector(config)
 
