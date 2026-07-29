@@ -1,17 +1,17 @@
 # src/enhancements/data_integration/bio_parameter_catalog.py
 """
-Enhanced Bio‑Parameter Catalog v2.0.0
+Enhanced Bio‑Parameter Catalog v2.1.0
 ======================================
 Curated catalog of organism‑like efficiency profiles for bio‑inspired modules.
 
 Features:
-- Pydantic‑validated configuration and data models.
-- Versioning and schema migration.
+- Pydantic‑validated configuration and data models (with fallback dataclasses).
+- Versioning and schema migration (with migration function).
 - File watching (optional) for hot‑reload.
 - CRUD operations (add, update, delete, list, search).
-- Export/import to JSON.
-- Metadata (version, last_updated, source).
-- Thread‑safe caching with TTL.
+- Export/import to JSON with proper datetime handling.
+- Metadata (version, last_updated, source, hash).
+- Thread‑safe caching with TTL (via LRU cache).
 - Comprehensive docstrings.
 - Integration with Green_Agent’s bio‑inspired modules.
 """
@@ -20,9 +20,11 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
-from datetime import datetime
+from typing import Dict, List, Optional, Any, Union, Tuple
+from datetime import datetime, timezone
 import hashlib
+import logging
+from collections import OrderedDict
 
 # ---------- Pydantic ----------
 try:
@@ -32,11 +34,10 @@ except ImportError:
     PYDANTIC_AVAILABLE = False
 
 # ---------- Logging ----------
-import logging
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Data Models (Pydantic)
+# Data Models (Pydantic or dataclass fallback)
 # ============================================================================
 if PYDANTIC_AVAILABLE:
     class OrganismProfile(BaseModel):
@@ -54,17 +55,18 @@ if PYDANTIC_AVAILABLE:
             return v
 
     class CatalogMetadata(BaseModel):
-        version: str = "2.0.0"
-        last_updated: datetime = Field(default_factory=datetime.utcnow)
+        version: str = "2.1.0"
+        last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
         source: str = "manual"
         hash: Optional[str] = None
 
     class BioParameterCatalogData(BaseModel):
         metadata: CatalogMetadata = Field(default_factory=CatalogMetadata)
         organism_types: Dict[str, OrganismProfile] = Field(default_factory=dict)
+
 else:
-    # Fallback using dicts
-    from dataclasses import dataclass
+    # Fallback using dataclasses
+    from dataclasses import dataclass, field
 
     @dataclass
     class OrganismProfile:
@@ -73,17 +75,25 @@ else:
         carbon_fixation_rate: float = 0.5
         helium_affinity: float = 0.5
 
+        def __post_init__(self):
+            # Validate range
+            for attr in ['photosynthetic_efficiency', 'resilience_to_stress', 'carbon_fixation_rate', 'helium_affinity']:
+                val = getattr(self, attr)
+                if not 0 <= val <= 1:
+                    raise ValueError(f"{attr} must be between 0 and 1")
+
     @dataclass
     class CatalogMetadata:
-        version: str = "2.0.0"
-        last_updated: datetime = None
+        version: str = "2.1.0"
+        last_updated: Optional[datetime] = field(default_factory=lambda: datetime.now(timezone.utc))
         source: str = "manual"
         hash: Optional[str] = None
 
+    @dataclass
     class BioParameterCatalogData:
-        def __init__(self, metadata=None, organism_types=None):
-            self.metadata = metadata or CatalogMetadata()
-            self.organism_types = organism_types or {}
+        metadata: CatalogMetadata = field(default_factory=CatalogMetadata)
+        organism_types: Dict[str, OrganismProfile] = field(default_factory=dict)
+
 
 # ============================================================================
 # File Watcher (optional)
@@ -122,10 +132,10 @@ class FileWatcher:
                 logger.error("FileWatcher error", error=str(e))
             time.sleep(self.interval)
 
+
 # ============================================================================
 # Enhanced BioParameterCatalog
 # ============================================================================
-
 class BioParameterCatalog:
     """
     Enhanced catalog of organism‑like efficiency profiles with validation,
@@ -176,13 +186,24 @@ class BioParameterCatalog:
                     self._data = BioParameterCatalogData(**raw)
                 except ValidationError as e:
                     logger.error("Validation failed, using defaults", error=str(e))
-                    self._data = BioParameterCatalogData()
+                    self._reset_to_defaults()
             else:
                 # Fallback: convert dicts to objects
-                metadata = CatalogMetadata(**raw.get('metadata', {}))
+                metadata_dict = raw.get('metadata', {})
+                # Convert last_updated string to datetime if present
+                if 'last_updated' in metadata_dict and isinstance(metadata_dict['last_updated'], str):
+                    try:
+                        metadata_dict['last_updated'] = datetime.fromisoformat(metadata_dict['last_updated'])
+                    except ValueError:
+                        # If parsing fails, use now
+                        metadata_dict['last_updated'] = datetime.now(timezone.utc)
+                metadata = CatalogMetadata(**metadata_dict)
                 organism_types = {}
                 for k, v in raw.get('organism_types', {}).items():
-                    organism_types[k] = OrganismProfile(**v)
+                    try:
+                        organism_types[k] = OrganismProfile(**v)
+                    except ValueError as e:
+                        logger.warning(f"Invalid profile for {k}, skipping: {e}")
                 self._data = BioParameterCatalogData(metadata, organism_types)
         else:
             # Create default catalog
@@ -212,8 +233,8 @@ class BioParameterCatalog:
             ),
         }
         metadata = CatalogMetadata(
-            version="2.0.0",
-            last_updated=datetime.utcnow(),
+            version="2.1.0",
+            last_updated=datetime.now(timezone.utc),
             source="default",
             hash=self._compute_hash(default_organisms),
         )
@@ -228,8 +249,13 @@ class BioParameterCatalog:
     def save(self):
         """Save the current catalog to disk."""
         with self._lock:
+            # Update metadata
+            self._data.metadata.last_updated = datetime.now(timezone.utc)
+            self._data.metadata.hash = self._compute_hash(self._data.organism_types)
+
+            # Prepare data for serialization
             if PYDANTIC_AVAILABLE:
-                data = self._data.dict()
+                data = self._data.model_dump(mode='json')
             else:
                 # Convert objects to dict
                 data = {
@@ -249,15 +275,25 @@ class BioParameterCatalog:
                         for k, v in self._data.organism_types.items()
                     }
                 }
-            # Update metadata
-            self._data.metadata.last_updated = datetime.utcnow()
-            self._data.metadata.hash = self._compute_hash(self._data.organism_types)
             with open(self.catalog_path, 'w') as f:
                 json.dump(data, f, indent=2)
 
     def _compute_hash(self, organism_types: Dict) -> str:
         """Compute a hash of the organism types for change detection."""
-        content = json.dumps(organism_types, sort_keys=True)
+        # Convert organism profiles to serializable dicts
+        if PYDANTIC_AVAILABLE:
+            serializable = {k: v.model_dump() for k, v in organism_types.items()}
+        else:
+            serializable = {
+                k: {
+                    "photosynthetic_efficiency": v.photosynthetic_efficiency,
+                    "resilience_to_stress": v.resilience_to_stress,
+                    "carbon_fixation_rate": v.carbon_fixation_rate,
+                    "helium_affinity": v.helium_affinity,
+                }
+                for k, v in organism_types.items()
+            }
+        content = json.dumps(serializable, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     # ---------- Public query methods ----------
@@ -275,7 +311,7 @@ class BioParameterCatalog:
             profile = self._data.organism_types.get(organism_type)
             if profile:
                 if PYDANTIC_AVAILABLE:
-                    return profile.dict()
+                    return profile.model_dump()
                 else:
                     return {
                         'photosynthetic_efficiency': profile.photosynthetic_efficiency,
@@ -294,6 +330,7 @@ class BioParameterCatalog:
         """
         Search for organism types that match the given filter criteria.
 
+        Supported operators: eq, ne, gt, gte, lt, lte.
         Example:
             catalog.search(photosynthetic_efficiency__gte=0.7)
         """
@@ -318,6 +355,10 @@ class BioParameterCatalog:
                         if attr != value:
                             match = False
                             break
+                    elif op == 'ne':
+                        if attr == value:
+                            match = False
+                            break
                     elif op == 'gte':
                         if attr < value:
                             match = False
@@ -335,6 +376,7 @@ class BioParameterCatalog:
                             match = False
                             break
                     else:
+                        # Unknown operator
                         match = False
                         break
                 if match:
@@ -347,12 +389,16 @@ class BioParameterCatalog:
         Add or update an organism type.
 
         Args:
-            name: The organism type name.
+            name: The organism type name (must not be empty).
             profile: Dictionary of parameters.
 
         Returns:
             True if successful.
         """
+        if not name or not name.strip():
+            logger.error("Organism type name cannot be empty")
+            return False
+
         with self._lock:
             if PYDANTIC_AVAILABLE:
                 try:
@@ -364,10 +410,14 @@ class BioParameterCatalog:
                 # Basic validation
                 required = ['photosynthetic_efficiency', 'resilience_to_stress', 'carbon_fixation_rate', 'helium_affinity']
                 for key in required:
-                    if key not in profile or not (0 <= profile[key] <= 1):
-                        logger.error(f"Missing or invalid {key}")
+                    if key not in profile:
+                        logger.error(f"Missing required key: {key}")
                         return False
-                validated = OrganismProfile(**profile)
+                try:
+                    validated = OrganismProfile(**profile)
+                except ValueError as e:
+                    logger.error("Invalid profile", error=str(e))
+                    return False
             self._data.organism_types[name] = validated
             self.save()
             return True
@@ -395,31 +445,35 @@ class BioParameterCatalog:
 
     # ---------- Export/import ----------
     def export_catalog(self, path: Path) -> None:
-        """Export the catalog to a JSON file."""
-        self.save()  # already saved, but we can copy to another location
-        with open(path, 'w') as f:
-            if PYDANTIC_AVAILABLE:
-                data = self._data.dict()
-            else:
-                # Convert to dict (same as save)
-                data = {
-                    "metadata": {
-                        "version": self._data.metadata.version,
-                        "last_updated": self._data.metadata.last_updated.isoformat() if self._data.metadata.last_updated else None,
-                        "source": self._data.metadata.source,
-                        "hash": self._data.metadata.hash,
-                    },
-                    "organism_types": {
-                        k: {
-                            "photosynthetic_efficiency": v.photosynthetic_efficiency,
-                            "resilience_to_stress": v.resilience_to_stress,
-                            "carbon_fixation_rate": v.carbon_fixation_rate,
-                            "helium_affinity": v.helium_affinity,
-                        }
-                        for k, v in self._data.organism_types.items()
+        """
+        Export the catalog to a JSON file at the given path.
+        Does NOT alter the default catalog file.
+        """
+        # Prepare data without altering the in-memory metadata
+        metadata = self._data.metadata
+        if PYDANTIC_AVAILABLE:
+            data = self._data.model_dump(mode='json')
+        else:
+            data = {
+                "metadata": {
+                    "version": metadata.version,
+                    "last_updated": metadata.last_updated.isoformat() if metadata.last_updated else None,
+                    "source": metadata.source,
+                    "hash": metadata.hash,
+                },
+                "organism_types": {
+                    k: {
+                        "photosynthetic_efficiency": v.photosynthetic_efficiency,
+                        "resilience_to_stress": v.resilience_to_stress,
+                        "carbon_fixation_rate": v.carbon_fixation_rate,
+                        "helium_affinity": v.helium_affinity,
                     }
+                    for k, v in self._data.organism_types.items()
                 }
+            }
+        with open(path, 'w') as f:
             json.dump(data, f, indent=2)
+        logger.info(f"Catalog exported to {path}")
 
     def import_catalog(self, path: Path, merge: bool = False) -> int:
         """
@@ -434,6 +488,7 @@ class BioParameterCatalog:
         """
         with open(path, 'r') as f:
             raw = json.load(f)
+
         if PYDANTIC_AVAILABLE:
             try:
                 imported = BioParameterCatalogData(**raw)
@@ -442,17 +497,26 @@ class BioParameterCatalog:
                 return 0
         else:
             # Parse manually
-            metadata = CatalogMetadata(**raw.get('metadata', {}))
+            metadata_dict = raw.get('metadata', {})
+            if 'last_updated' in metadata_dict and isinstance(metadata_dict['last_updated'], str):
+                try:
+                    metadata_dict['last_updated'] = datetime.fromisoformat(metadata_dict['last_updated'])
+                except ValueError:
+                    metadata_dict['last_updated'] = datetime.now(timezone.utc)
+            metadata = CatalogMetadata(**metadata_dict)
             organism_types = {}
             for k, v in raw.get('organism_types', {}).items():
-                organism_types[k] = OrganismProfile(**v)
+                try:
+                    organism_types[k] = OrganismProfile(**v)
+                except ValueError as e:
+                    logger.warning(f"Invalid profile for {k}, skipping: {e}")
             imported = BioParameterCatalogData(metadata, organism_types)
 
         with self._lock:
             if merge:
                 # Merge, overwriting existing keys
                 self._data.organism_types.update(imported.organism_types)
-                self._data.metadata.last_updated = datetime.utcnow()
+                self._data.metadata.last_updated = datetime.now(timezone.utc)
                 self._data.metadata.source = "imported"
                 self.save()
             else:
@@ -519,6 +583,11 @@ if __name__ == "__main__":
     }
     catalog.add_organism_type("ultra_high", new_profile)
     print("Added ultra_high")
+
+    # Export catalog to another file
+    export_path = Path("./exported_bio_parameters.json")
+    catalog.export_catalog(export_path)
+    print(f"Exported to {export_path}")
 
     # Save and close
     catalog.save()
