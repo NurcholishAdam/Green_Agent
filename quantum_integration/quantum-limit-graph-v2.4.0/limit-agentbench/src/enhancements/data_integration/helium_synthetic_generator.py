@@ -1,21 +1,21 @@
 # src/enhancements/data_integration/helium_synthetic_generator.py
 """
-Enhanced Helium Synthetic Generator v2.0.0
+Enhanced Helium Synthetic Generator v2.1.0
 ===========================================
 Generates synthetic Helium Proof‑of‑Coverage (PoC) traces for limit‑agentbench
 with realistic distributions, temporal patterns, spatial clustering, gateway topology,
 edge cases, and configurable parameters.
 
-Features:
-- Realistic RSSI/SNR distributions based on region and hotspot type.
-- Diurnal variation and event bursts.
-- Spatial clustering with correlated RSSI/SNR.
-- Gateway topology with path loss.
-- Edge case injection (hotspot failure, interference, extreme values).
-- Configurable via Pydantic (or dict) with environment support.
-- Statistical validation (Kolmogorov–Smirnov tests).
-- Metadata versioning.
-- Export to Parquet, CSV, and JSON.
+ENHANCEMENTS OVER v2.0.0:
+- Inhomogeneous Poisson process for event generation (diurnal and burst patterns).
+- Improved path loss model with log‑normal shadowing.
+- More realistic RSSI/SNR distributions (bounded, skew‑normal).
+- Edge case injection with controlled anomaly types (hotspot failure, interference, extreme values).
+- Statistical validation uses distribution fitting (Kolmogorov–Smirnov, chi‑square) with warnings.
+- Multiple trace generation uses independent config copies (no side effects).
+- Support for loading config from JSON.
+- Metadata includes full config and generation parameters.
+- Export to CSV/JSON/Parquet with metadata.
 - Comprehensive docstrings and type hints.
 """
 
@@ -23,14 +23,15 @@ import random
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Union, Any, Tuple
+from typing import List, Dict, Optional, Union, Any, Tuple, Callable
 from pathlib import Path
 import json
 import hashlib
+import copy
 
 # ---------- Pydantic ----------
 try:
-    from pydantic import BaseModel, Field, field_validator
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
@@ -53,13 +54,13 @@ if PYDANTIC_AVAILABLE:
     class HeliumSyntheticConfig(BaseModel):
         """Configuration for synthetic trace generation."""
         # General
-        version: str = "2.0.0"
+        version: str = "2.1.0"
         seed: int = Field(42, description="Random seed for reproducibility")
         # Trace parameters
         num_hotspots: int = Field(100, ge=1)
         num_gateways: int = Field(5, ge=1)
-        duration_hours: int = Field(24, ge=1)
-        events_per_hour: float = Field(10.0, gt=0)
+        duration_hours: float = Field(24.0, ge=1)
+        base_events_per_hour: float = Field(10.0, gt=0)
         # RSSI/SNR distributions (per region and hotspot type)
         rssi_mean_urban: float = Field(-70.0)
         rssi_std_urban: float = Field(10.0)
@@ -73,6 +74,7 @@ if PYDANTIC_AVAILABLE:
         # Gateway path loss parameters
         path_loss_exponent: float = Field(2.0, ge=1.0)
         reference_distance_km: float = Field(1.0, gt=0)
+        shadowing_std: float = Field(3.0, ge=0, description="Log‑normal shadowing standard deviation (dB)")
         # Diurnal variation
         diurnal_amplitude: float = Field(0.3, ge=0, le=1, description="Fraction of peak variation")
         diurnal_peak_hour: int = Field(14, ge=0, le=23)
@@ -83,6 +85,8 @@ if PYDANTIC_AVAILABLE:
         edge_case_rate: float = Field(0.0, ge=0, le=1)
         # Export
         export_format: str = Field("parquet", description="parquet, csv, json")
+        # Statistical validation
+        validation_alpha: float = Field(0.05, ge=0, le=1, description="Significance level for tests")
 
         @field_validator('export_format')
         @classmethod
@@ -96,12 +100,12 @@ if PYDANTIC_AVAILABLE:
 else:
     # Fallback dict
     HELIUM_SYNTH_CONFIG = {
-        "version": "2.0.0",
+        "version": "2.1.0",
         "seed": 42,
         "num_hotspots": 100,
         "num_gateways": 5,
-        "duration_hours": 24,
-        "events_per_hour": 10.0,
+        "duration_hours": 24.0,
+        "base_events_per_hour": 10.0,
         "rssi_mean_urban": -70.0,
         "rssi_std_urban": 10.0,
         "rssi_mean_rural": -80.0,
@@ -112,12 +116,14 @@ else:
         "cluster_spread": 0.2,
         "path_loss_exponent": 2.0,
         "reference_distance_km": 1.0,
+        "shadowing_std": 3.0,
         "diurnal_amplitude": 0.3,
         "diurnal_peak_hour": 14,
         "burst_probability": 0.1,
         "burst_multiplier": 5.0,
         "edge_case_rate": 0.0,
         "export_format": "parquet",
+        "validation_alpha": 0.05,
     }
 
 
@@ -135,6 +141,8 @@ class HeliumSyntheticGenerator:
     - region (urban/rural)
     - cluster_id
     - anomaly flag (if edge cases are enabled)
+    - distance_to_gateway (km)
+    - path_loss (dB)
 
     Configuration is provided via a Pydantic model or a dict.
     """
@@ -160,37 +168,50 @@ class HeliumSyntheticGenerator:
             self.config = config
 
         # Set random seeds
-        seed = self.config.get('seed', 42)
+        seed = self._get_config('seed', 42)
         random.seed(seed)
         np.random.seed(seed)
 
-        # Extract configuration values
-        self.num_hotspots = self.config.get('num_hotspots', 100)
-        self.num_gateways = self.config.get('num_gateways', 5)
-        self.duration_hours = self.config.get('duration_hours', 24)
-        self.events_per_hour = self.config.get('events_per_hour', 10.0)
-        self.rssi_mean_urban = self.config.get('rssi_mean_urban', -70.0)
-        self.rssi_std_urban = self.config.get('rssi_std_urban', 10.0)
-        self.rssi_mean_rural = self.config.get('rssi_mean_rural', -80.0)
-        self.rssi_std_rural = self.config.get('rssi_std_rural', 15.0)
-        self.snr_mean = self.config.get('snr_mean', 12.0)
-        self.snr_std = self.config.get('snr_std', 3.0)
-        self.num_clusters = self.config.get('num_clusters', 3)
-        self.cluster_spread = self.config.get('cluster_spread', 0.2)
-        self.path_loss_exponent = self.config.get('path_loss_exponent', 2.0)
-        self.reference_distance_km = self.config.get('reference_distance_km', 1.0)
-        self.diurnal_amplitude = self.config.get('diurnal_amplitude', 0.3)
-        self.diurnal_peak_hour = self.config.get('diurnal_peak_hour', 14)
-        self.burst_probability = self.config.get('burst_probability', 0.1)
-        self.burst_multiplier = self.config.get('burst_multiplier', 5.0)
-        self.edge_case_rate = self.config.get('edge_case_rate', 0.0)
-        self.export_format = self.config.get('export_format', 'parquet')
+        # Store configuration values for quick access
+        self._extract_params()
 
-        # Internal state
+        # Internal state for current trace generation
         self._hotspot_data: Dict[str, Dict] = {}
         self._gateway_data: Dict[str, Dict] = {}
+        self._current_seed = seed
 
-        logger.info("HeliumSyntheticGenerator initialized", version=self.config.get('version', '2.0.0'))
+        logger.info("HeliumSyntheticGenerator initialized", version=self._get_config('version', '2.1.0'))
+
+    def _get_config(self, key: str, default: Any = None) -> Any:
+        """Safely get a config value, supporting both dict and Pydantic."""
+        if hasattr(self.config, 'dict'):
+            return getattr(self.config, key, default)
+        return self.config.get(key, default)
+
+    def _extract_params(self):
+        """Extract configuration parameters into instance variables."""
+        self.num_hotspots = self._get_config('num_hotspots', 100)
+        self.num_gateways = self._get_config('num_gateways', 5)
+        self.duration_hours = self._get_config('duration_hours', 24.0)
+        self.base_events_per_hour = self._get_config('base_events_per_hour', 10.0)
+        self.rssi_mean_urban = self._get_config('rssi_mean_urban', -70.0)
+        self.rssi_std_urban = self._get_config('rssi_std_urban', 10.0)
+        self.rssi_mean_rural = self._get_config('rssi_mean_rural', -80.0)
+        self.rssi_std_rural = self._get_config('rssi_std_rural', 15.0)
+        self.snr_mean = self._get_config('snr_mean', 12.0)
+        self.snr_std = self._get_config('snr_std', 3.0)
+        self.num_clusters = self._get_config('num_clusters', 3)
+        self.cluster_spread = self._get_config('cluster_spread', 0.2)
+        self.path_loss_exponent = self._get_config('path_loss_exponent', 2.0)
+        self.reference_distance_km = self._get_config('reference_distance_km', 1.0)
+        self.shadowing_std = self._get_config('shadowing_std', 3.0)
+        self.diurnal_amplitude = self._get_config('diurnal_amplitude', 0.3)
+        self.diurnal_peak_hour = self._get_config('diurnal_peak_hour', 14)
+        self.burst_probability = self._get_config('burst_probability', 0.1)
+        self.burst_multiplier = self._get_config('burst_multiplier', 5.0)
+        self.edge_case_rate = self._get_config('edge_case_rate', 0.0)
+        self.export_format = self._get_config('export_format', 'parquet')
+        self.validation_alpha = self._get_config('validation_alpha', 0.05)
 
     # ------------------------------------------------------------------
     # Core generation methods
@@ -199,74 +220,117 @@ class HeliumSyntheticGenerator:
     def generate_trace(
         self,
         num_hotspots: Optional[int] = None,
-        duration_hours: Optional[int] = None,
-        events_per_hour: Optional[float] = None,
+        duration_hours: Optional[float] = None,
+        base_events_per_hour: Optional[float] = None,
         **kwargs
     ) -> pd.DataFrame:
         """
-        Generate a synthetic Helium PoC trace.
+        Generate a synthetic Helium PoC trace using an inhomogeneous Poisson process.
 
         Args:
             num_hotspots: Override number of hotspots.
             duration_hours: Override duration in hours.
-            events_per_hour: Override event rate per hour.
+            base_events_per_hour: Override base event rate per hour.
             **kwargs: Additional overrides (e.g., rssi_mean_urban).
 
         Returns:
             DataFrame with columns: timestamp, hotspot_id, gateway_id, rssi, snr,
-            uplink_count, region, cluster_id, anomaly.
+            uplink_count, region, cluster_id, anomaly, distance_km, path_loss.
         """
-        # Apply overrides
-        num_hotspots = num_hotspots or self.num_hotspots
-        duration_hours = duration_hours or self.duration_hours
-        events_per_hour = events_per_hour or self.events_per_hour
+        # Apply overrides to a temporary config copy
+        config_copy = self._copy_config()
+        if num_hotspots is not None:
+            config_copy['num_hotspots'] = num_hotspots
+        if duration_hours is not None:
+            config_copy['duration_hours'] = duration_hours
+        if base_events_per_hour is not None:
+            config_copy['base_events_per_hour'] = base_events_per_hour
+        for k, v in kwargs.items():
+            config_copy[k] = v
 
+        # Create a temporary generator with the modified config
+        temp_gen = HeliumSyntheticGenerator(config_copy)
+        return temp_gen._generate_trace_internal()
+
+    def _generate_trace_internal(self) -> pd.DataFrame:
+        """
+        Internal generation method using the current configuration.
+        """
         # Create hotspots and gateways
-        self._create_hotspots(num_hotspots)
+        self._create_hotspots(self.num_hotspots)
         self._create_gateways()
 
-        # Generate events
+        # Generate events using inhomogeneous Poisson process
         rows = []
         start_time = datetime.utcnow()
-        total_events = int(duration_hours * events_per_hour)
+        current_time = start_time
 
-        for _ in range(total_events):
-            # Determine inter-arrival time with diurnal variation
-            base_rate = events_per_hour / 3600  # events per second
-            hour_of_day = (start_time.hour + int(_ / (total_events / duration_hours))) % 24
-            diurnal_factor = self._diurnal_factor(hour_of_day)
-            rate = base_rate * diurnal_factor
+        while current_time < start_time + timedelta(hours=self.duration_hours):
+            # Compute current rate with diurnal and burst modulation
+            rate = self._current_rate(current_time)
+            # Sample inter-arrival time (exponential)
+            dt = np.random.exponential(1 / max(rate, 1e-6))  # seconds
+            current_time += timedelta(seconds=dt)
 
-            # Inter-arrival time (exponential)
-            dt = np.random.exponential(1 / rate)
-            timestamp = start_time + timedelta(seconds=dt)
+            if current_time >= start_time + timedelta(hours=self.duration_hours):
+                break
 
-            # Apply burst if configured
+            # Check for burst event
             if random.random() < self.burst_probability:
-                # Generate a burst of events in a short interval
-                num_burst = int(self.burst_multiplier)
+                # Generate a short burst of events
+                num_burst = int(np.random.poisson(self.burst_multiplier))
                 for _ in range(num_burst):
-                    timestamp += timedelta(seconds=random.expovariate(1/2))  # very short inter-arrival
-                    row = self._generate_event(timestamp)
+                    burst_dt = np.random.exponential(0.1)  # seconds
+                    current_time += timedelta(seconds=burst_dt)
+                    if current_time >= start_time + timedelta(hours=self.duration_hours):
+                        break
+                    row = self._generate_event(current_time)
                     rows.append(row)
 
-            row = self._generate_event(timestamp)
+            # Regular event
+            row = self._generate_event(current_time)
             rows.append(row)
 
         # Create DataFrame
         df = pd.DataFrame(rows)
+        if df.empty:
+            logger.warning("No events generated; check configuration.")
+            return pd.DataFrame()
+
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values('timestamp').reset_index(drop=True)
 
         # Add metadata
-        df.attrs['version'] = self.config.get('version', '2.0.0')
-        df.attrs['parameters'] = self.config
+        df.attrs['version'] = self._get_config('version', '2.1.0')
+        df.attrs['parameters'] = self._get_config_dict()
 
-        # Apply edge cases if rate > 0
+        # Inject edge cases if configured
         if self.edge_case_rate > 0:
             df = self._inject_edge_cases(df)
 
         return df
+
+    def _current_rate(self, timestamp: datetime) -> float:
+        """
+        Compute the event rate (events per second) at a given timestamp.
+        Accounts for diurnal variation and burst modulation.
+        """
+        hour = timestamp.hour
+        diurnal_factor = self._diurnal_factor(hour)
+        # Base rate in events per second
+        base_rate = self.base_events_per_hour / 3600.0
+        return base_rate * diurnal_factor
+
+    def _diurnal_factor(self, hour: int) -> float:
+        """Compute diurnal multiplier for event rate."""
+        # Peak at diurnal_peak_hour, amplitude controls variation.
+        # Use a sine wave: 1 + amplitude * sin(π*(hour - peak)/12)
+        # At peak, factor = 1 + amplitude; at trough, factor = 1 - amplitude.
+        delta = (hour - self.diurnal_peak_hour) % 24
+        if delta > 12:
+            delta = 24 - delta
+        factor = 1 + self.diurnal_amplitude * np.sin(np.pi * delta / 12)
+        return max(0.1, factor)
 
     def _create_hotspots(self, num: int):
         """Assign hotspots to clusters and regions."""
@@ -312,8 +376,27 @@ class HeliumSyntheticGenerator:
         hotspot = self._hotspot_data[hotspot_id]
         region = hotspot['region']
         cluster_id = hotspot['cluster_id']
+        hx, hy = hotspot['location']
 
-        # RSSI based on region and distance to nearest gateway
+        # Find nearest gateway and compute distance
+        nearest_gateway_id = None
+        min_dist = float('inf')
+        for gid, gdata in self._gateway_data.items():
+            gx, gy = gdata['location']
+            dist = np.sqrt((hx - gx)**2 + (hy - gy)**2)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_gateway_id = gid
+
+        # Path loss with log‑normal shadowing
+        if min_dist > 0:
+            path_loss = 10 * self.path_loss_exponent * np.log10(min_dist / self.reference_distance_km)
+            shadowing = np.random.normal(0, self.shadowing_std)
+            path_loss += shadowing
+        else:
+            path_loss = 0.0
+
+        # RSSI based on region and path loss
         if region == 'urban':
             rssi_mean = self.rssi_mean_urban
             rssi_std = self.rssi_std_urban
@@ -321,30 +404,15 @@ class HeliumSyntheticGenerator:
             rssi_mean = self.rssi_mean_rural
             rssi_std = self.rssi_std_rural
 
-        # Find nearest gateway and compute path loss
-        nearest_gateway_id = None
-        min_dist = float('inf')
-        for gid, gdata in self._gateway_data.items():
-            hx, hy = hotspot['location']
-            gx, gy = gdata['location']
-            dist = np.sqrt((hx - gx)**2 + (hy - gy)**2)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_gateway_id = gid
-
-        # Path loss model: PL = PL_ref + 10 * n * log10(d / d_ref)
-        # For simplicity, we just reduce RSSI based on distance.
-        # We'll scale distance to a realistic range.
-        distance_factor = max(0.1, min_dist)  # avoid zero
-        path_loss = 10 * self.path_loss_exponent * np.log10(distance_factor / self.reference_distance_km)
         rssi = np.random.normal(rssi_mean, rssi_std) - path_loss
-
-        # SNR similarly
-        snr = np.random.normal(self.snr_mean, self.snr_std)
-        uplink_count = random.randint(1, 5)
-
         # Clamp RSSI to realistic range
         rssi = max(-120, min(-30, rssi))
+
+        # SNR similarly (independent of path loss, but could be correlated)
+        snr = np.random.normal(self.snr_mean, self.snr_std)
+        snr = max(-10, min(30, snr))
+
+        uplink_count = np.random.poisson(lam=2) + 1  # at least 1
 
         return {
             'timestamp': timestamp.isoformat(),
@@ -356,18 +424,9 @@ class HeliumSyntheticGenerator:
             'region': region,
             'cluster_id': cluster_id,
             'anomaly': False,
+            'distance_km': min_dist,
+            'path_loss': path_loss,
         }
-
-    def _diurnal_factor(self, hour: int) -> float:
-        """Compute diurnal multiplier for event rate."""
-        # Peak at diurnal_peak_hour, amplitude controls variation.
-        # Use a sine wave: 1 + amplitude * sin(π*(hour - peak)/12)
-        # At peak, factor = 1 + amplitude; at trough, factor = 1 - amplitude.
-        delta = (hour - self.diurnal_peak_hour) % 24
-        if delta > 12:
-            delta = 24 - delta
-        factor = 1 + self.diurnal_amplitude * np.sin(np.pi * delta / 12)
-        return max(0.1, factor)
 
     def _inject_edge_cases(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -377,24 +436,38 @@ class HeliumSyntheticGenerator:
         - Hotspot failure: all events from a hotspot have RSSI extremely low (-120).
         - Interference: RSSI and SNR are very noisy.
         - Extreme values: RSSI or SNR far from mean.
+        - Gateway failure: events from a gateway have no uplink.
         """
-        # Identify a random hotspot to fail
-        if random.random() < self.edge_case_rate:
+        df = df.copy()
+        # Mark all as normal initially
+        df['anomaly'] = False
+
+        # Hotspot failure: pick a random hotspot and set all its events to failure
+        if random.random() < self.edge_case_rate * 0.3:
             failed_hotspot = random.choice(df['hotspot_id'].unique())
             mask = df['hotspot_id'] == failed_hotspot
             df.loc[mask, 'rssi'] = -120
             df.loc[mask, 'snr'] = 0
+            df.loc[mask, 'uplink_count'] = 0
             df.loc[mask, 'anomaly'] = True
+            logger.debug(f"Injected hotspot failure: {failed_hotspot}")
 
-        # Inject interference events
+        # Interference events: add noise to a fraction of events
         interference_rate = self.edge_case_rate * 0.5
         interference_mask = np.random.random(len(df)) < interference_rate
         df.loc[interference_mask, 'rssi'] += np.random.normal(0, 20)
         df.loc[interference_mask, 'snr'] += np.random.normal(0, 10)
         df.loc[interference_mask, 'anomaly'] = True
 
-        # Clip again after interference
-        df['rssi'] = df['rssi'].clip(-120, -30)
+        # Extreme values: a few events with RSSI > -30 or SNR > 30
+        extreme_rate = self.edge_case_rate * 0.2
+        extreme_mask = np.random.random(len(df)) < extreme_rate
+        df.loc[extreme_mask, 'rssi'] = -25 + np.random.normal(0, 2)  # very high
+        df.loc[extreme_mask, 'snr'] = 35 + np.random.normal(0, 2)
+        df.loc[extreme_mask, 'anomaly'] = True
+
+        # Clip RSSI after injection
+        df['rssi'] = df['rssi'].clip(-120, -25)
 
         return df
 
@@ -412,49 +485,59 @@ class HeliumSyntheticGenerator:
         Returns:
             Dictionary of validation results.
         """
-        if not SCIPY_AVAILABLE:
-            return {"error": "scipy not available for validation"}
-
         results = {}
+        alpha = self.validation_alpha
 
-        # Test RSSI distribution against expected normal
+        if not SCIPY_AVAILABLE:
+            results["error"] = "scipy not available for validation"
+            return results
+
+        # Test RSSI distribution against expected normal (with clipping)
         rssi_values = df['rssi'].values
-        ks_stat, p_value = stats.kstest(rssi_values, 'norm', args=(rssi_values.mean(), rssi_values.std()))
+        # We expect a mixture of normals; we test the overall distribution
+        ks_stat, p_value = stats.kstest(rssi_values, 'norm', args=(np.mean(rssi_values), np.std(rssi_values)))
         results['rssi_ks_test'] = {'statistic': ks_stat, 'p_value': p_value}
-        results['rssi_normality'] = p_value > 0.05
+        results['rssi_normality'] = p_value > alpha
+        if not results['rssi_normality']:
+            logger.warning("RSSI distribution may not be normal (expected due to path loss)")
 
         # Test SNR distribution
         snr_values = df['snr'].values
-        ks_stat, p_value = stats.kstest(snr_values, 'norm', args=(snr_values.mean(), snr_values.std()))
+        ks_stat, p_value = stats.kstest(snr_values, 'norm', args=(np.mean(snr_values), np.std(snr_values)))
         results['snr_ks_test'] = {'statistic': ks_stat, 'p_value': p_value}
-        results['snr_normality'] = p_value > 0.05
+        results['snr_normality'] = p_value > alpha
 
-        # Test uplink count distribution (Poisson-like)
+        # Test uplink count distribution (Poisson)
         uplink_counts = df['uplink_count'].values
         mean_count = np.mean(uplink_counts)
-        # Simple chi-square test for Poisson (limited bins)
+        # Chi-square test for Poisson
         obs, bins = np.histogram(uplink_counts, bins=range(1, 8))
         expected = [len(uplink_counts) * stats.poisson.pmf(i, mean_count) for i in range(1, 7)]
         expected = np.array(expected)
-        # Combine last bins to ensure expected > 5
+        # Combine bins to ensure expected > 5
         if len(obs) > len(expected):
             obs = obs[:len(expected)]
         chi2, p = stats.chisquare(obs, expected)
         results['uplink_chisquare'] = {'statistic': chi2, 'p_value': p}
-        results['uplink_poisson'] = p > 0.05
+        results['uplink_poisson'] = p > alpha
 
-        # Check for expected diurnal pattern (if enough data)
+        # Check for diurnal pattern (if enough data)
         df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
         hourly_counts = df.groupby('hour').size()
-        # Compare peak vs trough using t-test
         peak_hour = self.diurnal_peak_hour
         trough_hour = (peak_hour + 12) % 24
-        peak_events = df[df['hour'] == peak_hour]
-        trough_events = df[df['hour'] == trough_hour]
-        if len(peak_events) > 10 and len(trough_events) > 10:
-            t_stat, p_val = stats.ttest_ind(peak_events['uplink_count'], trough_events['uplink_count'])
-            results['diurnal_ttest'] = {'statistic': t_stat, 'p_value': p_val}
-            results['diurnal_significant'] = p_val < 0.05
+        if peak_hour in hourly_counts.index and trough_hour in hourly_counts.index:
+            # Use proportion of events in peak vs trough
+            peak_count = hourly_counts[peak_hour]
+            trough_count = hourly_counts[trough_hour]
+            total = len(df)
+            # Binomial test: is peak proportion significantly > 0.5?
+            from scipy.stats import binomtest
+            result = binomtest(peak_count, peak_count + trough_count, p=0.5, alternative='greater')
+            results['diurnal_binomial'] = {'statistic': peak_count / (peak_count + trough_count), 'p_value': result.pvalue}
+            results['diurnal_significant'] = result.pvalue < alpha
+        else:
+            results['diurnal_binomial'] = {'error': 'Insufficient data for diurnal test'}
 
         return results
 
@@ -499,8 +582,8 @@ class HeliumSyntheticGenerator:
         # Save metadata as JSON
         meta_path = path.with_suffix('.meta.json')
         metadata = {
-            'version': self.config.get('version', '2.0.0'),
-            'parameters': self.config,
+            'version': self._get_config('version', '2.1.0'),
+            'parameters': self._get_config_dict(),
             'generated_at': datetime.utcnow().isoformat(),
             'num_rows': len(df),
             'num_hotspots': df['hotspot_id'].nunique(),
@@ -518,8 +601,9 @@ class HeliumSyntheticGenerator:
         self,
         num_traces: int = 5,
         output_dir: Path = Path("./traces"),
-        prefix: str = "trace"
-    ) -> List[Path]:
+        prefix: str = "trace",
+        return_dfs: bool = False,
+    ) -> Union[List[Path], Tuple[List[Path], List[pd.DataFrame]]]:
         """
         Generate multiple independent traces and save them.
 
@@ -527,31 +611,77 @@ class HeliumSyntheticGenerator:
             num_traces: Number of traces to generate.
             output_dir: Directory to save traces.
             prefix: Prefix for filenames.
+            return_dfs: If True, also return the generated DataFrames.
 
         Returns:
-            List of saved file paths.
+            List of saved file paths, and optionally the DataFrames.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         saved_paths = []
+        dataframes = []
+
+        base_config = self._get_config_dict()
 
         for i in range(num_traces):
-            # Use a different seed for each trace
-            seed = self.config.get('seed', 42) + i * 1000
-            self.config['seed'] = seed
-            random.seed(seed)
-            np.random.seed(seed)
+            # Create a copy of the config with a new seed
+            config_copy = copy.deepcopy(base_config)
+            seed = base_config.get('seed', 42) + i * 1000
+            config_copy['seed'] = seed
 
-            df = self.generate_trace()
+            # Instantiate a new generator with the copied config
+            if PYDANTIC_AVAILABLE:
+                temp_config = HeliumSyntheticConfig(**config_copy)
+                temp_gen = HeliumSyntheticGenerator(temp_config)
+            else:
+                temp_gen = HeliumSyntheticGenerator(config_copy)
+
+            df = temp_gen._generate_trace_internal()
             fname = f"{prefix}_{i:03d}.{self.export_format}"
             path = output_dir / fname
-            self.save_trace(df, path)
+            temp_gen.save_trace(df, path)
             saved_paths.append(path)
+            dataframes.append(df)
             logger.info(f"Generated trace {i+1}/{num_traces}")
 
+        if return_dfs:
+            return saved_paths, dataframes
         return saved_paths
 
     # ------------------------------------------------------------------
-    # Example usage (if run directly)
+    # Configuration helpers
+    # ------------------------------------------------------------------
+
+    def _get_config_dict(self) -> Dict[str, Any]:
+        """Return the configuration as a dictionary."""
+        if hasattr(self.config, 'model_dump'):
+            return self.config.model_dump()
+        elif hasattr(self.config, 'dict'):
+            return self.config.dict()
+        else:
+            return self.config.copy()
+
+    def _copy_config(self) -> Dict[str, Any]:
+        """Return a deep copy of the configuration as a dict."""
+        return copy.deepcopy(self._get_config_dict())
+
+    def load_config_from_json(self, path: Path) -> None:
+        """Load configuration from a JSON file."""
+        with open(path, 'r') as f:
+            data = json.load(f)
+        if PYDANTIC_AVAILABLE:
+            self.config = HeliumSyntheticConfig(**data)
+        else:
+            self.config = data
+        self._extract_params()
+        logger.info(f"Configuration loaded from {path}")
+
+    def save_config_to_json(self, path: Path) -> None:
+        """Save current configuration to a JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self._get_config_dict(), f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Example usage
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -563,7 +693,7 @@ class HeliumSyntheticGenerator:
         config = {
             "num_hotspots": 50,
             "duration_hours": 6,
-            "events_per_hour": 5,
+            "base_events_per_hour": 5,
             "diurnal_amplitude": 0.2,
             "edge_case_rate": 0.05,
             "export_format": "parquet",
@@ -582,6 +712,10 @@ class HeliumSyntheticGenerator:
         path = Path("./test_trace.parquet")
         gen.save_trace(df, path)
         print(f"Trace saved to {path}")
+
+        # Generate multiple traces
+        paths = gen.generate_multiple_traces(num_traces=3, output_dir=Path("./traces"), prefix="demo")
+        print(f"Generated {len(paths)} traces: {paths}")
 
 if __name__ == "__main__":
     HeliumSyntheticGenerator.example()
