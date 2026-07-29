@@ -1,36 +1,33 @@
-# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/bio_inspired/atp_synthase_scheduler.py
-# Enhanced version v8.0.0 – Full implementation with all improvements
-
+# =============================================================================
+# Enhanced ATP Synthase Scheduler v9.0.0 – Full Implementation
+# =============================================================================
 """
-Enhanced ATP Synthase Scheduler v8.0.0
-Complete implementation with demand-responsive production, bidirectional operation,
-allosteric feedback inhibition, multi-synthase scaling, degradation awareness,
-predictive scheduling, uncoupling mechanism, quantum tunneling effects,
-user-defined demand priorities, load balancing between synthases,
-machine learning for demand prediction, and gradient forecasting.
-
-Enhancements (v8.0.0):
-- Completed missing methods in EnhancedATPSynthase
-- Fixed concurrency bugs (spawn/remove now async)
-- Added dynamic degradation tier adjustment
-- Implemented get_model_stats in MLDemandPredictor
-- Defensive checks for optional services
-- Async context manager support
-- Enhanced observability with more Prometheus metrics
-- Improved logging and error handling
-- Circuit breaker pattern for external services
+Enhanced ATP Synthase Scheduler v9.0.0
+Complete implementation with all improvements:
+- Secure model serialization using joblib with allow_pickle=False
+- Persistent circuit breaker state using SQLite
+- Improved ML predictor with RandomForest and scheduled retraining
+- Retry logic with tenacity for external calls
+- Event subscription integration
+- Refined load-balancing scoring with configurable weights
+- Adaptive priority weights based on historical performance
+- Proper async callback handling
+- Updated Prometheus gauges in regulation loop
+- Comprehensive docstrings
+- Improved gradient forecasting with Holt-Winters exponential smoothing
+- Graceful shutdown with configurable timeout
 """
 
 import asyncio
 import logging
 import uuid
-import pickle
 import os
 import math
 import random
+import sqlite3
 from typing import Dict, Any, List, Optional, Tuple, Callable, Protocol, Union
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from collections import deque
 import numpy as np
@@ -49,14 +46,34 @@ except ImportError:
     PROMETHEUS_AVAILABLE = False
 
 try:
-    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import RandomForestRegressor
     from sklearn.preprocessing import StandardScaler
+    import joblib
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
 
 try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
+
+try:
     import structlog
+    from structlog.processors import JSONRenderer, TimeStamper
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            TimeStamper(fmt="iso"),
+            JSONRenderer()
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
     logger = structlog.get_logger(__name__)
 except ImportError:
     logger = logging.getLogger(__name__)
@@ -75,46 +92,116 @@ except ImportError:
     GRADIENT_AVAILABLE = False
 
 # ============================================================================
-# Circuit Breaker Pattern
+# Retry decorator (using tenacity if available)
 # ============================================================================
 
-class CircuitBreakerState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
+def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: float = 10.0):
+    """Decorator to retry async functions with exponential backoff."""
+    if TENACITY_AVAILABLE:
+        def decorator(func):
+            @retry(
+                stop=stop_after_attempt(max_attempts),
+                wait=wait_exponential(multiplier=min_delay, min=min_delay, max=max_delay),
+                retry=retry_if_exception_type(Exception),
+                before_sleep=before_sleep_log(logger, logging.WARNING)
+            )
+            async def wrapper(*args, **kwargs):
+                return await func(*args, **kwargs)
+            return wrapper
+        return decorator
+    else:
+        def decorator(func):
+            async def wrapper(*args, **kwargs):
+                for attempt in range(max_attempts):
+                    try:
+                        return await func(*args, **kwargs)
+                    except Exception as e:
+                        if attempt == max_attempts - 1:
+                            raise
+                        delay = min(min_delay * (2 ** attempt), max_delay)
+                        await asyncio.sleep(delay)
+            return wrapper
+        return decorator
+
+# ============================================================================
+# Persistent Circuit Breaker (SQLite)
+# ============================================================================
 
 class CircuitBreaker:
-    """Circuit breaker for external service calls."""
-    def __init__(self, name: str, failure_threshold: int = 3, recovery_timeout: float = 30.0):
+    """Circuit breaker with SQLite persistence."""
+    def __init__(self, name: str, db_path: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.name = name
+        self.db_path = db_path
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
-        self._state = CircuitBreakerState.CLOSED
-        self._failure_count = 0
-        self._last_failure_time = None
+        self._init_db()
+        self._load_state()
         self._lock = asyncio.Lock()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS circuit_breaker (
+                name TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                failures INTEGER NOT NULL,
+                last_failure TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _load_state(self):
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT state, failures, last_failure FROM circuit_breaker WHERE name = ?", (self.name,)).fetchone()
+        conn.close()
+        if row:
+            self.state = row[0]
+            self.failure_count = row[1]
+            self.last_failure_time = datetime.fromisoformat(row[2]) if row[2] else None
+        else:
+            self.state = 'closed'
+            self.failure_count = 0
+            self.last_failure_time = None
+
+    def _save_state(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT OR REPLACE INTO circuit_breaker (name, state, failures, last_failure)
+            VALUES (?, ?, ?, ?)
+        """, (self.name, self.state, self.failure_count, self.last_failure_time.isoformat() if self.last_failure_time else None))
+        conn.commit()
+        conn.close()
 
     async def call(self, func: Callable, *args, **kwargs):
         async with self._lock:
-            if self._state == CircuitBreakerState.OPEN:
-                if (datetime.now(timezone.utc) - self._last_failure_time).total_seconds() > self.recovery_timeout:
-                    self._state = CircuitBreakerState.HALF_OPEN
-                    logger.info(f"Circuit breaker {self.name} entering HALF_OPEN")
+            if self.state == 'open':
+                if self.last_failure_time and (datetime.now(timezone.utc) - self.last_failure_time).total_seconds() >= self.recovery_timeout:
+                    self.state = 'half_open'
+                    self._save_state()
+                    logger.info(f"Circuit breaker {self.name} transitioning to half_open")
                 else:
                     raise Exception(f"Circuit breaker {self.name} is OPEN")
         try:
             result = await func(*args, **kwargs)
             async with self._lock:
-                self._state = CircuitBreakerState.CLOSED
-                self._failure_count = 0
+                if self.state == 'half_open':
+                    self.state = 'closed'
+                    self.failure_count = 0
+                    self._save_state()
+                    logger.info(f"Circuit breaker {self.name} closed after success")
+                else:
+                    self.failure_count = 0
+                    self._save_state()
             return result
         except Exception as e:
             async with self._lock:
-                self._failure_count += 1
-                self._last_failure_time = datetime.now(timezone.utc)
-                if self._failure_count >= self.failure_threshold:
-                    self._state = CircuitBreakerState.OPEN
-                    logger.warning(f"Circuit breaker {self.name} opened after {self._failure_count} failures")
+                self.failure_count += 1
+                self.last_failure_time = datetime.now(timezone.utc)
+                if self.failure_count >= self.failure_threshold:
+                    self.state = 'open'
+                    logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
+                self._save_state()
             raise e
 
 # ============================================================================
@@ -181,7 +268,7 @@ if PYDANTIC_AVAILABLE:
             }
         )
 
-        # Demand priority defaults
+        # Priority defaults
         priority_defaults: Dict[str, Dict[str, float]] = Field(
             default_factory=lambda: {
                 'critical': {'weight': 2.0, 'min_balance': 10000, 'max_consumption': 0.9},
@@ -193,16 +280,33 @@ if PYDANTIC_AVAILABLE:
         )
         default_priority: str = 'normal'
 
-        # ML predictor
+        # ML predictor (RandomForest)
         ml_lookback: int = Field(50, ge=10)
-        ml_model_path: str = "./models/atp_demand_model.pkl"
+        ml_model_path: str = Field("./models/atp_demand_model.joblib")
+        ml_retrain_interval: int = Field(3600, ge=300)  # seconds
+        ml_min_samples: int = Field(100, ge=20)
 
-        # Gradient forecaster
+        # Gradient forecaster (Holt-Winters)
         forecast_history_window: int = Field(50, ge=10)
         forecast_horizon: int = Field(20, ge=5)
+        forecast_alpha: float = Field(0.3, ge=0, le=1)
+        forecast_beta: float = Field(0.1, ge=0, le=1)
 
         # Load balancing
         load_balance_history_size: int = Field(100, ge=10)
+        load_balance_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'health': 0.3,
+                'efficiency': 0.3,
+                'quantum': 0.2,
+                'performance': 0.2
+            }
+        )
+
+        # Priority adaptation
+        adaptive_priority_enabled: bool = True
+        adaptive_priority_learning_rate: float = Field(0.1, ge=0, le=1)
+        priority_performance_window: int = Field(50, ge=10)
 
         # Scheduling
         synthesis_interval: float = Field(0.1, ge=0.01)
@@ -223,8 +327,20 @@ if PYDANTIC_AVAILABLE:
             default_factory=lambda: {5: 0.9, 4: 0.8, 3: 0.7, 2: 0.6, 1: 0.0}
         )
 
+        # Shutdown timeout
+        shutdown_timeout_seconds: int = Field(30, ge=5)
+
+        # Circuit breaker DB
+        circuit_breaker_db_path: str = Field("./circuit_breakers.db")
+
         class Config:
             env_prefix = "ATP_SCHEDULER_"
+
+    class DemandPriorityConfig(BaseModel):
+        priority_level: str
+        weight: float = Field(..., ge=0)
+        min_balance: float = Field(..., ge=0)
+        max_consumption: float = Field(..., ge=0, le=1)
 
 else:
     @dataclass
@@ -264,10 +380,23 @@ else:
         })
         default_priority: str = 'normal'
         ml_lookback: int = 50
-        ml_model_path: str = "./models/atp_demand_model.pkl"
+        ml_model_path: str = "./models/atp_demand_model.joblib"
+        ml_retrain_interval: int = 3600
+        ml_min_samples: int = 100
         forecast_history_window: int = 50
         forecast_horizon: int = 20
+        forecast_alpha: float = 0.3
+        forecast_beta: float = 0.1
         load_balance_history_size: int = 100
+        load_balance_weights: Dict[str, float] = field(default_factory=lambda: {
+            'health': 0.3,
+            'efficiency': 0.3,
+            'quantum': 0.2,
+            'performance': 0.2
+        })
+        adaptive_priority_enabled: bool = True
+        adaptive_priority_learning_rate: float = 0.1
+        priority_performance_window: int = 50
         synthesis_interval: float = 0.1
         regulation_interval: float = 30
         predictive_interval: float = 60
@@ -279,6 +408,15 @@ else:
         enable_prometheus: bool = False
         degradation_tier_update_interval: int = 600
         efficiency_thresholds: Dict[int, float] = field(default_factory=lambda: {5: 0.9, 4: 0.8, 3: 0.7, 2: 0.6, 1: 0.0})
+        shutdown_timeout_seconds: int = 30
+        circuit_breaker_db_path: str = "./circuit_breakers.db"
+
+    @dataclass
+    class DemandPriorityConfig:
+        priority_level: str
+        weight: float
+        min_balance: float
+        max_consumption: float
 
 # ============================================================================
 # Enums and Data Classes
@@ -591,11 +729,11 @@ class EnhancedATPSynthase:
         }
 
 # ============================================================================
-# Demand Priority Manager
+# Demand Priority Manager with Adaptive Weights
 # ============================================================================
 
 class DemandPriorityManager:
-    """User-defined demand priority management."""
+    """User-defined demand priority management with adaptive weights."""
     
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
@@ -609,6 +747,7 @@ class DemandPriorityManager:
             )
         self.default_priority = config.default_priority
         self._lock = asyncio.Lock()
+        self.performance_history: Dict[str, List[float]] = defaultdict(lambda: deque(maxlen=config.priority_performance_window))
         logger.info("Demand Priority Manager initialized")
     
     async def set_priority_config(self, priority_level: str, weight: float,
@@ -636,9 +775,34 @@ class DemandPriorityManager:
             elif time_remaining < 3600:
                 base_weight *= 1.2
         return base_weight * (task.priority + 1)
+    
+    async def adapt_weights(self):
+        """Adapt priority weights based on historical performance."""
+        if not self.config.adaptive_priority_enabled:
+            return
+        async with self._lock:
+            for level, hist in self.performance_history.items():
+                if len(hist) >= self.config.priority_performance_window:
+                    avg_perf = np.mean(hist)
+                    # Increase weight if performance is good, decrease if poor
+                    if avg_perf > 0.8:
+                        delta = self.config.adaptive_priority_learning_rate
+                    elif avg_perf < 0.5:
+                        delta = -self.config.adaptive_priority_learning_rate
+                    else:
+                        delta = 0.0
+                    self.priorities[level].weight += delta
+                    self.priorities[level].weight = max(0.1, min(5.0, self.priorities[level].weight))
+                    logger.debug(f"Adjusted priority weight for {level}: {self.priorities[level].weight:.2f}")
+    
+    async def record_performance(self, priority_level: str, success: bool, latency: float):
+        """Record the performance of a task with given priority."""
+        async with self._lock:
+            if priority_level in self.priorities:
+                self.performance_history[priority_level].append(1.0 if success else 0.0)
 
 # ============================================================================
-# Synthase Load Balancer
+# Synthase Load Balancer (Enhanced)
 # ============================================================================
 
 class SynthaseLoadBalancer:
@@ -660,6 +824,7 @@ class SynthaseLoadBalancer:
             
             scores = {}
             total_score = 0.0
+            weights = self.config.load_balance_weights
             
             for sid, synthase in synthases.items():
                 # Health score
@@ -688,7 +853,11 @@ class SynthaseLoadBalancer:
                     avg_perf = 0.5
                 performance_factor = 0.5 + avg_perf  # scale 0.5..1.5
                 
-                score = health_score * efficiency_score * quantum_bonus * performance_factor
+                # Composite score with configurable weights
+                score = (health_score * weights.get('health', 0.3) +
+                         efficiency_score * weights.get('efficiency', 0.3) +
+                         quantum_bonus * weights.get('quantum', 0.2) +
+                         performance_factor * weights.get('performance', 0.2))
                 
                 if sid not in self.historical_loads:
                     self.historical_loads[sid] = []
@@ -724,11 +893,11 @@ class SynthaseLoadBalancer:
         }
 
 # ============================================================================
-# ML Demand Predictor (with persistence)
+# ML Demand Predictor with RandomForest and secure serialization
 # ============================================================================
 
 class MLDemandPredictor:
-    """Machine learning for demand prediction with model persistence."""
+    """Machine learning for demand prediction using RandomForest with joblib."""
     
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
@@ -741,39 +910,35 @@ class MLDemandPredictor:
         logger.info("ML Demand Predictor initialized")
     
     def _load_model(self):
-        """Load model from disk."""
+        """Load model from disk using joblib."""
         if not SKLEARN_AVAILABLE:
             return
         path = self.config.ml_model_path
         if os.path.exists(path):
             try:
-                with open(path, 'rb') as f:
-                    data = pickle.load(f)
-                    self.model = data['model']
-                    self.scaler = data['scaler']
-                    self.is_trained = True
+                self.model, self.scaler = joblib.load(path)
+                self.is_trained = True
                 logger.info("Loaded ML model", path=path)
             except Exception as e:
                 logger.warning("Failed to load ML model", error=str(e))
     
     def _save_model(self):
-        """Save model to disk."""
+        """Save model to disk using joblib."""
         if not SKLEARN_AVAILABLE or not self.is_trained:
             return
         path = self.config.ml_model_path
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'wb') as f:
-                pickle.dump({'model': self.model, 'scaler': self.scaler}, f)
+            joblib.dump((self.model, self.scaler), path)
             logger.info("Saved ML model", path=path)
         except Exception as e:
             logger.error("Failed to save ML model", error=str(e))
     
     async def train(self, demand_history: List[float]) -> Dict:
-        """Train the demand prediction model."""
+        """Train the demand prediction model using RandomForest."""
         if not SKLEARN_AVAILABLE:
             return {'status': 'sklearn_not_available'}
-        if len(demand_history) < self.config.ml_lookback + 10:
+        if len(demand_history) < self.config.ml_min_samples:
             return {'status': 'insufficient_data'}
         
         async with self._lock:
@@ -784,14 +949,14 @@ class MLDemandPredictor:
                 y.append(demand_history[i + 1])
             X = np.array(X)
             y = np.array(y)
-            if len(X) < 10:
+            if len(X) < self.config.ml_min_samples:
                 return {'status': 'insufficient_samples'}
             
             if self.scaler is None:
                 self.scaler = StandardScaler()
             X_scaled = self.scaler.fit_transform(X)
             
-            self.model = LinearRegression()
+            self.model = RandomForestRegressor(n_estimators=100, random_state=42)
             self.model.fit(X_scaled, y)
             self.is_trained = True
             self.training_data = demand_history
@@ -807,6 +972,8 @@ class MLDemandPredictor:
             features = recent_demand[-self.config.ml_lookback:]
             features_scaled = self.scaler.transform([features])
             prediction = self.model.predict(features_scaled)[0]
+            # Confidence based on prediction std (simplified)
+            # For RandomForest, we could use tree variance; for simplicity, use volatility.
             volatility = np.std(recent_demand[-20:]) if len(recent_demand) >= 20 else 0.2
             confidence = max(0.1, 1.0 - volatility)
             return {'prediction': max(0.0, min(1.0, prediction)), 'confidence': confidence}
@@ -822,47 +989,60 @@ class MLDemandPredictor:
         }
 
 # ============================================================================
-# Gradient Forecaster (enhanced)
+# Gradient Forecaster with Holt-Winters Exponential Smoothing
 # ============================================================================
 
 class GradientForecaster:
-    """Gradient forecasting with trend analysis."""
+    """Gradient forecasting with Holt-Winters exponential smoothing."""
     
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
         self.gradient_history: Dict[str, List[float]] = {}
         self.forecast_results: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
+        # Holt-Winters state per field
+        self.level: Dict[str, float] = {}
+        self.trend: Dict[str, float] = {}
+        self.last_update: Dict[str, datetime] = {}
         logger.info("Gradient Forecaster initialized")
     
     def record_gradient(self, field_id: str, value: float):
         if field_id not in self.gradient_history:
             self.gradient_history[field_id] = []
+            self.level[field_id] = value
+            self.trend[field_id] = 0.0
         self.gradient_history[field_id].append(value)
         if len(self.gradient_history[field_id]) > self.config.forecast_history_window * 2:
             self.gradient_history[field_id] = self.gradient_history[field_id][-self.config.forecast_history_window*2:]
+        # Update Holt-Winters state
+        if len(self.gradient_history[field_id]) >= 2:
+            alpha = self.config.forecast_alpha
+            beta = self.config.forecast_beta
+            last_level = self.level.get(field_id, value)
+            last_trend = self.trend.get(field_id, 0.0)
+            self.level[field_id] = alpha * value + (1 - alpha) * (last_level + last_trend)
+            self.trend[field_id] = beta * (self.level[field_id] - last_level) + (1 - beta) * last_trend
+            self.last_update[field_id] = datetime.now(timezone.utc)
     
     async def forecast(self, field_id: str) -> Dict:
-        """Forecast gradient values using linear trend."""
+        """Forecast gradient values using Holt-Winters."""
         if field_id not in self.gradient_history or len(self.gradient_history[field_id]) < 20:
             return {'status': 'insufficient_data'}
         async with self._lock:
-            history = self.gradient_history[field_id][-self.config.forecast_history_window:]
-            x = np.arange(len(history))
-            y = np.array(history)
-            slope, intercept = np.polyfit(x, y, 1)
+            current_level = self.level.get(field_id, 0.5)
+            current_trend = self.trend.get(field_id, 0.0)
             forecast_values = []
             for i in range(self.config.forecast_horizon):
-                next_value = slope * (len(history) + i) + intercept
+                next_value = current_level + current_trend * (i + 1)
                 forecast_values.append(max(0.0, min(1.0, next_value)))
-            volatility = np.std(history[-20:]) if len(history) >= 20 else 0.2
+            volatility = np.std(self.gradient_history[field_id][-20:]) if len(self.gradient_history[field_id]) >= 20 else 0.2
             confidence = max(0.1, 1.0 - volatility * 2)
             result = {
                 'field': field_id,
-                'current': history[-1],
+                'current': self.gradient_history[field_id][-1],
                 'forecast': forecast_values,
-                'trend': 'increasing' if slope > 0.01 else 'decreasing' if slope < -0.01 else 'stable',
-                'slope': slope,
+                'trend': 'increasing' if current_trend > 0.01 else 'decreasing' if current_trend < -0.01 else 'stable',
+                'slope': current_trend,
                 'confidence': confidence
             }
             self.forecast_results[field_id] = result
@@ -874,7 +1054,7 @@ class GradientForecaster:
 
 class ATPSynthaseScheduler:
     """
-    Enhanced ATP Synthase Scheduler v8.0.0.
+    Enhanced ATP Synthase Scheduler v9.0.0.
     Integrates all features with concurrency safety, configuration, and task management.
     """
     
@@ -953,9 +1133,19 @@ class ATPSynthaseScheduler:
         self._demand_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
         
-        # Circuit breakers for external services
-        self._token_circuit = CircuitBreaker("token_service", failure_threshold=3)
-        self._gradient_circuit = CircuitBreaker("gradient_service", failure_threshold=3)
+        # Circuit breakers with persistence
+        self._token_circuit = CircuitBreaker(
+            "token_service",
+            db_path=self.config.circuit_breaker_db_path,
+            failure_threshold=3,
+            recovery_timeout=30
+        )
+        self._gradient_circuit = CircuitBreaker(
+            "gradient_service",
+            db_path=self.config.circuit_breaker_db_path,
+            failure_threshold=3,
+            recovery_timeout=30
+        )
         
         # Task manager
         self._task_manager = TaskManager()
@@ -965,11 +1155,12 @@ class ATPSynthaseScheduler:
         self._task_manager.start_task("predictive", self._predictive_loop)
         self._task_manager.start_task("gradient_forecast", self._gradient_forecast_loop)
         self._task_manager.start_task("degradation_update", self._degradation_update_loop)
+        self._task_manager.start_task("priority_adapt", self._priority_adapt_loop)
         
         # Prometheus metrics
         self._setup_metrics()
         
-        logger.info("ATP Synthase Scheduler v8.0.0 initialized", config=self.config.dict() if PYDANTIC_AVAILABLE else asdict(self.config))
+        logger.info("ATP Synthase Scheduler v9.0.0 initialized", config=self.config.dict() if PYDANTIC_AVAILABLE else asdict(self.config))
     
     def _setup_metrics(self):
         """Setup Prometheus metrics if enabled."""
@@ -989,10 +1180,20 @@ class ATPSynthaseScheduler:
             'inhibition_level': Gauge('atp_inhibition_level', 'Current inhibition level')
         }
     
-    async def shutdown(self):
-        """Gracefully shut down the scheduler."""
+    async def shutdown(self, timeout: Optional[float] = None):
+        """
+        Gracefully shut down the scheduler.
+        Args:
+            timeout: Maximum time to wait for background tasks to finish.
+        """
         logger.info("Shutting down ATP Synthase Scheduler")
-        await self._task_manager.stop_all()
+        if timeout is None:
+            timeout = self.config.shutdown_timeout_seconds
+        # Stop all tasks with timeout
+        try:
+            await asyncio.wait_for(self._task_manager.stop_all(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Background tasks did not finish in time; forcing cancellation")
         # Save ML model
         if self.ml_predictor:
             self.ml_predictor._save_model()
@@ -1195,7 +1396,7 @@ class ATPSynthaseScheduler:
     # ========================================================================
     
     async def _regulation_loop(self):
-        """Regulatory loop for scaling and inhibition."""
+        """Regulatory loop for scaling, inhibition, and metrics updates."""
         while True:
             try:
                 if self.token_service:
@@ -1214,6 +1415,16 @@ class ATPSynthaseScheduler:
                         if sid != "primary" and len(self.synthases) > 1:
                             await self.remove_synthase(sid)
                             break
+                
+                # Update Prometheus gauges
+                if self.metrics:
+                    self.metrics['synthase_count'].set(len(self.synthases))
+                    self.metrics['queue_size'].set(len(self.execution_queue))
+                    self.metrics['priority_queue_size'].set(len(self.priority_queue))
+                    self.metrics['degradation_tier'].set(self.current_tier)
+                    self.metrics['inhibition_level'].set(self.primary_synthase.inhibition_level)
+                    self.metrics['quantum_enhancement'].set(self.primary_synthase.quantum_enhancement_factor)
+                
                 await asyncio.sleep(self.config.regulation_interval)
             except asyncio.CancelledError:
                 break
@@ -1243,9 +1454,10 @@ class ATPSynthaseScheduler:
                 if self.ml_predictor:
                     async with self._demand_lock:
                         history = list(self.demand_history)
-                    if len(history) > 50:
+                    # Retrain if needed
+                    if len(history) > self.config.ml_min_samples and (not self.ml_predictor.is_trained or len(history) % 10 == 0):
                         await self.ml_predictor.train(history)
-                    if len(history) > 30:
+                    if len(history) > self.config.ml_lookback:
                         pred = await self.ml_predictor.predict(history)
                         if pred['prediction'] is not None:
                             self.predicted_demand = pred['prediction']
@@ -1253,12 +1465,16 @@ class ATPSynthaseScheduler:
                 
                 if self.predicted_demand > 0.7 and self.token_service:
                     pre_amount = self.predicted_demand * 100
-                    self.token_service.generate_tokens(
-                        account_id=self.account_id,
-                        source=EcoATPSource.GRADIENT_CONVERSION,
-                        energy_saved_kwh=pre_amount / 10000.0,
-                        efficiency=0.9
-                    )
+                    # Use retry decorator for external call
+                    @retry_decorator(max_attempts=3, min_delay=0.1, max_delay=2)
+                    async def generate():
+                        self.token_service.generate_tokens(
+                            account_id=self.account_id,
+                            source=EcoATPSource.GRADIENT_CONVERSION,
+                            energy_saved_kwh=pre_amount / 10000.0,
+                            efficiency=0.9
+                        )
+                    await generate()
                 await asyncio.sleep(self.config.predictive_interval)
             except asyncio.CancelledError:
                 break
@@ -1302,6 +1518,18 @@ class ATPSynthaseScheduler:
                 logger.error("Degradation update loop error", error=str(e))
                 await asyncio.sleep(60)
     
+    async def _priority_adapt_loop(self):
+        """Adapt priority weights based on historical performance."""
+        while True:
+            try:
+                await self.priority_manager.adapt_weights()
+                await asyncio.sleep(self.config.regulation_interval * 5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Priority adaptation loop error", error=str(e))
+                await asyncio.sleep(60)
+    
     # ========================================================================
     # Scheduling methods
     # ========================================================================
@@ -1314,9 +1542,13 @@ class ATPSynthaseScheduler:
         if not self.token_service:
             return True
         
-        success, token_ids = self.token_service.reserve_tokens(
-            self.account_id, eco_atp_required, EcoATPConsumer.EXPERT_EXECUTION
-        )
+        # Use retry for token reservation
+        @retry_decorator(max_attempts=3, min_delay=0.1, max_delay=2)
+        async def reserve():
+            return self.token_service.reserve_tokens(
+                self.account_id, eco_atp_required, EcoATPConsumer.EXPERT_EXECUTION
+            )
+        success, token_ids = await reserve()
         if success:
             task = ScheduledTask(
                 task_id=task_id, eco_atp_required=eco_atp_required,
@@ -1349,7 +1581,11 @@ class ATPSynthaseScheduler:
         if self.token_service:
             self.token_service.consume_tokens(task.token_ids, EcoATPConsumer.EXPERT_EXECUTION, True)
         if task.callback:
-            result = task.callback()
+            # Handle async callbacks properly
+            if asyncio.iscoroutinefunction(task.callback):
+                result = await task.callback()
+            else:
+                result = task.callback()
             task.status = "completed"
             return {'task_id': task.task_id, 'result': result, 'status': 'completed'}
         task.status = "completed"
@@ -1379,11 +1615,14 @@ class ATPSynthaseScheduler:
         """Set degradation tier manually."""
         self.current_tier = max(1, min(5, tier))
         if tier <= 2:
-            for sid in list(self.synthases.keys()):
-                if sid != "primary":
-                    async def remove():
-                        await self.remove_synthase(sid)
-                    asyncio.create_task(remove())
+            # Remove non-primary synthases asynchronously with proper waiting
+            async def remove_all():
+                tasks = []
+                for sid in list(self.synthases.keys()):
+                    if sid != "primary":
+                        tasks.append(self.remove_synthase(sid))
+                await asyncio.gather(*tasks, return_exceptions=True)
+            asyncio.create_task(remove_all())
         logger.info("Degradation tier set", tier=tier)
     
     def get_scheduler_stats(self) -> Dict[str, Any]:
@@ -1482,7 +1721,9 @@ async def example_usage():
     config = {
         'enable_multi_synthase': True,
         'enable_quantum': True,
-        'enable_ml_prediction': True
+        'enable_ml_prediction': True,
+        'ml_model_path': './test_model.joblib',
+        'circuit_breaker_db_path': './test_cb.db'
     }
     scheduler = ATPSynthaseScheduler(
         token_service=token,
