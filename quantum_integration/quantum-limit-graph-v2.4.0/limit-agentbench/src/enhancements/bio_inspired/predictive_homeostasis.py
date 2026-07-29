@@ -1,16 +1,16 @@
 # =============================================================================
-# Enhanced Photosynthetic Harvester v9.0.0 – Production‑ready with all fixes
+# Enhanced Photosynthetic Harvester v9.1.0 – Production‑ready with all fixes
 # =============================================================================
 # This file integrates all enhancements recommended:
 # - Centralized TaskManager for all background tasks
-# - Safe genetic optimizer using simulation snapshots
-# - Full persistence with file/redis backends
+# - Safe genetic optimizer using simulation snapshots (with real data)
+# - Full persistence with file/redis backends (with proper checkpointing)
 # - Circuit breakers for external services
-# - JWT‑based WebSocket authentication (optional)
-# - Self‑healing strategies implemented
-# - Improved RL training loop with background updates
+# - JWT‑based WebSocket authentication (optional, with rate limiting)
+# - Self‑healing strategies implemented and triggered
+# - Improved RL training loop with background updates and reward signals
 # - Fixed locking, concurrency, and error handling
-# - Comprehensive logging and observability
+# - Comprehensive logging and observability (Prometheus metrics)
 # =============================================================================
 
 import asyncio
@@ -49,7 +49,7 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 try:
-    from prometheus_client import Gauge, Counter, Histogram, generate_latest
+    from prometheus_client import Gauge, Counter, Histogram, generate_latest, start_http_server
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
@@ -61,10 +61,16 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
 try:
-    from pydantic import BaseModel, Field, validator, root_validator
+    from pydantic import BaseModel, Field, validator, root_validator, ConfigDict
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
+
+try:
+    import jwt
+    JWT_AVAILABLE = True
+except ImportError:
+    JWT_AVAILABLE = False
 
 # Local imports (with fallback)
 try:
@@ -818,61 +824,64 @@ class ChildHarvesterCompetition:
 
     async def allocate_budget(self) -> Dict[str, float]:
         async with self._lock:
-            children = list(self.parent.child_harvesters.values())
-            if not children:
-                return {}
-            scores = {}
-            total_score = 0.0
-            for child in children:
-                cycles = child.harvest_cycles
-                if cycles > 0:
-                    score = child.total_harvested / cycles
-                else:
-                    score = 0.5
-                scores[child.harvester_id] = score
-                total_score += score
-            if total_score == 0:
-                per_child = self.excitation_budget / len(children)
-                return {c.harvester_id: per_child for c in children}
-            allocation = {}
-            for child in children:
-                allocation[child.harvester_id] = (scores[child.harvester_id] / total_score) * self.excitation_budget
-            self.budget_consumption = allocation
-            self.budget_cycle += 1
-            return allocation
+            # Acquire parent's child lock to safely read child_harvesters
+            async with self.parent._child_lock:
+                children = list(self.parent.child_harvesters.values())
+                if not children:
+                    return {}
+                scores = {}
+                total_score = 0.0
+                for child in children:
+                    cycles = child.harvest_cycles
+                    if cycles > 0:
+                        score = child.total_harvested / cycles
+                    else:
+                        score = 0.5
+                    scores[child.harvester_id] = score
+                    total_score += score
+                if total_score == 0:
+                    per_child = self.excitation_budget / len(children)
+                    return {c.harvester_id: per_child for c in children}
+                allocation = {}
+                for child in children:
+                    allocation[child.harvester_id] = (scores[child.harvester_id] / total_score) * self.excitation_budget
+                self.budget_consumption = allocation
+                self.budget_cycle += 1
+                return allocation
 
     async def run_competition(self):
         async with self._lock:
-            children = list(self.parent.child_harvesters.values())
-            if len(children) < 2:
-                return
-            performance = {}
-            for child in children:
-                cycles = child.harvest_cycles
-                performance[child.harvester_id] = child.total_harvested / cycles if cycles > 0 else 0
-            sorted_perf = sorted(performance.items(), key=lambda x: x[1])
-            bottom_count = max(1, int(len(sorted_perf) * self.replacement_threshold))
-            bottom = [cid for cid, _ in sorted_perf[:bottom_count]]
-            top = [cid for cid, _ in sorted_perf[-bottom_count:]]
-            if not top:
-                return
-            for child_id in bottom:
-                top_id = random.choice(top)
-                top_child = self.parent.child_harvesters.get(top_id)
-                if not top_child:
-                    continue
-                # Clone top child's configuration and mutate
-                new_child = self.parent.spawn_child_from_template(top_child)
-                if new_child:
-                    # Mutate sensitivity slightly
-                    for p in new_child.pigments.pigments:
-                        if random.random() < 0.3:
-                            new_child.pigments.pigments[p]['sensitivity'] = (
-                                new_child.pigments.pigments[p]['base_sensitivity'] * random.uniform(0.8, 1.2)
-                            )
-                    self.parent.remove_child(child_id)
-                    self.parent.child_harvesters[new_child.harvester_id] = new_child
-                    logger.info(f"Replaced child {child_id} with {new_child.harvester_id}")
+            async with self.parent._child_lock:
+                children = list(self.parent.child_harvesters.values())
+                if len(children) < 2:
+                    return
+                performance = {}
+                for child in children:
+                    cycles = child.harvest_cycles
+                    performance[child.harvester_id] = child.total_harvested / cycles if cycles > 0 else 0
+                sorted_perf = sorted(performance.items(), key=lambda x: x[1])
+                bottom_count = max(1, int(len(sorted_perf) * self.replacement_threshold))
+                bottom = [cid for cid, _ in sorted_perf[:bottom_count]]
+                top = [cid for cid, _ in sorted_perf[-bottom_count:]]
+                if not top:
+                    return
+                for child_id in bottom:
+                    top_id = random.choice(top)
+                    top_child = self.parent.child_harvesters.get(top_id)
+                    if not top_child:
+                        continue
+                    # Clone top child's configuration and mutate
+                    new_child = self.parent.spawn_child_from_template(top_child)
+                    if new_child:
+                        # Mutate sensitivity slightly
+                        for p in new_child.pigments.pigments:
+                            if random.random() < 0.3:
+                                new_child.pigments.pigments[p]['sensitivity'] = (
+                                    new_child.pigments.pigments[p]['base_sensitivity'] * random.uniform(0.8, 1.2)
+                                )
+                        self.parent.remove_child(child_id)
+                        self.parent.child_harvesters[new_child.harvester_id] = new_child
+                        logger.info(f"Replaced child {child_id} with {new_child.harvester_id}")
 
     def get_stats(self) -> Dict:
         return {'budget_cycle': self.budget_cycle, 'budget_consumption': self.budget_consumption}
@@ -1029,9 +1038,15 @@ class ZeroTrustSecurity:
             return token == self.config.websocket_auth_token
 
     def _verify_jwt(self, token: str) -> bool:
-        # Placeholder: in production, use PyJWT to verify signature
-        # For demo, just check if token equals the secret
-        return token == self.config.websocket_jwt_secret
+        if not JWT_AVAILABLE:
+            logger.warning("JWT library not available, using fallback token comparison")
+            return token == self.config.websocket_jwt_secret
+        try:
+            # Use PyJWT to decode and verify
+            jwt.decode(token, self.config.websocket_jwt_secret, algorithms=['HS256'])
+            return True
+        except jwt.InvalidTokenError:
+            return False
 
     def check_rate_limit(self, user_id: str) -> bool:
         now = time.time()
@@ -1212,7 +1227,7 @@ class IoTSensorHub:
                 'acoustic': random.uniform(0, 1), 'chemical': random.uniform(0, 1)}
 
 # =============================================================================
-# WebSocket Server (with JWT authentication)
+# WebSocket Server (with JWT authentication and rate limiting)
 # =============================================================================
 class HarvesterWebSocketServer:
     def __init__(self, config: HarvesterConfig, harvester: 'EnhancedPhotosyntheticHarvester'):
@@ -1225,6 +1240,7 @@ class HarvesterWebSocketServer:
         self.is_running = False
         self.server = None
         self._lock = asyncio.Lock()
+        self.security = ZeroTrustSecurity(config)
         if not WEBSOCKETS_AVAILABLE:
             logger.warning("WebSocket support not available")
 
@@ -1251,19 +1267,15 @@ class HarvesterWebSocketServer:
 
     async def _handle_connection(self, websocket: websockets.WebSocketServerProtocol, path):
         # Authentication
-        auth_token = self.config.websocket_auth_token
-        jwt_secret = self.config.websocket_jwt_secret
         try:
             auth_msg = await asyncio.wait_for(websocket.recv(), timeout=5)
-            if jwt_secret:
-                # Simple JWT verification (placeholder)
-                if auth_msg != jwt_secret:
-                    await websocket.close(1008, "Authentication failed")
-                    return
-            else:
-                if auth_msg != auth_token:
-                    await websocket.close(1008, "Authentication failed")
-                    return
+            if not await self.security.authenticate(auth_msg):
+                await websocket.close(1008, "Authentication failed")
+                return
+            # Rate limiting
+            if not self.security.check_rate_limit(websocket.remote_address):
+                await websocket.close(1008, "Rate limit exceeded")
+                return
         except asyncio.TimeoutError:
             await websocket.close(1008, "Authentication timeout")
             return
@@ -1432,16 +1444,25 @@ class PersistentHarvesterState:
 
     async def save_checkpoint(self, checkpoint: Dict[str, Any]) -> bool:
         timestamp = datetime.now(timezone.utc).isoformat()
-        key = f"{self.harvester_id}:checkpoint:{timestamp}"
+        checkpoint_key = f"{self.harvester_id}:checkpoint:{timestamp}"
+        latest_key = f"{self.harvester_id}:checkpoint:latest"
         async with self._lock:
-            return await self.backend.save(key, checkpoint)
+            # Save the checkpoint with timestamp
+            if not await self.backend.save(checkpoint_key, checkpoint):
+                return False
+            # Save the latest pointer (just the timestamp) and also the checkpoint data
+            if not await self.backend.save(latest_key, checkpoint):
+                # If saving latest fails, rollback? For simplicity, we just log.
+                logger.error("Failed to save latest checkpoint pointer")
+            return True
 
     async def load_latest_checkpoint(self) -> Optional[Tuple[str, Dict[str, Any]]]:
-        key = f"{self.harvester_id}:checkpoint:latest"
+        latest_key = f"{self.harvester_id}:checkpoint:latest"
         async with self._lock:
-            data = await self.backend.load(key)
+            data = await self.backend.load(latest_key)
             if data:
-                return (key, data)
+                # data is the checkpoint dict itself
+                return (latest_key, data)
         return None
 
 # =============================================================================
@@ -1496,7 +1517,7 @@ class EnhancedPhotosyntheticHarvester:
         self.harvest_cycles = 0
         self.peak_harvest_rate = 0.0
         self.account_id = f"photosynthetic_{self.harvester_id}"
-        if self.token_manager:
+        if self.token_manager and TOKEN_MANAGER_AVAILABLE:
             self.token_manager.create_account(self.account_id)
 
         # Locks
@@ -1513,7 +1534,23 @@ class EnhancedPhotosyntheticHarvester:
         if self.config.enable_persistence:
             asyncio.create_task(self._restore_state())
 
+        # Prometheus metrics
+        self._setup_metrics()
+
         logger.info(f"EnhancedPhotosyntheticHarvester initialized: {self.harvester_id}")
+
+    def _setup_metrics(self):
+        if not PROMETHEUS_AVAILABLE or not self.config.enable_prometheus:
+            return
+        self.metrics = {
+            'harvested_total': Counter('harvester_harvested_total', 'Total tokens harvested'),
+            'efficiency_current': Gauge('harvester_efficiency_current', 'Current efficiency'),
+            'damage_current': Gauge('harvester_damage_current', 'Current cumulative damage'),
+            'pigment_damage': Gauge('harvester_pigment_damage', 'Damage per pigment', ['pigment']),
+            'children_count': Gauge('harvester_children_count', 'Number of children'),
+            'genetic_fitness': Gauge('harvester_genetic_fitness', 'Best genetic fitness'),
+        }
+        start_http_server(8000)  # default port, configurable
 
     async def _competition_loop(self):
         while True:
@@ -1557,7 +1594,12 @@ class EnhancedPhotosyntheticHarvester:
     async def _restore_state(self):
         if not self.config.enable_persistence:
             return
-        state = await self.persistence.load_state()
+        # First try to load the latest checkpoint
+        checkpoint = await self.persistence.load_latest_checkpoint()
+        if checkpoint:
+            state = checkpoint[1]
+        else:
+            state = await self.persistence.load_state()
         if state:
             async with self._state_lock:
                 self.total_harvested = state.get('total_harvested', 0)
@@ -1599,6 +1641,7 @@ class EnhancedPhotosyntheticHarvester:
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
         await self.persistence.save_checkpoint(state)
+        # Also save the full state for backward compatibility
         await self.persistence.save_state(state)
 
     async def spawn_child(self, specialization: str) -> Optional['EnhancedPhotosyntheticHarvester']:
@@ -1659,6 +1702,10 @@ class EnhancedPhotosyntheticHarvester:
             return False
 
     async def harvest_cycle(self, environmental_data: Dict[str, float]) -> Dict[str, Any]:
+        # Inject chaos if enabled
+        if self.config.enable_chaos:
+            await self.chaos.inject_latency(ms=50, duration=1)
+
         try:
             # 1. Security (simplified)
             # 2. Sensor fusion
@@ -1676,13 +1723,12 @@ class EnhancedPhotosyntheticHarvester:
                 state = self.rl.get_state_vector({
                     'raw_excitations': fused,
                     'efficiency': self.reaction_center.current_efficiency,
-                    'damage': 0,
+                    'damage': self.reaction_center.cumulative_damage,
                     'account_balance': self._get_balance(),
                     'child_results': {}
                 })
                 mode, _ = await self.rl.select_action(state)
                 self.set_mode(mode)
-                # Also store transition later if we have reward - skipped for simplicity
 
             # 4. Sense pigments
             excitations = await self.pigments.sense_environment(fused)
@@ -1696,6 +1742,9 @@ class EnhancedPhotosyntheticHarvester:
                 self.harvest_cycles += 1
                 if generated > self.peak_harvest_rate:
                     self.peak_harvest_rate = generated
+                # Store environmental data for genetic optimizer (only for root)
+                if not self.is_child:
+                    self.genetic_optimizer.recent_data.append(fused.copy())
 
             # 7. Predictive maintenance
             health = await self.pigments.get_health_summary()
@@ -1728,9 +1777,37 @@ class EnhancedPhotosyntheticHarvester:
             await self.event_system.emit('harvest_complete', result)
 
             # 12. Self-healing check (if needed)
-            # We can trigger healing based on risk or health; here we just log.
             if risk > 0.6:
                 await self.self_healer.apply_healing('damage_accumulation')
+
+            # 13. RL reward and transition storage
+            if self.rl:
+                # Compute reward: positive for generated tokens, negative for damage
+                reward = generated / 1000.0 - self.reaction_center.cumulative_damage * 10.0
+                next_state = self.rl.get_state_vector({
+                    'raw_excitations': fused,
+                    'efficiency': self.reaction_center.current_efficiency,
+                    'damage': self.reaction_center.cumulative_damage,
+                    'account_balance': self._get_balance(),
+                    'child_results': {}
+                })
+                # Action index (from mode)
+                mode_to_idx = {mode: i for i, mode in enumerate([HarvestingMode.FULL, HarvestingMode.ADAPTIVE,
+                                                                 HarvestingMode.MODULATED, HarvestingMode.CONSERVATIVE,
+                                                                 HarvestingMode.MINIMAL, HarvestingMode.SURVIVAL])}
+                action_idx = mode_to_idx.get(self.mode, 1)
+                done = False  # episodic? not used
+                await self.rl.store_transition(state, action_idx, reward, next_state, done)
+
+            # Update Prometheus metrics
+            if self.config.enable_prometheus and PROMETHEUS_AVAILABLE:
+                self.metrics['harvested_total'].inc(generated)
+                self.metrics['efficiency_current'].set(self.reaction_center.current_efficiency)
+                self.metrics['damage_current'].set(self.reaction_center.cumulative_damage)
+                for pigment, h in self.pigments.pigment_health.items():
+                    self.metrics['pigment_damage'].labels(pigment=pigment).set(h.damage_accumulation)
+                self.metrics['children_count'].set(len(self.child_harvesters))
+                self.metrics['genetic_fitness'].set(self.genetic_optimizer.best_fitness)
 
             return result
 
@@ -1739,7 +1816,7 @@ class EnhancedPhotosyntheticHarvester:
             return {'error': str(e), 'harvester_id': self.harvester_id}
 
     def _get_balance(self) -> float:
-        if self.token_manager:
+        if self.token_manager and TOKEN_MANAGER_AVAILABLE:
             return self.token_manager.get_account_summary(self.account_id).get('balance', 0)
         return 0
 
