@@ -1,7 +1,6 @@
 """
-TimeTickEngine v3.0
-Enhanced simulation driver with configurable data sources, interpolation,
-checkpointing, metrics, and graceful shutdown.
+TimeTickEngine v3.1 – Enhanced simulation driver with configurable data sources,
+interpolation, checkpointing, metrics, and graceful shutdown.
 
 Supports:
 - CSV data loading with validation and configurable date column.
@@ -12,6 +11,8 @@ Supports:
 - Graceful stop via stop() method.
 - Async context manager for clean resource management.
 - Configurable date format and checkpoint retention.
+- Data hash validation for checkpoint compatibility.
+- Improved live data handling and error recovery.
 """
 
 import asyncio
@@ -25,6 +26,7 @@ import pickle
 import glob
 from pathlib import Path
 import math
+import hashlib
 
 import pandas as pd
 import numpy as np
@@ -39,6 +41,12 @@ try:
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 # ============================================================================
 # Configuration (Pydantic or dataclass)
@@ -66,6 +74,8 @@ if PYDANTIC_AVAILABLE:
         live_data_callback: Optional[Callable[[], Awaitable[Dict[str, float]]]] = Field(
             None, description="Async callback to fetch live data."
         )
+        # Custom metrics storage limit
+        max_custom_metrics_entries: int = Field(1000, ge=1, description="Maximum number of custom metric entries to keep.")
 
         @validator('interpolation_method')
         def validate_interpolation(cls, v):
@@ -104,6 +114,7 @@ else:
         max_checkpoints: int = 5
         live_fetch_interval: float = 1.0
         live_data_callback: Optional[Callable] = None
+        max_custom_metrics_entries: int = 1000
 
 # ============================================================================
 # Protocols for loose coupling
@@ -113,6 +124,8 @@ class HarvesterProtocol(Protocol):
     async def harvest_cycle(self, environmental_data: Dict[str, float]) -> Dict[str, Any]: ...
     def set_mode(self, mode: Any) -> None: ...
     async def get_harvesting_stats(self) -> Dict[str, Any]: ...
+    # Optional: may have restore_state method
+    # def restore_state(self, state: Dict[str, Any]) -> None: ...
 
 class TranslatorProtocol(Protocol):
     """Protocol for translating CSV rows to harvester input."""
@@ -130,21 +143,23 @@ class SimulationState:
     total_harvested: float
     harvest_cycles: int
     metrics: Dict[str, Any]
-    harvester_state: Optional[Dict[str, Any]] = None  # optional snapshot of harvester
+    harvester_state: Optional[Dict[str, Any]] = None
+    data_hash: Optional[str] = None  # hash of the data file for validation
     timestamp: str
 
 # ============================================================================
-# Metrics Collector (extensible)
+# Metrics Collector (extensible with capped storage)
 # ============================================================================
 class MetricsCollector:
-    """Collect and aggregate simulation metrics."""
-    def __init__(self):
+    """Collect and aggregate simulation metrics with capped storage for custom metrics."""
+    def __init__(self, max_custom_entries: int = 1000):
         self.total_harvested = 0.0
         self.harvest_cycles = 0
         self.efficiencies: List[float] = []
         self.modes: List[str] = []
         self.timestamps: List[datetime] = []
-        self.custom_metrics: Dict[str, List[Any]] = {}  # for additional metrics
+        self.custom_metrics: Dict[str, List[Any]] = {}
+        self._max_custom_entries = max_custom_entries
 
     def record(self, result: Dict[str, Any]):
         self.total_harvested += result.get('eco_atp_generated', 0)
@@ -159,6 +174,9 @@ class MetricsCollector:
                 if key not in self.custom_metrics:
                     self.custom_metrics[key] = []
                 self.custom_metrics[key].append(value)
+                # Trim if over limit
+                if len(self.custom_metrics[key]) > self._max_custom_entries:
+                    self.custom_metrics[key] = self.custom_metrics[key][-self._max_custom_entries:]
 
     def get_summary(self) -> Dict[str, Any]:
         summary = {
@@ -169,12 +187,14 @@ class MetricsCollector:
             'mode_counts': {mode: self.modes.count(mode) for mode in set(self.modes)},
             'duration_hours': (self.timestamps[-1] - self.timestamps[0]).total_seconds() / 3600 if self.timestamps else 0
         }
-        # Add custom metrics summary (average, min, max)
+        # Add custom metrics summary (average, min, max) based on last _max_custom_entries
         for key, values in self.custom_metrics.items():
             if values:
-                summary[f'avg_{key}'] = np.mean(values)
-                summary[f'min_{key}'] = np.min(values)
-                summary[f'max_{key}'] = np.max(values)
+                # Use last N values for summary
+                recent = values[-self._max_custom_entries:]
+                summary[f'avg_{key}'] = np.mean(recent)
+                summary[f'min_{key}'] = np.min(recent)
+                summary[f'max_{key}'] = np.max(recent)
         return summary
 
 # ============================================================================
@@ -190,6 +210,7 @@ class LiveDataFeed:
         self._callback = config.live_data_callback
         self._running = False
         self._last_data: Optional[Dict[str, float]] = None
+        self._backoff = 0.5  # initial backoff seconds
 
     async def fetch(self) -> Dict[str, float]:
         """Fetch the latest data using the callback or fallback."""
@@ -198,9 +219,15 @@ class LiveDataFeed:
                 data = await self._callback()
                 if data is not None:
                     self._last_data = data
+                    self._backoff = 0.5  # reset backoff on success
                     return data
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error("Live data callback failed: %s", e)
+                # Exponential backoff
+                self._backoff = min(self._backoff * 2, 30.0)
+                await asyncio.sleep(self._backoff)
         # If no callback or failure, return last known data or default
         if self._last_data is None:
             # Provide default values from config value_columns (set to 0.5)
@@ -211,8 +238,16 @@ class LiveDataFeed:
         """Background task to continuously fetch data."""
         self._running = True
         while self._running:
-            await self.fetch()
-            await asyncio.sleep(self.config.live_fetch_interval)
+            try:
+                await self.fetch()
+                await asyncio.sleep(self.config.live_fetch_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Live feed run error: %s", e)
+                await asyncio.sleep(self._backoff)
+        self._running = False
+        logger.info("Live data feed stopped.")
 
     def stop(self):
         self._running = False
@@ -255,12 +290,13 @@ class TimeTickEngine:
 
         # Internal state
         self.daily_df: Optional[pd.DataFrame] = None
-        self.metrics = MetricsCollector()
+        self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
         self._running = False
         self._stop_event = asyncio.Event()
         self._current_index = 0
         self._checkpoint_path = None
         self._live_feed: Optional[LiveDataFeed] = None
+        self._data_hash: Optional[str] = None  # hash of loaded data file
 
         # Ensure checkpoint directory exists
         if self.config.enable_checkpointing:
@@ -284,6 +320,14 @@ class TimeTickEngine:
             raise ValueError("CSV path not provided.")
 
         logger.info("Loading CSV from %s", path)
+
+        # Compute hash of the file for checkpoint validation
+        try:
+            with open(path, 'rb') as f:
+                self._data_hash = hashlib.md5(f.read()).hexdigest()
+        except Exception as e:
+            logger.warning("Could not compute data hash for checkpoint validation: %s", e)
+            self._data_hash = None
 
         try:
             df = pd.read_csv(path)
@@ -317,7 +361,7 @@ class TimeTickEngine:
             end = pd.to_datetime(self.config.end_date)
             df = df[df[self.config.date_column] <= end]
 
-        # Store monthly data
+        # Store monthly data (might be daily or other frequency; we'll resample to daily)
         self.df_monthly = df
 
         # Interpolate to daily
@@ -330,6 +374,11 @@ class TimeTickEngine:
         """
         Interpolate monthly data to daily using the configured method.
         """
+        if self.df_monthly.empty:
+            logger.warning("No data after filtering; daily DataFrame will be empty.")
+            self.daily_df = pd.DataFrame(columns=['date'] + self.config.value_columns)
+            return
+
         df_monthly = self.df_monthly.set_index(self.config.date_column)
         daily_index = pd.date_range(
             start=df_monthly.index.min(),
@@ -391,6 +440,11 @@ class TimeTickEngine:
 
         logger.info("Starting simulation from index %d", self._current_index)
 
+        # Optional progress bar for CSV
+        pbar = None
+        if TQDM_AVAILABLE and self.config.data_source == 'csv' and total_ticks:
+            pbar = tqdm(total=total_ticks, initial=self._current_index, desc="Simulating")
+
         try:
             while self._running and not self._stop_event.is_set():
                 if self.config.data_source == 'csv':
@@ -398,6 +452,8 @@ class TimeTickEngine:
                         logger.info("Reached end of data.")
                         break
                     row = self.daily_df.iloc[self._current_index]
+                    if pbar:
+                        pbar.update(1)
                 else:
                     # Live data: use latest from feed
                     if self._live_feed:
@@ -443,7 +499,7 @@ class TimeTickEngine:
                 # Save checkpoint
                 if self.config.enable_checkpointing and self.config.data_source == 'csv':
                     if self._current_index % self.config.checkpoint_interval == 0:
-                        self._save_checkpoint(self._current_index)
+                        await self._save_checkpoint(self._current_index)
 
                 # Tick delay
                 await asyncio.sleep(self.config.tick_interval_seconds)
@@ -455,8 +511,8 @@ class TimeTickEngine:
             logger.info("Simulation cancelled.")
             self._running = False
             # Save final checkpoint
-            if self.config.enable_checkpointing:
-                self._save_checkpoint(self._current_index)
+            if self.config.enable_checkpointing and self.config.data_source == 'csv':
+                await self._save_checkpoint(self._current_index)
             raise
 
         except Exception as e:
@@ -465,6 +521,8 @@ class TimeTickEngine:
             raise
 
         finally:
+            if pbar:
+                pbar.close()
             self._running = False
             self._stop_event.set()
             if live_task:
@@ -501,24 +559,31 @@ class TimeTickEngine:
             logger.error("Row translation failed: %s", e)
             return None
 
-    def _save_checkpoint(self, current_index: int):
+    async def _save_checkpoint(self, current_index: int):
         """Save current simulation state to a checkpoint file."""
         # Attempt to get harvester state if available
         harvester_state = None
         try:
             if hasattr(self.harvester, 'get_harvesting_stats'):
-                stats = asyncio.run(self.harvester.get_harvesting_stats())
+                stats = await self.harvester.get_harvesting_stats()
                 harvester_state = stats
         except Exception as e:
             logger.warning("Could not retrieve harvester state for checkpoint: %s", e)
 
+        # Determine current date string
+        if self.config.data_source == 'csv' and self.daily_df is not None and current_index < len(self.daily_df):
+            current_date_str = self.daily_df.iloc[current_index]['date'].isoformat()
+        else:
+            current_date_str = datetime.now().isoformat()
+
         state = SimulationState(
             current_index=current_index,
-            current_date=self.daily_df.iloc[current_index]['date'].isoformat() if self.daily_df is not None else datetime.now().isoformat(),
+            current_date=current_date_str,
             total_harvested=self.metrics.total_harvested,
             harvest_cycles=self.metrics.harvest_cycles,
             metrics=self.metrics.get_summary(),
             harvester_state=harvester_state,
+            data_hash=self._data_hash,
             timestamp=datetime.now().isoformat()
         )
         # Use timestamp in filename to keep versions
@@ -536,7 +601,7 @@ class TimeTickEngine:
     def _cleanup_old_checkpoints(self):
         """Remove oldest checkpoint files beyond max_checkpoints."""
         pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
-        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=os.path.getctime)
+        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=os.path.getmtime)
         if len(checkpoint_files) > self.config.max_checkpoints:
             for old_file in checkpoint_files[:-self.config.max_checkpoints]:
                 try:
@@ -546,9 +611,9 @@ class TimeTickEngine:
                     logger.warning("Failed to remove old checkpoint %s: %s", old_file, e)
 
     def _load_checkpoint(self) -> bool:
-        """Load the latest checkpoint and update state."""
+        """Load the latest checkpoint and validate compatibility."""
         pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
-        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=os.path.getctime)
+        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=os.path.getmtime)
         if not checkpoint_files:
             return False
 
@@ -556,12 +621,24 @@ class TimeTickEngine:
         try:
             with open(latest, 'rb') as f:
                 state = pickle.load(f)
+
+            # Validate data hash (if present)
+            if self._data_hash is not None and state.data_hash is not None:
+                if state.data_hash != self._data_hash:
+                    logger.warning("Data hash mismatch: checkpoint may be incompatible. Resuming from start.")
+                    return False
+
             self._current_index = state.current_index
             self.metrics.total_harvested = state.total_harvested
             self.metrics.harvest_cycles = state.harvest_cycles
             # Restore harvester state if possible
             if state.harvester_state and hasattr(self.harvester, 'restore_state'):
-                self.harvester.restore_state(state.harvester_state)
+                try:
+                    self.harvester.restore_state(state.harvester_state)
+                    logger.info("Restored harvester state from checkpoint.")
+                except Exception as e:
+                    logger.warning("Failed to restore harvester state: %s", e)
+
             logger.info("Resumed from checkpoint: index %d, date %s, file %s",
                         state.current_index, state.current_date, latest)
             return True
@@ -582,8 +659,8 @@ class TimeTickEngine:
             self.stop()
             # Wait a moment for stop to propagate
             await asyncio.sleep(0.1)
-        if self.config.enable_checkpointing and self._current_index > 0:
-            self._save_checkpoint(self._current_index)
+        if self.config.enable_checkpointing and self._current_index > 0 and self.config.data_source == 'csv':
+            await self._save_checkpoint(self._current_index)
         logger.info("TimeTickEngine shutdown.")
 
     async def __aenter__(self):
