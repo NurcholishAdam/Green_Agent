@@ -1,44 +1,47 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/carbon_sequestration_manager.py
-# Enhanced version v3.0.0 – Full integration with bio‑inspired core, event‑driven, circuit breakers, self‑healing, and deep MoE/SEG integration
+# Enhanced version v4.0.0 – Refactored for maintainability, concurrency, and resilience
 
 """
-Enhanced Carbon Sequestration and Offset Integration v3.0.0
-Complete green agent implementation with full bio‑inspired core integration.
-
-New Features:
-- Event-driven integration via core EventBroker (carbon, helium, alerts, config)
-- Circuit breakers for all external services
-- Self-healing and reactive alert handling
-- Configuration reload via events
-- Swarm coordination via SwarmCoordinator
-- Integration with TimeTickEngine and QuantumBridge
-- Integration with CostBenefitEngine and PredictiveAlertSystem
-- Workflow orchestration triggers on threshold breaches
-- Deep MoE and Self-Evolving Gate integration with rich context
-- Enhanced telemetry and health monitoring
+Enhanced Carbon Sequestration and Offset Integration v4.0.0
+Modular, event‑driven, and robust implementation.
 """
 
 import asyncio
 import logging
-import numpy as np
-from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, Protocol
+import json
+import os
+import hashlib
+import math
+import random
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from enum import Enum
-from collections import deque, defaultdict
-import hashlib
-import json
+from typing import Dict, Any, List, Optional, Tuple, Deque, Callable
+from collections import defaultdict, deque
+import numpy as np
 import aiohttp
-import os
-import pickle
 import zlib
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import SGDRegressor
-from sklearn.metrics import r2_score, mean_squared_error
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+
+# Optional torch
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("PyTorch not available; ML project selection will be disabled.")
+
+# Optional sklearn
+try:
+    from sklearn.linear_model import SGDRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -46,25 +49,15 @@ logger = logging.getLogger(__name__)
 # Bio-Inspired Core Import (with fallback)
 # ============================================================================
 try:
-    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker, Persistence
-    from enhancements.bio_inspired.eco_atp_currency import EcoATPTokenManager
-    from enhancements.bio_inspired.proton_gradient_fields import GradientFieldManager
-    from enhancements.bio_inspired.atp_synthase_scheduler import ATPSynthaseScheduler
-    from enhancements.bio_inspired.chromatophore_compartments import CompartmentManager
-    from enhancements.bio_inspired.biomass_storage import BiomassStorage
-    from enhancements.bio_inspired.photosynthetic_harvester import PhotosyntheticHarvester
-    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
-    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
+    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
     BIO_INSPIRED_AVAILABLE = True
 except ImportError:
     BIO_INSPIRED_AVAILABLE = False
-    # Fallback definitions
     class BioEvent:
         def __init__(self, event_type, source, data=None):
             self.event_type = event_type
             self.source = source
             self.data = data or {}
-
     class CircuitBreaker:
         def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
             self.name = name
@@ -78,7 +71,7 @@ except ImportError:
             return await func(*args, **kwargs)
 
 # ============================================================================
-# MoE and Self-Evolving Gate imports (optional)
+# MoE imports (optional)
 # ============================================================================
 try:
     from ..expert_router import ExpertRouter
@@ -87,42 +80,112 @@ try:
     MOE_AVAILABLE = True
 except ImportError:
     MOE_AVAILABLE = False
-    logger.warning("MoE Expert Router or Self-Evolving Gates not available - sequestration manager will operate standalone")
 
-# ============================================================================
-# Helium Provider Interface (unchanged)
-# ============================================================================
 class HeliumProvider:
     def get_scarcity(self) -> float: raise NotImplementedError
     def get_cost_index(self) -> float: raise NotImplementedError
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Configuration Dataclass (Enhanced)
+# Enums and Data Classes
 # ============================================================================
+@dataclass
+class CarbonCredit:
+    credit_id: str
+    amount_kg: float
+    project_type: str
+    verification_date: datetime
+    expiry_date: datetime
+    price_per_kg: float
+    is_verified: bool = False
+    permanence_years: float = 0.0
+    co_benefits: List[str] = field(default_factory=list)
+    sustainability_score: float = 0.0
+    helium_offset_equivalent_l: float = 0.0
+
+# ============================================================================
+# Configuration Dataclass with Sub‑Configs
+# ============================================================================
+@dataclass
+class CarbonConfig:
+    enabled: bool = True
+    region: str = "us-east"
+    update_interval_seconds: int = 300
+    max_retries: int = 3
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery_timeout: float = 30.0
+    api_key_env: str = "ELECTRICITYMAP_API_KEY"
+
+@dataclass
+class HeliumConfig:
+    enabled: bool = True
+    budget_l: float = 100.0
+    helium_to_co2_factor: float = 20.0
+    accounting_interval_seconds: int = 60
+
+@dataclass
+class PredictiveConfig:
+    enabled: bool = True
+    history_window: int = 100
+    update_interval_seconds: int = 300
+
+@dataclass
+class MLConfig:
+    enabled: bool = True
+    input_size: int = 8
+    hidden_size: int = 64
+    epochs: int = 100
+    batch_size: int = 32
+    train_interval_seconds: int = 600
+
+@dataclass
+class FederatedConfig:
+    enabled: bool = True
+    server_url: Optional[str] = None
+    sparsity_ratio: float = 0.1
+    sync_interval_seconds: int = 3600
+    max_retries: int = 3
+
+@dataclass
+class TelemetryConfig:
+    enabled: bool = True
+    export_interval_seconds: int = 60
+
+@dataclass
+class PersistenceConfig:
+    enabled: bool = True
+    path: str = "carbon_sequestration_state.json"
+    save_interval_seconds: int = 300
+
+@dataclass
+class SelfHealingConfig:
+    enabled: bool = True
 
 @dataclass
 class CarbonSequestrationConfig:
-    """Centralized configuration for the Carbon Sequestration Manager."""
+    """Centralized configuration with sub‑configs."""
+    # High‑level flags
+    enable_bio_integration: bool = True
+    enable_event_driven: bool = True
+    enable_swarm_coordination: bool = True
+    enable_human_ai: bool = True
+    enable_cost_benefit: bool = True
+    enable_time_tick_engine: bool = True
+    enable_quantum_bridge: bool = True
+
+    # Sub‑configs
+    carbon: CarbonConfig = field(default_factory=CarbonConfig)
+    helium: HeliumConfig = field(default_factory=HeliumConfig)
+    predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
+    ml: MLConfig = field(default_factory=MLConfig)
+    federated: FederatedConfig = field(default_factory=FederatedConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+    self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+
     # Budgets
     carbon_budget_kg: float = 1000.0
     helium_budget_l: float = 100.0
-
-    # Feature flags
-    enable_federated: bool = True
-    enable_carbon_intensity: bool = True
-    enable_predictive: bool = True
-    enable_ml_selection: bool = True
-    enable_human_ai: bool = True
-    enable_helium_tracking: bool = True
-    enable_persistence: bool = True
-    enable_telemetry: bool = True
-    enable_event_driven: bool = True
-    enable_self_healing: bool = True
-    enable_swarm_coordination: bool = True
-    enable_time_tick_engine: bool = True
-    enable_quantum_bridge: bool = True
-    enable_cost_benefit: bool = True
 
     # Offset strategy
     offset_strategy: str = 'proactive'  # 'proactive', 'reactive', 'conservative'
@@ -130,161 +193,92 @@ class CarbonSequestrationConfig:
     # Helium-to-CO2 equivalence factor (kg CO2 per kg helium)
     helium_to_co2_factor: float = 20.0
 
-    # Retry and circuit breaker
+    # Retry parameters
     max_retries: int = 3
     retry_base_delay_ms: float = 100.0
     retry_max_delay_ms: float = 5000.0
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout: float = 30.0
 
-    # Predictive analyzer
-    predictive_history_window: int = 100
-
-    # ML project selector
-    ml_input_size: int = 8
-    ml_hidden_size: int = 64
-    ml_epochs: int = 100
-    ml_batch_size: int = 32
-
-    # Federated learning
-    server_url: Optional[str] = None
-    federated_sparsity_ratio: float = 0.1  # top-k% of data to keep
-
-    # Persistence
-    persistence_path: str = "carbon_sequestration_state.pkl"
-
-    # Telemetry
-    telemetry_export_interval: int = 60
-
     # Workflow triggers
     workflow_on_critical_alert: str = "adjust_offset_strategy"
     workflow_on_slo_breach: str = "rebalance_carbon_budget"
 
     # Swarm sharing interval
-    swarm_share_interval: int = 60
+    swarm_share_interval_seconds: int = 60
 
 # ============================================================================
-# Protocols for external modules (unchanged)
+# Carbon Intensity Manager (Improved)
 # ============================================================================
-
-class CarbonIntensityProvider(Protocol):
-    async def get_current_intensity(self) -> float: ...
-
-# ============================================================================
-# Retry Helper (unchanged)
-# ============================================================================
-
-async def retry_async(
-    func: Callable,
-    max_retries: int,
-    base_delay_ms: float,
-    max_delay_ms: float,
-    *args,
-    **kwargs
-) -> Any:
-    """Retry an async function with exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
-            await asyncio.sleep(delay)
-    raise RuntimeError("Max retries exceeded")
-
-# ============================================================================
-# Carbon Intensity Manager (Enhanced with circuit breaker)
-# ============================================================================
-
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration with retry, circuit breaker, and caching."""
-
-    def __init__(self, config: CarbonSequestrationConfig):
+    def __init__(self, config: CarbonConfig):
         self.config = config
         self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
-        self.region = "us-east"
+        self.region = config.region
         self.carbon_intensity = 0.0
-        self.last_update = None
+        self.last_update: Optional[datetime] = None
         self._lock = asyncio.Lock()
-        self._session = None
-        self.update_interval = 300
-        self.cache = {}
-        self.historical_intensities = deque(maxlen=1000)
-        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
-        self.circuit_breaker_threshold = config.circuit_breaker_failure_threshold
-        self.max_retries = config.max_retries
-        self._circuit = CircuitBreaker("carbon_api", failure_threshold=config.circuit_breaker_failure_threshold, recovery_timeout=config.circuit_breaker_recovery_timeout)
-        logger.info(f"CarbonIntensityManager initialized (region={self.region}, retries={self.max_retries})")
+        self._session: Optional[aiohttp.ClientSession] = None
+        self.cache: Dict[str, Dict] = {}
+        self.historical_intensities: Deque[float] = deque(maxlen=1000)
+        self.api_key = os.getenv(config.api_key_env, '')
+        self._circuit = CircuitBreaker(
+            "carbon_api",
+            failure_threshold=config.circuit_breaker_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
+        logger.info(f"CarbonIntensityManager initialized (region={self.region})")
 
-    async def _get_session(self):
+    async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
+        if region is not None:
+            self.region = region
+
         async def _fetch():
-            if region is not None:
-                self.region = region
-            if self.circuit_open:
-                if datetime.now(timezone.utc) < self.circuit_open_until:
-                    logger.warning("Circuit breaker open, using fallback data")
-                    return self._get_fallback_response()
-                else:
-                    self.circuit_open = False
-                    self.failure_count = 0
-                    logger.info("Circuit breaker reset for CarbonIntensityManager")
             cache_key = f"{self.region}_{datetime.now(timezone.utc).hour}"
-            if cache_key in self.cache and self.last_update and (datetime.now(timezone.utc) - self.last_update).seconds < self.update_interval:
+            if (self.last_update and
+                (datetime.now(timezone.utc) - self.last_update).seconds < self.config.update_interval_seconds and
+                cache_key in self.cache):
                 return self.cache[cache_key]
-            for attempt in range(self.max_retries):
+
+            for attempt in range(self.config.max_retries):
                 try:
                     session = await self._get_session()
                     url = f"{self.endpoint}/latest?zone={self.region}"
                     headers = {'auth-token': self.api_key} if self.api_key else {}
-                    async with session.get(url, headers=headers, timeout=10) as response:
-                        if response.status == 200:
-                            data = await response.json()
+                    async with session.get(url, headers=headers, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
                             self.carbon_intensity = data.get('carbonIntensity', 400)
                             self.last_update = datetime.now(timezone.utc)
-                            self.cache[cache_key] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update.isoformat()}
+                            result = {
+                                'intensity': self.carbon_intensity,
+                                'region': self.region,
+                                'timestamp': self.last_update.isoformat()
+                            }
+                            self.cache[cache_key] = result
                             self.historical_intensities.append(self.carbon_intensity)
-                            self.failure_count = 0
-                            return {'intensity': self.carbon_intensity, 'region': self.region, 'timestamp': self.last_update.isoformat()}
+                            return result
                         else:
-                            logger.warning(f"Carbon API returned {response.status}, attempt {attempt+1}")
-                            if attempt == self.max_retries - 1:
-                                self.failure_count += 1
-                                if self.failure_count >= self.circuit_breaker_threshold:
-                                    self.circuit_open = True
-                                    self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                                    logger.error("Circuit breaker opened for CarbonIntensityManager")
-                                return self._get_fallback_response()
-                            await asyncio.sleep(2 ** attempt)
+                            logger.warning(f"Carbon API returned {resp.status}, attempt {attempt+1}")
                 except Exception as e:
                     logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
-                    if attempt == self.max_retries - 1:
-                        self.failure_count += 1
-                        if self.failure_count >= self.circuit_breaker_threshold:
-                            self.circuit_open = True
-                            self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                        return self._get_fallback_response()
-                    await asyncio.sleep(2 ** attempt)
-            return self._get_fallback_response()
+                await asyncio.sleep(2 ** attempt)
+
+            fallback_intensities = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500}
+            intensity = fallback_intensities.get(self.region, 400)
+            self.carbon_intensity = intensity
+            self.last_update = datetime.now(timezone.utc)
+            return {'intensity': intensity, 'region': self.region, 'timestamp': self.last_update.isoformat(), 'is_fallback': True}
+
         return await self._circuit.call(_fetch)
 
-    def _get_fallback_response(self) -> Dict:
-        fallback_intensities = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500}
-        intensity = fallback_intensities.get(self.region, 400)
-        self.carbon_intensity = intensity
-        self.last_update = datetime.now(timezone.utc)
-        return {'intensity': intensity, 'region': self.region, 'timestamp': self.last_update.isoformat(), 'is_fallback': True}
-
     async def get_current_intensity(self) -> float:
-        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.update_interval:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.config.update_interval_seconds:
             await self.update_carbon_intensity(self.region)
         return self.carbon_intensity
 
@@ -293,23 +287,20 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Helium Sequestration Manager (unchanged)
+# Helium Sequestration Manager (Improved)
 # ============================================================================
-
 class HeliumSequestrationManager:
-    """
-    Helium emission tracking and offset integration.
-    """
-
-    def __init__(self, config: CarbonSequestrationConfig):
+    def __init__(self, config: HeliumConfig):
         self.config = config
-        self.helium_budget_l = config.helium_budget_l
-        self.helium_emissions: deque = deque(maxlen=86400)
-        self.helium_offsets: deque = deque(maxlen=86400)
-        self._running_total_emissions = 0.0
-        self._running_total_offsets = 0.0
-        self.helium_to_co2_factor = config.helium_to_co2_factor
-        self.helium_sequestration_projects = {
+        self.budget_l = config.budget_l
+        self.emissions: Deque[Dict] = deque(maxlen=86400)
+        self.offsets: Deque[Dict] = deque(maxlen=86400)
+        self._total_emissions = 0.0
+        self._total_offsets = 0.0
+        self._lock = asyncio.Lock()
+        self._task: Optional[asyncio.Task] = None
+        self._accounting_loop_running = False
+        self.sequestration_projects = {
             'helium_recovery_advanced': {
                 'type': 'helium_recovery',
                 'capacity_l_per_year': 5000,
@@ -332,42 +323,54 @@ class HeliumSequestrationManager:
                 'co_benefits': ['technology_diversification', 'cost_reduction']
             }
         }
+        logger.info(f"HeliumSequestrationManager initialized: budget={self.budget_l}L")
 
-        asyncio.create_task(self._helium_accounting_loop())
-        logger.info(f"Helium Sequestration Manager initialized: budget={self.helium_budget_l}L, factor={self.helium_to_co2_factor}")
+    def record_emission(self, amount_l: float, source: str = "unknown"):
+        self.emissions.append({'amount_l': amount_l, 'source': source, 'timestamp': datetime.now(timezone.utc)})
+        self._total_emissions += amount_l
 
-    def record_helium_emission(self, amount_l: float, source: str = "unknown"):
-        emission = {'amount_l': amount_l, 'source': source, 'timestamp': datetime.now(timezone.utc)}
-        self.helium_emissions.append(emission)
-        self._running_total_emissions += amount_l
+    def record_offset(self, amount_l: float, project_id: str = None):
+        self.offsets.append({'amount_l': amount_l, 'project_id': project_id or 'unknown', 'timestamp': datetime.now(timezone.utc)})
+        self._total_offsets += amount_l
 
-    def record_helium_offset(self, amount_l: float, project_id: str = None):
-        offset = {'amount_l': amount_l, 'project_id': project_id or 'unknown', 'timestamp': datetime.now(timezone.utc)}
-        self.helium_offsets.append(offset)
-        self._running_total_offsets += amount_l
-
-    async def _helium_accounting_loop(self):
-        while True:
+    async def _accounting_loop(self):
+        self._accounting_loop_running = True
+        while self._accounting_loop_running:
             try:
-                net_position = self._running_total_emissions - self._running_total_offsets
-                remaining_budget = self.helium_budget_l - net_position
-                if remaining_budget < 0:
-                    logger.critical(f"Helium budget exceeded! Net position: {net_position:.2f} L")
-                elif remaining_budget < self.helium_budget_l * 0.2:
-                    logger.warning(f"Helium budget warning: {remaining_budget:.2f} L remaining")
-                await asyncio.sleep(60)
+                async with self._lock:
+                    net = self._total_emissions - self._total_offsets
+                    remaining = self.budget_l - net
+                    if remaining < 0:
+                        logger.critical(f"Helium budget exceeded! Net: {net:.2f} L")
+                    elif remaining < self.budget_l * 0.2:
+                        logger.warning(f"Helium budget warning: {remaining:.2f} L remaining")
+                await asyncio.sleep(self.config.accounting_interval_seconds)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Helium accounting error: {e}")
                 await asyncio.sleep(5)
 
-    def get_helium_position(self) -> Dict[str, Any]:
+    def start(self):
+        if not self._task:
+            self._task = asyncio.create_task(self._accounting_loop())
+
+    async def stop(self):
+        if self._task:
+            self._accounting_loop_running = False
+            self._task.cancel()
+            await self._task
+            self._task = None
+
+    def get_position(self) -> Dict[str, Any]:
+        net = self._total_emissions - self._total_offsets
         return {
-            'total_emissions_l': self._running_total_emissions,
-            'total_offsets_l': self._running_total_offsets,
-            'net_position_l': self._running_total_emissions - self._running_total_offsets,
-            'remaining_budget_l': self.helium_budget_l - (self._running_total_emissions - self._running_total_offsets),
-            'co2_equivalent_kg': (self._running_total_emissions - self._running_total_offsets) * self.helium_to_co2_factor,
-            'projects': self.helium_sequestration_projects
+            'total_emissions_l': self._total_emissions,
+            'total_offsets_l': self._total_offsets,
+            'net_position_l': net,
+            'remaining_budget_l': self.budget_l - net,
+            'co2_equivalent_kg': net * self.config.helium_to_co2_factor,
+            'projects': self.sequestration_projects
         }
 
     def calculate_helium_offset_from_carbon(self, carbon_credit_kg: float) -> float:
@@ -375,7 +378,7 @@ class HeliumSequestrationManager:
 
     def select_helium_project(self, amount_l: float) -> Dict[str, Any]:
         scored_projects = []
-        for project_id, project in self.helium_sequestration_projects.items():
+        for project_id, project in self.sequestration_projects.items():
             cost_score = 1.0 / (1.0 + project['cost_per_l'])
             capacity_score = min(project['capacity_l_per_year'] / max(amount_l, 1), 1.0)
             efficiency_score = project['efficiency']
@@ -383,33 +386,24 @@ class HeliumSequestrationManager:
             scored_projects.append((project_id, score, project))
         scored_projects.sort(key=lambda x: x[1], reverse=True)
         if scored_projects:
-            return {
-                'project_id': scored_projects[0][0],
-                'project': scored_projects[0][2],
-                'score': scored_projects[0][1]
-            }
+            return {'project_id': scored_projects[0][0], 'project': scored_projects[0][2], 'score': scored_projects[0][1]}
         return {'project_id': None, 'project': None, 'score': 0.0}
 
 # ============================================================================
-# Predictive Sequestration Analyzer (unchanged)
+# Predictive Sequestration Analyzer (Improved)
 # ============================================================================
-
 class PredictiveSequestrationAnalyzer:
-    """Predictive reflexivity with online learning (SGD) for sequestration."""
-
-    def __init__(self, config: CarbonSequestrationConfig):
+    def __init__(self, config: PredictiveConfig):
         self.config = config
-        self.history_window = config.predictive_history_window
-        self.sequestration_history = deque(maxlen=self.history_window)
-        self.forecast_history = deque(maxlen=50)
-        self.scaler = StandardScaler()
+        self.history_window = config.history_window
+        self.history: Deque[Dict] = deque(maxlen=config.history_window)
+        self.forecasts: Deque[Dict] = deque(maxlen=50)
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.model = None
         self.is_trained = False
-        self._ml_available = False
-        self._init_model()
-
-    def _init_model(self):
-        try:
+        self._ml_available = SKLEARN_AVAILABLE
+        self._lock = asyncio.Lock()
+        if self._ml_available:
             self.model = SGDRegressor(
                 learning_rate='constant',
                 eta0=0.01,
@@ -419,70 +413,68 @@ class PredictiveSequestrationAnalyzer:
                 random_state=42,
                 warm_start=True
             )
-            self._ml_available = True
-        except ImportError:
-            logger.warning("SGDRegressor not available; using fallback moving average")
+            logger.info("PredictiveSequestrationAnalyzer initialized with SGD")
+        else:
+            logger.warning("sklearn not available; using moving average fallback")
 
-    def update_history(self, sequestration_data: Dict):
-        self.sequestration_history.append({
+    def update_history(self, data: Dict):
+        self.history.append({
             'timestamp': datetime.now(timezone.utc),
-            'offset_amount': sequestration_data.get('offset_amount', 0),
-            'credit_price': sequestration_data.get('credit_price', 50),
-            'project_success_rate': sequestration_data.get('project_success_rate', 0.9),
-            'verification_confidence': sequestration_data.get('verification_confidence', 0.7),
-            'carbon_intensity': sequestration_data.get('carbon_intensity', 400)
+            'offset_amount': data.get('offset_amount', 0),
+            'credit_price': data.get('credit_price', 50),
+            'project_success_rate': data.get('project_success_rate', 0.9),
+            'verification_confidence': data.get('verification_confidence', 0.7),
+            'carbon_intensity': data.get('carbon_intensity', 400)
         })
 
-    async def train_forecast_model(self):
+    async def train(self) -> Dict:
         if not self._ml_available:
             return {'status': 'ml_not_available'}
-        if len(self.sequestration_history) < 10:
-            return {'status': 'insufficient_data', 'samples': len(self.sequestration_history)}
+        if len(self.history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.history)}
 
-        X, y = [], []
-        history_list = list(self.sequestration_history)
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['offset_amount'] / 1000,
-                    data['credit_price'] / 100,
-                    data['project_success_rate'],
-                    data['verification_confidence'],
-                    data['carbon_intensity'] / 100
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['offset_amount'])
+        async with self._lock:
+            X, y = [], []
+            hist_list = list(self.history)
+            for i in range(len(hist_list) - 5):
+                features = []
+                for j in range(5):
+                    data = hist_list[i + j]
+                    features.extend([
+                        data['offset_amount'] / 1000,
+                        data['credit_price'] / 100,
+                        data['project_success_rate'],
+                        data['verification_confidence'],
+                        data['carbon_intensity'] / 100
+                    ])
+                X.append(features)
+                y.append(hist_list[i + 5]['offset_amount'])
 
-        X = np.array(X)
-        y = np.array(y)
+            X = np.array(X)
+            y = np.array(y)
+            if self.scaler.mean_ is None:
+                X_scaled = self.scaler.fit_transform(X)
+            else:
+                X_scaled = self.scaler.transform(X)
 
-        if self.scaler.mean_ is None:
-            X_scaled = self.scaler.fit_transform(X)
-        else:
-            X_scaled = self.scaler.transform(X)
+            for _ in range(3):
+                self.model.partial_fit(X_scaled, y)
+            self.is_trained = True
 
-        # Incremental training
-        for _ in range(3):
-            self.model.partial_fit(X_scaled, y)
-        self.is_trained = True
+            pred = self.model.predict(X_scaled)
+            r2 = r2_score(y, pred) if len(y) > 5 else 0.0
+            logger.info(f"Predictive model updated. R²={r2:.3f}")
+            return {'status': 'success', 'r2': r2, 'samples': len(X)}
 
-        # Compute R2 for diagnostics
-        pred = self.model.predict(X_scaled)
-        r2 = r2_score(y, pred) if len(y) > 5 else 0.0
-        logger.info(f"Predictive model updated. R²={r2:.3f}")
-        return {'status': 'success', 'r2': r2, 'samples': len(X)}
-
-    async def predict_offset_demand(self) -> Dict:
-        if not self.is_trained or len(self.sequestration_history) < 10:
-            if len(self.sequestration_history) > 0:
-                recent = [h['offset_amount'] for h in list(self.sequestration_history)[-5:]]
+    async def predict_demand(self) -> Dict:
+        if not self.is_trained or len(self.history) < 10:
+            if self.history:
+                recent = [h['offset_amount'] for h in list(self.history)[-5:]]
                 pred = np.mean(recent) if recent else 1000
                 return {'predicted_demand': pred, 'confidence': 0.3, 'trend': 'moving_average'}
             return {'predicted_demand': 1000, 'confidence': 0.0, 'trend': 'insufficient_data'}
 
-        recent = list(self.sequestration_history)[-5:]
+        recent = list(self.history)[-5:]
         features = []
         for data in recent:
             features.extend([
@@ -499,201 +491,52 @@ class PredictiveSequestrationAnalyzer:
                 features_scaled = self.scaler.transform(features)
             else:
                 features_scaled = features
-            pred = self.model.predict(features_scaled)[0]
-            return pred
+            return self.model.predict(features_scaled)[0]
 
         prediction = await asyncio.to_thread(predict)
-        confidence = min(0.9, 0.5 + 0.4 * (len(self.sequestration_history) / 100))
+        confidence = min(0.9, 0.5 + 0.4 * (len(self.history) / 100))
 
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
+        if len(self.forecasts) > 5:
+            recent_forecasts = list(self.forecasts)[-5:]
             trend = "increasing" if prediction > recent_forecasts[-1] else "decreasing" if prediction < recent_forecasts[-1] else "stable"
         else:
             trend = "stable"
 
-        self.forecast_history.append({'prediction': prediction, 'trend': trend})
+        self.forecasts.append({'prediction': prediction, 'trend': trend})
         return {
             'predicted_demand': max(0, prediction),
             'confidence': confidence,
             'trend': trend,
-            'recommended_actions': self._generate_predictive_actions(prediction)
+            'recommended_actions': self._generate_actions(prediction)
         }
 
-    def _generate_predictive_actions(self, prediction: float) -> List[str]:
-        actions = []
+    def _generate_actions(self, prediction: float) -> List[str]:
         if prediction > 5000:
-            actions.append("Increase sequestration project capacity")
-            actions.append("Diversify project portfolio")
+            return ["Increase sequestration project capacity", "Diversify project portfolio"]
         elif prediction < 1000:
-            actions.append("Reduce sequestration spending")
-            actions.append("Focus on high-impact projects")
-        else:
-            actions.append("Maintain current sequestration strategy")
-        return actions
+            return ["Reduce sequestration spending", "Focus on high-impact projects"]
+        return ["Maintain current sequestration strategy"]
 
 # ============================================================================
-# Federated Sequestration Manager (unchanged)
+# ML Project Selector (PyTorch, with thread offload)
 # ============================================================================
-
-class FederatedSequestrationManager:
-    """Federated reflexive learning with compression and retry."""
-
-    def __init__(self, config: CarbonSequestrationConfig):
-        self.config = config
-        self.server_url = config.server_url
-        self.round = 0
-        self.local_projects = {}
-        self.global_projects = {}
-        self.participants = []
-        self.contribution_scores = {}
-        self._lock = asyncio.Lock()
-        self._session = None
-        self.sparsity_ratio = config.federated_sparsity_ratio
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
-        self._circuit = CircuitBreaker("federated_server", failure_threshold=config.circuit_breaker_failure_threshold, recovery_timeout=config.circuit_breaker_recovery_timeout)
-        logger.info("FederatedSequestrationManager initialized")
-
-    async def _get_session(self):
-        if self._session is None and self.server_url:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    def _compress_project_data(self, data: Dict) -> Dict:
-        if self.sparsity_ratio == 1.0:
-            return data
-        numeric_items = {k: v for k, v in data.items() if isinstance(v, (int, float))}
-        if not numeric_items:
-            return data
-        sorted_items = sorted(numeric_items.items(), key=lambda x: abs(x[1]), reverse=True)
-        k = max(1, int(len(sorted_items) * self.sparsity_ratio))
-        kept_keys = {item[0] for item in sorted_items[:k]}
-        compressed = {k: v for k, v in data.items() if k in kept_keys or not isinstance(v, (int, float))}
-        return compressed
-
-    async def send_local_projects(self, participant_id: str, project_data: Dict, performance: float = 1.0) -> Dict:
-        if not self.server_url:
-            return {'status': 'local'}
-        if self.circuit_open:
-            if datetime.now(timezone.utc) < self.circuit_open_until:
-                logger.warning("Circuit breaker open, skipping send")
-                return {'status': 'circuit_open'}
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
-        async def _send():
-            for attempt in range(self.config.max_retries):
-                try:
-                    async with self._lock:
-                        session = await self._get_session()
-                        compressed = self._compress_project_data(project_data)
-                        update_data = {
-                            'participant_id': participant_id,
-                            'round': self.round,
-                            'project_data': compressed,
-                            'performance': performance,
-                            'sparsity_ratio': self.sparsity_ratio,
-                            'timestamp': datetime.now(timezone.utc).isoformat()
-                        }
-                        async with session.post(
-                            f"{self.server_url}/federated/sequestration",
-                            json=update_data,
-                            timeout=30
-                        ) as response:
-                            if response.status == 200:
-                                result = await response.json()
-                                self.round += 1
-                                self.contribution_scores[participant_id] = performance
-                                self.failure_count = 0
-                                return result
-                            else:
-                                logger.warning(f"Federated send failed (attempt {attempt+1}): {response.status}")
-                except Exception as e:
-                    logger.error(f"Federated send error (attempt {attempt+1}): {e}")
-                await asyncio.sleep(2 ** attempt)
-            self.failure_count += 1
-            if self.failure_count >= self.config.circuit_breaker_failure_threshold:
-                self.circuit_open = True
-                self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                logger.error("Circuit breaker opened for FederatedSequestrationManager")
-            return {'status': 'failed'}
-        return await self._circuit.call(_send)
-
-    async def get_global_projects(self) -> Optional[Dict]:
-        if not self.server_url:
-            return self.global_projects
-        async def _fetch():
-            for attempt in range(self.config.max_retries):
-                try:
-                    async with self._lock:
-                        session = await self._get_session()
-                        async with session.get(
-                            f"{self.server_url}/federated/sequestration/global",
-                            timeout=30
-                        ) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                self.global_projects = data.get('projects', {})
-                                self.participants = data.get('participants', [])
-                                return self.global_projects
-                            else:
-                                logger.warning(f"Global fetch failed (attempt {attempt+1}): {response.status}")
-                except Exception as e:
-                    logger.error(f"Global fetch error (attempt {attempt+1}): {e}")
-                await asyncio.sleep(2 ** attempt)
-            return None
-        return await self._circuit.call(_fetch)
-
-    def aggregate_projects(self, peer_projects: List[Dict], weights: Dict[str, float] = None) -> Dict:
-        if not peer_projects:
-            return {}
-        aggregated = {}
-        if weights is None:
-            weights = {i: 1.0 for i in range(len(peer_projects))}
-        for project_id in peer_projects[0].keys():
-            if isinstance(peer_projects[0][project_id], (int, float)):
-                total = 0.0
-                total_weight = 0.0
-                for i, peer in enumerate(peer_projects):
-                    if project_id in peer:
-                        total += peer[project_id] * weights.get(i, 1.0)
-                        total_weight += weights.get(i, 1.0)
-                aggregated[project_id] = total / max(total_weight, 0.001)
-        return aggregated
-
-    def get_federated_stats(self) -> Dict:
-        return {
-            'round': self.round,
-            'participants': len(self.participants),
-            'has_global_projects': bool(self.global_projects),
-            'contribution_scores': self.contribution_scores,
-            'sparsity_ratio': self.sparsity_ratio,
-            'circuit_open': self.circuit_open
-        }
-
-    async def close(self):
-        if self._session:
-            await self._session.close()
-
-# ============================================================================
-# ML Project Selector (unchanged)
-# ============================================================================
-
 class MLProjectSelector:
-    """Machine learning-based project selection with incremental training and checkpointing."""
-
-    def __init__(self, config: CarbonSequestrationConfig):
+    def __init__(self, config: MLConfig):
         self.config = config
-        self.input_size = config.ml_input_size
-        self.hidden_size = config.ml_hidden_size
+        self.input_size = config.input_size
+        self.hidden_size = config.hidden_size
         self.model = None
-        self.scaler = StandardScaler()
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.is_trained = False
         self.optimizer = None
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = None
         self.training_history: List[float] = []
-        self._init_model()
+        self._lock = asyncio.Lock()
+        if TORCH_AVAILABLE:
+            self._init_model()
+            logger.info("MLProjectSelector initialized with PyTorch")
+        else:
+            logger.warning("PyTorch not available; ML project selection disabled")
 
     def _init_model(self):
         class ProjectSelector(nn.Module):
@@ -706,21 +549,24 @@ class MLProjectSelector:
                     nn.Linear(hidden_size, hidden_size // 2),
                     nn.ReLU(),
                     nn.BatchNorm1d(hidden_size // 2),
-                    nn.Linear(hidden_size // 2, len(self.get_project_types()))
+                    nn.Linear(hidden_size // 2, 5)  # 5 project types
                 )
 
-            def get_project_types(self):
-                return ['reforestation', 'dac', 'biochar', 'ocean_based', 'helium_recovery']
+            def forward(self, x):
+                return self.network(x)
 
         self.model = ProjectSelector(self.input_size, self.hidden_size)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.CrossEntropyLoss()
 
-    async def train_model(self, training_data: List[Dict], epochs: Optional[int] = None) -> Dict:
+    async def train(self, training_data: List[Dict], epochs: Optional[int] = None) -> Dict:
+        if not TORCH_AVAILABLE or not self.model:
+            return {'status': 'disabled'}
         if len(training_data) < 20:
             return {'status': 'insufficient_data', 'samples': len(training_data)}
 
-        epochs = epochs or self.config.ml_epochs
-        project_types = self.model.get_project_types()
+        epochs = epochs or self.config.epochs
+        project_types = ['reforestation', 'dac', 'biochar', 'ocean_based', 'helium_recovery']
 
         X = []
         y = []
@@ -735,52 +581,55 @@ class MLProjectSelector:
                 item.get('project_age_months', 1) / 12,
                 item.get('historical_success', 0.8)
             ])
-            # One-hot encode selected project
-            selected = [0] * len(project_types)
-            if 'selected_project' in item:
-                idx = project_types.index(item['selected_project']) if item['selected_project'] in project_types else 0
-                selected[idx] = 1
-            y.append(selected)
+            selected = item.get('selected_project', 'reforestation')
+            idx = project_types.index(selected) if selected in project_types else 0
+            y.append(idx)
 
         X = np.array(X)
         y = np.array(y)
 
-        if self.scaler.mean_ is None:
-            X_scaled = self.scaler.fit_transform(X)
+        if self.scaler is not None:
+            if self.scaler.mean_ is None:
+                X_scaled = self.scaler.fit_transform(X)
+            else:
+                X_scaled = self.scaler.transform(X)
         else:
-            X_scaled = self.scaler.transform(X)
+            X_scaled = X
 
         dataset = TensorDataset(
             torch.FloatTensor(X_scaled),
-            torch.FloatTensor(y)
+            torch.LongTensor(y)
         )
-        dataloader = DataLoader(dataset, batch_size=self.config.ml_batch_size, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
 
-        self.model.train()
-        losses = []
-        for epoch in range(epochs):
-            epoch_loss = 0
-            for batch_X, batch_y in dataloader:
-                self.optimizer.zero_grad()
-                output = self.model(batch_X)
-                loss = self.criterion(output, torch.argmax(batch_y, dim=1))
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                epoch_loss += loss.item()
-            losses.append(epoch_loss / len(dataloader))
-            if (epoch + 1) % 20 == 0:
-                logger.debug(f"ML Training Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
+        async with self._lock:
+            def train_sync():
+                self.model.train()
+                losses = []
+                for epoch in range(epochs):
+                    epoch_loss = 0
+                    for batch_X, batch_y in dataloader:
+                        self.optimizer.zero_grad()
+                        output = self.model(batch_X)
+                        loss = self.criterion(output, batch_y)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                        epoch_loss += loss.item()
+                    losses.append(epoch_loss / len(dataloader))
+                    if (epoch + 1) % 20 == 0:
+                        logger.debug(f"ML Training Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
+                return losses
 
-        self.is_trained = True
-        self.training_history.extend(losses)
-        if len(self.training_history) > 1000:
-            self.training_history = self.training_history[-1000:]
+            losses = await asyncio.to_thread(train_sync)
+            self.is_trained = True
+            self.training_history.extend(losses)
+            if len(self.training_history) > 1000:
+                self.training_history = self.training_history[-1000:]
+            return {'status': 'success', 'loss': np.mean(losses), 'samples': len(X)}
 
-        return {'status': 'success', 'loss': np.mean(losses), 'samples': len(X)}
-
-    async def select_projects_ml(self, criteria: Dict) -> List[Dict[str, Any]]:
-        if not self.is_trained:
+    async def select_projects(self, criteria: Dict) -> List[Dict[str, Any]]:
+        if not TORCH_AVAILABLE or not self.is_trained:
             return []
 
         features = np.array([[
@@ -793,13 +642,16 @@ class MLProjectSelector:
             criteria.get('project_age_months', 1) / 12,
             criteria.get('historical_success', 0.8)
         ]])
-        features_scaled = self.scaler.transform(features)
+        if self.scaler is not None:
+            features_scaled = self.scaler.transform(features)
+        else:
+            features_scaled = features
 
         self.model.eval()
         with torch.no_grad():
             output = self.model(torch.FloatTensor(features_scaled)).numpy()[0]
 
-        project_types = self.model.get_project_types()
+        project_types = ['reforestation', 'dac', 'biochar', 'ocean_based', 'helium_recovery']
         probabilities = [float(x) for x in output]
 
         recommendations = []
@@ -813,7 +665,9 @@ class MLProjectSelector:
         recommendations.sort(key=lambda x: x['score'], reverse=True)
         return recommendations
 
-    def get_model_checkpoint(self) -> Dict:
+    def get_checkpoint(self) -> Dict:
+        if not TORCH_AVAILABLE:
+            return {}
         return {
             'state_dict': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
@@ -824,30 +678,132 @@ class MLProjectSelector:
         }
 
     def load_checkpoint(self, checkpoint: Dict):
+        if not TORCH_AVAILABLE or not checkpoint:
+            return
         self.model.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        if checkpoint.get('scaler_mean') is not None:
+        if checkpoint.get('scaler_mean') is not None and self.scaler is not None:
             self.scaler.mean_ = np.array(checkpoint['scaler_mean'])
             self.scaler.scale_ = np.array(checkpoint['scaler_std'])
         self.is_trained = checkpoint.get('is_trained', False)
         self.training_history = checkpoint.get('training_history', [])
 
 # ============================================================================
-# Human-AI Collaborative Sequestration (unchanged)
+# Federated Sequestration Manager (Improved)
 # ============================================================================
+class FederatedSequestrationManager:
+    def __init__(self, config: FederatedConfig):
+        self.config = config
+        self.server_url = config.server_url
+        self.round = 0
+        self.local_projects = {}
+        self.global_projects = {}
+        self.participants = []
+        self.contribution_scores = {}
+        self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._circuit = CircuitBreaker(
+            "federated_server",
+            failure_threshold=3,
+            recovery_timeout=30.0
+        )
+        logger.info("FederatedSequestrationManager initialized")
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    def _compress(self, data: Dict) -> Dict:
+        if self.config.sparsity_ratio == 1.0:
+            return data
+        numeric = {k: v for k, v in data.items() if isinstance(v, (int, float))}
+        if not numeric:
+            return data
+        sorted_items = sorted(numeric.items(), key=lambda x: abs(x[1]), reverse=True)
+        k = max(1, int(len(sorted_items) * self.config.sparsity_ratio))
+        kept = {item[0] for item in sorted_items[:k]}
+        return {k: v for k, v in data.items() if k in kept or not isinstance(v, (int, float))}
+
+    async def send_local_projects(self, participant_id: str, project_data: Dict, performance: float = 1.0) -> Dict:
+        if not self.server_url:
+            return {'status': 'local'}
+
+        async def _send():
+            for attempt in range(self.config.max_retries):
+                try:
+                    async with self._lock:
+                        session = await self._get_session()
+                        compressed = self._compress(project_data)
+                        update = {
+                            'participant_id': participant_id,
+                            'round': self.round,
+                            'project_data': compressed,
+                            'performance': performance,
+                            'sparsity_ratio': self.config.sparsity_ratio,
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        }
+                        async with session.post(
+                            f"{self.server_url}/federated/sequestration",
+                            json=update,
+                            timeout=30
+                        ) as resp:
+                            if resp.status == 200:
+                                result = await resp.json()
+                                self.round += 1
+                                self.contribution_scores[participant_id] = performance
+                                return result
+                            else:
+                                logger.warning(f"Federated send failed (attempt {attempt+1}): {resp.status}")
+                except Exception as e:
+                    logger.error(f"Federated send error (attempt {attempt+1}): {e}")
+                await asyncio.sleep(2 ** attempt)
+            return {'status': 'failed'}
+        return await self._circuit.call(_send)
+
+    async def get_global_projects(self) -> Optional[Dict]:
+        if not self.server_url:
+            return self.global_projects
+
+        async def _fetch():
+            for attempt in range(self.config.max_retries):
+                try:
+                    async with self._lock:
+                        session = await self._get_session()
+                        async with session.get(
+                            f"{self.server_url}/federated/sequestration/global",
+                            timeout=30
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                self.global_projects = data.get('projects', {})
+                                self.participants = data.get('participants', [])
+                                return self.global_projects
+                            else:
+                                logger.warning(f"Global fetch failed (attempt {attempt+1}): {resp.status}")
+                except Exception as e:
+                    logger.error(f"Global fetch error (attempt {attempt+1}): {e}")
+                await asyncio.sleep(2 ** attempt)
+            return None
+        return await self._circuit.call(_fetch)
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Human-AI Collaborative Sequestration (Simplified)
+# ============================================================================
 class HumanAICollaborativeSequestration:
-    """Human-AI collaborative reflection for carbon sequestration."""
-
     def __init__(self):
-        self.feedback_history = deque(maxlen=1000)
-        self.reflection_logs = deque(maxlen=100)
-        self.user_preferences = {}
+        self.feedback_history: Deque[Dict] = deque(maxlen=1000)
+        self.reflection_logs: Deque[Dict] = deque(maxlen=100)
+        self.user_preferences: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
     def collect_feedback(self, user_id: str, feedback: Dict) -> Dict:
-        feedback_entry = {'user_id': user_id, 'timestamp': datetime.now(timezone.utc), 'feedback': feedback}
-        self.feedback_history.append(feedback_entry)
+        entry = {'user_id': user_id, 'timestamp': datetime.now(timezone.utc), 'feedback': feedback}
+        self.feedback_history.append(entry)
         if 'preference' in feedback:
             self.user_preferences[user_id] = feedback['preference']
         reflection = self._generate_reflection(feedback)
@@ -862,19 +818,19 @@ class HumanAICollaborativeSequestration:
             'actions': [],
             'sequestration_insights': []
         }
-        if 'concern' in feedback:
-            if feedback['concern'] == 'cost':
-                reflection['insights'].append("Cost optimization can be improved through project diversity")
-                reflection['actions'].append("Implement cost-aware project selection")
-            elif feedback['concern'] == 'permanence':
-                reflection['insights'].append("Long-term permanence requires multi-decade planning")
-                reflection['actions'].append("Prioritize high-permanence projects")
-            elif feedback['concern'] == 'verification':
-                reflection['insights'].append("Verification accuracy needs improvement")
-                reflection['actions'].append("Implement enhanced verification methods")
-            elif feedback['concern'] == 'helium':
-                reflection['sequestration_insights'].append("Helium offset integration is needed")
-                reflection['actions'].append("Implement helium sequestration projects")
+        concern = feedback.get('concern')
+        if concern == 'cost':
+            reflection['insights'].append("Cost optimization can be improved through project diversity")
+            reflection['actions'].append("Implement cost-aware project selection")
+        elif concern == 'permanence':
+            reflection['insights'].append("Long-term permanence requires multi-decade planning")
+            reflection['actions'].append("Prioritize high-permanence projects")
+        elif concern == 'verification':
+            reflection['insights'].append("Verification accuracy needs improvement")
+            reflection['actions'].append("Implement enhanced verification methods")
+        elif concern == 'helium':
+            reflection['sequestration_insights'].append("Helium offset integration is needed")
+            reflection['actions'].append("Implement helium sequestration projects")
         if 'suggestion' in feedback:
             reflection['actions'].append(f"Implementing suggestion: {feedback['suggestion']}")
         reflection['action_items'] = self._prioritize_actions(reflection['actions'])
@@ -883,18 +839,14 @@ class HumanAICollaborativeSequestration:
     def _prioritize_actions(self, actions: List[str]) -> List[Dict]:
         priorities = []
         for action in actions:
-            if any(keyword in action.lower() for keyword in ['urgent', 'critical']):
-                priority = 'high'
-                impact = 0.9
-            elif any(keyword in action.lower() for keyword in ['sequestration', 'carbon']):
-                priority = 'high'
-                impact = 0.8
-            elif any(keyword in action.lower() for keyword in ['helium']):
-                priority = 'medium'
-                impact = 0.6
+            if any(kw in action.lower() for kw in ['urgent', 'critical']):
+                priority, impact = 'high', 0.9
+            elif any(kw in action.lower() for kw in ['sequestration', 'carbon']):
+                priority, impact = 'high', 0.8
+            elif any(kw in action.lower() for kw in ['helium']):
+                priority, impact = 'medium', 0.6
             else:
-                priority = 'medium'
-                impact = 0.5
+                priority, impact = 'medium', 0.5
             priorities.append({
                 'action': action,
                 'priority': priority,
@@ -903,117 +855,90 @@ class HumanAICollaborativeSequestration:
             })
         return sorted(priorities, key=lambda x: x['impact'], reverse=True)
 
-    def get_collaborative_insights(self) -> Dict:
+    async def get_insights(self) -> Dict:
         if len(self.feedback_history) < 5:
             return {'status': 'insufficient_feedback'}
-        recent_feedback = list(self.feedback_history)[-20:]
-        topics = {}
-        for f in recent_feedback:
-            topic = f['feedback'].get('topic', 'general')
-            topics[topic] = topics.get(topic, 0) + 1
+        recent = list(self.feedback_history)[-20:]
+        topics = defaultdict(int)
+        for f in recent:
+            topics[f['feedback'].get('topic', 'general')] += 1
         most_common = max(topics.items(), key=lambda x: x[1]) if topics else ('none', 0)
         return {
             'total_feedback': len(self.feedback_history),
-            'top_topics': topics,
+            'top_topics': dict(topics),
             'most_common_topic': most_common[0],
             'engagement_score': min(1.0, len(self.feedback_history) / 100),
             'user_count': len(set(f['user_id'] for f in self.feedback_history))
         }
 
 # ============================================================================
-# Data Classes (unchanged)
+# Persistence Manager (JSON with versioning)
 # ============================================================================
-
-@dataclass
-class CarbonCredit:
-    credit_id: str
-    amount_kg: float
-    project_type: str
-    verification_date: datetime
-    expiry_date: datetime
-    price_per_kg: float
-    is_verified: bool = False
-    permanence_years: float = 0.0
-    co_benefits: List[str] = field(default_factory=list)
-    sustainability_score: float = 0.0
-    helium_offset_equivalent_l: float = 0.0
-
-# ============================================================================
-# Persistence Manager (unchanged)
-# ============================================================================
-
 class CarbonSequestrationPersistenceManager:
-    """Manages persistence of sequestration state, ML model, and credits."""
-
-    def __init__(self, config: CarbonSequestrationConfig):
+    def __init__(self, config: PersistenceConfig):
         self.config = config
-        self.path = config.persistence_path
+        self.path = config.path
         self._lock = asyncio.Lock()
+        self._version = 1
         logger.info(f"CarbonSequestrationPersistenceManager initialized (path={self.path})")
 
-    async def save_state(self, manager: 'CarbonSequestrationManager') -> bool:
+    async def save_state(self, state: Dict[str, Any]) -> bool:
         async with self._lock:
             try:
-                state = {
-                    'config': manager.config,
-                    'credits': manager.credits,
-                    'total_sequestered': manager.total_sequestered,
-                    'total_offset': manager.total_offset,
-                    'transaction_history': manager.transaction_history,
-                    'sustainability_score': manager.sustainability_score,
-                    'helium_manager_state': {
-                        'helium_emissions': list(manager.helium_manager.helium_emissions),
-                        'helium_offsets': list(manager.helium_manager.helium_offsets),
-                        '_running_total_emissions': manager.helium_manager._running_total_emissions,
-                        '_running_total_offsets': manager.helium_manager._running_total_offsets,
-                    } if manager.helium_manager else None,
-                    'ml_checkpoint': manager.ml_selector.get_model_checkpoint() if manager.ml_selector else None,
+                payload = {
+                    'version': self._version,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'data': self._make_serializable(state)
                 }
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
-                logger.info(f"Sequestration state saved to {self.path}")
+                with open(self.path, 'w') as f:
+                    json.dump(payload, f, indent=2)
+                logger.info(f"State saved to {self.path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
                 return False
 
-    async def load_state(self, manager: 'CarbonSequestrationManager') -> bool:
+    async def load_state(self) -> Optional[Dict]:
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
-                return False
+                return None
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
-
-                manager.credits = state.get('credits', [])
-                manager.total_sequestered = state.get('total_sequestered', 0.0)
-                manager.total_offset = state.get('total_offset', 0.0)
-                manager.transaction_history = state.get('transaction_history', [])
-                manager.sustainability_score = state.get('sustainability_score', 0.0)
-
-                # Restore helium manager
-                he_state = state.get('helium_manager_state')
-                if he_state and manager.helium_manager:
-                    manager.helium_manager.helium_emissions = deque(he_state.get('helium_emissions', []), maxlen=86400)
-                    manager.helium_manager.helium_offsets = deque(he_state.get('helium_offsets', []), maxlen=86400)
-                    manager.helium_manager._running_total_emissions = he_state.get('_running_total_emissions', 0.0)
-                    manager.helium_manager._running_total_offsets = he_state.get('_running_total_offsets', 0.0)
-
-                # Restore ML checkpoint
-                ml_checkpoint = state.get('ml_checkpoint')
-                if ml_checkpoint and manager.ml_selector:
-                    manager.ml_selector.load_checkpoint(ml_checkpoint)
-
-                logger.info(f"Sequestration state loaded from {self.path}")
-                return True
+                with open(self.path, 'r') as f:
+                    payload = json.load(f)
+                if payload.get('version') != self._version:
+                    logger.warning(f"State version mismatch; may be incompatible")
+                return self._deserialize(payload.get('data', {}))
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
-                return False
+                return None
+
+    def _make_serializable(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_serializable(v) for v in obj]
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (deque, set)):
+            return self._make_serializable(list(obj))
+        elif hasattr(obj, '__dict__'):
+            return self._make_serializable(obj.__dict__)
+        else:
+            return obj
+
+    def _deserialize(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._deserialize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._deserialize(v) for v in obj]
+        elif isinstance(obj, str):
+            try:
+                return datetime.fromisoformat(obj)
+            except ValueError:
+                return obj
+        else:
+            return obj
 
     async def delete_state(self):
         async with self._lock:
@@ -1026,10 +951,7 @@ class CarbonSequestrationPersistenceManager:
 # ============================================================================
 # Telemetry Collector (unchanged)
 # ============================================================================
-
 class CarbonSequestrationTelemetry:
-    """Collects telemetry for the carbon sequestration system."""
-
     def __init__(self):
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
@@ -1057,14 +979,15 @@ class CarbonSequestrationTelemetry:
         return metric_name
 
     async def export(self) -> str:
-        output = []
-        for key, value in self.metrics['counters'].items():
-            output.append(f"# TYPE {key} counter\n{key} {value}")
-        for key, value in self.metrics['gauges'].items():
-            output.append(f"# TYPE {key} gauge\n{key} {value}")
-        for key, values in self.metrics['histograms'].items():
-            output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
-        return "\n".join(output)
+        async with self._lock:
+            output = []
+            for key, value in self.metrics['counters'].items():
+                output.append(f"# TYPE {key} counter\n{key} {value}")
+            for key, value in self.metrics['gauges'].items():
+                output.append(f"# TYPE {key} gauge\n{key} {value}")
+            for key, values in self.metrics['histograms'].items():
+                output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
+            return "\n".join(output)
 
     def reset(self):
         self.metrics.clear()
@@ -1073,405 +996,99 @@ class CarbonSequestrationTelemetry:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Enhanced Carbon Sequestration Manager (Main Class) – v3.0.0
+# Storage Module
 # ============================================================================
-
-class CarbonSequestrationManager:
-    """
-    Enhanced Carbon Sequestration Manager v3.0.0 - Complete Green Agent Implementation
-    with full bio‑inspired core integration.
-    """
-
-    def __init__(
-        self,
-        bio_core: Optional[EnhancedBioInspiredCore] = None,
-        config: Optional[CarbonSequestrationConfig] = None,
-        **kwargs
-    ):
-        """
-        Initialize the sequestration manager.
-
-        Args:
-            bio_core: Reference to the bio‑inspired core for event subscriptions.
-            config: Configuration dataclass (preferred).
-            **kwargs: Legacy arguments for backward compatibility.
-        """
-        if config is None:
-            config = CarbonSequestrationConfig(
-                enable_federated=kwargs.get('enable_federated', True),
-                enable_carbon_intensity=kwargs.get('enable_carbon_intensity', True),
-                enable_predictive=kwargs.get('enable_predictive', True),
-                enable_ml_selection=kwargs.get('enable_ml_selection', True),
-                enable_human_ai=kwargs.get('enable_human_ai', True),
-                enable_helium_tracking=kwargs.get('enable_helium_tracking', True),
-                enable_persistence=kwargs.get('enable_persistence', True),
-                enable_telemetry=kwargs.get('enable_telemetry', True),
-                enable_event_driven=kwargs.get('enable_event_driven', True),
-                enable_self_healing=kwargs.get('enable_self_healing', True),
-                enable_swarm_coordination=kwargs.get('enable_swarm_coordination', True),
-                enable_time_tick_engine=kwargs.get('enable_time_tick_engine', True),
-                enable_quantum_bridge=kwargs.get('enable_quantum_bridge', True),
-                enable_cost_benefit=kwargs.get('enable_cost_benefit', True),
-                max_retries=kwargs.get('max_retries', 3),
-                retry_base_delay_ms=kwargs.get('retry_base_delay_ms', 100.0),
-                retry_max_delay_ms=kwargs.get('retry_max_delay_ms', 5000.0),
-                circuit_breaker_failure_threshold=kwargs.get('circuit_breaker_failure_threshold', 5),
-                circuit_breaker_recovery_timeout=kwargs.get('circuit_breaker_recovery_timeout', 30.0),
-                persistence_path=kwargs.get('persistence_path', 'carbon_sequestration_state.pkl')
-            )
-        self.config = config
-
-        # Feature flags
-        self.enable_federated = self.config.enable_federated
-        self.enable_carbon_intensity = self.config.enable_carbon_intensity
-        self.enable_predictive = self.config.enable_predictive
-        self.enable_ml_selection = self.config.enable_ml_selection
-        self.enable_human_ai = self.config.enable_human_ai
-        self.enable_helium_tracking = self.config.enable_helium_tracking
-        self.enable_persistence = self.config.enable_persistence
-        self.enable_telemetry = self.config.enable_telemetry
-        self.enable_event_driven = self.config.enable_event_driven
-        self.enable_self_healing = self.config.enable_self_healing
-        self.enable_swarm_coordination = self.config.enable_swarm_coordination
-        self.enable_time_tick_engine = self.config.enable_time_tick_engine
-        self.enable_quantum_bridge = self.config.enable_quantum_bridge
-        self.enable_cost_benefit = self.config.enable_cost_benefit
-
-        # Core configuration
-        self.offset_strategy = self.config.offset_strategy
+class CarbonSequestrationStorage:
+    def __init__(self):
         self.credits: List[CarbonCredit] = []
+        self.transaction_history: List[Dict] = []
         self.sequestration_projects: Dict[str, Dict] = {}
-
-        # Store bio‑core reference
-        self.bio_core = bio_core
-        self.event_broker = None
-        self.alert_system = None
-        self.anomaly_detection = None
-        self.cost_benefit_engine = None
-        self.quantum_bridge = None
-        self.tick_engine = None
-        self.swarm_coordinator = None
-        self.self_healer = None
-        self.workflow_orchestrator = None
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
-
-        # Extract core sub‑modules if available
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
-            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.token_manager = getattr(self.bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(self.bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
-            self.harvester = getattr(self.bio_core, 'harvester', None)
-
-        # MoE and Self-Evolving Gate references (injected)
-        self.expert_router = None
-        self.gating_network = None
-        self.self_evolving_gate = None
-
-        # Helium provider (injected)
-        self.helium_provider = None
-
-        # Initialize sub-modules with config
-        self.carbon_manager = CarbonIntensityManager(self.config) if self.enable_carbon_intensity else None
-        self.helium_manager = HeliumSequestrationManager(self.config) if self.enable_helium_tracking else None
-        self.predictive_analyzer = PredictiveSequestrationAnalyzer(self.config) if self.enable_predictive else None
-        self.federated_manager = FederatedSequestrationManager(self.config) if self.enable_federated else None
-        self.ml_selector = MLProjectSelector(self.config) if self.enable_ml_selection else None
-        self.human_ai = HumanAICollaborativeSequestration() if self.enable_human_ai else None
-
-        # Persistence and telemetry
-        self.persistence = CarbonSequestrationPersistenceManager(self.config) if self.enable_persistence else None
-        self.telemetry = CarbonSequestrationTelemetry() if self.enable_telemetry else None
-
-        # Circuit breakers for external services
-        self._carbon_circuit = CircuitBreaker("carbon_api")
-        self._federated_circuit = CircuitBreaker("federated_api")
-        self._ml_circuit = CircuitBreaker("ml_selector")
-
-        # Tracking
+        self.sustainability_score = 0.0
         self.total_sequestered = 0.0
         self.total_offset = 0.0
-        self.transaction_history: List[Dict] = []
-        self.sustainability_score = 0.0
-        self.health_status = "healthy"
-        self.last_error = None
+        self._lock = asyncio.Lock()
 
-        # Initialize projects
-        self._initialize_projects()
+    async def add_credit(self, credit: CarbonCredit):
+        async with self._lock:
+            self.credits.append(credit)
+            if len(self.credits) > 10000:
+                self.credits = self.credits[-10000:]
 
-        # Subscribe to core events if enabled
-        if self.enable_event_driven and self.event_broker:
-            self._subscribe_events()
+    async def add_transaction(self, transaction: Dict):
+        async with self._lock:
+            self.transaction_history.append(transaction)
+            if len(self.transaction_history) > 10000:
+                self.transaction_history = self.transaction_history[-10000:]
 
-        # Start background tasks
-        self._start_background_tasks()
+    async def update_sustainability_score(self, score: float):
+        async with self._lock:
+            self.sustainability_score = score
 
-        # Load state if persistence enabled
-        if self.enable_persistence and self.persistence:
-            asyncio.create_task(self._load_state())
+    async def update_totals(self, offset: float, sequestered: float):
+        async with self._lock:
+            self.total_offset += offset
+            self.total_sequestered += sequestered
 
-        logger.info(
-            f"Enhanced Carbon Sequestration Manager v3.0.0 initialized with {len(self.credits)} credits, "
-            f"helium_budget={self.config.helium_budget_l}L, "
-            f"federated={self.enable_federated}, ml={self.enable_ml_selection}, "
-            f"event_driven={self.enable_event_driven}, self_healing={self.enable_self_healing}"
-        )
+    async def get_credits(self, limit: Optional[int] = None) -> List[CarbonCredit]:
+        async with self._lock:
+            if limit is not None:
+                return self.credits[-limit:]
+            return self.credits.copy()
 
-    # ========================================================================
-    # Event Subscriptions
-    # ========================================================================
-    def _subscribe_events(self):
-        if self.event_broker:
-            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('config_updated', self._on_config_updated)
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('health_update', self._on_health_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            logger.info("Carbon Sequestration Manager subscribed to core events")
+    async def get_transaction_history(self, limit: Optional[int] = None) -> List[Dict]:
+        async with self._lock:
+            if limit is not None:
+                return self.transaction_history[-limit:]
+            return self.transaction_history.copy()
 
-    async def _on_carbon_update(self, event: BioEvent):
-        intensity = event.data.get('intensity', 400)
-        price = event.data.get('price', 50.0)
-        self.carbon_intensity = intensity
-        self.carbon_price = price
-        # Update predictive analyzer
-        self.predictive_analyzer.update_history({
-            'offset_amount': 0,
-            'credit_price': price,
-            'project_success_rate': 0.9,
-            'verification_confidence': 0.7,
-            'carbon_intensity': intensity
-        })
-        # Adjust offset strategy based on carbon intensity
-        if intensity > 500:
-            self.offset_strategy = 'proactive'
-        elif intensity < 300:
-            self.offset_strategy = 'conservative'
+    async def get_sustainability_score(self) -> float:
+        async with self._lock:
+            return self.sustainability_score
 
-    async def _on_helium_update(self, event: BioEvent):
-        scarcity = event.data.get('scarcity', 0.5)
-        price = event.data.get('price', 0.5)
-        self.helium_scarcity = scarcity
-        self.helium_price = price
-        if self.helium_manager:
-            # Adjust helium budget based on scarcity
-            self.helium_manager.helium_budget_l = 100.0 * (1.0 - scarcity * 0.3)
-            self.helium_manager.helium_to_co2_factor = self.config.helium_to_co2_factor * (1.0 + 0.1 * scarcity)
-        # Adjust project selection weights
-        if scarcity > 0.7:
-            # Prioritize helium recovery projects
-            for project in self.sequestration_projects.values():
-                project['cost_per_kg'] *= (1.0 - 0.1 * scarcity)
+    async def get_totals(self) -> Dict[str, float]:
+        async with self._lock:
+            return {'offset': self.total_offset, 'sequestered': self.total_sequestered}
 
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative offset and triggering healing")
-            self.offset_strategy = 'conservative'
-            if self.enable_self_healing and self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-            if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
-                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_alert)
+    async def get_projects(self) -> Dict[str, Dict]:
+        async with self._lock:
+            return dict(self.sequestration_projects)
 
-    async def _on_config_updated(self, event: BioEvent):
-        updates = event.data.get('updates', {})
-        if 'carbon_sequestration' in updates:
-            new_config = updates['carbon_sequestration']
-            for key, value in new_config.items():
-                if hasattr(self.config, key):
-                    setattr(self.config, key, value)
-            logger.info("Carbon Sequestration configuration reloaded")
+    async def set_projects(self, projects: Dict[str, Dict]):
+        async with self._lock:
+            self.sequestration_projects = projects
 
-    async def _on_token_update(self, event: BioEvent):
-        self.token_balance = event.data.get('balance', 500)
+    async def get_stats(self) -> Dict[str, Any]:
+        async with self._lock:
+            return {
+                'total_credits': len(self.credits),
+                'verified_credits': sum(1 for c in self.credits if c.is_verified),
+                'total_offset_kg': self.total_offset,
+                'total_sequestered_kg': self.total_sequestered,
+                'sustainability_score': self.sustainability_score
+            }
 
-    async def _on_health_update(self, event: BioEvent):
-        self.health_status = event.data.get('status', 'healthy')
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        if event.data.get('metric') == 'carbon_intensity':
-            logger.info("Carbon anomaly detected; adjusting offset strategy")
-            self.offset_strategy = 'proactive'
-        if event.data.get('metric') == 'helium_scarcity':
-            logger.info("Helium anomaly detected; adjusting helium budgets")
-            if self.helium_manager:
-                self.helium_manager.helium_budget_l *= 0.8
-
-    # ========================================================================
-    # Background Tasks (unchanged, but with event-driven updates)
-    # ========================================================================
-    def _start_background_tasks(self):
-        if self.enable_carbon_intensity and self.carbon_manager:
-            asyncio.create_task(self._carbon_update_loop())
-        if self.enable_predictive and self.predictive_analyzer:
-            asyncio.create_task(self._predictive_update_loop())
-        if self.enable_federated and self.federated_manager:
-            asyncio.create_task(self._federated_sync_loop())
-        if self.enable_telemetry and self.telemetry:
-            asyncio.create_task(self._telemetry_export_loop())
-        if self.enable_swarm_coordination and self.swarm_coordinator:
-            asyncio.create_task(self._swarm_update_loop())
-        if self.enable_persistence:
-            asyncio.create_task(self._persistence_save_loop())
-
-    async def _carbon_update_loop(self):
-        while True:
-            try:
-                await self.carbon_manager.update_carbon_intensity()
-                if self.telemetry:
-                    intensity = await self.carbon_manager.get_current_intensity()
-                    self.telemetry.gauge('carbon_intensity', intensity)
-                await asyncio.sleep(self.carbon_manager.update_interval if self.carbon_manager else 300)
-            except Exception as e:
-                logger.error(f"Carbon update error: {e}")
-                await asyncio.sleep(60)
-
-    async def _predictive_update_loop(self):
-        while True:
-            try:
-                if self.predictive_analyzer and self.transaction_history:
-                    recent = self.transaction_history[-5:] if self.transaction_history else []
-                    if recent:
-                        offset_amount = recent[-1].get('offset_amount_kg', 0)
-                        credit_price = np.mean([t.get('cost', 0) / max(t.get('offset_amount_kg', 1), 1) for t in recent[-10:]])
-                        self.predictive_analyzer.update_history({
-                            'offset_amount': offset_amount,
-                            'credit_price': credit_price,
-                            'project_success_rate': 0.9,
-                            'verification_confidence': 0.7,
-                            'carbon_intensity': self.carbon_manager.carbon_intensity if self.carbon_manager else 400
-                        })
-                    await self.predictive_analyzer.train_forecast_model()
-                await asyncio.sleep(300)
-            except Exception as e:
-                logger.error(f"Predictive update error: {e}")
-                await asyncio.sleep(60)
-
-    async def _federated_sync_loop(self):
-        while True:
-            try:
-                if self.federated_manager and self.transaction_history:
-                    participant_id = f"sequestration_{hashlib.md5(str(self.sequestration_projects).encode()).hexdigest()[:8]}"
-                    await self.federated_manager.send_local_projects(
-                        participant_id,
-                        {
-                            'total_projects': len(self.sequestration_projects),
-                            'total_sequestered': self.total_sequestered,
-                            'total_offset': self.total_offset,
-                            'sustainability_score': self.sustainability_score,
-                            'timestamp': datetime.now(timezone.utc).isoformat()
-                        },
-                        performance=self.sustainability_score
-                    )
-                    await self.federated_manager.get_global_projects()
-                await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error(f"Federated sync error: {e}")
-                await asyncio.sleep(300)
-
-    async def _telemetry_export_loop(self):
-        while True:
-            try:
-                if self.enable_telemetry and self.telemetry:
-                    export_data = await self.telemetry.export()
-                    logger.debug(f"Telemetry export: {len(export_data)} bytes")
-                await asyncio.sleep(self.config.telemetry_export_interval)
-            except Exception as e:
-                logger.error(f"Telemetry export error: {e}")
-                await asyncio.sleep(60)
-
-    async def _swarm_update_loop(self):
-        while True:
-            try:
-                await self.share_with_swarm()
-                await asyncio.sleep(self.config.swarm_share_interval)
-            except Exception as e:
-                logger.error(f"Swarm update error: {e}")
-                await asyncio.sleep(120)
-
-    async def _persistence_save_loop(self):
-        while True:
-            try:
-                await self.save_state()
-                await asyncio.sleep(300)  # every 5 minutes
-            except Exception as e:
-                logger.error(f"Persistence save error: {e}")
-                await asyncio.sleep(60)
-
-    # ========================================================================
-    # Swarm Coordination
-    # ========================================================================
-    async def share_with_swarm(self):
-        if not self.enable_swarm_coordination or not self.swarm_coordinator:
-            return
-        swarm_payload = {
-            'manager_id': hashlib.md5(str(self.sequestration_projects).encode()).hexdigest()[:8],
-            'sustainability_score': self.sustainability_score,
-            'total_offset': self.total_offset,
-            'total_sequestered': self.total_sequestered,
-            'credits_count': len(self.credits),
-            'helium_position': self.helium_manager.get_helium_position() if self.helium_manager else {}
-        }
-        await self.swarm_coordinator.share_predictions(swarm_payload)
-
-    # ========================================================================
-    # Deep MoE and Self-Evolving Gate Integration
-    # ========================================================================
-    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
-        self.gating_network = gating_network
-        logger.info("Gating network injected into Carbon Sequestration")
-
-    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
-        self.self_evolving_gate = gate
-        logger.info("Self-Evolving Gate injected into Carbon Sequestration")
-
-    def set_expert_router(self, router: 'ExpertRouter'):
-        self.expert_router = router
-        logger.info("Expert Router injected into Carbon Sequestration")
-
-    def set_helium_provider(self, provider: HeliumProvider):
-        self.helium_provider = provider
-        logger.info("Helium provider injected into Carbon Sequestration")
-
-    # ========================================================================
-    # Bio-Inspired Module Injection
-    # ========================================================================
-    def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        logger.info("Bio-inspired modules injected into Carbon Sequestration")
-
-    # ========================================================================
-    # Enhanced Offset Methods (with QuantumBridge, TimeTickEngine, CostBenefit)
-    # ========================================================================
+# ============================================================================
+# Analyzer Module
+# ============================================================================
+class CarbonSequestrationAnalyzer:
+    def __init__(
+        self,
+        config: CarbonSequestrationConfig,
+        storage: CarbonSequestrationStorage,
+        carbon_manager: Optional[CarbonIntensityManager],
+        helium_manager: Optional[HeliumSequestrationManager],
+        predictive: Optional[PredictiveSequestrationAnalyzer],
+        ml_selector: Optional[MLProjectSelector],
+        human_ai: Optional[HumanAICollaborativeSequestration]
+    ):
+        self.config = config
+        self.storage = storage
+        self.carbon_manager = carbon_manager
+        self.helium_manager = helium_manager
+        self.predictive = predictive
+        self.ml_selector = ml_selector
+        self.human_ai = human_ai
+        self._lock = asyncio.Lock()
 
     async def offset_expert_emissions(
         self,
@@ -1480,52 +1097,23 @@ class CarbonSequestrationManager:
         urgency: str = 'normal',
         use_ml_selection: bool = False
     ) -> Dict[str, Any]:
-        """
-        Enhanced offset emissions with ML-based project selection and bio‑inspired integrations.
-        """
         # Get carbon intensity
         carbon_intensity = 400
         if self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
 
-        # Use QuantumBridge to adjust carbon/helium weights if available
-        if self.enable_quantum_bridge and self.quantum_bridge:
-            q_params = self.quantum_bridge.get_qubo_parameters()
-            penalty_carbon = q_params.get('penalty_carbon', 0.5)
-            penalty_helium = q_params.get('penalty_helium_shortage', 0.5)
-            if penalty_carbon > 0.7:
-                carbon_intensity *= 1.2
-            if penalty_helium > 0.7:
-                # Reduce helium budget
-                if self.helium_manager:
-                    self.helium_manager.helium_budget_l *= 0.8
-
-        # Use TimeTickEngine for helium forecast if available
-        if self.enable_time_tick_engine and self.tick_engine:
-            forecast = self.tick_engine.get_helium_forecast(4)
-            if forecast and len(forecast) > 3:
-                avg_future_helium = np.mean(forecast)
-                if avg_future_helium < 0.3:
-                    # Helium scarcity predicted, increase offset amount
-                    offset_amount = expert_carbon_kg * 1.5
-                else:
-                    offset_amount = expert_carbon_kg * 1.0
-            else:
-                offset_amount = expert_carbon_kg * 1.0
-        else:
-            offset_amount = expert_carbon_kg * 1.0
-
         # Determine offset amount based on strategy
-        if self.offset_strategy == 'proactive':
-            offset_amount = max(offset_amount, expert_carbon_kg * 1.2)
-        elif self.offset_strategy == 'reactive':
-            offset_amount = max(offset_amount, expert_carbon_kg)
+        offset_amount = expert_carbon_kg * 1.0
+        if self.config.offset_strategy == 'proactive':
+            offset_amount = max(expert_carbon_kg, expert_carbon_kg * 1.2)
+        elif self.config.offset_strategy == 'reactive':
+            offset_amount = max(expert_carbon_kg, expert_carbon_kg)
         else:  # conservative
-            offset_amount = min(offset_amount, expert_carbon_kg * 0.5)
+            offset_amount = min(expert_carbon_kg, expert_carbon_kg * 0.5)
 
         # Select projects
-        if use_ml_selection and self.enable_ml_selection and self.ml_selector:
-            ml_results = await self.ml_selector.select_projects_ml({
+        if use_ml_selection and self.ml_selector:
+            ml_results = await self.ml_selector.select_projects({
                 'carbon_intensity': carbon_intensity,
                 'cost_budget': min(1.0, budget_remaining / 1000),
                 'urgency': {'critical': 0.9, 'normal': 0.5, 'opportunistic': 0.2}.get(urgency, 0.5),
@@ -1544,49 +1132,35 @@ class CarbonSequestrationManager:
                 'helium_recovery': 'helium_recovery_advanced'
             }
             selected_projects = [project_map.get(p, p) for p in selected_projects if p in project_map]
-            if not selected_projects:
-                selected_projects = self._select_projects(offset_amount, urgency)
         else:
             selected_projects = self._select_projects(offset_amount, urgency)
 
         # Allocate offset across projects
         allocation = self._allocate_offset(offset_amount, selected_projects)
 
-        # Use CostBenefitEngine to evaluate offset strategy if available
-        if self.enable_cost_benefit and self.cost_benefit_engine:
-            params = {
-                'offset_amount': offset_amount,
-                'cost': sum(a['cost'] for a in allocation.values()),
-                'carbon_intensity': carbon_intensity
-            }
-            analysis = await self.cost_benefit_engine.analyze_scenario('carbon_sequestration', params)
-            result['cost_benefit_analysis'] = {
-                'roi': analysis.roi,
-                'net_value': analysis.net_value
-            }
-
         # Execute offset
         offset_result = await self._execute_offset(allocation)
 
-        # Create carbon credits with helium offsets
+        # Create carbon credits
         new_credits = self._generate_credits(offset_result)
-        self.credits.extend(new_credits)
+        for credit in new_credits:
+            await self.storage.add_credit(credit)
 
         # Handle helium offsets
-        if self.enable_helium_tracking and self.helium_manager:
+        if self.helium_manager:
             helium_offset = self.helium_manager.calculate_helium_offset_from_carbon(offset_amount)
             helium_project = self.helium_manager.select_helium_project(helium_offset)
             if helium_project['project_id']:
-                self.helium_manager.record_helium_offset(helium_offset, helium_project['project_id'])
+                self.helium_manager.record_offset(helium_offset, helium_project['project_id'])
 
-        # Update tracking
-        self.total_offset += offset_amount
-        self.total_sequestered += offset_amount * 0.1  # Simulated sequestration
+        # Update totals
+        await self.storage.update_totals(offset_amount, offset_amount * 0.1)
 
         # Calculate sustainability score
-        self.sustainability_score = self._calculate_sustainability_score(
+        sustainability_score = self._calculate_sustainability_score(
             offset_amount, expert_carbon_kg, carbon_intensity
         )
+        await self.storage.update_sustainability_score(sustainability_score)
 
         offset_plan = {
             'offset_amount_kg': offset_amount,
@@ -1597,79 +1171,37 @@ class CarbonSequestrationManager:
             'credits_generated': len(new_credits),
             'cost': sum(p['cost'] for p in allocation.values()),
             'carbon_intensity': carbon_intensity,
-            'sustainability_score': self.sustainability_score,
-            'helium_offset_l': helium_offset if self.enable_helium_tracking else 0,
+            'sustainability_score': sustainability_score,
+            'helium_offset_l': helium_offset if self.helium_manager else 0,
             'ml_used': use_ml_selection,
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
-
-        self.transaction_history.append(offset_plan)
+        await self.storage.add_transaction(offset_plan)
 
         # Update predictive analyzer
-        if self.predictive_analyzer:
-            self.predictive_analyzer.update_history({
+        if self.predictive:
+            self.predictive.update_history({
                 'offset_amount': offset_amount,
                 'credit_price': offset_plan['cost'] / max(offset_amount, 1),
                 'project_success_rate': 0.9,
                 'verification_confidence': 0.7,
                 'carbon_intensity': carbon_intensity
             })
-            await self.predictive_analyzer.train_forecast_model()
+            await self.predictive.train()
 
-        # Human-AI collaboration
-        if self.enable_human_ai and self.human_ai:
-            insights = self.human_ai.get_collaborative_insights()
-            offset_plan['human_ai_insights'] = insights
-
-        # Pass offset plan to gating network if available
-        if self.gating_network and self.expert_router:
-            features = np.array([
-                offset_amount / 1000,
-                self.sustainability_score,
-                carbon_intensity / 800,
-                len(selected_projects)
-            ])
-            reward = 1.0 - (expert_carbon_kg - offset_amount) / max(expert_carbon_kg, 1)
-            context = {
-                'expert_carbon_kg': expert_carbon_kg,
-                'offset_amount': offset_amount,
-                'strategy': self.offset_strategy
-            }
-            self.gating_network.update(features, reward, context)
-
-        # Pass to self-evolving gate if available
-        if self.self_evolving_gate:
-            self.self_evolving_gate.adapt(
-                state=torch.tensor([offset_amount, self.sustainability_score]),
-                chosen_expert=0,  # dummy
-                reward=1.0 - (expert_carbon_kg - offset_amount) / max(expert_carbon_kg, 1),
-                environmental_feedback={'strategy': self.offset_strategy},
-                quantum_mode=False
-            )
-
-        # Telemetry
-        if self.telemetry:
-            self.telemetry.increment('offsets_performed')
-            self.telemetry.gauge('offset_amount', offset_amount)
-            self.telemetry.gauge('sustainability_score', self.sustainability_score)
-
-        # Check for critical impact and trigger workflow
-        if self.sustainability_score < 0.4 and self.workflow_orchestrator:
-            await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_slo_breach)
+        # Human‑AI insights
+        if self.human_ai:
+            offset_plan['human_ai_insights'] = await self.human_ai.get_insights()
 
         logger.info(
             f"Offset {expert_carbon_kg:.4f} kg CO2 with {offset_amount:.4f} kg "
             f"across {len(selected_projects)} projects, "
-            f"sustainability_score={self.sustainability_score:.2f}"
+            f"sustainability_score={sustainability_score:.2f}"
         )
-
         return offset_plan
 
     def _calculate_sustainability_score(
-        self,
-        offset_amount: float,
-        expert_carbon_kg: float,
-        carbon_intensity: float
+        self, offset_amount: float, expert_carbon_kg: float, carbon_intensity: float
     ) -> float:
         offset_ratio = min(1.0, offset_amount / max(expert_carbon_kg, 1))
         carbon_factor = 1.0 - (carbon_intensity / 800)
@@ -1678,9 +1210,9 @@ class CarbonSequestrationManager:
         return min(1.0, max(0.0, score))
 
     def _select_projects(self, amount_kg: float, urgency: str) -> List[str]:
-        """Select sequestration projects based on amount and urgency."""
+        projects = asyncio.run(self.storage.get_projects())
         scored_projects = []
-        for project_id, project in self.sequestration_projects.items():
+        for project_id, project in projects.items():
             cost_score = 1.0 / (1.0 + project['cost_per_kg'])
             capacity_score = min(project['capacity_kg_per_year'] / max(amount_kg, 1), 1.0)
             permanence_score = min(project['permanence_years'] / 1000, 1.0)
@@ -1692,31 +1224,25 @@ class CarbonSequestrationManager:
                 score = 0.30 * cost_score + 0.25 * capacity_score + 0.25 * permanence_score + 0.20 * helium_score
             else:
                 score = 0.40 * cost_score + 0.30 * capacity_score + 0.15 * permanence_score + 0.15 * helium_score
-
             scored_projects.append((project_id, score))
 
         scored_projects.sort(key=lambda x: x[1], reverse=True)
-
         selected = []
         total_capacity = 0
         for project_id, _ in scored_projects:
             selected.append(project_id)
-            total_capacity += self.sequestration_projects[project_id]['capacity_kg_per_year']
+            total_capacity += projects[project_id]['capacity_kg_per_year']
             if total_capacity >= amount_kg:
                 break
-
         return selected
 
     def _allocate_offset(self, amount_kg: float, projects: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Allocate offset amount across selected projects."""
+        projects_dict = asyncio.run(self.storage.get_projects())
         allocation = {}
         remaining = amount_kg
-        sorted_projects = sorted(
-            projects,
-            key=lambda p: self.sequestration_projects[p]['cost_per_kg']
-        )
+        sorted_projects = sorted(projects, key=lambda p: projects_dict[p]['cost_per_kg'])
         for project_id in sorted_projects:
-            project = self.sequestration_projects[project_id]
+            project = projects_dict[project_id]
             max_from_project = min(remaining, project['capacity_kg_per_year'] / 365)
             helium_potential = project.get('helium_offset_potential_l', 0) * max_from_project / 1000
             allocation[project_id] = {
@@ -1733,12 +1259,9 @@ class CarbonSequestrationManager:
         return allocation
 
     async def _execute_offset(self, allocation: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """Execute offset allocation with helium integration."""
         total_amount = sum(a['amount_kg'] for a in allocation.values())
         total_cost = sum(a['cost'] for a in allocation.values())
         total_helium = sum(a['helium_offset_potential_l'] for a in allocation.values())
-
-        # Simulated execution with verification
         return {
             'total_amount_kg': total_amount,
             'total_cost': total_cost,
@@ -1746,14 +1269,14 @@ class CarbonSequestrationManager:
             'projects': allocation,
             'execution_time': datetime.now(timezone.utc).isoformat(),
             'verification_pending': True,
-            'sustainability_score': self.sustainability_score
+            'sustainability_score': await self.storage.get_sustainability_score()
         }
 
     def _generate_credits(self, offset_result: Dict[str, Any]) -> List[CarbonCredit]:
-        """Generate carbon credits from offset execution."""
         credits = []
+        projects_dict = asyncio.run(self.storage.get_projects())
         for project_id, allocation in offset_result['projects'].items():
-            project = self.sequestration_projects[project_id]
+            project = projects_dict.get(project_id, {})
             credit = CarbonCredit(
                 credit_id=f"CRED-{datetime.now(timezone.utc).timestamp()}-{project_id}",
                 amount_kg=allocation['amount_kg'],
@@ -1762,145 +1285,70 @@ class CarbonSequestrationManager:
                 expiry_date=datetime.now(timezone.utc) + timedelta(days=365),
                 price_per_kg=allocation['cost'] / allocation['amount_kg'] if allocation['amount_kg'] > 0 else 0,
                 is_verified=False,
-                permanence_years=project['permanence_years'],
-                co_benefits=project['co_benefits'],
-                sustainability_score=self.sustainability_score,
+                permanence_years=project.get('permanence_years', 0),
+                co_benefits=project.get('co_benefits', []),
+                sustainability_score=offset_result['sustainability_score'],
                 helium_offset_equivalent_l=allocation.get('helium_offset_potential_l', 0)
             )
             credits.append(credit)
         return credits
 
-    # ========================================================================
-    # Verification Methods
-    # ========================================================================
-
-    def verify_credits(self) -> int:
-        """Verify carbon credits through auditing."""
+    async def verify_credits(self) -> int:
+        credits = await self.storage.get_credits()
         verified_count = 0
-        for credit in self.credits:
-            if not credit.is_verified:
-                if credit.amount_kg > 0 and credit.verification_date > datetime.now(timezone.utc) - timedelta(days=30):
-                    credit.is_verified = True
-                    verified_count += 1
-                    if self.enable_helium_tracking and self.helium_manager:
-                        self.helium_manager.record_helium_offset(
-                            credit.helium_offset_equivalent_l,
-                            f"credit_{credit.credit_id}"
-                        )
+        for credit in credits:
+            if not credit.is_verified and credit.amount_kg > 0 and credit.verification_date > datetime.now(timezone.utc) - timedelta(days=30):
+                credit.is_verified = True
+                verified_count += 1
+                if self.helium_manager:
+                    self.helium_manager.record_offset(
+                        credit.helium_offset_equivalent_l,
+                        f"credit_{credit.credit_id}"
+                    )
         logger.info(f"Verified {verified_count} carbon credits")
         return verified_count
 
-    # ========================================================================
-    # Training Methods
-    # ========================================================================
-
-    async def train_ml_model(self, training_data: List[Dict] = None) -> Dict:
-        """Train ML model for project selection."""
-        if not self.enable_ml_selection or not self.ml_selector:
+    async def train_ml_model(self, training_data: Optional[List[Dict]] = None) -> Dict:
+        if not self.ml_selector:
             return {'status': 'disabled'}
         if training_data is None:
-            training_data = self.transaction_history[-100:] if self.transaction_history else []
-        formatted_data = []
-        for item in training_data:
-            allocations = item.get('allocation', {})
-            selected_project = list(allocations.keys())[0] if allocations else 'reforestation_tropical'
-            project_map = {
-                'reforestation_tropical': 'reforestation',
-                'direct_air_capture': 'dac',
-                'biochar_agriculture': 'biochar',
-                'ocean_alkalinization': 'ocean_based',
-                'helium_recovery_advanced': 'helium_recovery'
-            }
-            formatted_data.append({
-                'carbon_intensity': item.get('carbon_intensity', 400),
-                'cost_budget': min(1.0, item.get('cost', 100) / 1000),
-                'urgency': 0.5,
-                'permanence_requirement': 0.5,
-                'co_benefit_weight': 0.5,
-                'verification_confidence': 0.7,
-                'project_age_months': 12,
-                'historical_success': 0.9,
-                'selected_project': project_map.get(selected_project, 'reforestation')
-            })
-        result = await self.ml_selector.train_model(formatted_data)
-        logger.info(f"ML model training completed: {result}")
-        return result
+            history = await self.storage.get_transaction_history(100)
+            training_data = []
+            for item in history:
+                allocations = item.get('allocation', {})
+                selected_project = list(allocations.keys())[0] if allocations else 'reforestation_tropical'
+                project_map = {
+                    'reforestation_tropical': 'reforestation',
+                    'direct_air_capture': 'dac',
+                    'biochar_agriculture': 'biochar',
+                    'ocean_alkalinization': 'ocean_based',
+                    'helium_recovery_advanced': 'helium_recovery'
+                }
+                training_data.append({
+                    'carbon_intensity': item.get('carbon_intensity', 400),
+                    'cost_budget': min(1.0, item.get('cost', 100) / 1000),
+                    'urgency': 0.5,
+                    'permanence_requirement': 0.5,
+                    'co_benefit_weight': 0.5,
+                    'verification_confidence': 0.7,
+                    'project_age_months': 12,
+                    'historical_success': 0.9,
+                    'selected_project': project_map.get(selected_project, 'reforestation')
+                })
+        return await self.ml_selector.train(training_data)
 
     async def train_predictive_model(self) -> Dict:
-        """Train predictive model for offset demand."""
-        if not self.enable_predictive or not self.predictive_analyzer:
+        if not self.predictive:
             return {'status': 'disabled'}
-        result = await self.predictive_analyzer.train_forecast_model()
-        logger.info(f"Predictive model training completed: {result}")
-        return result
+        return await self.predictive.train()
 
-    # ========================================================================
-    # Reporting Methods
-    # ========================================================================
-
-    def get_carbon_portfolio(self) -> Dict[str, Any]:
-        """Get comprehensive carbon portfolio status."""
-        verified_credits = [c for c in self.credits if c.is_verified]
-        unverified_credits = [c for c in self.credits if not c.is_verified]
-        total_verified = sum(c.amount_kg for c in verified_credits)
-        total_pending = sum(c.amount_kg for c in unverified_credits)
-
-        portfolio = {
-            'total_credits': len(self.credits),
-            'verified_credits': len(verified_credits),
-            'unverified_credits': len(unverified_credits),
-            'total_verified_kg': total_verified,
-            'total_pending_kg': total_pending,
-            'total_offset_kg': self.total_offset,
-            'total_sequestered_kg': self.total_sequestered,
-            'sustainability_score': self.sustainability_score,
-            'project_breakdown': {
-                pid: {
-                    'type': p['type'],
-                    'capacity': p['capacity_kg_per_year'],
-                    'cost': p['cost_per_kg'],
-                    'permanence_years': p['permanence_years'],
-                    'co_benefits': p['co_benefits'],
-                    'helium_offset_potential_l': p.get('helium_offset_potential_l', 0)
-                }
-                for pid, p in self.sequestration_projects.items()
-            },
-            'net_carbon_impact_kg': self.total_sequestered - self.total_offset
-        }
-
-        if self.enable_helium_tracking and self.helium_manager:
-            portfolio['helium_position'] = self.helium_manager.get_helium_position()
-
-        if self.enable_federated and self.federated_manager:
-            portfolio['federated_stats'] = self.federated_manager.get_federated_stats()
-
-        if self.enable_predictive and self.predictive_analyzer:
-            portfolio['predictive_forecast'] = asyncio.run(
-                self.predictive_analyzer.predict_offset_demand()
-            )
-
-        if self.enable_ml_selection and self.ml_selector:
-            portfolio['ml_status'] = {
-                'trained': self.ml_selector.is_trained,
-                'model_version': 'v3.0.0',
-                'training_samples': len(self.ml_selector.training_history)
-            }
-
-        if self.enable_human_ai and self.human_ai:
-            portfolio['human_ai_insights'] = self.human_ai.get_collaborative_insights()
-
-        return portfolio
-
-    def get_recommendation_for_expert(
-        self,
-        expert_carbon_per_inference: float,
-        annual_inferences: int
+    async def get_recommendation_for_expert(
+        self, expert_carbon_per_inference: float, annual_inferences: int
     ) -> Dict[str, Any]:
-        """Get carbon offset recommendation for specific expert."""
         annual_emissions = expert_carbon_per_inference * annual_inferences
-
+        projects = await self.storage.get_projects()
         project_costs = []
-        for pid, project in self.sequestration_projects.items():
+        for pid, project in projects.items():
             annual_cost = annual_emissions * project['cost_per_kg']
             helium_potential = project.get('helium_offset_potential_l', 0) * annual_emissions / 1000
             project_costs.append({
@@ -1911,119 +1359,761 @@ class CarbonSequestrationManager:
                 'co_benefits': project['co_benefits'],
                 'permanence_years': project['permanence_years'],
                 'helium_offset_potential_l': helium_potential,
-                'sustainability_score': self.sustainability_score
+                'sustainability_score': await self.storage.get_sustainability_score()
             })
-
         project_costs.sort(key=lambda x: x['annual_cost'])
-
-        recommendation = {
+        return {
             'expert_annual_emissions_kg': annual_emissions,
             'recommended_project': project_costs[0] if project_costs else None,
             'all_options': project_costs,
-            'offset_strategy': self.offset_strategy,
+            'offset_strategy': self.config.offset_strategy,
             'cost_effective': project_costs[0]['annual_cost'] < 100 if project_costs else False,
-            'sustainability_score': self.sustainability_score,
+            'sustainability_score': await self.storage.get_sustainability_score(),
             'recommended_helium_offset_l': project_costs[0]['helium_offset_potential_l'] if project_costs else 0
         }
 
-        if self.enable_helium_tracking and self.helium_manager:
-            helium_pos = self.helium_manager.get_helium_position()
-            recommendation['helium_budget_status'] = {
-                'remaining_l': helium_pos.get('remaining_budget_l', 0),
-                'is_sufficient': helium_pos.get('remaining_budget_l', 0) > annual_emissions * 0.01
+# ============================================================================
+# Reporter Module
+# ============================================================================
+class CarbonSequestrationReporter:
+    def __init__(
+        self,
+        config: CarbonSequestrationConfig,
+        storage: CarbonSequestrationStorage,
+        analyzer: CarbonSequestrationAnalyzer,
+        telemetry: Optional[CarbonSequestrationTelemetry],
+        persistence: Optional[CarbonSequestrationPersistenceManager],
+        human_ai: Optional[HumanAICollaborativeSequestration],
+        federated: Optional[FederatedSequestrationManager],
+        predictive: Optional[PredictiveSequestrationAnalyzer],
+        ml_selector: Optional[MLProjectSelector],
+        helium_manager: Optional[HeliumSequestrationManager]
+    ):
+        self.config = config
+        self.storage = storage
+        self.analyzer = analyzer
+        self.telemetry = telemetry
+        self.persistence = persistence
+        self.human_ai = human_ai
+        self.federated = federated
+        self.predictive = predictive
+        self.ml_selector = ml_selector
+        self.helium_manager = helium_manager
+        self._lock = asyncio.Lock()
+
+    async def get_carbon_portfolio(self) -> Dict[str, Any]:
+        stats = await self.storage.get_stats()
+        projects = await self.storage.get_projects()
+        portfolio = {
+            'total_credits': stats['total_credits'],
+            'verified_credits': stats['verified_credits'],
+            'total_offset_kg': stats['total_offset_kg'],
+            'total_sequestered_kg': stats['total_sequestered_kg'],
+            'sustainability_score': stats['sustainability_score'],
+            'project_breakdown': {
+                pid: {
+                    'type': p['type'],
+                    'capacity': p['capacity_kg_per_year'],
+                    'cost': p['cost_per_kg'],
+                    'permanence_years': p['permanence_years'],
+                    'co_benefits': p['co_benefits'],
+                    'helium_offset_potential_l': p.get('helium_offset_potential_l', 0)
+                }
+                for pid, p in projects.items()
+            },
+            'net_carbon_impact_kg': stats['total_sequestered_kg'] - stats['total_offset_kg']
+        }
+
+        if self.helium_manager:
+            portfolio['helium_position'] = self.helium_manager.get_position()
+
+        if self.federated:
+            portfolio['federated_stats'] = self.federated.get_federated_stats()
+
+        if self.predictive:
+            forecast = await self.predictive.predict_demand()
+            portfolio['predictive_forecast'] = forecast
+
+        if self.ml_selector:
+            portfolio['ml_status'] = {
+                'trained': self.ml_selector.is_trained,
+                'model_version': 'v4.0.0',
+                'training_samples': len(self.ml_selector.training_history)
             }
 
-        return recommendation
+        if self.human_ai:
+            portfolio['human_ai_insights'] = await self.human_ai.get_insights()
 
-    def get_sustainability_report(self) -> Dict[str, Any]:
-        """Generate comprehensive sustainability report."""
-        report = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'sustainability_score': self.sustainability_score,
-            'carbon_portfolio': self.get_carbon_portfolio(),
-            'helium_position': self.helium_manager.get_helium_position() if self.helium_manager else {},
-            'recommendations': self._generate_sustainability_recommendations()
-        }
-        return report
+        return portfolio
 
-    def _generate_sustainability_recommendations(self) -> List[str]:
-        recommendations = []
-        if self.sustainability_score < 0.5:
-            recommendations.append("Improve carbon sequestration through project diversification")
-        if self.total_offset < self.total_sequestered * 0.5:
-            recommendations.append("Increase offset allocation to match sequestration capacity")
-        if self.enable_helium_tracking and self.helium_manager:
-            helium_pos = self.helium_manager.get_helium_position()
-            if helium_pos.get('remaining_budget_l', 0) < 0:
-                recommendations.append("CRITICAL: Helium budget exceeded - implement recovery systems")
-        if self.enable_federated and self.federated_manager:
-            if len(self.federated_manager.participants) < 2:
-                recommendations.append("Increase federated participation for better project selection")
-        return recommendations or ["All sustainability metrics are within acceptable ranges"]
-
-    # ========================================================================
-    # Self-Healing
-    # ========================================================================
-    async def self_heal(self):
-        logger.info("CarbonSequestrationManager self‑healing")
-        if self.enable_self_healing:
-            # Reset budgets to config defaults
-            self.helium_manager.helium_budget_l = self.config.helium_budget_l
-            self.offset_strategy = 'proactive'
-            # Reset sustainability score
-            self.sustainability_score = 0.0
-            # Clear stale credits (keep last 10)
-            if len(self.credits) > 10:
-                self.credits = self.credits[-10:]
-            # Clear stale transaction history (keep last 10)
-            if len(self.transaction_history) > 10:
-                self.transaction_history = self.transaction_history[-10:]
-            # Reset health status
-            self.health_status = "healthy"
-            self.last_error = None
-            # Save state
-            await self.save_state()
-            logger.info("Self-healing completed")
-
-    # ========================================================================
-    # Health Status
-    # ========================================================================
-    async def get_health_status(self) -> Dict[str, Any]:
+    async def get_sustainability_report(self) -> Dict[str, Any]:
+        stats = await self.storage.get_stats()
         return {
-            'status': self.health_status,
-            'last_error': self.last_error,
-            'total_offset': self.total_offset,
-            'total_sequestered': self.total_sequestered,
-            'credits_count': len(self.credits),
-            'sustainability_score': self.sustainability_score,
-            'bio_integration_active': self.enable_bio_integration,
-            'event_driven_active': self.enable_event_driven,
-            'self_healing_enabled': self.enable_self_healing,
-            'swarm_coordination_active': self.enable_swarm_coordination,
-            'persistence_enabled': self.enable_persistence,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'sustainability_score': stats['sustainability_score'],
+            'carbon_portfolio': await self.get_carbon_portfolio(),
+            'helium_position': self.helium_manager.get_position() if self.helium_manager else {},
+            'recommendations': self._generate_recommendations()
         }
 
-    # ========================================================================
-    # Persistence Methods
-    # ========================================================================
+    def _generate_recommendations(self) -> List[str]:
+        recs = []
+        stats = asyncio.run(self.storage.get_stats())
+        if stats['sustainability_score'] < 0.5:
+            recs.append("Improve carbon sequestration through project diversification")
+        if stats['total_offset_kg'] < stats['total_sequestered_kg'] * 0.5:
+            recs.append("Increase offset allocation to match sequestration capacity")
+        if self.helium_manager:
+            remaining = self.helium_manager.get_position().get('remaining_budget_l', 0)
+            if remaining < 0:
+                recs.append("CRITICAL: Helium budget exceeded - implement recovery systems")
+        if self.federated and len(self.federated.participants) < 2:
+            recs.append("Increase federated participation for better project selection")
+        return recs or ["All sustainability metrics are within acceptable ranges"]
+
+    async def export_telemetry(self):
+        if self.telemetry:
+            data = await self.telemetry.export()
+            logger.debug(f"Telemetry export: {len(data)} bytes")
+
     async def save_state(self):
         if self.persistence:
-            await self.persistence.save_state(self)
+            state = {
+                'credits': await self.storage.get_credits(),
+                'transaction_history': await self.storage.get_transaction_history(),
+                'sequestration_projects': await self.storage.get_projects(),
+                'sustainability_score': await self.storage.get_sustainability_score(),
+                'total_sequestered': (await self.storage.get_totals())['sequestered'],
+                'total_offset': (await self.storage.get_totals())['offset'],
+                'helium_manager_state': {
+                    'emissions': list(self.helium_manager.emissions) if self.helium_manager else [],
+                    'offsets': list(self.helium_manager.offsets) if self.helium_manager else [],
+                    '_total_emissions': self.helium_manager._total_emissions if self.helium_manager else 0.0,
+                    '_total_offsets': self.helium_manager._total_offsets if self.helium_manager else 0.0,
+                } if self.helium_manager else None,
+                'ml_checkpoint': self.analyzer.ml_selector.get_checkpoint() if self.analyzer.ml_selector else None,
+            }
+            await self.persistence.save_state(state)
 
     async def load_state(self):
         if self.persistence:
-            await self.persistence.load_state(self)
+            state = await self.persistence.load_state()
+            if state:
+                # Restore credits
+                credits = state.get('credits', [])
+                for c in credits:
+                    await self.storage.add_credit(c)
+                # Restore transaction history
+                for t in state.get('transaction_history', []):
+                    await self.storage.add_transaction(t)
+                # Restore projects
+                await self.storage.set_projects(state.get('sequestration_projects', {}))
+                await self.storage.update_sustainability_score(state.get('sustainability_score', 0.0))
+                # Restore totals
+                await self.storage.update_totals(
+                    state.get('total_offset', 0.0),
+                    state.get('total_sequestered', 0.0)
+                )
+                # Restore helium manager
+                he_state = state.get('helium_manager_state')
+                if he_state and self.helium_manager:
+                    self.helium_manager.emissions = deque(he_state.get('emissions', []), maxlen=86400)
+                    self.helium_manager.offsets = deque(he_state.get('offsets', []), maxlen=86400)
+                    self.helium_manager._total_emissions = he_state.get('_total_emissions', 0.0)
+                    self.helium_manager._total_offsets = he_state.get('_total_offsets', 0.0)
+                # Restore ML checkpoint
+                ml_cp = state.get('ml_checkpoint')
+                if ml_cp and self.analyzer.ml_selector:
+                    self.analyzer.ml_selector.load_checkpoint(ml_cp)
 
-    # ========================================================================
+# ============================================================================
+# Main Controller
+# ============================================================================
+class CarbonSequestrationManager:
+    """
+    Enhanced Carbon Sequestration Manager v4.0.0
+    Controller that orchestrates storage, analysis, reporting, and event handling.
+    """
+
+    def __init__(
+        self,
+        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        config: Optional[CarbonSequestrationConfig] = None,
+        **kwargs
+    ):
+        if config is None:
+            config = CarbonSequestrationConfig(**{k: v for k, v in kwargs.items() if k in CarbonSequestrationConfig.__annotations__})
+        self.config = config
+
+        # Bio‑core references
+        self.bio_core = bio_core
+        self.event_broker = getattr(bio_core, 'event_broker', None) if bio_core else None
+        self.self_healer = getattr(bio_core, 'self_healer', None) if bio_core else None
+        self.workflow_orchestrator = getattr(bio_core, 'workflow_orchestrator', None) if bio_core else None
+        self.swarm_coordinator = getattr(bio_core, 'swarm_coordinator', None) if bio_core else None
+        self.token_manager = getattr(bio_core, 'token_manager', None) if bio_core else None
+        self.gradient_manager = getattr(bio_core, 'gradient_manager', None) if bio_core else None
+        self.quantum_bridge = getattr(bio_core, 'quantum_bridge', None) if bio_core else None
+        self.tick_engine = getattr(bio_core, 'tick_engine', None) if bio_core else None
+        self.cost_benefit_engine = getattr(bio_core, 'cost_benefit_engine', None) if bio_core else None
+
+        # Sub‑modules
+        self.carbon_manager = CarbonIntensityManager(self.config.carbon) if self.config.carbon.enabled else None
+        self.helium_manager = HeliumSequestrationManager(self.config.helium) if self.config.helium.enabled else None
+        self.predictive = PredictiveSequestrationAnalyzer(self.config.predictive) if self.config.predictive.enabled else None
+        self.ml_selector = MLProjectSelector(self.config.ml) if self.config.ml.enabled else None
+        self.federated = FederatedSequestrationManager(self.config.federated) if self.config.federated.enabled else None
+        self.human_ai = HumanAICollaborativeSequestration() if self.config.enable_human_ai else None
+        self.telemetry = CarbonSequestrationTelemetry() if self.config.telemetry.enabled else None
+        self.persistence = CarbonSequestrationPersistenceManager(self.config.persistence) if self.config.persistence.enabled else None
+
+        # Storage, Analyzer, Reporter
+        self.storage = CarbonSequestrationStorage()
+        self.analyzer = CarbonSequestrationAnalyzer(
+            self.config,
+            self.storage,
+            self.carbon_manager,
+            self.helium_manager,
+            self.predictive,
+            self.ml_selector,
+            self.human_ai
+        )
+        self.reporter = CarbonSequestrationReporter(
+            self.config,
+            self.storage,
+            self.analyzer,
+            self.telemetry,
+            self.persistence,
+            self.human_ai,
+            self.federated,
+            self.predictive,
+            self.ml_selector,
+            self.helium_manager
+        )
+
+        # MoE injectables
+        self.expert_router = None
+        self.gating_network = None
+        self.self_evolving_gate = None
+        self.helium_provider = None
+
+        # Health status
+        self.health_status = "healthy"
+        self.last_error: Optional[str] = None
+
+        # Event queue
+        self._event_queue: asyncio.Queue = asyncio.Queue()
+        self._event_consumer_task: Optional[asyncio.Task] = None
+
+        # Background tasks
+        self._background_tasks: List[asyncio.Task] = []
+
+        # Start sub‑module loops
+        if self.helium_manager:
+            self.helium_manager.start()
+
+        # Initialize projects
+        asyncio.create_task(self._initialize_projects())
+
+        # Subscribe to events
+        if self.config.enable_event_driven and self.event_broker:
+            self._subscribe_events()
+
+        # Start background tasks
+        self._start_background_tasks()
+
+        # Load state
+        if self.config.persistence.enabled:
+            asyncio.create_task(self.reporter.load_state())
+
+        logger.info("Carbon Sequestration Manager v4.0.0 initialized")
+
+    # ============================================================================
+    # Event Handling (via queue)
+    # ============================================================================
+    def _subscribe_events(self):
+        if self.event_broker:
+            self.event_broker.subscribe('carbon_update', self._enqueue_event)
+            self.event_broker.subscribe('helium_update', self._enqueue_event)
+            self.event_broker.subscribe('alert_generated', self._enqueue_event)
+            self.event_broker.subscribe('config_updated', self._enqueue_event)
+            self.event_broker.subscribe('token_balance_update', self._enqueue_event)
+            self.event_broker.subscribe('health_update', self._enqueue_event)
+            self.event_broker.subscribe('anomaly_detected', self._enqueue_event)
+            logger.info("Subscribed to core events via queue")
+
+    async def _enqueue_event(self, event: BioEvent):
+        await self._event_queue.put(event)
+
+    async def _event_consumer(self):
+        while True:
+            try:
+                event = await self._event_queue.get()
+                await self._handle_event(event)
+                self._event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Event consumer error: {e}")
+
+    async def _handle_event(self, event: BioEvent):
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler:
+            try:
+                await handler(event)
+            except Exception as e:
+                logger.error(f"Error handling event {event.event_type}: {e}")
+
+    async def _on_carbon_update(self, event: BioEvent):
+        intensity = event.data.get('intensity', 400)
+        if self.carbon_manager:
+            self.carbon_manager.carbon_intensity = intensity
+        if self.predictive:
+            self.predictive.update_history({
+                'offset_amount': 0,
+                'credit_price': event.data.get('price', 50),
+                'project_success_rate': 0.9,
+                'verification_confidence': 0.7,
+                'carbon_intensity': intensity
+            })
+        if intensity > 500:
+            self.config.offset_strategy = 'proactive'
+        elif intensity < 300:
+            self.config.offset_strategy = 'conservative'
+
+    async def _on_helium_update(self, event: BioEvent):
+        scarcity = event.data.get('scarcity', 0.5)
+        if self.helium_manager:
+            self.helium_manager.budget_l = self.config.helium_budget_l * (1.0 - scarcity * 0.3)
+            self.helium_manager.config.helium_to_co2_factor = self.config.helium_to_co2_factor * (1.0 + 0.1 * scarcity)
+        if scarcity > 0.7:
+            projects = await self.storage.get_projects()
+            for project in projects.values():
+                project['cost_per_kg'] *= (1.0 - 0.1 * scarcity)
+
+    async def _on_alert_generated(self, event: BioEvent):
+        if event.data.get('severity') == 'critical':
+            logger.warning("Critical alert; triggering self‑healing")
+            self.config.offset_strategy = 'conservative'
+            if self.config.self_healing.enabled and self.self_healer:
+                await self.self_healer.apply_healing('damage_accumulation')
+            if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
+                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_alert)
+
+    async def _on_config_updated(self, event: BioEvent):
+        updates = event.data.get('updates', {})
+        if 'carbon_sequestration' in updates:
+            new = updates['carbon_sequestration']
+            for key, value in new.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+            logger.info("Configuration reloaded")
+
+    async def _on_token_update(self, event: BioEvent):
+        pass
+
+    async def _on_health_update(self, event: BioEvent):
+        self.health_status = event.data.get('status', 'healthy')
+
+    async def _on_anomaly_detected(self, event: BioEvent):
+        if event.data.get('metric') == 'carbon_intensity':
+            self.config.offset_strategy = 'proactive'
+        if event.data.get('metric') == 'helium_scarcity':
+            if self.helium_manager:
+                self.helium_manager.budget_l *= 0.8
+
+    # ============================================================================
+    # Background Tasks (cancellable)
+    # ============================================================================
+    def _start_background_tasks(self):
+        # Event consumer
+        if self.config.enable_event_driven:
+            self._event_consumer_task = asyncio.create_task(self._event_consumer())
+            self._background_tasks.append(self._event_consumer_task)
+
+        # Carbon update loop
+        if self.carbon_manager:
+            t = asyncio.create_task(self._carbon_update_loop())
+            self._background_tasks.append(t)
+
+        # Predictive training loop
+        if self.predictive:
+            t = asyncio.create_task(self._predictive_update_loop())
+            self._background_tasks.append(t)
+
+        # ML training loop
+        if self.ml_selector:
+            t = asyncio.create_task(self._ml_training_loop())
+            self._background_tasks.append(t)
+
+        # Federated sync
+        if self.federated:
+            t = asyncio.create_task(self._federated_sync_loop())
+            self._background_tasks.append(t)
+
+        # Telemetry export
+        if self.telemetry:
+            t = asyncio.create_task(self._telemetry_export_loop())
+            self._background_tasks.append(t)
+
+        # Persistence save
+        if self.persistence:
+            t = asyncio.create_task(self._persistence_save_loop())
+            self._background_tasks.append(t)
+
+        # Swarm update
+        if self.config.enable_swarm_coordination and self.swarm_coordinator:
+            t = asyncio.create_task(self._swarm_update_loop())
+            self._background_tasks.append(t)
+
+    async def _carbon_update_loop(self):
+        while True:
+            try:
+                if self.carbon_manager:
+                    await self.carbon_manager.update_carbon_intensity()
+                    if self.telemetry:
+                        intensity = await self.carbon_manager.get_current_intensity()
+                        self.telemetry.gauge('carbon_intensity', intensity)
+                await asyncio.sleep(self.config.carbon.update_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Carbon update error: {e}")
+                await asyncio.sleep(60)
+
+    async def _predictive_update_loop(self):
+        while True:
+            try:
+                if self.predictive:
+                    await self.predictive.train()
+                await asyncio.sleep(self.config.predictive.update_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Predictive update error: {e}")
+                await asyncio.sleep(60)
+
+    async def _ml_training_loop(self):
+        while True:
+            try:
+                if self.ml_selector:
+                    history = await self.storage.get_transaction_history(100)
+                    if len(history) >= 20:
+                        training_data = []
+                        for item in history:
+                            allocations = item.get('allocation', {})
+                            selected_project = list(allocations.keys())[0] if allocations else 'reforestation_tropical'
+                            project_map = {
+                                'reforestation_tropical': 'reforestation',
+                                'direct_air_capture': 'dac',
+                                'biochar_agriculture': 'biochar',
+                                'ocean_alkalinization': 'ocean_based',
+                                'helium_recovery_advanced': 'helium_recovery'
+                            }
+                            training_data.append({
+                                'carbon_intensity': item.get('carbon_intensity', 400),
+                                'cost_budget': min(1.0, item.get('cost', 100) / 1000),
+                                'urgency': 0.5,
+                                'permanence_requirement': 0.5,
+                                'co_benefit_weight': 0.5,
+                                'verification_confidence': 0.7,
+                                'project_age_months': 12,
+                                'historical_success': 0.9,
+                                'selected_project': project_map.get(selected_project, 'reforestation')
+                            })
+                        await self.ml_selector.train(training_data)
+                await asyncio.sleep(self.config.ml.train_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"ML training error: {e}")
+                await asyncio.sleep(60)
+
+    async def _federated_sync_loop(self):
+        while True:
+            try:
+                if self.federated:
+                    stats = await self.storage.get_stats()
+                    pid = f"sequestration_{hashlib.md5(str(self.storage.sequestration_projects).encode()).hexdigest()[:8]}"
+                    await self.federated.send_local_projects(
+                        pid,
+                        {
+                            'total_projects': len(await self.storage.get_projects()),
+                            'total_sequestered': (await self.storage.get_totals())['sequestered'],
+                            'total_offset': (await self.storage.get_totals())['offset'],
+                            'sustainability_score': await self.storage.get_sustainability_score(),
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        },
+                        performance=await self.storage.get_sustainability_score()
+                    )
+                    await self.federated.get_global_projects()
+                await asyncio.sleep(self.config.federated.sync_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Federated sync error: {e}")
+                await asyncio.sleep(300)
+
+    async def _telemetry_export_loop(self):
+        while True:
+            try:
+                await self.reporter.export_telemetry()
+                await asyncio.sleep(self.config.telemetry.export_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Telemetry export error: {e}")
+                await asyncio.sleep(60)
+
+    async def _persistence_save_loop(self):
+        while True:
+            try:
+                await self.reporter.save_state()
+                await asyncio.sleep(self.config.persistence.save_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Persistence save error: {e}")
+                await asyncio.sleep(60)
+
+    async def _swarm_update_loop(self):
+        while True:
+            try:
+                await self.share_with_swarm()
+                await asyncio.sleep(self.config.swarm_share_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Swarm update error: {e}")
+                await asyncio.sleep(120)
+
+    # ============================================================================
+    # Public API
+    # ============================================================================
+    async def offset_expert_emissions(
+        self,
+        expert_carbon_kg: float,
+        budget_remaining: float,
+        urgency: str = 'normal',
+        use_ml_selection: bool = False
+    ) -> Dict[str, Any]:
+        result = await self.analyzer.offset_expert_emissions(
+            expert_carbon_kg, budget_remaining, urgency, use_ml_selection
+        )
+
+        # Trigger workflows if critical
+        if await self.storage.get_sustainability_score() < 0.4 and self.workflow_orchestrator:
+            await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_slo_breach)
+
+        # Feed to MoE components
+        if self.gating_network and self.expert_router:
+            features = np.array([
+                result['offset_amount_kg'] / 1000,
+                await self.storage.get_sustainability_score(),
+                (result.get('carbon_intensity', 400) / 800),
+                len(result.get('projects_used', []))
+            ])
+            reward = 1.0 - (expert_carbon_kg - result['offset_amount_kg']) / max(expert_carbon_kg, 1)
+            self.gating_network.update(features, reward, {'strategy': self.config.offset_strategy})
+
+        if self.self_evolving_gate and TORCH_AVAILABLE:
+            state = torch.tensor([
+                result['offset_amount_kg'],
+                await self.storage.get_sustainability_score()
+            ], dtype=torch.float32)
+            self.self_evolving_gate.adapt(
+                state=state,
+                chosen_expert=0,
+                reward=1.0 - (expert_carbon_kg - result['offset_amount_kg']) / max(expert_carbon_kg, 1),
+                environmental_feedback={'strategy': self.config.offset_strategy},
+                quantum_mode=False
+            )
+
+        # Telemetry
+        if self.telemetry:
+            self.telemetry.increment('offsets_performed')
+            self.telemetry.gauge('offset_amount', result['offset_amount_kg'])
+            self.telemetry.gauge('sustainability_score', await self.storage.get_sustainability_score())
+
+        logger.info(
+            f"Offset {expert_carbon_kg:.4f} kg CO2 with {result['offset_amount_kg']:.4f} kg "
+            f"across {len(result.get('projects_used', []))} projects, "
+            f"sustainability_score={await self.storage.get_sustainability_score():.2f}"
+        )
+        return result
+
+    async def verify_credits(self) -> int:
+        return await self.analyzer.verify_credits()
+
+    async def get_carbon_portfolio(self) -> Dict[str, Any]:
+        return await self.reporter.get_carbon_portfolio()
+
+    async def get_sustainability_report(self) -> Dict[str, Any]:
+        return await self.reporter.get_sustainability_report()
+
+    async def get_recommendation_for_expert(
+        self, expert_carbon_per_inference: float, annual_inferences: int
+    ) -> Dict[str, Any]:
+        return await self.analyzer.get_recommendation_for_expert(expert_carbon_per_inference, annual_inferences)
+
+    async def train_ml_model(self, training_data: Optional[List[Dict]] = None) -> Dict:
+        return await self.analyzer.train_ml_model(training_data)
+
+    async def train_predictive_model(self) -> Dict:
+        return await self.analyzer.train_predictive_model()
+
+    async def share_with_swarm(self):
+        if not self.config.enable_swarm_coordination or not self.swarm_coordinator:
+            return
+        stats = await self.storage.get_stats()
+        payload = {
+            'manager_id': hashlib.md5(str(self.storage.sequestration_projects).encode()).hexdigest()[:8],
+            'sustainability_score': stats['sustainability_score'],
+            'total_offset': stats['total_offset_kg'],
+            'total_sequestered': stats['total_sequestered_kg'],
+            'credits_count': stats['total_credits'],
+            'helium_position': self.helium_manager.get_position() if self.helium_manager else {}
+        }
+        await self.swarm_coordinator.share_predictions(payload)
+
+    # ============================================================================
+    # Injection Methods
+    # ============================================================================
+    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
+        self.gating_network = gating_network
+
+    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
+        self.self_evolving_gate = gate
+
+    def set_expert_router(self, router: 'ExpertRouter'):
+        self.expert_router = router
+
+    def set_helium_provider(self, provider: HeliumProvider):
+        self.helium_provider = provider
+
+    # ============================================================================
+    # Self‑Healing
+    # ============================================================================
+    async def self_heal(self):
+        logger.info("Self‑healing started")
+        if not self.config.self_healing.enabled:
+            logger.warning("Self‑healing disabled")
+            return
+
+        # Reset budgets
+        if self.helium_manager:
+            self.helium_manager.budget_l = self.config.helium_budget_l
+        self.config.offset_strategy = 'proactive'
+
+        # Reset sustainability score
+        await self.storage.update_sustainability_score(0.0)
+
+        # Trim credits and transaction history
+        credits = await self.storage.get_credits()
+        if len(credits) > 10:
+            async with self.storage._lock:
+                self.storage.credits = credits[-10:]
+        history = await self.storage.get_transaction_history()
+        if len(history) > 10:
+            async with self.storage._lock:
+                self.storage.transaction_history = history[-10:]
+
+        # Reset health status
+        self.health_status = "healthy"
+        self.last_error = None
+
+        # Save state
+        await self.reporter.save_state()
+        logger.info("Self‑healing completed")
+
+    # ============================================================================
+    # Health Status
+    # ============================================================================
+    async def get_health_status(self) -> Dict[str, Any]:
+        stats = await self.storage.get_stats()
+        return {
+            'status': self.health_status,
+            'last_error': self.last_error,
+            'total_offset': stats['total_offset_kg'],
+            'total_sequestered': stats['total_sequestered_kg'],
+            'credits_count': stats['total_credits'],
+            'sustainability_score': stats['sustainability_score'],
+            'bio_integration_active': self.config.enable_bio_integration,
+            'event_driven_active': self.config.enable_event_driven,
+            'self_healing_enabled': self.config.self_healing.enabled,
+            'persistence_enabled': self.config.persistence.enabled,
+        }
+
+    # ============================================================================
+    # Helper Methods
+    # ============================================================================
+    async def _initialize_projects(self):
+        default_projects = {
+            'reforestation_tropical': {
+                'type': 'reforestation',
+                'capacity_kg_per_year': 10000,
+                'cost_per_kg': 0.05,
+                'permanence_years': 100,
+                'co_benefits': ['biodiversity', 'water_cycle'],
+                'helium_offset_potential_l': 5
+            },
+            'direct_air_capture': {
+                'type': 'dac',
+                'capacity_kg_per_year': 5000,
+                'cost_per_kg': 0.20,
+                'permanence_years': 10000,
+                'co_benefits': ['technology', 'employment'],
+                'helium_offset_potential_l': 2
+            },
+            'biochar_agriculture': {
+                'type': 'biochar',
+                'capacity_kg_per_year': 8000,
+                'cost_per_kg': 0.08,
+                'permanence_years': 1000,
+                'co_benefits': ['soil_health', 'crop_yield'],
+                'helium_offset_potential_l': 3
+            },
+            'ocean_alkalinization': {
+                'type': 'ocean_based',
+                'capacity_kg_per_year': 20000,
+                'cost_per_kg': 0.15,
+                'permanence_years': 10000,
+                'co_benefits': ['ocean_health', 'carbon_sink'],
+                'helium_offset_potential_l': 1
+            },
+            'helium_recovery_advanced': {
+                'type': 'helium_recovery',
+                'capacity_kg_per_year': 1000,
+                'cost_per_kg': 0.50,
+                'permanence_years': 50,
+                'co_benefits': ['resource_conservation', 'technology'],
+                'helium_offset_potential_l': 50
+            }
+        }
+        await self.storage.set_projects(default_projects)
+
+    # ============================================================================
     # Shutdown
-    # ========================================================================
+    # ============================================================================
     async def shutdown(self):
-        """Graceful shutdown of all components."""
         logger.info("Shutting down Carbon Sequestration Manager")
-        if self.enable_persistence:
-            await self.save_state()
+        # Cancel background tasks
+        for task in self._background_tasks:
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
+        # Stop loops
+        if self.helium_manager:
+            await self.helium_manager.stop()
+
+        # Save final state
+        if self.persistence:
+            await self.reporter.save_state()
+
+        # Close external sessions
         if self.carbon_manager:
             await self.carbon_manager.close()
-        if self.federated_manager:
-            await self.federated_manager.close()
+        if self.federated:
+            await self.federated.close()
+
         logger.info("Shutdown complete")
