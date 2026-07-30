@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Green Agent MoE Expert System v6.2.0 - Unified Metabolic Ecosystem with Enhanced Resilience
+Green Agent MoE Expert System v6.3.0 - Unified Metabolic Ecosystem with Enhanced Resilience
 
 ENHANCED WITH: Secure JSON persistence, concurrency controls, retry/circuit breaker,
 full integration of Digital Twin & Sustainability Engine, input validation, rate limiting,
@@ -19,8 +19,8 @@ This module serves as the central nervous system connecting:
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Union, Callable
-from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Tuple, Union, Callable, TypeVar, Generic, cast
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 import asyncio
 import threading
@@ -34,6 +34,8 @@ import zlib
 import time
 import random
 from enum import Enum
+import inspect
+import pickle
 
 # Third-party imports
 try:
@@ -63,6 +65,12 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
+try:
+    from cryptography.fernet import Fernet
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -72,24 +80,28 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UnifiedEcosystemConfig:
     """Centralized configuration for the Unified Metabolic Ecosystem."""
-    # Feature flags
+    # Core features
     enable_quantum: bool = False
     enable_helium: bool = False
     enable_bio_inspired: bool = True
     enable_evolving_gates: bool = True
     enable_federated: bool = False
     enable_cross_region: bool = False
+    
+    # Sustainability & advanced
     enable_sustainability_dashboard: bool = True
     enable_predictive_maintenance: bool = True
     enable_digital_twin: bool = True
     enable_unified_sustainability: bool = True
+    
+    # Resilience & monitoring
     enable_health_checks: bool = True
     enable_self_healing: bool = True
     enable_alert_escalation: bool = True
     enable_dynamic_reconfig: bool = True
     enable_telemetry: bool = True
     enable_persistence: bool = True
-
+    
     # Tunable parameters
     twin_time_horizon_years: int = 10
     twin_n_simulations: int = 1000
@@ -101,6 +113,8 @@ class UnifiedEcosystemConfig:
     alert_escalation_timeout: int = 300
     prometheus_port: Optional[int] = None  # if set, start Prometheus HTTP server
     rate_limit_per_minute: int = 60
+    # Encryption key (Fernet) - if set, encrypt persistence
+    encryption_key: Optional[str] = None
 
     def __post_init__(self):
         # Validate boolean flags
@@ -122,6 +136,12 @@ class UnifiedEcosystemConfig:
             raise ValueError("alert_escalation_timeout must be >= 1")
         if self.rate_limit_per_minute < 1:
             raise ValueError("rate_limit_per_minute must be >= 1")
+        if self.encryption_key:
+            # Validate it's a valid Fernet key
+            try:
+                Fernet(self.encryption_key.encode())
+            except Exception as e:
+                raise ValueError(f"Invalid encryption key: {e}")
 
 # ============================================================================
 # Pydantic Models for Input Validation (if Pydantic available)
@@ -154,7 +174,7 @@ if BaseModel is not None:
 if BaseModel is not None:
     class EcosystemState(BaseModel):
         """Complete ecosystem state for serialization."""
-        version: str = "6.2.0"
+        version: str = "6.3.0"
         sustainability_score: float = 0.0
         last_update: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
         registry_stats: Dict[str, Any] = Field(default_factory=dict)
@@ -529,12 +549,12 @@ class TelemetryCollector:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Enhanced Persistence Manager (JSON + Pydantic)
+# Enhanced Persistence Manager (JSON + zlib + optional encryption)
 # ============================================================================
 
 class EcosystemPersistenceManager:
     """
-    Secure persistence using JSON + zlib compression and Pydantic schemas.
+    Secure persistence using JSON + zlib compression and optional Fernet encryption.
     Includes versioning and async I/O.
     """
 
@@ -542,12 +562,17 @@ class EcosystemPersistenceManager:
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
+        self._fernet = None
+        if config.encryption_key and CRYPTO_AVAILABLE:
+            self._fernet = Fernet(config.encryption_key.encode())
+        elif config.encryption_key:
+            logger.warning("Encryption key provided but cryptography not installed; encryption disabled.")
         logger.info(f"EcosystemPersistenceManager initialized (path={self.path})")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
            retry=retry_if_exception_type((IOError, OSError)))
     async def save_state(self, ecosystem: 'UnifiedMetabolicEcosystem') -> bool:
-        """Save the ecosystem state to disk using JSON + compression."""
+        """Save the ecosystem state to disk using JSON + compression (and optional encryption)."""
         async with self._lock:
             try:
                 # Build state
@@ -564,14 +589,24 @@ class EcosystemPersistenceManager:
                     recovery_attempts=dict(ecosystem.self_healing.recovery_attempts) if ecosystem.self_healing else {}
                 )
                 # Serialize
-                json_str = state.model_dump_json(indent=2) if BaseModel else json.dumps(state.__dict__, indent=2)
+                if BaseModel:
+                    json_str = state.model_dump_json(indent=2)
+                else:
+                    # Fallback to dict serialization
+                    json_str = json.dumps(state.__dict__, indent=2, default=str)
                 compressed = zlib.compress(json_str.encode('utf-8'))
+                if self._fernet:
+                    # Encrypt the compressed data
+                    encrypted = self._fernet.encrypt(compressed)
+                    data_to_write = encrypted
+                else:
+                    data_to_write = compressed
                 if aiofiles:
                     async with aiofiles.open(self.path, 'wb') as f:
-                        await f.write(compressed)
+                        await f.write(data_to_write)
                 else:
                     with open(self.path, 'wb') as f:
-                        f.write(compressed)
+                        f.write(data_to_write)
                 logger.info(f"Ecosystem state saved to {self.path}")
                 return True
             except Exception as e:
@@ -579,7 +614,7 @@ class EcosystemPersistenceManager:
                 return False
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-           retry=retry_if_exception_type((IOError, OSError, zlib.error)))
+           retry=retry_if_exception_type((IOError, OSError, zlib.error, ValueError)))
     async def load_state(self, ecosystem: 'UnifiedMetabolicEcosystem') -> bool:
         """Load the ecosystem state from disk."""
         async with self._lock:
@@ -589,11 +624,18 @@ class EcosystemPersistenceManager:
             try:
                 if aiofiles:
                     async with aiofiles.open(self.path, 'rb') as f:
-                        compressed = await f.read()
+                        data = await f.read()
                 else:
                     with open(self.path, 'rb') as f:
-                        compressed = f.read()
-                json_str = zlib.decompress(compressed).decode('utf-8')
+                        data = f.read()
+                # Decrypt if needed
+                if self._fernet:
+                    try:
+                        data = self._fernet.decrypt(data)
+                    except Exception as e:
+                        logger.error(f"Decryption failed: {e}")
+                        return False
+                json_str = zlib.decompress(data).decode('utf-8')
                 if BaseModel:
                     state = EcosystemState.model_validate_json(json_str)
                 else:
@@ -1358,12 +1400,12 @@ class PredictiveMaintenanceIntegrator:
         logger.info("PredictiveMaintenanceIntegrator shut down")
 
 # ============================================================================
-# Enhanced Unified Metabolic Ecosystem - Main Entry Point
+# Unified Metabolic Ecosystem - Main Entry Point
 # ============================================================================
 
 class UnifiedMetabolicEcosystem:
     """
-    Unified Metabolic Ecosystem v6.2.0 with Enhanced Resilience and Sustainability.
+    Unified Metabolic Ecosystem v6.3.0 with Enhanced Resilience and Sustainability.
     """
 
     def __init__(
@@ -1383,6 +1425,12 @@ class UnifiedMetabolicEcosystem:
         self._rate_limiter = RateLimiter(config.rate_limit_per_minute)
         self.telemetry = TelemetryCollector(config) if config.enable_telemetry else None
 
+        # Initialization status and ready flag
+        self._initialization_lock = asyncio.Lock()
+        self._init_task: Optional[asyncio.Task] = None
+        self._ready = False
+        self._init_exception: Optional[Exception] = None
+
         self.initialization_status: Dict[str, bool] = {}
         self.sustainability_score = 0.0
         self.helium_tracker = None
@@ -1401,425 +1449,459 @@ class UnifiedMetabolicEcosystem:
         self.bio_available = False
 
         logger.info("=" * 70)
-        logger.info("Initializing Unified Metabolic Ecosystem v6.2.0")
+        logger.info("Initializing Unified Metabolic Ecosystem v6.3.0")
         logger.info(f"  Config: {self.config}")
         logger.info("=" * 70)
 
-        # Step 1: Initialize Bio-Inspired Core
-        if config.enable_bio_inspired and BIO_INSPIRED_AVAILABLE:
-            try:
-                from enhancements.bio_inspired import BioInspiredGreenCore
-                self.bio_core = BioInspiredGreenCore()
-                self.bio_available = True
-                self.initialization_status['bio_inspired_core'] = True
-                logger.info("[BIO] Bio-Inspired Core initialized")
-            except Exception as e:
-                logger.error(f"[BIO] Failed to initialize Bio-Inspired Core: {e}")
+        # Launch async initialization
+        self._init_task = asyncio.create_task(self._async_init())
+
+    async def _async_init(self):
+        """Async initialization of all components."""
+        try:
+            # Step 1: Initialize Bio-Inspired Core
+            if self.config.enable_bio_inspired and BIO_INSPIRED_AVAILABLE:
+                try:
+                    from enhancements.bio_inspired import BioInspiredGreenCore
+                    self.bio_core = BioInspiredGreenCore()
+                    self.bio_available = True
+                    self.initialization_status['bio_inspired_core'] = True
+                    logger.info("[BIO] Bio-Inspired Core initialized")
+                except Exception as e:
+                    logger.error(f"[BIO] Failed to initialize Bio-Inspired Core: {e}")
+                    self.initialization_status['bio_inspired_core'] = False
+            else:
+                logger.info("[BIO] Bio-inspired architecture disabled or unavailable")
                 self.initialization_status['bio_inspired_core'] = False
-        else:
-            logger.info("[BIO] Bio-inspired architecture disabled or unavailable")
-            self.initialization_status['bio_inspired_core'] = False
 
-        # Step 2: Initialize Expert Registry
-        try:
-            self.registry = ExpertRegistry(
-                enable_genetics=self.bio_available,
-                enable_evolution=self.bio_available,
-                enable_ecosystem=self.bio_available
-            )
-            if self.bio_available:
-                self.registry.inject_bio_core(self.bio_core)
-            self.initialization_status['expert_registry'] = True
-            logger.info("[REGISTRY] Expert Registry initialized")
-        except Exception as e:
-            logger.error(f"[REGISTRY] Failed to initialize Expert Registry: {e}")
-            self.initialization_status['expert_registry'] = False
-            raise
-
-        # Step 3: Initialize Gating Network
-        try:
-            from .gating_network import MoEGatingNetwork, GatingContext
-            self.gating_network = MoEGatingNetwork(
-                num_experts=5 + (1 if config.enable_quantum else 0) + (1 if config.enable_helium else 0),
-                enable_bio_integration=self.bio_available
-            )
-            if self.bio_available:
-                self.gating_network.inject_bio_core(self.bio_core)
-            self.initialization_status['gating_network'] = True
-            logger.info("[GATING] Gating Network initialized")
-        except Exception as e:
-            logger.error(f"[GATING] Failed to initialize Gating Network: {e}")
-            self.initialization_status['gating_network'] = False
-            raise
-
-        # Step 4: Initialize Expert Router
-        try:
-            self.router = ExpertRouter(
-                enable_quantum=config.enable_quantum,
-                enable_signal_transduction=self.bio_available,
-                enable_allosteric=self.bio_available,
-                enable_metabolic_pathways=self.bio_available
-            )
-            self.router.gating_network = self.gating_network
-            if self.bio_available:
-                self.router.inject_bio_core(self.bio_core)
-            self.initialization_status['expert_router'] = True
-            logger.info("[ROUTER] Expert Router initialized")
-        except Exception as e:
-            logger.error(f"[ROUTER] Failed to initialize Expert Router: {e}")
-            self.initialization_status['expert_router'] = False
-            raise
-
-        # Step 5: Initialize Metabolic Experts
-        self.experts: Dict[str, Any] = {}
-        try:
-            from .experts.energy_expert import EnergyExpert
-            self.experts['energy'] = EnergyExpert(enable_bio_integration=self.bio_available)
-            if self.bio_available:
-                self.experts['energy'].inject_bio_core(self.bio_core)
-            logger.info("[EXPERT] Energy Expert initialized")
-        except Exception as e:
-            logger.error(f"[EXPERT] Energy Expert failed: {e}")
-
-        try:
-            from .experts.data_expert import DataExpert
-            self.experts['data'] = DataExpert(enable_bio_integration=self.bio_available)
-            if self.bio_available:
-                self.experts['data'].inject_bio_core(self.bio_core)
-            logger.info("[EXPERT] Data Expert initialized")
-        except Exception as e:
-            logger.error(f"[EXPERT] Data Expert failed: {e}")
-
-        try:
-            from .experts.iot_expert import IoTExpert
-            self.experts['iot'] = IoTExpert(enable_bio_integration=self.bio_available)
-            if self.bio_available:
-                self.experts['iot'].inject_bio_core(self.bio_core)
-            logger.info("[EXPERT] IoT Expert initialized")
-        except Exception as e:
-            logger.error(f"[EXPERT] IoT Expert failed: {e}")
-
-        if config.enable_quantum and QUANTUM_AVAILABLE:
+            # Step 2: Initialize Expert Registry
             try:
-                from .experts.quantum_expert import QuantumExpert
-                self.experts['quantum'] = QuantumExpert()
-                logger.info("[EXPERT] Quantum Expert initialized")
+                self.registry = ExpertRegistry(
+                    enable_genetics=self.bio_available,
+                    enable_evolution=self.bio_available,
+                    enable_ecosystem=self.bio_available
+                )
+                if self.bio_available:
+                    self.registry.inject_bio_core(self.bio_core)
+                self.initialization_status['expert_registry'] = True
+                logger.info("[REGISTRY] Expert Registry initialized")
             except Exception as e:
-                logger.error(f"[EXPERT] Quantum Expert failed: {e}")
+                logger.error(f"[REGISTRY] Failed to initialize Expert Registry: {e}")
+                self.initialization_status['expert_registry'] = False
+                raise
 
-        if config.enable_helium and HELIUM_AVAILABLE:
+            # Step 3: Initialize Gating Network
             try:
-                from .experts.helium_expert import HeliumExpert
-                self.experts['helium'] = HeliumExpert()
-                logger.info("[EXPERT] Helium Expert initialized")
-            except Exception as e:
-                logger.error(f"[EXPERT] Helium Expert failed: {e}")
-
-        for expert_id, expert in self.experts.items():
-            try:
-                if hasattr(expert, 'profile'):
-                    self.registry.register_expert(expert.profile, validate=False, auto_certify=True)
-            except Exception as e:
-                logger.warning(f"[REGISTRY] Failed to register {expert_id}: {e}")
-        self.initialization_status['experts'] = len(self.experts) > 0
-        logger.info(f"[EXPERTS] {len(self.experts)} metabolic experts initialized")
-
-        # Step 6: Wire Router and Gating Network
-        for idx, (expert_id, expert) in enumerate(self.experts.items()):
-            self.router.expert_index_map[idx] = expert_id
-            self.router.experts[expert_id] = expert
-            self.router.circuit_breakers[expert_id] = ExpertCircuitBreaker(expert_id=expert_id)
-        for idx, expert_id in self.router.expert_index_map.items():
-            self.gating_network.expert_index_map[idx] = expert_id
-
-        # Step 7: Advanced Modules (if available)
-        self.evolving_gates = None
-        self.federated = None
-        self.cross_region = None
-        if config.enable_evolving_gates and EVOLVING_GATES_AVAILABLE:
-            try:
-                from .advanced.self_evolving_gates import EnhancedSelfEvolvingGate
-                self.evolving_gates = EnhancedSelfEvolvingGate(
-                    input_dim=GatingContext().feature_dim,
-                    num_experts=len(self.experts),
+                from .gating_network import MoEGatingNetwork, GatingContext
+                self.gating_network = MoEGatingNetwork(
+                    num_experts=5 + (1 if self.config.enable_quantum else 0) + (1 if self.config.enable_helium else 0),
                     enable_bio_integration=self.bio_available
                 )
                 if self.bio_available:
-                    self.evolving_gates.inject_bio_core(self.bio_core)
-                self.initialization_status['evolving_gates'] = True
-                logger.info("[EVOLVE] Self-Evolving Gates initialized")
+                    self.gating_network.inject_bio_core(self.bio_core)
+                self.initialization_status['gating_network'] = True
+                logger.info("[GATING] Gating Network initialized")
             except Exception as e:
-                logger.error(f"[EVOLVE] Failed to initialize Self-Evolving Gates: {e}")
-                self.initialization_status['evolving_gates'] = False
+                logger.error(f"[GATING] Failed to initialize Gating Network: {e}")
+                self.initialization_status['gating_network'] = False
+                raise
 
-        if config.enable_federated and FEDERATED_AVAILABLE:
+            # Step 4: Initialize Expert Router
             try:
-                from .advanced.federated_experts import EnhancedFederatedOrchestrator
-                self.federated = EnhancedFederatedOrchestrator(enable_bio_integration=self.bio_available)
+                self.router = ExpertRouter(
+                    enable_quantum=self.config.enable_quantum,
+                    enable_signal_transduction=self.bio_available,
+                    enable_allosteric=self.bio_available,
+                    enable_metabolic_pathways=self.bio_available
+                )
+                self.router.gating_network = self.gating_network
                 if self.bio_available:
-                    self.federated.inject_bio_core(self.bio_core)
-                self.initialization_status['federated'] = True
-                logger.info("[FEDERATED] Federated Learning initialized")
+                    self.router.inject_bio_core(self.bio_core)
+                self.initialization_status['expert_router'] = True
+                logger.info("[ROUTER] Expert Router initialized")
             except Exception as e:
-                logger.error(f"[FEDERATED] Failed to initialize Federated Learning: {e}")
-                self.initialization_status['federated'] = False
+                logger.error(f"[ROUTER] Failed to initialize Expert Router: {e}")
+                self.initialization_status['expert_router'] = False
+                raise
 
-        if config.enable_cross_region and CROSS_REGION_AVAILABLE:
+            # Step 5: Initialize Metabolic Experts
+            self.experts: Dict[str, Any] = {}
             try:
-                from .advanced.cross_region_federation import CrossRegionFederationOptimizer
-                self.cross_region = CrossRegionFederationOptimizer(enable_bio_integration=self.bio_available)
+                from .experts.energy_expert import EnergyExpert
+                self.experts['energy'] = EnergyExpert(enable_bio_integration=self.bio_available)
                 if self.bio_available:
-                    self.cross_region.inject_bio_core(self.bio_core)
-                self.initialization_status['cross_region'] = True
-                logger.info("[CROSS-REGION] Cross-Region Federation initialized")
+                    self.experts['energy'].inject_bio_core(self.bio_core)
+                logger.info("[EXPERT] Energy Expert initialized")
             except Exception as e:
-                logger.error(f"[CROSS-REGION] Failed to initialize Cross-Region Federation: {e}")
-                self.initialization_status['cross_region'] = False
+                logger.error(f"[EXPERT] Energy Expert failed: {e}")
 
-        # Step 8: Integration Layers
-        self.layer_integrator = None
-        self.work_integrator = None
-        self.quantum_limits = None
-        try:
-            from .integration.layer_integrator import EnhancedLayerIntegrator
-            self.layer_integrator = EnhancedLayerIntegrator(enable_bio_integration=self.bio_available)
-            if self.bio_available:
-                self.layer_integrator.inject_bio_core(self.bio_core)
-            self.initialization_status['layer_integrator'] = True
-            logger.info("[LAYER] Layer Integrator initialized")
-        except Exception as e:
-            logger.error(f"[LAYER] Failed to initialize Layer Integrator: {e}")
-            self.initialization_status['layer_integrator'] = False
-
-        try:
-            from .integration.enhanced_work_integration import EnhancedWorkIntegrator
-            self.work_integrator = EnhancedWorkIntegrator(
-                expert_router=self.router,
-                enable_bio_integration=self.bio_available
-            )
-            if self.bio_available:
-                self.work_integrator.inject_bio_core(self.bio_core)
-            self.initialization_status['work_integrator'] = True
-            logger.info("[WORK] Work Integrator initialized")
-        except Exception as e:
-            logger.error(f"[WORK] Failed to initialize Work Integrator: {e}")
-            self.initialization_status['work_integrator'] = False
-
-        try:
-            from .integration.quantum_limit_integration import QuantumLimitGraphIntegrator
-            self.quantum_limits = QuantumLimitGraphIntegrator(enable_bio_integration=self.bio_available)
-            if self.bio_available:
-                self.quantum_limits.inject_bio_core(self.bio_core)
-            self.initialization_status['quantum_limits'] = True
-            logger.info("[QUANTUM] Quantum Limit Integrator initialized")
-        except Exception as e:
-            logger.error(f"[QUANTUM] Failed to initialize Quantum Limit Integrator: {e}")
-            self.initialization_status['quantum_limits'] = False
-
-        # Step 9: Monitoring
-        try:
-            from .monitoring.expert_metrics import ExpertMetricsCollector
-            self.metrics = ExpertMetricsCollector(enable_bio_integration=self.bio_available)
-            if self.bio_available:
-                self.metrics.inject_bio_core(self.bio_core)
-            self.initialization_status['metrics'] = True
-            logger.info("[METRICS] Expert Metrics initialized")
-        except Exception as e:
-            logger.error(f"[METRICS] Failed to initialize Expert Metrics: {e}")
-            self.initialization_status['metrics'] = False
-
-        # Step 10: Sustainability Modules
-        self.carbon_manager = None
-        self.circular_manager = None
-        self.offset_verifier = None
-        self.biodiversity = None
-        if SEQUESTRATION_AVAILABLE:
             try:
-                from .sustainability.carbon_sequestration import CarbonSequestrationManager
-                self.carbon_manager = CarbonSequestrationManager()
-                self.initialization_status['carbon_sequestration'] = True
-                logger.info("[SUSTAINABILITY] Carbon Sequestration Manager initialized")
+                from .experts.data_expert import DataExpert
+                self.experts['data'] = DataExpert(enable_bio_integration=self.bio_available)
+                if self.bio_available:
+                    self.experts['data'].inject_bio_core(self.bio_core)
+                logger.info("[EXPERT] Data Expert initialized")
             except Exception as e:
-                logger.error(f"[SUSTAINABILITY] Carbon Sequestration failed: {e}")
-                self.initialization_status['carbon_sequestration'] = False
-        if CIRCULAR_AVAILABLE:
-            try:
-                from .sustainability.circular_computing import CircularComputingManager
-                self.circular_manager = CircularComputingManager()
-                self.initialization_status['circular_computing'] = True
-                logger.info("[SUSTAINABILITY] Circular Computing Manager initialized")
-            except Exception as e:
-                logger.error(f"[SUSTAINABILITY] Circular Computing failed: {e}")
-                self.initialization_status['circular_computing'] = False
-        if OFFSET_AVAILABLE:
-            try:
-                from .sustainability.carbon_offset_verification import AutomatedCarbonOffsetVerification
-                self.offset_verifier = AutomatedCarbonOffsetVerification()
-                self.initialization_status['carbon_offset'] = True
-                logger.info("[SUSTAINABILITY] Carbon Offset Verification initialized")
-            except Exception as e:
-                logger.error(f"[SUSTAINABILITY] Carbon Offset failed: {e}")
-                self.initialization_status['carbon_offset'] = False
-        if BIODIVERSITY_AVAILABLE:
-            try:
-                from .sustainability.biodiversity_impact import BiodiversityImpactAssessor
-                self.biodiversity = BiodiversityImpactAssessor()
-                self.initialization_status['biodiversity'] = True
-                logger.info("[SUSTAINABILITY] Biodiversity Impact Assessor initialized")
-            except Exception as e:
-                logger.error(f"[SUSTAINABILITY] Biodiversity failed: {e}")
-                self.initialization_status['biodiversity'] = False
+                logger.error(f"[EXPERT] Data Expert failed: {e}")
 
-        # Step 11: Bio-Integrator
-        try:
-            self.bio_integrator = EnhancedBioInspiredIntegrator(self.bio_core)
-            components_to_register = [
-                ('registry', self.registry),
-                ('gating_network', self.gating_network),
-                ('router', self.router),
-                ('metrics', self.metrics),
-                ('work_integrator', self.work_integrator),
-                ('layer_integrator', self.layer_integrator),
-                ('quantum_limits', self.quantum_limits)
-            ]
-            for name, comp in components_to_register:
-                if comp:
-                    self.bio_integrator.register_component(name, comp)
-            self.initialization_status['bio_integrator'] = True
-            logger.info("[BIO-INTEGRATOR] Enhanced Bio-Inspired Integrator initialized")
+            try:
+                from .experts.iot_expert import IoTExpert
+                self.experts['iot'] = IoTExpert(enable_bio_integration=self.bio_available)
+                if self.bio_available:
+                    self.experts['iot'].inject_bio_core(self.bio_core)
+                logger.info("[EXPERT] IoT Expert initialized")
+            except Exception as e:
+                logger.error(f"[EXPERT] IoT Expert failed: {e}")
+
+            if self.config.enable_quantum and QUANTUM_AVAILABLE:
+                try:
+                    from .experts.quantum_expert import QuantumExpert
+                    self.experts['quantum'] = QuantumExpert()
+                    logger.info("[EXPERT] Quantum Expert initialized")
+                except Exception as e:
+                    logger.error(f"[EXPERT] Quantum Expert failed: {e}")
+
+            if self.config.enable_helium and HELIUM_AVAILABLE:
+                try:
+                    from .experts.helium_expert import HeliumExpert
+                    self.experts['helium'] = HeliumExpert()
+                    logger.info("[EXPERT] Helium Expert initialized")
+                except Exception as e:
+                    logger.error(f"[EXPERT] Helium Expert failed: {e}")
+
+            for expert_id, expert in self.experts.items():
+                try:
+                    if hasattr(expert, 'profile'):
+                        self.registry.register_expert(expert.profile, validate=False, auto_certify=True)
+                except Exception as e:
+                    logger.warning(f"[REGISTRY] Failed to register {expert_id}: {e}")
+            self.initialization_status['experts'] = len(self.experts) > 0
+            logger.info(f"[EXPERTS] {len(self.experts)} metabolic experts initialized")
+
+            # Step 6: Wire Router and Gating Network
+            for idx, (expert_id, expert) in enumerate(self.experts.items()):
+                self.router.expert_index_map[idx] = expert_id
+                self.router.experts[expert_id] = expert
+                self.router.circuit_breakers[expert_id] = ExpertCircuitBreaker(expert_id=expert_id)
+            for idx, expert_id in self.router.expert_index_map.items():
+                self.gating_network.expert_index_map[idx] = expert_id
+
+            # Step 7: Advanced Modules (if available)
+            self.evolving_gates = None
+            self.federated = None
+            self.cross_region = None
+            if self.config.enable_evolving_gates and EVOLVING_GATES_AVAILABLE:
+                try:
+                    from .advanced.self_evolving_gates import EnhancedSelfEvolvingGate
+                    self.evolving_gates = EnhancedSelfEvolvingGate(
+                        input_dim=GatingContext().feature_dim,
+                        num_experts=len(self.experts),
+                        enable_bio_integration=self.bio_available
+                    )
+                    if self.bio_available:
+                        self.evolving_gates.inject_bio_core(self.bio_core)
+                    self.initialization_status['evolving_gates'] = True
+                    logger.info("[EVOLVE] Self-Evolving Gates initialized")
+                except Exception as e:
+                    logger.error(f"[EVOLVE] Failed to initialize Self-Evolving Gates: {e}")
+                    self.initialization_status['evolving_gates'] = False
+
+            if self.config.enable_federated and FEDERATED_AVAILABLE:
+                try:
+                    from .advanced.federated_experts import EnhancedFederatedOrchestrator
+                    self.federated = EnhancedFederatedOrchestrator(enable_bio_integration=self.bio_available)
+                    if self.bio_available:
+                        self.federated.inject_bio_core(self.bio_core)
+                    self.initialization_status['federated'] = True
+                    logger.info("[FEDERATED] Federated Learning initialized")
+                except Exception as e:
+                    logger.error(f"[FEDERATED] Failed to initialize Federated Learning: {e}")
+                    self.initialization_status['federated'] = False
+
+            if self.config.enable_cross_region and CROSS_REGION_AVAILABLE:
+                try:
+                    from .advanced.cross_region_federation import CrossRegionFederationOptimizer
+                    self.cross_region = CrossRegionFederationOptimizer(enable_bio_integration=self.bio_available)
+                    if self.bio_available:
+                        self.cross_region.inject_bio_core(self.bio_core)
+                    self.initialization_status['cross_region'] = True
+                    logger.info("[CROSS-REGION] Cross-Region Federation initialized")
+                except Exception as e:
+                    logger.error(f"[CROSS-REGION] Failed to initialize Cross-Region Federation: {e}")
+                    self.initialization_status['cross_region'] = False
+
+            # Step 8: Integration Layers
+            self.layer_integrator = None
+            self.work_integrator = None
+            self.quantum_limits = None
+            try:
+                from .integration.layer_integrator import EnhancedLayerIntegrator
+                self.layer_integrator = EnhancedLayerIntegrator(enable_bio_integration=self.bio_available)
+                if self.bio_available:
+                    self.layer_integrator.inject_bio_core(self.bio_core)
+                self.initialization_status['layer_integrator'] = True
+                logger.info("[LAYER] Layer Integrator initialized")
+            except Exception as e:
+                logger.error(f"[LAYER] Failed to initialize Layer Integrator: {e}")
+                self.initialization_status['layer_integrator'] = False
+
+            try:
+                from .integration.enhanced_work_integration import EnhancedWorkIntegrator
+                self.work_integrator = EnhancedWorkIntegrator(
+                    expert_router=self.router,
+                    enable_bio_integration=self.bio_available
+                )
+                if self.bio_available:
+                    self.work_integrator.inject_bio_core(self.bio_core)
+                self.initialization_status['work_integrator'] = True
+                logger.info("[WORK] Work Integrator initialized")
+            except Exception as e:
+                logger.error(f"[WORK] Failed to initialize Work Integrator: {e}")
+                self.initialization_status['work_integrator'] = False
+
+            try:
+                from .integration.quantum_limit_integration import QuantumLimitGraphIntegrator
+                self.quantum_limits = QuantumLimitGraphIntegrator(enable_bio_integration=self.bio_available)
+                if self.bio_available:
+                    self.quantum_limits.inject_bio_core(self.bio_core)
+                self.initialization_status['quantum_limits'] = True
+                logger.info("[QUANTUM] Quantum Limit Integrator initialized")
+            except Exception as e:
+                logger.error(f"[QUANTUM] Failed to initialize Quantum Limit Integrator: {e}")
+                self.initialization_status['quantum_limits'] = False
+
+            # Step 9: Monitoring
+            try:
+                from .monitoring.expert_metrics import ExpertMetricsCollector
+                self.metrics = ExpertMetricsCollector(enable_bio_integration=self.bio_available)
+                if self.bio_available:
+                    self.metrics.inject_bio_core(self.bio_core)
+                self.initialization_status['metrics'] = True
+                logger.info("[METRICS] Expert Metrics initialized")
+            except Exception as e:
+                logger.error(f"[METRICS] Failed to initialize Expert Metrics: {e}")
+                self.initialization_status['metrics'] = False
+
+            # Step 10: Sustainability Modules
+            self.carbon_manager = None
+            self.circular_manager = None
+            self.offset_verifier = None
+            self.biodiversity = None
+            if SEQUESTRATION_AVAILABLE:
+                try:
+                    from .sustainability.carbon_sequestration import CarbonSequestrationManager
+                    self.carbon_manager = CarbonSequestrationManager()
+                    self.initialization_status['carbon_sequestration'] = True
+                    logger.info("[SUSTAINABILITY] Carbon Sequestration Manager initialized")
+                except Exception as e:
+                    logger.error(f"[SUSTAINABILITY] Carbon Sequestration failed: {e}")
+                    self.initialization_status['carbon_sequestration'] = False
+            if CIRCULAR_AVAILABLE:
+                try:
+                    from .sustainability.circular_computing import CircularComputingManager
+                    self.circular_manager = CircularComputingManager()
+                    self.initialization_status['circular_computing'] = True
+                    logger.info("[SUSTAINABILITY] Circular Computing Manager initialized")
+                except Exception as e:
+                    logger.error(f"[SUSTAINABILITY] Circular Computing failed: {e}")
+                    self.initialization_status['circular_computing'] = False
+            if OFFSET_AVAILABLE:
+                try:
+                    from .sustainability.carbon_offset_verification import AutomatedCarbonOffsetVerification
+                    self.offset_verifier = AutomatedCarbonOffsetVerification()
+                    self.initialization_status['carbon_offset'] = True
+                    logger.info("[SUSTAINABILITY] Carbon Offset Verification initialized")
+                except Exception as e:
+                    logger.error(f"[SUSTAINABILITY] Carbon Offset failed: {e}")
+                    self.initialization_status['carbon_offset'] = False
+            if BIODIVERSITY_AVAILABLE:
+                try:
+                    from .sustainability.biodiversity_impact import BiodiversityImpactAssessor
+                    self.biodiversity = BiodiversityImpactAssessor()
+                    self.initialization_status['biodiversity'] = True
+                    logger.info("[SUSTAINABILITY] Biodiversity Impact Assessor initialized")
+                except Exception as e:
+                    logger.error(f"[SUSTAINABILITY] Biodiversity failed: {e}")
+                    self.initialization_status['biodiversity'] = False
+
+            # Step 11: Bio-Integrator
+            self.bio_integrator = None
+            try:
+                from .integration.bio_integrator import EnhancedBioInspiredIntegrator
+                self.bio_integrator = EnhancedBioInspiredIntegrator(self.bio_core)
+                components_to_register = [
+                    ('registry', self.registry),
+                    ('gating_network', self.gating_network),
+                    ('router', self.router),
+                    ('metrics', self.metrics),
+                    ('work_integrator', self.work_integrator),
+                    ('layer_integrator', self.layer_integrator),
+                    ('quantum_limits', self.quantum_limits)
+                ]
+                for name, comp in components_to_register:
+                    if comp:
+                        self.bio_integrator.register_component(name, comp)
+                self.initialization_status['bio_integrator'] = True
+                logger.info("[BIO-INTEGRATOR] Enhanced Bio-Inspired Integrator initialized")
+            except Exception as e:
+                logger.error(f"[BIO-INTEGRATOR] Failed to initialize Bio-Integrator: {e}")
+                self.initialization_status['bio_integrator'] = False
+
+            # Step 12: New Systems (Health, Self-Healing, Alerts, Reconfig, Persistence)
+            if self.config.enable_health_checks:
+                self.health_system = HealthCheckSystem(self.config)
+                self.initialization_status['health_checks'] = True
+                for name, comp in [
+                    ('expert_registry', self.registry),
+                    ('gating_network', self.gating_network),
+                    ('expert_router', self.router),
+                    ('metrics', self.metrics),
+                    ('work_integrator', self.work_integrator),
+                    ('layer_integrator', self.layer_integrator),
+                    ('quantum_limits', self.quantum_limits)
+                ]:
+                    if comp:
+                        self.health_system.register_component(name, comp)
+                logger.info("[HEALTH] Health Check System initialized")
+            else:
+                self.initialization_status['health_checks'] = False
+
+            if self.config.enable_self_healing:
+                self.self_healing = SelfHealingSystem(self.config, self.health_system)
+                self.initialization_status['self_healing'] = True
+                self.self_healing.register_recovery_handler('expert_router', self._recover_router)
+                logger.info("[SELF-HEALING] Self-Healing System initialized")
+            else:
+                self.initialization_status['self_healing'] = False
+
+            if self.config.enable_alert_escalation:
+                self.alert_system = AlertEscalationSystem(self.config)
+                self.initialization_status['alert_escalation'] = True
+                logger.info("[ALERT] Alert Escalation System initialized")
+            else:
+                self.initialization_status['alert_escalation'] = False
+
+            if self.config.enable_dynamic_reconfig:
+                self.reconfig_system = DynamicReconfigurationSystem(self.config)
+                self.initialization_status['dynamic_reconfig'] = True
+                logger.info("[RECONFIG] Dynamic Reconfiguration System initialized")
+            else:
+                self.initialization_status['dynamic_reconfig'] = False
+
+            if self.config.enable_persistence:
+                self.persistence = EcosystemPersistenceManager(self.config)
+                self.initialization_status['persistence'] = True
+                logger.info("[PERSISTENCE] Ecosystem Persistence Manager initialized")
+                await self._load_persistence()
+            else:
+                self.initialization_status['persistence'] = False
+
+            # Step 13: Sustainability Dashboard
+            if self.config.enable_sustainability_dashboard:
+                self.sustainability_dashboard = UnifiedSustainabilityDashboard(self)
+                self.initialization_status['sustainability_dashboard'] = True
+                logger.info("[DASHBOARD] Unified Sustainability Dashboard initialized")
+            else:
+                self.initialization_status['sustainability_dashboard'] = False
+
+            # Step 14: Predictive Maintenance
+            if self.config.enable_predictive_maintenance:
+                self.predictive_maintenance = PredictiveMaintenanceIntegrator(self)
+                self.initialization_status['predictive_maintenance'] = True
+                logger.info("[PREDICTIVE] Predictive Maintenance Integrator initialized")
+            else:
+                self.initialization_status['predictive_maintenance'] = False
+
+            # Step 15: Wire Router Metrics
+            if hasattr(self.router, 'metrics_collector'):
+                self.router.metrics_collector = self.metrics
+
+            # Step 16: Digital Twin and Sustainability Engine (async)
+            if self.config.enable_digital_twin and DIGITAL_TWIN_AVAILABLE:
+                try:
+                    from enhancements.advanced.system_digital_twin import SystemDigitalTwin, DigitalTwinConfig
+                    twin_config = DigitalTwinConfig(
+                        time_horizon_years=self.config.twin_time_horizon_years,
+                        n_simulations=self.config.twin_n_simulations,
+                        confidence_level=self.config.twin_confidence
+                    )
+                    self.digital_twin = SystemDigitalTwin(twin_config)
+                    self.digital_twin.inject_modules(
+                        quantum_limits=self.quantum_limits,
+                        biodiversity=self.biodiversity,
+                        expert_registry=self.registry,
+                        circular_manager=self.circular_manager,
+                        carbon_manager=self.carbon_manager,
+                        helium_tracker=self.helium_tracker
+                    )
+                    self.initialization_status['digital_twin'] = True
+                    logger.info("[DIGITAL-TWIN] System Digital Twin initialized")
+                except Exception as e:
+                    logger.error(f"[DIGITAL-TWIN] Failed to initialize Digital Twin: {e}")
+                    self.initialization_status['digital_twin'] = False
+
+            if self.config.enable_unified_sustainability and SUSTAINABILITY_ENGINE_AVAILABLE:
+                try:
+                    from enhancements.sustainability.unified_sustainability_engine import UnifiedSustainabilityEngine
+                    self.sustainability_engine = UnifiedSustainabilityEngine()
+                    self.sustainability_engine.inject_modules(
+                        carbon_manager=self.carbon_manager,
+                        helium_tracker=self.helium_tracker,
+                        circular_manager=self.circular_manager,
+                        biodiversity=self.biodiversity,
+                        expert_registry=self.registry,
+                        quantum_limits=self.quantum_limits
+                    )
+                    self.initialization_status['sustainability_engine'] = True
+                    logger.info("[SUSTAINABILITY-ENGINE] Unified Sustainability Engine initialized")
+                    score = await self.sustainability_engine.update_sustainability_score()
+                    self.sustainability_score = score.total_score
+                    logger.info(f"[SUSTAINABILITY] Initial score: {self.sustainability_score:.3f}")
+                except Exception as e:
+                    logger.error(f"[SUSTAINABILITY-ENGINE] Failed to initialize Sustainability Engine: {e}")
+                    self.initialization_status['sustainability_engine'] = False
+
+            # Mark as ready
+            async with self._initialization_lock:
+                self._ready = True
+            logger.info("=" * 70)
+            logger.info("Unified Metabolic Ecosystem Initialization Complete")
+            logger.info(f"  Bio-Inspired: {self.bio_available}")
+            logger.info(f"  Experts: {len(self.experts)}")
+            logger.info(f"  Status: {sum(self.initialization_status.values())}/{len(self.initialization_status)} components")
+            logger.info("=" * 70)
+
         except Exception as e:
-            logger.error(f"[BIO-INTEGRATOR] Failed to initialize Bio-Integrator: {e}")
-            self.initialization_status['bio_integrator'] = False
-
-        # Step 12: New Systems (Health, Self-Healing, Alerts, Reconfig, Persistence)
-        if config.enable_health_checks:
-            self.health_system = HealthCheckSystem(config)
-            self.initialization_status['health_checks'] = True
-            for name, comp in [
-                ('expert_registry', self.registry),
-                ('gating_network', self.gating_network),
-                ('expert_router', self.router),
-                ('metrics', self.metrics),
-                ('work_integrator', self.work_integrator),
-                ('layer_integrator', self.layer_integrator),
-                ('quantum_limits', self.quantum_limits)
-            ]:
-                if comp:
-                    self.health_system.register_component(name, comp)
-            logger.info("[HEALTH] Health Check System initialized")
-        else:
-            self.initialization_status['health_checks'] = False
-
-        if config.enable_self_healing:
-            self.self_healing = SelfHealingSystem(config, self.health_system)
-            self.initialization_status['self_healing'] = True
-            self.self_healing.register_recovery_handler('expert_router', self._recover_router)
-            logger.info("[SELF-HEALING] Self-Healing System initialized")
-        else:
-            self.initialization_status['self_healing'] = False
-
-        if config.enable_alert_escalation:
-            self.alert_system = AlertEscalationSystem(config)
-            self.initialization_status['alert_escalation'] = True
-            logger.info("[ALERT] Alert Escalation System initialized")
-        else:
-            self.initialization_status['alert_escalation'] = False
-
-        if config.enable_dynamic_reconfig:
-            self.reconfig_system = DynamicReconfigurationSystem(config)
-            self.initialization_status['dynamic_reconfig'] = True
-            logger.info("[RECONFIG] Dynamic Reconfiguration System initialized")
-        else:
-            self.initialization_status['dynamic_reconfig'] = False
-
-        if config.enable_persistence:
-            self.persistence = EcosystemPersistenceManager(config)
-            self.initialization_status['persistence'] = True
-            logger.info("[PERSISTENCE] Ecosystem Persistence Manager initialized")
-            asyncio.create_task(self._load_persistence())
-        else:
-            self.initialization_status['persistence'] = False
-
-        # Step 13: Sustainability Dashboard
-        if config.enable_sustainability_dashboard:
-            self.sustainability_dashboard = UnifiedSustainabilityDashboard(self)
-            self.initialization_status['sustainability_dashboard'] = True
-            logger.info("[DASHBOARD] Unified Sustainability Dashboard initialized")
-        else:
-            self.initialization_status['sustainability_dashboard'] = False
-
-        # Step 14: Predictive Maintenance
-        if config.enable_predictive_maintenance:
-            self.predictive_maintenance = PredictiveMaintenanceIntegrator(self)
-            self.initialization_status['predictive_maintenance'] = True
-            logger.info("[PREDICTIVE] Predictive Maintenance Integrator initialized")
-        else:
-            self.initialization_status['predictive_maintenance'] = False
-
-        # Step 15: Wire Router Metrics
-        if hasattr(self.router, 'metrics_collector'):
-            self.router.metrics_collector = self.metrics
-
-        # Step 16: Async init for Digital Twin and Sustainability Engine
-        self._init_digital_twin_and_sustainability_task = asyncio.create_task(
-            self._async_init_digital_twin_and_sustainability()
-        )
-
-        logger.info("=" * 70)
-        logger.info("Unified Metabolic Ecosystem Initialization Complete")
-        logger.info(f"  Bio-Inspired: {self.bio_available}")
-        logger.info(f"  Experts: {len(self.experts)}")
-        logger.info(f"  Status: {sum(self.initialization_status.values())}/{len(self.initialization_status)} components")
-        logger.info("=" * 70)
+            logger.error(f"Initialization failed: {e}", exc_info=True)
+            async with self._initialization_lock:
+                self._init_exception = e
+                self._ready = False
+            raise
 
     # --------------------------------------------------------------------------
-    # Async Initialization for Digital Twin and Sustainability Engine
+    # Initialization Status and Waiting
     # --------------------------------------------------------------------------
 
-    async def _async_init_digital_twin_and_sustainability(self):
-        if self.config.enable_digital_twin and DIGITAL_TWIN_AVAILABLE:
-            try:
-                from enhancements.advanced.system_digital_twin import SystemDigitalTwin, DigitalTwinConfig
-                twin_config = DigitalTwinConfig(
-                    time_horizon_years=self.config.twin_time_horizon_years,
-                    n_simulations=self.config.twin_n_simulations,
-                    confidence_level=self.config.twin_confidence
-                )
-                self.digital_twin = SystemDigitalTwin(twin_config)
-                self.digital_twin.inject_modules(
-                    quantum_limits=self.quantum_limits,
-                    biodiversity=self.biodiversity,
-                    expert_registry=self.registry,
-                    circular_manager=self.circular_manager,
-                    carbon_manager=self.carbon_manager,
-                    helium_tracker=self.helium_tracker
-                )
-                self.initialization_status['digital_twin'] = True
-                logger.info("[DIGITAL-TWIN] System Digital Twin initialized")
-            except Exception as e:
-                logger.error(f"[DIGITAL-TWIN] Failed to initialize Digital Twin: {e}")
-                self.initialization_status['digital_twin'] = False
+    async def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait until the ecosystem is fully initialized.
+        Returns True if ready, False if timeout or initialization failed.
+        Raises exception if initialization failed.
+        """
+        try:
+            if self._init_task:
+                await asyncio.wait_for(self._init_task, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error("Initialization timed out")
+            return False
+        async with self._initialization_lock:
+            if self._init_exception:
+                raise self._init_exception
+            return self._ready
 
-        if self.config.enable_unified_sustainability and SUSTAINABILITY_ENGINE_AVAILABLE:
-            try:
-                from enhancements.sustainability.unified_sustainability_engine import UnifiedSustainabilityEngine
-                self.sustainability_engine = UnifiedSustainabilityEngine()
-                self.sustainability_engine.inject_modules(
-                    carbon_manager=self.carbon_manager,
-                    helium_tracker=self.helium_tracker,
-                    circular_manager=self.circular_manager,
-                    biodiversity=self.biodiversity,
-                    expert_registry=self.registry,
-                    quantum_limits=self.quantum_limits
-                )
-                self.initialization_status['sustainability_engine'] = True
-                logger.info("[SUSTAINABILITY-ENGINE] Unified Sustainability Engine initialized")
-                score = await self.sustainability_engine.update_sustainability_score()
-                self.sustainability_score = score.total_score
-                logger.info(f"[SUSTAINABILITY] Initial score: {self.sustainability_score:.3f}")
-            except Exception as e:
-                logger.error(f"[SUSTAINABILITY-ENGINE] Failed to initialize Sustainability Engine: {e}")
-                self.initialization_status['sustainability_engine'] = False
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
 
     # --------------------------------------------------------------------------
     # Persistence Methods
@@ -1847,8 +1929,12 @@ class UnifiedMetabolicEcosystem:
         return True
 
     # --------------------------------------------------------------------------
-    # Public Methods
+    # Public Methods (require readiness check)
     # --------------------------------------------------------------------------
+
+    async def _ensure_ready(self):
+        if not self.is_ready:
+            raise RuntimeError("Ecosystem not fully initialized. Call wait_until_ready() first.")
 
     async def run_sustainability_scenario(
         self,
@@ -1856,6 +1942,7 @@ class UnifiedMetabolicEcosystem:
         parameters: Dict[str, Any],
         time_horizon_years: Optional[int] = None
     ) -> Dict[str, Any]:
+        await self._ensure_ready()
         if not self.config.enable_digital_twin or not self.digital_twin:
             return {'status': 'digital_twin_not_enabled'}
         from enhancements.advanced.system_digital_twin import SimulationScenario
@@ -1879,27 +1966,32 @@ class UnifiedMetabolicEcosystem:
         }
 
     async def get_twin_projections(self) -> Dict[str, Any]:
+        await self._ensure_ready()
         if not self.config.enable_digital_twin or not self.digital_twin:
             return {'status': 'digital_twin_not_enabled'}
         return await self.digital_twin.export_projections()
 
     async def get_sustainability_status(self) -> Dict[str, Any]:
+        await self._ensure_ready()
         if not self.config.enable_unified_sustainability or not self.sustainability_engine:
             return {'status': 'sustainability_engine_not_enabled'}
         return await self.sustainability_engine.get_sustainability_report()
 
     async def get_sustainability_score(self) -> float:
+        await self._ensure_ready()
         if not self.config.enable_unified_sustainability or not self.sustainability_engine:
             return self.sustainability_score
         return await self.sustainability_engine.get_current_score()
 
     async def get_sustainability_dimensions(self) -> Dict[str, Any]:
+        await self._ensure_ready()
         if not self.config.enable_unified_sustainability or not self.sustainability_engine:
             return {'status': 'sustainability_engine_not_enabled'}
         status = await self.sustainability_engine.get_sustainability_report()
         return status.get('dimensions', {})
 
     async def update_sustainability_score(self) -> float:
+        await self._ensure_ready()
         if not self.config.enable_unified_sustainability or not self.sustainability_engine:
             return self.sustainability_score
         score = await self.sustainability_engine.update_sustainability_score()
@@ -1914,6 +2006,8 @@ class UnifiedMetabolicEcosystem:
         """
         Process a task through the ecosystem, integrating digital twin and sustainability engine.
         """
+        await self._ensure_ready()
+
         # Rate limiting
         if not await self._rate_limiter.acquire():
             return {'success': False, 'error': 'Rate limit exceeded'}
@@ -1997,8 +2091,10 @@ class UnifiedMetabolicEcosystem:
     # --------------------------------------------------------------------------
 
     def get_ecosystem_status(self) -> Dict[str, Any]:
+        if not self.is_ready:
+            return {'status': 'not_initialized', 'initialization_status': self.initialization_status}
         status = {
-            'ecosystem_version': '6.2.0',
+            'ecosystem_version': '6.3.0',
             'bio_inspired_available': self.bio_available,
             'initialization_status': self.initialization_status,
             'expert_count': len(self.experts),
@@ -2089,11 +2185,13 @@ class UnifiedMetabolicEcosystem:
             logger.info(f"Health check added for component: {component_name}")
 
     async def get_health_status(self) -> Dict[str, Any]:
+        await self._ensure_ready()
         if self.health_system:
             return await self.health_system.get_system_health()
         return {'status': 'health_system_not_enabled'}
 
     async def get_alerts(self, active_only: bool = True) -> List[Dict]:
+        await self._ensure_ready()
         if self.alert_system:
             if active_only:
                 return await self.alert_system.get_active_alerts()
@@ -2101,11 +2199,13 @@ class UnifiedMetabolicEcosystem:
         return []
 
     async def resolve_alert(self, alert_id: str):
+        await self._ensure_ready()
         if self.alert_system:
             await self.alert_system.resolve_alert(alert_id)
             logger.info(f"Alert {alert_id} resolved")
 
     async def reconfigure_by_metrics(self, metrics: Dict[str, float]):
+        await self._ensure_ready()
         if not self.config.enable_dynamic_reconfig or not self.reconfig_system:
             return {'status': 'reconfiguration_not_enabled'}
         await self.reconfig_system.reconfigure_by_metrics(metrics)
@@ -2120,6 +2220,13 @@ class UnifiedMetabolicEcosystem:
 
     async def shutdown(self):
         logger.info("Shutting down Unified Metabolic Ecosystem...")
+        # Cancel initialization task if still running
+        if self._init_task and not self._init_task.done():
+            self._init_task.cancel()
+            try:
+                await self._init_task
+            except asyncio.CancelledError:
+                pass
         tasks = []
         if self.sustainability_dashboard:
             tasks.append(self.sustainability_dashboard.shutdown())
