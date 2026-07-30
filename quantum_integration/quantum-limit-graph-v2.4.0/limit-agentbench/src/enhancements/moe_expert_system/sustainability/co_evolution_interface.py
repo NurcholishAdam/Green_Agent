@@ -1,36 +1,23 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/co_evolution_engine.py
-# Enhanced version v4.0.0 – Full integration with bio‑inspired core, event‑driven, circuit breakers, self‑healing, and deep MoE/SEG integration
+# Enhanced version v5.0.0 – Refactored for maintainability, concurrency, and resilience
 
 """
-Enhanced Human-AI Co-Evolution Engine v4.0.0
-Complete green agent implementation with full bio‑inspired core integration.
-
-New Features:
-- Event-driven integration via core EventBroker (carbon, helium, alerts, config)
-- Circuit breakers for all external services
-- Self-healing and reactive alert handling
-- Configuration reload via events
-- Swarm coordination via SwarmCoordinator
-- Integration with TimeTickEngine and QuantumBridge
-- Integration with CostBenefitEngine and PredictiveAlertSystem
-- Workflow orchestration triggers on threshold breaches
-- Deep MoE and Self-Evolving Gate integration with rich context
-- Enhanced telemetry and health monitoring
+Enhanced Human-AI Co-Evolution Engine v5.0.0
+Modular, event‑driven, and robust implementation.
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-import numpy as np
-import re
-import hashlib
-import pickle
-import zlib
-import os
 import json
+import os
+import hashlib
+import re
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Optional, Tuple, Deque, Callable
 from collections import defaultdict, deque
+import numpy as np
+import zlib
 
 logger = logging.getLogger(__name__)
 
@@ -38,25 +25,15 @@ logger = logging.getLogger(__name__)
 # Bio-Inspired Core Import (with fallback)
 # ============================================================================
 try:
-    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker, Persistence
-    from enhancements.bio_inspired.eco_atp_currency import EcoATPTokenManager
-    from enhancements.bio_inspired.proton_gradient_fields import GradientFieldManager
-    from enhancements.bio_inspired.atp_synthase_scheduler import ATPSynthaseScheduler
-    from enhancements.bio_inspired.chromatophore_compartments import CompartmentManager
-    from enhancements.bio_inspired.biomass_storage import BiomassStorage
-    from enhancements.bio_inspired.photosynthetic_harvester import PhotosyntheticHarvester
-    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
-    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
+    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
     BIO_INSPIRED_AVAILABLE = True
 except ImportError:
     BIO_INSPIRED_AVAILABLE = False
-    # Fallback definitions
     class BioEvent:
         def __init__(self, event_type, source, data=None):
             self.event_type = event_type
             self.source = source
             self.data = data or {}
-
     class CircuitBreaker:
         def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
             self.name = name
@@ -70,7 +47,7 @@ except ImportError:
             return await func(*args, **kwargs)
 
 # ============================================================================
-# MoE and Self-Evolving Gate imports (optional)
+# MoE imports (optional)
 # ============================================================================
 try:
     from ..expert_router import ExpertRouter
@@ -79,20 +56,15 @@ try:
     MOE_AVAILABLE = True
 except ImportError:
     MOE_AVAILABLE = False
-    logger.warning("MoE Expert Router or Self-Evolving Gates not available - co-evolution engine will operate standalone")
 
-# ============================================================================
-# Helium Provider Interface (unchanged)
-# ============================================================================
 class HeliumProvider:
     def get_scarcity(self) -> float: raise NotImplementedError
     def get_cost_index(self) -> float: raise NotImplementedError
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Configuration Dataclass (Enhanced)
+# Configuration with Sub‑Configs
 # ============================================================================
-
 @dataclass
 class CoEvolutionConfig:
     """Centralized configuration for the Co-Evolution Engine."""
@@ -101,6 +73,12 @@ class CoEvolutionConfig:
     exploration_rate: float = 0.1
     adaptation_threshold: float = 0.7
 
+    # History limits
+    feedback_history_limit: int = 1000
+    performance_history_limit: int = 1000
+    sustainability_trajectory_limit: int = 1000
+    milestone_limit: int = 100
+
     # Retry and circuit breaker
     max_retries: int = 3
     retry_base_delay_ms: float = 100.0
@@ -108,14 +86,8 @@ class CoEvolutionConfig:
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout: float = 30.0
 
-    # History limits
-    feedback_history_limit: int = 1000
-    performance_history_limit: int = 1000
-    sustainability_trajectory_limit: int = 1000
-    milestone_limit: int = 100
-
     # Persistence
-    persistence_path: str = "co_evolution_state.pkl"
+    persistence_path: str = "co_evolution_state.json"
 
     # Telemetry
     telemetry_export_interval: int = 60
@@ -123,28 +95,17 @@ class CoEvolutionConfig:
     # Periodic co-evolution interval (seconds)
     co_evolution_interval: int = 300
 
-    # Sentiment model (if None, use rule-based)
-    sentiment_model: Optional[Any] = None
-
-    # Impact/effort estimates (can be overridden)
+    # Estimated impact/effort per area
     estimated_impact: Dict[str, float] = field(default_factory=lambda: {
-        'quantum': 0.8,
-        'moe': 0.6,
-        'sustainability': 0.9,
-        'user_experience': 0.7,
-        'federated': 0.6,
-        'system_wide': 0.8
+        'quantum': 0.8, 'moe': 0.6, 'sustainability': 0.9,
+        'user_experience': 0.7, 'federated': 0.6, 'system_wide': 0.8
     })
     estimated_effort: Dict[str, float] = field(default_factory=lambda: {
-        'quantum': 0.7,
-        'moe': 0.5,
-        'sustainability': 0.6,
-        'user_experience': 0.3,
-        'federated': 0.5,
-        'system_wide': 0.8
+        'quantum': 0.7, 'moe': 0.5, 'sustainability': 0.6,
+        'user_experience': 0.3, 'federated': 0.5, 'system_wide': 0.8
     })
 
-    # NEW: Feature flags for bio-inspired integrations
+    # Feature flags
     enable_event_driven: bool = True
     enable_self_healing: bool = True
     enable_swarm_coordination: bool = True
@@ -160,35 +121,21 @@ class CoEvolutionConfig:
     # Swarm sharing interval
     swarm_share_interval: int = 60
 
-    # Bio-inspired integrations (injected later)
-    bio_core: Optional[Any] = None
-
-    def __post_init__(self):
-        for key, value in self.__dict__.items():
-            if isinstance(value, bool):
-                setattr(self, key, bool(value))
-
 # ============================================================================
-# Sentiment Analyzer (unchanged)
+# Sentiment Analyzer (unchanged but refactored)
 # ============================================================================
 class SentimentAnalyzer:
-    # ... (same as before)
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
-        self.model = config.sentiment_model
         self.sentiment_keywords = {
-            'positive': {
-                'excellent': 1.0, 'great': 0.8, 'good': 0.6, 'nice': 0.5,
-                'happy': 0.7, 'satisfied': 0.8, 'impressed': 0.9, 'love': 1.0,
-                'amazing': 1.0, 'perfect': 1.0, 'awesome': 0.9, 'fantastic': 1.0,
-                'helpful': 0.6, 'useful': 0.5, 'improved': 0.7, 'better': 0.6
-            },
-            'negative': {
-                'bad': -0.6, 'terrible': -1.0, 'awful': -0.9, 'horrible': -1.0,
-                'sad': -0.5, 'disappointed': -0.7, 'frustrated': -0.8, 'angry': -0.9,
-                'useless': -0.7, 'broken': -0.8, 'confusing': -0.5, 'slow': -0.5,
-                'worse': -0.6, 'issue': -0.4, 'problem': -0.5, 'error': -0.6
-            }
+            'positive': {'excellent': 1.0, 'great': 0.8, 'good': 0.6, 'nice': 0.5,
+                         'happy': 0.7, 'satisfied': 0.8, 'impressed': 0.9, 'love': 1.0,
+                         'amazing': 1.0, 'perfect': 1.0, 'awesome': 0.9, 'fantastic': 1.0,
+                         'helpful': 0.6, 'useful': 0.5, 'improved': 0.7, 'better': 0.6},
+            'negative': {'bad': -0.6, 'terrible': -1.0, 'awful': -0.9, 'horrible': -1.0,
+                         'sad': -0.5, 'disappointed': -0.7, 'frustrated': -0.8, 'angry': -0.9,
+                         'useless': -0.7, 'broken': -0.8, 'confusing': -0.5, 'slow': -0.5,
+                         'worse': -0.6, 'issue': -0.4, 'problem': -0.5, 'error': -0.6}
         }
         self.emotion_keywords = {
             'joy': ['happy', 'glad', 'delighted', 'pleased', 'joy', 'wonderful'],
@@ -206,19 +153,11 @@ class SentimentAnalyzer:
                            'moderately', 'kind of', 'sort of', 'rather']
         self.negations = ['not', 'never', 'none', 'nobody', 'no', 'neither', 'nor',
                           'hardly', 'scarcely', 'barely', 'no one', 'nothing', 'nowhere']
-        logger.info("Sentiment Analyzer initialized (model: %s)", 'ML' if self.model else 'rule-based')
 
     def analyze_sentiment(self, text: str) -> Dict[str, Any]:
-        # ... (same as before) ...
         if not text or not text.strip():
             return {'score': 0.0, 'confidence': 0.0, 'sentiment': 'neutral',
                     'emotions': {}, 'key_phrases': []}
-        if self.model:
-            try:
-                result = self.model.predict_sentiment(text)
-                return result
-            except Exception as e:
-                logger.warning(f"ML sentiment model failed: {e}, falling back to rule-based")
         text_lower = text.lower()
         words = text_lower.split()
         score = 0.0
@@ -319,13 +258,13 @@ class RecommendationPrioritizer:
         return prioritized
 
 # ============================================================================
-# Long-Term Impact Tracker (unchanged)
+# Long-Term Impact Tracker (refactored with async)
 # ============================================================================
 class LongTermImpactTracker:
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
-        self.impact_history: Dict[str, List[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=100))
-        self.sustainability_scores: deque = deque(maxlen=config.sustainability_trajectory_limit)
+        self.impact_history: Dict[str, Deque[Dict]] = defaultdict(lambda: deque(maxlen=100))
+        self.sustainability_scores: Deque[float] = deque(maxlen=config.sustainability_trajectory_limit)
         self.decay_rates: Dict[str, float] = {}
         self._lock = asyncio.Lock()
 
@@ -401,75 +340,73 @@ class LongTermImpactTracker:
         self.decay_rates = data.get('decay_rates', {})
 
 # ============================================================================
-# Persistence Manager (unchanged)
+# Persistence Manager (JSON with versioning)
 # ============================================================================
 class CoEvolutionPersistenceManager:
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
+        self._version = 1
         logger.info(f"CoEvolutionPersistenceManager initialized (path={self.path})")
 
-    async def save_state(self, engine: 'EnhancedCoEvolutionEngine') -> bool:
+    async def save_state(self, state: Dict[str, Any]) -> bool:
         async with self._lock:
             try:
-                state = {
-                    'config': engine.config,
-                    'feedback_history': list(engine.feedback_history),
-                    'user_models': engine.user_models,
-                    'policy_suggestions': engine.policy_suggestions,
-                    'collaborative_decisions': engine.collaborative_decisions,
-                    'evolution_milestones': [m.to_dict() for m in engine.evolution_milestones],
-                    'milestone_strategies': engine.milestone_strategies,
-                    'performance_history': engine.performance_history,
-                    'trust_history': engine.trust_history,
-                    'sustainability_trajectory': list(engine.sustainability_trajectory),
-                    'historical_effectiveness': engine.historical_effectiveness,
-                    'impact_tracker': engine.impact_tracker.to_dict()
+                payload = {
+                    'version': self._version,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'data': self._make_serializable(state)
                 }
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
-                logger.info(f"Co-evolution state saved to {self.path}")
+                with open(self.path, 'w') as f:
+                    json.dump(payload, f, indent=2)
+                logger.info(f"State saved to {self.path}")
                 return True
             except Exception as e:
-                logger.error(f"Failed to save co-evolution state: {e}")
+                logger.error(f"Failed to save state: {e}")
                 return False
 
-    async def load_state(self, engine: 'EnhancedCoEvolutionEngine') -> bool:
+    async def load_state(self) -> Optional[Dict]:
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
-                return False
+                return None
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
-                engine.feedback_history = deque(state.get('feedback_history', []), maxlen=engine.config.feedback_history_limit)
-                engine.user_models = state.get('user_models', {})
-                engine.policy_suggestions = state.get('policy_suggestions', [])
-                engine.collaborative_decisions = state.get('collaborative_decisions', [])
-                engine.evolution_milestones = deque()
-                for m_dict in state.get('evolution_milestones', []):
-                    milestone = engine._dict_to_milestone(m_dict)
-                    if milestone:
-                        engine.evolution_milestones.append(milestone)
-                engine.milestone_strategies = state.get('milestone_strategies', {})
-                engine.performance_history = state.get('performance_history', [])
-                engine.trust_history = state.get('trust_history', [])
-                engine.sustainability_trajectory = deque(
-                    state.get('sustainability_trajectory', []),
-                    maxlen=engine.config.sustainability_trajectory_limit
-                )
-                engine.historical_effectiveness = state.get('historical_effectiveness', {})
-                engine.impact_tracker.from_dict(state.get('impact_tracker', {}))
-                logger.info(f"Co-evolution state loaded from {self.path}")
-                return True
+                with open(self.path, 'r') as f:
+                    payload = json.load(f)
+                if payload.get('version') != self._version:
+                    logger.warning(f"State version mismatch; may be incompatible")
+                return self._deserialize(payload.get('data', {}))
             except Exception as e:
-                logger.error(f"Failed to load co-evolution state: {e}")
-                return False
+                logger.error(f"Failed to load state: {e}")
+                return None
+
+    def _make_serializable(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_serializable(v) for v in obj]
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (deque, set)):
+            return self._make_serializable(list(obj))
+        elif hasattr(obj, '__dict__'):
+            return self._make_serializable(obj.__dict__)
+        else:
+            return obj
+
+    def _deserialize(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._deserialize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._deserialize(v) for v in obj]
+        elif isinstance(obj, str):
+            try:
+                return datetime.fromisoformat(obj)
+            except ValueError:
+                return obj
+        else:
+            return obj
 
     async def delete_state(self):
         async with self._lock:
@@ -510,14 +447,15 @@ class CoEvolutionTelemetry:
         return metric_name
 
     async def export(self) -> str:
-        output = []
-        for key, value in self.metrics['counters'].items():
-            output.append(f"# TYPE {key} counter\n{key} {value}")
-        for key, value in self.metrics['gauges'].items():
-            output.append(f"# TYPE {key} gauge\n{key} {value}")
-        for key, values in self.metrics['histograms'].items():
-            output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
-        return "\n".join(output)
+        async with self._lock:
+            output = []
+            for key, value in self.metrics['counters'].items():
+                output.append(f"# TYPE {key} counter\n{key} {value}")
+            for key, value in self.metrics['gauges'].items():
+                output.append(f"# TYPE {key} gauge\n{key} {value}")
+            for key, values in self.metrics['histograms'].items():
+                output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
+            return "\n".join(output)
 
     def reset(self):
         self.metrics.clear()
@@ -576,683 +514,247 @@ class EvolutionMilestone:
         }
 
 # ============================================================================
-# Enhanced Co-Evolution Engine (Main Class) – v4.0.0
+# Storage Module
 # ============================================================================
-
-class EnhancedCoEvolutionEngine:
-    """
-    Enhanced Human-AI Co-Evolution Engine v4.0.0
-    With full bio‑inspired core integration.
-    """
-
-    def __init__(
-        self,
-        bio_core: Optional[EnhancedBioInspiredCore] = None,
-        config: Optional[CoEvolutionConfig] = None,
-        **kwargs
-    ):
-        """
-        Initialize the co-evolution engine.
-
-        Args:
-            bio_core: Reference to the bio‑inspired core for event subscriptions.
-            config: Configuration dataclass (preferred).
-            **kwargs: Legacy arguments for backward compatibility.
-        """
-        if config is None:
-            config = CoEvolutionConfig(
-                enable_event_driven=kwargs.get('enable_event_driven', True),
-                enable_self_healing=kwargs.get('enable_self_healing', True),
-                enable_swarm_coordination=kwargs.get('enable_swarm_coordination', True),
-                enable_time_tick_engine=kwargs.get('enable_time_tick_engine', True),
-                enable_quantum_bridge=kwargs.get('enable_quantum_bridge', True),
-                enable_cost_benefit=kwargs.get('enable_cost_benefit', True),
-                enable_workflow_orchestration=kwargs.get('enable_workflow_orchestration', True),
-                max_retries=kwargs.get('max_retries', 3),
-                retry_base_delay_ms=kwargs.get('retry_base_delay_ms', 100.0),
-                retry_max_delay_ms=kwargs.get('retry_max_delay_ms', 5000.0),
-                circuit_breaker_failure_threshold=kwargs.get('circuit_breaker_failure_threshold', 5),
-                circuit_breaker_recovery_timeout=kwargs.get('circuit_breaker_recovery_timeout', 30.0),
-                persistence_path=kwargs.get('persistence_path', 'co_evolution_state.pkl'),
-                co_evolution_interval=kwargs.get('co_evolution_interval', 300)
-            )
+class CoEvolutionStorage:
+    """Thread‑safe storage for all co‑evolution state."""
+    def __init__(self, config: CoEvolutionConfig):
         self.config = config
-
-        # Feature flags
-        self.enable_event_driven = config.enable_event_driven
-        self.enable_self_healing = config.enable_self_healing
-        self.enable_swarm_coordination = config.enable_swarm_coordination
-        self.enable_time_tick_engine = config.enable_time_tick_engine
-        self.enable_quantum_bridge = config.enable_quantum_bridge
-        self.enable_cost_benefit = config.enable_cost_benefit
-        self.enable_workflow_orchestration = config.enable_workflow_orchestration
-
-        # Store bio‑core reference
-        self.bio_core = bio_core
-        self.event_broker = None
-        self.alert_system = None
-        self.anomaly_detection = None
-        self.cost_benefit_engine = None
-        self.quantum_bridge = None
-        self.tick_engine = None
-        self.swarm_coordinator = None
-        self.self_healer = None
-        self.workflow_orchestrator = None
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
-
-        # Extract core sub‑modules if available
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
-            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.token_manager = getattr(self.bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(self.bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
-            self.harvester = getattr(self.bio_core, 'harvester', None)
-
-        # MoE and Self-Evolving Gate references (injected)
-        self.expert_router = None
-        self.gating_network = None
-        self.self_evolving_gate = None
-
-        # Helium provider (injected)
-        self.helium_provider = None
-
-        # Injected external components
-        self.quantum_benchmark = None
-        self.fft_moe = None
-        self.helium_manager = None
-        self.federated_orchestrator = None
-        self.predictive_analyzer = None
-
-        # Internal modules
-        self.sentiment_analyzer = SentimentAnalyzer(self.config)
-        self.recommendation_prioritizer = RecommendationPrioritizer(self.config)
-        self.impact_tracker = LongTermImpactTracker(self.config)
-        self.persistence = CoEvolutionPersistenceManager(self.config) if self.config.persistence_path else None
-        self.telemetry = CoEvolutionTelemetry()
-
-        # State with bounded histories
-        self.feedback_history = deque(maxlen=self.config.feedback_history_limit)
+        self.feedback_history: Deque[Dict] = deque(maxlen=config.feedback_history_limit)
         self.user_models: Dict[str, Dict[str, Any]] = {}
         self.policy_suggestions: List[Dict[str, Any]] = []
         self.collaborative_decisions: List[Dict[str, Any]] = []
-        self.evolution_milestones = deque(maxlen=self.config.milestone_limit)
+        self.evolution_milestones: Deque[EvolutionMilestone] = deque(maxlen=config.milestone_limit)
         self.milestone_strategies: Dict[str, List[Dict]] = {}
-
-        self.performance_history = deque(maxlen=self.config.performance_history_limit)
-        self.trust_history = deque(maxlen=1000)
-        self.sustainability_trajectory = deque(maxlen=self.config.sustainability_trajectory_limit)
-
+        self.performance_history: Deque[Dict] = deque(maxlen=config.performance_history_limit)
+        self.trust_history: Deque[float] = deque(maxlen=1000)
+        self.sustainability_trajectory: Deque[float] = deque(maxlen=config.sustainability_trajectory_limit)
         self.historical_effectiveness: Dict[str, float] = {
             'quantum': 0.5, 'moe': 0.5, 'sustainability': 0.5,
             'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
         }
-
         self._lock = asyncio.Lock()
-        self._running = True
-        self._co_evolution_task: Optional[asyncio.Task] = None
-        self.health_status = "healthy"
-        self.last_error = None
 
-        # Circuit breakers for external services
-        self._quantum_circuit = CircuitBreaker("quantum_benchmark")
-        self._moe_circuit = CircuitBreaker("fft_moe")
-        self._helium_circuit = CircuitBreaker("helium_manager")
-        self._federated_circuit = CircuitBreaker("federated_orchestrator")
-        self._predictive_circuit = CircuitBreaker("predictive_analyzer")
-
-        # Subscribe to core events if enabled
-        if self.enable_event_driven and self.event_broker:
-            self._subscribe_events()
-
-        # Start background co-evolution loop
-        self._start_background_tasks()
-
-        # Load state if persistence available
-        if self.persistence:
-            asyncio.create_task(self._load_state())
-
-        logger.info("Enhanced Co-Evolution Engine v4.0.0 initialized")
-
-    # ========================================================================
-    # Event Subscriptions
-    # ========================================================================
-    def _subscribe_events(self):
-        if self.event_broker:
-            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('config_updated', self._on_config_updated)
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('health_update', self._on_health_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            logger.info("Co-Evolution Engine subscribed to core events")
-
-    async def _on_carbon_update(self, event: BioEvent):
-        intensity = event.data.get('intensity', 400)
-        price = event.data.get('price', 50.0)
-        self.carbon_intensity = intensity
-        self.carbon_price = price
-        # Update impact tracker
-        await self.impact_tracker.record_impact(
-            'sustainability',
-            {'carbon_intensity': intensity, 'carbon_price': price},
-            1.0 - (intensity / 800)
-        )
-
-    async def _on_helium_update(self, event: BioEvent):
-        scarcity = event.data.get('scarcity', 0.5)
-        price = event.data.get('price', 0.5)
-        self.helium_scarcity = scarcity
-        self.helium_price = price
-        if self.helium_manager:
-            # Adjust helium budget
-            self.helium_manager.helium_budget_l = 100.0 * (1.0 - scarcity * 0.3)
-        # Update impact tracker
-        await self.impact_tracker.record_impact(
-            'sustainability',
-            {'helium_scarcity': scarcity, 'helium_price': price},
-            1.0 - scarcity
-        )
-
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative co-evolution and triggering healing")
-            self.config.exploration_rate = 0.05
-            if self.enable_self_healing and self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-            if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
-                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_alert)
-
-    async def _on_config_updated(self, event: BioEvent):
-        updates = event.data.get('updates', {})
-        if 'co_evolution' in updates:
-            new_config = updates['co_evolution']
-            for key, value in new_config.items():
-                if hasattr(self.config, key):
-                    setattr(self.config, key, value)
-            logger.info("Co-Evolution configuration reloaded")
-
-    async def _on_token_update(self, event: BioEvent):
-        self.token_balance = event.data.get('balance', 500)
-
-    async def _on_health_update(self, event: BioEvent):
-        self.health_status = event.data.get('status', 'healthy')
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        if event.data.get('metric') == 'carbon_intensity':
-            logger.info("Carbon anomaly detected; adjusting learning rate")
-            self.config.learning_rate *= 0.9
-        if event.data.get('metric') == 'helium_scarcity':
-            logger.info("Helium anomaly detected; adjusting adaptation threshold")
-            self.config.adaptation_threshold = max(0.5, self.config.adaptation_threshold * 0.9)
-
-    # ========================================================================
-    # Background Tasks
-    # ========================================================================
-    def _start_background_tasks(self):
-        async def co_evolution_loop():
-            while self._running:
-                try:
-                    await self.co_evolve()
-                    await asyncio.sleep(self.config.co_evolution_interval)
-                except Exception as e:
-                    logger.error(f"Co-evolution loop error: {e}")
-                    await asyncio.sleep(60)
-        self._co_evolution_task = asyncio.create_task(co_evolution_loop())
-        if self.enable_swarm_coordination and self.swarm_coordinator:
-            asyncio.create_task(self._swarm_update_loop())
-
-    async def _swarm_update_loop(self):
-        while True:
-            try:
-                await self.share_with_swarm()
-                await asyncio.sleep(self.config.swarm_share_interval)
-            except Exception as e:
-                logger.error(f"Swarm update error: {e}")
-                await asyncio.sleep(120)
-
-    # ========================================================================
-    # Swarm Coordination
-    # ========================================================================
-    async def share_with_swarm(self):
-        if not self.enable_swarm_coordination or not self.swarm_coordinator:
-            return
-        swarm_payload = {
-            'engine_id': hashlib.md5(str(self.user_models).encode()).hexdigest()[:8],
-            'sustainability_score': self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5),
-            'milestones': len(self.evolution_milestones),
-            'feedback_count': len(self.feedback_history),
-            'historical_effectiveness': self.historical_effectiveness
-        }
-        await self.swarm_coordinator.share_predictions(swarm_payload)
-
-    # ========================================================================
-    # Injection Methods
-    # ========================================================================
-    def inject_components(
-        self,
-        quantum_benchmark=None,
-        fft_moe=None,
-        helium_manager=None,
-        federated_orchestrator=None,
-        predictive_analyzer=None
-    ):
-        """Inject external components."""
-        self.quantum_benchmark = quantum_benchmark
-        self.fft_moe = fft_moe
-        self.helium_manager = helium_manager
-        self.federated_orchestrator = federated_orchestrator
-        self.predictive_analyzer = predictive_analyzer
-        logger.info("System components injected into Co-Evolution Engine")
-
-    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
-        self.gating_network = gating_network
-        logger.info("Gating network injected into Co-Evolution Engine")
-
-    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
-        self.self_evolving_gate = gate
-        logger.info("Self-Evolving Gate injected into Co-Evolution Engine")
-
-    def set_expert_router(self, router: 'ExpertRouter'):
-        self.expert_router = router
-        logger.info("Expert Router injected into Co-Evolution Engine")
-
-    def set_helium_provider(self, provider: HeliumProvider):
-        self.helium_provider = provider
-        logger.info("Helium provider injected into Co-Evolution Engine")
-
-    def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        logger.info("Bio-inspired modules injected into Co-Evolution Engine")
-
-    # ========================================================================
-    # Persistence Methods
-    # ========================================================================
-    async def _load_state(self):
-        if self.persistence:
-            await self.persistence.load_state(self)
-
-    async def save_state(self):
-        if self.persistence:
-            await self.persistence.save_state(self)
-
-    async def delete_state(self):
-        if self.persistence:
-            await self.persistence.delete_state()
-
-    # ========================================================================
-    # Telemetry
-    # ========================================================================
-    async def get_telemetry_export(self) -> str:
-        return await self.telemetry.export()
-
-    # ========================================================================
-    # Health Status
-    # ========================================================================
-    async def get_health_status(self) -> Dict[str, Any]:
-        return {
-            'status': self.health_status,
-            'last_error': self.last_error,
-            'score': min(1.0, self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5)),
-            'details': {
-                'injected_components': {
-                    'quantum_benchmark': self.quantum_benchmark is not None,
-                    'fft_moe': self.fft_moe is not None,
-                    'helium_manager': self.helium_manager is not None,
-                    'federated_orchestrator': self.federated_orchestrator is not None,
-                    'predictive_analyzer': self.predictive_analyzer is not None
-                },
-                'milestones': len(self.evolution_milestones),
-                'feedback_count': len(self.feedback_history),
-                'performance_samples': len(self.performance_history),
-                'user_models': len(self.user_models),
-                'persistence_enabled': self.persistence is not None,
-                'telemetry_active': True,
-                'bio_integration_active': self.bio_core is not None,
-                'event_driven_active': self.enable_event_driven,
-                'self_healing_enabled': self.enable_self_healing,
-                'swarm_coordination_active': self.enable_swarm_coordination
-            }
-        }
-
-    # ========================================================================
-    # Main Co-Evolution Loop (Enhanced)
-    # ========================================================================
-    async def co_evolve(self) -> Dict[str, Any]:
-        """
-        Main co-evolution loop - drives system-wide improvement.
-        Returns evolution status and metrics.
-        """
+    # -------------------- Feedback --------------------
+    async def add_feedback(self, feedback: Dict):
         async with self._lock:
-            logger.info("Starting co-evolution cycle")
-            self.telemetry.increment('co_evolution_cycles')
+            self.feedback_history.append(feedback)
 
-            system_state = await self._collect_system_state()
-            human_feedback = await self._aggregate_human_feedback_with_sentiment()
-            opportunities = self._identify_opportunities(system_state, human_feedback)
+    async def get_feedback(self, limit: Optional[int] = None) -> List[Dict]:
+        async with self._lock:
+            if limit is not None:
+                return list(self.feedback_history)[-limit:]
+            return list(self.feedback_history)
 
-            # Predictive opportunities with circuit breaker
-            predicted = await self._predict_opportunities(system_state)
-            if predicted:
-                opportunities.extend(predicted)
+    async def clear_feedback(self):
+        async with self._lock:
+            self.feedback_history.clear()
 
-            recommendations = self._generate_holistic_recommendations(system_state, opportunities)
-            prioritized = self.recommendation_prioritizer.prioritize_recommendations(
-                recommendations, self.historical_effectiveness
-            )
+    # -------------------- User Models --------------------
+    async def get_user_model(self, user_id: str) -> Optional[Dict]:
+        async with self._lock:
+            return self.user_models.get(user_id)
 
-            applied = await self._apply_recommendations(prioritized[:3])
-            impact = await self._measure_impact(applied)
+    async def update_user_model(self, user_id: str, updates: Dict):
+        async with self._lock:
+            if user_id not in self.user_models:
+                self.user_models[user_id] = {}
+            self.user_models[user_id].update(updates)
 
-            # Record long-term impact
-            for item in applied:
-                if item.get('result', {}).get('success'):
-                    area = item['recommendation'].get('area', 'general')
-                    await self.impact_tracker.record_impact(
-                        area,
-                        item['result'],
-                        impact['metrics']['sustainability']
-                    )
+    async def get_user_models(self) -> Dict[str, Dict]:
+        async with self._lock:
+            return dict(self.user_models)
 
-            self._update_evolution_state(impact, human_feedback)
+    async def clear_user_models(self):
+        async with self._lock:
+            self.user_models.clear()
 
-            milestone = self._detect_milestone(impact)
-            if milestone:
-                self._learn_from_milestone(milestone)
+    # -------------------- Policies & Decisions --------------------
+    async def add_policy_suggestion(self, suggestion: Dict):
+        async with self._lock:
+            self.policy_suggestions.append(suggestion)
 
-            self._update_historical_effectiveness(applied)
+    async def get_policy_suggestions(self, limit: Optional[int] = None) -> List[Dict]:
+        async with self._lock:
+            if limit:
+                return self.policy_suggestions[-limit:]
+            return self.policy_suggestions.copy()
 
-            # Pass to gating network if available
-            if self.gating_network and self.expert_router:
-                features = np.array([
-                    impact['metrics']['overall_effectiveness'],
-                    impact['metrics']['sustainability'],
-                    len(opportunities),
-                    len(applied)
-                ])
-                reward = impact['metrics']['overall_effectiveness']
-                context = {
-                    'opportunities': len(opportunities),
-                    'applied': len(applied),
-                    'milestone': milestone.to_dict() if milestone else None
-                }
-                self.gating_network.update(features, reward, context)
+    async def add_collaborative_decision(self, decision: Dict):
+        async with self._lock:
+            self.collaborative_decisions.append(decision)
 
-            # Pass to self-evolving gate if available
-            if self.self_evolving_gate:
-                self.self_evolving_gate.adapt(
-                    state=torch.tensor([impact['metrics']['sustainability'], impact['metrics']['performance']]),
-                    chosen_expert=0,  # dummy
-                    reward=impact['metrics']['overall_effectiveness'],
-                    environmental_feedback={'opportunities': len(opportunities)},
-                    quantum_mode=False
-                )
+    async def get_collaborative_decisions(self, limit: Optional[int] = None) -> List[Dict]:
+        async with self._lock:
+            if limit:
+                return self.collaborative_decisions[-limit:]
+            return self.collaborative_decisions.copy()
 
-            # Trigger workflow if needed
-            if impact['metrics']['overall_effectiveness'] < 0.4 and self.workflow_orchestrator:
-                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_slo_breach)
+    # -------------------- Milestones --------------------
+    async def add_milestone(self, milestone: EvolutionMilestone):
+        async with self._lock:
+            self.evolution_milestones.append(milestone)
 
-            # Telemetry
-            self.telemetry.gauge('sustainability_score', impact['metrics']['sustainability'])
-            self.telemetry.gauge('performance_score', impact['metrics']['performance'])
-            self.telemetry.gauge('milestone_count', len(self.evolution_milestones))
+    async def get_milestones(self, limit: Optional[int] = None) -> List[EvolutionMilestone]:
+        async with self._lock:
+            if limit:
+                return list(self.evolution_milestones)[-limit:]
+            return list(self.evolution_milestones)
 
-            return {
-                'status': 'success' if applied else 'partial',
-                'recommendations_applied': applied,
-                'impact': impact,
-                'milestone': milestone.to_dict() if milestone else None,
-                'system_state': system_state,
-                'human_feedback_count': len(human_feedback),
-                'sustainability_trend': self._calculate_trend(),
-                'long_term_trend': self.impact_tracker.get_overall_trend()
+    async def find_milestone_by_strategy(self, strategy_signature: str) -> Optional[EvolutionMilestone]:
+        async with self._lock:
+            for m in self.evolution_milestones:
+                if m.strategy_signature == strategy_signature:
+                    return m
+            return None
+
+    # -------------------- Milestone Strategies --------------------
+    async def add_milestone_strategy(self, strategy_signature: str, entry: Dict):
+        async with self._lock:
+            if strategy_signature not in self.milestone_strategies:
+                self.milestone_strategies[strategy_signature] = []
+            self.milestone_strategies[strategy_signature].append(entry)
+
+    async def get_milestone_strategies(self) -> Dict[str, List[Dict]]:
+        async with self._lock:
+            return dict(self.milestone_strategies)
+
+    # -------------------- Performance & Trust --------------------
+    async def add_performance_record(self, record: Dict):
+        async with self._lock:
+            self.performance_history.append(record)
+
+    async def get_performance_history(self, limit: Optional[int] = None) -> List[Dict]:
+        async with self._lock:
+            if limit:
+                return list(self.performance_history)[-limit:]
+            return list(self.performance_history)
+
+    async def add_trust_score(self, score: float):
+        async with self._lock:
+            self.trust_history.append(score)
+
+    async def get_trust_history(self, limit: Optional[int] = None) -> List[float]:
+        async with self._lock:
+            if limit:
+                return list(self.trust_history)[-limit:]
+            return list(self.trust_history)
+
+    # -------------------- Sustainability Trajectory --------------------
+    async def add_sustainability_score(self, score: float):
+        async with self._lock:
+            self.sustainability_trajectory.append(score)
+
+    async def get_sustainability_trajectory(self, limit: Optional[int] = None) -> List[float]:
+        async with self._lock:
+            if limit:
+                return list(self.sustainability_trajectory)[-limit:]
+            return list(self.sustainability_trajectory)
+
+    # -------------------- Historical Effectiveness --------------------
+    async def get_historical_effectiveness(self) -> Dict[str, float]:
+        async with self._lock:
+            return dict(self.historical_effectiveness)
+
+    async def update_historical_effectiveness(self, area: str, effectiveness: float):
+        async with self._lock:
+            old = self.historical_effectiveness.get(area, 0.5)
+            self.historical_effectiveness[area] = old * 0.7 + effectiveness * 0.3
+
+    async def reset_historical_effectiveness(self):
+        async with self._lock:
+            self.historical_effectiveness = {
+                'quantum': 0.5, 'moe': 0.5, 'sustainability': 0.5,
+                'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
             }
 
-    # ============================================================================
-    # Helper Methods (Enhanced with circuit breakers)
-    # ============================================================================
+    # -------------------- State Snapshot --------------------
+    async def to_dict(self) -> Dict:
+        async with self._lock:
+            return {
+                'feedback_history': list(self.feedback_history),
+                'user_models': self.user_models,
+                'policy_suggestions': self.policy_suggestions,
+                'collaborative_decisions': self.collaborative_decisions,
+                'evolution_milestones': [m.to_dict() for m in self.evolution_milestones],
+                'milestone_strategies': self.milestone_strategies,
+                'performance_history': list(self.performance_history),
+                'trust_history': list(self.trust_history),
+                'sustainability_trajectory': list(self.sustainability_trajectory),
+                'historical_effectiveness': self.historical_effectiveness
+            }
 
-    async def _collect_system_state(self) -> Dict[str, Any]:
-        state = {'timestamp': datetime.now(timezone.utc).isoformat(), 'components': {}}
-        if self.quantum_benchmark:
-            try:
-                state['components']['quantum'] = await self._quantum_circuit.call(
-                    retry_async,
-                    self.quantum_benchmark.get_benchmark_summary,
-                    self.config.max_retries,
-                    self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
-                )
-            except Exception as e:
-                logger.error(f"Quantum benchmark failed: {e}")
-                state['components']['quantum'] = {'error': str(e)}
+    async def from_dict(self, data: Dict):
+        async with self._lock:
+            self.feedback_history = deque(data.get('feedback_history', []), maxlen=self.config.feedback_history_limit)
+            self.user_models = data.get('user_models', {})
+            self.policy_suggestions = data.get('policy_suggestions', [])
+            self.collaborative_decisions = data.get('collaborative_decisions', [])
+            self.evolution_milestones = deque()
+            for m_dict in data.get('evolution_milestones', []):
+                milestone = self._dict_to_milestone(m_dict)
+                if milestone:
+                    self.evolution_milestones.append(milestone)
+            self.milestone_strategies = data.get('milestone_strategies', {})
+            self.performance_history = deque(data.get('performance_history', []), maxlen=self.config.performance_history_limit)
+            self.trust_history = deque(data.get('trust_history', []), maxlen=1000)
+            self.sustainability_trajectory = deque(data.get('sustainability_trajectory', []), maxlen=self.config.sustainability_trajectory_limit)
+            self.historical_effectiveness = data.get('historical_effectiveness', {})
 
-        if self.fft_moe:
-            try:
-                state['components']['moe'] = await self._moe_circuit.call(
-                    retry_async,
-                    self.fft_moe.get_fft_moe_status,
-                    self.config.max_retries,
-                    self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
-                )
-            except Exception as e:
-                logger.error(f"FFT-MoE failed: {e}")
-                state['components']['moe'] = {'error': str(e)}
+    def _dict_to_milestone(self, d: Dict) -> Optional[EvolutionMilestone]:
+        try:
+            return EvolutionMilestone(
+                timestamp=datetime.fromisoformat(d['timestamp']),
+                milestone_type=d['milestone_type'],
+                description=d['description'],
+                metrics=d['metrics'],
+                human_feedback_count=d['human_feedback_count'],
+                ai_suggestion_impact=d['ai_suggestion_impact'],
+                strategy_signature=d.get('strategy_signature'),
+                reuse_count=d.get('reuse_count', 0),
+                effectiveness_history=d.get('effectiveness_history', [])
+            )
+        except Exception as e:
+            logger.error(f"Failed to reconstruct milestone: {e}")
+            return None
 
-        if self.helium_manager:
-            try:
-                state['components']['helium'] = await self._helium_circuit.call(
-                    retry_async,
-                    self.helium_manager.get_stats,
-                    self.config.max_retries,
-                    self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
-                )
-            except Exception as e:
-                logger.error(f"Helium manager failed: {e}")
-                state['components']['helium'] = {'error': str(e)}
+# ============================================================================
+# Analyzer Module
+# ============================================================================
+class CoEvolutionAnalyzer:
+    """Handles sentiment, prioritization, opportunity detection, and impact tracking."""
+    def __init__(
+        self,
+        config: CoEvolutionConfig,
+        storage: CoEvolutionStorage,
+        sentiment_analyzer: SentimentAnalyzer,
+        recommender: RecommendationPrioritizer,
+        impact_tracker: LongTermImpactTracker
+    ):
+        self.config = config
+        self.storage = storage
+        self.sentiment = sentiment_analyzer
+        self.recommender = recommender
+        self.impact_tracker = impact_tracker
 
-        if self.federated_orchestrator:
-            try:
-                state['components']['federated'] = await self._federated_circuit.call(
-                    retry_async,
-                    self.federated_orchestrator.get_status,
-                    self.config.max_retries,
-                    self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
-                )
-            except Exception as e:
-                logger.error(f"Federated orchestrator failed: {e}")
-                state['components']['federated'] = {'error': str(e)}
-
-        state['overall'] = self._calculate_system_metrics(state['components'])
-        state['long_term_trends'] = {}
-        for area in ['quantum', 'moe', 'sustainability', 'user_experience', 'federated']:
-            trend = self.impact_tracker.get_area_trend(area)
-            if trend.get('status') != 'insufficient_data':
-                state['long_term_trends'][area] = trend
-        return state
-
-    async def _aggregate_human_feedback_with_sentiment(self) -> List[Dict[str, Any]]:
+    async def aggregate_human_feedback_with_sentiment(self) -> List[Dict[str, Any]]:
+        """Aggregate feedback from user models and collaborative decisions with sentiment analysis."""
+        user_models = await self.storage.get_user_models()
+        decisions = await self.storage.get_collaborative_decisions()
         all_feedback = []
-        for user_id, user_model in self.user_models.items():
+        for user_id, user_model in user_models.items():
             for fb in user_model.get('feedback', []):
                 if 'comment' in fb:
-                    fb['sentiment'] = self.sentiment_analyzer.analyze_sentiment(fb['comment'])
+                    fb['sentiment'] = self.sentiment.analyze_sentiment(fb['comment'])
                     all_feedback.append(fb)
-        for decision in self.collaborative_decisions:
+        for decision in decisions:
             for fb in decision.get('feedback', []):
                 if 'comment' in fb:
-                    fb['sentiment'] = self.sentiment_analyzer.analyze_sentiment(fb['comment'])
+                    fb['sentiment'] = self.sentiment.analyze_sentiment(fb['comment'])
                     all_feedback.append(fb)
         return all_feedback[-self.config.feedback_history_limit:]
 
-    async def _predict_opportunities(self, system_state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        opportunities = []
-        if not self.predictive_analyzer:
-            return opportunities
-
-        # Use TimeTickEngine for helium forecast if available
-        if self.enable_time_tick_engine and self.tick_engine:
-            try:
-                forecast = self.tick_engine.get_helium_forecast(4)
-                if forecast and len(forecast) > 3:
-                    avg_future = np.mean(forecast)
-                    if avg_future < 0.3:
-                        opportunities.append({
-                            'area': 'sustainability',
-                            'type': 'predicted_constraint',
-                            'priority': 0.85,
-                            'suggestion': f'Helium scarcity predicted in 4 hours - proactive reduction needed',
-                            'expected_impact': 'Prevent critical helium shortage',
-                            'predicted': True,
-                            'timeframe_hours': 4
-                        })
-            except Exception as e:
-                logger.warning(f"TimeTickEngine forecast error: {e}")
-
-        # Use QuantumBridge to adjust carbon/helium weights if available
-        if self.enable_quantum_bridge and self.quantum_bridge:
-            try:
-                q_params = self.quantum_bridge.get_qubo_parameters()
-                penalty_helium = q_params.get('penalty_helium_shortage', 0.5)
-                if penalty_helium > 0.7:
-                    opportunities.append({
-                        'area': 'sustainability',
-                        'type': 'quantum_derived_opportunity',
-                        'priority': 0.8,
-                        'suggestion': 'QuantumBridge indicates high helium penalty - implement recovery',
-                        'expected_impact': '50% reduction in helium usage',
-                        'predicted': True
-                    })
-            except Exception as e:
-                logger.warning(f"QuantumBridge error: {e}")
-
-        # Use CostBenefitEngine to evaluate opportunities if available
-        if self.enable_cost_benefit and self.cost_benefit_engine:
-            try:
-                # Simulate a cost-benefit analysis for a system-wide optimization
-                params = {'area': 'system_wide', 'opportunities': len(opportunities)}
-                analysis = await self.cost_benefit_engine.analyze_scenario('co_evolution', params)
-                if analysis.roi > 0.5:
-                    opportunities.append({
-                        'area': 'system_wide',
-                        'type': 'cost_benefit_derived',
-                        'priority': 0.7,
-                        'suggestion': f'System-wide optimization recommended (ROI: {analysis.roi:.2f})',
-                        'expected_impact': 'Overall performance uplift',
-                        'predicted': True
-                    })
-            except Exception as e:
-                logger.warning(f"CostBenefitEngine error: {e}")
-
-        try:
-            # Existing predictive analyzer
-            if self.predictive_analyzer and hasattr(self.predictive_analyzer, 'predict_federation_trend'):
-                forecast = await self._predictive_circuit.call(
-                    retry_async,
-                    self.predictive_analyzer.predict_federation_trend,
-                    self.config.max_retries,
-                    self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
-                )
-                if forecast and forecast.get('predicted_sustainability_score', 0.5) < 0.4:
-                    opportunities.append({
-                        'area': 'federated',
-                        'type': 'predicted_performance_decline',
-                        'priority': 0.7,
-                        'suggestion': 'Federated learning sustainability predicted to decline - proactive optimization needed',
-                        'expected_impact': 'Prevent performance degradation',
-                        'predicted': True
-                    })
-        except Exception as e:
-            logger.warning(f"Predictive opportunity identification error: {e}")
-
-        return opportunities
-
-    def _identify_opportunities(self, system_state: Dict[str, Any], human_feedback: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        opportunities = []
-        if system_state['components'].get('quantum'):
-            q = system_state['components']['quantum']
-            if q.get('average_energy_savings_percent', 0) < 10:
-                opportunities.append({
-                    'area': 'quantum', 'type': 'performance', 'priority': 0.7,
-                    'suggestion': 'Optimize quantum circuit depth and qubit usage',
-                    'expected_impact': '20-30% energy savings'
-                })
-        if system_state['components'].get('moe'):
-            m = system_state['components']['moe']
-            if m.get('total_updates_processed', 0) < 10:
-                opportunities.append({
-                    'area': 'moe', 'type': 'adoption', 'priority': 0.5,
-                    'suggestion': 'Increase client participation in FFT-MoE',
-                    'expected_impact': 'Improved personalization and accuracy'
-                })
-        if system_state['components'].get('helium'):
-            h = system_state['components']['helium']
-            scarcity = h.get('current', {}).get('scarcity_index', 0)
-            if scarcity > 0.6:
-                opportunities.append({
-                    'area': 'sustainability', 'type': 'constraint', 'priority': 0.9,
-                    'suggestion': 'Reduce helium usage through alternative cooling',
-                    'expected_impact': '50-80% helium savings'
-                })
-
-        if human_feedback:
-            sentiments = [f.get('sentiment', {}).get('score', 0) for f in human_feedback if 'sentiment' in f]
-            if sentiments:
-                avg_sentiment = np.mean(sentiments)
-                negative_ratio = sum(1 for s in sentiments if s < -0.3) / max(len(sentiments), 1)
-                if negative_ratio > 0.2:
-                    opportunities.append({
-                        'area': 'user_experience', 'type': 'sentiment_driven', 'priority': 0.75,
-                        'suggestion': f'Address user concerns - {negative_ratio:.0%} negative feedback detected',
-                        'expected_impact': 'Improved user satisfaction and trust'
-                    })
-            themes = self._extract_feedback_themes_with_sentiment(human_feedback)
-            for theme, data in themes.items():
-                if data['count'] > len(human_feedback) * 0.2:
-                    sentiment_weight = 1.0 + (0.5 - data['avg_sentiment']) * 0.5
-                    priority = min(0.9, 0.6 + sentiment_weight * 0.3)
-                    opportunities.append({
-                        'area': 'user_experience', 'type': theme, 'priority': priority,
-                        'suggestion': f'Address user concerns about {theme} (sentiment: {data["avg_sentiment"]:.2f})',
-                        'expected_impact': 'Improved user satisfaction and trust'
-                    })
-
-        opportunities.sort(key=lambda x: x['priority'], reverse=True)
-        return opportunities[:5]
-
-    def _extract_feedback_themes_with_sentiment(self, feedback: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    async def extract_feedback_themes_with_sentiment(self, feedback: List[Dict]) -> Dict[str, Dict]:
         keyword_map = {
             'usability': ['confusing', 'complicated', 'hard to use', 'intuitive', 'usability'],
             'performance': ['slow', 'fast', 'lag', 'responsiveness', 'performance'],
@@ -1275,7 +777,68 @@ class EnhancedCoEvolutionEngine:
                 themes[theme]['avg_sentiment'] = themes[theme]['sentiment_sum'] / themes[theme]['count']
         return themes
 
-    def _generate_holistic_recommendations(self, system_state: Dict[str, Any], opportunities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def identify_opportunities(
+        self,
+        system_state: Dict[str, Any],
+        human_feedback: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        opportunities = []
+        # Quantum
+        q = system_state.get('components', {}).get('quantum', {})
+        if q.get('average_energy_savings_percent', 0) < 10:
+            opportunities.append({
+                'area': 'quantum', 'type': 'performance', 'priority': 0.7,
+                'suggestion': 'Optimize quantum circuit depth and qubit usage',
+                'expected_impact': '20-30% energy savings'
+            })
+        # MoE
+        m = system_state.get('components', {}).get('moe', {})
+        if m.get('total_updates_processed', 0) < 10:
+            opportunities.append({
+                'area': 'moe', 'type': 'adoption', 'priority': 0.5,
+                'suggestion': 'Increase client participation in FFT-MoE',
+                'expected_impact': 'Improved personalization and accuracy'
+            })
+        # Helium
+        h = system_state.get('components', {}).get('helium', {})
+        scarcity = h.get('current', {}).get('scarcity_index', 0)
+        if scarcity > 0.6:
+            opportunities.append({
+                'area': 'sustainability', 'type': 'constraint', 'priority': 0.9,
+                'suggestion': 'Reduce helium usage through alternative cooling',
+                'expected_impact': '50-80% helium savings'
+            })
+
+        # Sentiment‑driven
+        if human_feedback:
+            sentiments = [f.get('sentiment', {}).get('score', 0) for f in human_feedback if 'sentiment' in f]
+            if sentiments:
+                negative_ratio = sum(1 for s in sentiments if s < -0.3) / max(len(sentiments), 1)
+                if negative_ratio > 0.2:
+                    opportunities.append({
+                        'area': 'user_experience', 'type': 'sentiment_driven', 'priority': 0.75,
+                        'suggestion': f'Address user concerns - {negative_ratio:.0%} negative feedback detected',
+                        'expected_impact': 'Improved user satisfaction and trust'
+                    })
+            themes = await self.extract_feedback_themes_with_sentiment(human_feedback)
+            for theme, data in themes.items():
+                if data['count'] > len(human_feedback) * 0.2:
+                    sentiment_weight = 1.0 + (0.5 - data['avg_sentiment']) * 0.5
+                    priority = min(0.9, 0.6 + sentiment_weight * 0.3)
+                    opportunities.append({
+                        'area': 'user_experience', 'type': theme, 'priority': priority,
+                        'suggestion': f'Address user concerns about {theme} (sentiment: {data["avg_sentiment"]:.2f})',
+                        'expected_impact': 'Improved user satisfaction and trust'
+                    })
+
+        opportunities.sort(key=lambda x: x['priority'], reverse=True)
+        return opportunities[:5]
+
+    async def generate_holistic_recommendations(
+        self,
+        system_state: Dict[str, Any],
+        opportunities: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         combined = {}
         for opp in opportunities:
             key = opp['area']
@@ -1290,20 +853,21 @@ class EnhancedCoEvolutionEngine:
                 combined[key]['suggestions'].append(opp['suggestion'])
                 combined[key]['priority'] = max(combined[key]['priority'], opp['priority'])
 
+        historical = await self.storage.get_historical_effectiveness()
         recommendations = []
         for area, data in combined.items():
             strategy_sig = self._generate_strategy_signature(area, data['suggestions'])
-            existing = self._find_milestone_by_strategy(strategy_sig)
+            existing = await self.storage.find_milestone_by_strategy(strategy_sig)
             rec = {
                 'area': area,
                 'action': data['suggestions'][0] if len(data['suggestions']) == 1 else f"Multiple actions: {', '.join(data['suggestions'][:2])}",
                 'priority': data['priority'],
                 'rationale': self._generate_rationale(area, system_state),
-                'expected_outcome': self._predict_outcome(area, data['types']),
+                'expected_outcome': self._predict_outcome(area, data['types'], historical),
                 'predicted': data.get('predicted', False),
                 'timeframe_hours': data.get('timeframe_hours', None),
                 'strategy_signature': strategy_sig,
-                'historical_effectiveness': self.historical_effectiveness.get(area, 0.5)
+                'historical_effectiveness': historical.get(area, 0.5)
             }
             if existing:
                 rec['previous_effectiveness'] = existing.ai_suggestion_impact
@@ -1325,12 +889,6 @@ class EnhancedCoEvolutionEngine:
         combined = f"{area}:{'.'.join(sorted(suggestions))}"
         return hashlib.md5(combined.encode()).hexdigest()[:12]
 
-    def _find_milestone_by_strategy(self, strategy_signature: str) -> Optional[EvolutionMilestone]:
-        for milestone in self.evolution_milestones:
-            if milestone.strategy_signature == strategy_signature:
-                return milestone
-        return None
-
     def _generate_rationale(self, area: str, system_state: Dict[str, Any]) -> str:
         rationales = {
             'quantum': 'Quantum energy savings below target, optimization needed',
@@ -1348,7 +906,7 @@ class EnhancedCoEvolutionEngine:
                 base += f" (Long-term trend: {trend['trend']}, continue momentum)"
         return base
 
-    def _predict_outcome(self, area: str, types: List[str]) -> str:
+    def _predict_outcome(self, area: str, types: List[str], historical: Dict[str, float]) -> str:
         outcomes = {
             'quantum': '10-30% reduction in energy consumption',
             'moe': 'Improved personalization and model accuracy',
@@ -1357,12 +915,467 @@ class EnhancedCoEvolutionEngine:
             'federated': 'Better global model performance'
         }
         base = outcomes.get(area, 'Expected performance improvement')
-        eff = self.historical_effectiveness.get(area, 0.5)
+        eff = historical.get(area, 0.5)
         if eff > 0.7:
             base += f" (Historically effective: {eff:.1%})"
         elif eff < 0.3:
             base += f" (Historically challenging: {eff:.1%})"
         return base
+
+    async def calculate_trend(self) -> str:
+        traj = await self.storage.get_sustainability_trajectory(20)
+        if len(traj) < 10:
+            return "stable"
+        recent = traj[-10:]
+        avg_recent = np.mean(recent)
+        older = traj[-20:-10] if len(traj) >= 20 else recent
+        avg_older = np.mean(older)
+        if avg_recent > avg_older * 1.05:
+            return "improving"
+        elif avg_recent < avg_older * 0.95:
+            return "declining"
+        else:
+            return "stable"
+
+    async def detect_milestone(self, impact: Dict[str, Any]) -> Optional[EvolutionMilestone]:
+        metrics = impact['metrics']
+        if metrics.get('sustainability', 0) > 0.8:
+            # Find best area
+            best_area = 'sustainability'
+            details = impact.get('details', [])
+            if details:
+                best_area = max(details, key=lambda x: x.get('effectiveness', 0)).get('area', 'sustainability')
+            strategy_sig = self._generate_strategy_signature(best_area, ["sustainability_breakthrough"])
+            milestone = EvolutionMilestone(
+                timestamp=datetime.now(timezone.utc),
+                milestone_type='breakthrough',
+                description='Achieved major sustainability improvement',
+                metrics=metrics,
+                human_feedback_count=len(await self.storage.get_feedback()),
+                ai_suggestion_impact=0.9,
+                strategy_signature=strategy_sig
+            )
+        elif metrics.get('performance', 0) > 0.7 and metrics.get('user_satisfaction', 0) > 0.6:
+            milestone = EvolutionMilestone(
+                timestamp=datetime.now(timezone.utc),
+                milestone_type='breakthrough',
+                description='System performance and user satisfaction at high levels',
+                metrics=metrics,
+                human_feedback_count=len(await self.storage.get_feedback()),
+                ai_suggestion_impact=0.8
+            )
+        elif len(await self.storage.get_performance_history()) > 5:
+            perf_hist = await self.storage.get_performance_history(5)
+            if len(perf_hist) >= 3:
+                recent_perf = [h['impact']['metrics']['performance'] for h in perf_hist if 'metrics' in h['impact']]
+                if len(recent_perf) >= 3:
+                    improvement = np.mean(recent_perf[-3:]) - np.mean(recent_perf[:3])
+                    if improvement > 0.15:
+                        milestone = EvolutionMilestone(
+                            timestamp=datetime.now(timezone.utc),
+                            milestone_type='learning_spike',
+                            description=f'Performance improvement of {improvement:.1%} detected',
+                            metrics=metrics,
+                            human_feedback_count=len(await self.storage.get_feedback()),
+                            ai_suggestion_impact=improvement
+                        )
+        elif len(await self.storage.get_sustainability_trajectory()) > 10:
+            traj = await self.storage.get_sustainability_trajectory(5)
+            if np.std(traj) < 0.1 and np.mean(traj) > 0.6:
+                milestone = EvolutionMilestone(
+                    timestamp=datetime.now(timezone.utc),
+                    milestone_type='adaptation',
+                    description='System showing stable, high sustainability performance',
+                    metrics=metrics,
+                    human_feedback_count=len(await self.storage.get_feedback()),
+                    ai_suggestion_impact=0.7
+                )
+        else:
+            milestone = None
+
+        if milestone:
+            await self.storage.add_milestone(milestone)
+            await self._learn_from_milestone(milestone)
+        return milestone
+
+    async def _learn_from_milestone(self, milestone: EvolutionMilestone):
+        if milestone.strategy_signature:
+            await self.storage.add_milestone_strategy(milestone.strategy_signature, {
+                'effectiveness': milestone.ai_suggestion_impact,
+                'timestamp': milestone.timestamp.isoformat(),
+                'context': milestone.description
+            })
+            area = self._extract_area_from_milestone(milestone)
+            if area:
+                await self.storage.update_historical_effectiveness(area, milestone.ai_suggestion_impact)
+        if milestone.ai_suggestion_impact > 0.7:
+            milestone.reuse_count += 1
+            logger.info(f"Milestone strategy {milestone.strategy_signature} marked for reuse (impact: {milestone.ai_suggestion_impact:.2f})")
+
+    def _extract_area_from_milestone(self, milestone: EvolutionMilestone) -> Optional[str]:
+        areas = ['quantum', 'moe', 'sustainability', 'user_experience', 'federated']
+        for area in areas:
+            if area in milestone.description.lower():
+                return area
+        return None
+
+# ============================================================================
+# Orchestrator (Main Controller)
+# ============================================================================
+class CoEvolutionOrchestrator:
+    """
+    Orchestrates the co‑evolution cycle, manages events, external components,
+    and background tasks.
+    """
+    def __init__(
+        self,
+        config: CoEvolutionConfig,
+        storage: CoEvolutionStorage,
+        analyzer: CoEvolutionAnalyzer,
+        prioritizer: RecommendationPrioritizer,
+        impact_tracker: LongTermImpactTracker,
+        telemetry: CoEvolutionTelemetry,
+        persistence: Optional[CoEvolutionPersistenceManager],
+        bio_core: Optional[EnhancedBioInspiredCore] = None
+    ):
+        self.config = config
+        self.storage = storage
+        self.analyzer = analyzer
+        self.prioritizer = prioritizer
+        self.impact_tracker = impact_tracker
+        self.telemetry = telemetry
+        self.persistence = persistence
+        self.bio_core = bio_core
+
+        # External components (injected)
+        self.quantum_benchmark = None
+        self.fft_moe = None
+        self.helium_manager = None
+        self.federated_orchestrator = None
+        self.predictive_analyzer = None
+        self.event_broker = None
+        self.self_healer = None
+        self.workflow_orchestrator = None
+        self.swarm_coordinator = None
+        self.tick_engine = None
+        self.quantum_bridge = None
+        self.cost_benefit_engine = None
+
+        # Circuit breakers
+        self._quantum_circuit = CircuitBreaker("quantum_benchmark")
+        self._moe_circuit = CircuitBreaker("fft_moe")
+        self._helium_circuit = CircuitBreaker("helium_manager")
+        self._federated_circuit = CircuitBreaker("federated_orchestrator")
+        self._predictive_circuit = CircuitBreaker("predictive_analyzer")
+
+        # Health
+        self.health_status = "healthy"
+        self.last_error = None
+
+        # Event queue
+        self._event_queue: asyncio.Queue = asyncio.Queue()
+        self._event_consumer_task: Optional[asyncio.Task] = None
+
+        # Background tasks
+        self._background_tasks: List[asyncio.Task] = []
+        self._running = True
+        self._co_evolution_task: Optional[asyncio.Task] = None
+
+        # Subscribe to events if enabled
+        if self.config.enable_event_driven and self.bio_core:
+            self._subscribe_events()
+
+        # Start background tasks
+        self._start_background_tasks()
+
+    # ========================================================================
+    # Injection Methods
+    # ========================================================================
+    def inject_components(
+        self,
+        quantum_benchmark=None,
+        fft_moe=None,
+        helium_manager=None,
+        federated_orchestrator=None,
+        predictive_analyzer=None
+    ):
+        self.quantum_benchmark = quantum_benchmark
+        self.fft_moe = fft_moe
+        self.helium_manager = helium_manager
+        self.federated_orchestrator = federated_orchestrator
+        self.predictive_analyzer = predictive_analyzer
+        logger.info("External components injected into Co-Evolution Orchestrator")
+
+    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
+        self.gating_network = gating_network
+
+    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
+        self.self_evolving_gate = gate
+
+    def set_expert_router(self, router: 'ExpertRouter'):
+        self.expert_router = router
+
+    # ========================================================================
+    # Event Handling (via queue)
+    # ========================================================================
+    def _subscribe_events(self):
+        if self.event_broker:
+            self.event_broker.subscribe('carbon_update', self._enqueue_event)
+            self.event_broker.subscribe('helium_update', self._enqueue_event)
+            self.event_broker.subscribe('alert_generated', self._enqueue_event)
+            self.event_broker.subscribe('config_updated', self._enqueue_event)
+            self.event_broker.subscribe('token_balance_update', self._enqueue_event)
+            self.event_broker.subscribe('health_update', self._enqueue_event)
+            self.event_broker.subscribe('anomaly_detected', self._enqueue_event)
+            logger.info("Co-Evolution Engine subscribed to core events via queue")
+
+    async def _enqueue_event(self, event: BioEvent):
+        await self._event_queue.put(event)
+
+    async def _event_consumer(self):
+        while True:
+            try:
+                event = await self._event_queue.get()
+                await self._handle_event(event)
+                self._event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Event consumer error: {e}")
+
+    async def _handle_event(self, event: BioEvent):
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler:
+            try:
+                await handler(event)
+            except Exception as e:
+                logger.error(f"Error handling event {event.event_type}: {e}")
+
+    async def _on_carbon_update(self, event: BioEvent):
+        intensity = event.data.get('intensity', 400)
+        price = event.data.get('price', 50.0)
+        await self.impact_tracker.record_impact(
+            'sustainability',
+            {'carbon_intensity': intensity, 'carbon_price': price},
+            1.0 - (intensity / 800)
+        )
+
+    async def _on_helium_update(self, event: BioEvent):
+        scarcity = event.data.get('scarcity', 0.5)
+        if self.helium_manager:
+            # Adjust helium budget (if manager supports)
+            pass
+        await self.impact_tracker.record_impact(
+            'sustainability',
+            {'helium_scarcity': scarcity, 'helium_price': event.data.get('price', 0.5)},
+            1.0 - scarcity
+        )
+
+    async def _on_alert_generated(self, event: BioEvent):
+        if event.data.get('severity') == 'critical':
+            logger.warning("Critical alert; triggering self‑healing")
+            self.config.exploration_rate = 0.05
+            if self.config.enable_self_healing and self.self_healer:
+                await self.self_healer.apply_healing('damage_accumulation')
+            if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
+                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_alert)
+
+    async def _on_config_updated(self, event: BioEvent):
+        updates = event.data.get('updates', {})
+        if 'co_evolution' in updates:
+            new = updates['co_evolution']
+            for key, value in new.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+            logger.info("Co-Evolution configuration reloaded")
+
+    async def _on_token_update(self, event: BioEvent):
+        pass
+
+    async def _on_health_update(self, event: BioEvent):
+        self.health_status = event.data.get('status', 'healthy')
+
+    async def _on_anomaly_detected(self, event: BioEvent):
+        if event.data.get('metric') == 'carbon_intensity':
+            self.config.learning_rate *= 0.9
+        if event.data.get('metric') == 'helium_scarcity':
+            self.config.adaptation_threshold = max(0.5, self.config.adaptation_threshold * 0.9)
+
+    # ========================================================================
+    # Background Tasks
+    # ========================================================================
+    def _start_background_tasks(self):
+        # Event consumer
+        if self.config.enable_event_driven:
+            self._event_consumer_task = asyncio.create_task(self._event_consumer())
+            self._background_tasks.append(self._event_consumer_task)
+
+        # Co-evolution loop
+        async def co_evolution_loop():
+            while self._running:
+                try:
+                    await self.co_evolve()
+                    await asyncio.sleep(self.config.co_evolution_interval)
+                except Exception as e:
+                    logger.error(f"Co-evolution loop error: {e}")
+                    await asyncio.sleep(60)
+        self._co_evolution_task = asyncio.create_task(co_evolution_loop())
+        self._background_tasks.append(self._co_evolution_task)
+
+        # Swarm update loop
+        if self.config.enable_swarm_coordination and self.swarm_coordinator:
+            async def swarm_loop():
+                while True:
+                    try:
+                        await self.share_with_swarm()
+                        await asyncio.sleep(self.config.swarm_share_interval)
+                    except Exception as e:
+                        logger.error(f"Swarm update error: {e}")
+                        await asyncio.sleep(120)
+            t = asyncio.create_task(swarm_loop())
+            self._background_tasks.append(t)
+
+    # ========================================================================
+    # Swarm Coordination
+    # ========================================================================
+    async def share_with_swarm(self):
+        if not self.swarm_coordinator:
+            return
+        historical = await self.storage.get_historical_effectiveness()
+        payload = {
+            'orchestrator_id': hashlib.md5(str(historical).encode()).hexdigest()[:8],
+            'sustainability_score': self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5),
+            'milestones': len(await self.storage.get_milestones()),
+            'feedback_count': len(await self.storage.get_feedback()),
+            'historical_effectiveness': historical
+        }
+        await self.swarm_coordinator.share_predictions(payload)
+
+    # ========================================================================
+    # Main Co-Evolution Cycle
+    # ========================================================================
+    async def co_evolve(self) -> Dict[str, Any]:
+        """Main co-evolution cycle."""
+        self.telemetry.increment('co_evolution_cycles')
+
+        system_state = await self._collect_system_state()
+        human_feedback = await self.analyzer.aggregate_human_feedback_with_sentiment()
+        opportunities = await self.analyzer.identify_opportunities(system_state, human_feedback)
+
+        # Predictive opportunities (with circuit breakers)
+        predicted = await self._predict_opportunities(system_state)
+        if predicted:
+            opportunities.extend(predicted)
+
+        recommendations = await self.analyzer.generate_holistic_recommendations(system_state, opportunities)
+        historical = await self.storage.get_historical_effectiveness()
+        prioritized = self.prioritizer.prioritize_recommendations(recommendations, historical)
+
+        applied = await self._apply_recommendations(prioritized[:3])
+        impact = await self._measure_impact(applied)
+
+        # Record long-term impact
+        for item in applied:
+            if item.get('result', {}).get('success'):
+                area = item['recommendation'].get('area', 'general')
+                await self.impact_tracker.record_impact(
+                    area,
+                    item['result'],
+                    impact['metrics']['sustainability']
+                )
+                await self.storage.add_sustainability_score(impact['metrics']['sustainability'])
+
+        # Update performance history
+        await self.storage.add_performance_record({
+            'timestamp': datetime.now(timezone.utc),
+            'impact': impact
+        })
+
+        # Milestone detection
+        milestone = await self.analyzer.detect_milestone(impact)
+        if milestone:
+            logger.info(f"Milestone detected: {milestone.milestone_type} - {milestone.description}")
+
+        # Update historical effectiveness
+        for item in applied:
+            if item.get('result', {}).get('success'):
+                area = item['recommendation'].get('area', 'general')
+                eff = item.get('result', {}).get('effectiveness', 0.5)
+                await self.storage.update_historical_effectiveness(area, eff)
+
+        # Telemetry
+        self.telemetry.gauge('sustainability_score', impact['metrics']['sustainability'])
+        self.telemetry.gauge('performance_score', impact['metrics']['performance'])
+        self.telemetry.gauge('milestone_count', len(await self.storage.get_milestones()))
+
+        return {
+            'status': 'success' if applied else 'partial',
+            'recommendations_applied': applied,
+            'impact': impact,
+            'milestone': milestone.to_dict() if milestone else None,
+            'system_state': system_state,
+            'human_feedback_count': len(human_feedback),
+            'sustainability_trend': await self.analyzer.calculate_trend(),
+            'long_term_trend': self.impact_tracker.get_overall_trend()
+        }
+
+    async def _collect_system_state(self) -> Dict[str, Any]:
+        state = {'timestamp': datetime.now(timezone.utc).isoformat(), 'components': {}}
+        if self.quantum_benchmark:
+            try:
+                state['components']['quantum'] = await self._quantum_circuit.call(
+                    retry_async,
+                    self.quantum_benchmark.get_benchmark_summary,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+            except Exception as e:
+                logger.error(f"Quantum benchmark failed: {e}")
+                state['components']['quantum'] = {'error': str(e)}
+        if self.fft_moe:
+            try:
+                state['components']['moe'] = await self._moe_circuit.call(
+                    retry_async,
+                    self.fft_moe.get_fft_moe_status,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+            except Exception as e:
+                logger.error(f"FFT-MoE failed: {e}")
+                state['components']['moe'] = {'error': str(e)}
+        if self.helium_manager:
+            try:
+                state['components']['helium'] = await self._helium_circuit.call(
+                    retry_async,
+                    self.helium_manager.get_stats,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+            except Exception as e:
+                logger.error(f"Helium manager failed: {e}")
+                state['components']['helium'] = {'error': str(e)}
+        if self.federated_orchestrator:
+            try:
+                state['components']['federated'] = await self._federated_circuit.call(
+                    retry_async,
+                    self.federated_orchestrator.get_status,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+            except Exception as e:
+                logger.error(f"Federated orchestrator failed: {e}")
+                state['components']['federated'] = {'error': str(e)}
+        state['overall'] = self._calculate_system_metrics(state['components'])
+        state['long_term_trends'] = {}
+        for area in ['quantum', 'moe', 'sustainability', 'user_experience', 'federated']:
+            trend = self.impact_tracker.get_area_trend(area)
+            if trend.get('status') != 'insufficient_data':
+                state['long_term_trends'][area] = trend
+        return state
 
     def _calculate_system_metrics(self, components: Dict[str, Any]) -> Dict[str, float]:
         metrics = {'overall_health': 0.0, 'sustainability_score': 0.0, 'performance_score': 0.0, 'user_engagement': 0.0}
@@ -1378,26 +1391,86 @@ class EnhancedCoEvolutionEngine:
                                      metrics['user_engagement'] * 0.3)
         return metrics
 
-    def _update_evolution_state(self, impact: Dict[str, Any], feedback: List[Dict[str, Any]]):
-        self.performance_history.append({'timestamp': datetime.now(timezone.utc), 'impact': impact})
-        for user_id, user_model in self.user_models.items():
-            if impact['metrics'].get('user_satisfaction', 0) > 0.5:
-                user_model['trust_score'] = min(1.0, user_model.get('trust_score', 0.5) + 0.05)
-            else:
-                user_model['trust_score'] = max(0.0, user_model.get('trust_score', 0.5) - 0.02)
+    async def _predict_opportunities(self, system_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        opportunities = []
+        if not self.predictive_analyzer:
+            return opportunities
 
-    def _calculate_trend(self) -> str:
-        if len(self.sustainability_trajectory) < 10:
-            return "stable"
-        recent = list(self.sustainability_trajectory)[-10:]
-        avg_recent = np.mean(recent)
-        avg_older = np.mean(list(self.sustainability_trajectory)[-20:-10]) if len(self.sustainability_trajectory) >= 20 else avg_recent
-        if avg_recent > avg_older * 1.05:
-            return "improving"
-        elif avg_recent < avg_older * 0.95:
-            return "declining"
-        else:
-            return "stable"
+        # TimeTickEngine
+        if self.config.enable_time_tick_engine and self.tick_engine:
+            try:
+                forecast = self.tick_engine.get_helium_forecast(4)
+                if forecast and len(forecast) > 3:
+                    avg_future = np.mean(forecast)
+                    if avg_future < 0.3:
+                        opportunities.append({
+                            'area': 'sustainability',
+                            'type': 'predicted_constraint',
+                            'priority': 0.85,
+                            'suggestion': f'Helium scarcity predicted in 4 hours - proactive reduction needed',
+                            'expected_impact': 'Prevent critical helium shortage',
+                            'predicted': True,
+                            'timeframe_hours': 4
+                        })
+            except Exception as e:
+                logger.warning(f"TimeTickEngine forecast error: {e}")
+
+        # QuantumBridge
+        if self.config.enable_quantum_bridge and self.quantum_bridge:
+            try:
+                q_params = self.quantum_bridge.get_qubo_parameters()
+                penalty_helium = q_params.get('penalty_helium_shortage', 0.5)
+                if penalty_helium > 0.7:
+                    opportunities.append({
+                        'area': 'sustainability',
+                        'type': 'quantum_derived_opportunity',
+                        'priority': 0.8,
+                        'suggestion': 'QuantumBridge indicates high helium penalty - implement recovery',
+                        'expected_impact': '50% reduction in helium usage',
+                        'predicted': True
+                    })
+            except Exception as e:
+                logger.warning(f"QuantumBridge error: {e}")
+
+        # CostBenefitEngine
+        if self.config.enable_cost_benefit and self.cost_benefit_engine:
+            try:
+                analysis = await self.cost_benefit_engine.analyze_scenario('co_evolution', {})
+                if analysis.roi > 0.5:
+                    opportunities.append({
+                        'area': 'system_wide',
+                        'type': 'cost_benefit_derived',
+                        'priority': 0.7,
+                        'suggestion': f'System-wide optimization recommended (ROI: {analysis.roi:.2f})',
+                        'expected_impact': 'Overall performance uplift',
+                        'predicted': True
+                    })
+            except Exception as e:
+                logger.warning(f"CostBenefitEngine error: {e}")
+
+        # Predictive analyzer
+        if hasattr(self.predictive_analyzer, 'predict_federation_trend'):
+            try:
+                forecast = await self._predictive_circuit.call(
+                    retry_async,
+                    self.predictive_analyzer.predict_federation_trend,
+                    self.config.max_retries,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms
+                )
+                if forecast and forecast.get('predicted_sustainability_score', 0.5) < 0.4:
+                    opportunities.append({
+                        'area': 'federated',
+                        'type': 'predicted_performance_decline',
+                        'priority': 0.7,
+                        'suggestion': 'Federated learning sustainability predicted to decline - proactive optimization needed',
+                        'expected_impact': 'Prevent performance degradation',
+                        'predicted': True
+                    })
+            except Exception as e:
+                logger.warning(f"Predictive opportunity identification error: {e}")
+
+        return opportunities
 
     async def _apply_recommendations(self, recommendations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         applied = []
@@ -1418,7 +1491,7 @@ class EnhancedCoEvolutionEngine:
                 applied.append({'recommendation': rec, 'result': result, 'timestamp': datetime.now(timezone.utc).isoformat()})
             except Exception as e:
                 logger.error(f"Failed to apply recommendation: {e}")
-                applied.append({'recommendation': rec, 'result': {'success': False, 'error': str(e)}, 'timestamp': datetime.now(timezone.utc).isoformat()})
+                applied.append({'recommendation': rec, 'result': {'success': False, 'error': str(e)}})
         return applied
 
     async def _apply_quantum_optimization(self) -> Dict[str, Any]:
@@ -1464,113 +1537,14 @@ class EnhancedCoEvolutionEngine:
         return {'success': True, 'optimizations_applied': ['cache_clearing', 'model_pruning', 'data_compression'], 'effectiveness': 0.6}
 
     def _generate_recommendations(self, forecast: Dict[str, Any]) -> List[str]:
-        recs = []
         days = forecast.get('days_to_critical')
         if days is not None:
             if days <= 3:
-                recs.append("URGENT: Implement immediate helium reduction measures")
-                recs.append("Prioritize critical jobs only")
+                return ["URGENT: Implement immediate helium reduction measures", "Prioritize critical jobs only"]
             elif days <= 7:
-                recs.append("Accelerate helium efficiency improvements")
-                recs.append("Begin transitioning to helium-efficient operations")
-        return recs
+                return ["Accelerate helium efficiency improvements", "Begin transitioning to helium-efficient operations"]
+        return []
 
-    # ============================================================================
-    # Milestone Learning (unchanged)
-    # ============================================================================
-    def _detect_milestone(self, impact: Dict[str, Any]) -> Optional[EvolutionMilestone]:
-        strategy_sig = None
-        if impact['metrics']['sustainability'] > 0.8:
-            if impact['details']:
-                best = max(impact['details'], key=lambda x: x.get('effectiveness', 0))
-                strategy_sig = self._generate_strategy_signature(best['area'], [best['recommendation']])
-            milestone = EvolutionMilestone(
-                timestamp=datetime.now(timezone.utc),
-                milestone_type='breakthrough',
-                description='Achieved major sustainability improvement',
-                metrics=impact['metrics'],
-                human_feedback_count=len(self.feedback_history),
-                ai_suggestion_impact=0.9,
-                strategy_signature=strategy_sig
-            )
-        elif impact['metrics']['performance'] > 0.7 and impact['metrics']['user_satisfaction'] > 0.6:
-            if impact['details']:
-                best = max(impact['details'], key=lambda x: x.get('effectiveness', 0))
-                strategy_sig = self._generate_strategy_signature(best['area'], [best['recommendation']])
-            milestone = EvolutionMilestone(
-                timestamp=datetime.now(timezone.utc),
-                milestone_type='breakthrough',
-                description='System performance and user satisfaction at high levels',
-                metrics=impact['metrics'],
-                human_feedback_count=len(self.feedback_history),
-                ai_suggestion_impact=0.8,
-                strategy_signature=strategy_sig
-            )
-        elif len(self.performance_history) > 5:
-            recent = [h['impact']['metrics']['performance'] for h in list(self.performance_history)[-5:]
-                      if 'metrics' in h['impact']]
-            if len(recent) >= 3:
-                improvement = np.mean(recent[-3:]) - np.mean(recent[:3])
-                if improvement > 0.15:
-                    milestone = EvolutionMilestone(
-                        timestamp=datetime.now(timezone.utc),
-                        milestone_type='learning_spike',
-                        description=f'Performance improvement of {improvement:.1%} detected',
-                        metrics=impact['metrics'],
-                        human_feedback_count=len(self.feedback_history),
-                        ai_suggestion_impact=improvement
-                    )
-        elif len(self.sustainability_trajectory) > 10:
-            recent_trend = list(self.sustainability_trajectory)[-5:]
-            if np.std(recent_trend) < 0.1 and np.mean(recent_trend) > 0.6:
-                milestone = EvolutionMilestone(
-                    timestamp=datetime.now(timezone.utc),
-                    milestone_type='adaptation',
-                    description='System showing stable, high sustainability performance',
-                    metrics=impact['metrics'],
-                    human_feedback_count=len(self.feedback_history),
-                    ai_suggestion_impact=0.7
-                )
-
-        if milestone:
-            self.evolution_milestones.append(milestone)
-            self._learn_from_milestone(milestone)
-        return milestone
-
-    def _learn_from_milestone(self, milestone: EvolutionMilestone):
-        if milestone.strategy_signature:
-            if milestone.strategy_signature not in self.milestone_strategies:
-                self.milestone_strategies[milestone.strategy_signature] = []
-            self.milestone_strategies[milestone.strategy_signature].append({
-                'effectiveness': milestone.ai_suggestion_impact,
-                'timestamp': milestone.timestamp.isoformat(),
-                'context': milestone.description
-            })
-            area = self._extract_area_from_milestone(milestone)
-            if area:
-                self.historical_effectiveness[area] = milestone.ai_suggestion_impact
-        if milestone.ai_suggestion_impact > 0.7:
-            milestone.reuse_count += 1
-            logger.info(f"Milestone strategy {milestone.strategy_signature} marked for reuse (impact: {milestone.ai_suggestion_impact:.2f})")
-
-    def _extract_area_from_milestone(self, milestone: EvolutionMilestone) -> Optional[str]:
-        areas = ['quantum', 'moe', 'sustainability', 'user_experience', 'federated']
-        for area in areas:
-            if area in milestone.description.lower():
-                return area
-        return None
-
-    def _update_historical_effectiveness(self, applied: List[Dict[str, Any]]):
-        for item in applied:
-            if item.get('result', {}).get('success'):
-                area = item['recommendation'].get('area', 'general')
-                old = self.historical_effectiveness.get(area, 0.5)
-                new = item.get('result', {}).get('effectiveness', 0.5)
-                self.historical_effectiveness[area] = old * 0.7 + new * 0.3
-
-    # ============================================================================
-    # Impact Measurement (unchanged)
-    # ============================================================================
     async def _measure_impact(self, applied: List[Dict[str, Any]]) -> Dict[str, Any]:
         impact = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -1607,29 +1581,30 @@ class EnhancedCoEvolutionEngine:
         impact['long_term_trend'] = self.impact_tracker.get_overall_trend()
         return impact
 
-    # ============================================================================
-    # Public Query Methods (unchanged)
-    # ============================================================================
-    def get_evolution_status(self) -> Dict[str, Any]:
+    # ========================================================================
+    # Public Query Methods
+    # ========================================================================
+    async def get_evolution_status(self) -> Dict[str, Any]:
         return {
             'timestamp': datetime.now(timezone.utc).isoformat(),
-            'performance_history': len(self.performance_history),
-            'milestones': len(self.evolution_milestones),
-            'user_models': len(self.user_models),
-            'policy_suggestions': len(self.policy_suggestions),
-            'collaborative_decisions': len(self.collaborative_decisions),
+            'performance_history': len(await self.storage.get_performance_history()),
+            'milestones': len(await self.storage.get_milestones()),
+            'user_models': len(await self.storage.get_user_models()),
+            'policy_suggestions': len(await self.storage.get_policy_suggestions()),
+            'collaborative_decisions': len(await self.storage.get_collaborative_decisions()),
             'learning_rate': self.config.learning_rate,
             'exploration_rate': self.config.exploration_rate,
             'adaptation_threshold': self.config.adaptation_threshold,
-            'historical_effectiveness': self.historical_effectiveness,
-            'milestone_strategies': len(self.milestone_strategies),
+            'historical_effectiveness': await self.storage.get_historical_effectiveness(),
+            'milestone_strategies': len(await self.storage.get_milestone_strategies()),
             'long_term_trend': self.impact_tracker.get_overall_trend()
         }
 
-    def get_feedback_sentiment_summary(self) -> Dict[str, Any]:
-        if not self.feedback_history:
+    async def get_feedback_sentiment_summary(self) -> Dict[str, Any]:
+        feedback = await self.storage.get_feedback()
+        if not feedback:
             return {'status': 'no_feedback'}
-        sentiments = [fb.get('sentiment', {}).get('score', 0) for fb in self.feedback_history if 'sentiment' in fb]
+        sentiments = [fb.get('sentiment', {}).get('score', 0) for fb in feedback if 'sentiment' in fb]
         if not sentiments:
             return {'status': 'no_sentiment_data'}
         return {
@@ -1641,83 +1616,213 @@ class EnhancedCoEvolutionEngine:
             'trend': 'improving' if len(sentiments) > 10 and np.mean(sentiments[-5:]) > np.mean(sentiments[:5]) else 'stable'
         }
 
-    def get_milestone_summary(self) -> Dict[str, Any]:
-        if not self.evolution_milestones:
+    async def get_milestone_summary(self) -> Dict[str, Any]:
+        milestones = await self.storage.get_milestones()
+        if not milestones:
             return {'status': 'no_milestones'}
         types = defaultdict(int)
         impacts = []
-        for m in self.evolution_milestones:
+        for m in milestones:
             types[m.milestone_type] += 1
             impacts.append(m.ai_suggestion_impact)
         return {
-            'total_milestones': len(self.evolution_milestones),
+            'total_milestones': len(milestones),
             'types': dict(types),
             'average_impact': np.mean(impacts) if impacts else 0,
             'max_impact': max(impacts) if impacts else 0,
-            'reused_strategies': sum(1 for m in self.evolution_milestones if m.reuse_count > 0),
-            'most_recent': self.evolution_milestones[-1].to_dict() if self.evolution_milestones else None
+            'reused_strategies': sum(1 for m in milestones if m.reuse_count > 0),
+            'most_recent': milestones[-1].to_dict() if milestones else None
         }
 
-    # ============================================================================
-    # Milestone conversion helper (unchanged)
-    # ============================================================================
-    def _dict_to_milestone(self, d: Dict) -> Optional[EvolutionMilestone]:
-        try:
-            return EvolutionMilestone(
-                timestamp=datetime.fromisoformat(d['timestamp']),
-                milestone_type=d['milestone_type'],
-                description=d['description'],
-                metrics=d['metrics'],
-                human_feedback_count=d['human_feedback_count'],
-                ai_suggestion_impact=d['ai_suggestion_impact'],
-                strategy_signature=d.get('strategy_signature'),
-                reuse_count=d.get('reuse_count', 0),
-                effectiveness_history=d.get('effectiveness_history', [])
-            )
-        except Exception as e:
-            logger.error(f"Failed to reconstruct milestone: {e}")
-            return None
+    async def get_health_status(self) -> Dict[str, Any]:
+        return {
+            'status': self.health_status,
+            'last_error': self.last_error,
+            'score': min(1.0, self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5)),
+            'details': {
+                'injected_components': {
+                    'quantum_benchmark': self.quantum_benchmark is not None,
+                    'fft_moe': self.fft_moe is not None,
+                    'helium_manager': self.helium_manager is not None,
+                    'federated_orchestrator': self.federated_orchestrator is not None,
+                    'predictive_analyzer': self.predictive_analyzer is not None
+                },
+                'milestones': len(await self.storage.get_milestones()),
+                'feedback_count': len(await self.storage.get_feedback()),
+                'performance_samples': len(await self.storage.get_performance_history()),
+                'user_models': len(await self.storage.get_user_models()),
+                'persistence_enabled': self.persistence is not None,
+                'event_driven_active': self.config.enable_event_driven,
+                'self_healing_enabled': self.config.enable_self_healing,
+                'swarm_coordination_active': self.config.enable_swarm_coordination
+            }
+        }
 
-    # ============================================================================
-    # Self-Healing
-    # ============================================================================
+    async def get_telemetry_export(self) -> str:
+        return await self.telemetry.export()
+
+    # ========================================================================
+    # Persistence
+    # ========================================================================
+    async def save_state(self):
+        if self.persistence:
+            storage_dict = await self.storage.to_dict()
+            impact_dict = self.impact_tracker.to_dict()
+            state = {
+                'storage': storage_dict,
+                'impact_tracker': impact_dict,
+                'config': asdict(self.config)
+            }
+            await self.persistence.save_state(state)
+
+    async def load_state(self):
+        if self.persistence:
+            state = await self.persistence.load_state()
+            if state:
+                await self.storage.from_dict(state.get('storage', {}))
+                self.impact_tracker.from_dict(state.get('impact_tracker', {}))
+                # Restore config if needed (already set)
+                logger.info("State loaded successfully")
+
+    async def delete_state(self):
+        if self.persistence:
+            await self.persistence.delete_state()
+
+    # ========================================================================
+    # Self‑Healing
+    # ========================================================================
     async def self_heal(self):
         logger.info("CoEvolutionEngine self‑healing")
-        if self.enable_self_healing:
-            # Reset learning parameters
-            self.config.learning_rate = 0.01
-            self.config.exploration_rate = 0.1
-            self.config.adaptation_threshold = 0.7
-            # Clear stale feedback and performance history (keep last 10)
-            if len(self.feedback_history) > 10:
-                self.feedback_history = deque(list(self.feedback_history)[-10:], maxlen=self.config.feedback_history_limit)
-            if len(self.performance_history) > 10:
-                self.performance_history = deque(list(self.performance_history)[-10:], maxlen=self.config.performance_history_limit)
-            # Reset historical effectiveness
-            self.historical_effectiveness = {
-                'quantum': 0.5, 'moe': 0.5, 'sustainability': 0.5,
-                'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
-            }
-            # Reset health status
-            self.health_status = "healthy"
-            self.last_error = None
-            # Save state
-            await self.save_state()
-            logger.info("Self-healing completed")
+        if not self.config.enable_self_healing:
+            logger.warning("Self‑healing disabled")
+            return
 
-    # ============================================================================
+        # Reset learning parameters
+        self.config.learning_rate = 0.01
+        self.config.exploration_rate = 0.1
+        self.config.adaptation_threshold = 0.7
+
+        # Trim histories
+        feedback = await self.storage.get_feedback()
+        if len(feedback) > 10:
+            await self.storage.clear_feedback()
+            for fb in feedback[-10:]:
+                await self.storage.add_feedback(fb)
+
+        perf = await self.storage.get_performance_history()
+        if len(perf) > 10:
+            async with self.storage._lock:
+                self.storage.performance_history = deque(perf[-10:], maxlen=self.config.performance_history_limit)
+
+        # Reset historical effectiveness
+        await self.storage.reset_historical_effectiveness()
+
+        # Reset health
+        self.health_status = "healthy"
+        self.last_error = None
+
+        # Save state
+        await self.save_state()
+        logger.info("Self‑healing completed")
+
+    # ========================================================================
     # Shutdown
-    # ============================================================================
+    # ========================================================================
     async def shutdown(self):
-        """Graceful shutdown of the co-evolution engine."""
         logger.info("Shutting down Co-Evolution Engine")
         self._running = False
-        if self._co_evolution_task:
-            self._co_evolution_task.cancel()
-            try:
-                await self._co_evolution_task
-            except asyncio.CancelledError:
-                pass
+        # Cancel background tasks
+        for task in self._background_tasks:
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
         if self.persistence:
             await self.save_state()
         logger.info("Co-Evolution Engine shutdown complete")
+
+# ============================================================================
+# Main Entrypoint (for backward compatibility)
+# ============================================================================
+class EnhancedCoEvolutionEngine(CoEvolutionOrchestrator):
+    """
+    Legacy wrapper for backward compatibility.
+    """
+    def __init__(
+        self,
+        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        config: Optional[CoEvolutionConfig] = None,
+        **kwargs
+    ):
+        if config is None:
+            config = CoEvolutionConfig(**{k: v for k, v in kwargs.items() if k in CoEvolutionConfig.__annotations__})
+        self.config = config
+
+        # Create sub‑components
+        self.storage = CoEvolutionStorage(config)
+        self.sentiment = SentimentAnalyzer(config)
+        self.prioritizer = RecommendationPrioritizer(config)
+        self.impact_tracker = LongTermImpactTracker(config)
+        self.analyzer = CoEvolutionAnalyzer(config, self.storage, self.sentiment, self.prioritizer, self.impact_tracker)
+        self.telemetry = CoEvolutionTelemetry()
+        self.persistence = CoEvolutionPersistenceManager(config) if config.persistence_path else None
+
+        # Call parent constructor
+        super().__init__(
+            config,
+            self.storage,
+            self.analyzer,
+            self.prioritizer,
+            self.impact_tracker,
+            self.telemetry,
+            self.persistence,
+            bio_core
+        )
+
+        # Store bio‑core reference for event subscriptions
+        self.bio_core = bio_core
+        if bio_core:
+            self.event_broker = getattr(bio_core, 'event_broker', None)
+            self.self_healer = getattr(bio_core, 'self_healer', None)
+            self.workflow_orchestrator = getattr(bio_core, 'workflow_orchestrator', None)
+            self.swarm_coordinator = getattr(bio_core, 'swarm_coordinator', None)
+            self.tick_engine = getattr(bio_core, 'tick_engine', None)
+            self.quantum_bridge = getattr(bio_core, 'quantum_bridge', None)
+            self.cost_benefit_engine = getattr(bio_core, 'cost_benefit_engine', None)
+
+        # Initialize and start
+        self._subscribe_events()
+        self._start_background_tasks()
+        if self.persistence:
+            asyncio.create_task(self.load_state())
+
+        logger.info("Enhanced Co-Evolution Engine v5.0.0 initialized")
+
+    # Expose storage and analyzer methods for backward compatibility
+    def get_evolution_status(self) -> Dict[str, Any]:
+        return asyncio.run(super().get_evolution_status())
+
+    def get_feedback_sentiment_summary(self) -> Dict[str, Any]:
+        return asyncio.run(super().get_feedback_sentiment_summary())
+
+    def get_milestone_summary(self) -> Dict[str, Any]:
+        return asyncio.run(super().get_milestone_summary())
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        return await super().get_health_status()
+
+    async def get_telemetry_export(self) -> str:
+        return await super().get_telemetry_export()
+
+    async def save_state(self):
+        await super().save_state()
+
+    async def load_state(self):
+        await super().load_state()
+
+    async def delete_state(self):
+        await super().delete_state()
+
+    async def self_heal(self):
+        await super().self_heal()
+
+    async def shutdown(self):
+        await super().shutdown()
