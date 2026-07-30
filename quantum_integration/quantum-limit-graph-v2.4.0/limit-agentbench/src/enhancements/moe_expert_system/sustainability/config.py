@@ -1,16 +1,65 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Dict, List
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from typing import Optional, Dict, List, Literal
+from enum import Enum
 import os
 
+# ==============================================
+# Enums for compression methods and quantization
+# ==============================================
+
+class CompressionMethod(str, Enum):
+    STRUCTURED_PRUNING = "structured_pruning"
+    UNSTRUCTURED_PRUNING = "unstructured_pruning"
+    INT8_QUANT = "int8_quant"
+    HYBRID = "hybrid"
+    SVD = "svd"
+
+class QuantizationMethod(str, Enum):
+    INT8_DYNAMIC = "int8_dynamic"
+    INT8_STATIC = "int8_static"
+    FP16 = "fp16"
+
+# ==============================================
+# Enhanced Sustainability Configuration
+# ==============================================
+
 class SustainabilityConfig(BaseModel):
+    """
+    Configuration for sustainability‑aware model compression.
+    All fields can be overridden via environment variables with prefix SUSTAINABILITY_.
+    """
+
     # ========== General ==========
-    energy_threshold: float = Field(5.0, ge=0, description="Joules; triggers compression if exceeded")
-    accuracy_drop_tolerance: float = Field(0.02, ge=0, le=1, description="Max allowable absolute accuracy drop")
+    energy_threshold_joules: float = Field(
+        5.0,
+        ge=0,
+        description="Energy per inference in Joules; compression triggered if exceeded"
+    )
+    accuracy_drop_tolerance: float = Field(
+        0.02,
+        ge=0,
+        le=1,
+        description="Max allowable absolute accuracy drop after compression"
+    )
 
     # ========== Hardware & Energy ==========
-    hardware_profile: str = Field("default", description="default, gpu, cpu, tpu")
-    energy_per_mac: float = Field(0.5e-12, gt=0, description="pJ per MAC operation")
-    max_energy_joules: float = Field(10.0, gt=0, description="Used for normalization in fitness score")
+    hardware_profile: str = Field(
+        "default",
+        description="Name of the hardware profile to use (must exist in hardware_profiles)"
+    )
+    hardware_profiles: Dict[str, float] = Field(
+        default_factory=lambda: {
+            'default': 0.5e-12,
+            'gpu': 0.3e-12,
+            'cpu': 0.5e-12,
+            'tpu': 0.2e-12,
+        },
+        description="Mapping of profile names to energy per MAC (Joules)"
+    )
+    energy_normalization_max_joules: Optional[float] = Field(
+        None,
+        description="Maximum energy per inference used for normalization; if None, uses 2× energy_threshold_joules"
+    )
 
     # ========== Fitness Scoring ==========
     fitness_accuracy_weight: float = Field(0.6, ge=0, le=1)
@@ -20,24 +69,47 @@ class SustainabilityConfig(BaseModel):
     compression_bonus: float = Field(0.05, ge=0, le=0.5)
 
     # ========== Adaptive Weights ==========
-    use_adaptive_weights: bool = Field(True, description="Use AdaptiveCostFunction weights if available")
-    adaptive_learning_rate: float = Field(0.01, gt=0, le=1)
+    use_adaptive_weights: bool = Field(
+        True,
+        description="Use AdaptiveCostFunction weights if available"
+    )
+    adaptive_learning_rate: float = Field(
+        0.01,
+        gt=0,
+        le=1,
+        description="Learning rate for adaptive weight updates"
+    )
 
     # ========== Compression Strategies ==========
     pruning_sparsity: float = Field(0.3, ge=0, le=1)
     structured_pruning_enabled: bool = Field(True)
-    quantization_method: str = Field("int8_dynamic", description="int8_dynamic, int8_static, fp16")
+    quantization_method: QuantizationMethod = Field(QuantizationMethod.INT8_DYNAMIC)
     hybrid_pruning_sparsity: float = Field(0.2, ge=0, le=1)
-    compression_strategy_priority: List[str] = Field(
-        default=["structured_pruning", "unstructured_pruning", "int8_quant", "hybrid"],
-        description="Order in which methods are tried"
+    svd_rank_factor: float = Field(
+        0.5,
+        gt=0,
+        le=1,
+        description="Fraction of original rank to keep in SVD"
+    )
+    compression_strategy_priority: List[CompressionMethod] = Field(
+        default=[
+            CompressionMethod.STRUCTURED_PRUNING,
+            CompressionMethod.UNSTRUCTURED_PRUNING,
+            CompressionMethod.INT8_QUANT,
+            CompressionMethod.HYBRID,
+            CompressionMethod.SVD,
+        ],
+        description="Order in which compression methods are tried"
     )
 
     # ========== Carbon & Sustainability ==========
     carbon_aware_enabled: bool = Field(True)
     carbon_offset_enabled: bool = Field(False)
-    carbon_intensity_api_key: Optional[str] = Field(None)
-    carbon_region: str = Field("global")
+    carbon_intensity_api_key: Optional[str] = Field(
+        None,
+        description="API key for Electricity Map (required if carbon_aware_enabled)"
+    )
+    carbon_region: str = Field("global", description="Region code for carbon intensity API")
 
     # ========== Persistence ==========
     compressed_model_dir: str = Field("./compressed_models")
@@ -47,7 +119,12 @@ class SustainabilityConfig(BaseModel):
     # ========== Telemetry & Logging ==========
     log_compression_events: bool = Field(True)
     export_metrics: bool = Field(True)
-    prometheus_port: Optional[int] = Field(9090, ge=1024, le=65535)
+    prometheus_port: Optional[int] = Field(
+        9090,
+        ge=1024,
+        le=65535,
+        description="Port for Prometheus metrics; required if export_metrics=True"
+    )
 
     # ========== Integration Hooks ==========
     enable_anomaly_trigger: bool = Field(True)
@@ -55,26 +132,73 @@ class SustainabilityConfig(BaseModel):
     enable_auto_recompress: bool = Field(True)
     recompress_interval_seconds: int = Field(3600, ge=60)
 
-    # ========== Environment Variable Support ==========
-    class Config:
-        env_prefix = "SUSTAINABILITY_"
+    # ========== Versioning ==========
+    version: str = Field("1.0", description="Configuration schema version")
 
-    @field_validator('fitness_accuracy_weight', 'fitness_energy_weight', 'fitness_carbon_weight', 'fitness_material_weight')
-    @classmethod
-    def weights_sum_to_one(cls, v, values):
-        # Ensure the four weights sum to 1 (when all are provided)
-        weights = {
-            'accuracy': values.data.get('fitness_accuracy_weight', 0.6),
-            'energy': values.data.get('fitness_energy_weight', 0.4),
-            'carbon': values.data.get('fitness_carbon_weight', 0.1),
-            'material': values.data.get('fitness_material_weight', 0.05),
-        }
-        # Actually, since these are optional and have defaults, we can't enforce sum=1 because they are separate.
-        # Instead, we'll provide a method to normalize later.
-        return v
+    # Pydantic v2 configuration
+    model_config = ConfigDict(env_prefix="SUSTAINABILITY_")
+
+    # ---------- Validation ----------
+    @model_validator(mode='after')
+    def validate_carbon_api_key(self):
+        """Ensure API key is provided when carbon awareness is enabled."""
+        if self.carbon_aware_enabled and not self.carbon_intensity_api_key:
+            raise ValueError("carbon_intensity_api_key is required when carbon_aware_enabled is True")
+        return self
+
+    @model_validator(mode='after')
+    def validate_prometheus_port(self):
+        """Ensure Prometheus port is set when metrics export is enabled."""
+        if self.export_metrics and self.prometheus_port is None:
+            raise ValueError("prometheus_port is required when export_metrics is True")
+        return self
+
+    @model_validator(mode='after')
+    def validate_recompress_interval(self):
+        """Ensure recompression interval is reasonable when auto‑recompress is enabled."""
+        if self.enable_auto_recompress and self.recompress_interval_seconds < 60:
+            raise ValueError("recompress_interval_seconds must be at least 60 when enable_auto_recompress is True")
+        return self
+
+    @model_validator(mode='after')
+    def ensure_hardware_profile_exists(self):
+        """Ensure the selected hardware profile is defined in hardware_profiles."""
+        if self.hardware_profile not in self.hardware_profiles:
+            raise ValueError(f"hardware_profile '{self.hardware_profile}' not found in hardware_profiles")
+        return self
+
+    @model_validator(mode='after')
+    def normalize_fitness_weights(self):
+        """
+        Normalize fitness weights to sum to 1 and warn if they don't.
+        The original weights are preserved; the normalized versions are used in fitness scoring.
+        """
+        weights = [
+            self.fitness_accuracy_weight,
+            self.fitness_energy_weight,
+            self.fitness_carbon_weight,
+            self.fitness_material_weight,
+        ]
+        total = sum(weights)
+        if abs(total - 1.0) > 1e-6:
+            logger.warning(
+                f"Fitness weights sum to {total:.4f}, not 1. They will be normalized automatically."
+            )
+        return self
+
+    # ---------- Utility Methods ----------
+    def get_energy_per_mac(self) -> float:
+        """Get the energy per MAC for the selected hardware profile."""
+        return self.hardware_profiles.get(self.hardware_profile, self.hardware_profiles['default'])
+
+    def get_energy_normalization_max(self) -> float:
+        """Get the max energy value used for normalization."""
+        if self.energy_normalization_max_joules is not None:
+            return self.energy_normalization_max_joules
+        return self.energy_threshold_joules * 2.0
 
     def normalized_fitness_weights(self) -> Dict[str, float]:
-        """Return fitness weights that sum to 1."""
+        """Return fitness weights that sum to 1, based on the configured values."""
         weights = {
             'accuracy': self.fitness_accuracy_weight,
             'energy': self.fitness_energy_weight,
@@ -85,3 +209,34 @@ class SustainabilityConfig(BaseModel):
         if total > 0:
             return {k: v / total for k, v in weights.items()}
         return weights
+
+    # ---------- Serialization Helpers ----------
+    def to_dict(self) -> Dict:
+        """Export configuration as a dictionary (excluding None values)."""
+        return self.model_dump(exclude_none=True)
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SustainabilityConfig":
+        """Create a config instance from a dictionary."""
+        return cls(**data)
+
+    @classmethod
+    def from_env(cls) -> "SustainabilityConfig":
+        """Load configuration from environment variables (prefix SUSTAINABILITY_)."""
+        return cls()
+
+# ==============================================
+# Logger for warning messages
+# ==============================================
+import logging
+logger = logging.getLogger(__name__)
+
+# ==============================================
+# Convenience exports
+# ==============================================
+
+__all__ = [
+    "SustainabilityConfig",
+    "CompressionMethod",
+    "QuantizationMethod",
+]
