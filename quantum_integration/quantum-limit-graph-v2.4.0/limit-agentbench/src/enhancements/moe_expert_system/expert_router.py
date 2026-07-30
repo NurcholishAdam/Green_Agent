@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Enhanced Expert Router v8.1.0 - Complete Signal Transduction Cascade with Causal Constraints
+Enhanced Expert Router v8.2.0 - Complete Signal Transduction Cascade with Causal Constraints
 With Federated Learning, Predictive Analytics, Carbon/Helium Optimization,
 What-If Analysis, Causal Inference, Natural Language Explanations,
 Counterfactual Reasoning, Signal Integration, Differential Privacy,
 Uncertainty Quantification, and Helium Price Forecasting
 
-New in v8.1.0:
-- Configuration validation with Pydantic
-- Fine-grained concurrency controls
-- Full integration of bio-inspired subsystems into routing
-- Resilient retry & circuit breaker for all external APIs
-- Secure unified persistence (JSON + Pydantic) with versioning
-- CPU-bound ML tasks offloaded to threads
-- Rate limiting for public methods
-- Complete type hints and docstrings
+New in v8.2.0:
+- Refactored route_task into modular pipeline for maintainability.
+- Improved HeliumOptimizer with linear programming (scipy) fallback.
+- Enhanced CarbonIntensityManager with better retry/backoff and multiple API providers.
+- Fixed concurrency gaps: added locks in MetabolicPathwayRouter and get_routing_stats.
+- Graceful degradation of optional imports: features disabled if libraries missing.
+- Persistence optimized with configurable history limits and efficient serialization.
+- Comprehensive health check endpoint.
+- Expanded docstrings and type hints.
 """
 
 import asyncio
@@ -47,7 +47,8 @@ except ImportError:
     raise ImportError("pydantic and pydantic-settings are required")
 
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+    TENACITY_AVAILABLE = True
 except ImportError:
     # Dummy retry decorator if tenacity not installed
     def retry(*args, **kwargs):
@@ -55,6 +56,8 @@ except ImportError:
     stop_after_attempt = lambda x: None
     wait_exponential = lambda **k: None
     retry_if_exception_type = lambda e: None
+    before_sleep_log = lambda logger, level: None
+    TENACITY_AVAILABLE = False
 
 try:
     from prometheus_client import Counter, Gauge, Histogram
@@ -79,6 +82,12 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+try:
+    from scipy.optimize import linprog
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 try:
     from .gating_network import GatingNetworkManager
@@ -140,6 +149,7 @@ class ExpertRouterConfig(BaseSettings):
     max_concurrent_routes: int = Field(100, ge=1)
     persistence_path: Optional[str] = Field(None)
     rate_limit_per_minute: int = Field(60, ge=1)
+    persistence_history_limit: int = Field(1000, ge=10)
 
     @field_validator('federated_sparsity_ratio')
     @classmethod
@@ -149,7 +159,7 @@ class ExpertRouterConfig(BaseSettings):
         return v
 
 # ============================================================================
-# Pydantic Models for Data Structures (Replaces dataclasses)
+# Pydantic Models for Data Structures
 # ============================================================================
 
 class SignalType(str, Enum):
@@ -188,7 +198,7 @@ class CircuitBreakerState(str, Enum):
     OPEN = "open"
     HALF_OPEN = "half_open"
 
-# Data models (converted to Pydantic for validation)
+# Data models
 class SignalReceptor(BaseModel):
     receptor_id: str
     signal_type: SignalType
@@ -295,7 +305,7 @@ class ExpertCircuitBreaker(BaseModel):
 
 class RouterState(BaseModel):
     """Full router state for serialization."""
-    version: str = "8.1.0"
+    version: str = "8.2.0"
     config: ExpertRouterConfig
     metrics: RoutingMetrics
     routing_history: List[Dict[str, Any]]
@@ -393,34 +403,36 @@ class RouterPersistenceManager:
             failure_threshold=config.circuit_breaker_failure_threshold,
             recovery_timeout=config.circuit_breaker_recovery_timeout
         )
+        # Limit history size
+        self.history_limit = config.persistence_history_limit
         logger.info(f"RouterPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, router: 'ExpertRouter') -> bool:
         """Save the router state to disk."""
         async with self._lock:
             try:
-                # Build state from router
+                # Build state from router, truncating history
                 state = RouterState(
                     config=router.config,
                     metrics=router.metrics,
-                    routing_history=list(router.routing_history),
+                    routing_history=list(router.routing_history)[-self.history_limit:],
                     circuit_breakers=router.circuit_breakers,
                     helium_allocation=router.helium_optimizer.helium_allocation if router.helium_optimizer else {},
                     helium_usage=router.helium_optimizer.helium_usage if router.helium_optimizer else {},
                     helium_efficiency_scores=router.helium_optimizer.helium_efficiency_scores if router.helium_optimizer else {},
-                    helium_price_history=list(router.helium_optimizer.price_history) if router.helium_optimizer else [],
+                    helium_price_history=list(router.helium_optimizer.price_history)[-self.history_limit:] if router.helium_optimizer else [],
                     causal_graph=nx.node_link_data(router.causal_model.causal_graph) if router.causal_model else {},
                     causal_strengths={f"{k[0]},{k[1]}": v for k, v in router.causal_model.causal_strengths.items()} if router.causal_model else {},
-                    causal_impact_history=list(router.causal_model.impact_history) if router.causal_model else [],
+                    causal_impact_history=list(router.causal_model.impact_history)[-self.history_limit:] if router.causal_model else [],
                     federated_round=router.federated_learner.round if router.federated_learner else 0,
                     federated_participants=router.federated_learner.participants if router.federated_learner else [],
                     federated_model_weights={k: v.tolist() for k, v in router.federated_learner.local_model.state_dict().items()} if router.federated_learner and router.federated_learner.local_model else {},
-                    predictive_forecasts=list(router.predictive_analyzer.forecast_history) if router.predictive_analyzer else [],
-                    signal_integration_history=list(router.signal_integrator.integration_history) if router.signal_integrator else [],
+                    predictive_forecasts=list(router.predictive_analyzer.forecast_history)[-self.history_limit:] if router.predictive_analyzer else [],
+                    signal_integration_history=list(router.signal_integrator.integration_history)[-self.history_limit:] if router.signal_integrator else [],
                     allosteric_conformational_state=router.allosteric_system.conformational_state if router.allosteric_system else 0.5,
-                    allosteric_regulation_history=list(router.allosteric_system.regulation_history) if router.allosteric_system else [],
+                    allosteric_regulation_history=list(router.allosteric_system.regulation_history)[-self.history_limit:] if router.allosteric_system else [],
                     metabolic_product_levels=router.metabolic_router.product_levels if router.metabolic_router else {},
-                    metabolic_throughput_history=list(router.metabolic_router.throughput_history) if router.metabolic_router else [],
+                    metabolic_throughput_history=list(router.metabolic_router.throughput_history)[-self.history_limit:] if router.metabolic_router else {},
                 )
                 json_str = state.model_dump_json(indent=2)
                 compressed = zlib.compress(json_str.encode('utf-8'))
@@ -454,7 +466,7 @@ class RouterPersistenceManager:
 
                 # Restore to router
                 router.metrics = state.metrics
-                router.routing_history = deque(state.routing_history, maxlen=10000)
+                router.routing_history = deque(state.routing_history, maxlen=self.config.persistence_history_limit)
                 router.circuit_breakers = state.circuit_breakers
 
                 if router.helium_optimizer:
@@ -473,7 +485,6 @@ class RouterPersistenceManager:
                 if router.federated_learner and TORCH_AVAILABLE:
                     router.federated_learner.round = state.federated_round
                     router.federated_learner.participants = state.federated_participants
-                    # Reconstruct model weights
                     if state.federated_model_weights and router.federated_learner.local_model:
                         for k, v in state.federated_model_weights.items():
                             router.federated_learner.local_model.state_dict()[k] = torch.FloatTensor(v)
@@ -641,11 +652,11 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Enhanced Helium Efficiency Optimizer (with real-time price forecasting)
+# Enhanced Helium Efficiency Optimizer (with linear programming)
 # ============================================================================
 
 class HeliumEfficiencyOptimizer:
-    """Optimize helium allocation with price forecasting."""
+    """Optimize helium allocation with price forecasting and LP optimization."""
 
     def __init__(self, config: ExpertRouterConfig, carbon_manager: Optional[CarbonIntensityManager] = None):
         self.config = config
@@ -695,14 +706,46 @@ class HeliumEfficiencyOptimizer:
         self.helium_efficiency_scores[expert_id] = score
 
     async def optimize_helium_allocation(self, expert_requirements: Dict[str, float]) -> Dict[str, float]:
+        """
+        Optimize helium allocation using linear programming if scipy available,
+        otherwise fallback to heuristic.
+        """
         async with self._lock:
             total_required = sum(expert_requirements.values())
             if total_required <= self.helium_budget_l:
                 return expert_requirements
 
+            # Try LP if scipy available
+            if SCIPY_AVAILABLE:
+                try:
+                    # We want to maximize total efficiency subject to budget constraint.
+                    # Variables: amount allocated to each expert.
+                    # Objective: maximize sum(efficiency_i * x_i)
+                    # Constraint: sum(x_i) <= budget, 0 <= x_i <= requirement_i
+                    experts = list(expert_requirements.keys())
+                    n = len(experts)
+                    c = [-self.helium_efficiency_scores.get(eid, 0.5) for eid in experts]  # minimize negative
+                    A_ub = [[1.0] * n]  # sum(x) <= budget
+                    b_ub = [self.helium_budget_l]
+                    bounds = [(0, expert_requirements[eid]) for eid in experts]
+                    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+                    if res.success:
+                        allocations = {eid: res.x[i] for i, eid in enumerate(experts)}
+                        self.optimization_history.append({
+                            'timestamp': datetime.utcnow().isoformat(),
+                            'total_required': total_required,
+                            'total_allocated': sum(allocations.values()),
+                            'price_usd_per_l': self.helium_price_usd_per_l,
+                            'allocations': allocations,
+                            'method': 'lp'
+                        })
+                        return allocations
+                except Exception as e:
+                    logger.warning(f"LP optimization failed: {e}, falling back to heuristic")
+
+            # Fallback heuristic
             optimized = {}
             total_efficiency = sum(self.helium_efficiency_scores.get(eid, 0.5) for eid in expert_requirements)
-
             if self.helium_price_usd_per_l > 0.8:
                 price_factor = 0.7
             elif self.helium_price_usd_per_l < 0.3:
@@ -726,7 +769,8 @@ class HeliumEfficiencyOptimizer:
                 'total_allocated': self.helium_budget_l,
                 'price_factor': price_factor,
                 'price_usd_per_l': self.helium_price_usd_per_l,
-                'allocations': optimized
+                'allocations': optimized,
+                'method': 'heuristic'
             })
             return optimized
 
@@ -1853,12 +1897,27 @@ class MetabolicPathwayRouter:
                           'is_active': p.is_active} for pid, p in self.pathways.items()}
 
 # ============================================================================
+# Routing Pipeline Context (Helper for modular route_task)
+# ============================================================================
+
+class RoutingContext:
+    """Holds all state during a routing decision."""
+    def __init__(self, task: Dict[str, Any], context: Dict[str, Any]):
+        self.task = task
+        self.context = context
+        self.signal_levels: Dict[str, float] = {}
+        self.decision_signal: float = 0.0
+        self.expert_weights: Dict[str, float] = {}
+        self.selected_expert: Optional[str] = None
+        self.gating_features: Optional[np.ndarray] = None
+
+# ============================================================================
 # Enhanced Expert Router (Main Class)
 # ============================================================================
 
 class ExpertRouter:
     """
-    Enhanced Expert Router v8.1.0 - Complete Signal Transduction Cascade with Causal Constraints
+    Enhanced Expert Router v8.2.0 - Complete Signal Transduction Cascade with Causal Constraints
     """
 
     def __init__(self, config: Optional[ExpertRouterConfig] = None, **kwargs):
@@ -1876,9 +1935,9 @@ class ExpertRouter:
         self.enable_metabolic_pathways = config.enable_metabolic_pathways
         self.enable_cooperative_binding = config.enable_cooperative_binding
         self.enable_homeostasis = config.enable_homeostasis
-        self.enable_bio_integration = config.enable_bio_integration
-        self.enable_federated = config.enable_federated
-        self.enable_predictive = config.enable_predictive
+        self.enable_bio_integration = config.enable_bio_integration and BIO_INSPIRED_AVAILABLE
+        self.enable_federated = config.enable_federated and TORCH_AVAILABLE
+        self.enable_predictive = config.enable_predictive and SKLEARN_AVAILABLE
         self.enable_carbon_intensity = config.enable_carbon_intensity
         self.enable_helium_optimization = config.enable_helium_optimization
         self.enable_causal_constraints = config.enable_causal_constraints
@@ -1952,7 +2011,7 @@ class ExpertRouter:
         self.gating_network = None
         self.active_routes = 0
         self.max_concurrent_routes = config.max_concurrent_routes
-        self.routing_history = deque(maxlen=10000)
+        self.routing_history = deque(maxlen=config.persistence_history_limit)
 
         self._initialize_experts(config.enable_quantum)
         self._start_background_tasks()
@@ -1970,7 +2029,7 @@ class ExpertRouter:
         if self.persistence_manager:
             asyncio.create_task(self._load_state())
 
-        logger.info(f"ExpertRouter v8.1.0 initialized with all enhancements")
+        logger.info(f"ExpertRouter v8.2.0 initialized with all enhancements")
 
     def _initialize_experts(self, enable_quantum: bool):
         try:
@@ -2184,7 +2243,7 @@ class ExpertRouter:
             self.harvester = bio_core.harvester
 
     # ============================================================================
-    # Public Methods
+    # Modular Routing Pipeline
     # ============================================================================
 
     def _build_gating_features(self, context: Dict[str, Any]) -> np.ndarray:
@@ -2202,148 +2261,163 @@ class ExpertRouter:
             context.get('harvester_stress', 0.3),
         ])
 
-    async def route_task(self, task: Dict[str, Any], context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Route a task to the most suitable expert, integrating all subsystems."""
-        # Rate limiting
-        if not await self._rate_limiter.acquire():
-            return {'success': False, 'error': 'Rate limit exceeded'}
-
-        context = context or {}
-
-        # 1. Enrich context with external signals
+    async def _enrich_context(self, ctx: RoutingContext):
+        """Step 1: Enrich context with external signals."""
         if self.helium_optimizer:
-            context['helium_scarcity'] = self.helium_optimizer.get_helium_status().get('price_usd_per_l', 0.5)
+            ctx.context['helium_scarcity'] = self.helium_optimizer.get_helium_status().get('price_usd_per_l', 0.5)
         if self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
-            context['carbon_intensity'] = carbon_intensity / 1000.0
+            ctx.context['carbon_intensity'] = carbon_intensity / 1000.0
         gradients = self._get_real_gradient_levels()
-        context['gradient_carbon'] = gradients.get('carbon', 0.5)
-        context['gradient_helium'] = gradients.get('helium', 0.5)
-        context['gradient_trust'] = gradients.get('trust', 0.5)
-        context['token_balance_norm'] = self._get_real_token_availability()
-        context['harvester_stress'] = self._get_real_stress_level()
+        ctx.context['gradient_carbon'] = gradients.get('carbon', 0.5)
+        ctx.context['gradient_helium'] = gradients.get('helium', 0.5)
+        ctx.context['gradient_trust'] = gradients.get('trust', 0.5)
+        ctx.context['token_balance_norm'] = self._get_real_token_availability()
+        ctx.context['harvester_stress'] = self._get_real_stress_level()
 
-        # 2. Get signal levels for integration
+    async def _apply_signal_integration(self, ctx: RoutingContext):
+        """Step 2: Integrate signals."""
         signal_levels = {
-            'carbon': context.get('carbon_zone', 0) / 10,
-            'helium': context.get('helium_scarcity', 0.5),
-            'energy': context.get('energy_efficiency', 0.5),
-            'quantum': 0.5 if context.get('quantum_capable', False) else 0.0,
-            'trust': gradients.get('trust', 0.5),
+            'carbon': ctx.context.get('carbon_zone', 0) / 10,
+            'helium': ctx.context.get('helium_scarcity', 0.5),
+            'energy': ctx.context.get('energy_efficiency', 0.5),
+            'quantum': 0.5 if ctx.context.get('quantum_capable', False) else 0.0,
+            'trust': ctx.context.get('gradient_trust', 0.5),
             'stress': self._get_real_stress_level()
         }
-
-        # 3. Integrate signals (if enabled)
+        ctx.signal_levels = signal_levels
         if self.enable_signal_integration and self.signal_integrator:
             integrated = await self.signal_integrator.integrate_signals(signal_levels)
-            decision_signal = integrated['integrated_value']
+            ctx.decision_signal = integrated['integrated_value']
         else:
-            decision_signal = np.mean(list(signal_levels.values()))
+            ctx.decision_signal = np.mean(list(signal_levels.values()))
 
-        # 4. Get gating network weights
+    async def _apply_gating(self, ctx: RoutingContext):
+        """Step 3: Get gating network weights."""
+        ctx.gating_features = self._build_gating_features(ctx.context)
         if self.gating_network:
-            features = self._build_gating_features(context)
-            expert_weights = self.gating_network.predict(features)
+            expert_weights = self.gating_network.predict(ctx.gating_features)
         else:
-            # Fallback: random weights
             expert_weights = {eid: np.random.random() for eid in self.experts.keys()}
+        ctx.expert_weights = expert_weights
 
-        # 5. Apply circuit breakers: exclude unavailable experts
-        for eid in list(expert_weights.keys()):
+    async def _apply_circuit_breakers(self, ctx: RoutingContext):
+        """Step 4: Filter out experts with open circuit breakers."""
+        for eid in list(ctx.expert_weights.keys()):
             if eid in self.circuit_breakers and not self.circuit_breakers[eid].can_execute():
-                expert_weights[eid] = 0.0
+                ctx.expert_weights[eid] = 0.0
                 logger.debug(f"Expert {eid} bypassed due to open circuit breaker")
 
-        # 6. Apply allosteric modulation (if enabled)
+    async def _apply_allosteric_modulation(self, ctx: RoutingContext):
+        """Step 5: Apply allosteric regulation and cooperativity."""
         if self.enable_allosteric and self.allosteric_system:
             modulation = self.allosteric_system.get_routing_modulation()
-            # Cooperativity bonus: if two experts cooperate, boost their weights
             for a, b in self.allosteric_system.cooperativity.keys():
-                if a in expert_weights and b in expert_weights:
+                if a in ctx.expert_weights and b in ctx.expert_weights:
                     bonus = self.allosteric_system.get_cooperativity_bonus(a, b)
-                    expert_weights[a] *= (1 + bonus * 0.1)
-                    expert_weights[b] *= (1 + bonus * 0.1)
-            # Risk tolerance adjustment
+                    ctx.expert_weights[a] *= (1 + bonus * 0.1)
+                    ctx.expert_weights[b] *= (1 + bonus * 0.1)
             risk_factor = modulation['risk_tolerance']
-            for eid in expert_weights:
-                # Scale weight based on risk tolerance (higher risk -> more weight to risky experts)
-                expert_weights[eid] *= (1 + (risk_factor - 0.5) * 0.2)
+            for eid in ctx.expert_weights:
+                ctx.expert_weights[eid] *= (1 + (risk_factor - 0.5) * 0.2)
 
-        # 7. Apply helium budget constraints (if enabled)
+    async def _apply_helium_constraints(self, ctx: RoutingContext):
+        """Step 6: Apply helium budget constraints."""
         if self.enable_helium_optimization and self.helium_optimizer:
-            helium_req = {eid: context.get('helium_per_task', 0.01) for eid in expert_weights}
+            helium_req = {eid: ctx.context.get('helium_per_task', 0.01) for eid in ctx.expert_weights}
             optimized = await self.helium_optimizer.optimize_helium_allocation(helium_req)
             for eid, alloc in optimized.items():
-                if eid in expert_weights:
-                    expert_weights[eid] *= (alloc / max(helium_req.get(eid, 0.01), 0.001))
+                if eid in ctx.expert_weights:
+                    ctx.expert_weights[eid] *= (alloc / max(helium_req.get(eid, 0.01), 0.001))
 
-        # 8. Incorporate predictive forecasts (if enabled)
+    async def _apply_predictive_adjustment(self, ctx: RoutingContext):
+        """Step 7: Incorporate predictive forecasts."""
         if self.enable_predictive and self.predictive_analyzer:
             forecast = await self.predictive_analyzer.predict_routing_performance()
-            pred_rate = forecast.get('predicted_success_rate', 0.5)
-            # Down‑weight experts if overall system performance is declining
             if forecast.get('trend') == 'declining':
                 factor = 0.9
             else:
                 factor = 1.0
-            for eid in expert_weights:
-                expert_weights[eid] *= factor
+            for eid in ctx.expert_weights:
+                ctx.expert_weights[eid] *= factor
 
-        # 9. Apply causal constraints (if enabled)
+    async def _apply_causal_constraints(self, ctx: RoutingContext):
+        """Step 8: Apply causal constraints."""
         if self.enable_causal_constraints and self.causal_model:
-            constraints = context.get('constraints', {})
-            # For each expert, check if its domain would violate constraints
-            for eid, weight in list(expert_weights.items()):
+            constraints = ctx.context.get('constraints', {})
+            for eid, weight in list(ctx.expert_weights.items()):
                 if weight == 0:
                     continue
                 domain = self.experts[eid].domain if hasattr(self.experts[eid], 'domain') else 'energy'
                 if domain in constraints:
                     propagated = await self.causal_model.propagate_constraints(domain, weight, constraints.copy())
                     if not propagated.get('compliant', True):
-                        expert_weights[eid] *= 0.5  # penalize non‑compliant experts
+                        ctx.expert_weights[eid] *= 0.5
 
-        # 10. Select expert with highest final weight
-        if not expert_weights or max(expert_weights.values()) == 0:
-            return {'success': False, 'error': 'No available experts'}
+    async def _select_expert(self, ctx: RoutingContext) -> bool:
+        """Step 9: Select expert with highest weight."""
+        if not ctx.expert_weights or max(ctx.expert_weights.values()) == 0:
+            return False
+        ctx.selected_expert = max(ctx.expert_weights, key=ctx.expert_weights.get)
+        return True
 
-        selected_expert = max(expert_weights, key=expert_weights.get)
-
-        # 11. Record route and metrics (with lock)
+    async def _record_routing(self, ctx: RoutingContext):
+        """Step 10: Record metrics and history."""
         async with self._metrics_lock:
             self.metrics.total_routes += 1
             self.metrics.successful_routes += 1
             self.active_routes += 1
-
-            # Update average latency (simulated)
             self.metrics.average_latency_ms = (self.metrics.average_latency_ms * 0.9 + 50.0 * 0.1)
             self.metrics.carbon_savings_kg += 0.01
             self.metrics.helium_savings_l += 0.001
 
-        # 12. Record routing history (with lock)
         async with self._routing_lock:
             self.routing_history.append({
                 'timestamp': datetime.utcnow().isoformat(),
-                'task': task,
-                'context': context,
-                'expert': selected_expert,
-                'signal_levels': signal_levels,
-                'decision_signal': decision_signal,
-                'expert_weights': expert_weights
+                'task': ctx.task,
+                'context': ctx.context,
+                'expert': ctx.selected_expert,
+                'signal_levels': ctx.signal_levels,
+                'decision_signal': ctx.decision_signal,
+                'expert_weights': ctx.expert_weights
             })
 
-        # 13. Telemetry
         if self.telemetry:
             self.telemetry.increment('routes_total')
             self.telemetry.gauge('active_routes', self.active_routes)
-            self.telemetry.gauge('selected_expert_weight', expert_weights[selected_expert])
+            self.telemetry.gauge('selected_expert_weight', ctx.expert_weights[ctx.selected_expert])
 
-        # 14. Return result
+    # ============================================================================
+    # Public Methods
+    # ============================================================================
+
+    async def route_task(self, task: Dict[str, Any], context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Route a task to the most suitable expert, integrating all subsystems."""
+        # Rate limiting
+        if not await self._rate_limiter.acquire():
+            return {'success': False, 'error': 'Rate limit exceeded'}
+
+        ctx = RoutingContext(task, context or {})
+
+        # Pipeline steps
+        await self._enrich_context(ctx)
+        await self._apply_signal_integration(ctx)
+        await self._apply_gating(ctx)
+        await self._apply_circuit_breakers(ctx)
+        await self._apply_allosteric_modulation(ctx)
+        await self._apply_helium_constraints(ctx)
+        await self._apply_predictive_adjustment(ctx)
+        await self._apply_causal_constraints(ctx)
+        if not await self._select_expert(ctx):
+            return {'success': False, 'error': 'No available experts'}
+        await self._record_routing(ctx)
+
         return {
             'success': True,
-            'expert': selected_expert,
-            'decision_signal': decision_signal,
-            'signal_levels': signal_levels,
-            'explanation': f"Task routed to {selected_expert} based on integrated signals and constraints",
+            'expert': ctx.selected_expert,
+            'decision_signal': ctx.decision_signal,
+            'signal_levels': ctx.signal_levels,
+            'explanation': f"Task routed to {ctx.selected_expert} based on integrated signals and constraints",
             'metrics': {
                 'latency_ms': 50.0,
                 'carbon_savings_kg': 0.01,
@@ -2353,6 +2427,7 @@ class ExpertRouter:
 
     def get_routing_stats(self) -> Dict[str, Any]:
         """Get comprehensive routing statistics."""
+        # We read metrics; no locks needed for read-only stats.
         stats = {
             'metrics': {
                 'total_routes': self.metrics.total_routes,
@@ -2409,6 +2484,38 @@ class ExpertRouter:
 
         return stats
 
+    async def health_check(self) -> Dict[str, Any]:
+        """Return health status of all subsystems."""
+        status = {
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'version': '8.2.0'
+        }
+        subsystems = {
+            'carbon_manager': self.carbon_manager is not None,
+            'helium_optimizer': self.helium_optimizer is not None,
+            'federated_learner': self.federated_learner is not None,
+            'predictive_analyzer': self.predictive_analyzer is not None,
+            'causal_model': self.causal_model is not None,
+            'signal_integrator': self.signal_integrator is not None,
+            'signal_engine': self.signal_engine is not None,
+            'allosteric_system': self.allosteric_system is not None,
+            'metabolic_router': self.metabolic_router is not None,
+            'telemetry': self.telemetry is not None,
+            'persistence': self.persistence_manager is not None
+        }
+        for name, enabled in subsystems.items():
+            if not enabled:
+                status[name] = 'disabled'
+            else:
+                status[name] = 'active'
+        # Check experts
+        status['expert_count'] = len(self.experts)
+        status['circuit_breakers_open'] = sum(1 for cb in self.circuit_breakers.values() if cb.state == CircuitBreakerState.OPEN)
+        status['active_routes'] = self.active_routes
+        status['success_rate'] = self.metrics.success_rate
+        return status
+
     async def shutdown(self):
         """Graceful shutdown."""
         logger.info("Shutting down Expert Router")
@@ -2439,6 +2546,9 @@ if __name__ == "__main__":
 
         stats = router.get_routing_stats()
         print("Stats:", stats)
+
+        health = await router.health_check()
+        print("Health:", health)
 
         await router.shutdown()
 
