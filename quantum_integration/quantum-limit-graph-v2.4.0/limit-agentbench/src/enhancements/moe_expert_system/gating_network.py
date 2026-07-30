@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Gating Network Module for MoE Expert System v2.0.0
+Gating Network Module for MoE Expert System v2.1.0
 
 Enhanced with:
 - Complete type hints and docstrings
 - Concurrency controls (asyncio locks)
-- Secure JSON/Pydantic persistence
+- Secure JSON/Pydantic persistence with fallback (pickle)
 - Tenacity retries and circuit breaker (half-open)
 - Configurable model architecture
 - Weighted online learning buffer
-- Integration with carbon/helium managers
+- Integration with carbon/helium managers (real-time features)
 - Prometheus telemetry (optional)
 - Proper shutdown
+- Health check endpoint
+- Improved federated learning logic
+- Better error handling and validation
+- Mock federated server for testing (included)
 """
 
 import asyncio
@@ -20,6 +24,7 @@ import json
 import os
 import hashlib
 import zlib
+import pickle  # Added for fallback
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -39,6 +44,11 @@ except ImportError:
     aiohttp = None
 
 try:
+    import aiofiles
+except ImportError:
+    aiofiles = None
+
+try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 except ImportError:
     # Dummy retry decorator
@@ -55,7 +65,7 @@ except ImportError:
     BaseModel = None
 
 try:
-    from prometheus_client import Counter, Gauge, Histogram
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
@@ -320,7 +330,7 @@ class RateLimiter:
 if BaseModel is not None:
     class GatingNetworkState(BaseModel):
         """Serializable state for the gating network."""
-        version: str = "2.0.0"
+        version: str = "2.1.0"
         model_state_dict: Dict[str, Any]
         optimizer_state_dict: Dict[str, Any]
         training_data: List[Tuple[List[float], int]]
@@ -353,6 +363,7 @@ class GatingNetworkManager:
     - Integration with carbon/helium managers.
     - Prometheus telemetry (optional).
     - Secure persistence (JSON + Pydantic).
+    - Health check endpoint.
     """
 
     def __init__(
@@ -453,49 +464,64 @@ class GatingNetworkManager:
 
     def _start_prometheus_server(self):
         """Start Prometheus HTTP server."""
-        from prometheus_client import start_http_server
         start_http_server(self.config.prometheus_port)
         logger.info(f"Prometheus metrics server started on port {self.config.prometheus_port}")
 
     # ============================================================================
-    # Feature Engineering
+    # Feature Engineering (Enhanced with Carbon/Helium Managers)
     # ============================================================================
 
-    def _build_features(self, context: Dict[str, Any]) -> np.ndarray:
+    async def _build_features(self, context: Dict[str, Any]) -> np.ndarray:
         """
         Build feature vector from context for the gating network.
-        Integrates carbon/helium data if available.
+        Integrates carbon/helium data if available and enabled.
+        Raises ValueError if the context is malformed.
         """
         features = []
 
-        # Base features
-        features.append(context.get('helium_scarcity', 0.5))
-        features.append(context.get('helium_cost_index', 1.0))
-        features.append(context.get('carbon_intensity', 0.5))
-        features.append(context.get('model_loss', 0.0))
-        features.append(context.get('gradient_variance', 0.0))
-        features.append(context.get('avg_client_energy', 0.5))
-        features.append(context.get('gradient_carbon', 0.5))
-        features.append(context.get('gradient_helium', 0.5))
-        features.append(context.get('token_balance_norm', 0.5))
-        features.append(context.get('harvester_stress', 0.3))
+        # Base features with validation
+        expected_keys = [
+            'helium_scarcity', 'helium_cost_index', 'carbon_intensity',
+            'model_loss', 'gradient_variance', 'avg_client_energy',
+            'gradient_carbon', 'gradient_helium', 'token_balance_norm',
+            'harvester_stress'
+        ]
+        for key in expected_keys:
+            val = context.get(key)
+            if val is None:
+                logger.warning(f"Missing context key '{key}', using default 0.5")
+                val = 0.5
+            if not isinstance(val, (int, float)):
+                raise ValueError(f"Context key '{key}' must be numeric, got {type(val)}")
+            features.append(float(val))
+
+        # Integrate with carbon_manager (if available)
+        if self.config.enable_carbon_awareness and self.carbon_manager:
+            # Example: get real-time carbon intensity and add as feature
+            # In a real implementation, you might call an async method.
+            # For now, we'll use a placeholder: fetch current intensity if available.
+            try:
+                carbon_intensity = await self.carbon_manager.get_current_intensity()
+                # Append as an extra feature (beyond the default 10)
+                features.append(carbon_intensity / 1000.0)  # normalize
+            except Exception as e:
+                logger.warning(f"Failed to fetch carbon intensity: {e}")
+                features.append(0.5)
+
+        # Integrate with helium_optimizer
+        if self.config.enable_helium_awareness and self.helium_optimizer:
+            try:
+                helium_status = self.helium_optimizer.get_helium_status()
+                helium_price = helium_status.get('price_usd_per_l', 0.5)
+                features.append(helium_price)
+            except Exception as e:
+                logger.warning(f"Failed to fetch helium price: {e}")
+                features.append(0.5)
 
         # Optionally add causal features
         if self.config.enable_causal_features:
             features.append(context.get('causal_impact_carbon', 0.0))
             features.append(context.get('causal_impact_helium', 0.0))
-
-        # Integrate with carbon_manager (if available)
-        if self.config.enable_carbon_awareness and self.carbon_manager:
-            # Example: get real-time carbon intensity and add as feature
-            # This would be async; but we assume the context already has it,
-            # or we could call a synchronous method.
-            pass
-
-        # Integrate with helium_optimizer
-        if self.config.enable_helium_awareness and self.helium_optimizer:
-            # Example: get helium price trend
-            pass
 
         # Ensure correct dimension (pad or truncate)
         if len(features) != self.config.input_dim:
@@ -514,12 +540,13 @@ class GatingNetworkManager:
         """
         Predict expert weights for a given context.
         Returns a dict mapping expert_id to probability (softmax).
+        Raises RuntimeError if rate limited.
         """
         # Rate limiting (optional)
         if self.rate_limiter and not await self.rate_limiter.acquire():
             raise RuntimeError("Rate limit exceeded for inference")
 
-        features = self._build_features(context)
+        features = await self._build_features(context)
         features_tensor = torch.FloatTensor(features).unsqueeze(0)
 
         with torch.no_grad():
@@ -546,6 +573,12 @@ class GatingNetworkManager:
         Add a single training sample with recency weighting.
         The buffer maintains a deque; newer samples have higher weight during training.
         """
+        # Validate input
+        if features.shape[0] != self.config.input_dim:
+            raise ValueError(f"Feature dimension mismatch: expected {self.config.input_dim}, got {features.shape[0]}")
+        if not 0 <= label < self.config.num_experts:
+            raise ValueError(f"Label out of range: {label} (num_experts={self.config.num_experts})")
+
         if len(self.training_buffer) >= self.config.max_training_samples:
             # Remove the oldest sample (FIFO)
             self.training_buffer.popleft()
@@ -661,7 +694,7 @@ class GatingNetworkManager:
         return private
 
     # ============================================================================
-    # Federated Learning
+    # Federated Learning (Enhanced with correct round handling)
     # ============================================================================
 
     async def _get_federated_session(self) -> aiohttp.ClientSession:
@@ -683,7 +716,7 @@ class GatingNetworkManager:
 
             update_data = {
                 'router_id': 'gating_network',
-                'round': self.federated_round,
+                'round': self.federated_round,  # current round number
                 'weights': serialized,
                 'performance': performance_metric,
                 'privacy_epsilon': self.config.privacy_epsilon,
@@ -710,7 +743,7 @@ class GatingNetworkManager:
 
             try:
                 result = await self._circuit_breaker.call(_do_update)
-                self.federated_round += 1
+                # Note: we increment round only after successful global model fetch
                 self.contribution_score += performance_metric
                 return result
             except Exception as e:
@@ -741,13 +774,15 @@ class GatingNetworkManager:
         try:
             data = await self._circuit_breaker.call(_do_fetch)
             weights = data.get('weights', {})
-            self.federated_round = data.get('round', 0)
+            round_from_server = data.get('round', 0)
             self.participants = data.get('participants', [])
             if weights:
                 state_dict = {k: torch.FloatTensor(v) for k, v in weights.items()}
                 self.model.load_state_dict(state_dict)
                 self.global_model_state = state_dict
                 self.is_trained = True
+                # Update round only after successful fetch
+                self.federated_round = round_from_server
             return weights
         except Exception as e:
             logger.error(f"Global fetch failed after circuit breaker: {e}")
@@ -791,7 +826,7 @@ class GatingNetworkManager:
                     recent_samples = buffer_list[-100:]
                     await self.participate_in_round(recent_samples)
 
-                # Update Prometheus gauge
+                # Update Prometheus gauges
                 if self._prometheus_metrics:
                     self._prometheus_metrics['federated_round'].set(self.federated_round)
                     state_val = {
@@ -841,15 +876,18 @@ class GatingNetworkManager:
             }
 
     # ============================================================================
-    # Persistence (Secure JSON + Pydantic)
+    # Persistence (Secure JSON + Pydantic with fallback)
     # ============================================================================
 
     async def save_model(self, path: str):
         """
         Save model and training state to disk using JSON + Pydantic (if available).
         """
+        # Ensure pickle is imported for fallback
+        import pickle
+
         if BaseModel is None:
-            # Fallback to pickle (insecure, but better than nothing)
+            # Fallback to pickle
             logger.warning("Pydantic not available; using pickle for persistence")
             state = {
                 'model_state_dict': self.model.state_dict(),
@@ -891,14 +929,21 @@ class GatingNetworkManager:
 
         json_str = state.model_dump_json(indent=2)
         compressed = zlib.compress(json_str.encode('utf-8'))
-        async with aiofiles.open(path, 'wb') as f:
-            await f.write(compressed)
+        if aiofiles:
+            async with aiofiles.open(path, 'wb') as f:
+                await f.write(compressed)
+        else:
+            # Fallback to synchronous I/O
+            with open(path, 'wb') as f:
+                f.write(compressed)
         logger.info(f"Model saved to {path} (JSON)")
 
-    async def load_model(self, path: str):
+    async def load_model(self, path: str) -> bool:
         """
         Load model and training state from disk.
         """
+        import pickle  # Ensure pickle is available
+
         if not os.path.exists(path):
             logger.warning(f"Persistence file {path} not found")
             return False
@@ -920,10 +965,18 @@ class GatingNetworkManager:
             return True
 
         # JSON + Pydantic
-        async with aiofiles.open(path, 'rb') as f:
-            compressed = await f.read()
-        json_str = zlib.decompress(compressed).decode('utf-8')
-        state = GatingNetworkState.model_validate_json(json_str)
+        try:
+            if aiofiles:
+                async with aiofiles.open(path, 'rb') as f:
+                    compressed = await f.read()
+            else:
+                with open(path, 'rb') as f:
+                    compressed = f.read()
+            json_str = zlib.decompress(compressed).decode('utf-8')
+            state = GatingNetworkState.model_validate_json(json_str)
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return False
 
         # Convert lists back to tensors
         model_dict = {k: torch.FloatTensor(v) for k, v in state.model_state_dict.items()}
@@ -947,6 +1000,24 @@ class GatingNetworkManager:
         return True
 
     # ============================================================================
+    # Health Check
+    # ============================================================================
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Return health status of the gating network manager."""
+        return {
+            'status': 'healthy',
+            'is_trained': self.is_trained,
+            'circuit_breaker_state': self._circuit_breaker.state.value,
+            'federated_connected': self.config.server_url is not None and self._federated_session is not None,
+            'training_samples': len(self.training_buffer),
+            'federated_round': self.federated_round,
+            'participants': len(self.participants),
+            'inference_count': self.inference_count,
+            'training_count': self.training_count
+        }
+
+    # ============================================================================
     # Cleanup
     # ============================================================================
 
@@ -964,6 +1035,57 @@ class GatingNetworkManager:
         logger.info("Shutdown complete")
 
 # ============================================================================
+# Mock Federated Server (for testing)
+# ============================================================================
+
+class MockFederatedServer:
+    """
+    A simple mock federated server for testing the gating network's federated learning.
+    Run with: `python -m asyncio` and call `await server.start()`.
+    """
+    def __init__(self, host: str = "localhost", port: int = 8000):
+        self.host = host
+        self.port = port
+        self.global_weights = {}
+        self.participants = []
+        self.round = 0
+        self.updates = []
+
+    async def handle_update(self, request):
+        data = await request.json()
+        self.updates.append(data)
+        self.participants.append(data.get('router_id'))
+        # Simple aggregation: average weights
+        if self.global_weights:
+            # average with existing
+            for k, v in data['weights'].items():
+                self.global_weights[k] = (self.global_weights[k] + torch.FloatTensor(v)) / 2
+        else:
+            self.global_weights = {k: torch.FloatTensor(v) for k, v in data['weights'].items()}
+        self.round += 1
+        return aiohttp.web.json_response({'status': 'ok'})
+
+    async def handle_global(self, request):
+        weights_serialized = {k: v.tolist() for k, v in self.global_weights.items()}
+        return aiohttp.web.json_response({
+            'weights': weights_serialized,
+            'round': self.round,
+            'participants': self.participants
+        })
+
+    async def start(self):
+        from aiohttp import web
+        app = web.Application()
+        app.router.add_post('/federated/gating/update', self.handle_update)
+        app.router.add_get('/federated/gating/global', self.handle_global)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, self.host, self.port)
+        await site.start()
+        logger.info(f"Mock federated server started at http://{self.host}:{self.port}")
+        return runner
+
+# ============================================================================
 # Example Usage (if run directly)
 # ============================================================================
 
@@ -971,6 +1093,10 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     async def main():
+        # Optional: start mock federated server
+        # server = MockFederatedServer()
+        # runner = await server.start()
+
         config = GatingNetworkConfig(
             input_dim=10,
             num_experts=5,
@@ -997,6 +1123,9 @@ if __name__ == "__main__":
 
         # Save model
         await manager.save_model("gating_model.json.gz")
+
+        # Health check
+        print("Health:", await manager.get_health_status())
 
         await manager.shutdown()
 
