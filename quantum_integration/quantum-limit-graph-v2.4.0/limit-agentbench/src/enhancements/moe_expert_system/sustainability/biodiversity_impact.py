@@ -1,44 +1,46 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/biodiversity_impact_assessor.py
-# Enhanced version v3.0.0 – Full integration with bio‑inspired core, event‑driven, circuit breakers, self‑healing, and deep MoE/SEG integration
+# Enhanced version v4.0.0 – Refactored for maintainability, concurrency, and resilience
 
 """
-Enhanced Biodiversity Impact Assessment v3.0.0 - Complete Green Agent Implementation
-with full bio‑inspired core integration.
-
-New Features:
-- Event-driven integration via core EventBroker (carbon, helium, alerts, config)
-- Circuit breakers for all external services
-- Self-healing and reactive alert handling
-- Configuration reload via events
-- Swarm coordination via SwarmCoordinator
-- Integration with TimeTickEngine and QuantumBridge
-- Integration with CostBenefitEngine and PredictiveAlertSystem
-- Workflow orchestration triggers on threshold breaches
-- Deep MoE and Self-Evolving Gate integration with rich context
-- Enhanced telemetry and health monitoring
+Enhanced Biodiversity Impact Assessment v4.0.0 – Modular, event‑driven, and robust.
 """
 
 import asyncio
 import logging
-import numpy as np
-from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, Protocol
+import json
+import os
+import math
+import hashlib
+import random
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from enum import Enum
+from typing import Dict, Any, List, Optional, Tuple, Deque, Callable
 from collections import deque, defaultdict
-import hashlib
-import json
+import numpy as np
 import aiohttp
-import os
-import pickle
 import zlib
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import SGDRegressor
-from sklearn.metrics import r2_score, mean_squared_error
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+
+# Optional PyTorch
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("PyTorch not available; ML impact prediction will be disabled.")
+
+# Optional sklearn
+try:
+    from sklearn.linear_model import SGDRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -46,25 +48,15 @@ logger = logging.getLogger(__name__)
 # Bio-Inspired Core Import (with fallback)
 # ============================================================================
 try:
-    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker, Persistence
-    from enhancements.bio_inspired.eco_atp_currency import EcoATPTokenManager
-    from enhancements.bio_inspired.proton_gradient_fields import GradientFieldManager
-    from enhancements.bio_inspired.atp_synthase_scheduler import ATPSynthaseScheduler
-    from enhancements.bio_inspired.chromatophore_compartments import CompartmentManager
-    from enhancements.bio_inspired.biomass_storage import BiomassStorage
-    from enhancements.bio_inspired.photosynthetic_harvester import PhotosyntheticHarvester
-    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
-    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
+    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
     BIO_INSPIRED_AVAILABLE = True
 except ImportError:
     BIO_INSPIRED_AVAILABLE = False
-    # Fallback definitions
     class BioEvent:
         def __init__(self, event_type, source, data=None):
             self.event_type = event_type
             self.source = source
             self.data = data or {}
-
     class CircuitBreaker:
         def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
             self.name = name
@@ -78,7 +70,7 @@ except ImportError:
             return await func(*args, **kwargs)
 
 # ============================================================================
-# MoE and Self-Evolving Gate imports (optional)
+# MoE imports (optional)
 # ============================================================================
 try:
     from ..expert_router import ExpertRouter
@@ -87,813 +79,15 @@ try:
     MOE_AVAILABLE = True
 except ImportError:
     MOE_AVAILABLE = False
-    logger.warning("MoE Expert Router or Self-Evolving Gates not available - biodiversity assessor will operate standalone")
 
-# ============================================================================
-# Helium Provider Interface (unchanged)
-# ============================================================================
 class HeliumProvider:
     def get_scarcity(self) -> float: raise NotImplementedError
     def get_cost_index(self) -> float: raise NotImplementedError
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Configuration Dataclass (Enhanced)
+# Enums and Data Classes
 # ============================================================================
-
-@dataclass
-class BiodiversityConfig:
-    """Centralized configuration for the Biodiversity Impact Assessor."""
-    # Feature flags
-    enable_federated: bool = True
-    enable_carbon_intensity: bool = True
-    enable_predictive: bool = True
-    enable_ml_prediction: bool = True
-    enable_human_ai: bool = True
-    enable_persistence: bool = True
-    enable_telemetry: bool = True
-    enable_helium_tracking: bool = True
-    enable_event_driven: bool = True
-    enable_self_healing: bool = True
-    enable_swarm_coordination: bool = True
-    enable_time_tick_engine: bool = True
-    enable_quantum_bridge: bool = True
-    enable_cost_benefit: bool = True
-
-    # Retry and circuit breaker
-    max_retries: int = 3
-    retry_base_delay_ms: float = 100.0
-    retry_max_delay_ms: float = 5000.0
-    circuit_breaker_failure_threshold: int = 5
-    circuit_breaker_recovery_timeout: float = 30.0
-
-    # Predictive analyzer
-    predictive_history_window: int = 100
-
-    # ML impact predictor
-    ml_input_size: int = 10
-    ml_hidden_size: int = 64
-    ml_epochs: int = 100
-    ml_batch_size: int = 32
-
-    # Federated learning
-    server_url: Optional[str] = None
-    federated_sparsity_ratio: float = 0.1  # top-k% of data to keep
-
-    # Persistence
-    persistence_path: str = "biodiversity_state.pkl"
-
-    # Telemetry
-    telemetry_export_interval: int = 60
-
-    # Ecosystem configuration file (optional)
-    ecosystems_config_path: Optional[str] = None
-
-    # Helium-to-CO2 equivalence factor (kg CO2 per kg helium)
-    helium_to_co2_factor: float = 20.0
-
-    # Workflow triggers
-    workflow_on_critical_impact: str = "adjust_mitigation_strategy"
-    workflow_on_slo_breach: str = "relocate_computation"
-
-    # Swarm sharing interval
-    swarm_share_interval: int = 60
-
-# ============================================================================
-# Protocols for external modules (NEW)
-# ============================================================================
-
-class CarbonIntensityProvider(Protocol):
-    async def get_current_intensity(self) -> float: ...
-
-class HeliumTrackerProvider(Protocol):
-    def get_helium_position(self) -> Dict[str, Any]: ...
-
-# ============================================================================
-# Retry Helper (unchanged)
-# ============================================================================
-
-async def retry_async(
-    func: Callable,
-    max_retries: int,
-    base_delay_ms: float,
-    max_delay_ms: float,
-    *args,
-    **kwargs
-) -> Any:
-    """Retry an async function with exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
-            await asyncio.sleep(delay)
-    raise RuntimeError("Max retries exceeded")
-
-# ============================================================================
-# Carbon Intensity Manager (Enhanced with circuit breaker)
-# ============================================================================
-
-class CarbonIntensityManager:
-    """Real-time carbon intensity integration with retry, circuit breaker, and caching."""
-
-    def __init__(self, config: BiodiversityConfig):
-        self.config = config
-        self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
-        self.region = "us-east"
-        self.carbon_intensity = 0.0
-        self.last_update = None
-        self._lock = asyncio.Lock()
-        self._session = None
-        self.update_interval = 300
-        self.cache = {}
-        self.historical_intensities = deque(maxlen=1000)
-        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
-        self.circuit_breaker_threshold = config.circuit_breaker_failure_threshold
-        self.max_retries = config.max_retries
-        self._circuit = CircuitBreaker("carbon_api", failure_threshold=config.circuit_breaker_failure_threshold, recovery_timeout=config.circuit_breaker_recovery_timeout)
-        logger.info(f"CarbonIntensityManager initialized (region={self.region}, retries={self.max_retries})")
-
-    async def _get_session(self):
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
-        async def _fetch():
-            if region is not None:
-                self.region = region
-            if self.circuit_open:
-                if datetime.now(timezone.utc) < self.circuit_open_until:
-                    logger.warning("Circuit breaker open, using fallback data")
-                    return self._get_fallback_response()
-                else:
-                    self.circuit_open = False
-                    self.failure_count = 0
-                    logger.info("Circuit breaker reset for CarbonIntensityManager")
-            cache_key = f"{self.region}_{datetime.now(timezone.utc).hour}"
-            if cache_key in self.cache and self.last_update and (datetime.now(timezone.utc) - self.last_update).seconds < self.update_interval:
-                return self.cache[cache_key]
-            for attempt in range(self.max_retries):
-                try:
-                    session = await self._get_session()
-                    url = f"{self.endpoint}/latest?zone={self.region}"
-                    headers = {'auth-token': self.api_key} if self.api_key else {}
-                    async with session.get(url, headers=headers, timeout=10) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            self.carbon_intensity = data.get('carbonIntensity', 400)
-                            self.last_update = datetime.now(timezone.utc)
-                            self.cache[cache_key] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update.isoformat()}
-                            self.historical_intensities.append(self.carbon_intensity)
-                            self.failure_count = 0
-                            return {'intensity': self.carbon_intensity, 'region': self.region,
-                                    'timestamp': self.last_update.isoformat()}
-                        else:
-                            logger.warning(f"Carbon API returned {response.status}, attempt {attempt+1}")
-                            if attempt == self.max_retries - 1:
-                                self.failure_count += 1
-                                if self.failure_count >= self.circuit_breaker_threshold:
-                                    self.circuit_open = True
-                                    self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                                    logger.error("Circuit breaker opened for CarbonIntensityManager")
-                                return self._get_fallback_response()
-                            await asyncio.sleep(2 ** attempt)
-                except Exception as e:
-                    logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
-                    if attempt == self.max_retries - 1:
-                        self.failure_count += 1
-                        if self.failure_count >= self.circuit_breaker_threshold:
-                            self.circuit_open = True
-                            self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                        return self._get_fallback_response()
-                    await asyncio.sleep(2 ** attempt)
-            return self._get_fallback_response()
-        return await self._circuit.call(_fetch)
-
-    def _get_fallback_response(self) -> Dict:
-        fallback_intensities = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500}
-        intensity = fallback_intensities.get(self.region, 400)
-        self.carbon_intensity = intensity
-        self.last_update = datetime.now(timezone.utc)
-        return {'intensity': intensity, 'region': self.region,
-                'timestamp': self.last_update.isoformat(), 'is_fallback': True}
-
-    async def get_current_intensity(self) -> float:
-        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.update_interval:
-            await self.update_carbon_intensity(self.region)
-        return self.carbon_intensity
-
-    async def close(self):
-        if self._session:
-            await self._session.close()
-
-# ============================================================================
-# Helium Impact Tracker (unchanged)
-# ============================================================================
-
-class HeliumImpactTracker:
-    """Tracks helium usage and its biodiversity impact."""
-
-    def __init__(self, config: BiodiversityConfig):
-        self.config = config
-        self.helium_budget_l = 100.0
-        self.helium_usage: deque = deque(maxlen=86400)
-        self.helium_recovered: deque = deque(maxlen=86400)
-        self._running_total_usage = 0.0
-        self._running_total_recovered = 0.0
-        self.helium_to_co2_factor = config.helium_to_co2_factor
-
-        asyncio.create_task(self._helium_accounting_loop())
-        logger.info("HeliumImpactTracker initialized")
-
-    def record_helium_usage(self, amount_l: float, source: str = "unknown"):
-        usage = {'amount_l': amount_l, 'source': source, 'timestamp': datetime.now(timezone.utc)}
-        self.helium_usage.append(usage)
-        self._running_total_usage += amount_l
-
-    def record_helium_recovery(self, amount_l: float, source: str = "unknown"):
-        recovery = {'amount_l': amount_l, 'source': source, 'timestamp': datetime.now(timezone.utc)}
-        self.helium_recovered.append(recovery)
-        self._running_total_recovered += amount_l
-
-    async def _helium_accounting_loop(self):
-        while True:
-            try:
-                net_position = self._running_total_usage - self._running_total_recovered
-                remaining_budget = self.helium_budget_l - net_position
-                if remaining_budget < 0:
-                    logger.critical(f"Helium budget exceeded! Net position: {net_position:.2f} L")
-                elif remaining_budget < self.helium_budget_l * 0.2:
-                    logger.warning(f"Helium budget warning: {remaining_budget:.2f} L remaining")
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"Helium accounting error: {e}")
-                await asyncio.sleep(5)
-
-    def get_helium_position(self) -> Dict[str, Any]:
-        return {
-            'total_usage_l': self._running_total_usage,
-            'total_recovered_l': self._running_total_recovered,
-            'net_position_l': self._running_total_usage - self._running_total_recovered,
-            'remaining_budget_l': self.helium_budget_l - (self._running_total_usage - self._running_total_recovered),
-            'co2_equivalent_kg': (self._running_total_usage - self._running_total_recovered) * self.helium_to_co2_factor
-        }
-
-# ============================================================================
-# Predictive Biodiversity Analyzer (unchanged)
-# ============================================================================
-
-class PredictiveBiodiversityAnalyzer:
-    """Predictive reflexivity with online learning (SGD) for biodiversity impact."""
-
-    def __init__(self, config: BiodiversityConfig):
-        self.config = config
-        self.history_window = config.predictive_history_window
-        self.impact_history = deque(maxlen=self.history_window)
-        self.forecast_history = deque(maxlen=50)
-        self.scaler = StandardScaler()
-        self.model = None
-        self.is_trained = False
-        self._ml_available = False
-        self._init_model()
-
-    def _init_model(self):
-        try:
-            self.model = SGDRegressor(
-                learning_rate='constant',
-                eta0=0.01,
-                penalty='l2',
-                alpha=0.0001,
-                max_iter=1,
-                random_state=42,
-                warm_start=True
-            )
-            self._ml_available = True
-        except ImportError:
-            logger.warning("SGDRegressor not available; using fallback moving average")
-
-    def update_history(self, impact_data: Dict):
-        self.impact_history.append({
-            'timestamp': datetime.now(timezone.utc),
-            'total_impact': impact_data.get('total_impact', 0.5),
-            'habitat_impact': impact_data.get('habitat_score', 0.5),
-            'energy_impact': impact_data.get('energy_score', 0.5),
-            'cooling_impact': impact_data.get('cooling_score', 0.5),
-            'resource_impact': impact_data.get('resource_score', 0.5),
-            'carbon_intensity': impact_data.get('carbon_intensity', 400),
-            'ecosystem_sensitivity': impact_data.get('ecosystem_sensitivity', 0.5)
-        })
-
-    async def train_forecast_model(self):
-        if not self._ml_available:
-            return {'status': 'ml_not_available'}
-        if len(self.impact_history) < 10:
-            return {'status': 'insufficient_data', 'samples': len(self.impact_history)}
-
-        X, y = [], []
-        history_list = list(self.impact_history)
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['total_impact'],
-                    data['habitat_impact'],
-                    data['energy_impact'],
-                    data['cooling_impact'],
-                    data['resource_impact'],
-                    data['carbon_intensity'] / 100,
-                    data['ecosystem_sensitivity']
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['total_impact'])
-
-        X = np.array(X)
-        y = np.array(y)
-
-        if self.scaler.mean_ is None:
-            X_scaled = self.scaler.fit_transform(X)
-        else:
-            X_scaled = self.scaler.transform(X)
-
-        # Incremental training
-        for _ in range(3):
-            self.model.partial_fit(X_scaled, y)
-        self.is_trained = True
-
-        # Compute R2 for diagnostics
-        pred = self.model.predict(X_scaled)
-        r2 = r2_score(y, pred) if len(y) > 5 else 0.0
-        logger.info(f"Biodiversity model updated. R²={r2:.3f}")
-        return {'status': 'success', 'r2': r2, 'samples': len(X)}
-
-    async def predict_impact_trend(self, hours: int = 24) -> Dict:
-        if not self.is_trained or len(self.impact_history) < 10:
-            if len(self.impact_history) > 0:
-                recent = [h['total_impact'] for h in list(self.impact_history)[-5:]]
-                pred = np.mean(recent) if recent else 0.5
-                return {'predicted_impact': pred, 'confidence': 0.3, 'trend': 'moving_average'}
-            return {'predicted_impact': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
-
-        recent = list(self.impact_history)[-5:]
-        features = []
-        for data in recent:
-            features.extend([
-                data['total_impact'],
-                data['habitat_impact'],
-                data['energy_impact'],
-                data['cooling_impact'],
-                data['resource_impact'],
-                data['carbon_intensity'] / 100,
-                data['ecosystem_sensitivity']
-            ])
-        features = np.array(features).reshape(1, -1)
-
-        def predict():
-            if self.scaler.mean_ is not None:
-                features_scaled = self.scaler.transform(features)
-            else:
-                features_scaled = features
-            pred = self.model.predict(features_scaled)[0]
-            return pred
-
-        prediction = await asyncio.to_thread(predict)
-        confidence = min(0.9, 0.5 + 0.4 * (len(self.impact_history) / 100))
-
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
-            trend = "improving" if prediction < recent_forecasts[-1] else "declining" if prediction > recent_forecasts[-1] else "stable"
-        else:
-            trend = "stable"
-
-        self.forecast_history.append({'prediction': prediction, 'trend': trend})
-        return {
-            'predicted_impact': prediction,
-            'confidence': confidence,
-            'trend': trend,
-            'recommended_actions': self._generate_predictive_actions(prediction)
-        }
-
-    def _generate_predictive_actions(self, prediction: float) -> List[str]:
-        actions = []
-        if prediction > 0.7:
-            actions.append("URGENT: Implement immediate biodiversity protection measures")
-            actions.append("Relocate computation to lower-impact areas")
-        elif prediction > 0.5:
-            actions.append("Optimize energy and cooling strategies")
-            actions.append("Invest in habitat restoration offsets")
-        elif prediction > 0.3:
-            actions.append("Monitor ecosystem health closely")
-        else:
-            actions.append("Current practices are sustainable - maintain standards")
-        return actions
-
-# ============================================================================
-# Federated Biodiversity Assessor (unchanged)
-# ============================================================================
-
-class FederatedBiodiversityAssessor:
-    """Federated reflexive learning with compression and retry."""
-
-    def __init__(self, config: BiodiversityConfig):
-        self.config = config
-        self.server_url = config.server_url
-        self.round = 0
-        self.local_impacts = {}
-        self.global_impacts = {}
-        self.participants = []
-        self.contribution_scores = {}
-        self._lock = asyncio.Lock()
-        self._session = None
-        self.sparsity_ratio = config.federated_sparsity_ratio
-        self.failure_count = 0
-        self.circuit_open = False
-        self.circuit_open_until: Optional[datetime] = None
-        self._circuit = CircuitBreaker("federated_server", failure_threshold=config.circuit_breaker_failure_threshold, recovery_timeout=config.circuit_breaker_recovery_timeout)
-        logger.info("FederatedBiodiversityAssessor initialized")
-
-    async def _get_session(self):
-        if self._session is None and self.server_url:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    def _compress_impact_data(self, data: Dict) -> Dict:
-        if self.sparsity_ratio == 1.0:
-            return data
-        numeric_items = {k: v for k, v in data.items() if isinstance(v, (int, float))}
-        if not numeric_items:
-            return data
-        sorted_items = sorted(numeric_items.items(), key=lambda x: abs(x[1]), reverse=True)
-        k = max(1, int(len(sorted_items) * self.sparsity_ratio))
-        kept_keys = {item[0] for item in sorted_items[:k]}
-        compressed = {k: v for k, v in data.items() if k in kept_keys or not isinstance(v, (int, float))}
-        return compressed
-
-    async def send_local_impact(self, participant_id: str, impact_data: Dict, performance: float = 1.0) -> Dict:
-        if not self.server_url:
-            return {'status': 'local'}
-        if self.circuit_open:
-            if datetime.now(timezone.utc) < self.circuit_open_until:
-                logger.warning("Circuit breaker open, skipping send")
-                return {'status': 'circuit_open'}
-            else:
-                self.circuit_open = False
-                self.failure_count = 0
-        async def _send():
-            for attempt in range(self.config.max_retries):
-                try:
-                    async with self._lock:
-                        session = await self._get_session()
-                        compressed = self._compress_impact_data(impact_data)
-                        update_data = {
-                            'participant_id': participant_id,
-                            'round': self.round,
-                            'impact_data': compressed,
-                            'performance': performance,
-                            'sparsity_ratio': self.sparsity_ratio,
-                            'timestamp': datetime.now(timezone.utc).isoformat()
-                        }
-                        async with session.post(
-                            f"{self.server_url}/federated/biodiversity",
-                            json=update_data,
-                            timeout=30
-                        ) as response:
-                            if response.status == 200:
-                                result = await response.json()
-                                self.round += 1
-                                self.contribution_scores[participant_id] = performance
-                                self.failure_count = 0
-                                return result
-                            else:
-                                logger.warning(f"Federated send failed (attempt {attempt+1}): {response.status}")
-                except Exception as e:
-                    logger.error(f"Federated send error (attempt {attempt+1}): {e}")
-                await asyncio.sleep(2 ** attempt)
-            self.failure_count += 1
-            if self.failure_count >= self.config.circuit_breaker_failure_threshold:
-                self.circuit_open = True
-                self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=self.config.circuit_breaker_recovery_timeout)
-                logger.error("Circuit breaker opened for FederatedBiodiversityAssessor")
-            return {'status': 'failed'}
-        return await self._circuit.call(_send)
-
-    async def get_global_impacts(self) -> Optional[Dict]:
-        if not self.server_url:
-            return self.global_impacts
-        async def _fetch():
-            for attempt in range(self.config.max_retries):
-                try:
-                    async with self._lock:
-                        session = await self._get_session()
-                        async with session.get(
-                            f"{self.server_url}/federated/biodiversity/global",
-                            timeout=30
-                        ) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                self.global_impacts = data.get('impacts', {})
-                                self.participants = data.get('participants', [])
-                                return self.global_impacts
-                            else:
-                                logger.warning(f"Global fetch failed (attempt {attempt+1}): {response.status}")
-                except Exception as e:
-                    logger.error(f"Global fetch error (attempt {attempt+1}): {e}")
-                await asyncio.sleep(2 ** attempt)
-            return None
-        return await self._circuit.call(_fetch)
-
-    def aggregate_impacts(self, peer_impacts: List[Dict], weights: Dict[str, float] = None) -> Dict:
-        if not peer_impacts:
-            return {}
-        aggregated = {}
-        if weights is None:
-            weights = {i: 1.0 for i in range(len(peer_impacts))}
-        for key in peer_impacts[0].keys():
-            if isinstance(peer_impacts[0][key], (int, float)):
-                total = 0.0
-                total_weight = 0.0
-                for i, peer in enumerate(peer_impacts):
-                    if key in peer:
-                        total += peer[key] * weights.get(i, 1.0)
-                        total_weight += weights.get(i, 1.0)
-                aggregated[key] = total / max(total_weight, 0.001)
-            else:
-                values = [peer.get(key) for peer in peer_impacts if key in peer]
-                if values:
-                    aggregated[key] = max(set(values), key=values.count)
-        return aggregated
-
-    def get_federated_stats(self) -> Dict:
-        return {
-            'round': self.round,
-            'participants': len(self.participants),
-            'has_global_impacts': bool(self.global_impacts),
-            'contribution_scores': self.contribution_scores,
-            'sparsity_ratio': self.sparsity_ratio,
-            'circuit_open': self.circuit_open
-        }
-
-    async def close(self):
-        if self._session:
-            await self._session.close()
-
-# ============================================================================
-# ML Impact Predictor (unchanged)
-# ============================================================================
-
-class MLImpactPredictor:
-    """Machine learning-based impact prediction with incremental training and checkpointing."""
-
-    def __init__(self, config: BiodiversityConfig):
-        self.config = config
-        self.input_size = config.ml_input_size
-        self.hidden_size = config.ml_hidden_size
-        self.model = None
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        self.optimizer = None
-        self.criterion = nn.MSELoss()
-        self.training_history: List[float] = []
-        self._init_model()
-
-    def _init_model(self):
-        class ImpactPredictor(nn.Module):
-            def __init__(self, input_size, hidden_size):
-                super().__init__()
-                self.network = nn.Sequential(
-                    nn.Linear(input_size, hidden_size),
-                    nn.ReLU(),
-                    nn.BatchNorm1d(hidden_size),
-                    nn.Linear(hidden_size, hidden_size // 2),
-                    nn.ReLU(),
-                    nn.BatchNorm1d(hidden_size // 2),
-                    nn.Linear(hidden_size // 2, 1)
-                )
-            def forward(self, x):
-                return self.network(x)
-
-        self.model = ImpactPredictor(self.input_size, self.hidden_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-
-    async def train_model(self, training_data: List[Dict], epochs: Optional[int] = None) -> Dict:
-        if len(training_data) < 20:
-            return {'status': 'insufficient_data', 'samples': len(training_data)}
-
-        epochs = epochs or self.config.ml_epochs
-
-        X = []
-        y = []
-        for item in training_data:
-            X.append([
-                item.get('carbon_intensity', 400) / 100,
-                item.get('energy_intensity', 0.5),
-                item.get('cooling_intensity', 0.5),
-                item.get('resource_intensity', 0.5),
-                item.get('ecosystem_sensitivity', 0.5),
-                item.get('proximity_factor', 0.5),
-                item.get('fragmentation_index', 0.5),
-                item.get('species_density', 0.5),
-                item.get('water_scarcity', 0.5),
-                item.get('temperature_anomaly', 0.5)
-            ])
-            y.append(item.get('total_impact', 0.5))
-
-        X = np.array(X)
-        y = np.array(y)
-
-        if self.scaler.mean_ is None:
-            X_scaled = self.scaler.fit_transform(X)
-        else:
-            X_scaled = self.scaler.transform(X)
-
-        dataset = TensorDataset(
-            torch.FloatTensor(X_scaled),
-            torch.FloatTensor(y).unsqueeze(1)
-        )
-        dataloader = DataLoader(dataset, batch_size=self.config.ml_batch_size, shuffle=True)
-
-        self.model.train()
-        losses = []
-        for epoch in range(epochs):
-            epoch_loss = 0
-            for batch_X, batch_y in dataloader:
-                self.optimizer.zero_grad()
-                output = self.model(batch_X)
-                loss = self.criterion(output, batch_y)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                epoch_loss += loss.item()
-            losses.append(epoch_loss / len(dataloader))
-            if (epoch + 1) % 20 == 0:
-                logger.debug(f"ML Training Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
-
-        self.is_trained = True
-        self.training_history.extend(losses)
-        if len(self.training_history) > 1000:
-            self.training_history = self.training_history[-1000:]
-
-        return {'status': 'success', 'loss': np.mean(losses), 'samples': len(X)}
-
-    async def predict_impact(self, scenario: Dict) -> Dict:
-        if not self.is_trained:
-            return {'predicted_impact': 0.5, 'confidence': 0.0, 'status': 'model_not_trained'}
-
-        features = np.array([[
-            scenario.get('carbon_intensity', 400) / 100,
-            scenario.get('energy_intensity', 0.5),
-            scenario.get('cooling_intensity', 0.5),
-            scenario.get('resource_intensity', 0.5),
-            scenario.get('ecosystem_sensitivity', 0.5),
-            scenario.get('proximity_factor', 0.5),
-            scenario.get('fragmentation_index', 0.5),
-            scenario.get('species_density', 0.5),
-            scenario.get('water_scarcity', 0.5),
-            scenario.get('temperature_anomaly', 0.5)
-        ]])
-        features_scaled = self.scaler.transform(features)
-
-        self.model.eval()
-        with torch.no_grad():
-            prediction = self.model(torch.FloatTensor(features_scaled)).numpy()[0, 0]
-
-        confidence = 0.8 if self.is_trained else 0.0
-        return {
-            'predicted_impact': float(prediction),
-            'confidence': confidence,
-            'status': 'success'
-        }
-
-    def get_model_checkpoint(self) -> Dict:
-        return {
-            'state_dict': self.model.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'scaler_mean': self.scaler.mean_.tolist() if self.scaler.mean_ is not None else None,
-            'scaler_std': self.scaler.scale_.tolist() if self.scaler.scale_ is not None else None,
-            'is_trained': self.is_trained,
-            'training_history': self.training_history
-        }
-
-    def load_checkpoint(self, checkpoint: Dict):
-        self.model.load_state_dict(checkpoint['state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        if checkpoint.get('scaler_mean') is not None:
-            self.scaler.mean_ = np.array(checkpoint['scaler_mean'])
-            self.scaler.scale_ = np.array(checkpoint['scaler_std'])
-        self.is_trained = checkpoint.get('is_trained', False)
-        self.training_history = checkpoint.get('training_history', [])
-
-# ============================================================================
-# Human-AI Collaborative Biodiversity (unchanged)
-# ============================================================================
-
-class HumanAICollaborativeBiodiversity:
-    """Human-AI collaborative reflection for biodiversity impact."""
-
-    def __init__(self):
-        self.feedback_history = deque(maxlen=1000)
-        self.reflection_logs = deque(maxlen=100)
-        self.user_preferences = {}
-        self._lock = asyncio.Lock()
-
-    def collect_feedback(self, user_id: str, feedback: Dict) -> Dict:
-        feedback_entry = {'user_id': user_id, 'timestamp': datetime.now(timezone.utc), 'feedback': feedback}
-        self.feedback_history.append(feedback_entry)
-        if 'preference' in feedback:
-            self.user_preferences[user_id] = feedback['preference']
-        reflection = self._generate_reflection(feedback)
-        self.reflection_logs.append(reflection)
-        return reflection
-
-    def _generate_reflection(self, feedback: Dict) -> Dict:
-        reflection = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'acknowledgment': f"Feedback received on {feedback.get('topic', 'biodiversity impact')}",
-            'insights': [],
-            'actions': [],
-            'biodiversity_insights': []
-        }
-        if 'concern' in feedback:
-            if feedback['concern'] == 'habitat':
-                reflection['insights'].append("Habitat impact can be reduced through location optimization")
-                reflection['actions'].append("Relocate computation to lower-impact areas")
-            elif feedback['concern'] == 'energy':
-                reflection['insights'].append("Energy source significantly affects biodiversity")
-                reflection['actions'].append("Switch to renewable energy sources")
-            elif feedback['concern'] == 'cooling':
-                reflection['insights'].append("Cooling method impacts local water ecosystems")
-                reflection['actions'].append("Implement water-free cooling solutions")
-            elif feedback['concern'] == 'biodiversity':
-                reflection['biodiversity_insights'].append("Biodiversity impact requires holistic assessment")
-                reflection['actions'].append("Implement comprehensive biodiversity monitoring")
-        if 'suggestion' in feedback:
-            reflection['actions'].append(f"Implementing suggestion: {feedback['suggestion']}")
-            reflection['insights'].append("User suggestion incorporated into improvement plan")
-        reflection['action_items'] = self._prioritize_actions(reflection['actions'])
-        return reflection
-
-    def _prioritize_actions(self, actions: List[str]) -> List[Dict]:
-        priorities = []
-        for action in actions:
-            if any(keyword in action.lower() for keyword in ['urgent', 'critical', 'immediate']):
-                priority = 'high'
-                impact = 0.9
-                effort = 'high'
-            elif any(keyword in action.lower() for keyword in ['biodiversity', 'habitat', 'ecosystem']):
-                priority = 'high'
-                impact = 0.8
-                effort = 'medium'
-            elif any(keyword in action.lower() for keyword in ['carbon', 'energy']):
-                priority = 'medium'
-                impact = 0.6
-                effort = 'medium'
-            else:
-                priority = 'low'
-                impact = 0.3
-                effort = 'low'
-            priorities.append({
-                'action': action,
-                'priority': priority,
-                'impact': impact,
-                'estimated_effort': effort,
-                'biodiversity_weight': impact
-            })
-        return sorted(priorities, key=lambda x: (x['impact'], x['biodiversity_weight']), reverse=True)
-
-    def get_collaborative_insights(self) -> Dict:
-        if len(self.feedback_history) < 5:
-            return {'status': 'insufficient_feedback'}
-        recent_feedback = list(self.feedback_history)[-20:]
-        topics = {}
-        biodiversity_concerns = {}
-        for f in recent_feedback:
-            topic = f['feedback'].get('topic', 'general')
-            topics[topic] = topics.get(topic, 0) + 1
-            if 'concern' in f['feedback']:
-                concern = f['feedback']['concern']
-                biodiversity_concerns[concern] = biodiversity_concerns.get(concern, 0) + 1
-        most_common = max(topics.items(), key=lambda x: x[1]) if topics else ('none', 0)
-        top_concern = max(biodiversity_concerns.items(), key=lambda x: x[1]) if biodiversity_concerns else ('none', 0)
-        return {
-            'total_feedback': len(self.feedback_history),
-            'top_topics': topics,
-            'most_common_topic': most_common[0],
-            'biodiversity_concerns': biodiversity_concerns,
-            'top_biodiversity_concern': top_concern[0],
-            'engagement_score': min(1.0, len(self.feedback_history) / 100),
-            'user_count': len(set(f['user_id'] for f in self.feedback_history))
-        }
-
-# ============================================================================
-# Enums and Data Classes (unchanged)
-# ============================================================================
-
 class EcosystemType(Enum):
     TROPICAL_FOREST = "tropical_forest"
     TEMPERATE_FOREST = "temperate_forest"
@@ -905,16 +99,12 @@ class EcosystemType(Enum):
     DESERT = "desert"
 
 class ImpactCategory(Enum):
-    HABITAT_LOSS = "habitat_loss"
-    SPECIES_DISPLACEMENT = "species_displacement"
-    WATER_POLLUTION = "water_pollution"
-    AIR_POLLUTION = "air_pollution"
-    NOISE_POLLUTION = "noise_pollution"
-    LIGHT_POLLUTION = "light_pollution"
-    THERMAL_POLLUTION = "thermal_pollution"
-    RESOURCE_DEPLETION = "resource_depletion"
-    CARBON_EMISSION = "carbon_emission"
-    HELIUM_DEPLETION = "helium_depletion"
+    HABITAT = "habitat"
+    ENERGY = "energy"
+    COOLING = "cooling"
+    RESOURCES = "resources"
+    CARBON = "carbon"
+    HELIUM = "helium"
 
 @dataclass
 class BiodiversityMetric:
@@ -939,78 +129,800 @@ class BiodiversityAssessment:
     mitigation_strategies: List[Dict]
     recommendations: List[str]
     sustainability_score: float
-    carbon_impact: float
-    helium_impact: float
+    carbon_impact: Dict[str, Any]
+    helium_impact: Dict[str, Any]
+    ml_prediction: Optional[Dict] = None
     timestamp: datetime
 
-# ============================================================================
-# Persistence Manager (unchanged)
-# ============================================================================
+@dataclass
+class CarbonConfig:
+    enabled: bool = True
+    region: str = "us-east"
+    update_interval_seconds: int = 300
+    max_retries: int = 3
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery_timeout: float = 30.0
+    api_key_env: str = "ELECTRICITYMAP_API_KEY"
 
-class BiodiversityPersistenceManager:
-    """Manages persistence of biodiversity state, ML model, and ecosystem data."""
+@dataclass
+class HeliumConfig:
+    enabled: bool = True
+    budget_l: float = 100.0
+    helium_to_co2_factor: float = 20.0
+    accounting_interval_seconds: int = 60
 
-    def __init__(self, config: BiodiversityConfig):
+@dataclass
+class PredictiveConfig:
+    enabled: bool = True
+    history_window: int = 100
+    update_interval_seconds: int = 300
+
+@dataclass
+class MLConfig:
+    enabled: bool = True
+    input_size: int = 10
+    hidden_size: int = 64
+    epochs: int = 100
+    batch_size: int = 32
+    train_interval_seconds: int = 600
+
+@dataclass
+class FederatedConfig:
+    enabled: bool = True
+    server_url: Optional[str] = None
+    sparsity_ratio: float = 0.1
+    sync_interval_seconds: int = 3600
+    max_retries: int = 3
+
+@dataclass
+class TelemetryConfig:
+    enabled: bool = True
+    export_interval_seconds: int = 60
+
+@dataclass
+class PersistenceConfig:
+    enabled: bool = True
+    path: str = "biodiversity_state.json"
+    save_interval_seconds: int = 300
+
+@dataclass
+class SelfHealingConfig:
+    enabled: bool = True
+
+@dataclass
+class BiodiversityConfig:
+    """Centralized configuration with sub‑configs."""
+    # High‑level flags
+    enable_bio_integration: bool = True
+    enable_event_driven: bool = True
+    enable_swarm_coordination: bool = True
+    enable_human_ai: bool = True
+    enable_cost_benefit: bool = True
+    enable_time_tick_engine: bool = True
+    enable_quantum_bridge: bool = True
+
+    # Sub‑configs
+    carbon: CarbonConfig = field(default_factory=CarbonConfig)
+    helium: HeliumConfig = field(default_factory=HeliumConfig)
+    predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
+    ml: MLConfig = field(default_factory=MLConfig)
+    federated: FederatedConfig = field(default_factory=FederatedConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+    self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+
+    # Workflow triggers
+    workflow_on_critical_impact: str = "adjust_mitigation_strategy"
+    workflow_on_slo_breach: str = "relocate_computation"
+
+    # Swarm sharing interval
+    swarm_share_interval_seconds: int = 60
+
+    # Token exchange rate (if bio‑integration)
+    token_exchange_rate: float = 1000.0
+
+# ============================================================================
+# Carbon Intensity Manager (improved)
+# ============================================================================
+class CarbonIntensityManager:
+    def __init__(self, config: CarbonConfig):
         self.config = config
-        self.path = config.persistence_path
+        self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
+        self.region = config.region
+        self.carbon_intensity = 0.0
+        self.last_update: Optional[datetime] = None
         self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self.cache: Dict[str, Dict] = {}
+        self.historical_intensities: Deque[float] = deque(maxlen=1000)
+        self.api_key = os.getenv(config.api_key_env, '')
+        self._circuit = CircuitBreaker(
+            "carbon_api",
+            failure_threshold=config.circuit_breaker_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
+        logger.info(f"CarbonIntensityManager initialized (region={self.region})")
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
+        if region is not None:
+            self.region = region
+
+        async def _fetch():
+            # Cache check
+            cache_key = f"{self.region}_{datetime.now(timezone.utc).hour}"
+            if (self.last_update and
+                (datetime.now(timezone.utc) - self.last_update).seconds < self.config.update_interval_seconds and
+                cache_key in self.cache):
+                return self.cache[cache_key]
+
+            for attempt in range(self.config.max_retries):
+                try:
+                    session = await self._get_session()
+                    url = f"{self.endpoint}/latest?zone={self.region}"
+                    headers = {'auth-token': self.api_key} if self.api_key else {}
+                    async with session.get(url, headers=headers, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            self.carbon_intensity = data.get('carbonIntensity', 400)
+                            self.last_update = datetime.now(timezone.utc)
+                            result = {
+                                'intensity': self.carbon_intensity,
+                                'region': self.region,
+                                'timestamp': self.last_update.isoformat()
+                            }
+                            self.cache[cache_key] = result
+                            self.historical_intensities.append(self.carbon_intensity)
+                            return result
+                        else:
+                            logger.warning(f"Carbon API returned {resp.status}, attempt {attempt+1}")
+                except Exception as e:
+                    logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
+                await asyncio.sleep(2 ** attempt)
+
+            # Fallback
+            fallback_intensities = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500}
+            intensity = fallback_intensities.get(self.region, 400)
+            self.carbon_intensity = intensity
+            self.last_update = datetime.now(timezone.utc)
+            return {'intensity': intensity, 'region': self.region, 'timestamp': self.last_update.isoformat(), 'is_fallback': True}
+
+        return await self._circuit.call(_fetch)
+
+    async def get_current_intensity(self) -> float:
+        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.config.update_interval_seconds:
+            await self.update_carbon_intensity(self.region)
+        return self.carbon_intensity
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Helium Impact Tracker (improved)
+# ============================================================================
+class HeliumImpactTracker:
+    def __init__(self, config: HeliumConfig):
+        self.config = config
+        self.budget_l = config.budget_l
+        self.usage: Deque[Dict] = deque(maxlen=86400)
+        self.recovered: Deque[Dict] = deque(maxlen=86400)
+        self._total_usage = 0.0
+        self._total_recovered = 0.0
+        self._lock = asyncio.Lock()
+        self._task: Optional[asyncio.Task] = None
+        self._accounting_loop_running = False
+        logger.info("HeliumImpactTracker initialized")
+
+    def record_usage(self, amount_l: float, source: str = "unknown"):
+        usage = {'amount_l': amount_l, 'source': source, 'timestamp': datetime.now(timezone.utc)}
+        self.usage.append(usage)
+        self._total_usage += amount_l
+
+    def record_recovery(self, amount_l: float, source: str = "unknown"):
+        recovery = {'amount_l': amount_l, 'source': source, 'timestamp': datetime.now(timezone.utc)}
+        self.recovered.append(recovery)
+        self._total_recovered += amount_l
+
+    async def _accounting_loop(self):
+        self._accounting_loop_running = True
+        while self._accounting_loop_running:
+            try:
+                async with self._lock:
+                    net = self._total_usage - self._total_recovered
+                    remaining = self.budget_l - net
+                    if remaining < 0:
+                        logger.critical(f"Helium budget exceeded! Net: {net:.2f} L")
+                    elif remaining < self.budget_l * 0.2:
+                        logger.warning(f"Helium budget warning: {remaining:.2f} L remaining")
+                await asyncio.sleep(self.config.accounting_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Helium accounting error: {e}")
+                await asyncio.sleep(5)
+
+    def start(self):
+        if not self._task:
+            self._task = asyncio.create_task(self._accounting_loop())
+
+    async def stop(self):
+        if self._task:
+            self._accounting_loop_running = False
+            self._task.cancel()
+            await self._task
+            self._task = None
+
+    def get_position(self) -> Dict[str, Any]:
+        net = self._total_usage - self._total_recovered
+        return {
+            'total_usage_l': self._total_usage,
+            'total_recovered_l': self._total_recovered,
+            'net_position_l': net,
+            'remaining_budget_l': self.budget_l - net,
+            'co2_equivalent_kg': net * self.config.helium_to_co2_factor
+        }
+
+# ============================================================================
+# Predictive Analyzer (improved)
+# ============================================================================
+class PredictiveBiodiversityAnalyzer:
+    def __init__(self, config: PredictiveConfig):
+        self.config = config
+        self.history_window = config.history_window
+        self.history: Deque[Dict] = deque(maxlen=config.history_window)
+        self.forecasts: Deque[Dict] = deque(maxlen=50)
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+        self.model = None
+        self.is_trained = False
+        self._ml_available = SKLEARN_AVAILABLE
+        self._lock = asyncio.Lock()
+        if self._ml_available:
+            self.model = SGDRegressor(
+                learning_rate='constant',
+                eta0=0.01,
+                penalty='l2',
+                alpha=0.0001,
+                max_iter=1,
+                random_state=42,
+                warm_start=True
+            )
+            logger.info("PredictiveBiodiversityAnalyzer initialized with SGD")
+        else:
+            logger.warning("sklearn not available; using moving average fallback")
+
+    def update_history(self, impact_data: Dict):
+        self.history.append({
+            'timestamp': datetime.now(timezone.utc),
+            'total_impact': impact_data.get('total_impact', 0.5),
+            'habitat_impact': impact_data.get('habitat_score', 0.5),
+            'energy_impact': impact_data.get('energy_score', 0.5),
+            'cooling_impact': impact_data.get('cooling_score', 0.5),
+            'resource_impact': impact_data.get('resource_score', 0.5),
+            'carbon_intensity': impact_data.get('carbon_intensity', 400),
+            'ecosystem_sensitivity': impact_data.get('ecosystem_sensitivity', 0.5)
+        })
+
+    async def train(self) -> Dict:
+        if not self._ml_available:
+            return {'status': 'ml_not_available'}
+        if len(self.history) < 10:
+            return {'status': 'insufficient_data', 'samples': len(self.history)}
+
+        async with self._lock:
+            X, y = [], []
+            hist_list = list(self.history)
+            for i in range(len(hist_list) - 5):
+                features = []
+                for j in range(5):
+                    data = hist_list[i + j]
+                    features.extend([
+                        data['total_impact'],
+                        data['habitat_impact'],
+                        data['energy_impact'],
+                        data['cooling_impact'],
+                        data['resource_impact'],
+                        data['carbon_intensity'] / 100,
+                        data['ecosystem_sensitivity']
+                    ])
+                X.append(features)
+                y.append(hist_list[i + 5]['total_impact'])
+
+            X = np.array(X)
+            y = np.array(y)
+            if self.scaler.mean_ is None:
+                X_scaled = self.scaler.fit_transform(X)
+            else:
+                X_scaled = self.scaler.transform(X)
+
+            for _ in range(3):
+                self.model.partial_fit(X_scaled, y)
+            self.is_trained = True
+
+            pred = self.model.predict(X_scaled)
+            r2 = r2_score(y, pred) if len(y) > 5 else 0.0
+            logger.info(f"Predictive model updated. R²={r2:.3f}")
+            return {'status': 'success', 'r2': r2, 'samples': len(X)}
+
+    async def predict_trend(self, hours: int = 24) -> Dict:
+        if not self.is_trained or len(self.history) < 10:
+            if self.history:
+                recent = [h['total_impact'] for h in list(self.history)[-5:]]
+                pred = np.mean(recent) if recent else 0.5
+                return {'predicted_impact': pred, 'confidence': 0.3, 'trend': 'moving_average'}
+            return {'predicted_impact': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
+
+        recent = list(self.history)[-5:]
+        features = []
+        for data in recent:
+            features.extend([
+                data['total_impact'],
+                data['habitat_impact'],
+                data['energy_impact'],
+                data['cooling_impact'],
+                data['resource_impact'],
+                data['carbon_intensity'] / 100,
+                data['ecosystem_sensitivity']
+            ])
+        features = np.array(features).reshape(1, -1)
+
+        def predict():
+            if self.scaler.mean_ is not None:
+                features_scaled = self.scaler.transform(features)
+            else:
+                features_scaled = features
+            return self.model.predict(features_scaled)[0]
+
+        prediction = await asyncio.to_thread(predict)
+        confidence = min(0.9, 0.5 + 0.4 * (len(self.history) / 100))
+
+        if len(self.forecasts) > 5:
+            recent_forecasts = list(self.forecasts)[-5:]
+            trend = "improving" if prediction < recent_forecasts[-1] else "declining" if prediction > recent_forecasts[-1] else "stable"
+        else:
+            trend = "stable"
+
+        self.forecasts.append({'prediction': prediction, 'trend': trend})
+        return {
+            'predicted_impact': prediction,
+            'confidence': confidence,
+            'trend': trend,
+            'recommended_actions': self._generate_actions(prediction)
+        }
+
+    def _generate_actions(self, prediction: float) -> List[str]:
+        if prediction > 0.7:
+            return ["URGENT: Implement immediate biodiversity protection measures",
+                    "Relocate computation to lower-impact areas"]
+        elif prediction > 0.5:
+            return ["Optimize energy and cooling strategies",
+                    "Invest in habitat restoration offsets"]
+        elif prediction > 0.3:
+            return ["Monitor ecosystem health closely"]
+        return ["Current practices are sustainable - maintain standards"]
+
+# ============================================================================
+# ML Impact Predictor (PyTorch, with thread offload)
+# ============================================================================
+class MLImpactPredictor:
+    def __init__(self, config: MLConfig):
+        self.config = config
+        self.input_size = config.input_size
+        self.hidden_size = config.hidden_size
+        self.model = None
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+        self.is_trained = False
+        self.optimizer = None
+        self.criterion = None
+        self.training_history: List[float] = []
+        self._lock = asyncio.Lock()
+        if TORCH_AVAILABLE:
+            self._init_model()
+            logger.info("MLImpactPredictor initialized with PyTorch")
+        else:
+            logger.warning("PyTorch not available; ML predictor disabled")
+
+    def _init_model(self):
+        class ImpactPredictor(nn.Module):
+            def __init__(self, input_size, hidden_size):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(input_size, hidden_size),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size),
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_size // 2),
+                    nn.Linear(hidden_size // 2, 1)
+                )
+            def forward(self, x):
+                return self.network(x)
+
+        self.model = ImpactPredictor(self.input_size, self.hidden_size)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.MSELoss()
+
+    async def train(self, training_data: List[Dict], epochs: Optional[int] = None) -> Dict:
+        if not TORCH_AVAILABLE or not self.model:
+            return {'status': 'disabled'}
+        if len(training_data) < 20:
+            return {'status': 'insufficient_data', 'samples': len(training_data)}
+
+        epochs = epochs or self.config.epochs
+
+        X = []
+        y = []
+        for item in training_data:
+            X.append([
+                item.get('carbon_intensity', 400) / 100,
+                item.get('energy_intensity', 0.5),
+                item.get('cooling_intensity', 0.5),
+                item.get('resource_intensity', 0.5),
+                item.get('ecosystem_sensitivity', 0.5),
+                item.get('proximity_factor', 0.5),
+                item.get('fragmentation_index', 0.5),
+                item.get('species_density', 0.5),
+                item.get('water_scarcity', 0.5),
+                item.get('temperature_anomaly', 0.5)
+            ])
+            y.append(item.get('total_impact', 0.5))
+
+        X = np.array(X)
+        y = np.array(y)
+
+        if self.scaler is not None:
+            if self.scaler.mean_ is None:
+                X_scaled = self.scaler.fit_transform(X)
+            else:
+                X_scaled = self.scaler.transform(X)
+        else:
+            X_scaled = X
+
+        dataset = TensorDataset(
+            torch.FloatTensor(X_scaled),
+            torch.FloatTensor(y).unsqueeze(1)
+        )
+        dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
+
+        async with self._lock:
+            # Offload training to a thread to avoid blocking event loop
+            def train_sync():
+                self.model.train()
+                losses = []
+                for epoch in range(epochs):
+                    epoch_loss = 0
+                    for batch_X, batch_y in dataloader:
+                        self.optimizer.zero_grad()
+                        output = self.model(batch_X)
+                        loss = self.criterion(output, batch_y)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                        epoch_loss += loss.item()
+                    losses.append(epoch_loss / len(dataloader))
+                    if (epoch + 1) % 20 == 0:
+                        logger.debug(f"ML Training Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
+                return losses
+
+            losses = await asyncio.to_thread(train_sync)
+            self.is_trained = True
+            self.training_history.extend(losses)
+            if len(self.training_history) > 1000:
+                self.training_history = self.training_history[-1000:]
+            return {'status': 'success', 'loss': np.mean(losses), 'samples': len(X)}
+
+    async def predict(self, scenario: Dict) -> Dict:
+        if not TORCH_AVAILABLE or not self.is_trained:
+            return {'predicted_impact': 0.5, 'confidence': 0.0, 'status': 'model_not_trained'}
+
+        features = np.array([[
+            scenario.get('carbon_intensity', 400) / 100,
+            scenario.get('energy_intensity', 0.5),
+            scenario.get('cooling_intensity', 0.5),
+            scenario.get('resource_intensity', 0.5),
+            scenario.get('ecosystem_sensitivity', 0.5),
+            scenario.get('proximity_factor', 0.5),
+            scenario.get('fragmentation_index', 0.5),
+            scenario.get('species_density', 0.5),
+            scenario.get('water_scarcity', 0.5),
+            scenario.get('temperature_anomaly', 0.5)
+        ]])
+        if self.scaler is not None:
+            features_scaled = self.scaler.transform(features)
+        else:
+            features_scaled = features
+
+        self.model.eval()
+        with torch.no_grad():
+            prediction = self.model(torch.FloatTensor(features_scaled)).numpy()[0, 0]
+
+        return {
+            'predicted_impact': float(prediction),
+            'confidence': 0.8 if self.is_trained else 0.0,
+            'status': 'success'
+        }
+
+    def get_checkpoint(self) -> Dict:
+        if not TORCH_AVAILABLE:
+            return {}
+        return {
+            'state_dict': self.model.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scaler_mean': self.scaler.mean_.tolist() if self.scaler.mean_ is not None else None,
+            'scaler_std': self.scaler.scale_.tolist() if self.scaler.scale_ is not None else None,
+            'is_trained': self.is_trained,
+            'training_history': self.training_history
+        }
+
+    def load_checkpoint(self, checkpoint: Dict):
+        if not TORCH_AVAILABLE or not checkpoint:
+            return
+        self.model.load_state_dict(checkpoint['state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        if checkpoint.get('scaler_mean') is not None and self.scaler is not None:
+            self.scaler.mean_ = np.array(checkpoint['scaler_mean'])
+            self.scaler.scale_ = np.array(checkpoint['scaler_std'])
+        self.is_trained = checkpoint.get('is_trained', False)
+        self.training_history = checkpoint.get('training_history', [])
+
+# ============================================================================
+# Federated Assessor (improved)
+# ============================================================================
+class FederatedBiodiversityAssessor:
+    def __init__(self, config: FederatedConfig):
+        self.config = config
+        self.server_url = config.server_url
+        self.round = 0
+        self.local_impacts = {}
+        self.global_impacts = {}
+        self.participants = []
+        self.contribution_scores = {}
+        self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._circuit = CircuitBreaker(
+            "federated_server",
+            failure_threshold=3,
+            recovery_timeout=30.0
+        )
+        logger.info("FederatedBiodiversityAssessor initialized")
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None and self.server_url:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    def _compress(self, data: Dict) -> Dict:
+        if self.config.sparsity_ratio == 1.0:
+            return data
+        numeric = {k: v for k, v in data.items() if isinstance(v, (int, float))}
+        if not numeric:
+            return data
+        sorted_items = sorted(numeric.items(), key=lambda x: abs(x[1]), reverse=True)
+        k = max(1, int(len(sorted_items) * self.config.sparsity_ratio))
+        kept = {item[0] for item in sorted_items[:k]}
+        return {k: v for k, v in data.items() if k in kept or not isinstance(v, (int, float))}
+
+    async def send_local_impact(self, participant_id: str, impact_data: Dict, performance: float = 1.0) -> Dict:
+        if not self.server_url:
+            return {'status': 'local'}
+
+        async def _send():
+            for attempt in range(self.config.max_retries):
+                try:
+                    async with self._lock:
+                        session = await self._get_session()
+                        compressed = self._compress(impact_data)
+                        update = {
+                            'participant_id': participant_id,
+                            'round': self.round,
+                            'impact_data': compressed,
+                            'performance': performance,
+                            'sparsity_ratio': self.config.sparsity_ratio,
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        }
+                        async with session.post(
+                            f"{self.server_url}/federated/biodiversity",
+                            json=update,
+                            timeout=30
+                        ) as resp:
+                            if resp.status == 200:
+                                result = await resp.json()
+                                self.round += 1
+                                self.contribution_scores[participant_id] = performance
+                                return result
+                            else:
+                                logger.warning(f"Federated send failed (attempt {attempt+1}): {resp.status}")
+                except Exception as e:
+                    logger.error(f"Federated send error (attempt {attempt+1}): {e}")
+                await asyncio.sleep(2 ** attempt)
+            return {'status': 'failed'}
+        return await self._circuit.call(_send)
+
+    async def get_global_impacts(self) -> Optional[Dict]:
+        if not self.server_url:
+            return self.global_impacts
+
+        async def _fetch():
+            for attempt in range(self.config.max_retries):
+                try:
+                    async with self._lock:
+                        session = await self._get_session()
+                        async with session.get(
+                            f"{self.server_url}/federated/biodiversity/global",
+                            timeout=30
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                self.global_impacts = data.get('impacts', {})
+                                self.participants = data.get('participants', [])
+                                return self.global_impacts
+                            else:
+                                logger.warning(f"Global fetch failed (attempt {attempt+1}): {resp.status}")
+                except Exception as e:
+                    logger.error(f"Global fetch error (attempt {attempt+1}): {e}")
+                await asyncio.sleep(2 ** attempt)
+            return None
+        return await self._circuit.call(_fetch)
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ============================================================================
+# Human‑AI Collaborative Support (simplified)
+# ============================================================================
+class HumanAICollaborativeBiodiversity:
+    def __init__(self):
+        self.feedback_history: Deque[Dict] = deque(maxlen=1000)
+        self.reflection_logs: Deque[Dict] = deque(maxlen=100)
+        self.user_preferences: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+    def collect_feedback(self, user_id: str, feedback: Dict) -> Dict:
+        entry = {'user_id': user_id, 'timestamp': datetime.now(timezone.utc), 'feedback': feedback}
+        self.feedback_history.append(entry)
+        if 'preference' in feedback:
+            self.user_preferences[user_id] = feedback['preference']
+        reflection = self._generate_reflection(feedback)
+        self.reflection_logs.append(reflection)
+        return reflection
+
+    def _generate_reflection(self, feedback: Dict) -> Dict:
+        reflection = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'acknowledgment': f"Feedback received on {feedback.get('topic', 'biodiversity impact')}",
+            'insights': [],
+            'actions': [],
+            'biodiversity_insights': []
+        }
+        concern = feedback.get('concern')
+        if concern == 'habitat':
+            reflection['insights'].append("Habitat impact can be reduced through location optimization")
+            reflection['actions'].append("Relocate computation to lower-impact areas")
+        elif concern == 'energy':
+            reflection['insights'].append("Energy source significantly affects biodiversity")
+            reflection['actions'].append("Switch to renewable energy sources")
+        elif concern == 'cooling':
+            reflection['insights'].append("Cooling method impacts local water ecosystems")
+            reflection['actions'].append("Implement water-free cooling solutions")
+        elif concern == 'biodiversity':
+            reflection['biodiversity_insights'].append("Biodiversity impact requires holistic assessment")
+            reflection['actions'].append("Implement comprehensive biodiversity monitoring")
+        if 'suggestion' in feedback:
+            reflection['actions'].append(f"Implementing suggestion: {feedback['suggestion']}")
+        reflection['action_items'] = self._prioritize_actions(reflection['actions'])
+        return reflection
+
+    def _prioritize_actions(self, actions: List[str]) -> List[Dict]:
+        priorities = []
+        for action in actions:
+            if any(kw in action.lower() for kw in ['urgent', 'critical', 'immediate']):
+                priority, impact, effort = 'high', 0.9, 'high'
+            elif any(kw in action.lower() for kw in ['biodiversity', 'habitat', 'ecosystem']):
+                priority, impact, effort = 'high', 0.8, 'medium'
+            elif any(kw in action.lower() for kw in ['carbon', 'energy']):
+                priority, impact, effort = 'medium', 0.6, 'medium'
+            else:
+                priority, impact, effort = 'low', 0.3, 'low'
+            priorities.append({
+                'action': action,
+                'priority': priority,
+                'impact': impact,
+                'estimated_effort': effort,
+                'biodiversity_weight': impact
+            })
+        return sorted(priorities, key=lambda x: (x['impact'], x['biodiversity_weight']), reverse=True)
+
+    async def get_insights(self) -> Dict:
+        if len(self.feedback_history) < 5:
+            return {'status': 'insufficient_feedback'}
+        recent = list(self.feedback_history)[-20:]
+        topics = defaultdict(int)
+        concerns = defaultdict(int)
+        for f in recent:
+            topics[f['feedback'].get('topic', 'general')] += 1
+            if 'concern' in f['feedback']:
+                concerns[f['feedback']['concern']] += 1
+        return {
+            'total_feedback': len(self.feedback_history),
+            'top_topics': dict(topics),
+            'top_concerns': dict(concerns),
+            'engagement_score': min(1.0, len(self.feedback_history) / 100),
+            'user_count': len(set(f['user_id'] for f in self.feedback_history))
+        }
+
+# ============================================================================
+# Persistence Manager (JSON with versioning)
+# ============================================================================
+class BiodiversityPersistenceManager:
+    def __init__(self, config: PersistenceConfig):
+        self.config = config
+        self.path = config.path
+        self._lock = asyncio.Lock()
+        self._version = 1
         logger.info(f"BiodiversityPersistenceManager initialized (path={self.path})")
 
-    async def save_state(self, assessor: 'BiodiversityImpactAssessor') -> bool:
+    async def save_state(self, state: Dict[str, Any]) -> bool:
         async with self._lock:
             try:
-                state = {
-                    'config': assessor.config,
-                    'ecosystems': assessor.ecosystems,
-                    'impact_history': assessor.impact_history,
-                    'mitigation_strategies': assessor.mitigation_strategies,
-                    'local_biodiversity_score': assessor.local_biodiversity_score,
-                    'global_biodiversity_score': assessor.global_biodiversity_score,
-                    'sustainability_score': assessor.sustainability_score,
-                    'total_carbon_savings_kg': assessor.total_carbon_savings_kg,
-                    'total_helium_savings_l': assessor.total_helium_savings_l,
-                    'ml_checkpoint': assessor.ml_predictor.get_model_checkpoint() if assessor.ml_predictor else None,
+                payload = {
+                    'version': self._version,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'data': self._make_serializable(state)
                 }
-                serialized = pickle.dumps(state)
-                compressed = zlib.compress(serialized)
-                with open(self.path, 'wb') as f:
-                    f.write(compressed)
-                logger.info(f"Biodiversity state saved to {self.path}")
+                with open(self.path, 'w') as f:
+                    json.dump(payload, f, indent=2)
+                logger.info(f"State saved to {self.path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
                 return False
 
-    async def load_state(self, assessor: 'BiodiversityImpactAssessor') -> bool:
+    async def load_state(self) -> Optional[Dict]:
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
-                return False
+                return None
             try:
-                with open(self.path, 'rb') as f:
-                    compressed = f.read()
-                serialized = zlib.decompress(compressed)
-                state = pickle.loads(serialized)
-
-                assessor.ecosystems = state.get('ecosystems', {})
-                assessor.impact_history = state.get('impact_history', [])
-                assessor.mitigation_strategies = state.get('mitigation_strategies', {})
-                assessor.local_biodiversity_score = state.get('local_biodiversity_score', 0.0)
-                assessor.global_biodiversity_score = state.get('global_biodiversity_score', 0.0)
-                assessor.sustainability_score = state.get('sustainability_score', 0.0)
-                assessor.total_carbon_savings_kg = state.get('total_carbon_savings_kg', 0.0)
-                assessor.total_helium_savings_l = state.get('total_helium_savings_l', 0.0)
-
-                # Restore ML checkpoint
-                ml_checkpoint = state.get('ml_checkpoint')
-                if ml_checkpoint and assessor.ml_predictor:
-                    assessor.ml_predictor.load_checkpoint(ml_checkpoint)
-
-                logger.info(f"Biodiversity state loaded from {self.path}")
-                return True
+                with open(self.path, 'r') as f:
+                    payload = json.load(f)
+                if payload.get('version') != self._version:
+                    logger.warning(f"State version mismatch; may be incompatible")
+                return self._deserialize(payload.get('data', {}))
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
-                return False
+                return None
+
+    def _make_serializable(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_serializable(v) for v in obj]
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (deque, set)):
+            return self._make_serializable(list(obj))
+        elif hasattr(obj, '__dict__'):
+            return self._make_serializable(obj.__dict__)
+        else:
+            return obj
+
+    def _deserialize(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._deserialize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._deserialize(v) for v in obj]
+        elif isinstance(obj, str):
+            try:
+                return datetime.fromisoformat(obj)
+            except ValueError:
+                return obj
+        else:
+            return obj
 
     async def delete_state(self):
         async with self._lock:
@@ -1023,10 +935,7 @@ class BiodiversityPersistenceManager:
 # ============================================================================
 # Telemetry Collector (unchanged)
 # ============================================================================
-
 class BiodiversityTelemetry:
-    """Collects telemetry for the biodiversity impact assessor."""
-
     def __init__(self):
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
@@ -1054,14 +963,15 @@ class BiodiversityTelemetry:
         return metric_name
 
     async def export(self) -> str:
-        output = []
-        for key, value in self.metrics['counters'].items():
-            output.append(f"# TYPE {key} counter\n{key} {value}")
-        for key, value in self.metrics['gauges'].items():
-            output.append(f"# TYPE {key} gauge\n{key} {value}")
-        for key, values in self.metrics['histograms'].items():
-            output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
-        return "\n".join(output)
+        async with self._lock:
+            output = []
+            for key, value in self.metrics['counters'].items():
+                output.append(f"# TYPE {key} counter\n{key} {value}")
+            for key, value in self.metrics['gauges'].items():
+                output.append(f"# TYPE {key} gauge\n{key} {value}")
+            for key, values in self.metrics['histograms'].items():
+                output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
+            return "\n".join(output)
 
     def reset(self):
         self.metrics.clear()
@@ -1070,424 +980,69 @@ class BiodiversityTelemetry:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Enhanced Biodiversity Impact Assessor (Main Class) – v3.0.0
+# Biodiversity Storage (holds data)
 # ============================================================================
-
-class BiodiversityImpactAssessor:
-    """
-    Enhanced Biodiversity Impact Assessor v3.0.0 - Complete Green Agent Implementation
-    with full bio‑inspired core integration.
-    """
-
-    def __init__(
-        self,
-        bio_core: Optional[EnhancedBioInspiredCore] = None,
-        config: Optional[BiodiversityConfig] = None,
-        **kwargs
-    ):
-        """
-        Initialize the biodiversity impact assessor.
-
-        Args:
-            bio_core: Reference to the bio‑inspired core for event subscriptions.
-            config: Configuration dataclass (preferred).
-            **kwargs: Legacy arguments for backward compatibility.
-        """
-        if config is None:
-            # Build config from kwargs
-            config = BiodiversityConfig(
-                enable_federated=kwargs.get('enable_federated', True),
-                enable_carbon_intensity=kwargs.get('enable_carbon_intensity', True),
-                enable_predictive=kwargs.get('enable_predictive', True),
-                enable_ml_prediction=kwargs.get('enable_ml_prediction', True),
-                enable_human_ai=kwargs.get('enable_human_ai', True),
-                enable_persistence=kwargs.get('enable_persistence', True),
-                enable_telemetry=kwargs.get('enable_telemetry', True),
-                enable_helium_tracking=kwargs.get('enable_helium_tracking', True),
-                enable_event_driven=kwargs.get('enable_event_driven', True),
-                enable_self_healing=kwargs.get('enable_self_healing', True),
-                enable_swarm_coordination=kwargs.get('enable_swarm_coordination', True),
-                enable_time_tick_engine=kwargs.get('enable_time_tick_engine', True),
-                enable_quantum_bridge=kwargs.get('enable_quantum_bridge', True),
-                enable_cost_benefit=kwargs.get('enable_cost_benefit', True),
-                max_retries=kwargs.get('max_retries', 3),
-                retry_base_delay_ms=kwargs.get('retry_base_delay_ms', 100.0),
-                retry_max_delay_ms=kwargs.get('retry_max_delay_ms', 5000.0),
-                circuit_breaker_failure_threshold=kwargs.get('circuit_breaker_failure_threshold', 5),
-                circuit_breaker_recovery_timeout=kwargs.get('circuit_breaker_recovery_timeout', 30.0),
-                persistence_path=kwargs.get('persistence_path', 'biodiversity_state.pkl')
-            )
-        self.config = config
-
-        # Feature flags
-        self.enable_federated = self.config.enable_federated
-        self.enable_carbon_intensity = self.config.enable_carbon_intensity
-        self.enable_predictive = self.config.enable_predictive
-        self.enable_ml_prediction = self.config.enable_ml_prediction
-        self.enable_human_ai = self.config.enable_human_ai
-        self.enable_persistence = self.config.enable_persistence
-        self.enable_telemetry = self.config.enable_telemetry
-        self.enable_helium_tracking = self.config.enable_helium_tracking
-        self.enable_event_driven = self.config.enable_event_driven
-        self.enable_self_healing = self.config.enable_self_healing
-        self.enable_swarm_coordination = self.config.enable_swarm_coordination
-        self.enable_time_tick_engine = self.config.enable_time_tick_engine
-        self.enable_quantum_bridge = self.config.enable_quantum_bridge
-        self.enable_cost_benefit = self.config.enable_cost_benefit
-
-        # Store bio‑core reference
-        self.bio_core = bio_core
-        self.event_broker = None
-        self.alert_system = None
-        self.anomaly_detection = None
-        self.cost_benefit_engine = None
-        self.quantum_bridge = None
-        self.tick_engine = None
-        self.swarm_coordinator = None
-        self.self_healer = None
-        self.workflow_orchestrator = None
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
-
-        # Extract core sub‑modules if available
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
-            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.token_manager = getattr(self.bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(self.bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
-            self.harvester = getattr(self.bio_core, 'harvester', None)
-
-        # MoE and Self-Evolving Gate references (injected)
-        self.expert_router = None
-        self.gating_network = None
-        self.self_evolving_gate = None
-
-        # Helium provider (injected)
-        self.helium_provider = None
-
-        # Initialize sub-modules
-        self.carbon_manager = CarbonIntensityManager(self.config) if self.enable_carbon_intensity else None
-        self.helium_tracker = HeliumImpactTracker(self.config) if self.enable_helium_tracking else None
-        self.predictive_analyzer = PredictiveBiodiversityAnalyzer(self.config) if self.enable_predictive else None
-        self.federated_assessor = FederatedBiodiversityAssessor(self.config) if self.enable_federated else None
-        self.ml_predictor = MLImpactPredictor(self.config) if self.enable_ml_prediction else None
-        self.human_ai = HumanAICollaborativeBiodiversity() if self.enable_human_ai else None
-
-        # Persistence and telemetry
-        self.persistence = BiodiversityPersistenceManager(self.config) if self.enable_persistence else None
-        self.telemetry = BiodiversityTelemetry() if self.enable_telemetry else None
-
-        # Ecosystem tracking
+class BiodiversityStorage:
+    def __init__(self):
         self.ecosystems: Dict[str, BiodiversityMetric] = {}
-        self.impact_history: List[Dict] = []
+        self.impact_history: List[BiodiversityAssessment] = []
         self.mitigation_strategies: Dict[str, List[Dict]] = {}
-
-        # Biodiversity scores
-        self.local_biodiversity_score = 0.0
-        self.global_biodiversity_score = 0.0
+        self.local_score = 0.0
+        self.global_score = 0.0
         self.sustainability_score = 0.0
         self.total_carbon_savings_kg = 0.0
         self.total_helium_savings_l = 0.0
+        self._lock = asyncio.Lock()
 
-        # Circuit breakers for external services
-        self._token_circuit = CircuitBreaker("token_service")
-        self._gradient_circuit = CircuitBreaker("gradient_service")
-        self._scheduler_circuit = CircuitBreaker("scheduler_service")
-        self._biomass_circuit = CircuitBreaker("biomass_storage")
-        self._compartment_circuit = CircuitBreaker("compartment_service")
-        self._carbon_circuit = CircuitBreaker("carbon_api")
+    async def add_assessment(self, assessment: BiodiversityAssessment):
+        async with self._lock:
+            self.impact_history.append(assessment)
+            # Keep last 1000 assessments
+            if len(self.impact_history) > 1000:
+                self.impact_history = self.impact_history[-1000:]
 
-        # Health status
-        self.health_status = "healthy"
-        self.last_error = None
+    async def update_scores(self, local: float, global_: float, sustainability: float):
+        async with self._lock:
+            self.local_score = local
+            self.global_score = global_
+            self.sustainability_score = sustainability
 
-        # Initialize ecosystems (from config or default)
-        self._initialize_ecosystems()
+    async def get_ecosystems(self) -> Dict[str, BiodiversityMetric]:
+        async with self._lock:
+            return dict(self.ecosystems)
 
-        # Subscribe to core events if enabled
-        if self.enable_event_driven and self.event_broker:
-            self._subscribe_events()
+    async def set_ecosystem(self, name: str, metric: BiodiversityMetric):
+        async with self._lock:
+            self.ecosystems[name] = metric
 
-        # Start background tasks
-        self._start_background_tasks()
+    async def get_impact_history(self, limit: int = 50) -> List[BiodiversityAssessment]:
+        async with self._lock:
+            return self.impact_history[-limit:]
 
-        # Load state if persistence enabled
-        if self.enable_persistence and self.persistence:
-            asyncio.create_task(self._load_state())
+    async def get_scores(self) -> Dict[str, float]:
+        async with self._lock:
+            return {
+                'local': self.local_score,
+                'global': self.global_score,
+                'sustainability': self.sustainability_score
+            }
 
-        logger.info("Enhanced Biodiversity Impact Assessor v3.0.0 initialized")
-
-    # ========================================================================
-    # Event Subscriptions
-    # ========================================================================
-    def _subscribe_events(self):
-        if self.event_broker:
-            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('config_updated', self._on_config_updated)
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('health_update', self._on_health_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            logger.info("Biodiversity Impact Assessor subscribed to core events")
-
-    async def _on_carbon_update(self, event: BioEvent):
-        intensity = event.data.get('intensity', 400)
-        price = event.data.get('price', 50.0)
-        self.carbon_intensity = intensity
-        self.carbon_price = price
-        # Update predictive analyzer
-        self.predictive_analyzer.update_history({
-            'total_impact': self.local_biodiversity_score,
-            'habitat_score': 0.5,  # placeholder
-            'energy_score': 0.5,
-            'cooling_score': 0.5,
-            'resource_score': 0.5,
-            'carbon_intensity': intensity,
-            'ecosystem_sensitivity': 0.5
-        })
-        # Adjust ecosystem carbon sensitivity
-        for eco in self.ecosystems.values():
-            eco.carbon_sensitivity = 0.5 + 0.5 * (intensity / 800)
-
-    async def _on_helium_update(self, event: BioEvent):
-        scarcity = event.data.get('scarcity', 0.5)
-        price = event.data.get('price', 0.5)
-        self.helium_scarcity = scarcity
-        self.helium_price = price
-        if self.helium_tracker:
-            # Adjust helium budget based on scarcity
-            self.helium_tracker.helium_budget_l = 100.0 * (1.0 - scarcity * 0.3)
-        # Adjust ecosystem helium sensitivity
-        for eco in self.ecosystems.values():
-            eco.helium_sensitivity = 0.5 + 0.5 * scarcity
-
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative assessment and triggering healing")
-            if self.enable_self_healing and self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-            if self.workflow_orchestrator and self.config.workflow_on_critical_impact:
-                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_impact)
-
-    async def _on_config_updated(self, event: BioEvent):
-        updates = event.data.get('updates', {})
-        if 'biodiversity_assessor' in updates:
-            new_config = updates['biodiversity_assessor']
-            for key, value in new_config.items():
-                if hasattr(self.config, key):
-                    setattr(self.config, key, value)
-            logger.info("Biodiversity Assessor configuration reloaded")
-
-    async def _on_token_update(self, event: BioEvent):
-        self.token_balance = event.data.get('balance', 500)
-
-    async def _on_health_update(self, event: BioEvent):
-        self.health_status = event.data.get('status', 'healthy')
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        if event.data.get('metric') == 'carbon_intensity':
-            logger.info("Carbon anomaly detected; adjusting assessment parameters")
-            # Increase sensitivity of ecosystems to carbon
-            for eco in self.ecosystems.values():
-                eco.carbon_sensitivity = min(1.0, eco.carbon_sensitivity * 1.2)
-        if event.data.get('metric') == 'helium_scarcity':
-            logger.info("Helium anomaly detected; adjusting helium sensitivity")
-            for eco in self.ecosystems.values():
-                eco.helium_sensitivity = min(1.0, eco.helium_sensitivity * 1.2)
-
-    # ========================================================================
-    # Background Tasks (unchanged, but with event-driven updates)
-    # ========================================================================
-    def _start_background_tasks(self):
-        if self.enable_carbon_intensity:
-            asyncio.create_task(self._carbon_update_loop())
-        if self.enable_predictive:
-            asyncio.create_task(self._predictive_update_loop())
-        if self.enable_federated:
-            asyncio.create_task(self._federated_sync_loop())
-        if self.enable_telemetry:
-            asyncio.create_task(self._telemetry_export_loop())
-        if self.enable_swarm_coordination and self.swarm_coordinator:
-            asyncio.create_task(self._swarm_update_loop())
-        if self.enable_persistence:
-            asyncio.create_task(self._persistence_save_loop())
-
-    async def _carbon_update_loop(self):
-        while True:
-            try:
-                await self.carbon_manager.update_carbon_intensity()
-                if self.telemetry:
-                    intensity = await self.carbon_manager.get_current_intensity()
-                    self.telemetry.gauge('carbon_intensity', intensity)
-                await asyncio.sleep(self.carbon_manager.update_interval if self.carbon_manager else 300)
-            except Exception as e:
-                logger.error(f"Carbon update error: {e}")
-                await asyncio.sleep(60)
-
-    async def _predictive_update_loop(self):
-        while True:
-            try:
-                if self.predictive_analyzer and self.impact_history:
-                    recent = self.impact_history[-5:] if self.impact_history else []
-                    if recent:
-                        total_impact = recent[-1].get('total_biodiversity_impact', 0.5)
-                        breakdown = recent[-1].get('impact_breakdown', {})
-                        habitat_score = breakdown.get('habitat', {}).get('score', 0.5)
-                        energy_score = breakdown.get('energy', {}).get('score', 0.5)
-                        cooling_score = breakdown.get('cooling', {}).get('score', 0.5)
-                        resource_score = breakdown.get('resources', {}).get('score', 0.5)
-                        carbon_intensity = self.carbon_manager.carbon_intensity if self.carbon_manager else 400
-                        ecosystem_sensitivity = breakdown.get('habitat', {}).get('sensitivity', 0.5)
-                        self.predictive_analyzer.update_history({
-                            'total_impact': total_impact,
-                            'habitat_score': habitat_score,
-                            'energy_score': energy_score,
-                            'cooling_score': cooling_score,
-                            'resource_score': resource_score,
-                            'carbon_intensity': carbon_intensity,
-                            'ecosystem_sensitivity': ecosystem_sensitivity
-                        })
-                    await self.predictive_analyzer.train_forecast_model()
-                await asyncio.sleep(300)
-            except Exception as e:
-                logger.error(f"Predictive update error: {e}")
-                await asyncio.sleep(60)
-
-    async def _federated_sync_loop(self):
-        while True:
-            try:
-                if self.federated_assessor and self.impact_history:
-                    latest = self.impact_history[-1] if self.impact_history else {}
-                    participant_id = f"biodiversity_{hashlib.md5(str(self.ecosystems).encode()).hexdigest()[:8]}"
-                    await self.federated_assessor.send_local_impact(
-                        participant_id,
-                        {
-                            'local_score': self.local_biodiversity_score,
-                            'global_score': self.global_biodiversity_score,
-                            'total_impact': latest.get('total_biodiversity_impact', 0.5),
-                            'timestamp': datetime.now(timezone.utc).isoformat()
-                        },
-                        performance=self.sustainability_score
-                    )
-                    await self.federated_assessor.get_global_impacts()
-                await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error(f"Federated sync error: {e}")
-                await asyncio.sleep(300)
-
-    async def _telemetry_export_loop(self):
-        while True:
-            try:
-                if self.enable_telemetry and self.telemetry:
-                    export_data = await self.telemetry.export()
-                    logger.debug(f"Telemetry export: {len(export_data)} bytes")
-                await asyncio.sleep(self.config.telemetry_export_interval)
-            except Exception as e:
-                logger.error(f"Telemetry export error: {e}")
-                await asyncio.sleep(60)
-
-    async def _swarm_update_loop(self):
-        while True:
-            try:
-                await self.share_with_swarm()
-                await asyncio.sleep(self.config.swarm_share_interval)
-            except Exception as e:
-                logger.error(f"Swarm update error: {e}")
-                await asyncio.sleep(120)
-
-    async def _persistence_save_loop(self):
-        while True:
-            try:
-                await self.save_state()
-                await asyncio.sleep(300)  # every 5 minutes
-            except Exception as e:
-                logger.error(f"Persistence save error: {e}")
-                await asyncio.sleep(60)
-
-    # ========================================================================
-    # Swarm Coordination
-    # ========================================================================
-    async def share_with_swarm(self):
-        if not self.enable_swarm_coordination or not self.swarm_coordinator:
-            return
-        swarm_payload = {
-            'assessor_id': hashlib.md5(str(self.ecosystems).encode()).hexdigest()[:8],
-            'local_biodiversity_score': self.local_biodiversity_score,
-            'global_biodiversity_score': self.global_biodiversity_score,
-            'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'total_helium_savings_l': self.total_helium_savings_l,
-            'ecosystems_tracked': len(self.ecosystems)
-        }
-        await self.swarm_coordinator.share_predictions(swarm_payload)
-
-    # ========================================================================
-    # Deep MoE and Self-Evolving Gate Integration
-    # ========================================================================
-    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
-        self.gating_network = gating_network
-        logger.info("Gating network injected into Biodiversity Assessor")
-
-    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
-        self.self_evolving_gate = gate
-        logger.info("Self-Evolving Gate injected into Biodiversity Assessor")
-
-    def set_expert_router(self, router: 'ExpertRouter'):
-        self.expert_router = router
-        logger.info("Expert Router injected into Biodiversity Assessor")
-
-    def set_helium_provider(self, provider: HeliumProvider):
-        self.helium_provider = provider
-        logger.info("Helium provider injected into Biodiversity Assessor")
-
-    # ========================================================================
-    # Bio-Inspired Module Injection
-    # ========================================================================
-    def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        logger.info("Bio-inspired modules injected into Biodiversity Impact Assessor")
-
-    def _get_ecosystem_carbon_sensitivity(self, ecosystem_name: str) -> float:
-        if ecosystem_name in self.ecosystems:
-            return self.ecosystems[ecosystem_name].carbon_sensitivity
-        return 0.5
-
-    def _get_ecosystem_helium_sensitivity(self, ecosystem_name: str) -> float:
-        if ecosystem_name in self.ecosystems:
-            return self.ecosystems[ecosystem_name].helium_sensitivity
-        return 0.5
-
-    # ========================================================================
-    # Enhanced Assessment Methods (with QuantumBridge, TimeTickEngine, CostBenefit)
-    # ========================================================================
+# ============================================================================
+# Biodiversity Analyzer (performs assessments)
+# ============================================================================
+class BiodiversityAnalyzer:
+    def __init__(self, config: BiodiversityConfig, storage: BiodiversityStorage,
+                 carbon_manager: Optional[CarbonIntensityManager] = None,
+                 helium_tracker: Optional[HeliumImpactTracker] = None,
+                 predictive: Optional[PredictiveBiodiversityAnalyzer] = None,
+                 ml_predictor: Optional[MLImpactPredictor] = None):
+        self.config = config
+        self.storage = storage
+        self.carbon_manager = carbon_manager
+        self.helium_tracker = helium_tracker
+        self.predictive = predictive
+        self.ml_predictor = ml_predictor
+        self._lock = asyncio.Lock()
 
     async def assess_expert_impact(
         self,
@@ -1496,229 +1051,191 @@ class BiodiversityImpactAssessor:
         energy_source: str,
         cooling_method: str,
         use_ml_prediction: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Enhanced biodiversity impact assessment with ML prediction and bio‑inspired integrations.
-        """
-        # Update carbon intensity
+    ) -> BiodiversityAssessment:
+        # Get carbon intensity
         carbon_intensity = 400
         if self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
 
-        # Use QuantumBridge to adjust carbon/helium weights if available
-        if self.enable_quantum_bridge and self.quantum_bridge:
-            q_params = self.quantum_bridge.get_qubo_parameters()
-            penalty_carbon = q_params.get('penalty_carbon', 0.5)
-            penalty_helium = q_params.get('penalty_helium_shortage', 0.5)
-            # Adjust sensitivity based on penalties
-            if penalty_carbon > 0.7:
-                carbon_intensity *= 1.2
-            if penalty_helium > 0.7:
-                for eco in self.ecosystems.values():
-                    eco.helium_sensitivity = min(1.0, eco.helium_sensitivity * 1.2)
+        # Perform sub‑assessments
+        habitat = self._assess_habitat(location)
+        energy = self._assess_energy(energy_source, location)
+        cooling = self._assess_cooling(cooling_method, location)
+        resources = self._assess_resources(expert_type)
+        carbon = self._assess_carbon(energy_source, location, carbon_intensity)
+        helium = self._assess_helium(cooling_method, location)
 
-        # Use TimeTickEngine for helium forecast if available
-        if self.enable_time_tick_engine and self.tick_engine:
-            forecast = self.tick_engine.get_helium_forecast(4)
-            if forecast and len(forecast) > 3:
-                avg_future_helium = np.mean(forecast)
-                if avg_future_helium < 0.3:
-                    # Helium scarcity predicted, increase helium sensitivity
-                    for eco in self.ecosystems.values():
-                        eco.helium_sensitivity = min(1.0, eco.helium_sensitivity * 1.1)
+        # Aggregate
+        breakdown = {
+            'habitat': habitat,
+            'energy': energy,
+            'cooling': cooling,
+            'resources': resources,
+            'carbon': carbon,
+            'helium': helium
+        }
+        total = (habitat['score'] + energy['score'] + cooling['score'] +
+                 resources['score'] + carbon['score'] + helium['score']) / 6.0
 
-        # Perform standard assessment
-        impact_scores = {}
-        total_impact = 0.0
-
-        habitat_impact = self._assess_habitat_impact(location)
-        impact_scores['habitat'] = habitat_impact
-        total_impact += habitat_impact['score']
-
-        energy_impact = self._assess_energy_impact(energy_source, location)
-        impact_scores['energy'] = energy_impact
-        total_impact += energy_impact['score']
-
-        cooling_impact = self._assess_cooling_impact(cooling_method, location)
-        impact_scores['cooling'] = cooling_impact
-        total_impact += cooling_impact['score']
-
-        resource_impact = self._assess_resource_impact(expert_type)
-        impact_scores['resources'] = resource_impact
-        total_impact += resource_impact['score']
-
-        # Carbon impact
-        carbon_impact = self._assess_carbon_impact(energy_source, location, carbon_intensity)
-        impact_scores['carbon'] = carbon_impact
-
-        # Helium impact
-        helium_impact = self._assess_helium_impact(cooling_method, location)
-        impact_scores['helium'] = helium_impact
-
-        total_impact += carbon_impact['score'] + helium_impact['score']
-        total_impact = total_impact / 6.0
-
-        # ML prediction if enabled
-        ml_prediction = None
-        if self.enable_ml_prediction and use_ml_prediction:
-            ml_prediction = await self.ml_predictor.predict_impact({
+        # ML prediction
+        ml_pred = None
+        if self.ml_predictor and use_ml_prediction:
+            ml_pred = await self.ml_predictor.predict({
                 'carbon_intensity': carbon_intensity,
-                'energy_intensity': energy_impact['score'],
-                'cooling_intensity': cooling_impact['score'],
-                'resource_intensity': resource_impact['score'],
-                'ecosystem_sensitivity': habitat_impact.get('sensitivity', 0.5),
-                'proximity_factor': habitat_impact.get('proximity_factor', 0.5),
-                'fragmentation_index': habitat_impact.get('fragmentation_index', 0.5),
+                'energy_intensity': energy['score'],
+                'cooling_intensity': cooling['score'],
+                'resource_intensity': resources['score'],
+                'ecosystem_sensitivity': habitat.get('sensitivity', 0.5),
+                'proximity_factor': habitat.get('proximity_factor', 0.5),
+                'fragmentation_index': habitat.get('fragmentation_index', 0.5),
                 'species_density': 0.5,
                 'water_scarcity': location.get('water_scarcity_index', 0.5),
                 'temperature_anomaly': 0.5
             })
 
-        # Generate mitigation strategies
-        mitigation = self._generate_mitigation_strategies(
-            impact_scores, expert_type, location
+        # Mitigation and recommendations
+        mitigation = self._generate_mitigation(breakdown, expert_type, location)
+        recommendations = self._generate_recommendations(breakdown)
+
+        # Sustainability score
+        sustainability = self._calc_sustainability(breakdown, total, carbon_intensity)
+
+        assessment = BiodiversityAssessment(
+            assessment_id=hashlib.md5(f"{expert_type}{location}{datetime.now(timezone.utc)}".encode()).hexdigest()[:12],
+            expert_type=expert_type,
+            location=location,
+            total_impact=total,
+            impact_breakdown=breakdown,
+            mitigation_strategies=mitigation,
+            recommendations=recommendations,
+            sustainability_score=sustainability,
+            carbon_impact=carbon,
+            helium_impact=helium,
+            ml_prediction=ml_pred,
+            timestamp=datetime.now(timezone.utc)
         )
 
-        # Use CostBenefitEngine to evaluate mitigation strategies if available
-        if self.enable_cost_benefit and self.cost_benefit_engine:
-            for strategy in mitigation:
-                # Create a scenario for cost-benefit analysis
-                params = {
-                    'impact_reduction': strategy['impact_reduction'],
-                    'cost': strategy['cost'],
-                    'implementation_time': strategy['implementation_time']
-                }
-                analysis = await self.cost_benefit_engine.analyze_scenario(
-                    f"mitigation_{strategy['type']}", params
-                )
-                strategy['roi'] = analysis.roi
-                strategy['net_value'] = analysis.net_value
+        # Store and update scores
+        await self.storage.add_assessment(assessment)
+        await self._update_scores(assessment)
 
-        # Calculate sustainability score
-        sustainability_score = self._calculate_sustainability_score(
-            impact_scores, total_impact, carbon_intensity
-        )
-
-        assessment = {
-            'assessment_id': hashlib.md5(f"{expert_type}{location}{datetime.now(timezone.utc)}".encode()).hexdigest()[:12],
-            'expert_type': expert_type,
-            'location': location,
-            'total_biodiversity_impact': total_impact,
-            'impact_breakdown': impact_scores,
-            'mitigation_strategies': mitigation,
-            'recommendations': self._generate_recommendations(impact_scores),
-            'sustainability_score': sustainability_score,
-            'carbon_impact': carbon_impact,
-            'helium_impact': helium_impact,
-            'ml_prediction': ml_prediction,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }
-
-        self.impact_history.append(assessment)
-        self._update_biodiversity_scores(assessment)
-
-        # Update predictive analyzer
-        if self.predictive_analyzer:
-            self.predictive_analyzer.update_history({
-                'total_impact': total_impact,
-                'habitat_score': habitat_impact['score'],
-                'energy_score': energy_impact['score'],
-                'cooling_score': cooling_impact['score'],
-                'resource_score': resource_impact['score'],
+        # Update predictive history
+        if self.predictive:
+            self.predictive.update_history({
+                'total_impact': total,
+                'habitat_score': habitat['score'],
+                'energy_score': energy['score'],
+                'cooling_score': cooling['score'],
+                'resource_score': resources['score'],
                 'carbon_intensity': carbon_intensity,
-                'ecosystem_sensitivity': habitat_impact.get('sensitivity', 0.5)
+                'ecosystem_sensitivity': habitat.get('sensitivity', 0.5)
             })
-            await self.predictive_analyzer.train_forecast_model()
 
-        # Human-AI collaboration
-        if self.enable_human_ai and self.human_ai:
-            insights = self.human_ai.get_collaborative_insights()
-            assessment['human_ai_insights'] = insights
-
-        # Telemetry
-        if self.telemetry:
-            self.telemetry.increment('assessments_performed')
-            self.telemetry.gauge('total_impact', total_impact)
-            self.telemetry.gauge('sustainability_score', sustainability_score)
-
-        # Helium tracking
-        if self.enable_helium_tracking and self.helium_tracker:
-            helium_usage_l = helium_impact.get('score', 0) * 10  # Placeholder calculation
-            self.helium_tracker.record_helium_usage(helium_usage_l, expert_type)
-
-        # Check for critical impact and trigger workflow
-        if total_impact > 0.8 and self.workflow_orchestrator:
-            await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_impact)
-
-        # Pass assessment to gating network if available
-        if self.gating_network and self.expert_router:
-            features = np.array([
-                total_impact,
-                carbon_intensity / 800,
-                self.sustainability_score,
-                len(self.mitigation_strategies)
-            ])
-            reward = 1.0 - total_impact
-            context = {
-                'expert_type': expert_type,
-                'location': location,
-                'total_impact': total_impact
-            }
-            self.gating_network.update(features, reward, context)
-
-        # Pass to self-evolving gate if available
-        if self.self_evolving_gate:
-            self.self_evolving_gate.adapt(
-                state=torch.tensor([total_impact, carbon_intensity/800]),
-                chosen_expert=0,  # dummy
-                reward=1.0 - total_impact,
-                environmental_feedback={'expert_type': expert_type},
-                quantum_mode=False
-            )
-
-        logger.info(
-            f"Biodiversity assessment for {expert_type}: impact={total_impact:.2f}, "
-            f"sustainability={sustainability_score:.2f}"
-        )
+        # Track helium
+        if self.helium_tracker:
+            helium_usage_l = helium['score'] * 10  # simplistic
+            self.helium_tracker.record_usage(helium_usage_l, expert_type)
 
         return assessment
 
-    # ========================================================================
-    # Existing Assessment Methods (Preserved)
-    # ========================================================================
+    # Assessment sub‑functions (same as original, but refactored)
+    def _assess_habitat(self, location: Dict[str, Any]) -> Dict[str, Any]:
+        nearest = self._find_nearest_ecosystem(location)
+        if not nearest:
+            return {'score': 0.1, 'category': 'minimal', 'ecosystem': None}
+        distance = location.get('distance_to_ecosystem_km', 100)
+        if distance < 1:
+            proximity = 1.0
+        elif distance < 10:
+            proximity = 0.7
+        elif distance < 50:
+            proximity = 0.3
+        else:
+            proximity = 0.1
+        ecosystem = self.storage.ecosystems.get(nearest)
+        if ecosystem:
+            sensitivity = min(ecosystem.endangered_species_count / 200.0, 1.0)
+            fragmentation = ecosystem.fragmentation_index
+        else:
+            sensitivity = 0.5
+            fragmentation = 0.5
+        score = proximity * 0.4 + sensitivity * 0.4 + fragmentation * 0.2
+        return {
+            'score': score,
+            'category': 'critical' if score > 0.7 else 'moderate' if score > 0.3 else 'low',
+            'ecosystem': nearest,
+            'proximity_factor': proximity,
+            'sensitivity': sensitivity,
+            'fragmentation_index': fragmentation
+        }
 
-    def _assess_carbon_impact(
-        self,
-        energy_source: str,
-        location: Dict[str, Any],
-        carbon_intensity: float
-    ) -> Dict[str, Any]:
-        """Assess carbon impact with real-time data."""
-        energy_factors = {
+    def _assess_energy(self, energy_source: str, location: Dict[str, Any]) -> Dict[str, Any]:
+        factors = {
+            'solar': 0.05, 'wind': 0.08, 'hydroelectric': 0.15,
+            'geothermal': 0.03, 'nuclear': 0.10, 'natural_gas': 0.40,
+            'coal': 0.80, 'oil': 0.90, 'biomass': 0.30,
+            'mixed_grid': 0.35
+        }
+        base = factors.get(energy_source, 0.5)
+        if location.get('near_water_body'):
+            if energy_source in ['hydroelectric', 'nuclear']:
+                base *= 1.5
+        if location.get('in_migration_corridor'):
+            if energy_source in ['wind']:
+                base *= 1.3
+        return {'score': base, 'energy_source': energy_source,
+                'category': 'high' if base > 0.5 else 'moderate' if base > 0.2 else 'low'}
+
+    def _assess_cooling(self, cooling_method: str, location: Dict[str, Any]) -> Dict[str, Any]:
+        factors = {
+            'air_cooling': 0.05, 'evaporative_cooling': 0.15,
+            'water_cooling': 0.25, 'helium_cooling': 0.10,
+            'geothermal_cooling': 0.03, 'liquid_immersion': 0.20,
+            'free_cooling': 0.02
+        }
+        base = factors.get(cooling_method, 0.15)
+        if cooling_method in ['water_cooling', 'evaporative_cooling']:
+            scarcity = location.get('water_scarcity_index', 0)
+            if scarcity > 0.7:
+                base *= 2.0
+            elif scarcity > 0.4:
+                base *= 1.5
+        if cooling_method in ['water_cooling', 'liquid_immersion']:
+            if location.get('near_water_body'):
+                base *= 1.3
+        return {'score': base, 'cooling_method': cooling_method,
+                'category': 'high' if base > 0.5 else 'moderate' if base > 0.2 else 'low'}
+
+    def _assess_resources(self, expert_type: str) -> Dict[str, Any]:
+        impacts = {
+            'energy_expert': {'rare_earth': 0.1, 'copper': 0.05, 'overall': 0.08},
+            'data_expert': {'rare_earth': 0.15, 'copper': 0.1, 'overall': 0.12},
+            'iot_expert': {'rare_earth': 0.05, 'copper': 0.02, 'overall': 0.04},
+            'quantum_expert': {'rare_earth': 0.3, 'copper': 0.2, 'overall': 0.25},
+            'helium_expert': {'rare_earth': 0.08, 'copper': 0.05, 'overall': 0.06}
+        }
+        overall = impacts.get(expert_type, {'overall': 0.1})['overall']
+        return {'score': overall, 'expert_type': expert_type,
+                'category': 'high' if overall > 0.2 else 'moderate' if overall > 0.1 else 'low'}
+
+    def _assess_carbon(self, energy_source: str, location: Dict[str, Any], carbon_intensity: float) -> Dict[str, Any]:
+        factors = {
             'solar': 0.02, 'wind': 0.03, 'hydroelectric': 0.05,
             'geothermal': 0.01, 'nuclear': 0.04, 'natural_gas': 0.35,
             'coal': 0.70, 'oil': 0.80, 'biomass': 0.25,
             'mixed_grid': 0.30
         }
-        base_impact = energy_factors.get(energy_source, 0.3)
+        base = factors.get(energy_source, 0.3)
         carbon_factor = carbon_intensity / 400.0
-        score = base_impact * carbon_factor
+        score = base * carbon_factor
         if location.get('near_carbon_sensitive_ecosystem'):
             score *= 1.3
-        return {
-            'score': min(score, 1.0),
-            'energy_source': energy_source,
-            'carbon_intensity': carbon_intensity,
-            'category': 'high' if score > 0.5 else 'moderate' if score > 0.2 else 'low'
-        }
+        return {'score': min(score, 1.0), 'energy_source': energy_source,
+                'carbon_intensity': carbon_intensity,
+                'category': 'high' if score > 0.5 else 'moderate' if score > 0.2 else 'low'}
 
-    def _assess_helium_impact(
-        self,
-        cooling_method: str,
-        location: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Assess helium impact on biodiversity."""
-        helium_factors = {
+    def _assess_helium(self, cooling_method: str, location: Dict[str, Any]) -> Dict[str, Any]:
+        factors = {
             'helium_cooling': 0.25,
             'water_cooling': 0.05,
             'air_cooling': 0.02,
@@ -1727,124 +1244,14 @@ class BiodiversityImpactAssessor:
             'liquid_immersion': 0.10,
             'free_cooling': 0.01
         }
-        base_impact = helium_factors.get(cooling_method, 0.05)
+        base = factors.get(cooling_method, 0.05)
         if location.get('near_helium_mining_region'):
-            base_impact *= 2.0
-        return {
-            'score': min(base_impact, 1.0),
-            'cooling_method': cooling_method,
-            'category': 'high' if base_impact > 0.2 else 'moderate' if base_impact > 0.05 else 'low'
-        }
-
-    def _calculate_sustainability_score(
-        self,
-        impact_scores: Dict[str, Any],
-        total_impact: float,
-        carbon_intensity: float
-    ) -> float:
-        """Calculate overall sustainability score."""
-        weights = {
-            'habitat': 0.25,
-            'energy': 0.20,
-            'cooling': 0.15,
-            'resources': 0.15,
-            'carbon': 0.15,
-            'helium': 0.10
-        }
-        score = 1.0
-        for category, scores in impact_scores.items():
-            if category in weights:
-                score -= scores.get('score', 0) * weights[category]
-        carbon_factor = 1.0 - (carbon_intensity / 800)
-        score = score * 0.7 + carbon_factor * 0.3
-        return max(0.0, min(1.0, score))
-
-    def _assess_habitat_impact(self, location: Dict[str, Any]) -> Dict[str, Any]:
-        """Assess habitat impact of computing location."""
-        nearest_ecosystem = self._find_nearest_ecosystem(location)
-        if not nearest_ecosystem:
-            return {'score': 0.1, 'category': 'minimal', 'ecosystem': None}
-        distance_km = location.get('distance_to_ecosystem_km', 100)
-        ecosystem = self.ecosystems[nearest_ecosystem]
-        if distance_km < 1:
-            proximity_factor = 1.0
-        elif distance_km < 10:
-            proximity_factor = 0.7
-        elif distance_km < 50:
-            proximity_factor = 0.3
-        else:
-            proximity_factor = 0.1
-        sensitivity = ecosystem.endangered_species_count / 200.0
-        sensitivity = min(sensitivity, 1.0)
-        fragmentation_factor = ecosystem.fragmentation_index
-        score = (proximity_factor * 0.4 + sensitivity * 0.4 + fragmentation_factor * 0.2)
-        return {
-            'score': score,
-            'category': 'critical' if score > 0.7 else 'moderate' if score > 0.3 else 'low',
-            'ecosystem': nearest_ecosystem,
-            'proximity_factor': proximity_factor,
-            'sensitivity': sensitivity,
-            'fragmentation_index': fragmentation_factor
-        }
-
-    def _assess_energy_impact(self, energy_source: str, location: Dict[str, Any]) -> Dict[str, Any]:
-        impact_factors = {
-            'solar': 0.05, 'wind': 0.08, 'hydroelectric': 0.15,
-            'geothermal': 0.03, 'nuclear': 0.10, 'natural_gas': 0.40,
-            'coal': 0.80, 'oil': 0.90, 'biomass': 0.30,
-            'mixed_grid': 0.35
-        }
-        base_impact = impact_factors.get(energy_source, 0.5)
-        if location.get('near_water_body'):
-            if energy_source in ['hydroelectric', 'nuclear']:
-                base_impact *= 1.5
-        if location.get('in_migration_corridor'):
-            if energy_source in ['wind']:
-                base_impact *= 1.3
-        return {
-            'score': base_impact,
-            'energy_source': energy_source,
-            'category': 'high' if base_impact > 0.5 else 'moderate' if base_impact > 0.2 else 'low'
-        }
-
-    def _assess_cooling_impact(self, cooling_method: str, location: Dict[str, Any]) -> Dict[str, Any]:
-        impact_factors = {
-            'air_cooling': 0.05, 'evaporative_cooling': 0.15,
-            'water_cooling': 0.25, 'helium_cooling': 0.10,
-            'geothermal_cooling': 0.03, 'liquid_immersion': 0.20,
-            'free_cooling': 0.02
-        }
-        base_impact = impact_factors.get(cooling_method, 0.15)
-        if cooling_method in ['water_cooling', 'evaporative_cooling']:
-            if location.get('water_scarcity_index', 0) > 0.7:
-                base_impact *= 2.0
-            elif location.get('water_scarcity_index', 0) > 0.4:
-                base_impact *= 1.5
-        if cooling_method in ['water_cooling', 'liquid_immersion']:
-            if location.get('near_water_body'):
-                base_impact *= 1.3
-        return {
-            'score': base_impact,
-            'cooling_method': cooling_method,
-            'category': 'high' if base_impact > 0.5 else 'moderate' if base_impact > 0.2 else 'low'
-        }
-
-    def _assess_resource_impact(self, expert_type: str) -> Dict[str, Any]:
-        resource_impacts = {
-            'energy_expert': {'rare_earth': 0.1, 'copper': 0.05, 'overall': 0.08},
-            'data_expert': {'rare_earth': 0.15, 'copper': 0.1, 'overall': 0.12},
-            'iot_expert': {'rare_earth': 0.05, 'copper': 0.02, 'overall': 0.04},
-            'quantum_expert': {'rare_earth': 0.3, 'copper': 0.2, 'overall': 0.25},
-            'helium_expert': {'rare_earth': 0.08, 'copper': 0.05, 'overall': 0.06}
-        }
-        impact = resource_impacts.get(expert_type, {'overall': 0.1})
-        return {
-            'score': impact['overall'],
-            'expert_type': expert_type,
-            'category': 'high' if impact['overall'] > 0.2 else 'moderate' if impact['overall'] > 0.1 else 'low'
-        }
+            base *= 2.0
+        return {'score': min(base, 1.0), 'cooling_method': cooling_method,
+                'category': 'high' if base > 0.2 else 'moderate' if base > 0.05 else 'low'}
 
     def _find_nearest_ecosystem(self, location: Dict[str, Any]) -> Optional[str]:
+        # Simplified – could be enhanced with geospatial lookup
         if location.get('latitude', 0) < 0:
             return 'amazon_rainforest'
         elif location.get('latitude', 0) > 45:
@@ -1852,14 +1259,9 @@ class BiodiversityImpactAssessor:
         else:
             return 'coral_reef_pacific'
 
-    def _generate_mitigation_strategies(
-        self,
-        impact_scores: Dict[str, Any],
-        expert_type: str,
-        location: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+    def _generate_mitigation(self, breakdown: Dict, expert_type: str, location: Dict) -> List[Dict]:
         strategies = []
-        if impact_scores['habitat']['score'] > 0.5:
+        if breakdown['habitat']['score'] > 0.5:
             strategies.append({
                 'type': 'habitat_protection',
                 'action': 'Relocate computation to lower-impact area',
@@ -1874,7 +1276,7 @@ class BiodiversityImpactAssessor:
                 'cost': 'high',
                 'implementation_time': 'long'
             })
-        if impact_scores['energy']['score'] > 0.3:
+        if breakdown['energy']['score'] > 0.3:
             strategies.append({
                 'type': 'renewable_energy',
                 'action': 'Switch to renewable energy sources',
@@ -1882,7 +1284,7 @@ class BiodiversityImpactAssessor:
                 'cost': 'medium',
                 'implementation_time': 'medium'
             })
-        if impact_scores['cooling']['score'] > 0.3:
+        if breakdown['cooling']['score'] > 0.3:
             strategies.append({
                 'type': 'efficient_cooling',
                 'action': 'Implement free cooling or geothermal cooling',
@@ -1890,7 +1292,7 @@ class BiodiversityImpactAssessor:
                 'cost': 'medium',
                 'implementation_time': 'medium'
             })
-        if impact_scores['resources']['score'] > 0.15:
+        if breakdown['resources']['score'] > 0.15:
             strategies.append({
                 'type': 'circular_economy',
                 'action': 'Use recycled materials and extend hardware life',
@@ -1898,7 +1300,7 @@ class BiodiversityImpactAssessor:
                 'cost': 'low',
                 'implementation_time': 'short'
             })
-        if 'carbon' in impact_scores and impact_scores['carbon']['score'] > 0.3:
+        if breakdown['carbon']['score'] > 0.3:
             strategies.append({
                 'type': 'carbon_offset',
                 'action': 'Implement carbon offset program',
@@ -1906,7 +1308,7 @@ class BiodiversityImpactAssessor:
                 'cost': 'medium',
                 'implementation_time': 'medium'
             })
-        if 'helium' in impact_scores and impact_scores['helium']['score'] > 0.1:
+        if breakdown['helium']['score'] > 0.1:
             strategies.append({
                 'type': 'helium_recovery',
                 'action': 'Implement helium recovery and recycling',
@@ -1916,278 +1318,725 @@ class BiodiversityImpactAssessor:
             })
         return strategies
 
-    def _generate_recommendations(self, impact_scores: Dict[str, Any]) -> List[str]:
+    def _generate_recommendations(self, breakdown: Dict) -> List[str]:
         recommendations = []
-        scores = {
-            category: scores['score']
-            for category, scores in impact_scores.items()
-            if isinstance(scores, dict) and 'score' in scores
-        }
-        highest_impact = max(scores.items(), key=lambda x: x[1]) if scores else ('none', 0)
-        if highest_impact[0] == 'habitat' and highest_impact[1] > 0.5:
+        scores = {cat: data['score'] for cat, data in breakdown.items() if 'score' in data}
+        highest = max(scores.items(), key=lambda x: x[1]) if scores else ('none', 0)
+        if highest[0] == 'habitat' and highest[1] > 0.5:
             recommendations.append("HIGH PRIORITY: Relocate computation to avoid sensitive ecosystems")
-        elif highest_impact[0] == 'energy' and highest_impact[1] > 0.5:
-            recommendations.append("HIGH PRIORITY: Switch to renewable energy to reduce biodiversity impact")
-        elif highest_impact[0] == 'cooling' and highest_impact[1] > 0.5:
-            recommendations.append("HIGH PRIORITY: Implement water-free cooling to protect aquatic ecosystems")
-        elif highest_impact[0] == 'carbon' and highest_impact[1] > 0.5:
-            recommendations.append("HIGH PRIORITY: Reduce carbon emissions through efficiency improvements")
-        elif highest_impact[0] == 'helium' and highest_impact[1] > 0.3:
-            recommendations.append("HIGH PRIORITY: Implement helium recovery and recycling systems")
-        if all(score < 0.2 for score in scores.values()):
-            recommendations.append("Current setup has minimal biodiversity impact - maintain standards")
+        elif highest[0] == 'energy' and highest[1] > 0.5:
+            recommendations.append("HIGH PRIORITY: Switch to renewable energy")
+        elif highest[0] == 'cooling' and highest[1] > 0.5:
+            recommendations.append("HIGH PRIORITY: Implement water-free cooling")
+        elif highest[0] == 'carbon' and highest[1] > 0.5:
+            recommendations.append("HIGH PRIORITY: Reduce carbon emissions")
+        elif highest[0] == 'helium' and highest[1] > 0.3:
+            recommendations.append("HIGH PRIORITY: Implement helium recovery")
+        if all(s < 0.2 for s in scores.values()):
+            recommendations.append("Current setup has minimal biodiversity impact")
         else:
             recommendations.append("Consider biodiversity offsets equivalent to 110% of calculated impact")
         return recommendations
 
-    def _update_biodiversity_scores(self, assessment: Dict[str, Any]):
+    def _calc_sustainability(self, breakdown: Dict, total: float, carbon_intensity: float) -> float:
+        weights = {'habitat': 0.25, 'energy': 0.20, 'cooling': 0.15,
+                   'resources': 0.15, 'carbon': 0.15, 'helium': 0.10}
+        score = 1.0
+        for cat, data in breakdown.items():
+            if cat in weights:
+                score -= data['score'] * weights[cat]
+        carbon_factor = 1.0 - (carbon_intensity / 800)
+        score = score * 0.7 + carbon_factor * 0.3
+        return max(0.0, min(1.0, score))
+
+    async def _update_scores(self, assessment: BiodiversityAssessment):
         alpha = 0.1
-        self.local_biodiversity_score = (
-            (1 - alpha) * self.local_biodiversity_score +
-            alpha * assessment['total_biodiversity_impact']
-        )
-        self.global_biodiversity_score = (
-            (1 - alpha * 0.5) * self.global_biodiversity_score +
-            alpha * 0.5 * assessment['total_biodiversity_impact']
-        )
-        self.sustainability_score = (
-            (1 - alpha) * self.sustainability_score +
-            alpha * assessment.get('sustainability_score', 0.5)
-        )
+        async with self.storage._lock:
+            self.storage.local_score = (1 - alpha) * self.storage.local_score + alpha * assessment.total_impact
+            self.storage.global_score = (1 - alpha * 0.5) * self.storage.global_score + alpha * 0.5 * assessment.total_impact
+            self.storage.sustainability_score = (1 - alpha) * self.storage.sustainability_score + alpha * assessment.sustainability_score
 
-    # ========================================================================
-    # Report Generation
-    # ========================================================================
+    async def get_routing_guidance(self, expert_options: List[str], location_options: List[Dict]) -> Dict:
+        assessments = []
+        for expert in expert_options:
+            for loc in location_options:
+                # Quick estimate
+                loc_sens = loc.get('biodiversity_sensitivity', 0.5)
+                expert_int = {
+                    'energy': 0.3, 'data': 0.4, 'iot': 0.2,
+                    'quantum': 0.6, 'helium': 0.35
+                }.get(expert, 0.4)
+                impact = loc_sens * expert_int
+                assessments.append({'expert': expert, 'location': loc.get('name', 'unknown'), 'estimated_impact': impact})
+        assessments.sort(key=lambda x: x['estimated_impact'])
+        best = assessments[0] if assessments else None
+        worst = assessments[-1] if assessments else None
+        return {
+            'best_option': best,
+            'worst_option': worst,
+            'all_options': assessments,
+            'recommendation': f"Use {best['expert']} at {best['location']}" if best else "No options",
+            'sustainability_score': self.storage.sustainability_score,
+            'biodiversity_impact_reduction': (worst['estimated_impact'] - best['estimated_impact']) / max(worst['estimated_impact'], 0.001) if best and worst else 0
+        }
 
-    def get_biodiversity_report(self) -> Dict[str, Any]:
-        recent_impacts = self.impact_history[-50:] if self.impact_history else []
+# ============================================================================
+# Biodiversity Reporter (reporting, telemetry, persistence)
+# ============================================================================
+class BiodiversityReporter:
+    def __init__(self, config: BiodiversityConfig, storage: BiodiversityStorage, analyzer: BiodiversityAnalyzer,
+                 telemetry: Optional[BiodiversityTelemetry] = None,
+                 persistence: Optional[BiodiversityPersistenceManager] = None,
+                 human_ai: Optional[HumanAICollaborativeBiodiversity] = None):
+        self.config = config
+        self.storage = storage
+        self.analyzer = analyzer
+        self.telemetry = telemetry
+        self.persistence = persistence
+        self.human_ai = human_ai
+        self._lock = asyncio.Lock()
+
+    async def generate_report(self) -> Dict[str, Any]:
+        scores = await self.storage.get_scores()
+        ecosystems = await self.storage.get_ecosystems()
+        recent = await self.storage.get_impact_history(10)
         report = {
-            'local_biodiversity_score': self.local_biodiversity_score,
-            'global_biodiversity_score': self.global_biodiversity_score,
-            'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg,
-            'total_helium_savings_l': self.total_helium_savings_l,
-            'ecosystems_tracked': len(self.ecosystems),
+            'local_biodiversity_score': scores['local'],
+            'global_biodiversity_score': scores['global'],
+            'sustainability_score': scores['sustainability'],
+            'total_carbon_savings_kg': self.storage.total_carbon_savings_kg,
+            'total_helium_savings_l': self.storage.total_helium_savings_l,
+            'ecosystems_tracked': len(ecosystems),
             'recent_impacts': [
                 {
-                    'expert_type': i['expert_type'],
-                    'impact': i['total_biodiversity_impact'],
-                    'sustainability_score': i.get('sustainability_score', 0.5),
-                    'timestamp': i['timestamp']
+                    'expert_type': a.expert_type,
+                    'impact': a.total_impact,
+                    'sustainability_score': a.sustainability_score,
+                    'timestamp': a.timestamp.isoformat()
                 }
-                for i in recent_impacts[-10:]
+                for a in recent
             ],
             'high_risk_ecosystems': [
-                name for name, eco in self.ecosystems.items()
+                name for name, eco in ecosystems.items()
                 if eco.endangered_species_count > 50
             ],
-            'mitigation_effectiveness': self._calculate_mitigation_effectiveness(),
+            'mitigation_effectiveness': self._calc_mitigation_effectiveness(),
             'recommendations': self._generate_global_recommendations()
         }
-        if self.enable_predictive and self.predictive_analyzer:
-            report['predictive_forecast'] = asyncio.run(
-                self.predictive_analyzer.predict_impact_trend()
-            )
-        if self.enable_federated and self.federated_assessor:
-            report['federated_stats'] = self.federated_assessor.get_federated_stats()
-        if self.enable_ml_prediction and self.ml_predictor:
-            report['ml_status'] = {
-                'trained': self.ml_predictor.is_trained,
-                'model_version': 'v3.0.0',
-                'training_samples': len(self.ml_predictor.training_history)
-            }
-        if self.enable_helium_tracking and self.helium_tracker:
-            report['helium_position'] = self.helium_tracker.get_helium_position()
-        if self.enable_swarm_coordination:
-            report['swarm_stats'] = {}  # placeholder
+        if self.analyzer.predictive:
+            forecast = await self.analyzer.predictive.predict_trend()
+            report['predictive_forecast'] = forecast
+        if self.human_ai:
+            report['human_ai_insights'] = await self.human_ai.get_insights()
         return report
 
-    def _calculate_mitigation_effectiveness(self) -> float:
-        if not self.impact_history:
-            return 0.0
-        recent = self.impact_history[-20:]
-        historical = self.impact_history[:-20]
+    def _calc_mitigation_effectiveness(self) -> float:
+        history = self.storage.impact_history
+        if len(history) < 20:
+            return 0.5
+        recent = history[-20:]
+        historical = history[:-20]
         if not historical:
             return 0.5
-        recent_avg = np.mean([i['total_biodiversity_impact'] for i in recent])
-        historical_avg = np.mean([i['total_biodiversity_impact'] for i in historical])
+        recent_avg = np.mean([a.total_impact for a in recent])
+        historical_avg = np.mean([a.total_impact for a in historical])
         if historical_avg > 0:
-            improvement = (historical_avg - recent_avg) / historical_avg
-            return max(improvement, 0.0)
+            return max((historical_avg - recent_avg) / historical_avg, 0.0)
         return 0.0
 
     def _generate_global_recommendations(self) -> List[str]:
-        recommendations = []
-        if self.local_biodiversity_score > 0.5:
-            recommendations.append("CRITICAL: Implement immediate biodiversity protection measures")
-        if any(eco.endangered_species_count > 100 for eco in self.ecosystems.values()):
-            recommendations.append("URGENT: Avoid computing operations near critical habitats")
-        if self.sustainability_score < 0.5:
-            recommendations.append("IMPROVE: Overall sustainability score needs improvement")
-        recommendations.append("Implement helium recovery systems to reduce mining impact on biodiversity")
-        recommendations.append("Monitor carbon intensity and optimize energy sources accordingly")
-        return recommendations
+        recs = []
+        if self.storage.local_score > 0.5:
+            recs.append("CRITICAL: Implement immediate biodiversity protection measures")
+        if any(eco.endangered_species_count > 100 for eco in self.storage.ecosystems.values()):
+            recs.append("URGENT: Avoid computing operations near critical habitats")
+        if self.storage.sustainability_score < 0.5:
+            recs.append("IMPROVE: Overall sustainability score needs improvement")
+        recs.append("Implement helium recovery systems to reduce mining impact")
+        recs.append("Monitor carbon intensity and optimize energy sources")
+        return recs
 
-    # ========================================================================
-    # Expert Routing Guidance
-    # ========================================================================
-
-    def get_expert_routing_guidance(
-        self,
-        expert_options: List[str],
-        location_options: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        impact_assessments = []
-        for expert in expert_options:
-            for location in location_options:
-                assessment = {
-                    'expert': expert,
-                    'location': location.get('name', 'unknown'),
-                    'estimated_impact': self._quick_impact_estimate(expert, location)
-                }
-                impact_assessments.append(assessment)
-        impact_assessments.sort(key=lambda x: x['estimated_impact'])
-        return {
-            'best_option': impact_assessments[0] if impact_assessments else None,
-            'worst_option': impact_assessments[-1] if impact_assessments else None,
-            'all_options': impact_assessments,
-            'recommendation': (
-                f"Use {impact_assessments[0]['expert']} at {impact_assessments[0]['location']}"
-                if impact_assessments else "No options available"
-            ),
-            'sustainability_score': self.sustainability_score,
-            'biodiversity_impact_reduction': (
-                (impact_assessments[-1]['estimated_impact'] - impact_assessments[0]['estimated_impact']) /
-                max(impact_assessments[-1]['estimated_impact'], 0.001)
-                if len(impact_assessments) > 1 else 0
-            )
-        }
-
-    def _quick_impact_estimate(self, expert_type: str, location: Dict[str, Any]) -> float:
-        location_sensitivity = location.get('biodiversity_sensitivity', 0.5)
-        expert_intensity = {
-            'energy': 0.3, 'data': 0.4, 'iot': 0.2,
-            'quantum': 0.6, 'helium': 0.35
-        }.get(expert_type, 0.4)
-        return location_sensitivity * expert_intensity
-
-    # ========================================================================
-    # Training Methods
-    # ========================================================================
-
-    async def train_ml_model(self, training_data: List[Dict] = None) -> Dict:
-        if not self.enable_ml_prediction or not self.ml_predictor:
-            return {'status': 'disabled'}
-        if training_data is None:
-            training_data = self.impact_history[-100:] if self.impact_history else []
-        formatted_data = []
-        for item in training_data:
-            breakdown = item.get('impact_breakdown', {})
-            formatted_data.append({
-                'carbon_intensity': item.get('carbon_impact', {}).get('carbon_intensity', 400),
-                'energy_intensity': breakdown.get('energy', {}).get('score', 0.5),
-                'cooling_intensity': breakdown.get('cooling', {}).get('score', 0.5),
-                'resource_intensity': breakdown.get('resources', {}).get('score', 0.5),
-                'ecosystem_sensitivity': breakdown.get('habitat', {}).get('sensitivity', 0.5),
-                'proximity_factor': breakdown.get('habitat', {}).get('proximity_factor', 0.5),
-                'fragmentation_index': breakdown.get('habitat', {}).get('fragmentation_index', 0.5),
-                'species_density': 0.5,
-                'water_scarcity': item.get('location', {}).get('water_scarcity_index', 0.5),
-                'temperature_anomaly': 0.5,
-                'total_impact': item.get('total_biodiversity_impact', 0.5)
-            })
-        result = await self.ml_predictor.train_model(formatted_data)
-        logger.info(f"ML model training completed: {result}")
-        return result
-
-    async def train_predictive_model(self) -> Dict:
-        if not self.enable_predictive or not self.predictive_analyzer:
-            return {'status': 'disabled'}
-        result = await self.predictive_analyzer.train_forecast_model()
-        logger.info(f"Predictive model training completed: {result}")
-        return result
-
-    # ========================================================================
-    # Persistence
-    # ========================================================================
+    async def export_telemetry(self):
+        if self.telemetry:
+            data = await self.telemetry.export()
+            logger.debug(f"Telemetry export: {len(data)} bytes")
 
     async def save_state(self):
         if self.persistence:
-            await self.persistence.save_state(self)
+            state = {
+                'ecosystems': self.storage.ecosystems,
+                'impact_history': self.storage.impact_history,
+                'mitigation_strategies': self.storage.mitigation_strategies,
+                'local_score': self.storage.local_score,
+                'global_score': self.storage.global_score,
+                'sustainability_score': self.storage.sustainability_score,
+                'total_carbon_savings_kg': self.storage.total_carbon_savings_kg,
+                'total_helium_savings_l': self.storage.total_helium_savings_l,
+                'ml_checkpoint': self.analyzer.ml_predictor.get_checkpoint() if self.analyzer.ml_predictor else None
+            }
+            await self.persistence.save_state(state)
 
     async def load_state(self):
         if self.persistence:
-            await self.persistence.load_state(self)
+            state = await self.persistence.load_state()
+            if state:
+                # Restore into storage
+                self.storage.ecosystems = state.get('ecosystems', {})
+                self.storage.impact_history = state.get('impact_history', [])
+                self.storage.mitigation_strategies = state.get('mitigation_strategies', {})
+                self.storage.local_score = state.get('local_score', 0.0)
+                self.storage.global_score = state.get('global_score', 0.0)
+                self.storage.sustainability_score = state.get('sustainability_score', 0.0)
+                self.storage.total_carbon_savings_kg = state.get('total_carbon_savings_kg', 0.0)
+                self.storage.total_helium_savings_l = state.get('total_helium_savings_l', 0.0)
+                ml_cp = state.get('ml_checkpoint')
+                if ml_cp and self.analyzer.ml_predictor:
+                    self.analyzer.ml_predictor.load_checkpoint(ml_cp)
 
+# ============================================================================
+# Main Controller
+# ============================================================================
+class BiodiversityImpactAssessor:
+    """
+    Enhanced Biodiversity Impact Assessor v4.0.0 – Controller that orchestrates
+    storage, analysis, reporting, event handling, and background tasks.
+    """
+
+    def __init__(
+        self,
+        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        config: Optional[BiodiversityConfig] = None,
+        **kwargs
+    ):
+        if config is None:
+            config = BiodiversityConfig(**{k: v for k, v in kwargs.items() if k in BiodiversityConfig.__annotations__})
+        self.config = config
+
+        # Bio‑core references
+        self.bio_core = bio_core
+        self.event_broker = getattr(bio_core, 'event_broker', None) if bio_core else None
+        self.self_healer = getattr(bio_core, 'self_healer', None) if bio_core else None
+        self.workflow_orchestrator = getattr(bio_core, 'workflow_orchestrator', None) if bio_core else None
+        self.swarm_coordinator = getattr(bio_core, 'swarm_coordinator', None) if bio_core else None
+        self.token_manager = getattr(bio_core, 'token_manager', None) if bio_core else None
+        self.gradient_manager = getattr(bio_core, 'gradient_manager', None) if bio_core else None
+
+        # Sub‑modules
+        self.carbon_manager = CarbonIntensityManager(self.config.carbon) if self.config.carbon.enabled else None
+        self.helium_tracker = HeliumImpactTracker(self.config.helium) if self.config.helium.enabled else None
+        self.predictive = PredictiveBiodiversityAnalyzer(self.config.predictive) if self.config.predictive.enabled else None
+        self.ml_predictor = MLImpactPredictor(self.config.ml) if self.config.ml.enabled else None
+        self.federated = FederatedBiodiversityAssessor(self.config.federated) if self.config.federated.enabled else None
+        self.human_ai = HumanAICollaborativeBiodiversity() if self.config.enable_human_ai else None
+        self.telemetry = BiodiversityTelemetry() if self.config.telemetry.enabled else None
+        self.persistence = BiodiversityPersistenceManager(self.config.persistence) if self.config.persistence.enabled else None
+
+        # Storage, Analyzer, Reporter
+        self.storage = BiodiversityStorage()
+        self.analyzer = BiodiversityAnalyzer(
+            config, self.storage, self.carbon_manager, self.helium_tracker,
+            self.predictive, self.ml_predictor
+        )
+        self.reporter = BiodiversityReporter(
+            config, self.storage, self.analyzer, self.telemetry,
+            self.persistence, self.human_ai
+        )
+
+        # MoE injectables
+        self.expert_router = None
+        self.gating_network = None
+        self.self_evolving_gate = None
+        self.helium_provider = None
+
+        # Event queue
+        self._event_queue: asyncio.Queue = asyncio.Queue()
+        self._event_consumer_task: Optional[asyncio.Task] = None
+
+        # Background tasks
+        self._background_tasks: List[asyncio.Task] = []
+
+        # Health
+        self.health_status = "healthy"
+        self.last_error: Optional[str] = None
+
+        # Initialize ecosystems (default or from config)
+        self._initialize_ecosystems()
+
+        # Subscribe to events
+        if self.config.enable_event_driven and self.event_broker:
+            self._subscribe_events()
+
+        # Start background tasks
+        self._start_background_tasks()
+
+        # Load state
+        if self.config.persistence.enabled:
+            asyncio.create_task(self._load_state())
+
+        logger.info("BiodiversityImpactAssessor v4.0.0 initialized")
+
+    # ============================================================================
+    # Event Handling (via queue)
+    # ============================================================================
+    def _subscribe_events(self):
+        if self.event_broker:
+            self.event_broker.subscribe('carbon_update', self._enqueue_event)
+            self.event_broker.subscribe('helium_update', self._enqueue_event)
+            self.event_broker.subscribe('alert_generated', self._enqueue_event)
+            self.event_broker.subscribe('config_updated', self._enqueue_event)
+            self.event_broker.subscribe('token_balance_update', self._enqueue_event)
+            self.event_broker.subscribe('health_update', self._enqueue_event)
+            self.event_broker.subscribe('anomaly_detected', self._enqueue_event)
+            logger.info("Subscribed to core events via queue")
+
+    async def _enqueue_event(self, event: BioEvent):
+        await self._event_queue.put(event)
+
+    async def _event_consumer(self):
+        while True:
+            try:
+                event = await self._event_queue.get()
+                await self._handle_event(event)
+                self._event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Event consumer error: {e}")
+
+    async def _handle_event(self, event: BioEvent):
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler:
+            try:
+                await handler(event)
+            except Exception as e:
+                logger.error(f"Error handling event {event.event_type}: {e}")
+
+    async def _on_carbon_update(self, event: BioEvent):
+        intensity = event.data.get('intensity', 400)
+        if self.carbon_manager:
+            self.carbon_manager.carbon_intensity = intensity
+        # Adjust ecosystem sensitivity
+        for eco in self.storage.ecosystems.values():
+            eco.carbon_sensitivity = 0.5 + 0.5 * (intensity / 800)
+
+    async def _on_helium_update(self, event: BioEvent):
+        scarcity = event.data.get('scarcity', 0.5)
+        if self.helium_tracker:
+            self.helium_tracker.budget_l = 100.0 * (1.0 - scarcity * 0.3)
+        for eco in self.storage.ecosystems.values():
+            eco.helium_sensitivity = 0.5 + 0.5 * scarcity
+
+    async def _on_alert_generated(self, event: BioEvent):
+        if event.data.get('severity') == 'critical':
+            logger.warning("Critical alert; triggering self‑healing")
+            if self.config.self_healing.enabled and self.self_healer:
+                await self.self_healer.apply_healing('damage_accumulation')
+            if self.workflow_orchestrator and self.config.workflow_on_critical_impact:
+                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_impact)
+
+    async def _on_config_updated(self, event: BioEvent):
+        updates = event.data.get('updates', {})
+        if 'biodiversity_assessor' in updates:
+            new = updates['biodiversity_assessor']
+            for key, value in new.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+            logger.info("Configuration reloaded")
+
+    async def _on_token_update(self, event: BioEvent):
+        pass  # optional
+
+    async def _on_health_update(self, event: BioEvent):
+        self.health_status = event.data.get('status', 'healthy')
+
+    async def _on_anomaly_detected(self, event: BioEvent):
+        if event.data.get('metric') == 'carbon_intensity':
+            for eco in self.storage.ecosystems.values():
+                eco.carbon_sensitivity = min(1.0, eco.carbon_sensitivity * 1.2)
+        if event.data.get('metric') == 'helium_scarcity':
+            for eco in self.storage.ecosystems.values():
+                eco.helium_sensitivity = min(1.0, eco.helium_sensitivity * 1.2)
+
+    # ============================================================================
+    # Background Tasks (cancellable)
+    # ============================================================================
+    def _start_background_tasks(self):
+        # Event consumer
+        if self.config.enable_event_driven:
+            self._event_consumer_task = asyncio.create_task(self._event_consumer())
+            self._background_tasks.append(self._event_consumer_task)
+
+        # Carbon update loop
+        if self.carbon_manager:
+            t = asyncio.create_task(self._carbon_update_loop())
+            self._background_tasks.append(t)
+
+        # Helium accounting
+        if self.helium_tracker:
+            self.helium_tracker.start()
+
+        # Predictive training loop
+        if self.predictive:
+            t = asyncio.create_task(self._predictive_update_loop())
+            self._background_tasks.append(t)
+
+        # ML training loop
+        if self.ml_predictor:
+            t = asyncio.create_task(self._ml_training_loop())
+            self._background_tasks.append(t)
+
+        # Federated sync
+        if self.federated:
+            t = asyncio.create_task(self._federated_sync_loop())
+            self._background_tasks.append(t)
+
+        # Telemetry export
+        if self.telemetry:
+            t = asyncio.create_task(self._telemetry_export_loop())
+            self._background_tasks.append(t)
+
+        # Persistence save
+        if self.persistence:
+            t = asyncio.create_task(self._persistence_save_loop())
+            self._background_tasks.append(t)
+
+        # Swarm update
+        if self.config.enable_swarm_coordination and self.swarm_coordinator:
+            t = asyncio.create_task(self._swarm_update_loop())
+            self._background_tasks.append(t)
+
+    async def _carbon_update_loop(self):
+        while True:
+            try:
+                if self.carbon_manager:
+                    await self.carbon_manager.update_carbon_intensity()
+                    if self.telemetry:
+                        intensity = await self.carbon_manager.get_current_intensity()
+                        self.telemetry.gauge('carbon_intensity', intensity)
+                await asyncio.sleep(self.config.carbon.update_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Carbon update error: {e}")
+                await asyncio.sleep(60)
+
+    async def _predictive_update_loop(self):
+        while True:
+            try:
+                if self.predictive and self.storage.impact_history:
+                    await self.predictive.train()
+                await asyncio.sleep(self.config.predictive.update_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Predictive update error: {e}")
+                await asyncio.sleep(60)
+
+    async def _ml_training_loop(self):
+        while True:
+            try:
+                if self.ml_predictor:
+                    # Use recent assessments for training
+                    history = await self.storage.get_impact_history(200)
+                    if len(history) >= 20:
+                        training_data = []
+                        for a in history:
+                            bd = a.impact_breakdown
+                            training_data.append({
+                                'carbon_intensity': a.carbon_impact.get('carbon_intensity', 400),
+                                'energy_intensity': bd.get('energy', {}).get('score', 0.5),
+                                'cooling_intensity': bd.get('cooling', {}).get('score', 0.5),
+                                'resource_intensity': bd.get('resources', {}).get('score', 0.5),
+                                'ecosystem_sensitivity': bd.get('habitat', {}).get('sensitivity', 0.5),
+                                'proximity_factor': bd.get('habitat', {}).get('proximity_factor', 0.5),
+                                'fragmentation_index': bd.get('habitat', {}).get('fragmentation_index', 0.5),
+                                'species_density': 0.5,
+                                'water_scarcity': a.location.get('water_scarcity_index', 0.5),
+                                'temperature_anomaly': 0.5,
+                                'total_impact': a.total_impact
+                            })
+                        await self.ml_predictor.train(training_data)
+                await asyncio.sleep(self.config.ml.train_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"ML training error: {e}")
+                await asyncio.sleep(60)
+
+    async def _federated_sync_loop(self):
+        while True:
+            try:
+                if self.federated:
+                    scores = await self.storage.get_scores()
+                    pid = f"biodiversity_{hashlib.md5(str(self.storage.ecosystems).encode()).hexdigest()[:8]}"
+                    await self.federated.send_local_impact(
+                        pid,
+                        {
+                            'local_score': scores['local'],
+                            'global_score': scores['global'],
+                            'total_impact': self.storage.impact_history[-1].total_impact if self.storage.impact_history else 0.5,
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        },
+                        performance=scores['sustainability']
+                    )
+                    await self.federated.get_global_impacts()
+                await asyncio.sleep(self.config.federated.sync_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Federated sync error: {e}")
+                await asyncio.sleep(300)
+
+    async def _telemetry_export_loop(self):
+        while True:
+            try:
+                await self.reporter.export_telemetry()
+                await asyncio.sleep(self.config.telemetry.export_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Telemetry export error: {e}")
+                await asyncio.sleep(60)
+
+    async def _persistence_save_loop(self):
+        while True:
+            try:
+                await self.reporter.save_state()
+                await asyncio.sleep(self.config.persistence.save_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Persistence save error: {e}")
+                await asyncio.sleep(60)
+
+    async def _swarm_update_loop(self):
+        while True:
+            try:
+                await self.share_with_swarm()
+                await asyncio.sleep(self.config.swarm_share_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Swarm update error: {e}")
+                await asyncio.sleep(120)
+
+    # ============================================================================
+    # Public API
+    # ============================================================================
+    async def assess_expert_impact(
+        self,
+        expert_type: str,
+        location: Dict[str, Any],
+        energy_source: str,
+        cooling_method: str,
+        use_ml_prediction: bool = False
+    ) -> Dict[str, Any]:
+        assessment = await self.analyzer.assess_expert_impact(
+            expert_type, location, energy_source, cooling_method, use_ml_prediction
+        )
+        # Trigger workflows if critical
+        if assessment.total_impact > 0.8 and self.workflow_orchestrator:
+            await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_impact)
+
+        # Feed to gating network / self‑evolving gate
+        if self.gating_network and self.expert_router:
+            features = np.array([
+                assessment.total_impact,
+                (assessment.carbon_impact.get('carbon_intensity', 400) / 800),
+                assessment.sustainability_score,
+                len(assessment.mitigation_strategies)
+            ])
+            reward = 1.0 - assessment.total_impact
+            self.gating_network.update(features, reward, {'expert_type': expert_type})
+
+        if self.self_evolving_gate and TORCH_AVAILABLE:
+            state = torch.tensor([assessment.total_impact, assessment.sustainability_score], dtype=torch.float32)
+            self.self_evolving_gate.adapt(
+                state=state,
+                chosen_expert=0,
+                reward=1.0 - assessment.total_impact,
+                environmental_feedback={'expert_type': expert_type},
+                quantum_mode=False
+            )
+
+        if self.telemetry:
+            self.telemetry.increment('assessments_performed')
+            self.telemetry.gauge('total_impact', assessment.total_impact)
+            self.telemetry.gauge('sustainability_score', assessment.sustainability_score)
+
+        logger.info(f"Assessment for {expert_type}: impact={assessment.total_impact:.2f}, sustainability={assessment.sustainability_score:.2f}")
+        return asdict(assessment)
+
+    async def get_biodiversity_report(self) -> Dict[str, Any]:
+        return await self.reporter.generate_report()
+
+    async def get_routing_guidance(self, expert_options: List[str], location_options: List[Dict]) -> Dict:
+        return await self.analyzer.get_routing_guidance(expert_options, location_options)
+
+    async def train_ml_model(self, training_data: Optional[List[Dict]] = None) -> Dict:
+        if not self.ml_predictor:
+            return {'status': 'disabled'}
+        if training_data is None:
+            history = await self.storage.get_impact_history(200)
+            training_data = []
+            for a in history:
+                bd = a.impact_breakdown
+                training_data.append({
+                    'carbon_intensity': a.carbon_impact.get('carbon_intensity', 400),
+                    'energy_intensity': bd.get('energy', {}).get('score', 0.5),
+                    'cooling_intensity': bd.get('cooling', {}).get('score', 0.5),
+                    'resource_intensity': bd.get('resources', {}).get('score', 0.5),
+                    'ecosystem_sensitivity': bd.get('habitat', {}).get('sensitivity', 0.5),
+                    'proximity_factor': bd.get('habitat', {}).get('proximity_factor', 0.5),
+                    'fragmentation_index': bd.get('habitat', {}).get('fragmentation_index', 0.5),
+                    'species_density': 0.5,
+                    'water_scarcity': a.location.get('water_scarcity_index', 0.5),
+                    'temperature_anomaly': 0.5,
+                    'total_impact': a.total_impact
+                })
+        return await self.ml_predictor.train(training_data)
+
+    async def train_predictive_model(self) -> Dict:
+        if not self.predictive:
+            return {'status': 'disabled'}
+        return await self.predictive.train()
+
+    async def share_with_swarm(self):
+        if not self.config.enable_swarm_coordination or not self.swarm_coordinator:
+            return
+        scores = await self.storage.get_scores()
+        payload = {
+            'assessor_id': hashlib.md5(str(self.storage.ecosystems).encode()).hexdigest()[:8],
+            'local_biodiversity_score': scores['local'],
+            'global_biodiversity_score': scores['global'],
+            'sustainability_score': scores['sustainability'],
+            'total_carbon_savings_kg': self.storage.total_carbon_savings_kg,
+            'total_helium_savings_l': self.storage.total_helium_savings_l,
+            'ecosystems_tracked': len(self.storage.ecosystems)
+        }
+        await self.swarm_coordinator.share_predictions(payload)
+
+    # ============================================================================
+    # Injection Methods
+    # ============================================================================
+    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
+        self.gating_network = gating_network
+
+    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
+        self.self_evolving_gate = gate
+
+    def set_expert_router(self, router: 'ExpertRouter'):
+        self.expert_router = router
+
+    def set_helium_provider(self, provider: HeliumProvider):
+        self.helium_provider = provider
+
+    def inject_bio_core(self, bio_core: Any = None, **kwargs):
+        pass  # Already handled in __init__
+
+    # ============================================================================
+    # Self‑Healing
+    # ============================================================================
+    async def self_heal(self):
+        logger.info("Self‑healing started")
+        if not self.config.self_healing.enabled:
+            logger.warning("Self‑healing disabled")
+            return
+        # Reset ecosystems to defaults
+        self._initialize_ecosystems()
+        # Reset scores in storage
+        async with self.storage._lock:
+            self.storage.local_score = 0.0
+            self.storage.global_score = 0.0
+            self.storage.sustainability_score = 0.0
+            self.storage.total_carbon_savings_kg = 0.0
+            self.storage.total_helium_savings_l = 0.0
+            self.storage.impact_history.clear()
+            self.storage.mitigation_strategies.clear()
+        self.health_status = "healthy"
+        self.last_error = None
+        await self.reporter.save_state()
+        logger.info("Self‑healing completed")
+
+    # ============================================================================
+    # Health Status
+    # ============================================================================
     async def get_health_status(self) -> Dict[str, Any]:
+        scores = await self.storage.get_scores()
         return {
             'status': self.health_status,
             'last_error': self.last_error,
-            'local_biodiversity_score': self.local_biodiversity_score,
-            'global_biodiversity_score': self.global_biodiversity_score,
-            'sustainability_score': self.sustainability_score,
-            'ecosystems_tracked': len(self.ecosystems),
-            'bio_integration_active': self.enable_bio_integration,
-            'event_driven_active': self.enable_event_driven,
-            'self_healing_enabled': self.enable_self_healing,
-            'swarm_coordination_active': self.enable_swarm_coordination,
-            'persistence_enabled': self.enable_persistence,
+            'local_biodiversity_score': scores['local'],
+            'global_biodiversity_score': scores['global'],
+            'sustainability_score': scores['sustainability'],
+            'ecosystems_tracked': len(self.storage.ecosystems),
+            'bio_integration_active': self.config.enable_bio_integration,
+            'event_driven_active': self.config.enable_event_driven,
+            'self_healing_enabled': self.config.self_healing.enabled,
+            'persistence_enabled': self.config.persistence.enabled,
         }
 
-    # ========================================================================
-    # Self-Healing
-    # ========================================================================
+    # ============================================================================
+    # Helper
+    # ============================================================================
+    def _initialize_ecosystems(self):
+        # Default ecosystems (could be loaded from config)
+        defaults = {
+            'amazon_rainforest': BiodiversityMetric(
+                ecosystem_type=EcosystemType.TROPICAL_FOREST,
+                species_richness=10000,
+                endangered_species_count=200,
+                habitat_area_km2=5500000,
+                fragmentation_index=0.3,
+                ecological_connectivity=0.7,
+                last_assessment=datetime.now(timezone.utc)
+            ),
+            'coral_reef_pacific': BiodiversityMetric(
+                ecosystem_type=EcosystemType.MARINE,
+                species_richness=5000,
+                endangered_species_count=150,
+                habitat_area_km2=200000,
+                fragmentation_index=0.4,
+                ecological_connectivity=0.5,
+                last_assessment=datetime.now(timezone.utc)
+            ),
+            'european_wetlands': BiodiversityMetric(
+                ecosystem_type=EcosystemType.WETLAND,
+                species_richness=2000,
+                endangered_species_count=80,
+                habitat_area_km2=15000,
+                fragmentation_index=0.6,
+                ecological_connectivity=0.4,
+                last_assessment=datetime.now(timezone.utc)
+            )
+        }
+        self.storage.ecosystems = defaults
 
-    async def self_heal(self):
-        logger.info("BiodiversityImpactAssessor self‑healing")
-        if self.enable_self_healing:
-            # Reset ecosystems to defaults
-            self._initialize_ecosystems()
-            # Reset scores
-            self.local_biodiversity_score = 0.0
-            self.global_biodiversity_score = 0.0
-            self.sustainability_score = 0.0
-            self.total_carbon_savings_kg = 0.0
-            self.total_helium_savings_l = 0.0
-            self.impact_history.clear()
-            self.mitigation_strategies.clear()
-            # Reset health status
-            self.health_status = "healthy"
-            self.last_error = None
-            # Save state
-            await self.save_state()
-            logger.info("Self-healing completed")
+    async def _load_state(self):
+        await self.reporter.load_state()
 
-    # ========================================================================
+    # ============================================================================
     # Shutdown
-    # ========================================================================
-
+    # ============================================================================
     async def shutdown(self):
         logger.info("Shutting down Biodiversity Impact Assessor")
-        if self.enable_persistence:
-            await self.save_state()
+        # Cancel background tasks
+        for task in self._background_tasks:
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
+        # Stop helium tracker
+        if self.helium_tracker:
+            await self.helium_tracker.stop()
+
+        # Save final state
+        if self.persistence:
+            await self.reporter.save_state()
+
+        # Close external sessions
         if self.carbon_manager:
             await self.carbon_manager.close()
-        if self.federated_assessor:
-            await self.federated_assessor.close()
+        if self.federated:
+            await self.federated.close()
+
         logger.info("Shutdown complete")
-
-# ============================================================================
-# Legacy Compatibility
-# ============================================================================
-
-class LegacyBiodiversityImpactAssessor(BiodiversityImpactAssessor):
-    """Legacy compatibility class."""
-    def __init__(self):
-        config = BiodiversityConfig(
-            enable_federated=False,
-            enable_carbon_intensity=False,
-            enable_predictive=False,
-            enable_ml_prediction=False,
-            enable_human_ai=False,
-            enable_helium_tracking=False,
-            enable_persistence=False,
-            enable_telemetry=False
-        )
-        super().__init__(config=config)
-        logger.info("Legacy Biodiversity Impact Assessor initialized")
