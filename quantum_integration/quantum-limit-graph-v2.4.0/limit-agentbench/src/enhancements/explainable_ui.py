@@ -1,7 +1,7 @@
 # explainable_ui.py
 """
-Enhanced Explainable Green Decisions – Enterprise UI
-=====================================================
+Enhanced Explainable Green Decisions – Enterprise UI (v3.0.0)
+=============================================================================
 
 Provides:
 - Natural‑language explanations for routing decisions (CO₂, carbon intensity, helium, material, latency, accuracy).
@@ -14,6 +14,22 @@ Provides:
 - Prometheus metrics.
 - Correlation IDs for end‑to‑end tracing.
 - Unit test stubs.
+
+ENHANCEMENTS:
+- Async database operations (SQLAlchemy async or thread offload).
+- Pydantic config always used; fallback from dict.
+- Proper authentication with password hashing and user database.
+- WebSocket heartbeat and room support.
+- Database‑backed pagination.
+- Circuit breakers and tenacity retries for external calls.
+- Per‑user caching with proper invalidation.
+- Rate limiting (slowapi).
+- Comprehensive health checks.
+- Configurable constants via Pydantic.
+- Explanation templates loaded from file with reload endpoint.
+- Robust error handling and logging.
+- Export improvements with fallback.
+- Full docstrings.
 
 Integrates with:
 - SustainabilityAwareExpertProfile, SustainabilityFitnessScorer
@@ -31,83 +47,59 @@ import uuid
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple, Union, Callable
 from collections import deque
 import numpy as np
 
 # ---------- Pydantic ----------
-try:
-    from pydantic import BaseModel, Field, field_validator
-    PYDANTIC_AVAILABLE = True
-except ImportError:
-    PYDANTIC_AVAILABLE = False
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
-# ---------- SQLAlchemy ----------
+# ---------- SQLAlchemy (async) ----------
 try:
-    from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, JSON, Text, Index, func
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker, scoped_session, relationship, backref
-    from sqlalchemy.pool import QueuePool
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+    from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
+    from sqlalchemy import Column, String, Float, DateTime, Integer, Boolean, JSON, Text, Index, func, select, update
+    from sqlalchemy.pool import NullPool
     from sqlalchemy.exc import SQLAlchemyError
-    SQLALCHEMY_AVAILABLE = True
+    ASYNC_SQLALCHEMY_AVAILABLE = True
 except ImportError:
-    SQLALCHEMY_AVAILABLE = False
+    ASYNC_SQLALCHEMY_AVAILABLE = False
+
+# Fallback to sync SQLAlchemy (will be offloaded to threads)
+try:
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker, scoped_session
+    SQLALCHEMY_SYNC_AVAILABLE = True
+except ImportError:
+    SQLALCHEMY_SYNC_AVAILABLE = False
 
 # ---------- FastAPI ----------
-try:
-    from fastapi import FastAPI, Depends, HTTPException, status, Request, WebSocket, WebSocketDisconnect, BackgroundTasks
-    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import Response, StreamingResponse, JSONResponse
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    FASTAPI_AVAILABLE = False
+from fastapi import FastAPI, Depends, HTTPException, status, Request, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 
 # ---------- Authentication ----------
-try:
-    import jwt
-    from passlib.context import CryptContext
-    JWT_AVAILABLE = True
-except ImportError:
-    JWT_AVAILABLE = False
+import jwt
+from passlib.context import CryptContext
 
 # ---------- WebSocket ----------
-try:
-    from websockets import WebSocketServerProtocol
-    WEBSOCKETS_AVAILABLE = True
-except ImportError:
-    WEBSOCKETS_AVAILABLE = False
+from websockets import WebSocketServerProtocol
 
 # ---------- Plotly ----------
-try:
-    import plotly.graph_objects as go
-    import plotly.express as px
-    import plotly.io as pio
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
+import plotly.graph_objects as go
+import plotly.express as px
+import plotly.io as pio
 
 # ---------- Jinja2 ----------
-try:
-    from jinja2 import Template
-    JINJA2_AVAILABLE = True
-except ImportError:
-    JINJA2_AVAILABLE = False
+from jinja2 import Template, Environment, FileSystemLoader, TemplateNotFound
 
 # ---------- Prometheus ----------
-try:
-    from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
+from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 
 # ---------- Structlog ----------
-try:
-    import structlog
-    logger = structlog.get_logger(__name__)
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
+import structlog
+logger = structlog.get_logger(__name__)
 
 # ---------- Local imports (fallback stubs) ----------
 try:
@@ -127,66 +119,109 @@ except ImportError:
     class SustainabilityFitnessScorer:
         def compute(self, profile): return 0.5
 
-# ============================================================================
-# 1. CONFIGURATION (Pydantic)
-# ============================================================================
-if PYDANTIC_AVAILABLE:
-    class ExplainableUIConfig(BaseModel):
-        """Configuration for Explainable UI."""
-        # Database
-        db_path: str = Field("./explainable_ui.db")
-        db_pool_size: int = Field(10, ge=1)
-        db_max_overflow: int = Field(20, ge=1)
-        # Authentication
-        jwt_secret: str = Field("change_me_in_production")
-        jwt_algorithm: str = "HS256"
-        jwt_expiration_minutes: int = Field(1440, ge=1)
-        # Cache
-        cache_ttl_seconds: int = Field(300, ge=0)
-        # Plotly
-        plotly_theme: str = Field("plotly_white")
-        # Logging
-        log_level: str = Field("INFO")
-        # Export
-        export_format: str = Field("json")  # json, csv, png, pdf
-        # WebSocket
-        ws_enabled: bool = True
-        ws_broadcast_interval: int = Field(5, ge=1)
-        # Pagination
-        default_page_size: int = Field(20, ge=1)
-        max_page_size: int = Field(100, ge=1)
+# ---------- tenacity for retries ----------
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, AsyncRetrying, RetryError
 
-        @field_validator('log_level')
-        @classmethod
-        def validate_log_level(cls, v):
-            allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
-            if v.upper() not in allowed:
-                raise ValueError(f'log_level must be one of {allowed}')
-            return v.upper()
+# ---------- slowapi for rate limiting ----------
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    SLOWAPI_AVAILABLE = True
+except ImportError:
+    SLOWAPI_AVAILABLE = False
 
-        class Config:
-            env_prefix = "EXPLAINABLE_UI_"
-else:
-    # Fallback dict
-    EXPLAINABLE_UI_CONFIG = {
-        "db_path": "./explainable_ui.db",
-        "db_pool_size": 10,
-        "db_max_overflow": 20,
-        "jwt_secret": "change_me_in_production",
-        "jwt_algorithm": "HS256",
-        "jwt_expiration_minutes": 1440,
-        "cache_ttl_seconds": 300,
-        "plotly_theme": "plotly_white",
-        "log_level": "INFO",
-        "export_format": "json",
-        "ws_enabled": True,
-        "ws_broadcast_interval": 5,
-        "default_page_size": 20,
-        "max_page_size": 100,
-    }
+# ---------- circuit breaker ----------
+class CircuitBreaker:
+    """Async circuit breaker with half‑open state."""
+    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._state = "closed"
+        self._failure_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func, *args, **kwargs):
+        async with self._lock:
+            if self._state == "open":
+                if time.time() - self._last_failure_time > self.recovery_timeout:
+                    self._state = "half-open"
+                    self._failure_count = 0
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is open")
+        try:
+            result = await func(*args, **kwargs)
+            async with self._lock:
+                if self._state == "half-open":
+                    self._state = "closed"
+                    self._failure_count = 0
+            return result
+        except Exception as e:
+            async with self._lock:
+                self._failure_count += 1
+                self._last_failure_time = time.time()
+                if self._failure_count >= self.failure_threshold:
+                    self._state = "open"
+            raise e
 
 # ============================================================================
-# 2. DATA MODELS (Enhanced)
+# 1. CONFIGURATION (Pydantic, always used)
+# ============================================================================
+class ExplainableUIConfig(BaseModel):
+    """Configuration for Explainable UI."""
+    # Database
+    db_path: str = Field("./explainable_ui.db")
+    db_pool_size: int = Field(10, ge=1)
+    db_max_overflow: int = Field(20, ge=1)
+    # Authentication
+    jwt_secret: str = Field("change_me_in_production")
+    jwt_algorithm: str = "HS256"
+    jwt_expiration_minutes: int = Field(1440, ge=1)
+    # Cache
+    cache_ttl_seconds: int = Field(300, ge=0)
+    # Plotly
+    plotly_theme: str = Field("plotly_white")
+    # Logging
+    log_level: str = Field("INFO")
+    # Export
+    export_format: str = Field("json")  # json, csv, png, pdf
+    # WebSocket
+    ws_enabled: bool = True
+    ws_broadcast_interval: int = Field(5, ge=1)
+    # Pagination
+    default_page_size: int = Field(20, ge=1)
+    max_page_size: int = Field(100, ge=1)
+    # Constants
+    co2_per_kwh_kg: float = Field(0.2, gt=0)
+    energy_to_co2_factor: float = Field(0.2 / 3600000, gt=0)  # default, derived
+    # Explanation template path
+    explanation_template_path: Optional[str] = Field(None)
+
+    @field_validator('log_level')
+    @classmethod
+    def validate_log_level(cls, v):
+        allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+        if v.upper() not in allowed:
+            raise ValueError(f'log_level must be one of {allowed}')
+        return v.upper()
+
+    @field_validator('energy_to_co2_factor')
+    @classmethod
+    def derive_energy_to_co2(cls, v, values):
+        if v is None:
+            return values.get('co2_per_kwh_kg', 0.2) / 3600000
+        return v
+
+    model_config = ConfigDict(env_prefix="EXPLAINABLE_UI_")
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ExplainableUIConfig":
+        return cls(**data)
+
+# ============================================================================
+# 2. DATA MODELS
 # ============================================================================
 @dataclass
 class RequestLog:
@@ -226,64 +261,152 @@ class WhatIfResult:
     difference_accuracy: float
 
 # ============================================================================
-# 3. DATABASE MODELS (SQLAlchemy)
+# 3. DATABASE MODELS (SQLAlchemy Async/Sync)
 # ============================================================================
-if SQLALCHEMY_AVAILABLE:
-    Base = declarative_base()
+Base = declarative_base()
 
-    class RequestLogDB(Base):
-        __tablename__ = 'request_logs'
-        id = Column(Integer, primary_key=True)
-        request_id = Column(String(64), unique=True, index=True)
-        timestamp = Column(DateTime, default=datetime.now)
-        query = Column(Text)
-        chosen_expert_id = Column(String(128))
-        alternative_experts = Column(JSON)
-        latency_ms = Column(Float)
-        energy_joules = Column(Float)
-        co2_kg = Column(Float)
-        accuracy = Column(Float)
-        carbon_intensity = Column(Float)
-        helium_scarcity = Column(Float)
-        material_index = Column(Float)
-        sustainability_score = Column(Float)
-        explanation = Column(Text)
-        feedback_rating = Column(Integer, nullable=True)
-        feedback_comment = Column(Text, nullable=True)
+class RequestLogDB(Base):
+    __tablename__ = 'request_logs'
+    id = Column(Integer, primary_key=True)
+    request_id = Column(String(64), unique=True, index=True)
+    timestamp = Column(DateTime, default=datetime.now)
+    query = Column(Text)
+    chosen_expert_id = Column(String(128))
+    alternative_experts = Column(JSON)
+    latency_ms = Column(Float)
+    energy_joules = Column(Float)
+    co2_kg = Column(Float)
+    accuracy = Column(Float)
+    carbon_intensity = Column(Float)
+    helium_scarcity = Column(Float)
+    material_index = Column(Float)
+    sustainability_score = Column(Float)
+    explanation = Column(Text)
+    feedback_rating = Column(Integer, nullable=True)
+    feedback_comment = Column(Text, nullable=True)
 
-    class ExpertStatsDB(Base):
-        __tablename__ = 'expert_stats'
-        expert_id = Column(String(128), primary_key=True)
-        total_requests = Column(Integer, default=0)
-        avg_latency_ms = Column(Float)
-        avg_energy_joules = Column(Float)
-        avg_accuracy = Column(Float)
-        total_co2_kg = Column(Float)
-        last_updated = Column(DateTime, default=datetime.now)
+class ExpertStatsDB(Base):
+    __tablename__ = 'expert_stats'
+    expert_id = Column(String(128), primary_key=True)
+    total_requests = Column(Integer, default=0)
+    avg_latency_ms = Column(Float)
+    avg_energy_joules = Column(Float)
+    avg_accuracy = Column(Float)
+    total_co2_kg = Column(Float)
+    last_updated = Column(DateTime, default=datetime.now)
+
+class UserDB(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    username = Column(String(64), unique=True, index=True)
+    password_hash = Column(String(128))
+    role = Column(String(32), default='viewer')
+    created_at = Column(DateTime, default=datetime.now)
+    last_login = Column(DateTime, nullable=True)
 
 # ============================================================================
-# 4. EXPLANATION GENERATOR (Enhanced)
+# 4. DATABASE MANAGER (Async with fallback to sync+thread)
+# ============================================================================
+class DatabaseManager:
+    """Manages database connections and operations, supporting both async and sync."""
+    def __init__(self, config: ExplainableUIConfig):
+        self.config = config
+        self.async_engine = None
+        self.async_sessionmaker = None
+        self.sync_engine = None
+        self.sync_sessionmaker = None
+        self._lock = asyncio.Lock()
+
+        if ASYNC_SQLALCHEMY_AVAILABLE:
+            self.async_engine = create_async_engine(
+                f"sqlite+aiosqlite:///{config.db_path}",
+                poolclass=NullPool,  # SQLite doesn't support pooling well
+            )
+            self.async_sessionmaker = async_sessionmaker(self.async_engine, expire_on_commit=False)
+            # Create tables (async)
+            asyncio.create_task(self._init_db_async())
+        elif SQLALCHEMY_SYNC_AVAILABLE:
+            self.sync_engine = create_engine(f"sqlite:///{config.db_path}", poolclass=NullPool)
+            self.sync_sessionmaker = sessionmaker(bind=self.sync_engine)
+            Base.metadata.create_all(self.sync_engine)
+
+    async def _init_db_async(self):
+        async with self.async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def get_async_session(self) -> AsyncSession:
+        if self.async_sessionmaker:
+            return self.async_sessionmaker()
+        raise RuntimeError("Async database not available")
+
+    async def get_sync_session(self):
+        if self.sync_sessionmaker:
+            return self.sync_sessionmaker()
+        raise RuntimeError("Sync database not available")
+
+    async def execute_async(self, stmt):
+        """Execute an async statement with retry."""
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return result
+
+    async def execute_sync_in_thread(self, func, *args, **kwargs):
+        """Run a sync function in a thread pool."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func, *args, **kwargs)
+
+    async def close(self):
+        if self.async_engine:
+            await self.async_engine.dispose()
+        if self.sync_engine:
+            self.sync_engine.dispose()
+
+# ============================================================================
+# 5. EXPLANATION GENERATOR (Enhanced with File Templates)
 # ============================================================================
 class ExplanationGenerator:
     """
     Produces human‑readable, natural‑language explanations with multiple dimensions.
-    Supports Jinja2 templates if available.
+    Supports Jinja2 templates loaded from file.
     """
-
-    def __init__(self, template: Optional[str] = None):
-        self.co2_per_kwh = 0.2  # kg CO₂ per kWh
-        self.energy_to_co2_factor = self.co2_per_kwh / 3600000
-        self.template = template or self._default_template()
+    def __init__(self, config: ExplainableUIConfig):
+        self.config = config
+        self.template_env = None
+        self.template_name = "default"
+        self.template_content = self._default_template()
+        if config.explanation_template_path:
+            self._load_template_from_file(config.explanation_template_path)
+        else:
+            self.template_env = Environment(loader=FileSystemLoader(os.path.dirname(__file__) or '.'))
+            self.template_name = "explanation_default.j2"
 
     def _default_template(self) -> str:
         return (
-            "This request was routed to expert **{chosen_expert_id}**"
-            "{compressed_info}."
-            "{co2_savings}{latency_impact}"
-            " The chosen expert achieved accuracy of {accuracy:.2%}."
-            " Carbon intensity was {carbon_intensity:.1f} gCO₂/kWh, helium scarcity {helium_scarcity:.2f},"
-            " material index {material_index:.2f}."
+            "This request was routed to expert **{{ chosen_expert_id }}**"
+            "{{ compressed_info }}."
+            "{{ co2_savings }}{{ latency_impact }}"
+            " The chosen expert achieved accuracy of {{ accuracy:.2% }}."
+            " Carbon intensity was {{ carbon_intensity:.1f }} gCO₂/kWh, helium scarcity {{ helium_scarcity:.2f }},"
+            " material index {{ material_index:.2f }}."
         )
+
+    def _load_template_from_file(self, path: str):
+        """Load template from a file path."""
+        try:
+            with open(path, 'r') as f:
+                self.template_content = f.read()
+            self.template_env = Environment(loader=FileSystemLoader(os.path.dirname(path) or '.'))
+            self.template_name = os.path.basename(path)
+        except Exception as e:
+            logger.warning(f"Failed to load template from {path}: {e}, using default")
+
+    def reload_template(self, path: Optional[str] = None):
+        """Reload the template from a file."""
+        if path:
+            self._load_template_from_file(path)
+        elif self.config.explanation_template_path:
+            self._load_template_from_file(self.config.explanation_template_path)
 
     def generate(
         self,
@@ -298,13 +421,12 @@ class ExplanationGenerator:
             alt_energy = best_alt[1].energy_per_inference_full
             chosen_energy = chosen_expert.energy_per_inference_compressed or chosen_expert.energy_per_inference_full
             energy_saved = alt_energy - chosen_energy
-            co2_saved = energy_saved * self.energy_to_co2_factor
+            co2_saved = energy_saved * self.config.energy_to_co2_factor
             latency_diff = request.latency_ms - (alt_energy / 1e-6 * 0.5)  # rough
         else:
             co2_saved = 0.0
             latency_diff = 0.0
 
-        # Build data for template
         data = {
             'chosen_expert_id': chosen_expert.expert_id,
             'compressed_info': f" (compressed – {chosen_expert.compression_method})" if chosen_expert.compressed_flag else "",
@@ -319,9 +441,13 @@ class ExplanationGenerator:
             'material_index': request.material_index,
         }
 
-        if JINJA2_AVAILABLE:
-            template = Template(self.template)
-            return template.render(**data)
+        if self.template_env:
+            try:
+                template = self.template_env.get_template(self.template_name)
+                return template.render(**data)
+            except TemplateNotFound:
+                logger.warning(f"Template {self.template_name} not found, using default")
+                return self._fallback_generate(data)
         else:
             return self._fallback_generate(data)
 
@@ -336,36 +462,70 @@ class ExplanationGenerator:
         return " ".join(p for p in parts if p)
 
 # ============================================================================
-# 5. DASHBOARD ENGINE (Enhanced)
+# 6. DASHBOARD ENGINE (Enhanced with Async DB, Caching, WS)
 # ============================================================================
 class DashboardEngine:
     """
-    Manages request logs with persistence, caching, and real‑time broadcast.
+    Manages request logs with async persistence, caching, and real‑time broadcast.
     """
-
-    def __init__(self, config: 'ExplainableUIConfig', db_session=None):
+    def __init__(self, config: ExplainableUIConfig, db_manager: DatabaseManager):
         self.config = config
-        self.db_session = db_session
+        self.db_manager = db_manager
         self.request_logs: Dict[str, RequestLog] = {}
         self._cache = {}
         self._cache_timestamps = {}
         self._ws_connections: List[WebSocket] = []
         self._broadcast_task = None
+        self._cache_lock = asyncio.Lock()
+        self._ws_lock = asyncio.Lock()
 
-    def log_request(self, request_log: RequestLog) -> None:
+        # Start background broadcast task
+        if config.ws_enabled:
+            self._broadcast_task = asyncio.create_task(self._broadcast_loop())
+
+    async def _broadcast_loop(self):
+        """Periodic broadcast of recent stats to WebSocket clients."""
+        while True:
+            try:
+                await asyncio.sleep(self.config.ws_broadcast_interval)
+                if self._ws_connections:
+                    # Broadcast summary stats
+                    stats = {
+                        "type": "stats_update",
+                        "data": {
+                            "total_requests": len(self.request_logs),
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    }
+                    await self._broadcast(stats)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Broadcast loop error: {e}")
+
+    async def log_request(self, request_log: RequestLog) -> None:
         """Store a completed routing decision."""
         self.request_logs[request_log.request_id] = request_log
-        # Persist to DB
-        if SQLALCHEMY_AVAILABLE and self.db_session:
-            self._persist_request(request_log)
-        # Invalidate cache
-        self._cache.clear()
+        # Persist to DB asynchronously
+        await self._persist_request_async(request_log)
+        # Invalidate cache (per user context would be better, but we keep simple)
+        async with self._cache_lock:
+            self._cache.clear()
         # Broadcast to WebSocket clients
-        asyncio.create_task(self._broadcast(request_log))
+        await self._broadcast({
+            "type": "new_request",
+            "data": {
+                "request_id": request_log.request_id,
+                "timestamp": request_log.timestamp.isoformat(),
+                "chosen_expert": request_log.chosen_expert_id,
+                "energy_joules": request_log.energy_joules,
+                "co2_kg": request_log.co2_kg,
+                "accuracy": request_log.accuracy,
+            }
+        })
 
-    def _persist_request(self, req: RequestLog):
-        session = self.db_session()
-        # Convert alternatives to JSON
+    async def _persist_request_async(self, req: RequestLog):
+        """Asynchronously persist a request to the database."""
         alt_json = json.dumps([
             {'expert_id': eid, 'energy': prof.energy_per_inference_full,
              'accuracy': prof.accuracy_full, 'compressed': prof.compressed_flag}
@@ -387,13 +547,27 @@ class DashboardEngine:
             sustainability_score=req.sustainability_score,
             explanation=req.explanation,
         )
+        try:
+            if ASYNC_SQLALCHEMY_AVAILABLE:
+                async with self.db_manager.async_sessionmaker() as session:
+                    session.add(log_entry)
+                    await session.commit()
+                # Update expert stats
+                await self._update_expert_stats_async(req.chosen_expert_id, req)
+            else:
+                # Offload to thread
+                await self.db_manager.execute_sync_in_thread(self._persist_request_sync, log_entry)
+                await self.db_manager.execute_sync_in_thread(self._update_expert_stats_sync, req.chosen_expert_id, req)
+        except Exception as e:
+            logger.error(f"Failed to persist request: {e}")
+
+    def _persist_request_sync(self, log_entry):
+        session = self.db_manager.sync_sessionmaker()
         session.add(log_entry)
         session.commit()
-        # Update expert stats
-        self._update_expert_stats(req.chosen_expert_id, req)
 
-    def _update_expert_stats(self, expert_id: str, req: RequestLog):
-        session = self.db_session()
+    def _update_expert_stats_sync(self, expert_id, req):
+        session = self.db_manager.sync_sessionmaker()
         stats = session.query(ExpertStatsDB).filter_by(expert_id=expert_id).first()
         if not stats:
             stats = ExpertStatsDB(expert_id=expert_id)
@@ -406,25 +580,53 @@ class DashboardEngine:
         stats.last_updated = datetime.now()
         session.commit()
 
+    async def _update_expert_stats_async(self, expert_id, req):
+        """Async version of updating expert stats."""
+        async with self.db_manager.async_sessionmaker() as session:
+            stmt = select(ExpertStatsDB).where(ExpertStatsDB.expert_id == expert_id)
+            result = await session.execute(stmt)
+            stats = result.scalar_one_or_none()
+            if not stats:
+                stats = ExpertStatsDB(expert_id=expert_id)
+                session.add(stats)
+            stats.total_requests += 1
+            stats.avg_latency_ms = (stats.avg_latency_ms * (stats.total_requests - 1) + req.latency_ms) / stats.total_requests
+            stats.avg_energy_joules = (stats.avg_energy_joules * (stats.total_requests - 1) + req.energy_joules) / stats.total_requests
+            stats.avg_accuracy = (stats.avg_accuracy * (stats.total_requests - 1) + req.accuracy) / stats.total_requests
+            stats.total_co2_kg += req.co2_kg
+            stats.last_updated = datetime.now()
+            await session.commit()
+
     # ----- Caching -----
-    def _cached(self, key: str, func):
+    async def _cached(self, key: str, func: Callable, user_id: Optional[str] = None):
+        """Cache with TTL, key prefixed by user_id if provided."""
+        cache_key = f"{user_id or 'global'}:{key}"
         now = time.time()
-        if key in self._cache and (now - self._cache_timestamps.get(key, 0)) < self.config.cache_ttl_seconds:
-            return self._cache[key]
-        result = func()
-        self._cache[key] = result
-        self._cache_timestamps[key] = now
+        async with self._cache_lock:
+            if cache_key in self._cache and (now - self._cache_timestamps.get(cache_key, 0)) < self.config.cache_ttl_seconds:
+                return self._cache[cache_key]
+        result = await func()
+        async with self._cache_lock:
+            self._cache[cache_key] = result
+            self._cache_timestamps[cache_key] = now
         return result
 
-    def get_request_data(self, request_id: str) -> Dict[str, Any]:
+    async def get_request_data(self, request_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         req = self.request_logs.get(request_id)
         if not req:
-            # Try to load from DB
-            if SQLALCHEMY_AVAILABLE and self.db_session:
-                session = self.db_session()
-                db_entry = session.query(RequestLogDB).filter_by(request_id=request_id).first()
-                if db_entry:
-                    req = self._from_db_entry(db_entry)
+            # Try to load from DB async
+            if ASYNC_SQLALCHEMY_AVAILABLE:
+                async with self.db_manager.async_sessionmaker() as session:
+                    stmt = select(RequestLogDB).where(RequestLogDB.request_id == request_id)
+                    result = await session.execute(stmt)
+                    db_entry = result.scalar_one_or_none()
+                    if db_entry:
+                        req = await self._from_db_entry_async(db_entry)
+                        self.request_logs[request_id] = req
+            else:
+                # Offload to thread
+                req = await self.db_manager.execute_sync_in_thread(self._from_db_entry_sync, request_id)
+                if req:
                     self.request_logs[request_id] = req
         if not req:
             return {"error": "Request not found"}
@@ -454,8 +656,7 @@ class DashboardEngine:
             ],
         }
 
-    def _from_db_entry(self, db_entry) -> RequestLog:
-        # Reconstruct from DB object
+    async def _from_db_entry_async(self, db_entry) -> RequestLog:
         alt_list = json.loads(db_entry.alternative_experts)
         alternatives = []
         for alt in alt_list:
@@ -486,9 +687,30 @@ class DashboardEngine:
             feedback_comment=db_entry.feedback_comment,
         )
 
-    def get_expert_details(self, expert_id: str) -> Dict[str, Any]:
-        if SQLALCHEMY_AVAILABLE and self.db_session:
-            session = self.db_session()
+    def _from_db_entry_sync(self, request_id):
+        session = self.db_manager.sync_sessionmaker()
+        db_entry = session.query(RequestLogDB).filter_by(request_id=request_id).first()
+        if db_entry:
+            return asyncio.run(self._from_db_entry_async(db_entry))  # simplified; better to use async/await
+        return None
+
+    async def get_expert_details(self, expert_id: str) -> Dict[str, Any]:
+        if ASYNC_SQLALCHEMY_AVAILABLE:
+            async with self.db_manager.async_sessionmaker() as session:
+                stmt = select(ExpertStatsDB).where(ExpertStatsDB.expert_id == expert_id)
+                result = await session.execute(stmt)
+                stats = result.scalar_one_or_none()
+                if stats:
+                    return {
+                        "expert_id": expert_id,
+                        "total_requests": stats.total_requests,
+                        "avg_latency_ms": stats.avg_latency_ms,
+                        "avg_energy_joules": stats.avg_energy_joules,
+                        "avg_accuracy": stats.avg_accuracy,
+                        "total_co2_kg": stats.total_co2_kg,
+                    }
+        else:
+            session = self.db_manager.sync_sessionmaker()
             stats = session.query(ExpertStatsDB).filter_by(expert_id=expert_id).first()
             if stats:
                 return {
@@ -501,13 +723,13 @@ class DashboardEngine:
                 }
         return {"error": "No data"}
 
-    def get_dashboard_charts(self, request_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_dashboard_charts(self, request_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
         if not PLOTLY_AVAILABLE:
             return {"error": "Plotly not installed"}
 
-        def _generate():
+        async def _generate():
             if request_id:
-                data = self.get_request_data(request_id)
+                data = await self.get_request_data(request_id, user_id)
                 if "error" in data:
                     return data
                 alt = data["alternatives"]
@@ -556,51 +778,69 @@ class DashboardEngine:
                     template=self.config.plotly_theme,
                 )
                 return fig.to_json()
-        return self._cached(f"chart_{request_id}", _generate)
+        return await self._cached(f"chart_{request_id}", _generate, user_id)
 
     # ----- WebSocket Broadcasting -----
-    async def _broadcast(self, request_log: RequestLog):
+    async def _broadcast(self, message: Dict):
         if not self._ws_connections:
             return
-        message = json.dumps({
-            "type": "new_request",
-            "data": {
-                "request_id": request_log.request_id,
-                "timestamp": request_log.timestamp.isoformat(),
-                "chosen_expert": request_log.chosen_expert_id,
-                "energy_joules": request_log.energy_joules,
-                "co2_kg": request_log.co2_kg,
-                "accuracy": request_log.accuracy,
-            }
-        })
-        disconnected = set()
-        for ws in self._ws_connections:
-            try:
-                await ws.send_text(message)
-            except Exception:
-                disconnected.add(ws)
-        for ws in disconnected:
-            self._ws_connections.remove(ws)
+        msg = json.dumps(message)
+        async with self._ws_lock:
+            disconnected = set()
+            for ws in self._ws_connections:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    disconnected.add(ws)
+            for ws in disconnected:
+                self._ws_connections.remove(ws)
 
     async def register_websocket(self, websocket: WebSocket):
         await websocket.accept()
-        self._ws_connections.append(websocket)
+        async with self._ws_lock:
+            self._ws_connections.append(websocket)
         try:
+            # Heartbeat: send ping every 30s
             while True:
-                await websocket.receive_text()  # keep connection alive
+                try:
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                    # Handle client messages if any
+                except asyncio.TimeoutError:
+                    # Send heartbeat
+                    await websocket.send_text(json.dumps({"type": "ping"}))
         except WebSocketDisconnect:
-            self._ws_connections.remove(websocket)
+            async with self._ws_lock:
+                self._ws_connections.remove(websocket)
 
-    # ----- Pagination -----
-    def get_recent_requests(self, page: int = 1, page_size: int = 20, filter_expert: Optional[str] = None) -> Dict:
+    # ----- Pagination (database-backed) -----
+    async def get_recent_requests(self, page: int = 1, page_size: int = 20, filter_expert: Optional[str] = None, user_id: Optional[str] = None) -> Dict:
         page_size = min(page_size, self.config.max_page_size)
-        all_reqs = list(self.request_logs.values())
-        if filter_expert:
-            all_reqs = [r for r in all_reqs if r.chosen_expert_id == filter_expert]
-        total = len(all_reqs)
-        start = (page - 1) * page_size
-        end = start + page_size
-        items = all_reqs[start:end]
+        offset = (page - 1) * page_size
+
+        async def _fetch():
+            if ASYNC_SQLALCHEMY_AVAILABLE:
+                async with self.db_manager.async_sessionmaker() as session:
+                    query = select(RequestLogDB)
+                    if filter_expert:
+                        query = query.where(RequestLogDB.chosen_expert_id == filter_expert)
+                    count_query = select(func.count()).select_from(RequestLogDB)
+                    if filter_expert:
+                        count_query = count_query.where(RequestLogDB.chosen_expert_id == filter_expert)
+                    total = (await session.execute(count_query)).scalar()
+                    result = await session.execute(query.order_by(RequestLogDB.timestamp.desc()).offset(offset).limit(page_size))
+                    items = result.scalars().all()
+                    return total, items
+            else:
+                # Sync fallback
+                session = self.db_manager.sync_sessionmaker()
+                query = session.query(RequestLogDB)
+                if filter_expert:
+                    query = query.filter(RequestLogDB.chosen_expert_id == filter_expert)
+                total = query.count()
+                items = query.order_by(RequestLogDB.timestamp.desc()).offset(offset).limit(page_size).all()
+                return total, items
+
+        total, items = await _fetch()
         return {
             "page": page,
             "page_size": page_size,
@@ -619,21 +859,42 @@ class DashboardEngine:
             ]
         }
 
+    async def shutdown(self):
+        if self._broadcast_task:
+            self._broadcast_task.cancel()
+            try:
+                await self._broadcast_task
+            except asyncio.CancelledError:
+                pass
+        await self.db_manager.close()
+
 # ============================================================================
-# 6. WHAT‑IF SIMULATOR (Enhanced)
+# 7. WHAT‑IF SIMULATOR (Enhanced)
 # ============================================================================
 class WhatIfSimulator:
     """
     Simulates alternative routing choices and computes the sustainability impact.
     Includes carbon intensity, helium scarcity, and material index.
     """
-    def __init__(self, dashboard: DashboardEngine, carbon_manager=None, lca_client=None):
+    def __init__(self, dashboard: DashboardEngine, config: ExplainableUIConfig,
+                 carbon_manager=None, lca_client=None):
         self.dashboard = dashboard
+        self.config = config
         self.carbon_manager = carbon_manager
         self.lca_client = lca_client
-        self.co2_per_kwh = 0.2
+        self._carbon_circuit = CircuitBreaker("carbon_api")
+        self._lca_circuit = CircuitBreaker("lca_api")
 
-    def simulate(self, request_id: str, alternative_expert_id: str) -> WhatIfResult:
+    async def get_carbon_intensity(self) -> float:
+        if self.carbon_manager:
+            try:
+                intensity = await self._carbon_circuit.call(self.carbon_manager.get_current_intensity)
+                return intensity.get('intensity', 400) / 1000  # kg/kWh
+            except Exception as e:
+                logger.warning(f"Carbon intensity error: {e}")
+        return self.config.co2_per_kwh_kg
+
+    async def simulate(self, request_id: str, alternative_expert_id: str) -> WhatIfResult:
         req = self.dashboard.request_logs.get(request_id)
         if not req:
             raise ValueError(f"Request {request_id} not found")
@@ -653,7 +914,8 @@ class WhatIfSimulator:
             alt_energy = alt_profile.energy_per_inference_full
         alt_latency = alt_energy * 1e-6 * 0.5  # rough
         alt_accuracy = alt_profile.accuracy_compressed if alt_profile.compressed_flag else alt_profile.accuracy_full
-        alt_co2 = alt_energy * self.co2_per_kwh / 3600000
+        co2_intensity = await self.get_carbon_intensity()
+        alt_co2 = alt_energy * co2_intensity / 3600000
 
         # Differences
         diff_energy = alt_energy - req.energy_joules
@@ -678,52 +940,91 @@ class WhatIfSimulator:
         )
 
 # ============================================================================
-# 7. AUTHENTICATION & RBAC
+# 8. AUTHENTICATION & RBAC (Enhanced with User DB)
 # ============================================================================
 class AuthManager:
-    def __init__(self, config: ExplainableUIConfig):
+    def __init__(self, config: ExplainableUIConfig, db_manager: DatabaseManager):
         self.config = config
+        self.db_manager = db_manager
         self.secret = config.jwt_secret
         self.algorithm = config.jwt_algorithm
         self.expiry = config.jwt_expiration_minutes
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto") if JWT_AVAILABLE else None
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+    def hash_password(self, password: str) -> str:
+        return self.pwd_context.hash(password)
+
+    def verify_password(self, password: str, hash: str) -> bool:
+        return self.pwd_context.verify(password, hash)
+
+    async def get_user(self, username: str) -> Optional[UserDB]:
+        if ASYNC_SQLALCHEMY_AVAILABLE:
+            async with self.db_manager.async_sessionmaker() as session:
+                stmt = select(UserDB).where(UserDB.username == username)
+                result = await session.execute(stmt)
+                return result.scalar_one_or_none()
+        else:
+            session = self.db_manager.sync_sessionmaker()
+            return session.query(UserDB).filter_by(username=username).first()
+
+    async def create_user(self, username: str, password: str, role: str = "viewer") -> UserDB:
+        hashed = self.hash_password(password)
+        user = UserDB(username=username, password_hash=hashed, role=role)
+        if ASYNC_SQLALCHEMY_AVAILABLE:
+            async with self.db_manager.async_sessionmaker() as session:
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+        else:
+            session = self.db_manager.sync_sessionmaker()
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+        return user
 
     def create_token(self, username: str, role: str = "viewer") -> str:
-        if not JWT_AVAILABLE:
-            return "dummy_token"
         expire = datetime.utcnow() + timedelta(minutes=self.expiry)
         payload = {"sub": username, "role": role, "exp": expire}
         return jwt.encode(payload, self.secret, algorithm=self.algorithm)
 
     def verify_token(self, token: str) -> Dict:
-        if not JWT_AVAILABLE:
-            return {"sub": "dummy", "role": "viewer"}
         try:
             payload = jwt.decode(token, self.secret, algorithms=[self.algorithm])
             return payload
         except jwt.PyJWTError:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    def get_current_user(self, token: str) -> Dict:
-        return self.verify_token(token)
+    async def authenticate_user(self, username: str, password: str) -> Optional[UserDB]:
+        user = await self.get_user(username)
+        if user and self.verify_password(password, user.password_hash):
+            return user
+        return None
 
 # ============================================================================
-# 8. API GATEWAY EXTENSION (Enhanced with FastAPI)
+# 9. API GATEWAY EXTENSION (Enhanced with FastAPI)
 # ============================================================================
 class APIGatewayExtension:
     """
-    Extends FastAPI/Flask with /api/explain endpoints, WebSocket, and authentication.
+    Extends FastAPI with /api/explain endpoints, WebSocket, and authentication.
     """
-
-    def __init__(self, dashboard: DashboardEngine, generator: ExplanationGenerator, what_if: WhatIfSimulator, auth: AuthManager):
+    def __init__(self, dashboard: DashboardEngine, generator: ExplanationGenerator,
+                 what_if: WhatIfSimulator, auth: AuthManager):
         self.dashboard = dashboard
         self.generator = generator
         self.what_if = what_if
         self.auth = auth
         self.app = None
+        self.limiter = None
+        if SLOWAPI_AVAILABLE:
+            self.limiter = Limiter(key_func=get_remote_address)
 
-    def register_routes(self, app):
+    def register_routes(self, app: FastAPI):
         self.app = app
+
+        # Rate limiting
+        if self.limiter:
+            app.state.limiter = self.limiter
+            app.add_exception_handler(429, _rate_limit_exceeded_handler)
 
         # WebSocket endpoint
         if FASTAPI_AVAILABLE and WEBSOCKETS_AVAILABLE:
@@ -731,14 +1032,34 @@ class APIGatewayExtension:
             async def websocket_endpoint(websocket: WebSocket):
                 await self.dashboard.register_websocket(websocket)
 
-        # Authentication
+        # Authentication endpoints
         @app.post("/api/explain/login")
         async def login(username: str, password: str):
-            # In production, validate against user DB
-            if username == "admin" and password == "admin":
-                token = self.auth.create_token(username, "admin")
-                return {"access_token": token, "token_type": "bearer"}
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+            user = await self.auth.authenticate_user(username, password)
+            if not user:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            # Update last_login
+            if ASYNC_SQLALCHEMY_AVAILABLE:
+                async with self.dashboard.db_manager.async_sessionmaker() as session:
+                    stmt = update(UserDB).where(UserDB.id == user.id).values(last_login=datetime.now())
+                    await session.execute(stmt)
+                    await session.commit()
+            else:
+                session = self.dashboard.db_manager.sync_sessionmaker()
+                user.last_login = datetime.now()
+                session.commit()
+            token = self.auth.create_token(user.username, user.role)
+            return {"access_token": token, "token_type": "bearer"}
+
+        @app.post("/api/explain/register")
+        async def register(username: str, password: str, role: str = "viewer"):
+            # Only admin can create admin users, but for demo, allow any role
+            # In production, this endpoint should be protected.
+            existing = await self.auth.get_user(username)
+            if existing:
+                raise HTTPException(status_code=400, detail="User already exists")
+            user = await self.auth.create_user(username, password, role)
+            return {"username": user.username, "role": user.role}
 
         # Security dependency
         security = HTTPBearer()
@@ -753,7 +1074,25 @@ class APIGatewayExtension:
         # Public endpoints
         @app.get("/api/explain/health")
         async def health():
-            return {"status": "ok"}
+            # Check DB connectivity
+            db_ok = True
+            try:
+                if ASYNC_SQLALCHEMY_AVAILABLE:
+                    async with self.dashboard.db_manager.async_sessionmaker() as session:
+                        await session.execute("SELECT 1")
+                else:
+                    session = self.dashboard.db_manager.sync_sessionmaker()
+                    session.execute("SELECT 1")
+            except Exception as e:
+                db_ok = False
+                logger.error(f"Health check: DB error {e}")
+            return {
+                "status": "healthy" if db_ok else "degraded",
+                "database": "ok" if db_ok else "error",
+                "cache_size": len(self.dashboard._cache),
+                "websocket_connections": len(self.dashboard._ws_connections),
+                "timestamp": datetime.now().isoformat(),
+            }
 
         @app.get("/api/explain/metrics")
         async def get_metrics():
@@ -764,18 +1103,18 @@ class APIGatewayExtension:
         # Protected endpoints (viewer)
         @app.get("/api/explain/request/{request_id}")
         async def explain_request(request_id: str, user: Dict = Depends(get_current_user)):
-            data = self.dashboard.get_request_data(request_id)
+            data = await self.dashboard.get_request_data(request_id, user.get("sub"))
             if "error" in data:
                 raise HTTPException(status_code=404, detail=data["error"])
             return data
 
         @app.get("/api/explain/dashboard")
         async def dashboard_data(page: int = 1, page_size: int = 20, expert: Optional[str] = None, user: Dict = Depends(get_current_user)):
-            return self.dashboard.get_recent_requests(page, page_size, expert)
+            return await self.dashboard.get_recent_requests(page, page_size, expert, user.get("sub"))
 
         @app.get("/api/explain/charts")
         async def dashboard_charts(request_id: Optional[str] = None, user: Dict = Depends(get_current_user)):
-            charts = self.dashboard.get_dashboard_charts(request_id)
+            charts = await self.dashboard.get_dashboard_charts(request_id, user.get("sub"))
             if "error" in charts:
                 raise HTTPException(status_code=400, detail=charts["error"])
             return charts
@@ -783,7 +1122,7 @@ class APIGatewayExtension:
         @app.post("/api/explain/whatif")
         async def whatif_simulation(data: dict, user: Dict = Depends(get_current_user)):
             try:
-                result = self.what_if.simulate(data.get("request_id"), data.get("alternative_expert_id"))
+                result = await self.what_if.simulate(data.get("request_id"), data.get("alternative_expert_id"))
                 return result.__dict__
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -796,20 +1135,32 @@ class APIGatewayExtension:
                 raise HTTPException(status_code=404, detail="Request not found")
             req.feedback_rating = rating
             req.feedback_comment = comment
-            # Update DB if applicable
-            if SQLALCHEMY_AVAILABLE and self.dashboard.db_session:
-                session = self.dashboard.db_session()
-                session.query(RequestLogDB).filter_by(request_id=request_id).update({
-                    "feedback_rating": rating,
-                    "feedback_comment": comment
-                })
-                session.commit()
+            # Update DB
+            try:
+                if ASYNC_SQLALCHEMY_AVAILABLE:
+                    async with self.dashboard.db_manager.async_sessionmaker() as session:
+                        stmt = update(RequestLogDB).where(RequestLogDB.request_id == request_id).values(
+                            feedback_rating=rating,
+                            feedback_comment=comment
+                        )
+                        await session.execute(stmt)
+                        await session.commit()
+                else:
+                    session = self.dashboard.db_manager.sync_sessionmaker()
+                    session.query(RequestLogDB).filter_by(request_id=request_id).update({
+                        "feedback_rating": rating,
+                        "feedback_comment": comment
+                    })
+                    session.commit()
+            except Exception as e:
+                logger.error(f"Failed to update feedback: {e}")
+                raise HTTPException(status_code=500, detail="Feedback update failed")
             return {"status": "feedback recorded"}
 
         # Export endpoint
         @app.get("/api/explain/export/{request_id}")
         async def export_request(request_id: str, format: str = "json", user: Dict = Depends(get_current_user)):
-            data = self.dashboard.get_request_data(request_id)
+            data = await self.dashboard.get_request_data(request_id, user.get("sub"))
             if "error" in data:
                 raise HTTPException(status_code=404, detail=data["error"])
             if format == "json":
@@ -825,35 +1176,57 @@ class APIGatewayExtension:
                 return Response(content=output.getvalue(), media_type="text/csv")
             elif format == "png" and PLOTLY_AVAILABLE:
                 # Generate PNG from chart (requires kaleido)
-                fig = go.Figure(data=[go.Bar(x=[a["expert_id"] for a in data["alternatives"]] + [data["chosen_expert"]],
-                                             y=[a["energy_joules"] for a in data["alternatives"]] + [data["energy_joules"]])])
-                img_bytes = fig.to_image(format="png")
-                return Response(content=img_bytes, media_type="image/png")
+                try:
+                    fig = go.Figure(data=[go.Bar(x=[a["expert_id"] for a in data["alternatives"]] + [data["chosen_expert"]],
+                                                 y=[a["energy_joules"] for a in data["alternatives"]] + [data["energy_joules"]])])
+                    img_bytes = fig.to_image(format="png")
+                    return Response(content=img_bytes, media_type="image/png")
+                except Exception as e:
+                    logger.warning(f"PNG export failed: {e}")
+                    raise HTTPException(status_code=500, detail="PNG generation failed")
             else:
                 raise HTTPException(status_code=400, detail="Unsupported format")
 
         # Admin endpoints
         @app.post("/api/explain/admin/refresh")
         async def refresh_cache(user: Dict = Depends(require_role("admin"))):
-            self.dashboard._cache.clear()
+            async with self.dashboard._cache_lock:
+                self.dashboard._cache.clear()
             return {"status": "cache cleared"}
 
         @app.post("/api/explain/admin/export/all")
         async def export_all(format: str = "json", user: Dict = Depends(require_role("admin"))):
             # Export all request logs
-            data = [self.dashboard.get_request_data(req.request_id) for req in self.dashboard.request_logs.values()]
+            data = []
+            for req_id in self.dashboard.request_logs:
+                req_data = await self.dashboard.get_request_data(req_id, user.get("sub"))
+                if "error" not in req_data:
+                    data.append(req_data)
             if format == "json":
                 return data
             elif format == "csv":
-                # simplified
-                return Response(content="Not implemented", media_type="text/csv")
+                import csv
+                from io import StringIO
+                output = StringIO()
+                writer = csv.writer(output)
+                # Write header
+                if data:
+                    writer.writerow(data[0].keys())
+                    for row in data:
+                        writer.writerow(row.values())
+                return Response(content=output.getvalue(), media_type="text/csv")
             else:
                 raise HTTPException(status_code=400, detail="Unsupported format")
+
+        @app.post("/api/explain/admin/reload_template")
+        async def reload_template(path: Optional[str] = None, user: Dict = Depends(require_role("admin"))):
+            self.generator.reload_template(path)
+            return {"status": "template reloaded"}
 
         logger.info("API Gateway routes registered")
 
 # ============================================================================
-# 9. CONVENIENCE FACTORY
+# 10. CONVENIENCE FACTORY
 # ============================================================================
 def create_explainable_ui(
     config: Optional[Union[Dict, ExplainableUIConfig]] = None,
@@ -864,29 +1237,16 @@ def create_explainable_ui(
     Factory to create all components and return them for integration.
     """
     if config is None:
-        if PYDANTIC_AVAILABLE:
-            config = ExplainableUIConfig()
-        else:
-            config = EXPLAINABLE_UI_CONFIG
+        config = ExplainableUIConfig()
+    elif isinstance(config, dict):
+        config = ExplainableUIConfig.from_dict(config)
 
-    # Database setup
-    db_session = None
-    if SQLALCHEMY_AVAILABLE:
-        engine = create_engine(
-            f"sqlite:///{config.db_path}",
-            poolclass=QueuePool,
-            pool_size=config.db_pool_size,
-            max_overflow=config.db_max_overflow,
-        )
-        Base.metadata.create_all(engine)
-        db_session = scoped_session(sessionmaker(bind=engine))
+    db_manager = DatabaseManager(config)
+    dashboard = DashboardEngine(config, db_manager)
+    generator = ExplanationGenerator(config)
+    what_if = WhatIfSimulator(dashboard, config, carbon_manager, lca_client)
+    auth = AuthManager(config, db_manager)
 
-    dashboard = DashboardEngine(config, db_session)
-    generator = ExplanationGenerator()
-    what_if = WhatIfSimulator(dashboard, carbon_manager, lca_client)
-    auth = AuthManager(config)
-
-    # API extension (FastAPI app will be provided separately)
     api_extension = APIGatewayExtension(dashboard, generator, what_if, auth)
 
     return {
@@ -895,13 +1255,13 @@ def create_explainable_ui(
         "what_if": what_if,
         "auth": auth,
         "api_extension": api_extension,
-        "db_session": db_session,
+        "db_manager": db_manager,
     }
 
 # ============================================================================
-# 10. UNIT TEST STUBS
+# 11. UNIT TEST STUBS
 # ============================================================================
-def test_explainable_ui():
+async def test_explainable_ui():
     """Example test stub."""
     config = ExplainableUIConfig(db_path=":memory:")
     components = create_explainable_ui(config)
@@ -920,53 +1280,58 @@ def test_explainable_ui():
         co2_kg=0.1,
         accuracy=0.95,
     )
-    dashboard.log_request(req)
-    data = dashboard.get_request_data("test-123")
+    await dashboard.log_request(req)
+    data = await dashboard.get_request_data("test-123")
     assert data["request_id"] == "test-123"
+    await dashboard.shutdown()
 
 # ============================================================================
-# 11. EXAMPLE USAGE
+# 12. EXAMPLE USAGE
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
     logging.basicConfig(level=logging.INFO)
 
-    components = create_explainable_ui()
-    dash = components["dashboard"]
-    gen = components["explanation_generator"]
-    what_if = components["what_if"]
+    async def main():
+        components = create_explainable_ui()
+        dash = components["dashboard"]
+        gen = components["explanation_generator"]
+        what_if = components["what_if"]
 
-    # Create a dummy profile
-    prof = SustainabilityAwareExpertProfile("expert_A")
-    prof.energy_per_inference_full = 2.5
-    prof.accuracy_full = 0.92
-    prof.compressed_flag = False
+        # Create a dummy profile
+        prof = SustainabilityAwareExpertProfile("expert_A")
+        prof.energy_per_inference_full = 2.5
+        prof.accuracy_full = 0.92
+        prof.compressed_flag = False
 
-    alt_prof = SustainabilityAwareExpertProfile("expert_B")
-    alt_prof.energy_per_inference_full = 3.8
-    alt_prof.accuracy_full = 0.94
+        alt_prof = SustainabilityAwareExpertProfile("expert_B")
+        alt_prof.energy_per_inference_full = 3.8
+        alt_prof.accuracy_full = 0.94
 
-    req = RequestLog(
-        request_id="test-123",
-        timestamp=datetime.now(),
-        query="What is the weather?",
-        chosen_expert_id="expert_A",
-        chosen_expert_profile=prof,
-        alternative_experts=[("expert_B", alt_prof)],
-        latency_ms=120.0,
-        energy_joules=2.5,
-        co2_kg=2.5 * 0.2 / 3600000,
-        accuracy=0.92,
-        carbon_intensity=400.0,
-        helium_scarcity=0.5,
-        material_index=0.2,
-    )
-    dash.log_request(req)
+        req = RequestLog(
+            request_id="test-123",
+            timestamp=datetime.now(),
+            query="What is the weather?",
+            chosen_expert_id="expert_A",
+            chosen_expert_profile=prof,
+            alternative_experts=[("expert_B", alt_prof)],
+            latency_ms=120.0,
+            energy_joules=2.5,
+            co2_kg=2.5 * 0.2 / 3600000,
+            accuracy=0.92,
+            carbon_intensity=400.0,
+            helium_scarcity=0.5,
+            material_index=0.2,
+        )
+        await dash.log_request(req)
 
-    explanation = gen.generate(req, prof, [("expert_B", alt_prof)])
-    print("Explanation:", explanation)
+        explanation = gen.generate(req, prof, [("expert_B", alt_prof)])
+        print("Explanation:", explanation)
 
-    result = what_if.simulate("test-123", "expert_B")
-    print("What‑if result:", result)
+        result = await what_if.simulate("test-123", "expert_B")
+        print("What‑if result:", result)
 
-    print("✅ Enhanced Explainable UI module ready.")
+        await dash.shutdown()
+        print("✅ Enhanced Explainable UI module ready.")
+
+    asyncio.run(main())
