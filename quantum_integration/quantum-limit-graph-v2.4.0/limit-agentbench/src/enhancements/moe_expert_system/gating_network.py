@@ -384,6 +384,35 @@ class GatingNetworkManager:
                 f"Number of expert IDs ({len(self.expert_ids)}) must match num_experts ({self.config.num_experts})"
             )
 
+        # Extend existing GatingNetworkManager
+
+    async def select_teachers(
+        self,
+        domain: str,
+        reasoning_effort: str = "medium",
+        energy_mode: str = "balanced",
+        num_teachers: int = 2,
+    ) -> List[str]:
+        """
+        Route to teachers based on domain, reasoning effort, and energy mode.
+        Returns a list of teacher IDs (e.g., from the teacher grid).
+        """
+        # Build a composite key
+        key = f"{domain}_{reasoning_effort}_{energy_mode}"
+        # In a real implementation, you'd use a neural network to score teachers.
+        # For demonstration, we'll map to a predefined set of teacher IDs.
+        teacher_grid = {
+            "math_high_performance": ["math_expert_1", "math_expert_2"],
+            "math_high_balanced": ["math_expert_1", "math_expert_3"],
+            "math_high_eco": ["math_expert_3", "math_expert_4"],
+            # ... other combinations
+        }
+        # Fallback if key not found
+        if key not in teacher_grid:
+            key = f"{domain}_medium_balanced"
+        teacher_ids = teacher_grid.get(key, ["default_expert"])
+        return teacher_ids[:num_teachers]
+        
         # Model
         self.model = GatingNetwork(
             input_dim=self.config.input_dim,
