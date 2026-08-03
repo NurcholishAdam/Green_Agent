@@ -88,6 +88,12 @@ class GreenAgentConfig(BaseSettings):
             raise ValueError(f"log_level must be one of {allowed}")
         return v.upper()
 
+        distillation: Dict[str, Any] = {
+            "num_epochs": 3, "batch_size": 32,
+            "lr": 1e-5,
+            "reverse_kl": True,
+            "alpha_orm": 0.1,
+            "mixed_precision": True,}
 
 # -----------------------------------------------------------------------------
 # Initialization function (to be used in main.py)
