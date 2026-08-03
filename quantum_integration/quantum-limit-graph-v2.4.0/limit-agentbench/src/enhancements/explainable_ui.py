@@ -48,6 +48,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Union, Callable
+from ..enhancements.llm_client import LLMClient
 from collections import deque
 import numpy as np
 
@@ -370,11 +371,28 @@ class ExplanationGenerator:
     Produces human‑readable, natural‑language explanations with multiple dimensions.
     Supports Jinja2 templates loaded from file.
     """
-    def __init__(self, config: ExplainableUIConfig):
-        self.config = config
-        self.template_env = None
-        self.template_name = "default"
-        self.template_content = self._default_template()
+      # In ExplanationGenerator, add optional LLM client
+    def __init__(self, template: Optional[str] = None, llm_client: Optional[LLMClient] = None):
+        self.template = template or self._default_template()
+        self.llm_client = llm_client
+
+    async def generate(self, request: RequestLog, ...) -> str:
+        if self.llm_client:
+            # Build a prompt with the decision context
+            prompt = f"""
+            The routing system chose expert {request.chosen_expert_id} for query "{request.query}".
+            - Energy per inference: {request.energy_joules:.2f} J
+            - CO₂ emissions: {request.co2_kg:.4f} kg
+            - Carbon intensity: {request.carbon_intensity:.1f} gCO₂/kWh
+            - Helium scarcity: {request.helium_scarcity:.2f}
+            - Material index: {request.material_index:.2f}
+            - Accuracy: {request.accuracy:.2%}
+            Explain why this decision was made in a clear, concise manner.
+            """
+            return await self.llm_client.generate_explanation(prompt)
+        else:
+            # Fallback to template
+            return super().generate(request, chosen_expert, alternatives)  
         if config.explanation_template_path:
             self._load_template_from_file(config.explanation_template_path)
         else:
