@@ -31,6 +31,9 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, TypeVar, cast
+from typing import Optional
+from ..bio_inspired.eco_atp_currency import EcoATPTokenManager
+from ..bio_inspired.time_tick_engine import TimeTickEngine
 import numpy as np
 import networkx as nx
 
@@ -157,6 +160,49 @@ class ExpertRouterConfig(BaseSettings):
         if v < 0 or v > 1:
             raise ValueError("sparsity ratio must be between 0 and 1")
         return v
+
+    async def route_with_energy_awareness(
+        self,
+        query: Any,
+        domain: str,
+        reasoning_effort: str = "medium",
+        energy_mode: Optional[str] = None,
+    ) -> str:
+        """
+        Select an expert based on domain, reasoning effort, and energy mode.
+        If energy_mode is None, determine from current energy budget.
+        """
+        if energy_mode is None and hasattr(self, 'eco_manager'):
+            energy_budget = await self.eco_manager.get_current_budget()
+            if energy_budget > 0.7:
+                energy_mode = "performance"
+            elif energy_budget > 0.3:
+                energy_mode = "balanced"
+            else:
+                energy_mode = "eco"
+        elif energy_mode is None:
+            energy_mode = "balanced"
+
+        # Use gating network to select expert
+        if hasattr(self, 'gating_network'):
+            teacher_ids = await self.gating_network.select_teachers(
+                domain=domain,
+                reasoning_effort=reasoning_effort,
+                energy_mode=energy_mode,
+                num_teachers=1,
+            )
+            if teacher_ids:
+                return teacher_ids[0]
+        # Fallback to original routing
+        return self.route(query)
+
+    def inject_energy_managers(
+        self,
+        eco_manager: EcoATPTokenManager,
+        tick_engine: TimeTickEngine,
+    ):
+        self.eco_manager = eco_manager
+        self.tick_engine = tick_engine
 
 # ============================================================================
 # Pydantic Models for Data Structures
