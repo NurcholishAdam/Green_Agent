@@ -1,5 +1,5 @@
 """
-TimeTickEngine v3.1 – Enhanced simulation driver with configurable data sources,
+TimeTickEngine v3.2 – Enhanced simulation driver with configurable data sources,
 interpolation, checkpointing, metrics, and graceful shutdown.
 
 Supports:
@@ -13,12 +13,13 @@ Supports:
 - Configurable date format and checkpoint retention.
 - Data hash validation for checkpoint compatibility.
 - Improved live data handling and error recovery.
+- Removed extraneous methods; improved type hints and logging.
 """
 
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Callable, Union, List, Protocol, Awaitable
+from typing import Dict, Any, Optional, Callable, Union, List, Protocol, Awaitable, Tuple
 from dataclasses import dataclass, field, asdict
 import json
 import os
@@ -124,8 +125,7 @@ class HarvesterProtocol(Protocol):
     async def harvest_cycle(self, environmental_data: Dict[str, float]) -> Dict[str, Any]: ...
     def set_mode(self, mode: Any) -> None: ...
     async def get_harvesting_stats(self) -> Dict[str, Any]: ...
-    # Optional: may have restore_state method
-    # def restore_state(self, state: Dict[str, Any]) -> None: ...
+    def restore_state(self, state: Dict[str, Any]) -> None: ...
 
 class TranslatorProtocol(Protocol):
     """Protocol for translating CSV rows to harvester input."""
@@ -142,7 +142,8 @@ class SimulationState:
     current_date: str
     total_harvested: float
     harvest_cycles: int
-    metrics: Dict[str, Any]
+    metrics: Dict[str, Any]  # summary from MetricsCollector
+    metrics_data: Dict[str, Any]  # full metrics for restoration (custom metrics, etc.)
     harvester_state: Optional[Dict[str, Any]] = None
     data_hash: Optional[str] = None  # hash of the data file for validation
     timestamp: str
@@ -190,12 +191,35 @@ class MetricsCollector:
         # Add custom metrics summary (average, min, max) based on last _max_custom_entries
         for key, values in self.custom_metrics.items():
             if values:
-                # Use last N values for summary
                 recent = values[-self._max_custom_entries:]
                 summary[f'avg_{key}'] = np.mean(recent)
                 summary[f'min_{key}'] = np.min(recent)
                 summary[f'max_{key}'] = np.max(recent)
         return summary
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the entire collector to a dict for checkpointing."""
+        return {
+            'total_harvested': self.total_harvested,
+            'harvest_cycles': self.harvest_cycles,
+            'efficiencies': self.efficiencies,
+            'modes': self.modes,
+            'timestamps': [ts.isoformat() for ts in self.timestamps],
+            'custom_metrics': self.custom_metrics,
+            'max_custom_entries': self._max_custom_entries,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MetricsCollector':
+        """Restore a MetricsCollector from a dict."""
+        collector = cls(max_custom_entries=data.get('max_custom_entries', 1000))
+        collector.total_harvested = data.get('total_harvested', 0.0)
+        collector.harvest_cycles = data.get('harvest_cycles', 0)
+        collector.efficiencies = data.get('efficiencies', [])
+        collector.modes = data.get('modes', [])
+        collector.timestamps = [datetime.fromisoformat(ts) for ts in data.get('timestamps', [])]
+        collector.custom_metrics = data.get('custom_metrics', {})
+        return collector
 
 # ============================================================================
 # Live Data Feed (for real‑time simulation)
@@ -275,6 +299,10 @@ class TimeTickEngine:
         """
         self.harvester = harvester
         self.translator = translator
+
+        # Validate translator
+        if not (callable(translator) or hasattr(translator, 'translate_row')):
+            raise ValueError("translator must be a callable or have a translate_row method")
 
         # Load configuration
         if isinstance(config, dict):
@@ -370,26 +398,6 @@ class TimeTickEngine:
         logger.info("Loaded %d monthly rows, interpolated to %d daily ticks.",
                     len(self.df_monthly), len(self.daily_df))
 
-    # Extend TimeTickEngine
-
-    async def get_energy_price_forecast(self, hours: int = 24) -> List[float]:
-        """
-        Forecast energy price (USD/kWh) for the next N hours.
-        Uses historical data and simple exponential smoothing.
-        """
-        # Placeholder: return a constant or simulate diurnal pattern
-        now = datetime.now()
-        prices = []
-        for i in range(hours):
-            hour = (now.hour + i) % 24
-            # Simulate higher price during peak (9-17)
-            if 9 <= hour < 17:
-                price = 0.15 + 0.02 * np.sin((hour - 9) / 8 * np.pi)
-            else:
-                price = 0.10 + 0.01 * np.sin((hour - 20) / 4 * np.pi)
-            prices.append(price)
-        return prices
-    
     def _interpolate_daily(self):
         """
         Interpolate monthly data to daily using the configured method.
@@ -409,16 +417,25 @@ class TimeTickEngine:
         # Select only numeric columns for interpolation
         numeric_cols = [col for col in self.config.value_columns if col in df_monthly.columns]
 
-        if self.config.interpolation_method == 'linear':
-            self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='linear')
-        elif self.config.interpolation_method == 'quadratic':
-            self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='quadratic')
-        elif self.config.interpolation_method == 'spline':
-            self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='spline')
-        elif self.config.interpolation_method == 'time':
-            self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='time')
-        else:
-            raise ValueError(f"Unsupported interpolation method: {self.config.interpolation_method}")
+        try:
+            if self.config.interpolation_method == 'linear':
+                self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='linear')
+            elif self.config.interpolation_method == 'quadratic':
+                self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='quadratic')
+            elif self.config.interpolation_method == 'spline':
+                # Spline may require scipy; fallback to linear if it fails
+                try:
+                    self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='spline')
+                except Exception as e:
+                    logger.warning("Spline interpolation failed (%s), falling back to linear.", e)
+                    self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='linear')
+            elif self.config.interpolation_method == 'time':
+                self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='time')
+            else:
+                raise ValueError(f"Unsupported interpolation method: {self.config.interpolation_method}")
+        except Exception as e:
+            logger.error("Interpolation failed: %s", e)
+            raise
 
         # Reset index to have date as a column
         self.daily_df = self.daily_df.reset_index()
@@ -569,12 +586,8 @@ class TimeTickEngine:
             elif hasattr(self.translator, 'translate_row'):
                 return self.translator.translate_row(row)
             else:
-                # Fallback: map all value columns to float and prefix with 'helium_'
-                env_data = {}
-                for col in self.config.value_columns:
-                    if col in row:
-                        env_data[f"helium_{col}"] = float(row[col])
-                return env_data
+                # Fallback: raise error as translator is invalid
+                raise TypeError("translator is not a callable nor has translate_row method")
         except Exception as e:
             logger.error("Row translation failed: %s", e)
             return None
@@ -596,12 +609,17 @@ class TimeTickEngine:
         else:
             current_date_str = datetime.now().isoformat()
 
+        # Serialize metrics
+        metrics_summary = self.metrics.get_summary()
+        metrics_data = self.metrics.to_dict()
+
         state = SimulationState(
             current_index=current_index,
             current_date=current_date_str,
             total_harvested=self.metrics.total_harvested,
             harvest_cycles=self.metrics.harvest_cycles,
-            metrics=self.metrics.get_summary(),
+            metrics=metrics_summary,
+            metrics_data=metrics_data,
             harvester_state=harvester_state,
             data_hash=self._data_hash,
             timestamp=datetime.now().isoformat()
@@ -621,7 +639,7 @@ class TimeTickEngine:
     def _cleanup_old_checkpoints(self):
         """Remove oldest checkpoint files beyond max_checkpoints."""
         pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
-        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=os.path.getmtime)
+        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
         if len(checkpoint_files) > self.config.max_checkpoints:
             for old_file in checkpoint_files[:-self.config.max_checkpoints]:
                 try:
@@ -633,7 +651,7 @@ class TimeTickEngine:
     def _load_checkpoint(self) -> bool:
         """Load the latest checkpoint and validate compatibility."""
         pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
-        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=os.path.getmtime)
+        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
         if not checkpoint_files:
             return False
 
@@ -649,8 +667,14 @@ class TimeTickEngine:
                     return False
 
             self._current_index = state.current_index
-            self.metrics.total_harvested = state.total_harvested
-            self.metrics.harvest_cycles = state.harvest_cycles
+            # Restore metrics
+            if state.metrics_data:
+                self.metrics = MetricsCollector.from_dict(state.metrics_data)
+            else:
+                # Fallback to older checkpoint format
+                self.metrics.total_harvested = state.total_harvested
+                self.metrics.harvest_cycles = state.harvest_cycles
+
             # Restore harvester state if possible
             if state.harvester_state and hasattr(self.harvester, 'restore_state'):
                 try:
@@ -704,6 +728,8 @@ if __name__ == "__main__":
             }
         async def get_harvesting_stats(self):
             return {'harvester_id': 'mock'}
+        def restore_state(self, state):
+            pass
 
     # Mock translator
     class MockTranslator:
