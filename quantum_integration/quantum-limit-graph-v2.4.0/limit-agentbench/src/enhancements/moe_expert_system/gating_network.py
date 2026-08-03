@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Gating Network Module for MoE Expert System v2.1.0
+Gating Network Module for MoE Expert System v3.0.0
 
 Enhanced with:
 - Complete type hints and docstrings
 - Concurrency controls (asyncio locks)
-- Secure JSON/Pydantic persistence with fallback (pickle)
+- Secure JSON/Pydantic persistence (no pickle)
 - Tenacity retries and circuit breaker (half-open)
 - Configurable model architecture
 - Weighted online learning buffer
@@ -16,6 +16,7 @@ Enhanced with:
 - Improved federated learning logic
 - Better error handling and validation
 - Mock federated server for testing (included)
+- Pydantic configuration with environment support
 """
 
 import asyncio
@@ -24,7 +25,6 @@ import json
 import os
 import hashlib
 import zlib
-import pickle  # Added for fallback
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -59,10 +59,12 @@ except ImportError:
     retry_if_exception_type = lambda e: None
 
 try:
-    from pydantic import BaseModel, Field, ValidationError, field_validator
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
+    from pydantic_settings import BaseSettings, SettingsConfigDict
 except ImportError:
     # Fallback: use dataclass with manual validation
     BaseModel = None
+    BaseSettings = None
 
 try:
     from prometheus_client import Counter, Gauge, Histogram, start_http_server
@@ -73,96 +75,150 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration with Validation (using dataclass + post-init)
+# Configuration with Pydantic (if available)
 # ============================================================================
 
-@dataclass
-class GatingNetworkConfig:
-    """Centralized configuration for the Gating Network Manager."""
-    # Feature flags
-    enable_federated: bool = True
-    enable_differential_privacy: bool = True
-    enable_model_compression: bool = True
-    enable_online_learning: bool = True
-    enable_telemetry: bool = True
-    enable_carbon_awareness: bool = True
-    enable_helium_awareness: bool = True
-    enable_causal_features: bool = True
+if BaseSettings is not None:
+    class GatingNetworkConfig(BaseSettings):
+        """Centralized configuration for the Gating Network Manager."""
+        model_config = SettingsConfigDict(env_prefix="GATING_", case_sensitive=False)
 
-    # Model architecture
-    input_dim: int = 10
-    hidden_dim: int = 64
-    num_experts: int = 5
-    num_hidden_layers: int = 2  # new: configurable depth
-    activation: str = "relu"     # new: "relu", "tanh", "gelu"
-    dropout_rate: float = 0.1
-    learning_rate: float = 0.001
-    batch_size: int = 32
-    epochs_per_update: int = 3
+        # Feature flags
+        enable_federated: bool = True
+        enable_differential_privacy: bool = True
+        enable_model_compression: bool = True
+        enable_online_learning: bool = True
+        enable_telemetry: bool = True
+        enable_carbon_awareness: bool = True
+        enable_helium_awareness: bool = True
+        enable_causal_features: bool = True
 
-    # Training parameters
-    max_training_samples: int = 10000
-    online_learning_rate: float = 0.01
-    momentum: float = 0.9
-    weight_decay: float = 0.0001
-    recency_weight: float = 0.9  # new: weight for recent samples in buffer
+        # Model architecture
+        input_dim: int = Field(10, ge=1)
+        hidden_dim: int = Field(64, ge=1)
+        num_experts: int = Field(5, ge=1)
+        num_hidden_layers: int = Field(2, ge=1)
+        activation: str = Field("relu")
+        dropout_rate: float = Field(0.1, ge=0, le=1)
+        learning_rate: float = Field(0.001, gt=0)
+        batch_size: int = Field(32, ge=1)
+        epochs_per_update: int = Field(3, ge=1)
 
-    # Privacy and compression
-    privacy_epsilon: float = 1.0
-    noise_scale: float = 0.001
-    sparsity_ratio: float = 0.1
+        # Training parameters
+        max_training_samples: int = Field(10000, ge=1)
+        online_learning_rate: float = Field(0.01, gt=0)
+        momentum: float = Field(0.9, ge=0, le=1)
+        weight_decay: float = Field(0.0001, ge=0)
+        recency_weight: float = Field(0.9, ge=0, le=1)
 
-    # Federated learning
-    server_url: Optional[str] = None
-    federation_round_interval: int = 3600
+        # Privacy and compression
+        privacy_epsilon: float = Field(1.0, ge=0)
+        noise_scale: float = Field(0.001, ge=0)
+        sparsity_ratio: float = Field(0.1, ge=0, le=1)
 
-    # Resilience
-    max_retries: int = 3
-    retry_base_delay_ms: float = 100.0
-    retry_max_delay_ms: float = 5000.0
-    circuit_breaker_failure_threshold: int = 5
-    circuit_breaker_recovery_timeout: float = 30.0
+        # Federated learning
+        server_url: Optional[str] = None
+        federation_round_interval: int = Field(3600, ge=60)
 
-    # Telemetry
-    telemetry_export_interval: int = 60
-    prometheus_port: Optional[int] = None  # if set, start Prometheus HTTP server
+        # Resilience
+        max_retries: int = Field(3, ge=0)
+        retry_base_delay_ms: float = Field(100.0, ge=0)
+        retry_max_delay_ms: float = Field(5000.0, ge=0)
+        circuit_breaker_failure_threshold: int = Field(5, ge=1)
+        circuit_breaker_recovery_timeout: float = Field(30.0, ge=0)
 
-    def __post_init__(self):
-        # Validate boolean flags
-        for key, value in self.__dict__.items():
-            if isinstance(value, bool):
-                setattr(self, key, bool(value))
+        # Telemetry
+        telemetry_export_interval: int = Field(60, ge=1)
+        prometheus_port: Optional[int] = Field(None, ge=1024)
 
-        # Validate numeric ranges
-        if self.input_dim < 1:
-            raise ValueError("input_dim must be >= 1")
-        if self.hidden_dim < 1:
-            raise ValueError("hidden_dim must be >= 1")
-        if self.num_experts < 1:
-            raise ValueError("num_experts must be >= 1")
-        if self.num_hidden_layers < 1:
-            raise ValueError("num_hidden_layers must be >= 1")
-        if not (0 <= self.dropout_rate <= 1):
-            raise ValueError("dropout_rate must be between 0 and 1")
-        if self.learning_rate <= 0:
-            raise ValueError("learning_rate must be > 0")
-        if self.privacy_epsilon < 0:
-            raise ValueError("privacy_epsilon must be >= 0")
-        if not (0 <= self.sparsity_ratio <= 1):
-            raise ValueError("sparsity_ratio must be between 0 and 1")
-        if self.max_training_samples < 1:
-            raise ValueError("max_training_samples must be >= 1")
-        if self.recency_weight < 0 or self.recency_weight > 1:
-            raise ValueError("recency_weight must be between 0 and 1")
-        if self.circuit_breaker_failure_threshold < 1:
-            raise ValueError("circuit_breaker_failure_threshold must be >= 1")
-        if self.circuit_breaker_recovery_timeout < 0:
-            raise ValueError("circuit_breaker_recovery_timeout must be >= 0")
+        @field_validator('activation')
+        @classmethod
+        def validate_activation(cls, v):
+            allowed = {"relu", "tanh", "gelu"}
+            if v not in allowed:
+                raise ValueError(f"activation must be one of {allowed}")
+            return v
 
-        # Validate activation
-        valid_activations = {"relu", "tanh", "gelu"}
-        if self.activation not in valid_activations:
-            raise ValueError(f"activation must be one of {valid_activations}")
+        @field_validator('num_experts')
+        @classmethod
+        def validate_num_experts(cls, v):
+            if v < 1:
+                raise ValueError("num_experts must be >= 1")
+            return v
+
+        @field_validator('server_url')
+        @classmethod
+        def validate_server_url(cls, v):
+            if v is not None and not v.startswith(("http://", "https://")):
+                raise ValueError("server_url must start with http:// or https://")
+            return v
+else:
+    # Fallback dataclass with manual validation
+    @dataclass
+    class GatingNetworkConfig:
+        enable_federated: bool = True
+        enable_differential_privacy: bool = True
+        enable_model_compression: bool = True
+        enable_online_learning: bool = True
+        enable_telemetry: bool = True
+        enable_carbon_awareness: bool = True
+        enable_helium_awareness: bool = True
+        enable_causal_features: bool = True
+        input_dim: int = 10
+        hidden_dim: int = 64
+        num_experts: int = 5
+        num_hidden_layers: int = 2
+        activation: str = "relu"
+        dropout_rate: float = 0.1
+        learning_rate: float = 0.001
+        batch_size: int = 32
+        epochs_per_update: int = 3
+        max_training_samples: int = 10000
+        online_learning_rate: float = 0.01
+        momentum: float = 0.9
+        weight_decay: float = 0.0001
+        recency_weight: float = 0.9
+        privacy_epsilon: float = 1.0
+        noise_scale: float = 0.001
+        sparsity_ratio: float = 0.1
+        server_url: Optional[str] = None
+        federation_round_interval: int = 3600
+        max_retries: int = 3
+        retry_base_delay_ms: float = 100.0
+        retry_max_delay_ms: float = 5000.0
+        circuit_breaker_failure_threshold: int = 5
+        circuit_breaker_recovery_timeout: float = 30.0
+        telemetry_export_interval: int = 60
+        prometheus_port: Optional[int] = None
+
+        def __post_init__(self):
+            if self.input_dim < 1:
+                raise ValueError("input_dim must be >= 1")
+            if self.hidden_dim < 1:
+                raise ValueError("hidden_dim must be >= 1")
+            if self.num_experts < 1:
+                raise ValueError("num_experts must be >= 1")
+            if self.num_hidden_layers < 1:
+                raise ValueError("num_hidden_layers must be >= 1")
+            if not (0 <= self.dropout_rate <= 1):
+                raise ValueError("dropout_rate must be between 0 and 1")
+            if self.learning_rate <= 0:
+                raise ValueError("learning_rate must be > 0")
+            if self.privacy_epsilon < 0:
+                raise ValueError("privacy_epsilon must be >= 0")
+            if not (0 <= self.sparsity_ratio <= 1):
+                raise ValueError("sparsity_ratio must be between 0 and 1")
+            if self.max_training_samples < 1:
+                raise ValueError("max_training_samples must be >= 1")
+            if self.recency_weight < 0 or self.recency_weight > 1:
+                raise ValueError("recency_weight must be between 0 and 1")
+            if self.circuit_breaker_failure_threshold < 1:
+                raise ValueError("circuit_breaker_failure_threshold must be >= 1")
+            if self.circuit_breaker_recovery_timeout < 0:
+                raise ValueError("circuit_breaker_recovery_timeout must be >= 0")
+            valid_activations = {"relu", "tanh", "gelu"}
+            if self.activation not in valid_activations:
+                raise ValueError(f"activation must be one of {valid_activations}")
 
 # ============================================================================
 # Neural Network Model (with configurable architecture)
@@ -324,13 +380,13 @@ class RateLimiter:
             return False
 
 # ============================================================================
-# Persistence State (Pydantic or dataclass)
+# Persistence State (Pydantic)
 # ============================================================================
 
 if BaseModel is not None:
     class GatingNetworkState(BaseModel):
         """Serializable state for the gating network."""
-        version: str = "2.1.0"
+        version: str = "3.0.0"
         model_state_dict: Dict[str, Any]
         optimizer_state_dict: Dict[str, Any]
         training_data: List[Tuple[List[float], int]]
@@ -344,7 +400,7 @@ if BaseModel is not None:
         training_count: int = 0
         last_save: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 else:
-    # Fallback: use dict
+    # Fallback: use plain dict (not recommended)
     GatingNetworkState = None
 
 # ============================================================================
@@ -384,35 +440,6 @@ class GatingNetworkManager:
                 f"Number of expert IDs ({len(self.expert_ids)}) must match num_experts ({self.config.num_experts})"
             )
 
-        # Extend existing GatingNetworkManager
-
-    async def select_teachers(
-        self,
-        domain: str,
-        reasoning_effort: str = "medium",
-        energy_mode: str = "balanced",
-        num_teachers: int = 2,
-    ) -> List[str]:
-        """
-        Route to teachers based on domain, reasoning effort, and energy mode.
-        Returns a list of teacher IDs (e.g., from the teacher grid).
-        """
-        # Build a composite key
-        key = f"{domain}_{reasoning_effort}_{energy_mode}"
-        # In a real implementation, you'd use a neural network to score teachers.
-        # For demonstration, we'll map to a predefined set of teacher IDs.
-        teacher_grid = {
-            "math_high_performance": ["math_expert_1", "math_expert_2"],
-            "math_high_balanced": ["math_expert_1", "math_expert_3"],
-            "math_high_eco": ["math_expert_3", "math_expert_4"],
-            # ... other combinations
-        }
-        # Fallback if key not found
-        if key not in teacher_grid:
-            key = f"{domain}_medium_balanced"
-        teacher_ids = teacher_grid.get(key, ["default_expert"])
-        return teacher_ids[:num_teachers]
-        
         # Model
         self.model = GatingNetwork(
             input_dim=self.config.input_dim,
@@ -526,9 +553,6 @@ class GatingNetworkManager:
 
         # Integrate with carbon_manager (if available)
         if self.config.enable_carbon_awareness and self.carbon_manager:
-            # Example: get real-time carbon intensity and add as feature
-            # In a real implementation, you might call an async method.
-            # For now, we'll use a placeholder: fetch current intensity if available.
             try:
                 carbon_intensity = await self.carbon_manager.get_current_intensity()
                 # Append as an extra feature (beyond the default 10)
@@ -905,37 +929,13 @@ class GatingNetworkManager:
             }
 
     # ============================================================================
-    # Persistence (Secure JSON + Pydantic with fallback)
+    # Persistence (Secure JSON + Pydantic)
     # ============================================================================
 
     async def save_model(self, path: str):
         """
-        Save model and training state to disk using JSON + Pydantic (if available).
+        Save model and training state to disk using JSON + Pydantic.
         """
-        # Ensure pickle is imported for fallback
-        import pickle
-
-        if BaseModel is None:
-            # Fallback to pickle
-            logger.warning("Pydantic not available; using pickle for persistence")
-            state = {
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'training_data': list(self.training_buffer),
-                'config': self.config,
-                'expert_ids': self.expert_ids,
-                'federated_round': self.federated_round,
-                'participants': self.participants,
-                'contribution_score': self.contribution_score,
-                'is_trained': self.is_trained,
-                'inference_count': self.inference_count,
-                'training_count': self.training_count
-            }
-            with open(path, 'wb') as f:
-                pickle.dump(state, f)
-            logger.info(f"Model saved to {path} (pickle)")
-            return
-
         # Convert tensors to lists for JSON serialization
         model_dict = {k: v.tolist() for k, v in self.model.state_dict().items()}
         optimizer_dict = {k: v.tolist() for k, v in self.optimizer.state_dict().items()}
@@ -971,29 +971,10 @@ class GatingNetworkManager:
         """
         Load model and training state from disk.
         """
-        import pickle  # Ensure pickle is available
-
         if not os.path.exists(path):
             logger.warning(f"Persistence file {path} not found")
             return False
 
-        if BaseModel is None:
-            # Fallback to pickle
-            with open(path, 'rb') as f:
-                state = pickle.load(f)
-            self.model.load_state_dict(state['model_state_dict'])
-            self.optimizer.load_state_dict(state['optimizer_state_dict'])
-            self.training_buffer = deque(state['training_data'], maxlen=self.config.max_training_samples)
-            self.federated_round = state.get('federated_round', 0)
-            self.participants = state.get('participants', [])
-            self.contribution_score = state.get('contribution_score', 0.0)
-            self.is_trained = state.get('is_trained', False)
-            self.inference_count = state.get('inference_count', 0)
-            self.training_count = state.get('training_count', 0)
-            logger.info(f"Model loaded from {path} (pickle)")
-            return True
-
-        # JSON + Pydantic
         try:
             if aiofiles:
                 async with aiofiles.open(path, 'rb') as f:
