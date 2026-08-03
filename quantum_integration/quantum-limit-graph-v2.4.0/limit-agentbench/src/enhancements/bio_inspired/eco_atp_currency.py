@@ -322,6 +322,37 @@ else:
             # Simple fallback: load from env if needed
             return cls()
 
+        # Extend EcoATPTokenManager
+
+    async def energy_cost_per_token(
+        self,
+        batch_size: int,
+        domain: str,
+        token_length: int = 1,
+    ) -> float:
+        """
+        Estimate energy (Joules) required per token for a given domain and batch.
+        Uses current carbon intensity and hardware efficiency.
+        """
+        # Base energy per token (e.g., from profiling)
+        base_energy = 1e-6  # Joules per token
+        # Adjust for domain complexity
+        domain_factor = {
+            "math": 1.5,
+            "code": 1.2,
+            "general": 1.0,
+            "energy": 0.8,
+        }.get(domain, 1.0)
+        # Adjust for current carbon intensity (higher intensity -> higher energy cost)
+        if hasattr(self, 'carbon_manager'):
+            intensity = await self.carbon_manager.get_current_intensity()
+            intensity_factor = intensity / 400  # baseline 400 gCO2/kWh
+        else:
+            intensity_factor = 1.0
+        # Adjust for batch size (amortized)
+        batch_factor = 1.0 + 0.1 * (batch_size - 1)
+        energy = base_energy * domain_factor * intensity_factor * batch_factor * token_length
+        return energy
 # ============================================================================
 # Protocol Definitions
 # ============================================================================
