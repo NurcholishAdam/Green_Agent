@@ -34,6 +34,7 @@ from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, TypeV
 from typing import Optional
 from ..bio_inspired.eco_atp_currency import EcoATPTokenManager
 from ..bio_inspired.time_tick_engine import TimeTickEngine
+from ..enhancements.adapters import AdapterManager
 import numpy as np
 import networkx as nx
 
@@ -116,7 +117,23 @@ logger = logging.getLogger(__name__)
 class ExpertRouterConfig(BaseSettings):
     """Centralized configuration with validation and environment variable support."""
     model_config = SettingsConfigDict(env_prefix="EROUTER_", case_sensitive=False)
+    self.adapter_managers: Dict[str, AdapterManager] = {}
 
+    def register_adapter_manager(self, expert_id: str, adapter_mgr: AdapterManager):
+        self.adapter_managers[expert_id] = adapter_mgr
+
+    async def route_with_adapters(
+        self,
+        query: Any,
+        domain: str,
+        energy_mode: str = "balanced",
+    ) -> str:
+        # First select an expert (original routing logic)
+        expert_id = await self.route(query)  # or use energy-aware selection
+        # If the expert has adapters, apply the selected mode
+        if expert_id in self.adapter_managers:
+            self.adapter_managers[expert_id].activate_mode(energy_mode)
+        return expert_id
     # Feature flags
     enable_quantum: bool = Field(False)
     enable_signal_transduction: bool = Field(True)
