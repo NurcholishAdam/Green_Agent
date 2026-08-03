@@ -1641,6 +1641,8 @@ class EcoATPTokenManager:
         self.exchange_rate = exchange_rate or DynamicExchangeRate(self.config)
         self.gradient_provider = gradient_provider
         self.quantum_provider = quantum_provider
+        self.exchange_rate = config.get('token_exchange_rate', 1000.0)
+        self.adaptive_rate = config.get('adaptive_rate_enabled', True)
 
         # Core state
         self.accounts: Dict[str, EcoATPAccount] = {}
@@ -1728,6 +1730,21 @@ class EcoATPTokenManager:
             self._load_state()
 
         logger.info("Enhanced Eco-ATP Token Manager v9.0.0 initialized")
+
+        async def update_exchange_rate(self, scarcity_factors: Dict[str, float]):
+        """
+        Adjust exchange rate based on helium and carbon scarcity.
+        If helium scarcity is high, tokens become more valuable (rate increases).
+        """
+        if not self.adaptive_rate:
+            return
+        helium_scarcity = scarcity_factors.get('helium', 0.5)
+        carbon_scarcity = scarcity_factors.get('carbon', 0.5)
+        # Example: rate = base_rate * (1 + 0.5 * helium_scarcity + 0.3 * carbon_scarcity)
+        factor = 1.0 + 0.5 * helium_scarcity + 0.3 * carbon_scarcity
+        self.exchange_rate = self.exchange_rate * (0.9 + 0.1 * factor)
+        logger.info(f"Updated exchange rate to {self.exchange_rate:.2f}")
+
 
     def _start_tasks(self):
         self.task_manager.start_task("emergency_monitor", self._emergency_monitor_loop)
