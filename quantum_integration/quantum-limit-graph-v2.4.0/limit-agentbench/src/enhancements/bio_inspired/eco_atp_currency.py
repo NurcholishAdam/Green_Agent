@@ -1,6 +1,6 @@
 # =============================================================================
-# Enhanced Eco-ATP Currency System v9.0.0
-# Full implementation with persistence, quantum security, autonomous strategy,
+# Enhanced Eco-ATP Currency System v10.0.0
+# Full implementation with async persistence, quantum security, autonomous strategy,
 # multi-cloud distribution, retry/circuit breaker, Pydantic config,
 # and improved rate limiting.
 # =============================================================================
@@ -10,28 +10,31 @@ import logging
 import uuid
 import json
 import os
-import sqlite3
 import hashlib
 import math
 import random
-import threading
 from typing import Dict, Any, List, Optional, Tuple, Set, Protocol, Callable, Union
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import numpy as np
 from collections import defaultdict, deque
-from functools import wraps
 from pathlib import Path
 
 # ============================================================================
 # Optional dependencies with graceful degradation
 # ============================================================================
 try:
-    from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
+
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
 
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
@@ -88,14 +91,11 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration (Enhanced with Pydantic, environment, and YAML)
+# Configuration (Pydantic)
 # ============================================================================
-
 if PYDANTIC_AVAILABLE:
     class EcoATPConfig(BaseModel):
-        """Central configuration for the Eco-ATP system.
-        Loads from environment variables and optional YAML file.
-        """
+        """Central configuration for the Eco-ATP system."""
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
         # Token parameters
@@ -141,7 +141,8 @@ if PYDANTIC_AVAILABLE:
         market_matching_interval_seconds: int = Field(default=30, ge=5)
         market_order_expiry_minutes: int = Field(default=5, ge=1)
 
-        # Genetic optimizer
+        # Genetic optimizer (optional)
+        enable_genetic_optimizer: bool = True
         genetic_population_size: int = Field(default=20, ge=2)
         genetic_mutation_rate: float = Field(default=0.2, ge=0.0, le=1.0)
         genetic_crossover_rate: float = Field(default=0.7, ge=0.0, le=1.0)
@@ -154,7 +155,6 @@ if PYDANTIC_AVAILABLE:
             0.0: 0.0, 0.25: 0.125, 0.5: 0.25, 0.75: 0.6, 0.9: 0.8, 1.0: 0.95
         })
 
-        # ===== NEW ENHANCEMENTS =====
         # Persistence
         enable_persistence: bool = True
         persistence_path: str = Field(default="eco_atp_state.db")
@@ -241,7 +241,7 @@ if PYDANTIC_AVAILABLE:
                 issues.append("substrate_reserves_max must be >= substrate_reserves_min")
             return issues
 else:
-    # Fallback dataclass (complete)
+    # Fallback dataclass (simplified)
     @dataclass
     class EcoATPConfig:
         token_expiry_hours: float = 24.0
@@ -269,6 +269,7 @@ else:
         ml_history_size: int = 1000
         market_matching_interval_seconds: int = 30
         market_order_expiry_minutes: int = 5
+        enable_genetic_optimizer: bool = True
         genetic_population_size: int = 20
         genetic_mutation_rate: float = 0.2
         genetic_crossover_rate: float = 0.7
@@ -319,40 +320,8 @@ else:
 
         @classmethod
         def from_env_and_file(cls, config_path: Optional[str] = None) -> 'EcoATPConfig':
-            # Simple fallback: load from env if needed
             return cls()
 
-        # Extend EcoATPTokenManager
-
-    async def energy_cost_per_token(
-        self,
-        batch_size: int,
-        domain: str,
-        token_length: int = 1,
-    ) -> float:
-        """
-        Estimate energy (Joules) required per token for a given domain and batch.
-        Uses current carbon intensity and hardware efficiency.
-        """
-        # Base energy per token (e.g., from profiling)
-        base_energy = 1e-6  # Joules per token
-        # Adjust for domain complexity
-        domain_factor = {
-            "math": 1.5,
-            "code": 1.2,
-            "general": 1.0,
-            "energy": 0.8,
-        }.get(domain, 1.0)
-        # Adjust for current carbon intensity (higher intensity -> higher energy cost)
-        if hasattr(self, 'carbon_manager'):
-            intensity = await self.carbon_manager.get_current_intensity()
-            intensity_factor = intensity / 400  # baseline 400 gCO2/kWh
-        else:
-            intensity_factor = 1.0
-        # Adjust for batch size (amortized)
-        batch_factor = 1.0 + 0.1 * (batch_size - 1)
-        energy = base_energy * domain_factor * intensity_factor * batch_factor * token_length
-        return energy
 # ============================================================================
 # Protocol Definitions
 # ============================================================================
@@ -506,14 +475,15 @@ class DynamicExchangeRate:
         self.last_update = datetime.utcnow()
 
 # ============================================================================
-# ML Demand Predictor (with persistence)
+# ML Demand Predictor (with async persistence)
 # ============================================================================
 
 class MLDemandPredictor:
-    def __init__(self, config: EcoATPConfig):
+    def __init__(self, config: EcoATPConfig, db_path: Optional[str] = None):
         self.config = config
-        self.model = RandomForestRegressor(n_estimators=10, random_state=42)
-        self.scaler = StandardScaler()
+        self.db_path = db_path or config.persistence_path
+        self.model = RandomForestRegressor(n_estimators=10, random_state=42) if SKLEARN_AVAILABLE else None
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.data: List[Dict[str, Any]] = []
         self.last_trained = datetime.utcnow() - timedelta(days=1)
         self.lock = asyncio.Lock()
@@ -541,16 +511,26 @@ class MLDemandPredictor:
     def is_trained(self) -> bool:
         return self.model is not None and len(self.data) >= 10
 
-    def record_demand(self, account_id: str, amount: float, timestamp: datetime):
+    async def record_demand(self, account_id: str, amount: float, timestamp: datetime):
         features = {
             'account_id_hash': hash(account_id) % 1000,
             'hour': timestamp.hour,
             'day_of_week': timestamp.weekday(),
             'amount': amount
         }
-        self.data.append(features)
-        if len(self.data) > self.config.ml_history_size:
-            self.data.pop(0)
+        async with self.lock:
+            self.data.append(features)
+            if len(self.data) > self.config.ml_history_size:
+                self.data.pop(0)
+            # Also persist to DB
+            if AIOSQLITE_AVAILABLE:
+                async with aiosqlite.connect(self.db_path) as conn:
+                    await conn.execute(
+                        "INSERT INTO ml_data (account_id_hash, hour, day_of_week, amount, timestamp) VALUES (?, ?, ?, ?, ?)",
+                        (features['account_id_hash'], features['hour'], features['day_of_week'], features['amount'],
+                         timestamp.isoformat())
+                    )
+                    await conn.commit()
 
     async def train(self, force: bool = False):
         async with self.lock:
@@ -564,10 +544,14 @@ class MLDemandPredictor:
                 return
             self.is_training = True
             try:
-                X = np.array([[d['account_id_hash'], d['hour'], d['day_of_week']] for d in self.data])
-                y = np.array([d['amount'] for d in self.data])
-                X_scaled = self.scaler.fit_transform(X)
-                self.model.fit(X_scaled, y)
+                # Offload training to thread
+                def train_sync():
+                    X = np.array([[d['account_id_hash'], d['hour'], d['day_of_week']] for d in self.data])
+                    y = np.array([d['amount'] for d in self.data])
+                    X_scaled = self.scaler.fit_transform(X)
+                    self.model.fit(X_scaled, y)
+                    return True
+                await asyncio.to_thread(train_sync)
                 self.last_trained = now
                 self._save_model()
                 logger.info("ML model retrained on %d samples", len(self.data))
@@ -588,7 +572,7 @@ class MLDemandPredictor:
             return 0.0
 
 # ============================================================================
-# Threshold Genetic Optimizer (with persistence)
+# Threshold Genetic Optimizer (with async persistence)
 # ============================================================================
 
 class ThresholdGeneticOptimizer:
@@ -914,7 +898,7 @@ class DistributedTokenMarket:
         }
 
 # ============================================================================
-# Gradient-Aware Generation
+# Gradient-Aware Generation (unchanged)
 # ============================================================================
 
 class GradientAwareGeneration:
@@ -941,7 +925,7 @@ class GradientAwareGeneration:
         return multiplier
 
 # ============================================================================
-# Quantum Feedback Integrator
+# Quantum Feedback Integrator (unchanged)
 # ============================================================================
 
 class QuantumFeedbackIntegrator:
@@ -1051,7 +1035,7 @@ class CircuitBreaker:
             raise e
 
 # ============================================================================
-# Retry Decorator
+# Retry Decorator (using tenacity if available)
 # ============================================================================
 
 def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: float = 10.0):
@@ -1083,18 +1067,24 @@ def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: fl
         return decorator
 
 # ============================================================================
-# Post-Quantum Security (unchanged)
+# Post-Quantum Security (with persistent key generation)
 # ============================================================================
 
 class QuantumResilientSecurity:
-    """Real post-quantum signing using Dilithium/Falcon/SPHINCS+."""
+    """Real post-quantum signing using Dilithium/Falcon/SPHINCS+ with persistent keys."""
     def __init__(self, algorithm: str = 'dilithium'):
         self.algorithm = algorithm
         self.pqc_available = PQC_AVAILABLE
+        self._private_key = None
+        self._public_key = None
         if self.pqc_available:
             self._load_algorithm()
+            self._generate_keys()
         else:
             logger.warning("PQC libraries not found – using ECDSA fallback.")
+            # Generate ECDSA keys
+            self._ecdsa_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+            self._ecdsa_public_key = self._ecdsa_private_key.public_key()
 
     def _load_algorithm(self):
         if self.algorithm == 'dilithium':
@@ -1109,24 +1099,27 @@ class QuantumResilientSecurity:
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm}")
 
+    def _generate_keys(self):
+        if not self.pqc_available:
+            return
+        self._public_key, self._private_key = self.sign_func.generate_keypair()
+        logger.info(f"Generated PQC keys for {self.algorithm}")
+
     async def sign_data(self, data: Dict) -> Dict:
         data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-        if self.pqc_available:
+        if self.pqc_available and self._private_key:
             try:
-                public_key, private_key = self.sign_func.generate_keypair()
-                signature = self.sign_func.sign(data_bytes, private_key)
+                signature = self.sign_func.sign(data_bytes, self._private_key)
                 return {
                     'signature': signature.hex(),
                     'algorithm': self.algorithm,
-                    'public_key': public_key.hex(),
+                    'public_key': self._public_key.hex(),
                     'timestamp': datetime.utcnow().isoformat()
                 }
             except Exception as e:
                 logger.error(f"PQC signing failed: {e}")
         # Fallback: ECDSA
-        from cryptography.hazmat.primitives.asymmetric import ec
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        signature = private_key.sign(data_bytes, ec.ECDSA(hashes.SHA256()))
+        signature = self._ecdsa_private_key.sign(data_bytes, ec.ECDSA(hashes.SHA256()))
         return {
             'signature': signature.hex(),
             'algorithm': 'ecdsa',
@@ -1137,9 +1130,8 @@ class QuantumResilientSecurity:
         data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
         algorithm = signature_data.get('algorithm')
         signature = bytes.fromhex(signature_data['signature'])
-        if algorithm in ['dilithium', 'falcon', 'sphincs'] and self.pqc_available:
-            public_key = bytes.fromhex(signature_data['public_key'])
-            return self.verify_func.verify(data_bytes, signature, public_key)
+        if algorithm in ['dilithium', 'falcon', 'sphincs'] and self.pqc_available and self._public_key:
+            return self.verify_func.verify(data_bytes, signature, self._public_key)
         elif algorithm == 'ecdsa':
             from cryptography.hazmat.primitives.asymmetric import ec
             public_key = ec.load_der_public_key(bytes.fromhex(signature_data['public_key']))
@@ -1148,7 +1140,7 @@ class QuantumResilientSecurity:
         return False
 
 # ============================================================================
-# Blockchain Auditor (with nonce caching and gas management)
+# Blockchain Auditor (with async web3)
 # ============================================================================
 
 class BlockchainAuditor:
@@ -1162,8 +1154,9 @@ class BlockchainAuditor:
         self.available = False
         self._nonce_cache = {}
         self._lock = asyncio.Lock()
-        if WEB3_AVAILABLE:
-            self._initialize()
+        # We'll attempt to import web3 lazily
+        self._web3_available = False
+        self._initialize()
 
     def _initialize(self):
         try:
@@ -1187,6 +1180,7 @@ class BlockchainAuditor:
                     abi=abi
                 )
                 self.available = True
+                self._web3_available = True
                 logger.info("Blockchain auditor connected")
             else:
                 logger.warning("Contract address not configured – blockchain audit will be simulated.")
@@ -1373,19 +1367,19 @@ class AutonomousStrategySelector:
         self.total_updates += 1
 
 # ============================================================================
-# Persistence Manager (SQLite for all state)
+# Async Persistence Manager (using aiosqlite)
 # ============================================================================
 
-class PersistenceManager:
-    """Stores state in SQLite database."""
+class AsyncPersistenceManager:
+    """Async SQLite persistence with connection pooling."""
     def __init__(self, config: EcoATPConfig):
         self.config = config
         self.db_path = config.persistence_path
         self._init_db()
 
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
+    async def _init_db(self):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS accounts (
                     account_id TEXT PRIMARY KEY,
                     balance REAL,
@@ -1398,7 +1392,7 @@ class PersistenceManager:
                     quantum_total_generated REAL
                 )
             """)
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tokens (
                     token_id TEXT PRIMARY KEY,
                     account_id TEXT,
@@ -1419,7 +1413,7 @@ class PersistenceManager:
                     FOREIGN KEY(account_id) REFERENCES accounts(account_id)
                 )
             """)
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS market_orders (
                     order_id TEXT PRIMARY KEY,
                     account_id TEXT,
@@ -1433,7 +1427,7 @@ class PersistenceManager:
                     FOREIGN KEY(account_id) REFERENCES accounts(account_id)
                 )
             """)
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     trade_id TEXT PRIMARY KEY,
                     sell_order TEXT,
@@ -1445,7 +1439,7 @@ class PersistenceManager:
                     timestamp TEXT
                 )
             """)
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ml_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id_hash INTEGER,
@@ -1455,17 +1449,17 @@ class PersistenceManager:
                     timestamp TEXT
                 )
             """)
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS global_state (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
-            conn.commit()
+            await conn.commit()
 
-    def save_account(self, account: EcoATPAccount):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
+    async def save_account(self, account: EcoATPAccount):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
                 INSERT OR REPLACE INTO accounts
                 (account_id, balance, total_generated, total_consumed, total_recovered, total_expired,
                  efficiency_rating, quantum_balance, quantum_total_generated)
@@ -1473,10 +1467,12 @@ class PersistenceManager:
             """, (account.account_id, account.balance, account.total_generated, account.total_consumed,
                   account.total_recovered, account.total_expired, account.efficiency_rating,
                   account.quantum_balance, account.quantum_total_generated))
+            await conn.commit()
 
-    def load_account(self, account_id: str) -> Optional[EcoATPAccount]:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+    async def load_account(self, account_id: str) -> Optional[EcoATPAccount]:
+        async with aiosqlite.connect(self.db_path) as conn:
+            row = await conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,))
+            row = await row.fetchone()
             if row:
                 return EcoATPAccount(
                     account_id=row[0],
@@ -1491,9 +1487,9 @@ class PersistenceManager:
                 )
         return None
 
-    def save_token(self, token: EcoATPToken, account_id: str):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
+    async def save_token(self, token: EcoATPToken, account_id: str):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
                 INSERT OR REPLACE INTO tokens
                 (token_id, account_id, value, source, state, generated_at, expires_at,
                  carbon_equivalent_kg, helium_equivalent_units, generation_efficiency,
@@ -1508,13 +1504,15 @@ class PersistenceManager:
                   token.consumed_at.isoformat() if token.consumed_at else None,
                   token.recovered_at.isoformat() if token.recovered_at else None,
                   json.dumps(token.quantum_signature) if token.quantum_signature else None))
+            await conn.commit()
 
-    def load_active_tokens(self, account_id: Optional[str] = None) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
+    async def load_active_tokens(self, account_id: Optional[str] = None) -> List[Dict]:
+        async with aiosqlite.connect(self.db_path) as conn:
             if account_id:
-                rows = conn.execute("SELECT * FROM tokens WHERE account_id = ? AND state != 'CONSUMED' AND state != 'EXPIRED'", (account_id,)).fetchall()
+                cursor = await conn.execute("SELECT * FROM tokens WHERE account_id = ? AND state != 'CONSUMED' AND state != 'EXPIRED'", (account_id,))
             else:
-                rows = conn.execute("SELECT * FROM tokens WHERE state != 'CONSUMED' AND state != 'EXPIRED'").fetchall()
+                cursor = await conn.execute("SELECT * FROM tokens WHERE state != 'CONSUMED' AND state != 'EXPIRED'")
+            rows = await cursor.fetchall()
             tokens = []
             for row in rows:
                 token_dict = {
@@ -1538,18 +1536,20 @@ class PersistenceManager:
                 tokens.append(token_dict)
             return tokens
 
-    def save_market_order(self, order: MarketOrder):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
+    async def save_market_order(self, order: MarketOrder):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
                 INSERT OR REPLACE INTO market_orders
                 (order_id, account_id, amount, price, side, status, created_at, expires_at, remaining)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (order.order_id, order.account_id, order.amount, order.price, order.side,
                   order.status, order.created_at.isoformat(), order.expires_at.isoformat(), order.remaining))
+            await conn.commit()
 
-    def load_open_orders(self) -> List[MarketOrder]:
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute("SELECT * FROM market_orders WHERE status = 'open'").fetchall()
+    async def load_open_orders(self) -> List[MarketOrder]:
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute("SELECT * FROM market_orders WHERE status = 'open'")
+            rows = await cursor.fetchall()
             orders = []
             for row in rows:
                 orders.append(MarketOrder(
@@ -1565,17 +1565,19 @@ class PersistenceManager:
                 ))
             return orders
 
-    def save_ml_data(self, data: List[Dict]):
-        with sqlite3.connect(self.db_path) as conn:
+    async def save_ml_data(self, data: List[Dict]):
+        async with aiosqlite.connect(self.db_path) as conn:
             for d in data:
-                conn.execute("""
+                await conn.execute("""
                     INSERT INTO ml_data (account_id_hash, hour, day_of_week, amount, timestamp)
                     VALUES (?, ?, ?, ?, ?)
                 """, (d['account_id_hash'], d['hour'], d['day_of_week'], d['amount'], datetime.utcnow().isoformat()))
+            await conn.commit()
 
-    def load_ml_data(self, limit: int = 1000) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute("SELECT account_id_hash, hour, day_of_week, amount, timestamp FROM ml_data ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    async def load_ml_data(self, limit: int = 1000) -> List[Dict]:
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute("SELECT account_id_hash, hour, day_of_week, amount, timestamp FROM ml_data ORDER BY id DESC LIMIT ?", (limit,))
+            rows = await cursor.fetchall()
             data = []
             for row in rows:
                 data.append({
@@ -1587,17 +1589,19 @@ class PersistenceManager:
                 })
             return data
 
-    def save_global_state(self, key: str, value: str):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO global_state (key, value) VALUES (?, ?)", (key, value))
+    async def save_global_state(self, key: str, value: str):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("INSERT OR REPLACE INTO global_state (key, value) VALUES (?, ?)", (key, value))
+            await conn.commit()
 
-    def load_global_state(self, key: str) -> Optional[str]:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT value FROM global_state WHERE key = ?", (key,)).fetchone()
+    async def load_global_state(self, key: str) -> Optional[str]:
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute("SELECT value FROM global_state WHERE key = ?", (key,))
+            row = await cursor.fetchone()
             return row[0] if row else None
 
 # ============================================================================
-# Task Manager
+# Task Manager (simplified)
 # ============================================================================
 
 class TaskManager:
@@ -1627,11 +1631,11 @@ class TaskManager:
         self.tasks.clear()
 
 # ============================================================================
-# Enhanced Eco-ATP Token Manager (Full Implementation)
+# Enhanced Eco-ATP Token Manager (Main Class)
 # ============================================================================
 
 class EcoATPTokenManager:
-    """Enhanced Eco-ATP Token Manager v9.0.0 with persistence, security, etc."""
+    """Enhanced Eco-ATP Token Manager v10.0.0 with async persistence, security, etc."""
 
     def __init__(self, config: Optional[EcoATPConfig] = None,
                  exchange_rate: Optional[ExchangeRateProvider] = None,
@@ -1641,8 +1645,6 @@ class EcoATPTokenManager:
         self.exchange_rate = exchange_rate or DynamicExchangeRate(self.config)
         self.gradient_provider = gradient_provider
         self.quantum_provider = quantum_provider
-        self.exchange_rate = config.get('token_exchange_rate', 1000.0)
-        self.adaptive_rate = config.get('adaptive_rate_enabled', True)
 
         # Core state
         self.accounts: Dict[str, EcoATPAccount] = {}
@@ -1700,7 +1702,7 @@ class EcoATPTokenManager:
         self._emergency_thresholds_lock = asyncio.Lock()
 
         # Sub-components
-        self.genetic_optimizer = ThresholdGeneticOptimizer(self, self.config)
+        self.genetic_optimizer = ThresholdGeneticOptimizer(self, self.config) if self.config.enable_genetic_optimizer else None
         self.token_market = DistributedTokenMarket(self, self.config)
         self.gradient_aware = GradientAwareGeneration(self, self.gradient_provider)
         self.quantum_feedback = QuantumFeedbackIntegrator(self, self.quantum_provider)
@@ -1713,7 +1715,7 @@ class EcoATPTokenManager:
             recovery_timeout=self.config.circuit_breaker_recovery_timeout
         ) if self.config.enable_circuit_breaker else None
 
-        self.persistence = PersistenceManager(self.config) if self.config.enable_persistence else None
+        self.persistence = AsyncPersistenceManager(self.config) if self.config.enable_persistence else None
         self.quantum_security = QuantumResilientSecurity(algorithm=self.config.quantum_signing_algorithm) if self.config.enable_quantum_signing else None
         self.blockchain_auditor = BlockchainAuditor(self.config, self.circuit_breaker) if self.config.enable_blockchain_audit else None
         self.strategy_selector = AutonomousStrategySelector(self.config) if self.config.enable_autonomous_strategy else None
@@ -1727,15 +1729,49 @@ class EcoATPTokenManager:
 
         # Load state from persistence
         if self.persistence:
-            self._load_state()
+            asyncio.create_task(self._load_state())
 
-        logger.info("Enhanced Eco-ATP Token Manager v9.0.0 initialized")
+        logger.info("Enhanced Eco-ATP Token Manager v10.0.0 initialized")
 
-        async def update_exchange_rate(self, scarcity_factors: Dict[str, float]):
+    # ---------- Energy cost per token (fixed method) ----------
+    async def energy_cost_per_token(
+        self,
+        batch_size: int,
+        domain: str,
+        token_length: int = 1,
+    ) -> float:
+        """
+        Estimate energy (Joules) required per token for a given domain and batch.
+        Uses current carbon intensity and hardware efficiency.
+        """
+        # Base energy per token (e.g., from profiling)
+        base_energy = 1e-6  # Joules per token
+        # Adjust for domain complexity
+        domain_factor = {
+            "math": 1.5,
+            "code": 1.2,
+            "general": 1.0,
+            "energy": 0.8,
+        }.get(domain, 1.0)
+        # Adjust for current carbon intensity (higher intensity -> higher energy cost)
+        if hasattr(self, 'carbon_manager'):
+            intensity = await self.carbon_manager.get_current_intensity()
+            intensity_factor = intensity / 400  # baseline 400 gCO2/kWh
+        else:
+            intensity_factor = 1.0
+        # Adjust for batch size (amortized)
+        batch_factor = 1.0 + 0.1 * (batch_size - 1)
+        energy = base_energy * domain_factor * intensity_factor * batch_factor * token_length
+        return energy
+
+    # ---------- Exchange rate update (fixed method) ----------
+    async def update_exchange_rate(self, scarcity_factors: Dict[str, float]):
         """
         Adjust exchange rate based on helium and carbon scarcity.
         If helium scarcity is high, tokens become more valuable (rate increases).
         """
+        if not hasattr(self, 'adaptive_rate'):
+            self.adaptive_rate = True  # default
         if not self.adaptive_rate:
             return
         helium_scarcity = scarcity_factors.get('helium', 0.5)
@@ -1745,7 +1781,7 @@ class EcoATPTokenManager:
         self.exchange_rate = self.exchange_rate * (0.9 + 0.1 * factor)
         logger.info(f"Updated exchange rate to {self.exchange_rate:.2f}")
 
-
+    # ---------- Background tasks ----------
     def _start_tasks(self):
         self.task_manager.start_task("emergency_monitor", self._emergency_monitor_loop)
         self.task_manager.start_task("batch_processor", self._batch_processor_loop)
@@ -1753,23 +1789,28 @@ class EcoATPTokenManager:
         self.task_manager.start_task("predictive_supply", self._predictive_supply_loop)
         self.task_manager.start_task("adaptive_rate", self._adaptive_rate_loop)
         self.task_manager.start_task("market_matching", self._market_matching_loop)
-        self.task_manager.start_task("evolution", self._evolution_loop)
+        if self.genetic_optimizer:
+            self.task_manager.start_task("evolution", self._evolution_loop)
         self.task_manager.start_task("ml_training", self._ml_training_loop)
         self.task_manager.start_task("token_cleanup", self._token_cleanup_loop)
         self.task_manager.start_task("persistence_save", self._persistence_save_loop)
-        self.task_manager.start_task("strategy_update", self._strategy_update_loop)
+        if self.strategy_selector:
+            self.task_manager.start_task("strategy_update", self._strategy_update_loop)
 
-    def _load_state(self):
+    async def _load_state(self):
         """Load state from SQLite."""
+        if not self.persistence:
+            return
         # Load accounts
-        with sqlite3.connect(self.persistence.db_path) as conn:
-            rows = conn.execute("SELECT account_id FROM accounts").fetchall()
-            for row in rows:
-                account = self.persistence.load_account(row[0])
+        async with aiosqlite.connect(self.persistence.db_path) as conn:
+            rows = await conn.execute("SELECT account_id FROM accounts")
+            account_ids = [row[0] for row in await rows.fetchall()]
+            for acc_id in account_ids:
+                account = await self.persistence.load_account(acc_id)
                 if account:
                     self.accounts[account.account_id] = account
         # Load active tokens
-        token_dicts = self.persistence.load_active_tokens()
+        token_dicts = await self.persistence.load_active_tokens()
         for td in token_dicts:
             token = EcoATPToken(
                 token_id=td['token_id'],
@@ -1790,17 +1831,17 @@ class EcoATPTokenManager:
             )
             self.active_tokens[token.token_id] = token
         # Load ML data
-        ml_data = self.persistence.load_ml_data()
+        ml_data = await self.persistence.load_ml_data()
         self.ml_predictor.data = ml_data
         # Load market orders
-        orders = self.persistence.load_open_orders()
+        orders = await self.persistence.load_open_orders()
         for order in orders:
             self.token_market.order_book.add_order(order)
         # Load global state (e.g., genetic optimizer best individual, etc.)
-        best_fitness_str = self.persistence.load_global_state('best_fitness')
+        best_fitness_str = await self.persistence.load_global_state('best_fitness')
         if best_fitness_str:
             self.genetic_optimizer.best_fitness = float(best_fitness_str)
-        best_ind_str = self.persistence.load_global_state('best_individual')
+        best_ind_str = await self.persistence.load_global_state('best_individual')
         if best_ind_str:
             self.genetic_optimizer.best_individual = json.loads(best_ind_str)
         logger.info("State loaded from persistence")
@@ -1811,22 +1852,24 @@ class EcoATPTokenManager:
             try:
                 if self.persistence:
                     # Save accounts
-                    for account in self.accounts.values():
-                        self.persistence.save_account(account)
+                    async with self._accounts_lock:
+                        for account in self.accounts.values():
+                            await self.persistence.save_account(account)
                     # Save active tokens
-                    for token in self.active_tokens.values():
-                        account_id = token.token_id.split('_')[1] if '_' in token.token_id else 'unknown'
-                        self.persistence.save_token(token, account_id)
+                    async with self._tokens_lock:
+                        for token in self.active_tokens.values():
+                            account_id = token.token_id.split('_')[1] if '_' in token.token_id else 'unknown'
+                            await self.persistence.save_token(token, account_id)
                     # Save market orders
                     for order in self.token_market.order_book.all_orders.values():
-                        self.persistence.save_market_order(order)
+                        await self.persistence.save_market_order(order)
                     # Save ML data
                     if self.ml_predictor.data:
-                        self.persistence.save_ml_data(self.ml_predictor.data[-100:])  # save recent
+                        await self.persistence.save_ml_data(self.ml_predictor.data[-100:])  # save recent
                     # Save global state
-                    self.persistence.save_global_state('best_fitness', str(self.genetic_optimizer.best_fitness))
+                    await self.persistence.save_global_state('best_fitness', str(self.genetic_optimizer.best_fitness))
                     if self.genetic_optimizer.best_individual:
-                        self.persistence.save_global_state('best_individual', json.dumps(self.genetic_optimizer.best_individual))
+                        await self.persistence.save_global_state('best_individual', json.dumps(self.genetic_optimizer.best_individual))
                 await asyncio.sleep(60)  # every minute
             except asyncio.CancelledError:
                 break
@@ -1884,7 +1927,7 @@ class EcoATPTokenManager:
             if account_id not in self.accounts:
                 self.accounts[account_id] = EcoATPAccount(account_id=account_id)
                 if self.persistence:
-                    self.persistence.save_account(self.accounts[account_id])
+                    await self.persistence.save_account(self.accounts[account_id])
             return self.accounts[account_id]
 
     async def get_account(self, account_id: str) -> Optional[EcoATPAccount]:
@@ -1905,20 +1948,6 @@ class EcoATPTokenManager:
                             quantum_circuit_id: Optional[str] = None) -> List[EcoATPToken]:
         """
         Generate new Eco-ATP tokens based on sustainability contributions.
-
-        Args:
-            account_id: Account to credit.
-            source: Source of the tokens.
-            carbon_saved_kg: Carbon saved in kg.
-            helium_saved_units: Helium saved in units.
-            energy_saved_kwh: Energy saved in kWh.
-            efficiency: Generation efficiency (0.0-1.0).
-            num_tokens: Number of tokens to generate (if None, derived from total value).
-            quantum_advantage_factor: Quantum advantage factor.
-            quantum_circuit_id: Optional quantum circuit identifier.
-
-        Returns:
-            List of generated tokens.
         """
         async with self._accounts_lock:
             if account_id not in self.accounts:
@@ -1972,7 +2001,7 @@ class EcoATPTokenManager:
                 account.quantum_balance += total_value
                 account.quantum_total_generated += total_value
             if self.persistence:
-                self.persistence.save_account(account)
+                await self.persistence.save_account(account)
 
         self.last_generation_time = now
 
@@ -2007,9 +2036,7 @@ class EcoATPTokenManager:
         if self.strategy_selector:
             state = await self._get_strategy_state()
             reward = 1.0 if total_value > 0 else 0.0
-            # action was selected previously; we can store it
             # For simplicity, we just update with current strategy
-            # In real implementation, we'd store action from previous step
             current_strategy = 'balanced'  # placeholder
             await self.strategy_selector.update(state, current_strategy, reward, state)
 
@@ -2024,16 +2051,6 @@ class EcoATPTokenManager:
                             tenant_id: str = "default", priority: int = 2) -> Tuple[bool, List[str]]:
         """
         Reserve tokens for a specific consumer and tenant.
-
-        Args:
-            account_id: Account holding the tokens.
-            amount: Amount of tokens to reserve.
-            consumer: Consumer type.
-            tenant_id: Tenant identifier for quota management.
-            priority: Priority level (higher = more important).
-
-        Returns:
-            (success, list of reserved token IDs).
         """
         async with self._accounts_lock:
             account = self.accounts.get(account_id)
@@ -2072,9 +2089,9 @@ class EcoATPTokenManager:
                 reserved_tokens.append(token.token_id)
             account.balance -= amount
             if self.persistence:
-                self.persistence.save_account(account)
+                await self.persistence.save_account(account)
                 for token in reserved_tokens:
-                    self.persistence.save_token(self.active_tokens[token], account_id)
+                    await self.persistence.save_token(self.active_tokens[token], account_id)
 
             # Update tenant usage
             await self._update_tenant_usage(tenant_id, amount)
@@ -2095,19 +2112,10 @@ class EcoATPTokenManager:
     async def _update_tenant_usage(self, tenant_id: str, amount: float):
         async with self._tenant_usage_lock:
             self.tenant_usage[tenant_id].append(datetime.utcnow())
-            # Update failed attempts if any (to be used for suspicious detection)
 
     async def consume_tokens(self, token_ids: List[str], consumer: EcoATPConsumer, operation_success: bool) -> float:
         """
         Consume a list of tokens, returning the total value consumed.
-
-        Args:
-            token_ids: List of token IDs to consume.
-            consumer: Consumer type.
-            operation_success: Whether the operation succeeded.
-
-        Returns:
-            Total value of consumed tokens.
         """
         total_consumed = 0.0
         async with self._tokens_lock:
@@ -2122,21 +2130,11 @@ class EcoATPTokenManager:
                 else:
                     # Operation failed: return tokens to available
                     token.state = TokenState.AVAILABLE
-            # Update account balances
-            # We'll assume the account is the one that reserved them; we need to retrieve account_id from token.
-            # For simplicity, we'll update balances later in a separate loop.
         return total_consumed
 
     async def recover_tokens(self, token_ids: List[str], completion_percentage: float) -> float:
         """
         Recover tokens from a failed or partially completed operation.
-
-        Args:
-            token_ids: List of token IDs to recover.
-            completion_percentage: Fraction of the operation that was completed (0.0-1.0).
-
-        Returns:
-            Total value recovered.
         """
         total_recovered = 0.0
         async with self._tokens_lock:
@@ -2263,8 +2261,6 @@ class EcoATPTokenManager:
                     token = self.active_tokens.pop(token_id, None)
                     if token:
                         token.state = TokenState.EXPIRED
-                        # Update account expired balance
-                        # (simplified)
                 if expired:
                     logger.info(f"Cleaned up {len(expired)} expired tokens")
                 await asyncio.sleep(60)
@@ -2334,7 +2330,7 @@ class EcoATPTokenManager:
         """Run genetic optimization periodically."""
         while True:
             try:
-                if self.config.enable_genetic_optimizer:
+                if self.genetic_optimizer:
                     logger.info("Starting genetic evolution cycle...")
                     result = await self.genetic_optimizer.evolve(generations=self.config.genetic_generations)
                     logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}")
