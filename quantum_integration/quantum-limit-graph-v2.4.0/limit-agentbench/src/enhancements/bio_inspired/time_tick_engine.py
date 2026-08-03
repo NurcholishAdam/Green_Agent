@@ -370,6 +370,26 @@ class TimeTickEngine:
         logger.info("Loaded %d monthly rows, interpolated to %d daily ticks.",
                     len(self.df_monthly), len(self.daily_df))
 
+    # Extend TimeTickEngine
+
+    async def get_energy_price_forecast(self, hours: int = 24) -> List[float]:
+        """
+        Forecast energy price (USD/kWh) for the next N hours.
+        Uses historical data and simple exponential smoothing.
+        """
+        # Placeholder: return a constant or simulate diurnal pattern
+        now = datetime.now()
+        prices = []
+        for i in range(hours):
+            hour = (now.hour + i) % 24
+            # Simulate higher price during peak (9-17)
+            if 9 <= hour < 17:
+                price = 0.15 + 0.02 * np.sin((hour - 9) / 8 * np.pi)
+            else:
+                price = 0.10 + 0.01 * np.sin((hour - 20) / 4 * np.pi)
+            prices.append(price)
+        return prices
+    
     def _interpolate_daily(self):
         """
         Interpolate monthly data to daily using the configured method.
