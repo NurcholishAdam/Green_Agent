@@ -100,6 +100,35 @@ except ImportError:
 # Circuit Breaker Pattern
 # ============================================================================
 
+# Extend GradientFieldManager with multi‑field coupling
+class GradientFieldManager:
+    # ... existing ...
+
+    def __init__(self, config):
+        self.fields = {}
+        self.coupling_matrix = {}  # (field1, field2) -> coupling strength
+
+    def register_field(self, name: str, gradient_strength: float, decay_rate: float):
+        super().register_field(name, gradient_strength, decay_rate)
+        # Initialize coupling matrix for this field
+        for other in self.fields:
+            self.coupling_matrix[(name, other)] = 0.0
+            self.coupling_matrix[(other, name)] = 0.0
+
+    def pump_field(self, name: str, delta: float, source: str = "unknown"):
+        """Pump a field and propagate influence to coupled fields."""
+        super().pump_field(name, delta, source)
+        # Propagate to all coupled fields
+        for other in self.fields:
+            if other != name:
+                coupling = self.coupling_matrix.get((name, other), 0.0)
+                if coupling != 0.0:
+                    self.fields[other].gradient_strength += delta * coupling * 0.1
+
+    def set_coupling(self, field1: str, field2: str, strength: float):
+        self.coupling_matrix[(field1, field2)] = strength
+        self.coupling_matrix[(field2, field1)] = strength
+
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
     OPEN = "open"
