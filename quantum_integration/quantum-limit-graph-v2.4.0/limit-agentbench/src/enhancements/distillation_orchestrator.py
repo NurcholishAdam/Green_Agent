@@ -24,6 +24,8 @@ import logging
 from pathlib import Path
 import json
 import time
+import aiohttp
+import uuid
 
 # -----------------------------------------------------------------------------
 # Stubs for missing components (fallbacks)
@@ -92,6 +94,9 @@ class DistillationOrchestrator:
             baseline_energy_per_token (float): Baseline energy for savings calc (default 1.0).
             early_stopping_patience (int): Patience for early stopping (default 3).
             validation_split (float): Fraction of data for validation (default 0.1).
+            adaptive_api_url (str): Optional URL to AdaptiveCostFunction API to report MOPD results.
+            adaptive_api_token (str): Optional Bearer token to authorize requests to adaptive API.
+            expert_id (str): Optional expert identifier to include in feedback context.
         """
         self.student = student_model
         self.teachers = teachers
@@ -184,18 +189,22 @@ class DistillationOrchestrator:
             epoch_loss = 0.0
             epoch_energy = 0.0
             epoch_tokens = 0
+            epoch_distill_loss_sum = 0.0
+            epoch_distill_batch_count = 0
+            used_teacher_ids = set()
             start_time = time.time()
 
             # We'll run the epoch in a thread to avoid blocking the event loop
             # if the dataloader is synchronous.
             def run_epoch():
-                nonlocal epoch_loss, epoch_energy, epoch_tokens
+                nonlocal epoch_loss, epoch_energy, epoch_tokens, epoch_distill_loss_sum, epoch_distill_batch_count, used_teacher_ids
                 for batch_idx, (inputs, labels, domain) in enumerate(dataloader):
                     inputs = inputs.to(self.device)
                     labels = labels.to(self.device)
 
                     # 1. Teacher selection (energy-aware)
                     teacher_ids = self._select_teachers_sync(domain, reasoning_effort)
+                    used_teacher_ids.update(teacher_ids)
 
                     # 2. Forward passes (with mixed precision)
                     teacher_logits = []
@@ -221,6 +230,13 @@ class DistillationOrchestrator:
                             F.softmax(student_logits, dim=-1),
                             reduction="batchmean",
                         )
+
+                    # Track distillation loss for reporting
+                    try:
+                        epoch_distill_loss_sum += float(loss_distill.item())
+                    except Exception:
+                        epoch_distill_loss_sum += 0.0
+                    epoch_distill_batch_count += 1
 
                     # 4. Green ORM (energy penalty)
                     if self.cost_benefit and self.eco_manager:
@@ -278,6 +294,15 @@ class DistillationOrchestrator:
             total_loss += avg_epoch_loss
             total_energy_cost += epoch_energy
             total_tokens += epoch_tokens
+
+            # Prepare and send MOPD feedback to adaptive cost function if configured
+            avg_distill_loss = epoch_distill_loss_sum / epoch_distill_batch_count if epoch_distill_batch_count > 0 else 0.0
+            adaptive_url = self.config.get('adaptive_api_url')
+            if adaptive_url:
+                try:
+                    await self._send_mopd_report(list(used_teacher_ids), avg_distill_loss, epoch+1)
+                except Exception as e:
+                    logger.warning(f"Failed to send MOPD report to adaptive API: {e}")
 
         # Restore best model if early stopping was used
         if best_state_dict is not None:
@@ -362,3 +387,61 @@ class DistillationOrchestrator:
         with open(path / "distillation_config.json", "r") as f:
             self.config = json.load(f)
         logger.info(f"Student loaded from {path}")
+
+    async def _send_mopd_report(self, teacher_ids: List[str], avg_distill_loss: float, epoch: int):
+        """
+        Send a summary MOPD report to the AdaptiveCostFunction API.
+        Expected config keys:
+          - adaptive_api_url: base URL of adaptive API (e.g. http://localhost:8000)
+          - adaptive_api_token: optional bearer token
+          - expert_id: optional expert id to include in context
+        Payload format (JSON):
+          {
+            "context": {"request_id": <uuid>, "expert_id": <expert_id>, "node_id": <node_id>},
+            "metrics": {"energy_joules": <float>, "carbon_kg": <float>, "helium_units": <float>, "latency_ms": <float>, "accuracy": <float>},
+            "teacher_id": <teacher_id>,
+            "distillation_loss": <float>
+          }
+        The endpoint used: POST {adaptive_api_url.rstrip('/')}/mopd/record
+        """
+        adaptive_url = self.config.get('adaptive_api_url')
+        if not adaptive_url:
+            return
+        token = self.config.get('adaptive_api_token')
+        expert_id = self.config.get('expert_id', 'distillation')
+        node_id = self.config.get('node_id', None)
+
+        headers = {'Content-Type': 'application/json'}
+        if token:
+            headers['Authorization'] = f"Bearer {token}"
+
+        # Produce a single report per teacher
+        for tid in teacher_ids:
+            payload = {
+                'context': {
+                    'request_id': str(uuid.uuid4()),
+                    'expert_id': expert_id,
+                    'node_id': node_id,
+                },
+                'metrics': {
+                    'energy_joules': 0.0,
+                    'carbon_kg': 0.0,
+                    'helium_units': 0.0,
+                    'latency_ms': 0.0,
+                    'accuracy': 0.0,
+                },
+                'teacher_id': tid,
+                'distillation_loss': float(avg_distill_loss),
+                'epoch': epoch,
+            }
+            url = adaptive_url.rstrip('/') + '/mopd/record'
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                        if resp.status >= 400:
+                            text = await resp.text()
+                            logger.warning(f"Adaptive API returned {resp.status} for teacher {tid}: {text}")
+                        else:
+                            logger.info(f"Reported MOPD feedback for teacher {tid} (epoch={epoch}) to adaptive API")
+            except Exception as e:
+                logger.warning(f"Failed to POST MOPD report to {url} for teacher {tid}: {e}")
