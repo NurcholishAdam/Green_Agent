@@ -24,10 +24,10 @@ jobs:
 
       - name: Build and tag Docker image
         run: |
-          docker build -t ghcr.io/${{ github.repository }}:main .
-          docker tag ghcr.io/${{ github.repository }}:main ghcr.io/${{ github.repository }}:latest
+          docker build -t ghcr.io/${{ toLower(github.repository) }}:main .
+          docker tag ghcr.io/${{ toLower(github.repository) }}:main ghcr.io/${{ toLower(github.repository) }}:latest
 
       - name: Push Docker images
         run: |
-          docker push ghcr.io/${{ github.repository }}:main
-          docker push ghcr.io/${{ github.repository }}:latest
+          docker push ghcr.io/${{ toLower(github.repository) }}:main
+          docker push ghcr.io/${{ toLower(github.repository) }}:latest
