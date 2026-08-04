@@ -72,6 +72,7 @@ class DistillationOrchestrator:
         tick_engine: Optional[Any] = None,     # TimeTickEngine
         cost_benefit: Optional[Any] = None,    # CostBenefitEngine
         quantum_bridge: Optional[Any] = None,  # QuantumBridge
+        adaptive_function_instance: Optional[Any] = None,  # in-process AdaptiveCostFunction
     ):
         """
         Args:
@@ -83,6 +84,8 @@ class DistillationOrchestrator:
             tick_engine: Optional time tick engine for forecasts.
             cost_benefit: Optional cost-benefit engine for ORM.
             quantum_bridge: Optional quantum bridge for mixed precision.
+            adaptive_function_instance: Optional in-process AdaptiveCostFunction instance. If provided, the orchestrator will call
+                adaptive_function_instance.record_feedback(...) directly instead of making HTTP requests.
 
         Config keys:
             num_epochs (int): Number of epochs (default 3).
@@ -94,7 +97,7 @@ class DistillationOrchestrator:
             baseline_energy_per_token (float): Baseline energy for savings calc (default 1.0).
             early_stopping_patience (int): Patience for early stopping (default 3).
             validation_split (float): Fraction of data for validation (default 0.1).
-            adaptive_api_url (str): Optional URL to AdaptiveCostFunction API to report MOPD results.
+            adaptive_api_url (str): Optional URL to AdaptiveCostFunction API to report MOPD results (HTTP fallback).
             adaptive_api_token (str): Optional Bearer token to authorize requests to adaptive API.
             expert_id (str): Optional expert identifier to include in feedback context.
         """
@@ -139,6 +142,9 @@ class DistillationOrchestrator:
                 def __enter__(self): pass
                 def __exit__(self, *args): pass
             self._autocast_context = NoOp
+
+        # In-process adaptive function (preferred). If not provided, we'll try to import a global adaptive_function when used.
+        self.adaptive = adaptive_function_instance
 
         self._best_accuracy = 0.0
         self._patience_counter = 0
@@ -297,12 +303,34 @@ class DistillationOrchestrator:
 
             # Prepare and send MOPD feedback to adaptive cost function if configured
             avg_distill_loss = epoch_distill_loss_sum / epoch_distill_batch_count if epoch_distill_batch_count > 0 else 0.0
-            adaptive_url = self.config.get('adaptive_api_url')
-            if adaptive_url:
+
+            # Prefer in-process adaptive reporting if adaptive function instance is available.
+            if self.adaptive:
                 try:
-                    await self._send_mopd_report(list(used_teacher_ids), avg_distill_loss, epoch+1)
+                    expert_id = self.config.get('expert_id', 'distillation')
+                    node_id = self.config.get('node_id', None)
+                    metrics = {
+                        'energy_joules': 0.0,
+                        'carbon_kg': 0.0,
+                        'helium_units': 0.0,
+                        'latency_ms': 0.0,
+                        'accuracy': 0.0,
+                    }
+                    for tid in list(used_teacher_ids):
+                        context = {'request_id': str(uuid.uuid4()), 'expert_id': expert_id, 'node_id': node_id}
+                        # Call AdaptiveCostFunction.record_feedback directly
+                        await self.adaptive.record_feedback(context, metrics, teacher_id=tid, distillation_loss=avg_distill_loss)
+                        logger.info(f"In-process: reported MOPD feedback for teacher {tid} (epoch={epoch})")
                 except Exception as e:
-                    logger.warning(f"Failed to send MOPD report to adaptive API: {e}")
+                    logger.warning(f"Failed to report MOPD feedback in-process: {e}")
+            else:
+                # HTTP reporting (fallback)
+                adaptive_url = self.config.get('adaptive_api_url')
+                if adaptive_url:
+                    try:
+                        await self._send_mopd_report(list(used_teacher_ids), avg_distill_loss, epoch+1)
+                    except Exception as e:
+                        logger.warning(f"Failed to send MOPD report to adaptive API: {e}")
 
         # Restore best model if early stopping was used
         if best_state_dict is not None:
