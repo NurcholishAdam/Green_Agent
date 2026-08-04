@@ -1,8 +1,8 @@
 # File: src/enhancements/tokenization_optimizer.py
 """
 Tokenization optimizer – language‑aware tokenizer selection, segmentation, and token budgets.
-Enhanced version with async support, proper language detection, intelligent segmentation,
-extractive summarization, caching, structured logging, configuration validation, and metrics.
+Enhanced with Multi‑Teacher On‑Policy Distillation for adaptive strategy selection.
+Version 2.0.0
 """
 
 import asyncio
@@ -10,8 +10,14 @@ import hashlib
 import logging
 import os
 import re
+from abc import ABC, abstractmethod
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Dict, List, Any, Optional, Tuple, Union
+import random
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # External dependencies (install via pip)
@@ -32,7 +38,7 @@ except ImportError:
 try:
     from langdetect import detect, DetectorFactory
     LANGDETECT_AVAILABLE = True
-    DetectorFactory.seed = 0  # for reproducibility
+    DetectorFactory.seed = 0
 except ImportError:
     LANGDETECT_AVAILABLE = False
 
@@ -100,6 +106,10 @@ if PROMETHEUS_AVAILABLE:
     CACHE_HIT_COUNTER = Counter('tokenization_cache_hits_total', 'Cache hits for tokenization')
     CACHE_MISS_COUNTER = Counter('tokenization_cache_misses_total', 'Cache misses for tokenization')
     LANGUAGE_DISTRIBUTION = Gauge('tokenization_language_distribution', 'Language distribution of requests', ['language'])
+    # Distillation metrics
+    DISTILLATION_STRATEGY = Counter('distillation_strategy_selected', 'Strategy selected by distillation', ['strategy'])
+    DISTILLATION_REWARD = Histogram('distillation_reward', 'Reward received per request')
+    DISTILLATION_BUFFER_SIZE = Gauge('distillation_buffer_size', 'Replay buffer size')
 
 # -----------------------------------------------------------------------------
 # Configuration with Pydantic (fallback if not installed)
@@ -125,6 +135,11 @@ if PYDANTIC_AVAILABLE:
         fallback_language: str = Field('en', description="Fallback language if detection fails.")
         require_langdetect: bool = Field(False, description="Raise error if langdetect not available.")
         require_nltk: bool = Field(False, description="Raise error if NLTK not available.")
+        # Distillation parameters
+        distillation_epsilon: float = Field(0.1, description="Exploration rate for distillation.")
+        train_every: int = Field(10, description="Update student every N steps.")
+        replay_buffer_size: int = Field(2000, description="Size of replay buffer.")
+        student_learning_rate: float = Field(0.01, description="Learning rate for student.")
 
         @validator('summarization_ratio')
         def ratio_between_0_and_1(cls, v):
@@ -155,6 +170,11 @@ else:
         'fallback_language': 'en',
         'require_langdetect': False,
         'require_nltk': False,
+        # Distillation defaults
+        'distillation_epsilon': 0.1,
+        'train_every': 10,
+        'replay_buffer_size': 2000,
+        'student_learning_rate': 0.01,
     }
 
 # -----------------------------------------------------------------------------
@@ -188,27 +208,270 @@ class CircuitBreaker:
                 self._state = "OPEN"
             raise e
 
+# ============================================================================
+# NEW: Distillation Components
+# ============================================================================
+@dataclass
+class TokenizationState:
+    """Context for the distillation agent."""
+    text_length: int
+    avg_word_len: float
+    num_sentences: int
+    language: str
+    requested_budget: int
+    tokenizer_efficiency: float   # tokens/char for this language
+    domain: Optional[str] = None
+    time_of_day: int = 0          # 0-23
+
+    def to_feature_vector(self) -> np.ndarray:
+        """Convert to numeric feature vector (12 dims)."""
+        features = [
+            min(self.text_length / 10000.0, 1.0),
+            min(self.avg_word_len / 10.0, 1.0),
+            min(self.num_sentences / 100.0, 1.0),
+            min(self.requested_budget / 2000.0, 1.0),
+            self.tokenizer_efficiency,
+        ]
+        # One‑hot for language (top 4 + other)
+        lang_map = {'en': 0, 'id': 1, 'fr': 2, 'de': 3, 'es': 4}
+        one_hot = [0.0] * 5
+        idx = lang_map.get(self.language, 4)
+        one_hot[idx] = 1.0
+        features.extend(one_hot)
+        # Time and domain (if any)
+        features.append(self.time_of_day / 24.0)
+        # Domain one‑hot (simplified: 3 common domains)
+        domain_map = {'scientific': 0, 'legal': 1, 'general': 2}
+        domain_one_hot = [0.0] * 3
+        if self.domain:
+            d_idx = domain_map.get(self.domain, 2)
+            domain_one_hot[d_idx] = 1.0
+        features.extend(domain_one_hot)
+        return np.array(features, dtype=np.float32)
+
 # -----------------------------------------------------------------------------
-# Tokenization Optimizer (Enhanced)
+# Teacher abstract class and implementations
 # -----------------------------------------------------------------------------
+class Teacher(ABC):
+    @abstractmethod
+    def predict(self, state: TokenizationState) -> np.ndarray:
+        """Return probability vector over 5 strategies."""
+        pass
+
+    @abstractmethod
+    def confidence(self, state: TokenizationState) -> float:
+        """Return confidence in prediction [0,1]."""
+        pass
+
+
+class RuleBasedTeacher(Teacher):
+    """Rule‑based expert: prefers summarization if text is long and budget small."""
+    ACTION_SPACE = ['efficiency', 'accuracy', 'speed', 'budget', 'adaptive']
+
+    def predict(self, state: TokenizationState) -> np.ndarray:
+        probs = np.ones(5) * 0.1
+        if state.text_length > 5000 and state.requested_budget < 500:
+            probs[3] = 0.8   # budget strategy
+        elif state.num_sentences > 20:
+            probs[0] = 0.7   # efficiency (segmentation and truncation)
+        elif state.tokenizer_efficiency > 0.5:  # high tokens/char → use larger model?
+            probs[1] = 0.6   # accuracy
+        else:
+            probs[2] = 0.5   # speed
+        return probs / probs.sum()
+
+    def confidence(self, state: TokenizationState) -> float:
+        if state.text_length > 5000 and state.requested_budget < 500:
+            return 0.6
+        elif state.num_sentences > 20:
+            return 0.5
+        return 0.4
+
+
+class HistoricalMLTeacher(Teacher):
+    """Offline trained classifier (placeholder)."""
+    def __init__(self, model_path: Optional[str] = None):
+        self.model = None
+        if model_path and os.path.exists(model_path):
+            import joblib
+            self.model = joblib.load(model_path)
+
+    def predict(self, state: TokenizationState) -> np.ndarray:
+        if self.model is None:
+            return np.ones(5) / 5
+        x = state.to_feature_vector().reshape(1, -1)
+        probs = self.model.predict_proba(x)[0]
+        return probs
+
+    def confidence(self, state: TokenizationState) -> float:
+        return 0.7 if self.model is not None else 0.0
+
+
+class StatefulQTeacher(Teacher):
+    """Linear Q‑learning with state features."""
+    def __init__(self, storage: Any, lr: float = 0.1):
+        self.storage = storage
+        self.lr = lr
+        self.weights = np.zeros((12, 5))  # 12 features, 5 actions
+        self._load_state()
+
+    def _load_state(self):
+        if hasattr(self.storage, 'get_state'):
+            w = self.storage.get_state('q_teacher_weights')
+            if w:
+                self.weights = np.array(json.loads(w))
+
+    def _save_state(self):
+        if hasattr(self.storage, 'save_state'):
+            self.storage.save_state('q_teacher_weights', json.dumps(self.weights.tolist()))
+
+    def predict(self, state: TokenizationState) -> np.ndarray:
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        exp_q = np.exp(q - np.max(q))
+        return exp_q / exp_q.sum()
+
+    def confidence(self, state: TokenizationState) -> float:
+        return 0.5
+
+    def update(self, state: TokenizationState, action: int, reward: float):
+        x = state.to_feature_vector()
+        q_current = np.dot(x, self.weights[:, action])
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._save_state()
+
+
+class DistillationStudent:
+    """Linear softmax student updated via distillation + policy gradient."""
+    def __init__(self, feature_dim: int = 12, n_classes: int = 5, lr: float = 0.01):
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, state_vector: np.ndarray) -> np.ndarray:
+        logits = state_vector @ self.weights + self.biases
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
+        current_probs = self.predict_proba(state_vector)
+        logits = state_vector @ self.weights + self.biases
+
+        # Distillation gradient (KL divergence)
+        grad_distill = -(teacher_probs - current_probs)
+
+        # Policy gradient (REINFORCE)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        grad_rl = -reward * (one_hot - current_probs)
+
+        grad = distill_weight * grad_distill + rl_weight * grad_rl
+        self.weights -= self.lr * np.outer(state_vector, grad)
+        self.biases -= self.lr * grad
+        self.counter += 1
+
+
+class ReplayBuffer:
+    def __init__(self, max_size: int = 2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state_vec: np.ndarray, action: int, reward: float,
+             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+
+    def sample(self, batch_size: int = 32):
+        if len(self.buffer) < batch_size:
+            batch = list(self.buffer)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        return (np.array(states), actions, np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DistillationTokenizationOptimizer:
+    """
+    Multi‑teacher on‑policy distillation agent for tokenization strategy selection.
+    """
+    ACTION_SPACE = ['efficiency', 'accuracy', 'speed', 'budget', 'adaptive']
+
+    def __init__(self, storage: Any, config: Dict[str, Any]):
+        self.storage = storage
+        self.config = config
+        self.student = DistillationStudent(lr=config.get('student_learning_rate', 0.01))
+        self.teachers: List[Teacher] = [
+            RuleBasedTeacher(),
+            HistoricalMLTeacher(),
+            StatefulQTeacher(storage)
+        ]
+        self.replay_buffer = ReplayBuffer(max_size=config.get('replay_buffer_size', 2000))
+        self.epsilon = config.get('distillation_epsilon', 0.1)
+        self.train_every = config.get('train_every', 10)
+        self.counter = 0
+
+    async def select_strategy(self, state: TokenizationState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
+
+        # Ensemble teachers
+        teacher_probs = np.zeros(5)
+        total_conf = 0.0
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            conf = teacher.confidence(state)
+            teacher_probs += prob * conf
+            total_conf += conf
+        if total_conf > 0:
+            teacher_probs /= total_conf
+        else:
+            teacher_probs = np.ones(5) / 5
+
+        student_probs = self.student.predict_proba(state_vec)
+
+        if exploration and random.random() < self.epsilon:
+            action_idx = random.randint(0, 4)
+        else:
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = np.argmax(combined)
+
+        return self.ACTION_SPACE[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+        self.counter += 1
+
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
+            batch = self.replay_buffer.sample(8)
+            states, actions, rewards, _, teacher_probs_batch = batch
+            for i in range(len(states)):
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+
+        # Update StatefulQTeacher if we have the full state (we'll pass state separately)
+        # For simplicity, we'll update it in the main loop with the actual state.
+
+    def get_stats(self) -> Dict:
+        return {
+            'student_counter': self.student.counter,
+            'buffer_size': len(self.replay_buffer),
+            'weights_norm': float(np.linalg.norm(self.student.weights))
+        }
+
+# ============================================================================
+# Tokenization Optimizer (Enhanced with Distillation)
+# ============================================================================
 class TokenizationOptimizer:
     """
-    Optimizes tokenization for sustainability:
-    - Selects the most efficient tokenizer per language.
-    - Segments input by sentence boundaries.
-    - Enforces per‑segment token budgets.
-    - Supports summarization when budget is exceeded.
-    - Caches tokenization results.
-    - Provides metrics and structured logging.
+    Optimizes tokenization for sustainability with adaptive strategy selection.
     """
 
     def __init__(self, cfg: Optional[Union[Dict[str, Any], TokenizationConfig]] = None):
-        """
-        Initialize the optimizer.
-
-        Args:
-            cfg: Configuration dictionary or Pydantic object.
-        """
         if cfg is None:
             if PYDANTIC_AVAILABLE:
                 self.config = TokenizationConfig()
@@ -223,37 +486,48 @@ class TokenizationOptimizer:
             self.config = cfg
 
         # Validate required dependencies
-        if self.config.require_langdetect and not LANGDETECT_AVAILABLE:
+        if self.config.get('require_langdetect', False) and not LANGDETECT_AVAILABLE:
             raise ImportError("langdetect is required but not installed.")
-        if self.config.require_nltk and not NLTK_AVAILABLE:
+        if self.config.get('require_nltk', False) and not NLTK_AVAILABLE:
             raise ImportError("NLTK is required but not installed.")
 
         self.tokenizers: Dict[str, Any] = {}
-        self.language_map = self.config.get('language_tokenizer_map')
-        self.default_tokenizer_name = self.config.get('default_tokenizer')
+        self.language_map = self.config.get('language_tokenizer_map', {})
+        self.default_tokenizer_name = self.config.get('default_tokenizer', 'bert-base-uncased')
         self._tokenizer_lock = asyncio.Lock()
         self.circuit_breaker = CircuitBreaker(name="tokenizer_loading")
 
-        # Cache for tokenization results (keyed by (text, language, budget))
         self._cache: Dict[str, Dict] = {}
         self._cache_ttl = self.config.get('cache_ttl_seconds', 300)
 
+        # Distillation agent (we use a simple in‑memory storage for Q‑teacher)
+        self.distillation = DistillationTokenizationOptimizer(storage=self, config=self.config)
+
         logger.info("TokenizationOptimizer initialized", config=self.config)
+
+    # ------------------------------------------------------------------
+    # Storage interface for Q‑teacher (simplified)
+    # ------------------------------------------------------------------
+    def get_state(self, key: str) -> Optional[str]:
+        # In a real system, this would read from a database.
+        # For this example, we'll use a simple dict.
+        if not hasattr(self, '_state_store'):
+            self._state_store = {}
+        return self._state_store.get(key)
+
+    def save_state(self, key: str, value: str):
+        if not hasattr(self, '_state_store'):
+            self._state_store = {}
+        self._state_store[key] = value
 
     # ------------------------------------------------------------------
     # Language detection
     # ------------------------------------------------------------------
     async def detect_language(self, text: str) -> str:
-        """
-        Detect the language of the given text.
-
-        Uses langdetect if available, otherwise falls back to the configured fallback language.
-        """
         if not LANGDETECT_AVAILABLE:
             logger.warning("langdetect not available; using fallback language: %s", self.config.get('fallback_language', 'en'))
             return self.config.get('fallback_language', 'en')
         try:
-            # Run langdetect in a thread pool because it's blocking
             loop = asyncio.get_event_loop()
             lang = await loop.run_in_executor(None, detect, text)
             return lang
@@ -262,10 +536,9 @@ class TokenizationOptimizer:
             return self.config.get('fallback_language', 'en')
 
     # ------------------------------------------------------------------
-    # Tokenizer loading with retry and circuit breaker
+    # Tokenizer loading
     # ------------------------------------------------------------------
     async def _load_tokenizer(self, language: str) -> Any:
-        """Load a tokenizer for the given language with retry and circuit breaker."""
         if language in self.tokenizers:
             return self.tokenizers[language]
 
@@ -281,7 +554,6 @@ class TokenizationOptimizer:
                 return tokenizer
             except Exception as e:
                 logger.error("Failed to load tokenizer", language=language, model=model_name, error=str(e))
-                # Fallback to default tokenizer
                 if model_name != self.default_tokenizer_name:
                     logger.warning("Falling back to default tokenizer: %s", self.default_tokenizer_name)
                     tokenizer = AutoTokenizer.from_pretrained(self.default_tokenizer_name)
@@ -299,7 +571,6 @@ class TokenizationOptimizer:
             return await self.circuit_breaker.call(_load)
 
     async def _get_tokenizer(self, language: str) -> Any:
-        """Get or load a tokenizer for the language."""
         async with self._tokenizer_lock:
             return await self._load_tokenizer(language)
 
@@ -307,9 +578,6 @@ class TokenizationOptimizer:
     # Segmentation
     # ------------------------------------------------------------------
     async def _segment_text(self, text: str) -> List[str]:
-        """
-        Split text into sentences using NLTK or a fallback regex.
-        """
         if NLTK_AVAILABLE:
             try:
                 loop = asyncio.get_event_loop()
@@ -317,22 +585,14 @@ class TokenizationOptimizer:
                 return sentences
             except Exception as e:
                 logger.error("NLTK segmentation failed: %s", e, exc_info=True)
-                # Fallback to regex
-        # Fallback: split by common sentence boundaries
         return re.split(r'(?<=[.!?])\s+', text)
 
     # ------------------------------------------------------------------
     # Summarization
     # ------------------------------------------------------------------
     async def _summarize(self, text: str, target_tokens: int) -> str:
-        """
-        Summarize text using extractive summarization (TextRank) or fallback.
-        """
         if SUMMA_AVAILABLE:
             try:
-                # summa's summarize returns a summary with a specified ratio or word count
-                # We'll approximate by using a ratio based on target tokens.
-                # First, get token count of original
                 lang = await self.detect_language(text)
                 tokenizer = await self._get_tokenizer(lang)
                 tokens = tokenizer.encode(text, add_special_tokens=False)
@@ -343,50 +603,25 @@ class TokenizationOptimizer:
                 return summary if summary else text[:target_tokens * 4]
             except Exception as e:
                 logger.error("Summarization failed: %s", e, exc_info=True)
-                # Fallback to truncation
-        # Fallback: truncate to target_tokens * 4 characters (rough)
         return text[:target_tokens * 4]
 
     # ------------------------------------------------------------------
-    # Tokenization with caching
+    # Tokenization
     # ------------------------------------------------------------------
     async def _tokenize(self, text: str, language: str) -> Tuple[List[int], int]:
-        """
-        Tokenize text using the language-specific tokenizer.
-        Returns (token_ids, token_count).
-        """
         tokenizer = await self._get_tokenizer(language)
         tokens = tokenizer.encode(text, add_special_tokens=False)
         return tokens, len(tokens)
 
-    def _cache_key(self, text: str, language: str, budget: int) -> str:
-        """Generate a cache key based on text, language, and budget."""
-        # For simplicity, we hash the concatenation
-        key = f"{text}_{language}_{budget}"
+    def _cache_key(self, text: str, language: str, budget: int, strategy: str) -> str:
+        # Include strategy in cache key because different strategies may produce different results
+        key = f"{text}_{language}_{budget}_{strategy}"
         return hashlib.md5(key.encode()).hexdigest()
 
     # ------------------------------------------------------------------
-    # Main optimization method
+    # Core optimization with distillation
     # ------------------------------------------------------------------
     async def optimize(self, text: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Optimize tokenization for the given text.
-
-        Args:
-            text: Input text.
-            context: Dict containing:
-                - 'language' (optional): Language code.
-                - 'token_budget' (optional): Overall token budget.
-                - 'segment_budget' (optional): Per-segment budget (overrides global).
-
-        Returns:
-            Dict with:
-                - 'segments': list of (segment_text, segment_tokens)
-                - 'total_tokens': int
-                - 'language': str
-                - 'tokenizer_used': str
-                - 'cache_hit': bool
-        """
         start_time = time.time()
         language = context.get('language')
         if language is None:
@@ -394,64 +629,153 @@ class TokenizationOptimizer:
 
         budget = context.get('token_budget', 1000)
         segment_budget = context.get('segment_budget', None)
+        domain = context.get('domain', None)
 
-        # Check cache
-        cache_key = self._cache_key(text, language, budget)
+        # Build state for distillation
+        # Compute some features
+        text_length = len(text)
+        words = text.split()
+        avg_word_len = np.mean([len(w) for w in words]) if words else 0
+        sentences = await self._segment_text(text)
+        num_sentences = len(sentences)
+        tokenizer_efficiency = await self.get_token_efficiency(text, language)  # tokens/char
+
+        state = TokenizationState(
+            text_length=text_length,
+            avg_word_len=avg_word_len,
+            num_sentences=num_sentences,
+            language=language,
+            requested_budget=budget,
+            tokenizer_efficiency=tokenizer_efficiency,
+            domain=domain,
+            time_of_day=datetime.now().hour
+        )
+
+        # Select strategy via distillation
+        strategy, action_idx, state_vec, teacher_probs = await self.distillation.select_strategy(state, exploration=True)
+
+        # Check cache (including strategy)
+        cache_key = self._cache_key(text, language, budget, strategy)
         if self.config.get('enable_cache', True) and cache_key in self._cache:
             cached = self._cache[cache_key]
             if (datetime.now() - cached['timestamp']).seconds < self._cache_ttl:
                 if PROMETHEUS_AVAILABLE:
                     CACHE_HIT_COUNTER.inc()
-                logger.debug("Cache hit", language=language)
+                logger.debug("Cache hit", language=language, strategy=strategy)
                 cached['cache_hit'] = True
                 return cached
 
         if PROMETHEUS_AVAILABLE:
             CACHE_MISS_COUNTER.inc()
+            DISTILLATION_STRATEGY.labels(strategy=strategy).inc()
 
-        # Tokenize the full text to get total tokens
-        tokens, total_tokens = await self._tokenize(text, language)
-
-        # If total tokens <= budget, we can just return the whole text as a single segment
-        if total_tokens <= budget:
-            segments = [(text, total_tokens)]
-        else:
-            # Need to segment and potentially summarize
+        # Apply the chosen strategy
+        # For simplicity, we map strategies to different behaviours:
+        if strategy == 'efficiency':
+            # Use smallest tokenizer (default) and truncate aggressively
+            tokenizer_name = self.default_tokenizer_name
+            # No summarization, just truncate to budget
+            tokens, total_tokens = await self._tokenize(text, language)
+            if total_tokens > budget:
+                # Truncate tokens directly (not ideal but simple)
+                truncated_text = text[:budget * 4]  # rough heuristic
+                tokens, total_tokens = await self._tokenize(truncated_text, language)
+            segments = [(truncated_text if total_tokens > budget else text, total_tokens)]
+        elif strategy == 'accuracy':
+            # Use best tokenizer for language (if available) and summarize to preserve meaning
+            tokenizer_name = self.language_map.get(language, self.default_tokenizer_name)
+            # Summarize to ~80% of budget
+            target = int(budget * 0.8)
+            summary = await self._summarize(text, target)
+            tokens, total_tokens = await self._tokenize(summary, language)
+            segments = [(summary, total_tokens)]
+        elif strategy == 'speed':
+            # Use regex segmentation, no summarization, no expensive tokenizer
+            tokenizer_name = 'bert-base-uncased'  # fastest
+            # Simply split by sentences and take first N sentences to fit budget
             sentences = await self._segment_text(text)
-            # We'll allocate budget to sentences based on their token counts
-            # First, compute token count for each sentence
-            sent_token_counts = []
+            token_counts = []
             for sent in sentences:
                 _, cnt = await self._tokenize(sent, language)
-                sent_token_counts.append(cnt)
-
-            # If total tokens exceed budget, we need to summarize some sentences or truncate
-            # Simple approach: summarize the entire text to a summary that fits the budget
+                token_counts.append(cnt)
+            cum = 0
+            selected = []
+            for i, cnt in enumerate(token_counts):
+                if cum + cnt <= budget:
+                    selected.append(sentences[i])
+                    cum += cnt
+                else:
+                    break
+            if not selected:
+                selected = [text[:budget * 4]]
+            segments = [(s, token_counts[i]) for i, s in enumerate(sentences[:len(selected)])]
+            total_tokens = cum
+        elif strategy == 'budget':
+            # Try to meet budget exactly with summarization if needed
+            tokenizer_name = self.default_tokenizer_name
+            tokens, total_tokens = await self._tokenize(text, language)
             if total_tokens > budget:
-                target_tokens = int(budget * 0.8)  # leave some room
-                summary = await self._summarize(text, target_tokens)
-                # Re-tokenize summary
-                _, summary_tokens = await self._tokenize(summary, language)
-                # If summary still exceeds budget, truncate
-                if summary_tokens > budget:
-                    summary = summary[:budget * 4]
-                    _, summary_tokens = await self._tokenize(summary, language)
-                segments = [(summary, summary_tokens)]
-                total_tokens = summary_tokens
+                target = int(budget * 0.9)
+                summary = await self._summarize(text, target)
+                tokens, total_tokens = await self._tokenize(summary, language)
+                segments = [(summary, total_tokens)]
             else:
-                # This shouldn't happen because total_tokens > budget already
+                segments = [(text, total_tokens)]
+        else:  # 'adaptive'
+            # Mix: use the default strategy but with adaptive threshold
+            tokenizer_name = self.default_tokenizer_name
+            tokens, total_tokens = await self._tokenize(text, language)
+            if total_tokens > budget:
+                # Use summarization with ratio based on historical performance
+                ratio = 0.5  # could be learned
+                target = int(budget * ratio)
+                summary = await self._summarize(text, target)
+                tokens, total_tokens = await self._tokenize(summary, language)
+                segments = [(summary, total_tokens)]
+            else:
                 segments = [(text, total_tokens)]
 
+        # Compute reward
+        # Criteria: token efficiency (lower is better), budget adherence, semantic preservation (proxy: ratio of retained sentences)
+        reward = 0.0
+        # Efficiency: tokens per character - we want lower than average (0.3 is a baseline)
+        eff = total_tokens / len(text) if text else 0
+        if eff < 0.3:
+            reward += 0.4
+        elif eff < 0.5:
+            reward += 0.2
+        # Budget adherence: if total_tokens <= budget, reward; if too low, penalize (wasteful)
+        if total_tokens <= budget:
+            reward += 0.3
+            if total_tokens < budget * 0.3:
+                reward -= 0.1  # too short
+        else:
+            reward -= 0.2
+        # Semantic preservation: we'll use the ratio of segments retained vs original sentences
+        if num_sentences > 0:
+            retained = len(segments)
+            ratio = retained / num_sentences
+            if ratio > 0.5:
+                reward += 0.3
+        # Normalise reward to [0,1]
+        reward = max(0.0, min(1.0, reward))
+
+        # Update distillation agent
+        next_state = state  # we could compute a new state, but for simplicity we reuse
+        await self.distillation.update(state_vec, action_idx, reward, next_state.to_feature_vector(), teacher_probs)
+
+        # Prepare result
         result = {
             'segments': segments,
             'total_tokens': total_tokens,
             'language': language,
-            'tokenizer_used': self.language_map.get(language, self.default_tokenizer_name),
+            'tokenizer_used': tokenizer_name,
+            'strategy_used': strategy,
             'cache_hit': False,
             'timestamp': datetime.now()
         }
 
-        # Cache the result
+        # Cache
         if self.config.get('enable_cache', True):
             self._cache[cache_key] = result
 
@@ -461,17 +785,17 @@ class TokenizationOptimizer:
             TOKEN_COUNT_HISTOGRAM.labels(language=language).observe(total_tokens)
             TOKENIZATION_DURATION.labels(language=language).observe(time.time() - start_time)
             LANGUAGE_DISTRIBUTION.labels(language=language).set(1)
+            DISTILLATION_REWARD.observe(reward)
+            DISTILLATION_BUFFER_SIZE.set(len(self.distillation.replay_buffer))
 
-        logger.info("Tokenization completed", language=language, total_tokens=total_tokens, segments=len(segments))
+        logger.info("Tokenization completed", language=language, total_tokens=total_tokens,
+                    segments=len(segments), strategy=strategy, reward=reward)
         return result
 
     # ------------------------------------------------------------------
     # Utility: get token efficiency
     # ------------------------------------------------------------------
     async def get_token_efficiency(self, text: str, language: Optional[str] = None) -> float:
-        """
-        Return tokens per character as a measure of efficiency.
-        """
         if language is None:
             language = await self.detect_language(text)
         _, total_tokens = await self._tokenize(text, language)
@@ -481,22 +805,16 @@ class TokenizationOptimizer:
     # Cache management
     # ------------------------------------------------------------------
     async def clear_cache(self):
-        """Clear the in‑memory cache."""
         self._cache.clear()
         logger.info("Tokenization cache cleared")
 
     async def get_cache_stats(self) -> Dict:
-        """Return cache statistics."""
-        return {
-            'size': len(self._cache),
-            'ttl_seconds': self._cache_ttl,
-        }
+        return {'size': len(self._cache), 'ttl_seconds': self._cache_ttl}
 
     # ------------------------------------------------------------------
-    # Shutdown (cleanup)
+    # Shutdown
     # ------------------------------------------------------------------
     async def shutdown(self):
-        """Clean up resources."""
         self.tokenizers.clear()
         self._cache.clear()
         logger.info("TokenizationOptimizer shutdown complete")
@@ -512,7 +830,7 @@ async def example_usage():
     print(f"Segments: {result['segments']}")
     print(f"Total tokens: {result['total_tokens']}")
     print(f"Language: {result['language']}")
-    print(f"Cache hit: {result['cache_hit']}")
+    print(f"Strategy: {result['strategy_used']}")
 
     efficiency = await optimizer.get_token_efficiency(text)
     print(f"Token efficiency: {efficiency}")
