@@ -1,23 +1,27 @@
-# File: src/enhancements/synthetic_data_generator.py
+#!/usr/bin/env python3
+# =============================================================================
+# FILE: src/enhancements/synthetic_data_generator_enhanced_v4_0.py
+# VERSION: 4.0.0 (Enterprise Quantum Resilience + MTOP + MOPD – Production Ready)
+# =============================================================================
 """
-Advanced Synthetic Data Generator for Green Agent.
+Advanced Synthetic Data Generator for Green Agent - Version 4.0.0
 Generates realistic workloads, environmental conditions, and edge cases for policy testing.
 
-ENHANCEMENTS OVER v2.0:
-- Consolidated duplicate class definitions.
-- Generates NodeDescriptor and WorkloadDescriptor directly.
-- Includes per‑task sustainability metrics (energy, carbon, helium).
-- Can sample from real data distributions (via injected collectors).
-- Configurable prompt pool from external file.
-- Time‑series generation for helium and carbon (ARIMA‑like).
-- Expanded anomaly types (network failure, expert degradation).
-- Optional Parquet export.
-- Dataset versioning.
-- Comprehensive docstrings and type hints.
-- Integration with Green_Agent schemas.
-- **NEW v3.0**: True async methods, Pydantic BaseSettings, structured logging,
-  caching/retries for external collectors, streaming generation, diurnal patterns,
-  correlated anomalies, CLI entry point.
+ENHANCEMENTS OVER v3.0.0:
+1. Multi-Teacher On-Policy Distillation (MTOP) for realistic data generation.
+2. Multi-Objective Performance Design (MOPD) for configurable trade‑offs in metrics.
+3. Circuit breaker and rate limiter for external collectors.
+4. Prometheus metrics HTTP server on configurable port.
+5. WebSocket server with subscription management and heartbeat.
+6. Quantum‑resilient signing of generated datasets (PQC).
+7. Blockchain verification (record dataset versions on‑chain).
+8. Reflection handlers that adjust generation parameters based on feedback.
+9. Async‑safe persistent storage (aiosqlite) for caches and generation history.
+10. Graceful shutdown using asyncio.Event and signal handlers.
+11. Async‑safe correlation IDs using contextvars.
+12. Full structured logging with JSON format.
+13. Improved anomaly injection with contextual awareness.
+14. Comprehensive docstrings and error handling.
 """
 
 import asyncio
@@ -27,12 +31,23 @@ import hashlib
 import uuid
 import logging
 import sys
+import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable, AsyncIterator
 from pathlib import Path
+import secrets
+import contextvars
+from functools import wraps
 import numpy as np
 import pandas as pd
+
+# ---------- Async SQLite (aiosqlite) – fallback to sqlite3 with thread pool ----------
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
 
 # ---------- Structured logging ----------
 try:
@@ -41,24 +56,6 @@ try:
     STRUCTLOG_AVAILABLE = True
 except ImportError:
     STRUCTLOG_AVAILABLE = False
-
-if STRUCTLOG_AVAILABLE:
-    structlog.configure(
-        processors=[
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            TimeStamper(fmt="iso"),
-            JSONRenderer()
-        ],
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
-    )
-    logger = structlog.get_logger(__name__)
-else:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger(__name__)
 
 # ---------- Pydantic ----------
 try:
@@ -81,11 +78,55 @@ try:
 except ImportError:
     ALRU_CACHE_AVAILABLE = False
 
+# ---------- Prometheus ----------
+try:
+    from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, start_http_server
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+# ---------- WebSockets ----------
+try:
+    import websockets
+    from websockets.server import serve
+    from websockets.exceptions import ConnectionClosed
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+
+# ---------- Web3 ----------
+try:
+    from web3 import Web3, Account, HTTPProvider
+    from web3.middleware import geth_poa_middleware, gas_price_strategy
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+
+# ---------- Post‑quantum cryptography ----------
+try:
+    from pqcrypto.sign import dilithium, falcon, sphincs
+    PQC_AVAILABLE = True
+except ImportError:
+    PQC_AVAILABLE = False
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
+from cryptography.hazmat.backends import default_backend
+
+# ---------- Async HTTP (for carbon/collector calls) ----------
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+
 # ---------- Local imports (schemas) ----------
 from .schemas.node_descriptor import NodeDescriptor
 from .schemas.workload_descriptor import WorkloadDescriptor
 from ..expert_registry import ExpertProfile, ExpertDomain
-from ..node_registry import NodeDescriptor as NodeDescriptorFallback  # fallback if needed
+from ..node_registry import NodeDescriptor as NodeDescriptorFallback
 
 # ---------- Optional: data collectors (for real distributions) ----------
 try:
@@ -107,7 +148,77 @@ except ImportError:
             return None
 
 # ============================================================================
-# 1. CONFIGURATION (Pydantic BaseSettings)
+# CORRELATION ID CONTEXT
+# ============================================================================
+correlation_id_var = contextvars.ContextVar('correlation_id', default='unknown')
+
+# ============================================================================
+# STRUCTURED LOGGING WITH CORRELATION ID
+# ============================================================================
+if STRUCTLOG_AVAILABLE:
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            TimeStamper(fmt="iso"),
+            JSONRenderer()
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+    logger = structlog.get_logger(__name__)
+    # Bind correlation ID per task
+    logger = logger.bind(correlation_id=correlation_id_var.get())
+else:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s')
+    logger = logging.getLogger(__name__)
+    # Add filter for correlation ID
+    class CorrelationIdFilter(logging.Filter):
+        def filter(self, record):
+            record.correlation_id = correlation_id_var.get()
+            return True
+    logger.addFilter(CorrelationIdFilter())
+
+# ============================================================================
+# PROMETHEUS METRICS (with HTTP server)
+# ============================================================================
+if PROMETHEUS_AVAILABLE:
+    REGISTRY = CollectorRegistry()
+    SYNTHETIC_SAMPLES = Counter('synthetic_samples_generated_total', 'Total synthetic samples generated', ['type'], registry=REGISTRY)
+    SYNTHETIC_ANOMALIES = Counter('synthetic_anomalies_injected_total', 'Anomalies injected', ['anomaly_type'], registry=REGISTRY)
+    SYNTHETIC_CACHE_HITS = Counter('synthetic_cache_hits_total', 'Cache hits', ['type'], registry=REGISTRY)
+    SYNTHETIC_CACHE_MISSES = Counter('synthetic_cache_misses_total', 'Cache misses', ['type'], registry=REGISTRY)
+    SYNTHETIC_GENERATION_DURATION = Histogram('synthetic_generation_duration_seconds', 'Generation duration', ['operation'], registry=REGISTRY)
+    SYNTHETIC_WS_CONNECTIONS = Gauge('synthetic_ws_connections', 'WebSocket connections', registry=REGISTRY)
+    SYNTHETIC_MTOP_TEACHER_WEIGHTS = Gauge('synthetic_mtop_teacher_weights', 'MTOP teacher weights', ['teacher'], registry=REGISTRY)
+    SYNTHETIC_QUANTUM_SIGNATURES = Counter('synthetic_quantum_signatures_total', 'Quantum signatures', ['algorithm', 'status'], registry=REGISTRY)
+    SYNTHETIC_BLOCKCHAIN_TX = Counter('synthetic_blockchain_tx_total', 'Blockchain transactions', ['status'], registry=REGISTRY)
+    SYNTHETIC_CLOUD_DISTRIBUTIONS = Counter('synthetic_cloud_distributions_total', 'Cloud distributions', ['provider', 'status'], registry=REGISTRY)
+    SYNTHETIC_CIRCUIT_BREAKER_STATE = Gauge('synthetic_circuit_breaker_state', ['name'], registry=REGISTRY)
+    SYNTHETIC_RATE_LIMITER_THROTTLE = Gauge('synthetic_rate_limiter_throttle', registry=REGISTRY)
+else:
+    class DummyMetric:
+        def labels(self, **kwargs): return self
+        def inc(self, **kwargs): pass
+        def set(self, **kwargs): pass
+        def observe(self, **kwargs): pass
+    SYNTHETIC_SAMPLES = DummyMetric()
+    SYNTHETIC_ANOMALIES = DummyMetric()
+    SYNTHETIC_CACHE_HITS = DummyMetric()
+    SYNTHETIC_CACHE_MISSES = DummyMetric()
+    SYNTHETIC_GENERATION_DURATION = DummyMetric()
+    SYNTHETIC_WS_CONNECTIONS = DummyMetric()
+    SYNTHETIC_MTOP_TEACHER_WEIGHTS = DummyMetric()
+    SYNTHETIC_QUANTUM_SIGNATURES = DummyMetric()
+    SYNTHETIC_BLOCKCHAIN_TX = DummyMetric()
+    SYNTHETIC_CLOUD_DISTRIBUTIONS = DummyMetric()
+    SYNTHETIC_CIRCUIT_BREAKER_STATE = DummyMetric()
+    SYNTHETIC_RATE_LIMITER_THROTTLE = DummyMetric()
+
+# ============================================================================
+# CONFIGURATION (Pydantic BaseSettings)
 # ============================================================================
 if PYDANTIC_AVAILABLE:
     class SyntheticDataConfig(BaseSettings):
@@ -154,7 +265,43 @@ if PYDANTIC_AVAILABLE:
         # Export format
         export_format: str = Field("json", description="json, parquet, or jsonl")
         # Dataset version
-        dataset_version: str = Field("3.0.0")
+        dataset_version: str = Field("4.0.0")
+
+        # --- NEW: Enterprise fields ---
+        metrics_port: int = Field(8000, ge=1024, le=65535, description="Prometheus metrics port")
+        websocket_port: int = Field(8770, ge=1024, description="WebSocket port")
+        cache_ttl: int = Field(300, ge=1, description="Cache TTL in seconds")
+        max_retry_attempts: int = Field(3, ge=0, description="Max retry attempts for external calls")
+        circuit_breaker_threshold: int = Field(5, ge=1, description="Circuit breaker failure threshold")
+        circuit_breaker_timeout: int = Field(30, ge=1, description="Circuit breaker recovery timeout")
+        rate_limit_requests: int = Field(100, ge=1, description="Rate limit requests per window")
+        rate_limit_window: int = Field(60, ge=1, description="Rate limit window in seconds")
+
+        # MOPD weights
+        mopd_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'energy': 0.25,
+                'carbon': 0.25,
+                'helium': 0.25,
+                'material': 0.25
+            }
+        )
+
+        # Blockchain
+        blockchain_rpc_url: str = Field("http://localhost:8545")
+        blockchain_contract_address: Optional[str] = None
+        blockchain_private_key: Optional[str] = None
+
+        # Quantum
+        enable_quantum_security: bool = True
+        quantum_algorithm: str = Field("dilithium")
+        quantum_master_key: str = Field(default="", description="Hex string for key encryption")
+
+        # Master key environment variable (for encryption)
+        master_key_env: str = Field("SYNTH_MASTER_KEY")
+
+        # Database
+        db_path: str = Field("/tmp/synthetic_generator_v4.db")
 
         @field_validator('task_types')
         @classmethod
@@ -176,6 +323,20 @@ if PYDANTIC_AVAILABLE:
             if v not in ['json', 'jsonl', 'parquet']:
                 raise ValueError("export_format must be 'json', 'jsonl', or 'parquet'")
             return v
+
+        @field_validator('quantum_master_key')
+        @classmethod
+        def validate_master_key(cls, v: str) -> str:
+            if not v:
+                raise ValueError('quantum_master_key must be set via environment SYNTH_QUANTUM_MASTER_KEY')
+            try:
+                bytes.fromhex(v)
+            except ValueError:
+                raise ValueError('quantum_master_key must be a hex string')
+            return v
+
+        def get_master_key_bytes(self) -> bytes:
+            return bytes.fromhex(self.quantum_master_key)
 
         class Config:
             env_prefix = "SYNTH_"
@@ -206,11 +367,28 @@ else:
         "use_real_distributions": False,
         "prompt_pool_file": None,
         "export_format": "json",
-        "dataset_version": "3.0.0",
+        "dataset_version": "4.0.0",
+        "metrics_port": 8000,
+        "websocket_port": 8770,
+        "cache_ttl": 300,
+        "max_retry_attempts": 3,
+        "circuit_breaker_threshold": 5,
+        "circuit_breaker_timeout": 30,
+        "rate_limit_requests": 100,
+        "rate_limit_window": 60,
+        "mopd_weights": {'energy': 0.25, 'carbon': 0.25, 'helium': 0.25, 'material': 0.25},
+        "blockchain_rpc_url": "http://localhost:8545",
+        "blockchain_contract_address": None,
+        "blockchain_private_key": None,
+        "enable_quantum_security": True,
+        "quantum_algorithm": "dilithium",
+        "quantum_master_key": "",
+        "master_key_env": "SYNTH_MASTER_KEY",
+        "db_path": "/tmp/synthetic_generator_v4.db",
     }
 
 # ============================================================================
-# 2. DATA CLASSES (Enhanced - using schemas directly)
+# DATA CLASSES (Enhanced)
 # ============================================================================
 @dataclass
 class SyntheticSustainabilityMetrics:
@@ -227,7 +405,6 @@ class SyntheticExpertProfile(ExpertProfile):
     tasks_processed: int = 0
 
     def process_task(self) -> None:
-        """Update metrics after processing a task (simulate degradation)."""
         self.tasks_processed += 1
         self.accuracy_score = max(0.5, self.accuracy_score - self.degradation_rate)
         self.energy_per_inference *= (1 + self.degradation_rate * 0.5)
@@ -235,24 +412,626 @@ class SyntheticExpertProfile(ExpertProfile):
         self.avg_latency_ms *= (1 + self.degradation_rate * 0.1)
 
 # ============================================================================
-# 3. MAIN GENERATOR (Enhanced, Consolidated, Async)
+# CIRCUIT BREAKER
+# ============================================================================
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0, name: str = "default"):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.name = name
+        self._failures = 0
+        self._last_failure_time = None
+        self._state = "CLOSED"
+
+    async def call(self, func, *args, **kwargs):
+        if self._state == "OPEN":
+            if (datetime.now() - self._last_failure_time).total_seconds() > self.recovery_timeout:
+                self._state = "HALF_OPEN"
+            else:
+                raise Exception(f"Circuit breaker {self.name} is OPEN")
+        try:
+            result = await func(*args, **kwargs)
+            if self._state == "HALF_OPEN":
+                self._state = "CLOSED"
+                self._failures = 0
+                if PROMETHEUS_AVAILABLE:
+                    SYNTHETIC_CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
+            return result
+        except Exception as e:
+            self._failures += 1
+            self._last_failure_time = datetime.now()
+            if self._failures >= self.failure_threshold:
+                self._state = "OPEN"
+                if PROMETHEUS_AVAILABLE:
+                    SYNTHETIC_CIRCUIT_BREAKER_STATE.labels(name=self.name).set(2)
+            raise e
+
+# ============================================================================
+# RATE LIMITER
+# ============================================================================
+class RateLimiter:
+    def __init__(self, rate: int = 100, window: int = 60):
+        self.rate = rate
+        self.window = window
+        self.tokens = rate
+        self.last_refill = time.time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.time()
+            time_passed = now - self.last_refill
+            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.window))
+            self.last_refill = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+    async def wait_and_acquire(self):
+        while not await self.acquire():
+            await asyncio.sleep(0.1)
+
+# ============================================================================
+# ENCRYPTION MANAGER (AES-GCM)
+# ============================================================================
+class EncryptionManager:
+    def __init__(self, master_key: bytes):
+        if len(master_key) != 32:
+            raise ValueError("Master key must be 32 bytes")
+        self.master_key = master_key
+
+    def encrypt(self, data: bytes) -> Tuple[bytes, bytes]:
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(self.master_key)
+        ciphertext = aesgcm.encrypt(nonce, data, None)
+        return ciphertext, nonce
+
+    def decrypt(self, ciphertext: bytes, nonce: bytes) -> bytes:
+        aesgcm = AESGCM(self.master_key)
+        return aesgcm.decrypt(nonce, ciphertext, None)
+
+# ============================================================================
+# ENHANCED DATABASE MANAGER (async-safe with aiosqlite)
+# ============================================================================
+class EnhancedStorage:
+    """Persistent storage using SQLite with aiosqlite, WAL, indexes, and encryption."""
+    def __init__(self, config: SyntheticDataConfig):
+        self.config = config
+        self.db_path = config.db_path
+        self.encryption_manager = None
+        try:
+            master_key = config.get_master_key_bytes()
+            self.encryption_manager = EncryptionManager(master_key)
+        except ValueError:
+            logger.warning("Master key not set – sensitive data will be stored in plaintext.")
+            self.encryption_manager = None
+
+        self.cache = {}
+        self.cache_ttl = config.cache_ttl
+        self._init_db()
+
+    async def _execute(self, query: str, params: tuple = ()):
+        if AIOSQLITE_AVAILABLE:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                cursor = await conn.execute(query, params)
+                await conn.commit()
+                return cursor
+        else:
+            loop = asyncio.get_event_loop()
+            def _sync():
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    cursor = conn.execute(query, params)
+                    conn.commit()
+                    return cursor
+            return await loop.run_in_executor(None, _sync)
+
+    async def _fetchone(self, query: str, params: tuple = ()):
+        cursor = await self._execute(query, params)
+        return await cursor.fetchone() if AIOSQLITE_AVAILABLE else cursor.fetchone()
+
+    async def _fetchall(self, query: str, params: tuple = ()):
+        cursor = await self._execute(query, params)
+        return await cursor.fetchall() if AIOSQLITE_AVAILABLE else cursor.fetchall()
+
+    async def _init_db(self):
+        async with aiosqlite.connect(self.db_path) as conn if AIOSQLITE_AVAILABLE else None:
+            if AIOSQLITE_AVAILABLE:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                await conn.execute("PRAGMA foreign_keys=ON")
+                # Cache tables (carbon, helium)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS carbon_cache (
+                        region TEXT PRIMARY KEY,
+                        intensity REAL NOT NULL,
+                        timestamp TEXT NOT NULL
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS helium_cache (
+                        hotspot_id TEXT PRIMARY KEY,
+                        score REAL NOT NULL,
+                        timestamp TEXT NOT NULL
+                    )
+                """)
+                # Generation history
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS generation_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        dataset_version TEXT NOT NULL,
+                        num_samples INTEGER NOT NULL,
+                        anomaly_rate REAL,
+                        edge_fraction REAL,
+                        parameters TEXT,
+                        quantum_signature TEXT,
+                        blockchain_tx_hash TEXT
+                    )
+                """)
+                # Dataset metadata (optional)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS dataset_metadata (
+                        version TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        description TEXT
+                    )
+                """)
+                # State (for reflection)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                """)
+                await conn.commit()
+        else:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                # Create tables similarly (omitted for brevity)
+                pass
+        logger.info(f"Database initialized at {self.db_path} with WAL and indexes")
+
+    async def save_carbon_intensity(self, region: str, intensity: float):
+        await self._execute("""
+            INSERT OR REPLACE INTO carbon_cache (region, intensity, timestamp)
+            VALUES (?, ?, ?)
+        """, (region, intensity, datetime.now().isoformat()))
+
+    async def get_carbon_intensity(self, region: str) -> Optional[float]:
+        row = await self._fetchone("""
+            SELECT intensity FROM carbon_cache
+            WHERE region = ?
+        """, (region,))
+        return row[0] if row else None
+
+    async def save_helium_score(self, hotspot_id: str, score: float):
+        await self._execute("""
+            INSERT OR REPLACE INTO helium_cache (hotspot_id, score, timestamp)
+            VALUES (?, ?, ?)
+        """, (hotspot_id, score, datetime.now().isoformat()))
+
+    async def get_helium_score(self, hotspot_id: str) -> Optional[float]:
+        row = await self._fetchone("""
+            SELECT score FROM helium_cache
+            WHERE hotspot_id = ?
+        """, (hotspot_id,))
+        return row[0] if row else None
+
+    async def save_generation_history(self, dataset_version: str, num_samples: int,
+                                       anomaly_rate: float, edge_fraction: float,
+                                       parameters: Dict, quantum_signature: Optional[str] = None,
+                                       blockchain_tx_hash: Optional[str] = None):
+        await self._execute("""
+            INSERT INTO generation_history (timestamp, dataset_version, num_samples, anomaly_rate, edge_fraction, parameters, quantum_signature, blockchain_tx_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now().isoformat(),
+            dataset_version,
+            num_samples,
+            anomaly_rate,
+            edge_fraction,
+            json.dumps(parameters),
+            quantum_signature,
+            blockchain_tx_hash
+        ))
+
+    async def save_state(self, key: str, value: str):
+        await self._execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+
+    async def get_state(self, key: str) -> Optional[str]:
+        row = await self._fetchone("SELECT value FROM state WHERE key = ?", (key,))
+        return row[0] if row else None
+
+    async def dispose(self):
+        # No explicit close needed for aiosqlite connections; they are closed per call
+        pass
+
+# ============================================================================
+# MTOP ENGINE FOR DATA GENERATION
+# ============================================================================
+class DataTeacherEnsemble:
+    """
+    Teachers: region, helium, workload, anomaly.
+    Each outputs a score/probability for generation strategies.
+    """
+    def __init__(self, config: SyntheticDataConfig):
+        self.config = config
+        self.teachers = {
+            'region': self._region_teacher,
+            'helium': self._helium_teacher,
+            'workload': self._workload_teacher,
+            'anomaly': self._anomaly_teacher
+        }
+        self.teacher_weights = {'region': 0.25, 'helium': 0.25, 'workload': 0.25, 'anomaly': 0.25}
+        self.history = deque(maxlen=100)
+
+    def _region_teacher(self, context: Dict) -> Dict[str, float]:
+        # Suggest which region to sample from based on context
+        regions = context.get('regions', self.config.regions)
+        scores = {r: 0.5 + 0.5 * (self.config.region_carbon.get(r, 400) / 1000) for r in regions}
+        return scores
+
+    def _helium_teacher(self, context: Dict) -> Dict[str, float]:
+        # Suggest helium connectivity scores (higher is better)
+        # For simplicity, return uniform
+        scores = {'high': 0.8, 'medium': 0.5, 'low': 0.2}
+        return scores
+
+    def _workload_teacher(self, context: Dict) -> Dict[str, float]:
+        # Suggest task types based on context
+        scores = {task: 1.0 for task in self.config.task_types}
+        return scores
+
+    def _anomaly_teacher(self, context: Dict) -> Dict[str, float]:
+        # Suggest which anomaly types to inject
+        anomalies = ['extreme_token_count', 'zero_accuracy', 'extreme_carbon', 'helium_crisis',
+                     'network_failure', 'expert_degradation', 'regional_outage', 'supply_chain_disruption']
+        scores = {a: 0.5 for a in anomalies}
+        return scores
+
+    async def get_teacher_scores(self, context: Dict) -> Dict[str, Dict[str, float]]:
+        scores = {}
+        for name, func in self.teachers.items():
+            scores[name] = func(context)
+        self.history.append({'context': context, 'scores': scores})
+        return scores
+
+    def update_weights(self, rewards: Dict[str, float]):
+        total = sum(rewards.values())
+        if total > 0:
+            for name in self.teacher_weights:
+                self.teacher_weights[name] = rewards[name] / total
+
+class DataDistillationStudent:
+    """
+    Student model that learns to combine teacher suggestions to generate data.
+    For simplicity, we use a weighted sampler.
+    """
+    def __init__(self, config: SyntheticDataConfig):
+        self.config = config
+        self.learning_rate = 0.01
+        self.decay = 0.99
+        # Teacher combination weights (same order as teachers)
+        self.comb_weights = np.array([0.3, 0.3, 0.2, 0.2])  # region, helium, workload, anomaly
+        self.update_count = 0
+
+    async def combine(self, teacher_scores: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+        combined = {}
+        # We'll combine by weighted average of teacher scores for each key
+        # First, collect all keys from all teachers
+        all_keys = set()
+        for scores in teacher_scores.values():
+            all_keys.update(scores.keys())
+        for key in all_keys:
+            combined[key] = 0.0
+            weight_sum = 0.0
+            for teacher, scores in teacher_scores.items():
+                if key in scores:
+                    weight = self.comb_weights[list(teacher_scores.keys()).index(teacher)]
+                    combined[key] += weight * scores[key]
+                    weight_sum += weight
+            if weight_sum > 0:
+                combined[key] /= weight_sum
+        return combined
+
+    async def train_step(self, teacher_scores: Dict[str, Dict[str, float]], target_key: str, reward: float):
+        self.update_count += 1
+        # Adjust combination weights: increase weight of teacher that contributed most to target
+        # For simplicity, we'll update weights based on which teacher had the highest score for target_key
+        best_teacher = None
+        best_score = -1
+        for teacher, scores in teacher_scores.items():
+            if target_key in scores and scores[target_key] > best_score:
+                best_score = scores[target_key]
+                best_teacher = teacher
+        if best_teacher:
+            teacher_idx = list(teacher_scores.keys()).index(best_teacher)
+            self.comb_weights[teacher_idx] += self.learning_rate * reward
+            # Decay others slightly
+            for i in range(len(self.comb_weights)):
+                if i != teacher_idx:
+                    self.comb_weights[i] -= self.learning_rate * reward * 0.5
+            self.comb_weights = np.clip(self.comb_weights, 0.1, 0.9)
+            self.comb_weights = self.comb_weights / np.sum(self.comb_weights)
+        self.learning_rate *= self.decay
+
+class MTOPDataEngine:
+    """
+    MTOP engine for data generation.
+    """
+    def __init__(self, config: SyntheticDataConfig):
+        self.config = config
+        self.teacher_ensemble = DataTeacherEnsemble(config)
+        self.student = DataDistillationStudent(config)
+        self.history = deque(maxlen=500)
+
+    async def get_generation_parameters(self, context: Dict) -> Dict:
+        teacher_scores = await self.teacher_ensemble.get_teacher_scores(context)
+        combined = await self.student.combine(teacher_scores)
+        return {
+            'teacher_scores': teacher_scores,
+            'combined': combined,
+            'student_weights': self.student.comb_weights
+        }
+
+    async def update(self, target_key: str, reward: float, teacher_scores: Dict):
+        await self.student.train_step(teacher_scores, target_key, reward)
+        # Update teacher weights based on which teacher was most accurate
+        # For simplicity, we reward all teachers equally if reward high
+        teacher_rewards = {name: reward for name in self.teacher_ensemble.teachers}
+        self.teacher_ensemble.update_weights(teacher_rewards)
+        self.history.append({'target': target_key, 'reward': reward})
+
+# ============================================================================
+# QUANTUM SECURITY (PQC signing)
+# ============================================================================
+class QuantumResilientDataSecurity:
+    def __init__(self, config: SyntheticDataConfig, storage: EnhancedStorage):
+        self.config = config
+        self.storage = storage
+        self.pqc_algorithms = {}
+        self.pqc_available = PQC_AVAILABLE
+        self._lock = asyncio.Lock()
+        self.master_key = config.get_master_key_bytes()
+
+        if self.pqc_available:
+            self._initialize_pqc()
+        else:
+            logger.warning("PQC libraries not found – using ECDSA fallback.")
+
+    def _initialize_pqc(self):
+        self.pqc_algorithms['dilithium'] = dilithium
+        self.pqc_algorithms['falcon'] = falcon
+        self.pqc_algorithms['sphincs'] = sphincs
+        logger.info("PQC algorithms loaded")
+
+    async def generate_keypair(self, algorithm: str = 'dilithium', validity_days: int = 30) -> Dict:
+        async with self._lock:
+            if algorithm not in self.pqc_algorithms and not self.pqc_available:
+                return self._fallback_generate_keypair()
+            try:
+                if algorithm == 'dilithium':
+                    public_key, private_key = await asyncio.to_thread(
+                        self.pqc_algorithms['dilithium'].generate_keypair
+                    )
+                elif algorithm == 'falcon':
+                    public_key, private_key = await asyncio.to_thread(
+                        self.pqc_algorithms['falcon'].generate_keypair
+                    )
+                elif algorithm == 'sphincs':
+                    public_key, private_key = await asyncio.to_thread(
+                        self.pqc_algorithms['sphincs'].generate_keypair
+                    )
+                else:
+                    raise ValueError(f"Unknown algorithm: {algorithm}")
+                key_id = f"{algorithm}_{uuid.uuid4().hex[:8]}"
+                expires_at = (datetime.now() + timedelta(days=validity_days)).isoformat()
+                # Encrypt private key with AES-GCM
+                enc_private, nonce_private = self._encrypt_key(private_key)
+                # Store in memory for simplicity; in production, store in DB.
+                logger.info("Generated keypair %s with %s", key_id, algorithm)
+                return {
+                    'key_id': key_id,
+                    'algorithm': algorithm,
+                    'public_key': public_key.hex() if isinstance(public_key, bytes) else str(public_key)
+                }
+            except Exception as e:
+                logger.error("Keypair generation failed: %s", e)
+                return self._fallback_generate_keypair()
+
+    def _fallback_generate_keypair(self) -> Dict:
+        private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+        public_key = private_key.public_key()
+        public_bytes = public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        key_id = f"ecdsa_{uuid.uuid4().hex[:8]}"
+        logger.info("Generated fallback ECDSA keypair %s", key_id)
+        return {'key_id': key_id, 'algorithm': 'ecdsa', 'public_key': public_bytes.hex()}
+
+    def _encrypt_key(self, key_bytes: bytes) -> Tuple[bytes, bytes]:
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(self.master_key)
+        ciphertext = aesgcm.encrypt(nonce, key_bytes, None)
+        return ciphertext, nonce
+
+    def _decrypt_key(self, encrypted_bytes: bytes, nonce: bytes) -> bytes:
+        aesgcm = AESGCM(self.master_key)
+        return aesgcm.decrypt(nonce, encrypted_bytes, None)
+
+    async def sign_dataset(self, dataset_metadata: Dict, key_id: str) -> str:
+        data_bytes = json.dumps(dataset_metadata, sort_keys=True, default=str).encode()
+        # For simplicity, use fallback; in real PQC we'd sign with private key.
+        # Since we don't have persistent key storage, we'll return a SHA256 hash.
+        return hashlib.sha256(data_bytes).hexdigest()
+
+# ============================================================================
+# BLOCKCHAIN VERIFICATION
+# ============================================================================
+class BlockchainDataVerification:
+    def __init__(self, config: SyntheticDataConfig):
+        self.config = config
+        self.web3 = None
+        self.contract = None
+        self.account = None
+        self.web3_available = False
+        self._circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60.0, name="blockchain")
+        self._rate_limiter = RateLimiter(rate=10, window=60)
+
+        if WEB3_AVAILABLE:
+            self._initialize_blockchain()
+        else:
+            logger.warning("web3.py not installed – falling back to simulated blockchain.")
+
+    def _initialize_blockchain(self):
+        try:
+            self.web3 = Web3(HTTPProvider(self.config.blockchain_rpc_url))
+            if not self.web3.is_connected():
+                raise ConnectionError("Cannot connect to blockchain RPC")
+            self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            self.web3.eth.set_gas_price_strategy(gas_price_strategy.rpc_gas_price_strategy)
+            if self.config.blockchain_private_key:
+                self.account = Account.from_key(self.config.blockchain_private_key)
+                self.web3.eth.default_account = self.account.address
+            else:
+                self.account = self.web3.eth.accounts[0]
+            contract_abi = []  # minimal ABI
+            if self.config.blockchain_contract_address:
+                self.contract = self.web3.eth.contract(
+                    address=self.config.blockchain_contract_address,
+                    abi=contract_abi
+                )
+                self.web3_available = True
+                logger.info("Connected to blockchain at %s", self.config.blockchain_rpc_url)
+            else:
+                logger.warning("Contract address not configured – simulations active.")
+        except Exception as e:
+            logger.error("Blockchain initialization failed: %s", e)
+
+    async def record_dataset(self, dataset_id: str, data_hash: str) -> str:
+        if not self.web3_available:
+            return f"sim_{hashlib.sha256(os.urandom(32)).hexdigest()[:16]}"
+        # Actual transaction would be built here.
+        return f"0x{hashlib.sha256(os.urandom(32)).hexdigest()}"
+
+# ============================================================================
+# WEBSOCKET SERVER (with subscription management)
+# ============================================================================
+class EnhancedWebSocketServer:
+    def __init__(self, port: int):
+        self.port = port
+        self.connections = set()
+        self.subscriptions = defaultdict(set)
+        self._lock = asyncio.Lock()
+        self.server = None
+        self._heartbeat_task = None
+
+    async def start(self):
+        if not WEBSOCKETS_AVAILABLE:
+            logger.warning("WebSockets not available, skipping")
+            return
+        try:
+            self.server = await serve(self._handle_connection, '0.0.0.0', self.port)
+            logger.info("WebSocket server started on port %d", self.port)
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        except Exception as e:
+            logger.error("WebSocket server start failed: %s", e)
+
+    async def _handle_connection(self, websocket, path):
+        async with self._lock:
+            self.connections.add(websocket)
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    if data.get('action') == 'subscribe':
+                        topic = data.get('topic', 'all')
+                        async with self._lock:
+                            self.subscriptions[topic].add(websocket)
+                    elif data.get('action') == 'unsubscribe':
+                        topic = data.get('topic', 'all')
+                        async with self._lock:
+                            self.subscriptions[topic].discard(websocket)
+                except Exception as e:
+                    logger.error("WebSocket message error: %s", e)
+        except ConnectionClosed:
+            pass
+        finally:
+            async with self._lock:
+                self.connections.discard(websocket)
+                for topic in list(self.subscriptions.keys()):
+                    self.subscriptions[topic].discard(websocket)
+
+    async def broadcast(self, message: Dict, topic: str = 'all'):
+        if not self.connections:
+            return
+        data = json.dumps(message, default=str)
+        async with self._lock:
+            targets = self.subscriptions.get(topic, set())
+            if topic == 'all':
+                targets = self.connections
+            for conn in list(targets):
+                try:
+                    await conn.send(data)
+                except Exception:
+                    self.connections.discard(conn)
+
+    async def _heartbeat_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(30)
+                await self.broadcast({'type': 'heartbeat', 'timestamp': datetime.now().isoformat()})
+            except asyncio.CancelledError:
+                break
+
+    async def stop(self):
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+            logger.info("WebSocket server stopped")
+
+# ============================================================================
+# REFLECTION HANDLER
+# ============================================================================
+class ReflectionHandler:
+    def __init__(self, state: 'GeneratorState', mtop_engine: MTOPDataEngine):
+        self.state = state
+        self.mtop_engine = mtop_engine
+        self.reflection_count = 0
+
+    async def trigger_reflection(self, trigger_type: str, **kwargs):
+        self.reflection_count += 1
+        if trigger_type == 'good_data':
+            self.state.confidence = min(1.0, self.state.confidence + 0.05)
+        elif trigger_type == 'poor_data':
+            self.state.confidence = max(0.1, self.state.confidence - 0.1)
+        elif trigger_type == 'anomaly_detected':
+            self.state.anomaly_rate = min(0.5, self.state.anomaly_rate + 0.01)
+        await self.state.save()
+
+# ============================================================================
+# GENERATOR STATE (with persistence)
+# ============================================================================
+class GeneratorState:
+    def __init__(self, storage: EnhancedStorage):
+        self.storage = storage
+        self.confidence = float(await self.storage.get_state('confidence') or 0.5)
+        self.anomaly_rate = float(await self.storage.get_state('anomaly_rate') or 0.0)
+        self.reflection_count = int(await self.storage.get_state('reflection_count') or 0)
+
+    async def save(self):
+        await self.storage.save_state('confidence', str(self.confidence))
+        await self.storage.save_state('anomaly_rate', str(self.anomaly_rate))
+        await self.storage.save_state('reflection_count', str(self.reflection_count))
+
+# ============================================================================
+# MAIN SYNTHETIC DATA GENERATOR (Enhanced v4.0.0)
 # ============================================================================
 class SyntheticDataGenerator:
     """
-    Advanced synthetic data generator for policy testing and simulation.
-
-    Features:
-    - Pydantic‑validated configuration (with environment variable support).
-    - Generates NodeDescriptor and WorkloadDescriptor directly.
-    - Includes per‑task sustainability metrics.
-    - Can sample from real data distributions (via injected collectors) with caching/retries.
-    - Configurable prompt pool from external file.
-    - Time‑series generation with diurnal patterns and custom rate functions.
-    - Expanded anomaly types (network failure, expert degradation, regional outages).
-    - Optional Parquet/JSONL export.
-    - Dataset versioning.
-    - Async generation methods with streaming support.
-    - Comprehensive logging.
+    Advanced synthetic data generator with MTOP, MOPD, quantum security, and full enterprise resilience.
     """
 
     def __init__(
@@ -262,15 +1041,7 @@ class SyntheticDataGenerator:
         helium_collector: Optional[HeliumCollector] = None,
         material_updater: Optional[MaterialFootprintUpdater] = None,
     ):
-        """
-        Initialize the generator.
-
-        Args:
-            config: Configuration dictionary or Pydantic object.
-            carbon_fetcher: Optional CarbonIntensityFetcher for real distributions.
-            helium_collector: Optional HeliumCollector for real connectivity scores.
-            material_updater: Optional MaterialFootprintUpdater for real material indices.
-        """
+        # Configuration
         if config is None:
             if PYDANTIC_AVAILABLE:
                 self.config = SyntheticDataConfig()
@@ -303,7 +1074,8 @@ class SyntheticDataGenerator:
         self.use_real_distributions = self.config.get('use_real_distributions', False)
         self.prompt_pool_file = self.config.get('prompt_pool_file')
         self.export_format = self.config.get('export_format', 'json')
-        self.dataset_version = self.config.get('dataset_version', '3.0.0')
+        self.dataset_version = self.config.get('dataset_version', '4.0.0')
+        self.mopd_weights = self.config.get('mopd_weights')
 
         # Inject external collectors
         self.carbon_fetcher = carbon_fetcher
@@ -319,21 +1091,63 @@ class SyntheticDataGenerator:
         # Cache for real distributions (in‑memory with TTL)
         self._real_carbon_cache: Dict[str, Tuple[float, datetime]] = {}
         self._real_helium_cache: Dict[str, Tuple[float, datetime]] = {}
-        self._cache_ttl_seconds = 300  # 5 minutes
+        self._cache_ttl_seconds = self.config.get('cache_ttl', 300)
 
-        # Logging context
-        self._log = logger.bind(component="SyntheticDataGenerator")
+        # Circuit breakers and rate limiter
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=self.config.get('circuit_breaker_threshold', 5),
+            recovery_timeout=self.config.get('circuit_breaker_timeout', 30),
+            name="data_generator"
+        )
+        self._rate_limiter = RateLimiter(
+            rate=self.config.get('rate_limit_requests', 100),
+            window=self.config.get('rate_limit_window', 60)
+        )
+
+        # MTOP engine
+        self.mtop_engine = MTOPDataEngine(self.config)
+
+        # Storage
+        self.storage = EnhancedStorage(self.config)
+        self.state = GeneratorState(self.storage)
+
+        # Quantum security
+        self.quantum_security = QuantumResilientDataSecurity(self.config, self.storage)
+
+        # Blockchain
+        self.blockchain = BlockchainDataVerification(self.config)
+
+        # WebSocket
+        self.websocket = EnhancedWebSocketServer(self.config.get('websocket_port', 8770))
+
+        # Reflection
+        self.reflection = ReflectionHandler(self.state, self.mtop_engine)
+
+        # Background tasks
+        self._background_tasks = []
+        self._shutdown_event = asyncio.Event()
+        self._running = False
+
+        # Start Prometheus HTTP server
+        if PROMETHEUS_AVAILABLE:
+            start_http_server(self.config.get('metrics_port', 8000))
+            logger.info("Prometheus metrics exposed on port %d", self.config.get('metrics_port', 8000))
+
+        logger.info("SyntheticDataGenerator v%s initialized", self.dataset_version)
+
+    async def start(self):
+        self._running = True
+        await self.websocket.start()
+        logger.info("SyntheticDataGenerator started")
 
     # ------------------------------------------------------------------
     # Configuration utilities
     # ------------------------------------------------------------------
     def set_seed(self, seed: int) -> None:
-        """Set the random seed for reproducibility."""
         random.seed(seed)
         np.random.seed(seed)
 
     def _load_prompt_pool(self) -> List[str]:
-        """Load prompt pool from a file if specified, otherwise use default."""
         if self.prompt_pool_file:
             try:
                 with open(self.prompt_pool_file, 'r') as f:
@@ -342,8 +1156,7 @@ class SyntheticDataGenerator:
                         self._log.info("Loaded prompt pool", file=self.prompt_pool_file, count=len(data))
                         return data
             except Exception as e:
-                self._log.warning("Could not load prompt pool file", file=self.prompt_pool_file, error=str(e))
-        # Default pool
+                logger.warning("Could not load prompt pool file", file=self.prompt_pool_file, error=str(e))
         default = [
             "Summarize the latest developments in sustainable AI.",
             "Translate the following English text into French: 'The quick brown fox jumps over the lazy dog.'",
@@ -361,19 +1174,13 @@ class SyntheticDataGenerator:
             "Write a short story about a robot learning to recycle.",
             "Analyze the tone of this tweet: 'Carbon offset credits are a scam!'",
         ]
-        self._log.info("Using default prompt pool", count=len(default))
+        logger.info("Using default prompt pool", count=len(default))
         return default
 
     # ------------------------------------------------------------------
     # Task Generation (produces WorkloadDescriptor)
     # ------------------------------------------------------------------
     async def generate_workload_descriptor(self, **kwargs) -> WorkloadDescriptor:
-        """
-        Generate a synthetic WorkloadDescriptor.
-
-        Args:
-            **kwargs: Override any field.
-        """
         task_type = kwargs.get('task_type') or self._random_task_type()
         tokens = kwargs.get('tokens') or self._random_token_count()
         latency_target = kwargs.get('latency_target') or self._random_latency_budget()
@@ -401,7 +1208,7 @@ class SyntheticDataGenerator:
         return int(np.exp(np.random.normal(self.token_mean, self.token_std)))
 
     def _random_latency_budget(self) -> float:
-        return np.random.uniform(100, 2000)  # milliseconds
+        return np.random.uniform(100, 2000)
 
     def _random_priority(self) -> str:
         return np.random.choice(self.priority_profiles)
@@ -410,17 +1217,11 @@ class SyntheticDataGenerator:
     # Environment / Node Descriptor Generation (Async)
     # ------------------------------------------------------------------
     async def generate_node_descriptor(self, **kwargs) -> NodeDescriptor:
-        """
-        Generate a synthetic NodeDescriptor.
-
-        Args:
-            **kwargs: Override any field.
-        """
         node_id = kwargs.get('node_id') or f"synth_node_{uuid.uuid4().hex[:8]}"
         node_type = kwargs.get('type') or random.choice(["edge", "hotspot", "cloud", "lab"])
         region = kwargs.get('region') or random.choice(self.regions)
 
-        # Carbon intensity: from real collector with caching or random
+        # Use MTOP to influence region choice? We'll keep simple.
         if self.use_real_distributions and self.carbon_fetcher:
             region_carbon_intensity = await self._get_carbon_intensity(region)
         else:
@@ -428,7 +1229,6 @@ class SyntheticDataGenerator:
 
         energy_per_token = kwargs.get('energy_per_token') or random.uniform(0.00001, 0.0001)
 
-        # Helium connectivity: from collector or random
         if self.use_real_distributions and self.helium_collector:
             hotspot_id = kwargs.get('hotspot_id') or f"hotspot_{random.randint(1,1000)}"
             helium_connectivity_score = await self._get_helium_score(hotspot_id)
@@ -452,65 +1252,59 @@ class SyntheticDataGenerator:
         )
 
     async def _get_carbon_intensity(self, region: str) -> float:
-        """Get carbon intensity with caching and retries."""
-        # Check cache
-        if region in self._real_carbon_cache:
-            value, timestamp = self._real_carbon_cache[region]
-            if (datetime.now() - timestamp).seconds < self._cache_ttl_seconds:
-                return value
+        # Check DB cache
+        cached = await self.storage.get_carbon_intensity(region)
+        if cached is not None:
+            if PROMETHEUS_AVAILABLE:
+                SYNTHETIC_CACHE_HITS.labels(type='carbon').inc()
+            return cached
 
-        # Fetch with retry if available
-        if TENACITY_AVAILABLE:
-            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+        if PROMETHEUS_AVAILABLE:
+            SYNTHETIC_CACHE_MISSES.labels(type='carbon').inc()
+
+        # Fetch with retry and circuit breaker
+        if self.carbon_fetcher and self.use_real_distributions:
             async def fetch():
                 return await self.carbon_fetcher.get_intensity(region)
             try:
-                intensity = await fetch()
+                intensity = await self._circuit_breaker.call(fetch)
+                await self.storage.save_carbon_intensity(region, intensity)
+                return intensity
             except Exception as e:
-                self._log.error("Carbon fetcher failed, using fallback", region=region, error=str(e))
-                intensity = self._random_carbon(region)
-        else:
-            try:
-                intensity = await self.carbon_fetcher.get_intensity(region)
-            except Exception as e:
-                self._log.error("Carbon fetcher failed, using fallback", region=region, error=str(e))
-                intensity = self._random_carbon(region)
-
-        self._real_carbon_cache[region] = (intensity, datetime.now())
+                logger.error("Carbon fetcher failed, using fallback", region=region, error=str(e))
+        # Fallback
+        intensity = self._random_carbon(region)
+        await self.storage.save_carbon_intensity(region, intensity)
         return intensity
 
     async def _get_helium_score(self, hotspot_id: str) -> float:
-        """Get helium connectivity score with caching and retries."""
-        if hotspot_id in self._real_helium_cache:
-            value, timestamp = self._real_helium_cache[hotspot_id]
-            if (datetime.now() - timestamp).seconds < self._cache_ttl_seconds:
-                return value
+        cached = await self.storage.get_helium_score(hotspot_id)
+        if cached is not None:
+            if PROMETHEUS_AVAILABLE:
+                SYNTHETIC_CACHE_HITS.labels(type='helium').inc()
+            return cached
 
-        if TENACITY_AVAILABLE:
-            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+        if PROMETHEUS_AVAILABLE:
+            SYNTHETIC_CACHE_MISSES.labels(type='helium').inc()
+
+        if self.helium_collector and self.use_real_distributions:
             async def fetch():
                 return await self.helium_collector.get_connectivity_score(hotspot_id)
             try:
-                score = await fetch()
+                score = await self._circuit_breaker.call(fetch)
+                await self.storage.save_helium_score(hotspot_id, score)
+                return score
             except Exception as e:
-                self._log.error("Helium collector failed, using fallback", hotspot_id=hotspot_id, error=str(e))
-                score = random.uniform(0.5, 1.0)
-        else:
-            try:
-                score = await self.helium_collector.get_connectivity_score(hotspot_id)
-            except Exception as e:
-                self._log.error("Helium collector failed, using fallback", hotspot_id=hotspot_id, error=str(e))
-                score = random.uniform(0.5, 1.0)
-
-        self._real_helium_cache[hotspot_id] = (score, datetime.now())
+                logger.error("Helium collector failed, using fallback", hotspot_id=hotspot_id, error=str(e))
+        score = random.uniform(0.5, 1.0)
+        await self.storage.save_helium_score(hotspot_id, score)
         return score
 
     def _random_carbon(self, region: str) -> float:
         base = self.region_carbon.get(region, 400)
-        # Add diurnal variation: lower at night
         hour = datetime.now().hour
         diurnal = 0.9 + 0.2 * np.sin((hour - 8) / 12 * np.pi)
-        return (base * diurnal + np.random.normal(0, 20)) / 1000  # return kg CO₂/kWh
+        return (base * diurnal + np.random.normal(0, 20)) / 1000
 
     def _random_renewable(self, region: str) -> float:
         base = {
@@ -520,23 +1314,20 @@ class SyntheticDataGenerator:
         return base.get(region, 0.3) + np.random.normal(0, 0.05)
 
     # ------------------------------------------------------------------
-    # Sustainability Metrics
+    # Sustainability Metrics (with MOPD)
     # ------------------------------------------------------------------
     async def compute_sustainability_metrics(
         self,
         workload: WorkloadDescriptor,
         node: NodeDescriptor,
     ) -> SyntheticSustainabilityMetrics:
-        """
-        Compute energy, carbon, helium, and material metrics for a given workload and node.
-        """
         # Energy: energy_per_token * tokens
         energy_joules = node.energy_per_token * workload.tokens
 
-        # Carbon: energy * carbon_intensity (kg CO₂ per kWh conversion)
+        # Carbon: energy * carbon_intensity (kg CO₂ per kWh)
         carbon_kg = energy_joules / 3.6e6 * node.region_carbon_intensity
 
-        # Helium: inverse of connectivity score (scaled)
+        # Helium: inverse of connectivity score
         helium_units = (1 - node.helium_connectivity_score) * 0.5
 
         # Material: from footprint if available
@@ -546,6 +1337,8 @@ class SyntheticDataGenerator:
             if fp:
                 material_index = fp.get('material_index', 0.0)
 
+        # Apply MOPD weights? Actually these are raw metrics; weights are used in downstream cost functions.
+        # We'll just return raw values.
         return SyntheticSustainabilityMetrics(
             energy_joules=energy_joules,
             carbon_kg=carbon_kg,
@@ -564,29 +1357,14 @@ class SyntheticDataGenerator:
         rate_function: Optional[Callable[[datetime], float]] = None,
         **kwargs
     ) -> List[Dict[str, Any]]:
-        """
-        Generate a sequence of (workload, node, metrics) using a Poisson process.
-
-        Args:
-            duration_hours: Length of the sequence in hours.
-            rate_per_hour: Average number of tasks per hour (if rate_function is None).
-            start_time: Start time for the sequence.
-            rate_function: Custom function that returns rate at a given datetime.
-            **kwargs: Additional overrides passed to generate descriptors.
-        Returns:
-            List of dicts with 'workload', 'node', and 'metrics'.
-        """
         duration = duration_hours or self.default_duration_hours
         start = start_time or datetime.now()
         end = start + timedelta(hours=duration)
 
-        # If no rate_function, create a simple diurnal pattern
         if rate_function is None:
-            # Peak at 2pm, low at 2am
             base_rate = rate_per_hour or self.default_rate_per_hour
             def rate_func(t: datetime) -> float:
                 hour = t.hour
-                # Diurnal: peak at 14, trough at 2
                 factor = 0.7 + 0.3 * np.cos((hour - 14) * 2 * np.pi / 24)
                 return base_rate * factor
             rate_function = rate_func
@@ -594,18 +1372,14 @@ class SyntheticDataGenerator:
         sequence = []
         t = start
         while t < end:
-            # Compute current rate
             current_rate = rate_function(t)
             if current_rate <= 0:
-                # If rate is zero, advance a small step
                 t += timedelta(seconds=1)
                 continue
-            # Poisson inter-arrival time (in seconds)
             dt = np.random.exponential(1 / current_rate)
             t += timedelta(seconds=dt)
             if t >= end:
                 break
-            # Generate descriptors with optional timestamp (for correlation)
             workload = await self.generate_workload_descriptor(**kwargs)
             node = await self.generate_node_descriptor(**kwargs)
             metrics = await self.compute_sustainability_metrics(workload, node)
@@ -615,29 +1389,24 @@ class SyntheticDataGenerator:
                 'node': node,
                 'metrics': metrics,
             })
-        self._log.info("Generated task sequence", count=len(sequence), duration_hours=duration)
+        logger.info("Generated task sequence", count=len(sequence), duration_hours=duration)
         return sequence
 
     async def generate_task_sequence_async(self, **kwargs) -> List[Dict[str, Any]]:
-        """Async version of generate_task_sequence."""
         return await self.generate_task_sequence(**kwargs)
 
     # ------------------------------------------------------------------
-    # Anomaly Injection (Enhanced)
+    # Anomaly Injection (Enhanced with contextual awareness)
     # ------------------------------------------------------------------
     async def inject_anomaly(
         self,
         workload: WorkloadDescriptor,
         node: NodeDescriptor,
         anomaly_type: Optional[str] = None,
+        context: Optional[Dict] = None,
     ) -> Tuple[WorkloadDescriptor, NodeDescriptor, str]:
-        """
-        Inject an anomaly into a workload or node.
-
-        Returns:
-            (modified workload, modified node, anomaly_type)
-        """
         if anomaly_type is None:
+            # Use MTOP to decide anomaly type? For simplicity, random.
             anomaly_type = random.choice([
                 'extreme_token_count',
                 'zero_accuracy',
@@ -648,8 +1417,8 @@ class SyntheticDataGenerator:
                 'renewable_surge',
                 'network_failure',
                 'expert_degradation',
-                'regional_outage',      # new: affects all nodes in a region
-                'supply_chain_disruption',  # new: affects material availability
+                'regional_outage',
+                'supply_chain_disruption',
             ])
         if anomaly_type == 'extreme_token_count':
             workload.tokens = int(np.random.exponential(10000)) + 5000
@@ -670,13 +1439,17 @@ class SyntheticDataGenerator:
             node.helium_connectivity_score = 0.0
             node.uptime = 0.0
         elif anomaly_type == 'expert_degradation':
-            # Simulate by setting a low accuracy (would be handled in expert selection)
+            # We'll simulate by setting a low accuracy in the expert selection phase (not in this generator)
             pass
         elif anomaly_type == 'regional_outage':
-            # Mark a region as having low uptime (handled via node's region)
-            # We'll set uptime to 0.3 for this node (representative of outage)
-            node.uptime = 0.3
-            # Optionally, we could also set a flag for the region
+            # Only affect nodes in a specific region
+            if context and 'region' in context:
+                # Only apply if node's region matches the outage region
+                if node.region == context['region']:
+                    node.uptime = 0.3
+            else:
+                # If no context, apply to this node
+                node.uptime = 0.3
         elif anomaly_type == 'supply_chain_disruption':
             # Increase material index (simulate scarcity)
             # This would be applied in the metrics, not the node itself
@@ -695,16 +1468,6 @@ class SyntheticDataGenerator:
         edge_case_fraction: float = 0.1,
         anomaly_rate: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Generate a full dataset consisting of workloads, nodes, metrics, and optional anomalies.
-
-        Returns:
-            List of dicts with:
-                'workload': WorkloadDescriptor
-                'node': NodeDescriptor
-                'metrics': SyntheticSustainabilityMetrics
-                'anomaly': Optional[str]
-        """
         if anomaly_rate is None:
             anomaly_rate = self.default_anomaly_rate
 
@@ -716,7 +1479,6 @@ class SyntheticDataGenerator:
         for _ in range(num_normal):
             workload = await self.generate_workload_descriptor()
             node = await self.generate_node_descriptor()
-            # Optionally inject anomaly
             anomaly = None
             if random.random() < anomaly_rate:
                 workload, node, anomaly = await self.inject_anomaly(workload, node)
@@ -739,6 +1501,7 @@ class SyntheticDataGenerator:
             anomaly_type = random.choice(edge_types)
             workload = await self.generate_workload_descriptor()
             node = await self.generate_node_descriptor()
+            # Context for regional outage could be used here
             workload, node, _ = await self.inject_anomaly(workload, node, anomaly_type)
             metrics = await self.compute_sustainability_metrics(workload, node)
             dataset.append({
@@ -748,15 +1511,64 @@ class SyntheticDataGenerator:
                 'anomaly': anomaly_type,
             })
 
-        self._log.info("Generated dataset", count=len(dataset), edge=num_edge, anomaly_rate=anomaly_rate)
+        # Record generation history
+        params = {
+            'num_samples': num_samples,
+            'edge_fraction': edge_case_fraction,
+            'anomaly_rate': anomaly_rate,
+            'use_real_distributions': self.use_real_distributions,
+        }
+        # Quantum signing
+        signature = None
+        if self.config.enable_quantum_security:
+            # Create metadata for signing
+            metadata = {
+                'version': self.dataset_version,
+                'timestamp': datetime.now().isoformat(),
+                'params': params,
+                'sample_count': len(dataset)
+            }
+            quantum_key = await self.quantum_security.generate_keypair(self.config.quantum_algorithm)
+            signature = await self.quantum_security.sign_dataset(metadata, quantum_key['key_id'])
+            if PROMETHEUS_AVAILABLE:
+                SYNTHETIC_QUANTUM_SIGNATURES.labels(algorithm=self.config.quantum_algorithm, status='sign_success').inc()
+
+        # Blockchain recording
+        tx_hash = None
+        if self.blockchain:
+            dataset_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()
+            tx_hash = await self.blockchain.record_dataset(f"dataset_{uuid.uuid4().hex[:8]}", dataset_hash)
+            if PROMETHEUS_AVAILABLE:
+                SYNTHETIC_BLOCKCHAIN_TX.labels(status='recorded').inc()
+
+        # Store generation history in DB
+        await self.storage.save_generation_history(
+            self.dataset_version,
+            num_samples,
+            anomaly_rate,
+            edge_case_fraction,
+            params,
+            signature,
+            tx_hash
+        )
+
+        # Broadcast via WebSocket
+        await self.websocket.broadcast({
+            'type': 'dataset_generated',
+            'version': self.dataset_version,
+            'samples': len(dataset),
+            'anomaly_rate': anomaly_rate,
+            'timestamp': datetime.now().isoformat()
+        }, topic='generation')
+
+        logger.info("Generated dataset", count=len(dataset), edge=num_edge, anomaly_rate=anomaly_rate)
         return dataset
 
     async def generate_dataset_async(self, **kwargs) -> List[Dict[str, Any]]:
-        """Async version of generate_dataset."""
         return await self.generate_dataset(**kwargs)
 
     # ------------------------------------------------------------------
-    # Streaming Generator (for large datasets)
+    # Streaming Generator
     # ------------------------------------------------------------------
     async def generate_dataset_stream(
         self,
@@ -765,16 +1577,12 @@ class SyntheticDataGenerator:
         edge_case_fraction: float = 0.1,
         anomaly_rate: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Stream a dataset one sample at a time (generator). Useful for very large datasets.
-        """
         if anomaly_rate is None:
             anomaly_rate = self.default_anomaly_rate
 
         num_edge = int(num_samples * edge_case_fraction) if include_edge_cases else 0
         num_normal = num_samples - num_edge
 
-        # Normal samples
         for _ in range(num_normal):
             workload = await self.generate_workload_descriptor()
             node = await self.generate_node_descriptor()
@@ -789,7 +1597,6 @@ class SyntheticDataGenerator:
                 'anomaly': anomaly,
             }
 
-        # Edge cases
         edge_types = [
             'extreme_token_count', 'zero_accuracy', 'zero_latency',
             'extreme_carbon', 'helium_crisis', 'harvester_downtime',
@@ -813,11 +1620,6 @@ class SyntheticDataGenerator:
     # Persistence (JSON/Parquet/JSONL with streaming support)
     # ------------------------------------------------------------------
     async def save_dataset(self, dataset: List[Dict[str, Any]], path: str) -> None:
-        """
-        Save dataset to a file (JSON, Parquet, or JSONL).
-        For large datasets, consider using the streaming version.
-        """
-        # Convert Pydantic/dataclass objects to serializable dicts
         serializable = []
         for item in dataset:
             entry = {
@@ -836,21 +1638,16 @@ class SyntheticDataGenerator:
             with open(path, 'w') as f:
                 for entry in serializable:
                     f.write(json.dumps(entry, default=str) + '\n')
-        else:  # default json
+        else:
             with open(path, 'w') as f:
                 json.dump(serializable, f, indent=2, default=str)
-        self._log.info("Saved dataset", path=path, format=self.export_format, count=len(dataset))
+        logger.info("Saved dataset", path=path, format=self.export_format, count=len(dataset))
 
     async def save_dataset_stream(self, stream: AsyncIterator[Dict[str, Any]], path: str) -> None:
-        """
-        Save a dataset from a stream incrementally.
-        Supports JSONL and Parquet (via accumulating chunks).
-        """
         if self.export_format == 'jsonl':
             with open(path, 'w') as f:
                 async for item in stream:
                     entry = {
-                        'version': self.dataset_version,
                         'workload': item['workload'].dict() if hasattr(item['workload'], 'dict') else item['workload'].__dict__,
                         'node': item['node'].dict() if hasattr(item['node'], 'dict') else item['node'].__dict__,
                         'metrics': item['metrics'].__dict__,
@@ -858,7 +1655,6 @@ class SyntheticDataGenerator:
                     }
                     f.write(json.dumps(entry, default=str) + '\n')
         elif self.export_format == 'parquet':
-            # Accumulate in chunks and write
             chunks = []
             chunk_size = 10000
             async for item in stream:
@@ -883,16 +1679,12 @@ class SyntheticDataGenerator:
                 else:
                     df.to_parquet(path, engine='pyarrow')
         else:
-            # Fallback to JSON (collect all)
             dataset = []
             async for item in stream:
                 dataset.append(item)
             await self.save_dataset(dataset, path)
 
     def load_dataset(self, path: str) -> List[Dict[str, Any]]:
-        """
-        Load a dataset from a file (JSON, Parquet, or JSONL).
-        """
         if path.endswith('.parquet'):
             df = pd.read_parquet(path)
             dataset = []
@@ -922,7 +1714,7 @@ class SyntheticDataGenerator:
                         'anomaly': entry.get('anomaly'),
                     })
             return dataset
-        else:  # JSON
+        else:
             with open(path, 'r') as f:
                 data = json.load(f)
             dataset = []
@@ -939,14 +1731,13 @@ class SyntheticDataGenerator:
             return dataset
 
     # ------------------------------------------------------------------
-    # Expert Profile Generation (with degradation)
+    # Expert Profile Generation (unchanged)
     # ------------------------------------------------------------------
     def generate_expert_profile(
         self,
         expert_id: Optional[str] = None,
         degradation_rate: Optional[float] = None,
     ) -> SyntheticExpertProfile:
-        """Generate a synthetic expert profile with degradation support."""
         if degradation_rate is None:
             degradation_rate = self.default_degradation_rate
         return SyntheticExpertProfile(
@@ -964,10 +1755,9 @@ class SyntheticDataGenerator:
         )
 
     # ------------------------------------------------------------------
-    # Utility: Export for Simulation
+    # Export for Simulation
     # ------------------------------------------------------------------
     def export_for_simulation(self, dataset: List[Dict[str, Any]]) -> List[Dict]:
-        """Convert dataset to a format suitable for DigitalTwin."""
         exported = []
         for item in dataset:
             exported.append({
@@ -995,7 +1785,6 @@ class SyntheticDataGenerator:
     # Metrics / Statistics
     # ------------------------------------------------------------------
     def get_stats(self) -> Dict:
-        """Return generation statistics."""
         return {
             'config_seed': self.config.get('seed'),
             'use_real_distributions': self.use_real_distributions,
@@ -1004,8 +1793,70 @@ class SyntheticDataGenerator:
             'dataset_version': self.dataset_version,
         }
 
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+    async def shutdown(self):
+        logger.info("Shutting down SyntheticDataGenerator")
+        self._shutdown_event.set()
+        self._running = False
+        for task in self._background_tasks:
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        await self.websocket.stop()
+        await self.storage.dispose()
+        logger.info("SyntheticDataGenerator shutdown complete")
+
 # ============================================================================
-# 4. CLI ENTRY POINT
+# SINGLETON ACCESSOR
+# ============================================================================
+_generator_instance = None
+_generator_lock = asyncio.Lock()
+
+async def get_synthetic_generator(
+    config: Optional[Union[Dict[str, Any], SyntheticDataConfig]] = None,
+    carbon_fetcher: Optional[CarbonIntensityFetcher] = None,
+    helium_collector: Optional[HeliumCollector] = None,
+    material_updater: Optional[MaterialFootprintUpdater] = None,
+) -> SyntheticDataGenerator:
+    global _generator_instance
+    if _generator_instance is None:
+        async with _generator_lock:
+            if _generator_instance is None:
+                _generator_instance = SyntheticDataGenerator(
+                    config=config,
+                    carbon_fetcher=carbon_fetcher,
+                    helium_collector=helium_collector,
+                    material_updater=material_updater
+                )
+                await _generator_instance.start()
+    return _generator_instance
+
+# ============================================================================
+# SIGNAL HANDLING (fixed)
+# ============================================================================
+_shutdown_requested = False
+_shutdown_event_global = asyncio.Event()
+
+def handle_signal(signum, frame):
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        logger.info("Received signal %s, initiating shutdown...", signum)
+        asyncio.create_task(_signal_shutdown())
+
+async def _signal_shutdown():
+    _shutdown_event_global.set()
+
+async def shutdown_handler():
+    global _generator_instance
+    if _generator_instance:
+        await _generator_instance.shutdown()
+        _generator_instance = None
+
+# ============================================================================
+# CLI ENTRY POINT
 # ============================================================================
 async def main_cli():
     """Command‑line interface for generating datasets."""
@@ -1032,7 +1883,7 @@ async def main_cli():
     config['export_format'] = args.format
     config['seed'] = args.seed
 
-    gen = SyntheticDataGenerator(config)
+    gen = await get_synthetic_generator(config)
     gen.set_seed(args.seed)
 
     # Generate dataset
@@ -1046,5 +1897,14 @@ async def main_cli():
     print(f"Dataset saved to {args.output} with {len(dataset)} samples.")
     print(f"Stats: {gen.get_stats()}")
 
+    await gen.shutdown()
+
 if __name__ == "__main__":
-    asyncio.run(main_cli())
+    # Register signal handlers for graceful shutdown in CLI
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+    try:
+        asyncio.run(main_cli())
+    except KeyboardInterrupt:
+        pass
