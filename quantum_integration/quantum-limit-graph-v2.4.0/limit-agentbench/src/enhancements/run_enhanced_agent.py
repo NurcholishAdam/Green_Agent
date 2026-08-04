@@ -1,12 +1,13 @@
 # =============================================================================
 # FILE: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/run_enhanced_agent.py
-# VERSION: 8.0.0 (Green‑Agent Enterprise – Full Sustainability Integration)
+# VERSION: 8.1.0 (Green‑Agent Enterprise – Full Sustainability Integration + Distillation)
 # =============================================================================
 """
-Enhanced Green Agent Runner v8.0.0 – Complete Self‑Contained Implementation
+Enhanced Green Agent Runner v8.1.0 – Complete Self‑Contained Implementation
+With Multi‑Teacher On‑Policy Distillation for Autonomous Optimization
 
 All core modules: Storage with AES-256-GCM encryption, QuantumSecurity, Blockchain,
-AutonomousOptimizer (multi-armed bandit), MultiCloudDistribution (real SDKs),
+DistillationOptimizer (replaces bandit), MultiCloudDistribution (real SDKs),
 RunnerState, CircuitBreaker, RL (DQN), TaskQueue, Dashboard, and the main
 EnhancedGreenAgentRunner with full sustainability integrations.
 
@@ -31,6 +32,8 @@ import gc
 import heapq
 import signal
 import logging
+from abc import ABC, abstractmethod
+import numpy as np
 
 # ---------- Optional external dependencies ----------
 try:
@@ -98,10 +101,10 @@ except ImportError:
     PYDANTIC_AVAILABLE = False
 
 try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
+    from sklearn.ensemble import RandomForestClassifier
+    SKLEARN_AVAILABLE = True
 except ImportError:
-    NUMPY_AVAILABLE = False
+    SKLEARN_AVAILABLE = False
 
 import aiohttp
 
@@ -128,7 +131,7 @@ logger = structlog.get_logger(__name__)
 # Audit logger (rotating file)
 import logging.handlers
 audit_logger = logging.getLogger('agent_audit')
-audit_handler = logging.handlers.RotatingFileHandler('agent_audit_v8.log', maxBytes=50*1024*1024, backupCount=10)
+audit_handler = logging.handlers.RotatingFileHandler('agent_audit_v8_1.log', maxBytes=50*1024*1024, backupCount=10)
 audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
@@ -194,6 +197,11 @@ if PYDANTIC_AVAILABLE:
         K8S_SCALING_CARBON_THRESHOLD: float = Field(0.3, env='K8S_SCALING_CARBON_THRESHOLD')
         CHAOS_INJECT_INTERVAL: int = Field(300, env='CHAOS_INJECT_INTERVAL')
         CHAOS_FAILURE_RATE: float = Field(0.01, env='CHAOS_FAILURE_RATE')
+        # NEW: Distillation parameters
+        DISTILLATION_EPSILON: float = Field(0.1, env='DISTILLATION_EPSILON')
+        DISTILLATION_TRAIN_EVERY: int = Field(10, env='DISTILLATION_TRAIN_EVERY')
+        DISTILLATION_REPLAY_SIZE: int = Field(2000, env='DISTILLATION_REPLAY_SIZE')
+        DISTILLATION_LEARNING_RATE: float = Field(0.01, env='DISTILLATION_LEARNING_RATE')
 
         @validator('FALLBACK_PIPELINES')
         @classmethod
@@ -273,6 +281,10 @@ else:
         K8S_SCALING_CARBON_THRESHOLD = float(os.getenv('K8S_SCALING_CARBON_THRESHOLD', '0.3'))
         CHAOS_INJECT_INTERVAL = int(os.getenv('CHAOS_INJECT_INTERVAL', '300'))
         CHAOS_FAILURE_RATE = float(os.getenv('CHAOS_FAILURE_RATE', '0.01'))
+        DISTILLATION_EPSILON = float(os.getenv('DISTILLATION_EPSILON', '0.1'))
+        DISTILLATION_TRAIN_EVERY = int(os.getenv('DISTILLATION_TRAIN_EVERY', '10'))
+        DISTILLATION_REPLAY_SIZE = int(os.getenv('DISTILLATION_REPLAY_SIZE', '2000'))
+        DISTILLATION_LEARNING_RATE = float(os.getenv('DISTILLATION_LEARNING_RATE', '0.01'))
 
         @classmethod
         def get_master_key(cls) -> bytes:
@@ -302,6 +314,10 @@ if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
     CARBON_INTENSITY = Gauge('agent_carbon_intensity', 'Current carbon intensity (gCO₂/kWh)', registry=REGISTRY)
     ANOMALY_ALERTS = Counter('agent_anomaly_alerts_total', 'Anomaly alerts', ['node'], registry=REGISTRY)
     PREDICTIVE_MAINTENANCE_RECS = Counter('agent_pm_recommendations_total', 'Predictive maintenance recommendations', ['action'], registry=REGISTRY)
+    # Distillation metrics
+    DISTILLATION_STRATEGY = Counter('agent_distillation_strategy_selected', 'Strategy selected by distillation', ['strategy'], registry=REGISTRY)
+    DISTILLATION_REWARD = Histogram('agent_distillation_reward', 'Reward received per task', registry=REGISTRY)
+    DISTILLATION_BUFFER_SIZE = Gauge('agent_distillation_buffer_size', 'Replay buffer size', registry=REGISTRY)
 
 # Constants
 MAX_TASK_HISTORY = 10000
@@ -1164,120 +1180,268 @@ class BlockchainRunnerVerification:
         }
 
 # ============================================================================
-# MODULE 3: AUTONOMOUS RUNNER OPTIMIZER (with multi-armed bandit)
+# NEW: Distillation Components for Runner Optimization
 # ============================================================================
-class AutonomousRunnerOptimizer:
-    """
-    Autonomous runner optimization using a multi-armed bandit (ε-greedy) to
-    select strategies based on historical rewards.
-    """
+@dataclass
+class RunnerOptimizationState:
+    """Rich context for the multi‑teacher distillation agent."""
+    # System metrics
+    degradation_tier: int
+    token_balance: float
+    carbon_gradient: float
+    carbon_intensity: float
+    queue_size: int
+    # Task-specific
+    task_priority: int
+    task_urgency: str
+    estimated_energy: float
+    estimated_carbon: float
+    # Historical
+    recent_success_rate: float
+    avg_latency_ms: float
+    avg_energy_joules: float
+    # Environment
+    hour_of_day: int
+    is_weekend: bool
 
-    def __init__(self, storage: Storage, state: 'RunnerState'):
+    def to_feature_vector(self) -> np.ndarray:
+        """Convert to 14‑dim numeric feature vector."""
+        features = [
+            min(self.degradation_tier / 10.0, 1.0),
+            min(self.token_balance / 2000.0, 1.0),
+            self.carbon_gradient,
+            min(self.carbon_intensity / 1000.0, 1.0),
+            min(self.queue_size / 50.0, 1.0),
+            min(self.task_priority / 5.0, 1.0),
+            1.0 if self.task_urgency == 'critical' else 0.5 if self.task_urgency == 'high' else 0.0,
+            min(self.estimated_energy / 1000.0, 1.0),
+            min(self.estimated_carbon / 0.1, 1.0),
+            self.recent_success_rate,
+            min(self.avg_latency_ms / 10000.0, 1.0),
+            min(self.avg_energy_joules / 1000.0, 1.0),
+            self.hour_of_day / 24.0,
+            1.0 if self.is_weekend else 0.0,
+        ]
+        return np.array(features, dtype=np.float32)
+
+
+# Teacher abstract base
+class Teacher(ABC):
+    @abstractmethod
+    def predict(self, state: RunnerOptimizationState) -> np.ndarray:
+        """Return probability vector over 5 strategies."""
+        pass
+
+    @abstractmethod
+    def confidence(self, state: RunnerOptimizationState) -> float:
+        """Return confidence in prediction [0,1]."""
+        pass
+
+
+class RunnerRuleBasedTeacher(Teacher):
+    """Rule‑based expert: carbon‑aware, degradation‑aware, queue‑aware."""
+    ACTION_SPACE = ['performance', 'carbon', 'cost', 'hybrid', 'adaptive']
+
+    def predict(self, state: RunnerOptimizationState) -> np.ndarray:
+        probs = np.ones(5) * 0.1
+        if state.carbon_intensity > 500:
+            probs[1] = 0.8   # carbon strategy
+        elif state.degradation_tier <= 2:
+            probs[0] = 0.7   # performance (survival mode)
+        elif state.queue_size > 20:
+            probs[0] = 0.6   # performance (clear queue)
+        elif state.task_urgency == 'critical':
+            probs[0] = 0.7   # performance
+        elif state.token_balance < 200:
+            probs[2] = 0.6   # cost (conserve tokens)
+        return probs / probs.sum()
+
+    def confidence(self, state: RunnerOptimizationState) -> float:
+        if state.carbon_intensity > 500:
+            return 0.6
+        elif state.degradation_tier <= 2:
+            return 0.5
+        return 0.4
+
+
+class RunnerHistoricalMLTeacher(Teacher):
+    """Offline trained classifier on historical optimal actions."""
+    def __init__(self, model_path: Optional[str] = None):
+        self.model = None
+        if model_path and Path(model_path).exists():
+            import joblib
+            self.model = joblib.load(model_path)
+
+    def predict(self, state: RunnerOptimizationState) -> np.ndarray:
+        if self.model is None:
+            return np.ones(5) / 5
+        x = state.to_feature_vector().reshape(1, -1)
+        probs = self.model.predict_proba(x)[0]
+        return probs
+
+    def confidence(self, state: RunnerOptimizationState) -> float:
+        return 0.7 if self.model is not None else 0.0
+
+
+class RunnerStatefulQTeacher(Teacher):
+    """Linear Q‑learning with state features."""
+    def __init__(self, storage: Storage, lr: float = 0.1):
         self.storage = storage
-        self.state = state
-        self._lock = asyncio.Lock()
-        self.strategies = ['performance', 'carbon', 'cost', 'hybrid', 'adaptive']
-        self._q_values = {s: 0.0 for s in self.strategies}
-        self._counts = {s: 0 for s in self.strategies}
-        self.epsilon = 0.1
-        self._load_bandit_state()
+        self.lr = lr
+        self.weights = np.zeros((14, 5))  # 14 features, 5 actions
+        self._load_state()
 
-    def _load_bandit_state(self):
-        q_str = self.storage.get_state('bandit_q_values')
-        if q_str:
-            self._q_values = json.loads(q_str)
-        c_str = self.storage.get_state('bandit_counts')
-        if c_str:
-            self._counts = json.loads(c_str)
+    def _load_state(self):
+        w = self.storage.get_state('q_teacher_weights')
+        if w:
+            self.weights = np.array(json.loads(w))
 
-    def _save_bandit_state(self):
-        self.storage.save_state('bandit_q_values', json.dumps(self._q_values))
-        self.storage.save_state('bandit_counts', json.dumps(self._counts))
+    def _save_state(self):
+        self.storage.save_state('q_teacher_weights', json.dumps(self.weights.tolist()))
 
-    async def optimize_runner(self, current_state: Dict, strategy: str = None) -> Dict:
-        if strategy is None:
-            if random.random() < self.epsilon:
-                selected = random.choice(self.strategies)
-            else:
-                max_q = max(self._q_values.values())
-                best = [s for s, q in self._q_values.items() if q == max_q]
-                selected = random.choice(best)
+    def predict(self, state: RunnerOptimizationState) -> np.ndarray:
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        exp_q = np.exp(q - np.max(q))
+        return exp_q / exp_q.sum()
+
+    def confidence(self, state: RunnerOptimizationState) -> float:
+        return 0.5
+
+    def update(self, state: RunnerOptimizationState, action: int, reward: float):
+        x = state.to_feature_vector()
+        q_current = np.dot(x, self.weights[:, action])
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._save_state()
+
+
+class DistillationStudent:
+    """Linear softmax student updated via distillation + policy gradient."""
+    def __init__(self, feature_dim: int = 14, n_classes: int = 5, lr: float = 0.01):
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, state_vector: np.ndarray) -> np.ndarray:
+        logits = state_vector @ self.weights + self.biases
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
+        current_probs = self.predict_proba(state_vector)
+        logits = state_vector @ self.weights + self.biases
+
+        # Distillation gradient (KL divergence)
+        grad_distill = -(teacher_probs - current_probs)
+
+        # Policy gradient (REINFORCE)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        grad_rl = -reward * (one_hot - current_probs)
+
+        grad = distill_weight * grad_distill + rl_weight * grad_rl
+        self.weights -= self.lr * np.outer(state_vector, grad)
+        self.biases -= self.lr * grad
+        self.counter += 1
+
+
+class ReplayBuffer:
+    def __init__(self, max_size: int = 2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state_vec: np.ndarray, action: int, reward: float,
+             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+
+    def sample(self, batch_size: int = 32):
+        if len(self.buffer) < batch_size:
+            batch = list(self.buffer)
         else:
-            selected = strategy
+            batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        return (np.array(states), actions, np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
 
-        reward = await self._compute_reward(selected, current_state)
+    def __len__(self):
+        return len(self.buffer)
 
-        async with self._lock:
-            self._counts[selected] += 1
-            alpha = 1.0 / self._counts[selected]
-            self._q_values[selected] += alpha * (reward - self._q_values[selected])
-            self._save_bandit_state()
 
-        result = {
-            'action': f'{selected}_optimization',
-            'selected_strategy': selected,
-            'reward': reward,
-            'q_values': self._q_values,
-            'recommendation': self._generate_recommendation(selected, current_state)
-        }
+class DistillationRunnerOptimizer:
+    """
+    Replaces AutonomousRunnerOptimizer with multi‑teacher on‑policy distillation.
+    """
+    ACTION_SPACE = ['performance', 'carbon', 'cost', 'hybrid', 'adaptive']
 
-        self.storage.save_optimisation(selected, result)
-        await self._apply_optimization(selected, result)
+    def __init__(self, storage: Storage, config: Config):
+        self.storage = storage
+        self.config = config
+        self.student = DistillationStudent(lr=config.DISTILLATION_LEARNING_RATE)
+        self.teachers: List[Teacher] = [
+            RunnerRuleBasedTeacher(),
+            RunnerHistoricalMLTeacher(),  # optionally load model
+            RunnerStatefulQTeacher(storage)
+        ]
+        self.replay_buffer = ReplayBuffer(max_size=config.DISTILLATION_REPLAY_SIZE)
+        self.epsilon = config.DISTILLATION_EPSILON
+        self.train_every = config.DISTILLATION_TRAIN_EVERY
+        self.counter = 0
 
-        return result
+    async def select_strategy(self, state: RunnerOptimizationState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
 
-    async def _compute_reward(self, strategy: str, state: Dict) -> float:
-        success_rate = state.get('success_rate', 0.5)
-        carbon = state.get('carbon_intensity', 0.5)
-        cost = state.get('cost_budget', 0.5)
-        runner_quality = state.get('runner_quality', 0.5)
-
-        if strategy == 'performance':
-            reward = runner_quality * 0.8 + success_rate * 0.2
-        elif strategy == 'carbon':
-            reward = (1 - carbon) * 0.8 + success_rate * 0.2
-        elif strategy == 'cost':
-            reward = (1 - cost) * 0.8 + success_rate * 0.2
-        elif strategy == 'hybrid':
-            reward = (runner_quality + (1 - carbon) + (1 - cost)) / 3 * 0.7 + success_rate * 0.3
-        elif strategy == 'adaptive':
-            history = self.storage.get_recent_optimisations(20)
-            if history:
-                avg_success = sum(h['result'].get('reward', 0) for h in history) / len(history)
-                reward = avg_success * 0.6 + runner_quality * 0.4
-            else:
-                reward = 0.5
+        # Ensemble teachers
+        teacher_probs = np.zeros(5)
+        total_conf = 0.0
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            conf = teacher.confidence(state)
+            teacher_probs += prob * conf
+            total_conf += conf
+        if total_conf > 0:
+            teacher_probs /= total_conf
         else:
-            reward = 0.5
-        return reward
+            teacher_probs = np.ones(5) / 5
 
-    def _generate_recommendation(self, strategy: str, state: Dict) -> str:
-        if strategy == 'performance':
-            return "Focus on maximising task success rate and throughput."
-        elif strategy == 'carbon':
-            return "Prioritise carbon-aware task scheduling and pipeline selection."
-        elif strategy == 'cost':
-            return "Optimise resource usage across pipelines."
-        elif strategy == 'hybrid':
-            return "Balanced approach across performance, carbon, and cost."
-        elif strategy == 'adaptive':
-            return "Adjust dynamically based on recent runner performance trends."
-        return "Maintain current strategy with monitoring."
+        student_probs = self.student.predict_proba(state_vec)
 
-    async def _apply_optimization(self, strategy: str, result: Dict):
-        if strategy == 'performance':
-            self.state.success_threshold *= 1.02
-        elif strategy == 'carbon':
-            self.state.carbon_budget_remaining *= 0.95
+        if exploration and random.random() < self.epsilon:
+            action_idx = random.randint(0, 4)
+        else:
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = np.argmax(combined)
 
-    def get_optimization_stats(self) -> Dict:
+        return self.ACTION_SPACE[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+        self.counter += 1
+
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
+            batch = self.replay_buffer.sample(8)
+            states, actions, rewards, _, teacher_probs_batch = batch
+            for i in range(len(states)):
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+
+        # Update StatefulQTeacher if we have the original state (done in main loop)
+        # We'll update it separately in process_task with the actual state.
+
+    def get_stats(self) -> Dict:
         return {
-            'total_optimizations': len(self.storage.get_recent_optimisations(1000)),
-            'strategies': self.strategies,
-            'q_values': self._q_values,
-            'counts': self._counts,
-            'recent_optimizations': self.storage.get_recent_optimisations(5)
+            'student_counter': self.student.counter,
+            'buffer_size': len(self.replay_buffer),
+            'weights_norm': float(np.linalg.norm(self.student.weights))
         }
+
+
+# ============================================================================
+# MODULE 3: AUTONOMOUS RUNNER OPTIMIZER (replaced by distillation)
+# ============================================================================
+# (The original AutonomousRunnerOptimizer class is removed; the new optimizer is used.)
 
 # ============================================================================
 # MODULE 4: MULTI-CLOUD RUNNER DISTRIBUTION (with real SDK replication)
@@ -1839,7 +2003,7 @@ class WorkloadDescriptor:
             setattr(self, k, v)
 
 # ============================================================================
-# ENHANCED GREEN AGENT RUNNER (v8.0.0)
+# ENHANCED GREEN AGENT RUNNER (v8.1.0)
 # ============================================================================
 class EnhancedGreenAgentRunner:
     def __init__(self):
@@ -1861,7 +2025,8 @@ class EnhancedGreenAgentRunner:
         # Existing modules
         self.quantum_security = QuantumResilientRunnerSecurity(self.storage)
         self.blockchain = BlockchainRunnerVerification(self.storage)
-        self.autonomous_optimizer = AutonomousRunnerOptimizer(self.storage, self.state)
+        # REPLACED: self.autonomous_optimizer = AutonomousRunnerOptimizer(...)
+        self.distillation_optimizer = DistillationRunnerOptimizer(self.storage, config)
         self.cloud_distributor = MultiCloudRunnerDistribution(self.storage)
 
         # Pipeline selector with RL and circuit breakers
@@ -1898,7 +2063,7 @@ class EnhancedGreenAgentRunner:
 
         # Register signal handlers
         self._register_signal_handlers()
-        logger.info("Enhanced Green Agent Runner v8.0.0 initialized")
+        logger.info("Enhanced Green Agent Runner v8.1.0 initialized with Distillation")
 
     def _register_signal_handlers(self):
         try:
@@ -1914,9 +2079,48 @@ class EnhancedGreenAgentRunner:
             'token_balance': 1000,
             'carbon_gradient': 0.5,
             'predicted_carbon': 0.5,
-            'carbon_intensity': 0.4  # normalized
+            'carbon_intensity': 0.4,  # normalized
+            'queue_size': self.task_queue.size(),
         }
         return state
+
+    # ========================================================================
+    # NEW: Build optimization state
+    # ========================================================================
+    async def _get_optimization_state(self, task: Dict[str, Any]) -> RunnerOptimizationState:
+        """Gather context for the distillation agent."""
+        system_state = self._get_system_state()
+
+        # Compute recent stats
+        if self.total_tasks > 0:
+            success_rate = self.successful_tasks / self.total_tasks
+        else:
+            success_rate = 0.5
+
+        if self.task_history:
+            recent = list(self.task_history)[-20:]
+            avg_latency = np.mean([h['latency_ms'] for h in recent])
+            avg_energy = np.mean([h.get('energy_joules', 0) for h in recent])
+        else:
+            avg_latency = 100
+            avg_energy = 100
+
+        return RunnerOptimizationState(
+            degradation_tier=system_state['degradation_tier'],
+            token_balance=system_state['token_balance'],
+            carbon_gradient=system_state['carbon_gradient'],
+            carbon_intensity=system_state['carbon_intensity'] * 1000,  # convert back to gCO₂
+            queue_size=system_state['queue_size'],
+            task_priority=task.get('priority', 2),
+            task_urgency=task.get('urgency', 'normal'),
+            estimated_energy=task.get('estimated_energy_joules', 0),
+            estimated_carbon=task.get('carbon_impact', 0.5),
+            recent_success_rate=success_rate,
+            avg_latency_ms=avg_latency,
+            avg_energy_joules=avg_energy,
+            hour_of_day=datetime.now().hour,
+            is_weekend=datetime.now().weekday() >= 5
+        )
 
     async def submit_task(self, task: Dict[str, Any]) -> str:
         state = self._get_system_state()
@@ -1932,6 +2136,26 @@ class EnhancedGreenAgentRunner:
         self.total_tasks += 1
         task_id = task.get('task_id', 'unknown')
         system_state = self._get_system_state()
+
+        # --- Distillation: select strategy ---
+        optimization_state = await self._get_optimization_state(task)
+        strategy, action_idx, state_vec, teacher_probs = await self.distillation_optimizer.select_strategy(optimization_state, exploration=True)
+
+        # Apply strategy modifications (e.g., adjust task priority, pipeline selection)
+        if strategy == 'performance':
+            # Boost priority to clear queue faster
+            task['priority'] = task.get('priority', 2) + 1
+        elif strategy == 'carbon':
+            # If carbon is high, try to use energy-efficient pipeline
+            if system_state.get('carbon_intensity', 0.5) > 0.5:
+                task['preferred_pipeline'] = 'energy_efficient'
+        elif strategy == 'cost':
+            # Reduce resource usage
+            task['estimated_energy_joules'] = task.get('estimated_energy_joules', 0) * 0.8
+        elif strategy == 'adaptive':
+            # Use adaptive behavior based on historical data
+            pass
+        # (hybrid does nothing special)
 
         # Degradation awareness
         if config.ENABLE_DEGRADATION_AWARE:
@@ -1955,7 +2179,7 @@ class EnhancedGreenAgentRunner:
         energy_joules = result.get('energy_joules', latency * 0.1)
         carbon_kg = result.get('carbon_kg', energy_joules * 0.0001)
 
-        # RL update
+        # RL pipeline update (unchanged)
         if config.ENABLE_REINFORCEMENT_LEARNING and self.pipeline_selector.rl_learner:
             reward_info = {
                 'success': 1.0 if success else 0.0,
@@ -1965,6 +2189,25 @@ class EnhancedGreenAgentRunner:
             }
             next_state = self._get_system_state()
             await self.pipeline_selector.rl_learner.update(system_state, pipeline_name, reward_info, next_state)
+
+        # ---- Compute reward for distillation ----
+        reward = 0.0
+        if success:
+            reward += 0.5
+        # Latency reward: inverse of normalized latency
+        latency_score = max(0, 1 - latency / 10000)
+        reward += 0.15 * latency_score
+        # Energy reward
+        energy_score = max(0, 1 - energy_joules / 1000)
+        reward += 0.15 * energy_score
+        # Carbon reward
+        carbon_score = max(0, 1 - carbon_kg / 0.1)
+        reward += 0.2 * carbon_score
+        reward = max(0.0, min(1.0, reward))
+
+        # Update distillation optimizer
+        next_state = await self._get_optimization_state(task)
+        await self.distillation_optimizer.update(state_vec, action_idx, reward, next_state.to_feature_vector(), teacher_probs)
 
         # Update statistics
         if success:
@@ -1977,6 +2220,7 @@ class EnhancedGreenAgentRunner:
             'pipeline': pipeline_name,
             'success': success,
             'latency_ms': latency,
+            'energy_joules': energy_joules,
             'timestamp': datetime.utcnow().isoformat()
         })
 
@@ -1987,10 +2231,10 @@ class EnhancedGreenAgentRunner:
             'token_balance': system_state['token_balance'],
             'carbon_gradient': system_state['carbon_gradient']
         }
+        result['strategy_used'] = strategy
+        result['reward'] = reward
 
-        # ============================================================
-        # Quantum-Resilient Signing
-        # ============================================================
+        # ---- Quantum signing, blockchain, cloud (unchanged) ----
         result_data = result.copy()
         quantum_key = await self.quantum_security.generate_keypair('dilithium')
         signature = await self.quantum_security.sign_task_result(result_data, quantum_key['key_id'])
@@ -1998,9 +2242,6 @@ class EnhancedGreenAgentRunner:
         if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
             QUANTUM_SIGNATURES.labels(algorithm='dilithium', status='sign_success').inc()
 
-        # ============================================================
-        # Blockchain Verification
-        # ============================================================
         data_id = f"task_{uuid.uuid4().hex[:8]}"
         data_hash = hashlib.sha256(json.dumps(result_data, sort_keys=True, default=str).encode()).hexdigest()
         blockchain_result = await self.blockchain.record_task_result(
@@ -2012,28 +2253,18 @@ class EnhancedGreenAgentRunner:
         if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
             BLOCKCHAIN_VERIFICATIONS.labels(status='recorded').inc()
 
-        # ============================================================
-        # Multi-Cloud Distribution
-        # ============================================================
         cloud_data = {'size_gb': len(str(result)) * 0.001}
         distribution = await self.cloud_distributor.distribute_runner_data(cloud_data)
         result['cloud_distribution'] = distribution
         if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
             CLOUD_DISTRIBUTIONS.labels(provider=distribution['optimal_provider'], status='success').inc()
 
-        # ============================================================
-        # Autonomous Optimization
-        # ============================================================
-        state = {
-            'success_rate': self.successful_tasks / max(self.total_tasks, 1),
-            'carbon_intensity': system_state.get('carbon_intensity', 0.5),
-            'cost_budget': 0.5,
-            'runner_quality': self.state.historical_success_rate
-        }
-        optimization = await self.autonomous_optimizer.optimize_runner(state, 'hybrid')
-        result['autonomous_optimization'] = optimization
+        # Autonomous optimization now handled by distillation; we can still log stats
         if PROMETHEUS_AVAILABLE and config.ENABLE_PROMETHEUS:
-            AUTONOMOUS_OPTIMIZATIONS.labels(strategy=optimization['selected_strategy'], status='success').inc()
+            AUTONOMOUS_OPTIMIZATIONS.labels(strategy=strategy, status='success').inc()
+            DISTILLATION_STRATEGY.labels(strategy=strategy).inc()
+            DISTILLATION_REWARD.observe(reward)
+            DISTILLATION_BUFFER_SIZE.set(len(self.distillation_optimizer.replay_buffer))
 
         # Store in database
         self.storage.save_task_history(task_id, pipeline_name, success, latency, result)
@@ -2043,8 +2274,8 @@ class EnhancedGreenAgentRunner:
             AGENT_DURATION.labels(pipeline=pipeline_name).observe(latency / 1000)
             AGENT_QUEUE_SIZE.set(self.task_queue.size())
 
-        audit_logger.info("Task %s processed: success=%s, pipeline=%s, latency=%.0fms, blockchain=%s...",
-                         task_id, success, pipeline_name, latency,
+        audit_logger.info("Task %s processed: success=%s, pipeline=%s, latency=%.0fms, strategy=%s, reward=%.2f, blockchain=%s...",
+                         task_id, success, pipeline_name, latency, strategy, reward,
                          result['blockchain_tx_hash'][:16] if result['blockchain_tx_hash'] else 'N/A')
         return result
 
@@ -2075,8 +2306,7 @@ class EnhancedGreenAgentRunner:
                     result = await run_with_monitor()
                     if config.ENABLE_CIRCUIT_BREAKERS:
                         cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
-                        await cb.call(lambda: None)  # just to record success? Actually we need to record success.
-                        # We'll record success manually.
+                        # Record success by resetting failures
                         cb._failures = 0
                         cb._state = "CLOSED"
                     return result
@@ -2084,13 +2314,18 @@ class EnhancedGreenAgentRunner:
                     logger.error("Pipeline %s timed out after %ds", pipeline_name, config.TASK_TIMEOUT_SECONDS)
                     if config.ENABLE_CIRCUIT_BREAKERS:
                         cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
-                        await cb.call(lambda: exec('raise Exception("timeout")'))  # hack to trigger failure
+                        # Record failure
+                        cb._failures += 1
+                        if cb._failures >= cb.failure_threshold:
+                            cb._state = "OPEN"
                     continue
             except Exception as e:
                 logger.error("Pipeline %s failed: %s", pipeline_name, e)
                 if config.ENABLE_CIRCUIT_BREAKERS:
                     cb = self.pipeline_selector._get_circuit_breaker(pipeline_name)
-                    await cb.call(lambda: exec('raise Exception("failure")'))
+                    cb._failures += 1
+                    if cb._failures >= cb.failure_threshold:
+                        cb._state = "OPEN"
                 continue
         return {'success': False, 'error': 'All pipelines failed', 'task_id': task.get('task_id', 'unknown'), 'tried_pipelines': fallback_chain}
 
@@ -2151,7 +2386,7 @@ class EnhancedGreenAgentRunner:
     def get_status(self) -> Dict[str, Any]:
         system_state = self._get_system_state()
         return {
-            'version': '8.0.0',
+            'version': '8.1.0',
             'total_tasks': self.total_tasks,
             'successful_tasks': self.successful_tasks,
             'failed_tasks': self.failed_tasks,
@@ -2159,13 +2394,14 @@ class EnhancedGreenAgentRunner:
             'queue_size': self.task_queue.size(),
             'pipeline_stats': self.pipeline_selector.get_pipeline_stats(),
             'system_state': system_state,
+            'distillation_stats': self.distillation_optimizer.get_stats(),
             'running': self.running,
             'config': config.model_dump() if hasattr(config, 'model_dump') else config.__dict__,
             'timestamp': datetime.utcnow().isoformat()
         }
 
     async def start(self):
-        logger.info("Starting Enhanced Green Agent Runner v8.0.0...")
+        logger.info("Starting Enhanced Green Agent Runner v8.1.0...")
         await self.dashboard.start()
         await self.start_workers()
         if config.ENABLE_PROMETHEUS and PROMETHEUS_AVAILABLE:
@@ -2188,7 +2424,6 @@ class EnhancedGreenAgentRunner:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         await self.dashboard.stop()
         await self.bio_core.shutdown()
-        # Close data collectors
         if self.carbon_fetcher:
             await self.carbon_fetcher.close()
         logger.info("Enhanced Green Agent Runner shutdown complete")
@@ -2211,8 +2446,9 @@ async def main():
                 await asyncio.sleep(1)
                 if int(time.time()) % 30 == 0:
                     status = runner.get_status()
-                    logger.info("Status: %d tasks, %.1f%% success rate, queue: %d",
-                               status['total_tasks'], status['success_rate']*100, status['queue_size'])
+                    logger.info("Status: %d tasks, %.1f%% success rate, queue: %d, buffer: %d",
+                               status['total_tasks'], status['success_rate']*100,
+                               status['queue_size'], status['distillation_stats']['buffer_size'])
         except KeyboardInterrupt:
             logger.info("Received interrupt signal")
         except Exception as e:
