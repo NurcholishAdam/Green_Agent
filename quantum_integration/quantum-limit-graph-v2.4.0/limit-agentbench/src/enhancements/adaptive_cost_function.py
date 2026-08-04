@@ -1,74 +1,136 @@
 @@
- # NEW MOPD endpoints
- @app.get("/teachers", dependencies=[Depends(get_current_user)])
- async def get_teachers(domain: Optional[str] = None):
-     if not adaptive_function or not adaptive_function.enable_mopd:
-         raise HTTPException(status_code=503, detail="MOPD not enabled")
-     if domain:
-         teachers = await adaptive_function.select_teachers(domain)
-     else:
-         # Return all teachers and weights
-         weights = adaptive_function.teacher_grid_manager.get_teacher_weights()
-         return {"teacher_weights": weights, "grid": adaptive_function.teacher_grid_manager.teacher_grid}
-     return {"teachers": teachers}
+-from fastapi import FastAPI, Depends, HTTPException, status, Request, BackgroundTasks
+-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
++from fastapi import FastAPI, Depends, HTTPException, status, Request, BackgroundTasks
++from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
++import os
++import jwt
++from jwt import PyJWTError
 @@
- @app.post("/teachers/update_weight", dependencies=[Depends(require_admin)])
- async def update_teacher_weight(teacher_id: str, delta: float):
-     if not adaptive_function or not adaptive_function.enable_mopd:
-         raise HTTPException(status_code=503, detail="MOPD not enabled")
-     await adaptive_function.teacher_grid_manager.update_teacher_weight(teacher_id, delta)
-     return {"status": "updated", "teacher_id": teacher_id, "new_weight": adaptive_function.teacher_grid_manager.teacher_weights.get(teacher_id, 1.0)}
-@@
- @app.post("/pareto/add", dependencies=[Depends(require_admin)])
- async def add_pareto_point(weights: Dict[str, float]):
-     if not adaptive_function or not adaptive_function.pareto_enabled:
-         raise HTTPException(status_code=503, detail="Pareto not enabled")
-     added = await adaptive_function.pareto_manager.add(weights)
-     return {"added": added, "pareto_front": adaptive_function.pareto_manager.get_front()}
+-security = HTTPBearer()
+-async def verify_jwt(token: str) -> Dict:
+-    # In production, verify JWT properly and extract roles.
+-    # For demo, we accept any token and assign role based on presence.
+-    return {"sub": "admin", "role": "admin"}
+-
+-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+-    return await verify_jwt(credentials.credentials)
+-
+-async def require_admin(user: Dict = Depends(get_current_user)):
+-    if user.get("role") != "admin":
+-        raise HTTPException(status_code=403, detail="Admin role required")
+-    return user
++security = HTTPBearer()
 +
-+# -------------------------------------------------------------------------
-+# MOPD report endpoint
-+# -------------------------------------------------------------------------
-+@app.post("/mopd/record", dependencies=[Depends(get_current_user)])
-+async def mopd_record(payload: Dict[str, Any]):
-+    """
-+    Accepts MOPD (Multi-Teacher On-Policy Distillation) reports from trainers.
++# JWT auth helper using HS256 secret (or configure JWKS for RS256 in production)
++AUTH_SECRET = os.environ.get("ADAPTIVE_API_HS256_SECRET", "dev-secret-change-me")
++AUTH_ALGORITHM = os.environ.get("ADAPTIVE_API_ALGO", "HS256")
 +
-+    Expected JSON body:
-+    {
-+      "context": {"request_id": "<uuid>", "expert_id": "<id>", "node_id": "<id>"},
-+      "metrics": {"energy_joules": 0.0, "carbon_kg": 0.0, "helium_units": 0.0, "latency_ms": 0.0, "accuracy": 0.0},
-+      "teacher_id": "<teacher-id>",
-+      "distillation_loss": 0.123,
-+      "epoch": 1
-+    }
-+
-+    This endpoint will forward the data into AdaptiveCostFunction.record_feedback(...) so it is
-+    persisted into feedback_records and used for weight updates.
-+    """
-+    if not adaptive_function or not adaptive_function.enable_mopd:
-+        raise HTTPException(status_code=503, detail="MOPD not enabled")
-+
-+    context = payload.get("context", {}) or {}
-+    metrics = payload.get("metrics", {}) or {}
-+    teacher_id = payload.get("teacher_id")
-+    distillation_loss = payload.get("distillation_loss")
-+
-+    # Basic validation
-+    if not context.get("expert_id"):
-+        # Use configured expert_id as fallback if provided
-+        expert_id = adaptive_function._config_obj.teacher_grid.get('expert_id') if hasattr(adaptive_function, '_config_obj') else None
-+        if expert_id:
-+            context.setdefault('expert_id', expert_id)
-+
++async def verify_jwt(token: str) -> Dict:
++    if not token:
++        raise HTTPException(status_code=401, detail="Missing token")
 +    try:
-+        # Call record_feedback which will persist and enqueue the record for weight updates
-+        await adaptive_function.record_feedback(context, metrics, teacher_id=teacher_id, distillation_loss=distillation_loss)
-+    except Exception as e:
-+        logger.error(f"MOPD record failed: {e}")
-+        raise HTTPException(status_code=500, detail="Failed to record MOPD feedback")
++        payload = jwt.decode(token, AUTH_SECRET, algorithms=[AUTH_ALGORITHM])
++    except PyJWTError:
++        raise HTTPException(status_code=401, detail="Invalid token")
++    # Support roles claim or scope string
++    roles = payload.get("roles") or payload.get("scope") or []
++    if isinstance(roles, str):
++        roles = roles.split()
++    return {"sub": payload.get("sub"), "roles": roles, "claims": payload}
 +
-+    return {"status": "ok", "teacher_id": teacher_id, "distillation_loss": distillation_loss}
++async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
++    return await verify_jwt(credentials.credentials)
++
++async def require_admin(user: Dict = Depends(get_current_user)):
++    roles = user.get("roles", []) or []
++    if "admin" not in roles:
++        raise HTTPException(status_code=403, detail="Admin role required")
++    return user
++
++async def require_trainer(user: Dict = Depends(get_current_user)):
++    roles = user.get("roles", []) or []
++    if "trainer" not in roles and "admin" not in roles:
++        raise HTTPException(status_code=403, detail="Trainer role required")
++    return user
 @@
- @app.on_event("startup")
- async def startup():
+-    async def _persist_feedback_inner(self, context: Dict, actual: Dict, pred: float, actual_cost: float,
+-                                       teacher_id: Optional[str], distillation_loss: Optional[float]):
+-        async with self.db_manager.get_session() as session:
+-            await session.execute(
+-                text("""
+-                    INSERT INTO feedback_records
+-                    (request_id, expert_id, node_id, predicted_cost, actual_cost,
+-                     energy_joules, carbon_kg, helium_units, latency_ms, accuracy,
+-                     weights_snapshot, teacher_id, distillation_loss)
+-                    VALUES (:request_id, :expert_id, :node_id, :predicted_cost, :actual_cost,
+-                     :energy_joules, :carbon_kg, :helium_units, :latency_ms, :accuracy,
+-                     :weights_snapshot, :teacher_id, :distillation_loss)
+-                """),
+-                {
+-                    'request_id': context.get('request_id'),
+-                    'expert_id': context.get('expert_id'),
+-                    'node_id': context.get('node_id'),
+-                    'predicted_cost': pred,
+-                    'actual_cost': actual_cost,
+-                    'energy_joules': actual.get('energy_joules', 0),
+-                    'carbon_kg': actual.get('carbon_kg', 0),
+-                    'helium_units': actual.get('helium_units', 0),
+-                    'latency_ms': actual.get('latency_ms', 0),
+-                    'accuracy': actual.get('accuracy', 0),
+-                    'weights_snapshot': json.dumps(self.weights),
+-                    'teacher_id': teacher_id,
+-                    'distillation_loss': distillation_loss
+-                }
+-            )
+-            await session.commit()
++    async def _persist_feedback_inner(self, context: Dict, actual: Dict, pred: float, actual_cost: float,
++                                       teacher_id: Optional[str], distillation_loss: Optional[float]):
++        async with self.db_manager.get_session() as session:
++            # Persist extra metrics inside weights_snapshot JSON so schema need not change
++            weights_snapshot_json = {'weights': self.weights, 'extra_metrics': actual}
++            await session.execute(
++                text("""
++                    INSERT INTO feedback_records
++                    (request_id, expert_id, node_id, predicted_cost, actual_cost,
++                     energy_joules, carbon_kg, helium_units, latency_ms, accuracy,
++                     weights_snapshot, teacher_id, distillation_loss)
++                    VALUES (:request_id, :expert_id, :node_id, :predicted_cost, :actual_cost,
++                     :energy_joules, :carbon_kg, :helium_units, :latency_ms, :accuracy,
++                     :weights_snapshot, :teacher_id, :distillation_loss)
++                """),
++                {
++                    'request_id': context.get('request_id'),
++                    'expert_id': context.get('expert_id'),
++                    'node_id': context.get('node_id'),
++                    'predicted_cost': pred,
++                    'actual_cost': actual_cost,
++                    'energy_joules': actual.get('energy_joules', 0),
++                    'carbon_kg': actual.get('carbon_kg', 0),
++                    'helium_units': actual.get('helium_units', 0),
++                    'latency_ms': actual.get('latency_ms', 0),
++                    'accuracy': actual.get('accuracy', 0),
++                    'weights_snapshot': json.dumps(weights_snapshot_json),
++                    'teacher_id': teacher_id,
++                    'distillation_loss': distillation_loss
++                }
++            )
++            await session.commit()
+@@
+     async def record_feedback(
+@@
+-        # Persist feedback record (with retry)
+-        await self._persist_feedback(context, actual_metrics, predicted_cost, actual_cost,
+-                                     teacher_id, distillation_loss)
++        # Persist feedback record (with retry)
++        await self._persist_feedback(context, actual_metrics, predicted_cost, actual_cost,
++                                     teacher_id, distillation_loss)
++
++        # Prometheus: set distillation loss gauge if provided
++        try:
++            if distillation_loss is not None:
++                DISTILLATION_LOSS.set(float(distillation_loss)
++                                      if isinstance(DISTILLATION_LOSS, Gauge) else distillation_loss)
++        except Exception:
++            # ignore metric failures
++            pass
