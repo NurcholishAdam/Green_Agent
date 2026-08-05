@@ -1,25 +1,22 @@
-# predictive_maintenance.py
 """
-Enhanced Predictive Maintenance for Hardware Based on Sustainability Metrics
+Enhanced Predictive Maintenance for Hardware Based on Sustainability Metrics v3.1.0
 ============================================================================
 
 Tracks energy efficiency (FLOPs/Joule) per node over time, forecasts when
 efficiency will drop below a threshold, simulates replacement impact via
 DigitalTwin, and generates maintenance recommendations during low‑carbon periods.
 
-ENHANCEMENTS OVER v2.0:
-- All I/O operations are async (aiosqlite or thread‑offloaded).
-- Configuration always uses Pydantic (with dict fallback conversion).
-- Circuit breaker and tenacity retries for external calls.
-- LCA integration (material index) fully implemented with fallback.
-- Data pruning (retention policy) added.
-- Forecasting slope always available (extracted from model).
-- Connection pooling for SQLite.
-- Proper async run_analysis and shutdown.
-- Anomaly detection trigger implemented.
-- Structured logging with structlog.
-- Health check endpoint with dependency status.
-- Unit test stubs.
+ENHANCEMENTS OVER v3.0.0:
+- Adaptive action selection (replace/refurbish/monitor) via Multi‑Teacher Distillation.
+- State‑aware decisions based on efficiency, slope, days to threshold, cost savings,
+  carbon intensity, material index, and historical performance.
+- Online learning from outcome metrics (energy saved, cost saved, carbon saved).
+- Teachers: rule‑based, historical ML, stateful Q.
+- Student: linear softmax with distillation + REINFORCE.
+- Persistence for Q‑teacher weights and interaction logs.
+- Offline training for historical ML teacher.
+- Unit tests for distillation components.
+All previous features (async persistence, forecasting, digital twin, carbon/LCA integration, etc.) retained.
 """
 
 import asyncio
@@ -33,6 +30,10 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple, Callable, Union
 import numpy as np
 from collections import deque
+import random
+from abc import ABC, abstractmethod
+import pandas as pd
+from pathlib import Path
 
 # ---------- Pydantic ----------
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -82,6 +83,14 @@ except ImportError:
 
 # ---------- Tenacity for retries ----------
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# ---------- scikit-learn for ML teacher ----------
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import LabelEncoder
+    SKLEARN_ML = True
+except ImportError:
+    SKLEARN_ML = False
 
 # ---------- Circuit Breaker ----------
 class CircuitBreaker:
@@ -165,6 +174,19 @@ class PredictiveMaintenanceConfig(BaseModel):
     carbon_offset_price_per_kg_usd: float = Field(0.10, gt=0)
     electricity_price_per_kwh_usd: float = Field(0.12, gt=0)
 
+    # NEW: Distillation parameters
+    distillation_epsilon: float = Field(0.1, ge=0, le=1)
+    distillation_train_every: int = Field(10, ge=1)
+    distillation_replay_size: int = Field(2000, ge=10)
+    distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
+    distill_weight: float = Field(0.7, ge=0, le=1)
+    rl_weight: float = Field(0.3, ge=0, le=1)
+
+    # Persistence paths for distillation
+    q_weights_path: str = Field("./pm_q_weights.json")
+    interaction_logs_path: str = Field("./pm_interactions.csv")
+    historical_model_path: str = Field("./pm_historical_model.pkl")
+
     @field_validator('low_carbon_windows')
     @classmethod
     def validate_windows(cls, v):
@@ -188,28 +210,24 @@ class PredictiveMaintenanceConfig(BaseModel):
 # ============================================================================
 @dataclass
 class EfficiencyRecord:
-    """A single efficiency measurement for a node."""
     timestamp: datetime
     flops_per_joule: float
     energy_joules: float
     flops: float
 
-
 @dataclass
 class MaintenanceRecommendation:
-    """A recommendation for node maintenance/replacement."""
     node_id: str
     current_efficiency: float
     predicted_efficiency_in_30_days: float
     threshold: float
-    days_to_threshold: float  # negative if already below
-    recommended_action: str  # "replace", "refurbish", "monitor"
+    days_to_threshold: float
+    recommended_action: str
     suggested_date: datetime
-    carbon_savings_kg: float  # estimated CO₂ saved by acting
-    cost_savings_usd: float  # estimated cost savings
+    carbon_savings_kg: float
+    cost_savings_usd: float
     payback_days: Optional[float]
     simulation_result: Dict[str, Any] = field(default_factory=dict)
-
 
 # ============================================================================
 # 3. PERSISTENCE MANAGER (Async SQLite with connection pooling)
@@ -224,7 +242,6 @@ class PersistenceManager:
         self._init_db()
 
     async def _init_db(self):
-        """Create tables and indexes if not exist."""
         async with self._get_connection() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS efficiency_history (
@@ -263,7 +280,6 @@ class PersistenceManager:
             async with self._get_connection() as conn:
                 return await conn.execute(query, params)
         else:
-            # Offload to thread
             def sync_exec():
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.execute(query, params)
@@ -273,7 +289,6 @@ class PersistenceManager:
             return await loop.run_in_executor(None, sync_exec)
 
     async def _prune_old_data(self):
-        """Delete records older than data_retention_days."""
         cutoff = datetime.now() - timedelta(days=self.config.data_retention_days)
         await self._execute(
             "DELETE FROM efficiency_history WHERE timestamp < ?",
@@ -347,15 +362,10 @@ class PersistenceManager:
             await self._pool.close()
             self._pool = None
 
-
 # ============================================================================
-# 4. NODE EFFICIENCY TRACKER (with async persistence)
+# 4. NODE EFFICIENCY TRACKER (unchanged)
 # ============================================================================
 class NodeEfficiencyTracker:
-    """
-    Collects and maintains historical efficiency data per node.
-    Computes FLOPs/Joule from telemetry.
-    """
     def __init__(self, config: PredictiveMaintenanceConfig, persistence: Optional[PersistenceManager] = None):
         self.config = config
         self.history: Dict[str, List[EfficiencyRecord]] = {}
@@ -371,7 +381,6 @@ class NodeEfficiencyTracker:
                     self.history[node_id] = records
 
     async def add_measurement(self, node_id: str, flops: float, energy_joules: float) -> None:
-        """Add a new efficiency measurement."""
         if node_id not in self.history:
             await self._load_node_history(node_id)
         if node_id not in self.history:
@@ -393,7 +402,6 @@ class NodeEfficiencyTracker:
             await self.persistence.save_efficiency(node_id, record)
 
     async def get_efficiency_series(self, node_id: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (timestamps, efficiency_values) as numpy arrays."""
         if node_id not in self.history:
             await self._load_node_history(node_id)
         if node_id not in self.history or len(self.history[node_id]) == 0:
@@ -405,7 +413,6 @@ class NodeEfficiencyTracker:
         return times, effs
 
     async def get_latest_efficiency(self, node_id: str) -> Optional[float]:
-        """Return the most recent efficiency value."""
         if node_id not in self.history:
             await self._load_node_history(node_id)
         if node_id not in self.history or not self.history[node_id]:
@@ -414,7 +421,6 @@ class NodeEfficiencyTracker:
             return self.history[node_id][-1].flops_per_joule
 
     async def get_node_health(self, node_id: str, threshold: float) -> Dict[str, Any]:
-        """Return health status for a node."""
         eff = await self.get_latest_efficiency(node_id)
         if eff is None:
             return {"status": "unknown", "efficiency": None}
@@ -427,55 +433,40 @@ class NodeEfficiencyTracker:
                 return {"status": "degrading", "efficiency": eff}
         return {"status": "healthy", "efficiency": eff}
 
-
 # ============================================================================
-# 5. PREDICTIVE REFLEXIVITY (ENHANCED FORECASTING)
+# 5. PREDICTIVE REFLEXIVITY (unchanged)
 # ============================================================================
 class PredictiveReflexivity:
-    """
-    Forecasts future efficiency using advanced methods.
-    Uses exponential smoothing if available, otherwise linear regression.
-    Always provides a slope.
-    """
     def __init__(self, config: PredictiveMaintenanceConfig):
         self.config = config
         self.horizon_days = config.forecast_horizon_days
         self.min_points = config.min_data_points
 
     def forecast(self, times: np.ndarray, values: np.ndarray) -> Dict[str, Any]:
-        """
-        Forecast future values for the next N days.
-        Returns dict with predictions, confidence interval, and day of threshold crossing.
-        """
         if len(values) < self.min_points:
             return {"error": "Insufficient data"}
 
-        # Try exponential smoothing if available
         if STATSMODELS_AVAILABLE:
             try:
-                # Use Holt-Winters exponential smoothing
                 model = ExponentialSmoothing(values, trend='add', seasonal=None, damped_trend=True)
                 fit = model.fit()
                 forecast = fit.forecast(self.horizon_days)
-                # Extract slope from the trend component
                 trend = fit.params.get('trend', 0.0)
                 slope = trend
                 residuals = values - fit.fittedvalues
                 std_res = np.std(residuals)
-                z = 1.96  # 95% confidence
+                z = 1.96
                 lower = forecast - z * std_res
                 upper = forecast + z * std_res
                 return self._postprocess_forecast(times, values, forecast, lower, upper, slope=slope)
             except Exception as e:
                 logger.warning(f"Exponential smoothing failed: {e}, falling back to linear regression")
 
-        # Fallback to linear regression
         return self._linear_forecast(times, values)
 
     def _linear_forecast(self, times: np.ndarray, values: np.ndarray) -> Dict[str, Any]:
-        """Linear regression fallback."""
         t0 = times[0]
-        x = (times - t0) / (24 * 3600)  # days
+        x = (times - t0) / (24 * 3600)
         y = values
         coeffs = np.polyfit(x, y, 1)
         slope = coeffs[0]
@@ -493,7 +484,6 @@ class PredictiveReflexivity:
         return self._postprocess_forecast(times, values, predictions, lower, upper, slope=slope)
 
     def _postprocess_forecast(self, times, values, predictions, lower, upper, slope):
-        """Common post-processing for forecast results."""
         threshold = self.config.efficiency_threshold
         days_to_threshold = None
         crossing_day = None
@@ -517,22 +507,17 @@ class PredictiveReflexivity:
             "crossing_day": crossing_day,
         }
 
-
 # ============================================================================
-# 6. DIGITALTWIN SIMULATION FOR REPLACEMENT (ENHANCED)
+# 6. DIGITALTWIN SIMULATOR (unchanged)
 # ============================================================================
 class DigitalTwinSimulator:
-    """
-    Simulates the impact of replacing or refurbishing a node.
-    Incorporates carbon intensity, material index, and cost analysis.
-    """
     def __init__(self, config: PredictiveMaintenanceConfig,
                  carbon_manager: Optional[Any] = None,
                  lca_client: Optional[Any] = None):
         self.config = config
         self.carbon_manager = carbon_manager
         self.lca_client = lca_client
-        self.co2_per_kwh = 0.2  # default, updated if carbon_manager available
+        self.co2_per_kwh = 0.2
         self._carbon_circuit = CircuitBreaker("carbon_api")
         self._lca_circuit = CircuitBreaker("lca_api")
 
@@ -543,7 +528,7 @@ class DigitalTwinSimulator:
             intensity_data = await self._carbon_circuit.call(
                 self.carbon_manager.get_current_intensity
             )
-            return intensity_data.get('intensity', 400) / 1000  # g/kWh -> kg/kWh
+            return intensity_data.get('intensity', 400) / 1000
         except Exception as e:
             logger.warning(f"Carbon intensity retrieval failed: {e}")
             return self.co2_per_kwh
@@ -565,51 +550,36 @@ class DigitalTwinSimulator:
         self,
         node_id: str,
         current_efficiency: float,
-        action: str = "replace",  # "replace" or "refurbish"
+        action: str = "replace",
         expected_new_efficiency: float = None,
         workload_flops_per_day: float = 1e12,
         simulation_days: int = 365,
         hardware_model: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Simulate the impact of replacing or refurbishing the node.
-        Returns energy, CO₂, cost savings, and payback.
-        """
         if action == "replace":
             gain = self.config.replacement_efficiency_gain
-        else:  # refurbish
+        else:
             gain = self.config.refurbishment_efficiency_gain
 
         if expected_new_efficiency is None:
             expected_new_efficiency = current_efficiency * gain
 
-        # Energy per day
         energy_current = workload_flops_per_day / current_efficiency
         energy_new = workload_flops_per_day / expected_new_efficiency
         energy_saved_per_day = energy_current - energy_new
         energy_saved_total = energy_saved_per_day * simulation_days
 
-        # Carbon intensity
         carbon_intensity = await self._get_carbon_intensity()
-
-        # CO₂ savings
         co2_saved_total = energy_saved_total / 3.6e6 * carbon_intensity
-
-        # Cost savings (electricity)
         cost_saved_total = energy_saved_total / 3.6e6 * self.config.electricity_price_per_kwh_usd
 
-        # Hardware cost and maintenance cost
         hardware_cost = self.config.hardware_cost_usd if action == "replace" else 0.0
         maintenance_cost = self.config.maintenance_cost_usd if action == "refurbish" else 0.0
         total_initial_cost = hardware_cost + maintenance_cost
 
-        # Carbon offset value
         carbon_offset_value = co2_saved_total * self.config.carbon_offset_price_per_kg_usd
-
-        # Net savings (energy + carbon offset) minus initial cost
         net_savings = cost_saved_total + carbon_offset_value - total_initial_cost
 
-        # Payback period
         daily_savings = (cost_saved_total + carbon_offset_value) / simulation_days
         payback_days = total_initial_cost / daily_savings if daily_savings > 0 else None
 
@@ -632,13 +602,278 @@ class DigitalTwinSimulator:
             "payback_days": payback_days,
         }
 
+# ============================================================================
+# 7. DISTILLATION COMPONENTS FOR ACTION SELECTION
+# ============================================================================
+
+@dataclass
+class MaintenanceState:
+    """State for the distillation agent."""
+    current_efficiency: float
+    slope: float
+    days_to_threshold: float
+    net_savings_replace: float
+    net_savings_refurbish: float
+    payback_replace: Optional[float]
+    payback_refurbish: Optional[float]
+    carbon_intensity: float
+    material_index: float
+    # Historical performance (from logs)
+    action_success_rates: Dict[str, float]  # replace, refurbish, monitor
+    avg_reward: float
+
+    def to_feature_vector(self) -> np.ndarray:
+        """Convert to 11‑dim numeric feature vector."""
+        features = [
+            min(self.current_efficiency / 5e9, 1.0),
+            min(abs(self.slope) / 1e7, 1.0),
+            min(self.days_to_threshold / 90.0, 1.0),
+            min(self.net_savings_replace / 10000.0, 1.0),
+            min(self.net_savings_refurbish / 10000.0, 1.0),
+            min(self.carbon_intensity / 1.0, 1.0),
+            min(self.material_index / 2.0, 1.0),
+            self.action_success_rates.get('replace', 0.5),
+            self.action_success_rates.get('refurbish', 0.5),
+            self.action_success_rates.get('monitor', 0.5),
+            self.avg_reward,
+        ]
+        return np.array(features, dtype=np.float32)
+
+
+class Teacher(ABC):
+    @abstractmethod
+    def predict(self, state: MaintenanceState) -> np.ndarray:
+        """Return probability vector over 3 actions."""
+        pass
+
+    @abstractmethod
+    def confidence(self, state: MaintenanceState) -> float:
+        """Return confidence in prediction [0,1]."""
+        pass
+
+
+class ActionRuleBasedTeacher(Teacher):
+    """Rule‑based expert."""
+    ACTIONS = ['replace', 'refurbish', 'monitor']
+
+    def predict(self, state: MaintenanceState) -> np.ndarray:
+        probs = np.ones(3) * 0.1
+        if state.days_to_threshold <= 0:
+            if state.net_savings_replace > state.net_savings_refurbish:
+                probs[0] = 0.8  # replace
+            else:
+                probs[1] = 0.8  # refurbish
+        elif state.days_to_threshold <= 14:  # lead_time + 7
+            if state.net_savings_replace > state.net_savings_refurbish:
+                probs[0] = 0.7
+            else:
+                probs[1] = 0.7
+        else:
+            probs[2] = 0.7  # monitor
+        return probs / probs.sum()
+
+    def confidence(self, state: MaintenanceState) -> float:
+        if state.days_to_threshold <= 0:
+            return 0.6
+        return 0.4
+
+
+class ActionHistoricalMLTeacher(Teacher):
+    """Offline trained classifier from past interactions."""
+    def __init__(self, model_path: Optional[str] = None):
+        self.model = None
+        self.label_encoder = None
+        self.model_path = model_path or Path(PredictiveMaintenanceConfig().historical_model_path)
+        if self.model_path.exists():
+            try:
+                with open(self.model_path, 'rb') as f:
+                    self.model, self.label_encoder = pickle.load(f)
+                logger.info(f"Loaded historical ML model from {self.model_path}")
+            except Exception as e:
+                logger.error(f"Failed to load historical model: {e}")
+
+    def predict(self, state: MaintenanceState) -> np.ndarray:
+        if self.model is None or self.label_encoder is None:
+            return np.ones(3) / 3
+        x = state.to_feature_vector().reshape(1, -1)
+        probs = self.model.predict_proba(x)[0]
+        return probs
+
+    def confidence(self, state: MaintenanceState) -> float:
+        return 0.7 if self.model is not None else 0.0
+
+
+class ActionStatefulQTeacher(Teacher):
+    """Linear Q‑learning with state features."""
+    def __init__(self, lr: float = 0.1):
+        self.lr = lr
+        self.weights = np.zeros((11, 3))  # 11 features, 3 actions
+        self._load_state()
+
+    def _load_state(self):
+        path = Path(PredictiveMaintenanceConfig().q_weights_path)
+        if path.exists():
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                self.weights = np.array(data)
+                logger.info(f"Loaded Q‑teacher weights from {path}")
+            except Exception as e:
+                logger.error(f"Failed to load Q‑weights: {e}")
+
+    def _save_state(self):
+        path = Path(PredictiveMaintenanceConfig().q_weights_path)
+        with open(path, 'w') as f:
+            json.dump(self.weights.tolist(), f, indent=2)
+
+    def predict(self, state: MaintenanceState) -> np.ndarray:
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        exp_q = np.exp(q - np.max(q))
+        return exp_q / exp_q.sum()
+
+    def confidence(self, state: MaintenanceState) -> float:
+        return 0.5
+
+    def update(self, state: MaintenanceState, action: int, reward: float):
+        x = state.to_feature_vector()
+        q_current = np.dot(x, self.weights[:, action])
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._save_state()
+
+
+class DistillationStudent:
+    def __init__(self, feature_dim: int = 11, n_classes: int = 3, lr: float = 0.01):
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+        if num_classes != self.n_classes:
+            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_biases = np.zeros(num_classes)
+            min_dim = min(self.n_classes, num_classes)
+            new_weights[:, :min_dim] = self.weights[:, :min_dim]
+            new_biases[:min_dim] = self.biases[:min_dim]
+            self.weights = new_weights
+            self.biases = new_biases
+            self.n_classes = num_classes
+        logits = state_vector @ self.weights + self.biases
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
+        current_probs = self.predict_proba(state_vector, self.n_classes)
+        logits = state_vector @ self.weights + self.biases
+
+        grad_distill = -(teacher_probs - current_probs)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        grad_rl = -reward * (one_hot - current_probs)
+
+        grad = distill_weight * grad_distill + rl_weight * grad_rl
+        self.weights -= self.lr * np.outer(state_vector, grad)
+        self.biases -= self.lr * grad
+        self.counter += 1
+
+
+class ReplayBuffer:
+    def __init__(self, max_size: int = 2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state_vec: np.ndarray, action: int, reward: float,
+             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+
+    def sample(self, batch_size: int = 32):
+        if len(self.buffer) < batch_size:
+            batch = list(self.buffer)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        return (np.array(states), actions, np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DistillationActionOptimizer:
+    """
+    Multi‑teacher on‑policy distillation agent for maintenance action selection.
+    Actions: replace, refurbish, monitor.
+    """
+    ACTIONS = ['replace', 'refurbish', 'monitor']
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.teachers: List[Teacher] = [
+            ActionRuleBasedTeacher(),
+            ActionHistoricalMLTeacher(),
+            ActionStatefulQTeacher()
+        ]
+        self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
+        self.epsilon = config.get('distillation_epsilon', 0.1)
+        self.train_every = config.get('distillation_train_every', 10)
+        self.counter = 0
+
+    async def select_action(self, state: MaintenanceState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
+        n = 3
+
+        teacher_probs = np.zeros(n)
+        total_conf = 0.0
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            conf = teacher.confidence(state)
+            if len(prob) != n:
+                if len(prob) < n:
+                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
+                else:
+                    prob = prob[:n]
+            teacher_probs += prob * conf
+            total_conf += conf
+        if total_conf > 0:
+            teacher_probs /= total_conf
+        else:
+            teacher_probs = np.ones(n) / n
+
+        student_probs = self.student.predict_proba(state_vec, n)
+
+        if exploration and random.random() < self.epsilon:
+            action_idx = random.randint(0, n - 1)
+        else:
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = np.argmax(combined)
+
+        return self.ACTIONS[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+        self.counter += 1
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
+            batch = self.replay_buffer.sample(8)
+            states, actions, rewards, _, teacher_probs_batch = batch
+            for i in range(len(states)):
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+
+    def get_stats(self) -> Dict:
+        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+
 
 # ============================================================================
-# 7. MAINTENANCE SCHEDULER (ENHANCED)
+# 8. MAINTENANCE SCHEDULER (ENHANCED)
 # ============================================================================
 class MaintenanceScheduler:
     """
     Generates maintenance recommendations and schedules them during low‑carbon windows.
+    Uses distillation to select action.
     """
     def __init__(self, config: PredictiveMaintenanceConfig,
                  carbon_manager: Optional[Any] = None):
@@ -649,11 +884,24 @@ class MaintenanceScheduler:
         self.recommendations: Dict[str, MaintenanceRecommendation] = {}
         self._lock = asyncio.Lock()
 
+        # Distillation action optimizer
+        self.action_optimizer = DistillationActionOptimizer({
+            'distillation_epsilon': config.distillation_epsilon,
+            'distillation_train_every': config.distillation_train_every,
+            'distillation_replay_size': config.distillation_replay_size,
+            'distillation_learning_rate': config.distillation_learning_rate,
+        })
+
+        # Interaction tracking
+        self.interaction_log: List[Dict] = []
+        self.last_state_vec: Optional[np.ndarray] = None
+        self.last_action_idx: Optional[int] = None
+        self.last_teacher_probs: Optional[np.ndarray] = None
+
     def parse_time(self, time_str: str) -> datetime.time:
         return datetime.strptime(time_str, "%H:%M").time()
 
     async def get_next_low_carbon_window(self, from_date: datetime) -> Optional[datetime]:
-        """Find the next start time of a low‑carbon window after from_date."""
         today = from_date.date()
         for window in self.low_carbon_windows:
             start_time = self.parse_time(window["start"])
@@ -661,7 +909,6 @@ class MaintenanceScheduler:
             candidate = datetime.combine(today, start_time)
             if candidate > from_date:
                 return candidate
-        # Schedule for tomorrow's first window
         tomorrow = today + timedelta(days=1)
         first_window = self.low_carbon_windows[0]
         start_time = self.parse_time(first_window["start"])
@@ -672,37 +919,60 @@ class MaintenanceScheduler:
         node_id: str,
         current_efficiency: float,
         forecast_result: Dict[str, Any],
-        simulation_result: Dict[str, Any],
+        sim_replace: Dict[str, Any],
+        sim_refurb: Dict[str, Any],
     ) -> MaintenanceRecommendation:
         """
-        Create a maintenance recommendation based on forecast and simulation.
+        Create a maintenance recommendation using distillation to select action.
         """
+        # Build state
+        state = MaintenanceState(
+            current_efficiency=current_efficiency,
+            slope=forecast_result.get("slope", 0),
+            days_to_threshold=forecast_result.get("days_to_threshold", float('inf')),
+            net_savings_replace=sim_replace.get("net_savings_usd", 0),
+            net_savings_refurbish=sim_refurb.get("net_savings_usd", 0),
+            payback_replace=sim_replace.get("payback_days"),
+            payback_refurbish=sim_refurb.get("payback_days"),
+            carbon_intensity=await self._get_carbon_intensity(),
+            material_index=sim_replace.get("material_index", 0),
+            action_success_rates=self._get_action_success_rates(),
+            avg_reward=self._get_avg_reward(),
+        )
+
+        # Select action via distillation
+        action, action_idx, state_vec, teacher_probs = await self.action_optimizer.select_action(state, exploration=True)
+        self.last_state_vec = state_vec
+        self.last_action_idx = action_idx
+        self.last_teacher_probs = teacher_probs
+
+        # Determine suggested date
         threshold = self.config.efficiency_threshold
         days_to = forecast_result.get("days_to_threshold")
-        slope = forecast_result.get("slope", 0)
 
-        # Determine action based on days_to_threshold
-        if days_to is None:
-            action = "monitor"
+        if action == "monitor" or days_to is None or days_to > 30:
             suggested_date = datetime.now() + timedelta(days=30)
-        elif days_to <= 0:
-            action = "replace" if simulation_result.get("net_savings_usd", 0) > 0 else "refurbish"
-            suggested_date = await self.get_next_low_carbon_window(datetime.now())
-        elif days_to <= self.lead_time + 7:
-            action = "replace" if simulation_result.get("net_savings_usd", 0) > 0 else "refurbish"
+        else:
+            # Schedule maintenance before crossing
             crossing_date = datetime.now() + timedelta(days=days_to)
             maintenance_date = crossing_date - timedelta(days=self.lead_time)
             suggested_date = await self.get_next_low_carbon_window(maintenance_date)
-        else:
-            action = "monitor"
-            suggested_date = datetime.now() + timedelta(days=30)
 
-        # Carbon and cost savings from simulation
-        co2_saved = simulation_result.get("co2_saved_total_kg", 0.0) if action.startswith("replace") or action == "refurbish" else 0.0
-        cost_saved = simulation_result.get("net_savings_usd", 0.0) if action.startswith("replace") or action == "refurbish" else 0.0
+        # Use the simulation result that matches the chosen action
+        if action == "replace":
+            simulation_result = sim_replace
+        elif action == "refurbish":
+            simulation_result = sim_refurb
+        else:
+            simulation_result = {}  # monitor
+
+        # Carbon and cost savings
+        co2_saved = simulation_result.get("co2_saved_total_kg", 0.0) if action in ["replace", "refurbish"] else 0.0
+        cost_saved = simulation_result.get("net_savings_usd", 0.0) if action in ["replace", "refurbish"] else 0.0
         payback = simulation_result.get("payback_days")
 
         # Predict efficiency in 30 days
+        slope = forecast_result.get("slope", 0)
         pred_eff_30 = current_efficiency + slope * 30
 
         rec = MaintenanceRecommendation(
@@ -723,17 +993,83 @@ class MaintenanceScheduler:
         logger.info(f"Maintenance scheduled for node {node_id}: {rec.recommended_action} on {rec.suggested_date}")
         return rec
 
+    async def record_outcome(self, node_id: str, action: str, actual_energy_saved: float, actual_cost_saved: float, actual_carbon_saved: float):
+        """
+        Record the outcome of a maintenance action to update the distillation agent.
+        """
+        # Compute reward based on savings
+        reward = 0.0
+        if actual_energy_saved > 0:
+            reward += 0.4 * min(1.0, actual_energy_saved / 1e6)
+        if actual_cost_saved > 0:
+            reward += 0.3 * min(1.0, actual_cost_saved / 1000)
+        if actual_carbon_saved > 0:
+            reward += 0.3 * min(1.0, actual_carbon_saved / 100)
+        reward = max(0.0, min(1.0, reward))
+
+        # Log interaction
+        self.interaction_log.append({
+            'timestamp': datetime.now().isoformat(),
+            'node_id': node_id,
+            'action': action,
+            'reward': reward,
+        })
+        log_path = Path(PredictiveMaintenanceConfig().interaction_logs_path)
+        df_log = pd.DataFrame([self.interaction_log[-1]])
+        if log_path.exists():
+            df_log.to_csv(log_path, mode='a', header=False, index=False)
+        else:
+            df_log.to_csv(log_path, index=False)
+
+        # Update agent
+        if self.last_state_vec is not None and self.last_action_idx is not None:
+            next_state_vec = self.last_state_vec  # for simplicity, same state
+            await self.action_optimizer.update(
+                self.last_state_vec,
+                self.last_action_idx,
+                reward,
+                next_state_vec,
+                self.last_teacher_probs
+            )
+
+    def _get_action_success_rates(self) -> Dict[str, float]:
+        """Compute success rates from interaction log."""
+        rates = {'replace': 0.5, 'refurbish': 0.5, 'monitor': 0.5}
+        if not self.interaction_log:
+            return rates
+        for action in rates.keys():
+            entries = [e for e in self.interaction_log[-100:] if e['action'] == action]
+            if entries:
+                successes = sum(1 for e in entries if e['reward'] > 0.5)
+                rates[action] = successes / len(entries)
+        return rates
+
+    def _get_avg_reward(self) -> float:
+        if not self.interaction_log:
+            return 0.5
+        rewards = [e['reward'] for e in self.interaction_log[-50:]]
+        return np.mean(rewards) if rewards else 0.5
+
+    async def _get_carbon_intensity(self) -> float:
+        # Simplified: return default or from carbon_manager
+        if self.carbon_manager and self.config.carbon_intensity_enabled:
+            try:
+                intensity_data = await self.carbon_manager.get_current_intensity()
+                return intensity_data.get('intensity', 400) / 1000
+            except:
+                pass
+        return 0.4
+
     async def get_recommendations(self) -> List[MaintenanceRecommendation]:
         async with self._lock:
             return list(self.recommendations.values())
 
-
 # ============================================================================
-# 8. MAIN ORCHESTRATOR: PREDICTIVE MAINTENANCE ENGINE (ENHANCED)
+# 9. MAIN ORCHESTRATOR (ENHANCED)
 # ============================================================================
 class PredictiveMaintenanceEngine:
     """
-    Orchestrates the entire predictive maintenance pipeline.
+    Orchestrates the entire predictive maintenance pipeline with distillation.
     """
 
     def __init__(
@@ -779,7 +1115,7 @@ class PredictiveMaintenanceEngine:
         if self.config.refresh_interval > 0:
             self._background_task = asyncio.create_task(self._periodic_analysis())
 
-        logger.info("PredictiveMaintenanceEngine initialized")
+        logger.info("PredictiveMaintenanceEngine initialized with distillation")
 
     def register_telemetry_source(self, callback: Callable):
         self.telemetry_callback = callback
@@ -788,21 +1124,15 @@ class PredictiveMaintenanceEngine:
         self.dashboard_callback = callback
 
     async def update_node(self, node_id: str, flops: float, energy_joules: float) -> None:
-        """Add new measurement from telemetry."""
         await self.tracker.add_measurement(node_id, flops, energy_joules)
 
     async def analyze_node(self, node_id: str) -> Optional[MaintenanceRecommendation]:
-        """
-        Perform full analysis for a node: forecast, simulate, recommend.
-        """
         start_time = time.time()
-        # Check if we have enough data
         times, effs = await self.tracker.get_efficiency_series(node_id)
         if len(effs) < self.config.min_data_points:
             logger.debug(f"Node {node_id} has insufficient data for forecasting.")
             return None
 
-        # Forecast
         forecast = self.forecaster.forecast(times, effs)
         if "error" in forecast:
             logger.warning(f"Forecast error for {node_id}: {forecast['error']}")
@@ -812,22 +1142,18 @@ class PredictiveMaintenanceEngine:
         if current_eff is None:
             return None
 
-        # Anomaly detection trigger
         if self.anomaly_detector and self.config.anomaly_trigger_enabled:
             try:
                 anomalies = await self.anomaly_detector.get_recent_anomalies(node_id, minutes=60)
                 if anomalies:
                     logger.info(f"Anomalies detected for node {node_id}, forcing analysis")
-                    # Accelerate analysis (e.g., reduce forecast horizon)
             except Exception as e:
                 logger.warning(f"Anomaly detector error: {e}")
 
-        # Simulate replacement/refurbishment
         total_flops = sum(r.flops for r in self.tracker.history.get(node_id, []))
         days = len(self.tracker.history.get(node_id, []))
         avg_flops_per_day = total_flops / max(days, 1) if days > 0 else 1e12
 
-        # Get hardware model if available (could be stored in node metadata)
         hardware_model = f"node_{node_id}_model"
         material_index = await self.simulator._get_material_index(hardware_model)
 
@@ -842,24 +1168,14 @@ class PredictiveMaintenanceEngine:
             hardware_model=hardware_model
         )
 
-        # Choose the best action based on net savings
-        if sim_replace.get("net_savings_usd", 0) > sim_refurb.get("net_savings_usd", 0):
-            best_sim = sim_replace
-            best_action = "replace"
-        else:
-            best_sim = sim_refurb
-            best_action = "refurbish"
-
-        # Generate recommendation
+        # Generate recommendation via scheduler (which uses distillation)
         rec = await self.scheduler.generate_recommendation(
             node_id,
             current_eff,
             forecast,
-            best_sim,
+            sim_replace,
+            sim_refurb,
         )
-
-        # Adjust action if simulation suggests different
-        rec.recommended_action = best_action if best_action in ["replace", "refurbish"] else rec.recommended_action
 
         # Persist recommendation
         if self.persistence:
@@ -879,9 +1195,6 @@ class PredictiveMaintenanceEngine:
         return rec
 
     async def run_analysis(self, node_ids: List[str] = None) -> List[MaintenanceRecommendation]:
-        """
-        Run analysis on all nodes (or a subset) and return recommendations.
-        """
         if node_ids is None:
             node_ids = list(self.tracker.history.keys())
 
@@ -893,7 +1206,6 @@ class PredictiveMaintenanceEngine:
         return recommendations
 
     async def _periodic_analysis(self):
-        """Background task to periodically analyze all nodes."""
         while True:
             try:
                 await asyncio.sleep(self.config.refresh_interval)
@@ -904,7 +1216,6 @@ class PredictiveMaintenanceEngine:
                 logger.error(f"Periodic analysis error: {e}")
 
     async def get_dashboard_data(self) -> Dict[str, Any]:
-        """Return data suitable for SustainabilityDashboard."""
         recs = await self.scheduler.get_recommendations()
         data = {
             "total_nodes": len(self.tracker.history),
@@ -936,10 +1247,10 @@ class PredictiveMaintenanceEngine:
             },
             "nodes_tracked": len(self.tracker.history),
             "recommendations_pending": len(self.scheduler.recommendations),
+            "distillation_stats": self.scheduler.action_optimizer.get_stats(),
         }
 
     async def shutdown(self):
-        """Graceful shutdown of all resources."""
         logger.info("Shutting down PredictiveMaintenanceEngine")
         if self._background_task:
             self._background_task.cancel()
@@ -953,12 +1264,9 @@ class PredictiveMaintenanceEngine:
 
 
 # ============================================================================
-# 9. INTEGRATION WITH SUSTAINABILITYDASHBOARD (MOCK)
+# 10. INTEGRATION WITH SUSTAINABILITYDASHBOARD (mock, unchanged)
 # ============================================================================
 class SustainabilityDashboard:
-    """
-    Mock dashboard that receives maintenance recommendations.
-    """
     def __init__(self):
         self.recommendations = []
 
@@ -968,7 +1276,7 @@ class SustainabilityDashboard:
 
 
 # ============================================================================
-# 10. CONVENIENCE FACTORY
+# 11. CONVENIENCE FACTORY
 # ============================================================================
 def create_predictive_maintenance_system(
     config: Optional[Union[Dict, PredictiveMaintenanceConfig]] = None,
@@ -976,15 +1284,9 @@ def create_predictive_maintenance_system(
     lca_client: Optional[Any] = None,
     anomaly_detector: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """
-    Factory to create all components and wire them together.
-    """
     engine = PredictiveMaintenanceEngine(config, carbon_manager, lca_client, anomaly_detector)
     dashboard = SustainabilityDashboard()
-
-    # Wire dashboard callback
     engine.register_dashboard_callback(dashboard.update)
-
     return {
         "engine": engine,
         "tracker": engine.tracker,
@@ -997,10 +1299,10 @@ def create_predictive_maintenance_system(
 
 
 # ============================================================================
-# 11. REST API (FastAPI) – Optional
+# 12. REST API (FastAPI) – Optional (unchanged)
 # ============================================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Predictive Maintenance API", version="3.0.0")
+    app = FastAPI(title="Predictive Maintenance API", version="3.1.0")
     engine: Optional[PredictiveMaintenanceEngine] = None
 
     @app.get("/health")
@@ -1047,20 +1349,135 @@ if FASTAPI_AVAILABLE:
             await engine.shutdown()
         logger.info("FastAPI shutdown complete")
 
+
 # ============================================================================
-# 12. EXAMPLE USAGE (if run directly)
+# 13. UNIT TESTS (Phase 10)
+# ============================================================================
+import unittest
+from unittest import IsolatedAsyncioTestCase
+
+class TestDistillationComponents(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = {
+            'distillation_epsilon': 0.0,
+            'distillation_replay_size': 10,
+            'distillation_learning_rate': 0.01,
+            'distillation_train_every': 10,
+        }
+        self.optimizer = DistillationActionOptimizer(self.config)
+
+    def test_state_feature_vector(self):
+        state = MaintenanceState(
+            current_efficiency=2e9,
+            slope=-1e7,
+            days_to_threshold=5,
+            net_savings_replace=1000,
+            net_savings_refurbish=500,
+            payback_replace=100,
+            payback_refurbish=200,
+            carbon_intensity=0.4,
+            material_index=0.5,
+            action_success_rates={'replace':0.8, 'refurbish':0.6, 'monitor':0.4},
+            avg_reward=0.7,
+        )
+        vec = state.to_feature_vector()
+        self.assertEqual(len(vec), 11)
+
+    def test_rule_based_teacher(self):
+        teacher = ActionRuleBasedTeacher()
+        state = MaintenanceState(
+            current_efficiency=2e9,
+            slope=-1e7,
+            days_to_threshold=0,
+            net_savings_replace=1000,
+            net_savings_refurbish=500,
+            payback_replace=100,
+            payback_refurbish=200,
+            carbon_intensity=0.4,
+            material_index=0.5,
+            action_success_rates={},
+            avg_reward=0.5,
+        )
+        probs = teacher.predict(state)
+        self.assertAlmostEqual(sum(probs), 1.0)
+        self.assertGreater(probs[0], probs[1])  # replace should be highest
+
+    async def test_select_action(self):
+        state = MaintenanceState(
+            current_efficiency=2e9,
+            slope=-1e7,
+            days_to_threshold=5,
+            net_savings_replace=1000,
+            net_savings_refurbish=500,
+            payback_replace=100,
+            payback_refurbish=200,
+            carbon_intensity=0.4,
+            material_index=0.5,
+            action_success_rates={},
+            avg_reward=0.5,
+        )
+        action, idx, state_vec, teacher_probs = await self.optimizer.select_action(state, exploration=False)
+        self.assertIn(action, self.optimizer.ACTIONS)
+
+    def test_replay_buffer(self):
+        buffer = ReplayBuffer(max_size=5)
+        state_vec = np.random.randn(11)
+        buffer.push(state_vec, 0, 1.0, state_vec, np.ones(3)/3)
+        self.assertEqual(len(buffer), 1)
+        batch = buffer.sample(1)
+        self.assertEqual(len(batch[0]), 1)
+
+
+# ============================================================================
+# 14. OFFLINE TRAINING FOR HISTORICAL ML
+# ============================================================================
+def train_historical_model(log_path: Path = Path(PredictiveMaintenanceConfig().interaction_logs_path),
+                           model_path: Path = Path(PredictiveMaintenanceConfig().historical_model_path)):
+    """
+    Train a RandomForestClassifier from past interaction logs.
+    """
+    if not log_path.exists():
+        logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
+        return
+
+    df_logs = pd.read_csv(log_path)
+    if len(df_logs) < 10:
+        logger.warning("Not enough logs to train historical model (need at least 10).")
+        return
+
+    X_list = []
+    y_list = []
+    for _, row in df_logs.iterrows():
+        state_vec = json.loads(row['state_vector'])
+        X_list.append(state_vec)
+        y_list.append(row['action'])
+
+    X = np.array(X_list)
+    y = np.array(y_list)
+
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y_encoded)
+
+    with open(model_path, 'wb') as f:
+        pickle.dump((model, le), f)
+    logger.info(f"Historical ML model trained and saved to {model_path}")
+
+
+# ============================================================================
+# 15. EXAMPLE USAGE (unchanged but with distillation)
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
     logging.basicConfig(level=logging.INFO)
 
     async def main():
-        # Create system
         system = create_predictive_maintenance_system()
         engine = system["engine"]
         tracker = system["tracker"]
 
-        # Simulate some data for a node (degrading efficiency)
         node = "node-001"
         base_flops = 1e12
         initial_eff = 2.0e9
@@ -1069,7 +1486,6 @@ if __name__ == "__main__":
             energy = base_flops / eff
             await tracker.add_measurement(node, base_flops, energy)
 
-        # Run analysis
         recs = await engine.run_analysis([node])
         for rec in recs:
             print(f"Recommendation for {rec.node_id}:")
@@ -1081,7 +1497,6 @@ if __name__ == "__main__":
             print(f"  Current efficiency: {rec.current_efficiency:.2e} FLOPs/J")
             print(f"  Days to threshold: {rec.days_to_threshold:.1f}")
 
-        # Get dashboard data
         dashboard_data = await engine.get_dashboard_data()
         print("\nDashboard data:")
         print(json.dumps(dashboard_data, indent=2))
