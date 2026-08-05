@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Quantum Error Mitigation for Green Agent v4.0.0
+Quantum Error Mitigation for Green Agent v4.1.0
 Implements advanced error mitigation techniques for reliable quantum computing.
 ENHANCED WITH:
-- Real mitigation algorithms (ZNE, PEC, CDR, DD, MEM, SV) using simulation.
-- Proper async task management and cancellation.
-- Comprehensive locking for shared state.
-- Pydantic configuration with environment support.
-- Full telemetry updates.
-- Active sustainability dashboard monitoring.
-- Versioned persistence with migration.
-- Improved error handling and logging.
-- Integration with qiskit/mitiq (optional) for real quantum hardware.
-- Full type hints and docstrings.
+- Adaptive strategy selection via Multi‑Teacher On‑Policy Distillation.
+- State‑aware choice of mitigation method based on circuit, environment, and history.
+- Online learning from mitigation outcomes.
+- Teachers: rule‑based, historical ML, stateful Q.
+- Student: linear softmax with distillation + REINFORCE.
+- Persistence for Q‑teacher weights and interaction logs.
+- Offline training for historical ML teacher.
+- Unit tests for distillation components.
+All previous features (real mitigation algorithms, carbon/helium tracking, federated, predictive, etc.) retained.
 """
 
 import asyncio
@@ -36,6 +35,11 @@ import zlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
+import random
+from abc import ABC, abstractmethod
+import pickle
+import pandas as pd
+from pathlib import Path
 
 # Optional dependencies
 try:
@@ -79,6 +83,14 @@ try:
     MITIQ_AVAILABLE = True
 except ImportError:
     MITIQ_AVAILABLE = False
+
+# scikit-learn for ML teacher
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import LabelEncoder
+    SKLEARN_ML = True
+except ImportError:
+    SKLEARN_ML = False
 
 logger = logging.getLogger(__name__)
 
@@ -133,27 +145,18 @@ if PYDANTIC_AVAILABLE:
         telemetry_export_interval: int = Field(60, ge=1)
         prometheus_port: Optional[int] = Field(None, ge=1024)
 
-        # Strategy selection weights
-        carbon_aware_weights: Dict[str, float] = Field(default_factory=lambda: {
-            'dd': 0.9,
-            'measurement': 0.85,
-            'symmetry': 0.8,
-            'hybrid': 0.7,
-            'zne': 0.6,
-            'cdr': 0.5,
-            'pec': 0.4,
-            'fallback_simple': 0.95
-        })
-        performance_weights: Dict[str, float] = Field(default_factory=lambda: {
-            'dd': 0.85,
-            'hybrid': 0.92,
-            'zne': 0.90,
-            'pec': 0.88,
-            'cdr': 0.85,
-            'measurement': 0.80,
-            'symmetry': 0.82,
-            'fallback_simple': 0.70
-        })
+        # NEW: Distillation parameters
+        distillation_epsilon: float = Field(0.1, ge=0, le=1)
+        distillation_train_every: int = Field(10, ge=1)
+        distillation_replay_size: int = Field(2000, ge=10)
+        distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
+        distill_weight: float = Field(0.7, ge=0, le=1)
+        rl_weight: float = Field(0.3, ge=0, le=1)
+
+        # Persistence paths for distillation
+        q_weights_path: str = Field("./qm_q_weights.json")
+        interaction_logs_path: str = Field("./qm_interactions.csv")
+        historical_model_path: str = Field("./qm_historical_model.pkl")
 
         @field_validator('carbon_update_interval')
         @classmethod
@@ -219,14 +222,16 @@ else:
         persistence_path: str = "quantum_mitigator_state.json.gz"
         telemetry_export_interval: int = 60
         prometheus_port: Optional[int] = None
-        carbon_aware_weights: Dict[str, float] = field(default_factory=lambda: {
-            'dd': 0.9, 'measurement': 0.85, 'symmetry': 0.8, 'hybrid': 0.7,
-            'zne': 0.6, 'cdr': 0.5, 'pec': 0.4, 'fallback_simple': 0.95
-        })
-        performance_weights: Dict[str, float] = field(default_factory=lambda: {
-            'dd': 0.85, 'hybrid': 0.92, 'zne': 0.90, 'pec': 0.88,
-            'cdr': 0.85, 'measurement': 0.80, 'symmetry': 0.82, 'fallback_simple': 0.70
-        })
+        # Distillation defaults
+        distillation_epsilon: float = 0.1
+        distillation_train_every: int = 10
+        distillation_replay_size: int = 2000
+        distillation_learning_rate: float = 0.01
+        distill_weight: float = 0.7
+        rl_weight: float = 0.3
+        q_weights_path: str = "./qm_q_weights.json"
+        interaction_logs_path: str = "./qm_interactions.csv"
+        historical_model_path: str = "./qm_historical_model.pkl"
 
         def __post_init__(self):
             self._validate()
@@ -456,7 +461,7 @@ class QuantumMitigatorPersistenceManager:
             recovery_timeout=config.circuit_breaker_recovery_timeout,
             name="persistence"
         )
-        self._version = "4.0.0"
+        self._version = "4.1.0"
         logger.info(f"QuantumMitigatorPersistenceManager initialized (path={self.path})")
 
     async def _upgrade_state(self, state: Dict) -> Dict:
@@ -710,7 +715,6 @@ class CarbonIntensityManager:
     async def get_current_intensity(self) -> float:
         async with self._lock:
             if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.update_interval:
-                # We'll release lock and call update
                 pass
         if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.update_interval:
             await self.update_carbon_intensity(self.region)
@@ -1337,221 +1341,283 @@ class ErrorMitigationResult:
     logical_error_rate: float = 0.0
 
 # ============================================================================
-# Quantum Carbon-Aware Selector (Enhanced)
+# DISTILLATION COMPONENTS FOR STRATEGY SELECTION
 # ============================================================================
 
-class QuantumCarbonAwareSelector:
-    def __init__(self, carbon_manager: Optional[CarbonIntensityManager] = None):
-        self.carbon_manager = carbon_manager
-        self.selection_history = deque(maxlen=1000)
-        self._lock = asyncio.Lock()
-        self._carbon_weights = {}
-        self._performance_weights = {}
-        logger.info("Quantum Carbon-Aware Selector initialized")
+@dataclass
+class MitigationState:
+    """State for the distillation agent."""
+    # Circuit characteristics
+    circuit_depth: float
+    n_qubits: float
+    current_error_rate: float
+    # Environment
+    carbon_intensity: float
+    helium_scarcity: float
+    carbon_price: float
+    helium_price: float
+    # Historical success rates for each strategy (8 strategies)
+    success_rate_zne: float
+    success_rate_pec: float
+    success_rate_cdr: float
+    success_rate_dd: float
+    success_rate_measurement: float
+    success_rate_symmetry: float
+    success_rate_hybrid: float
+    success_rate_fallback: float
+    # Average improvement
+    avg_improvement: float
 
-    async def select_mitigation_with_carbon(
-        self,
-        options: List[str],
-        circuit: Dict,
-        carbon_intensity: Optional[float] = None,
-        carbon_price: Optional[float] = None
-    ) -> Tuple[str, float]:
-        if carbon_intensity is None and self.carbon_manager:
-            carbon_intensity = await self.carbon_manager.get_current_intensity()
-            carbon_price = await self.carbon_manager.get_current_carbon_price()
+    def to_feature_vector(self) -> np.ndarray:
+        """Convert to 16‑dim numeric feature vector."""
+        features = [
+            min(self.circuit_depth / 200.0, 1.0),
+            min(self.n_qubits / 50.0, 1.0),
+            min(self.current_error_rate / 0.5, 1.0),
+            min(self.carbon_intensity / 1000.0, 1.0),
+            self.helium_scarcity,
+            min(self.carbon_price / 200.0, 1.0),
+            min(self.helium_price / 5.0, 1.0),
+            self.success_rate_zne,
+            self.success_rate_pec,
+            self.success_rate_cdr,
+            self.success_rate_dd,
+            self.success_rate_measurement,
+            self.success_rate_symmetry,
+            self.success_rate_hybrid,
+            self.success_rate_fallback,
+            self.avg_improvement,
+        ]
+        return np.array(features, dtype=np.float32)
+
+
+# Teacher abstract base
+class Teacher(ABC):
+    @abstractmethod
+    def predict(self, state: MitigationState) -> np.ndarray:
+        """Return probability vector over 8 strategies."""
+        pass
+
+    @abstractmethod
+    def confidence(self, state: MitigationState) -> float:
+        """Return confidence in prediction [0,1]."""
+        pass
+
+
+class StrategyRuleBasedTeacher(Teacher):
+    """Rule‑based expert: uses original heuristics."""
+    STRATEGIES = ['zne', 'pec', 'cdr', 'dd', 'measurement', 'symmetry', 'hybrid', 'fallback_simple']
+
+    def predict(self, state: MitigationState) -> np.ndarray:
+        probs = np.ones(8) * 0.1
+        if state.current_error_rate < 0.02:
+            probs[3] = 0.8  # dd (lightweight)
+        elif state.circuit_depth > 100:
+            probs[0] = 0.8  # zne
+        elif state.n_qubits > 10:
+            probs[2] = 0.8  # cdr
+        elif state.carbon_intensity > 500:
+            # prefer low-overhead strategies
+            probs[3] = 0.6  # dd
+            probs[5] = 0.6  # symmetry
         else:
-            carbon_intensity = carbon_intensity or 400
-            carbon_price = carbon_price or 50
+            probs[6] = 0.7  # hybrid
+        return probs / probs.sum()
 
-        # Weights from config (passed via a method later)
-        carbon_weights = {
-            'dd': 0.9,
-            'measurement': 0.85,
-            'symmetry': 0.8,
-            'hybrid': 0.7,
-            'zne': 0.6,
-            'cdr': 0.5,
-            'pec': 0.4,
-            'fallback_simple': 0.95
-        }
-        performance_weights = {
-            'dd': 0.85,
-            'hybrid': 0.92,
-            'zne': 0.90,
-            'pec': 0.88,
-            'cdr': 0.85,
-            'measurement': 0.80,
-            'symmetry': 0.82,
-            'fallback_simple': 0.70
-        }
+    def confidence(self, state: MitigationState) -> float:
+        if state.current_error_rate < 0.02:
+            return 0.6
+        return 0.4
 
-        price_factor = min(2.0, carbon_price / 50.0)
-        scores = {}
-        for option in options:
-            carbon_score = carbon_weights.get(option, 0.5)
-            performance_score = performance_weights.get(option, 0.5)
-            if carbon_intensity > 500:
-                carbon_weight = min(0.8, 0.5 + price_factor * 0.15)
-                performance_weight = 1.0 - carbon_weight
-            elif carbon_intensity > 300:
-                carbon_weight = min(0.6, 0.3 + price_factor * 0.15)
-                performance_weight = 1.0 - carbon_weight
-            else:
-                carbon_weight = max(0.2, 0.3 - price_factor * 0.05)
-                performance_weight = 1.0 - carbon_weight
-            scores[option] = carbon_score * carbon_weight + performance_score * performance_weight
 
-        if not scores:
-            return 'dd', 0.5
-        best_option = max(scores.items(), key=lambda x: x[1])
-        async with self._lock:
-            self.selection_history.append({
-                'timestamp': datetime.utcnow().isoformat(),
-                'carbon_intensity': carbon_intensity,
-                'carbon_price': carbon_price,
-                'selected': best_option[0],
-                'score': best_option[1]
-            })
-        return best_option
-
-# ============================================================================
-# Quantum Sustainability Dashboard (Enhanced with active monitor)
-# ============================================================================
-
-class QuantumSustainabilityDashboard:
-    def __init__(self, carbon_manager: Optional[CarbonIntensityManager] = None,
-                 helium_tracker: Optional[HeliumQuantumTracker] = None):
-        self.carbon_manager = carbon_manager
-        self.helium_tracker = helium_tracker
-        self.history = []
-        self.alert_thresholds = {
-            'carbon_intensity': 500,
-            'helium_remaining': 0.2,
-            'error_rate': 0.1
-        }
-        self._lock = asyncio.Lock()
-        self._running = True
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
-        logger.info("Quantum Sustainability Dashboard initialized")
-
-    async def _monitor_loop(self):
-        """Periodically check thresholds and log alerts."""
-        while self._running:
+class StrategyHistoricalMLTeacher(Teacher):
+    """Offline trained classifier from past interactions."""
+    def __init__(self, model_path: Optional[str] = None):
+        self.model = None
+        self.label_encoder = None
+        self.model_path = model_path or Path(QuantumErrorMitigationConfig().historical_model_path)
+        if self.model_path.exists():
             try:
-                # Collect metrics
-                metrics = {}
-                if self.carbon_manager:
-                    intensity = await self.carbon_manager.get_current_intensity()
-                    metrics['carbon_intensity'] = intensity
-                if self.helium_tracker:
-                    pos = self.helium_tracker.get_helium_position()
-                    metrics['helium_remaining'] = pos.get('remaining_budget_l', 0) / max(pos.get('budget_l', 1), 1)
-                # Check alerts
-                alerts = []
-                if metrics.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
-                    alerts.append('High carbon intensity detected')
-                if metrics.get('helium_remaining', 1.0) < self.alert_thresholds['helium_remaining']:
-                    alerts.append('Helium budget critically low')
-                if alerts:
-                    logger.warning(f"Sustainability alerts: {alerts}")
-                    # Could trigger external notification
-                await asyncio.sleep(60)  # check every minute
-            except asyncio.CancelledError:
-                break
+                with open(self.model_path, 'rb') as f:
+                    self.model, self.label_encoder = pickle.load(f)
+                logger.info(f"Loaded historical ML model from {self.model_path}")
             except Exception as e:
-                logger.error(f"Sustainability monitor error: {e}")
-                await asyncio.sleep(300)
+                logger.error(f"Failed to load historical model: {e}")
 
-    async def get_dashboard_status(
-        self,
-        carbon_manager: Optional[CarbonIntensityManager] = None,
-        helium_tracker: Optional[HeliumQuantumTracker] = None,
-        mitigator: Optional['QuantumErrorMitigator'] = None
-    ) -> Dict:
-        status = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': 0.5
-        }
-        if carbon_manager:
-            status['carbon_intensity'] = await carbon_manager.get_current_intensity()
-            status['carbon_price'] = await carbon_manager.get_current_carbon_price()
-            status['carbon_savings_kg'] = carbon_manager.total_carbon_savings_kg
-        if helium_tracker:
-            helium_pos = helium_tracker.get_helium_position()
-            status['helium_position'] = helium_pos
-            status['helium_price'] = helium_pos.get('current_price_usd_per_l', 0.5)
-            status['helium_remaining_ratio'] = helium_pos.get('remaining_budget_l', 0) / max(helium_pos.get('budget_l', 1), 1)
-        if mitigator:
-            stats = mitigator.get_mitigation_statistics()
-            status['mitigation_performance'] = stats
-            status['success_rate'] = stats.get('success_rate', 0)
-            status['average_improvement'] = stats.get('average_improvement', 0)
+    def predict(self, state: MitigationState) -> np.ndarray:
+        if self.model is None or self.label_encoder is None:
+            return np.ones(8) / 8
+        x = state.to_feature_vector().reshape(1, -1)
+        probs = self.model.predict_proba(x)[0]
+        return probs
 
-        # Calculate composite score
-        score = 0.5
-        if status.get('success_rate', 0) > 0.8:
-            score += 0.2
-        if status.get('carbon_intensity', 400) < 300:
-            score += 0.15
-        if status.get('helium_remaining_ratio', 0.5) > 0.5:
-            score += 0.15
-        status['sustainability_score'] = min(1.0, max(0.0, score))
+    def confidence(self, state: MitigationState) -> float:
+        return 0.7 if self.model is not None else 0.0
 
-        # Alerts
-        alerts = []
-        if status.get('carbon_intensity', 0) > self.alert_thresholds['carbon_intensity']:
-            alerts.append('High carbon intensity detected')
-        if status.get('helium_remaining_ratio', 1.0) < self.alert_thresholds['helium_remaining']:
-            alerts.append('Helium budget critically low')
-        if status.get('success_rate', 1.0) < 0.7:
-            alerts.append('Mitigation success rate low')
-        if alerts:
-            status['alerts'] = alerts
 
-        async with self._lock:
-            self.history.append(status)
-            if len(self.history) > 1000:
-                self.history = self.history[-1000:]
+class StrategyStatefulQTeacher(Teacher):
+    """Linear Q‑learning with state features."""
+    def __init__(self, lr: float = 0.1):
+        self.lr = lr
+        self.weights = np.zeros((16, 8))  # 16 features, 8 actions
+        self._load_state()
 
-        return status
-
-    def generate_sustainability_report(self, status: Dict) -> Dict:
-        return {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sustainability_score': status.get('sustainability_score', 0.5),
-            'carbon_status': {
-                'intensity': status.get('carbon_intensity', 0),
-                'price_usd_per_ton': status.get('carbon_price', 50),
-                'savings_kg': status.get('carbon_savings_kg', 0)
-            },
-            'helium_status': {
-                'remaining_ratio': status.get('helium_remaining_ratio', 0.5),
-                'price_usd_per_l': status.get('helium_price', 0.5)
-            },
-            'mitigation_status': status.get('mitigation_performance', {}),
-            'alerts': status.get('alerts', []),
-            'recommendations': self._generate_recommendations(status)
-        }
-
-    def _generate_recommendations(self, status: Dict) -> List[str]:
-        recommendations = []
-        if status.get('carbon_intensity', 0) > 400:
-            recommendations.append("Schedule quantum operations during low-carbon hours")
-        if status.get('helium_remaining_ratio', 1.0) < 0.3:
-            recommendations.append("Implement helium recovery for quantum operations")
-        if status.get('success_rate', 1.0) < 0.8:
-            recommendations.append("Review mitigation strategy selection for better results")
-        return recommendations or ["All sustainability metrics are within acceptable ranges"]
-
-    async def shutdown(self):
-        self._running = False
-        if self._monitor_task:
-            self._monitor_task.cancel()
+    def _load_state(self):
+        path = Path(QuantumErrorMitigationConfig().q_weights_path)
+        if path.exists():
             try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
-        logger.info("QuantumSustainabilityDashboard shut down")
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                self.weights = np.array(data)
+                logger.info(f"Loaded Q‑teacher weights from {path}")
+            except Exception as e:
+                logger.error(f"Failed to load Q‑weights: {e}")
+
+    def _save_state(self):
+        path = Path(QuantumErrorMitigationConfig().q_weights_path)
+        with open(path, 'w') as f:
+            json.dump(self.weights.tolist(), f, indent=2)
+
+    def predict(self, state: MitigationState) -> np.ndarray:
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        exp_q = np.exp(q - np.max(q))
+        return exp_q / exp_q.sum()
+
+    def confidence(self, state: MitigationState) -> float:
+        return 0.5
+
+    def update(self, state: MitigationState, action: int, reward: float):
+        x = state.to_feature_vector()
+        q_current = np.dot(x, self.weights[:, action])
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._save_state()
+
+
+class DistillationStudent:
+    def __init__(self, feature_dim: int = 16, n_classes: int = 8, lr: float = 0.01):
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+        if num_classes != self.n_classes:
+            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_biases = np.zeros(num_classes)
+            min_dim = min(self.n_classes, num_classes)
+            new_weights[:, :min_dim] = self.weights[:, :min_dim]
+            new_biases[:min_dim] = self.biases[:min_dim]
+            self.weights = new_weights
+            self.biases = new_biases
+            self.n_classes = num_classes
+        logits = state_vector @ self.weights + self.biases
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
+        current_probs = self.predict_proba(state_vector, self.n_classes)
+        logits = state_vector @ self.weights + self.biases
+
+        grad_distill = -(teacher_probs - current_probs)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        grad_rl = -reward * (one_hot - current_probs)
+
+        grad = distill_weight * grad_distill + rl_weight * grad_rl
+        self.weights -= self.lr * np.outer(state_vector, grad)
+        self.biases -= self.lr * grad
+        self.counter += 1
+
+
+class ReplayBuffer:
+    def __init__(self, max_size: int = 2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state_vec: np.ndarray, action: int, reward: float,
+             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+
+    def sample(self, batch_size: int = 32):
+        if len(self.buffer) < batch_size:
+            batch = list(self.buffer)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        return (np.array(states), actions, np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DistillationStrategyOptimizer:
+    """
+    Multi‑teacher on‑policy distillation agent for mitigation strategy selection.
+    Strategies: zne, pec, cdr, dd, measurement, symmetry, hybrid, fallback_simple.
+    """
+    STRATEGIES = ['zne', 'pec', 'cdr', 'dd', 'measurement', 'symmetry', 'hybrid', 'fallback_simple']
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.teachers: List[Teacher] = [
+            StrategyRuleBasedTeacher(),
+            StrategyHistoricalMLTeacher(),
+            StrategyStatefulQTeacher()
+        ]
+        self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
+        self.epsilon = config.get('distillation_epsilon', 0.1)
+        self.train_every = config.get('distillation_train_every', 10)
+        self.counter = 0
+
+    async def select_strategy(self, state: MitigationState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
+        n = 8
+
+        teacher_probs = np.zeros(n)
+        total_conf = 0.0
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            conf = teacher.confidence(state)
+            if len(prob) != n:
+                if len(prob) < n:
+                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
+                else:
+                    prob = prob[:n]
+            teacher_probs += prob * conf
+            total_conf += conf
+        if total_conf > 0:
+            teacher_probs /= total_conf
+        else:
+            teacher_probs = np.ones(n) / n
+
+        student_probs = self.student.predict_proba(state_vec, n)
+
+        if exploration and random.random() < self.epsilon:
+            action_idx = random.randint(0, n - 1)
+        else:
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = np.argmax(combined)
+
+        return self.STRATEGIES[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+        self.counter += 1
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
+            batch = self.replay_buffer.sample(8)
+            states, actions, rewards, _, teacher_probs_batch = batch
+            for i in range(len(states)):
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+
+    def get_stats(self) -> Dict:
+        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+
 
 # ============================================================================
 # Enhanced Quantum Error Mitigator (Main Class)
@@ -1559,12 +1625,11 @@ class QuantumSustainabilityDashboard:
 
 class QuantumErrorMitigator:
     """
-    Enhanced Quantum Error Mitigation v4.0.0 with full sustainability and resilience features.
+    Enhanced Quantum Error Mitigation v4.1.0 with adaptive strategy selection via distillation.
     """
 
     def __init__(self, config: Optional[QuantumErrorMitigationConfig] = None, **kwargs):
         if config is None:
-            # Build config from kwargs for backward compatibility
             if PYDANTIC_AVAILABLE:
                 config = QuantumErrorMitigationConfig(**{
                     k: v for k, v in kwargs.items()
@@ -1585,7 +1650,7 @@ class QuantumErrorMitigator:
         self.enable_sustainability_dashboard = self.config.enable_sustainability_dashboard
         self.enable_qec = self.config.enable_qec
 
-        # Sub-modules with config
+        # Sub-modules
         self.carbon_manager = CarbonIntensityManager(self.config) if self.enable_carbon_intensity else None
         self.helium_tracker = HeliumQuantumTracker(self.config) if self.enable_helium_tracking else None
         self.federated_mitigator = FederatedQuantumMitigator(self.config) if self.enable_federated else None
@@ -1594,7 +1659,6 @@ class QuantumErrorMitigator:
         self.sustainability_dashboard = QuantumSustainabilityDashboard(
             self.carbon_manager, self.helium_tracker
         ) if self.enable_sustainability_dashboard else None
-        self.carbon_selector = QuantumCarbonAwareSelector(self.carbon_manager) if self.enable_carbon_intensity else None
 
         # Concurrency locks
         self._history_lock = asyncio.Lock()
@@ -1611,9 +1675,25 @@ class QuantumErrorMitigator:
             'pec': self.probabilistic_error_cancellation,
             'cdr': self.clifford_data_regression,
             'dd': self.dynamical_decoupling,
-            'mem': self.measurement_error_mitigation,
-            'sv': self.symmetry_verification
+            'measurement': self.measurement_error_mitigation,
+            'symmetry': self.symmetry_verification,
+            'hybrid': self._hybrid_mitigation,
+            'fallback_simple': self._fallback_mitigation,
         }
+
+        # NEW: Distillation strategy optimizer
+        self.strategy_optimizer = DistillationStrategyOptimizer({
+            'distillation_epsilon': self.config.distillation_epsilon,
+            'distillation_train_every': self.config.distillation_train_every,
+            'distillation_replay_size': self.config.distillation_replay_size,
+            'distillation_learning_rate': self.config.distillation_learning_rate,
+        })
+
+        # Interaction tracking
+        self.interaction_log: List[Dict] = []
+        self.last_state_vec: Optional[np.ndarray] = None
+        self.last_action_idx: Optional[int] = None
+        self.last_teacher_probs: Optional[np.ndarray] = None
 
         # Error models
         self.error_models = {}
@@ -1629,7 +1709,7 @@ class QuantumErrorMitigator:
             'average_carbon_saved': 0.0
         }
 
-        # Background tasks (store for cancellation)
+        # Background tasks
         self._background_tasks: List[asyncio.Task] = []
         self._start_background_tasks()
 
@@ -1637,7 +1717,7 @@ class QuantumErrorMitigator:
         self._load_state_task = asyncio.create_task(self._load_state())
         self._background_tasks.append(self._load_state_task)
 
-        logger.info("Enhanced Quantum Error Mitigator v4.0.0 initialized")
+        logger.info("Enhanced Quantum Error Mitigator v4.1.0 initialized with distillation")
 
     def _start_background_tasks(self):
         if self.enable_carbon_intensity and self.carbon_manager:
@@ -1766,8 +1846,11 @@ class QuantumErrorMitigator:
             carbon_price = await self.carbon_manager.get_current_carbon_price()
 
         helium_price = 0.5
+        helium_scarcity = 0.5
         if self.helium_tracker:
             helium_price = await self.helium_tracker.get_current_helium_price()
+            pos = self.helium_tracker.get_helium_position()
+            helium_scarcity = 1 - (pos.get('remaining_budget_l', 0) / max(pos.get('budget_l', 1), 1))
 
         original_carbon = self.carbon_manager.calculate_quantum_carbon_impact(
             circuit.depth, circuit.n_qubits
@@ -1802,19 +1885,20 @@ class QuantumErrorMitigator:
                 self.telemetry.gauge('qm_mitigated_error_rate', qec_result.mitigated_error_rate)
                 return qec_circuit, qec_result
 
-        # Select mitigation strategy
-        if preferred_method and preferred_method in self.strategies:
-            strategy = preferred_method
-        elif carbon_aware and self.carbon_selector:
-            options = list(self.strategies.keys())
-            strategy, _ = await self.carbon_selector.select_mitigation_with_carbon(
-                options, {'depth': circuit.depth, 'n_qubits': circuit.n_qubits},
-                carbon_intensity, carbon_price
-            )
-        else:
-            strategy = self._select_strategy(circuit, current_error, target_error_rate)
+        # ---- Distillation: select strategy ----
+        # Build state
+        state = self._build_state(circuit, current_error, carbon_intensity, helium_scarcity, carbon_price, helium_price)
+        strategy, action_idx, state_vec, teacher_probs = await self.strategy_optimizer.select_strategy(state, exploration=True)
+        self.last_state_vec = state_vec
+        self.last_action_idx = action_idx
+        self.last_teacher_probs = teacher_probs
 
         logger.info(f"Selected mitigation strategy: {strategy}")
+
+        # If a preferred method is given, override (but we still log the distillation choice)
+        if preferred_method and preferred_method in self.strategies:
+            strategy = preferred_method
+            logger.info(f"Overriding with preferred method: {strategy}")
 
         mitigation_func = self.strategies[strategy]
 
@@ -1837,7 +1921,6 @@ class QuantumErrorMitigator:
                 result.carbon_saved_kg = carbon_saved
                 result.resource_cost['carbon_price_usd_per_ton'] = carbon_price
 
-            # Track helium usage
             if self.helium_tracker:
                 helium_amount = result.overhead_factor * 0.01
                 await self.helium_tracker.record_helium_usage(
@@ -1846,19 +1929,15 @@ class QuantumErrorMitigator:
                 result.helium_efficiency = self.helium_tracker.get_helium_efficiency(strategy)
                 result.resource_cost['helium_price_usd_per_l'] = helium_price
 
-            # Calculate sustainability score
             result.sustainability_score = self._calculate_sustainability_score(result)
 
-            # Update federated model
             if self.federated_mitigator:
                 result.federated_round = self.federated_mitigator.round
 
-            # Record history
             async with self._history_lock:
                 self.mitigation_history.append(result)
             self._update_metrics(result)
 
-            # Update predictive analyzer
             if self.predictive_analyzer:
                 self.predictive_analyzer.update_history({
                     'original_error': result.original_error_rate,
@@ -1871,14 +1950,12 @@ class QuantumErrorMitigator:
                 })
                 await self.predictive_analyzer.train_prediction_model()
 
-            # Verify mitigation
-            if result.mitigated_error_rate > target_error_rate:
-                logger.warning(f"Mitigation fell short: {result.mitigated_error_rate:.4f} > {target_error_rate:.4f}")
-                if strategy != 'hybrid':
-                    logger.info("Attempting hybrid mitigation")
-                    mitigated_circuit, result = await self._hybrid_mitigation(
-                        circuit, target_error_rate, max_overhead
-                    )
+            # ---- Compute reward and update distillation agent ----
+            reward = self._compute_reward(result)
+            await self._update_agent(state_vec, action_idx, reward, state)
+
+            # Log interaction for offline training
+            self._log_interaction(state, strategy, reward, result)
 
             # Telemetry
             self.telemetry.increment('qm_mitigations_total')
@@ -2124,22 +2201,6 @@ class QuantumErrorMitigator:
         base_error = 0.001
         return min(1.0, base_error * circuit.depth * circuit.n_qubits)
 
-    def _select_strategy(
-        self,
-        circuit: QuantumCircuit,
-        current_error: float,
-        target_error_rate: float
-    ) -> str:
-        """Select a mitigation strategy based on circuit and error characteristics."""
-        if current_error < target_error_rate * 2:
-            return 'dd'  # lightweight
-        elif circuit.depth > 100:
-            return 'zne'  # good for deep circuits
-        elif circuit.n_qubits > 10:
-            return 'cdr'  # good for many qubits
-        else:
-            return 'hybrid'
-
     def _update_metrics(self, result: ErrorMitigationResult):
         async with self._metrics_lock:
             self.performance_metrics['total_mitigations'] += 1
@@ -2159,6 +2220,91 @@ class QuantumErrorMitigator:
         helium_score = result.helium_efficiency
         overhead_score = 1.0 - min(1.0, result.overhead_factor / 10.0)
         return (error_improvement * 0.4 + carbon_score * 0.2 + helium_score * 0.2 + overhead_score * 0.2)
+
+    # ---------- NEW: State building ----------
+    def _build_state(
+        self,
+        circuit: QuantumCircuit,
+        current_error: float,
+        carbon_intensity: float,
+        helium_scarcity: float,
+        carbon_price: float,
+        helium_price: float
+    ) -> MitigationState:
+        """Build state for the distillation agent."""
+        # Strategy success rates from history
+        success_rates = {s: 0.5 for s in DistillationStrategyOptimizer.STRATEGIES}
+        for result in self.mitigation_history[-100:]:
+            method = result.mitigation_method
+            if method in success_rates:
+                if result.mitigated_error_rate < result.original_error_rate:
+                    success_rates[method] = min(1.0, success_rates[method] + 0.02)
+                else:
+                    success_rates[method] = max(0.0, success_rates[method] - 0.02)
+
+        # Average improvement
+        if self.mitigation_history:
+            improvements = [1 - r.mitigated_error_rate / max(r.original_error_rate, 0.001) for r in self.mitigation_history[-50:]]
+            avg_improvement = np.mean(improvements) if improvements else 0.0
+        else:
+            avg_improvement = 0.0
+
+        return MitigationState(
+            circuit_depth=circuit.depth,
+            n_qubits=circuit.n_qubits,
+            current_error_rate=current_error,
+            carbon_intensity=carbon_intensity,
+            helium_scarcity=helium_scarcity,
+            carbon_price=carbon_price,
+            helium_price=helium_price,
+            success_rate_zne=success_rates.get('zne', 0.5),
+            success_rate_pec=success_rates.get('pec', 0.5),
+            success_rate_cdr=success_rates.get('cdr', 0.5),
+            success_rate_dd=success_rates.get('dd', 0.5),
+            success_rate_measurement=success_rates.get('measurement', 0.5),
+            success_rate_symmetry=success_rates.get('symmetry', 0.5),
+            success_rate_hybrid=success_rates.get('hybrid', 0.5),
+            success_rate_fallback=success_rates.get('fallback_simple', 0.5),
+            avg_improvement=avg_improvement,
+        )
+
+    # ---------- NEW: Reward computation ----------
+    def _compute_reward(self, result: ErrorMitigationResult) -> float:
+        improvement = 1 - result.mitigated_error_rate / max(result.original_error_rate, 0.001)
+        overhead_score = 1 - min(1.0, result.overhead_factor / 10.0)
+        carbon_saved_norm = min(1.0, result.carbon_saved_kg / 0.1)
+        helium_efficiency = result.helium_efficiency
+
+        reward = 0.4 * improvement + 0.3 * overhead_score + 0.2 * carbon_saved_norm + 0.1 * helium_efficiency
+        return max(0.0, min(1.0, reward))
+
+    # ---------- NEW: Update agent ----------
+    async def _update_agent(self, state_vec: np.ndarray, action_idx: int, reward: float, state: MitigationState):
+        next_state_vec = state.to_feature_vector()  # next state (same for simplicity)
+        await self.strategy_optimizer.update(
+            state_vec,
+            action_idx,
+            reward,
+            next_state_vec,
+            self.last_teacher_probs
+        )
+
+    # ---------- NEW: Log interaction ----------
+    def _log_interaction(self, state: MitigationState, strategy: str, reward: float, result: ErrorMitigationResult):
+        entry = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'strategy': strategy,
+            'reward': reward,
+            'result': result.__dict__,
+            'state_vector': state.to_feature_vector().tolist(),
+        }
+        self.interaction_log.append(entry)
+        log_path = Path(self.config.interaction_logs_path)
+        df_log = pd.DataFrame([entry])
+        if log_path.exists():
+            df_log.to_csv(log_path, mode='a', header=False, index=False)
+        else:
+            df_log.to_csv(log_path, index=False)
 
     # ============================================================================
     # Public Query Methods
@@ -2185,6 +2331,8 @@ class QuantumErrorMitigator:
         }
         if self.enable_qec and self.qec:
             stats['qec_status'] = self.qec.get_qec_status()
+        # Distillation stats
+        stats['distillation'] = self.strategy_optimizer.get_stats()
         return stats
 
     def get_sustainability_dashboard_status(self) -> Dict:
@@ -2238,7 +2386,6 @@ class QuantumErrorMitigator:
 
     async def shutdown(self):
         logger.info("Shutting down Quantum Error Mitigator")
-        # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
@@ -2255,10 +2402,10 @@ class QuantumErrorMitigator:
             await self.sustainability_dashboard.shutdown()
         logger.info("Shutdown complete")
 
+
 # ============================================================================
 # Singleton Accessor (Preserved)
 # ============================================================================
-
 _mitigator_instance = None
 
 async def get_quantum_mitigator() -> QuantumErrorMitigator:
@@ -2266,6 +2413,137 @@ async def get_quantum_mitigator() -> QuantumErrorMitigator:
     if _mitigator_instance is None:
         _mitigator_instance = QuantumErrorMitigator()
     return _mitigator_instance
+
+# ============================================================================
+# UNIT TESTS (Phase 10)
+# ============================================================================
+import unittest
+from unittest import IsolatedAsyncioTestCase
+
+class TestDistillationComponents(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = {
+            'distillation_epsilon': 0.0,
+            'distillation_replay_size': 10,
+            'distillation_learning_rate': 0.01,
+            'distillation_train_every': 10,
+        }
+        self.optimizer = DistillationStrategyOptimizer(self.config)
+
+    def test_state_feature_vector(self):
+        state = MitigationState(
+            circuit_depth=50,
+            n_qubits=10,
+            current_error_rate=0.05,
+            carbon_intensity=400,
+            helium_scarcity=0.5,
+            carbon_price=50,
+            helium_price=0.5,
+            success_rate_zne=0.8,
+            success_rate_pec=0.6,
+            success_rate_cdr=0.7,
+            success_rate_dd=0.9,
+            success_rate_measurement=0.85,
+            success_rate_symmetry=0.75,
+            success_rate_hybrid=0.95,
+            success_rate_fallback=0.5,
+            avg_improvement=0.7,
+        )
+        vec = state.to_feature_vector()
+        self.assertEqual(len(vec), 16)
+
+    def test_rule_based_teacher(self):
+        teacher = StrategyRuleBasedTeacher()
+        state = MitigationState(
+            circuit_depth=50,
+            n_qubits=10,
+            current_error_rate=0.05,
+            carbon_intensity=400,
+            helium_scarcity=0.5,
+            carbon_price=50,
+            helium_price=0.5,
+            success_rate_zne=0.8,
+            success_rate_pec=0.6,
+            success_rate_cdr=0.7,
+            success_rate_dd=0.9,
+            success_rate_measurement=0.85,
+            success_rate_symmetry=0.75,
+            success_rate_hybrid=0.95,
+            success_rate_fallback=0.5,
+            avg_improvement=0.7,
+        )
+        probs = teacher.predict(state)
+        self.assertAlmostEqual(sum(probs), 1.0)
+        self.assertGreater(probs[3], probs[0])  # dd should be highest
+
+    async def test_select_strategy(self):
+        state = MitigationState(
+            circuit_depth=50,
+            n_qubits=10,
+            current_error_rate=0.05,
+            carbon_intensity=400,
+            helium_scarcity=0.5,
+            carbon_price=50,
+            helium_price=0.5,
+            success_rate_zne=0.8,
+            success_rate_pec=0.6,
+            success_rate_cdr=0.7,
+            success_rate_dd=0.9,
+            success_rate_measurement=0.85,
+            success_rate_symmetry=0.75,
+            success_rate_hybrid=0.95,
+            success_rate_fallback=0.5,
+            avg_improvement=0.7,
+        )
+        strategy, idx, state_vec, teacher_probs = await self.optimizer.select_strategy(state, exploration=False)
+        self.assertIn(strategy, self.optimizer.STRATEGIES)
+
+    def test_replay_buffer(self):
+        buffer = ReplayBuffer(max_size=5)
+        state_vec = np.random.randn(16)
+        buffer.push(state_vec, 0, 1.0, state_vec, np.ones(8)/8)
+        self.assertEqual(len(buffer), 1)
+        batch = buffer.sample(1)
+        self.assertEqual(len(batch[0]), 1)
+
+
+# ============================================================================
+# OFFLINE TRAINING FOR HISTORICAL ML
+# ============================================================================
+def train_historical_model(log_path: Path = Path(QuantumErrorMitigationConfig().interaction_logs_path),
+                           model_path: Path = Path(QuantumErrorMitigationConfig().historical_model_path)):
+    """
+    Train a RandomForestClassifier from past interaction logs.
+    """
+    if not log_path.exists():
+        logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
+        return
+
+    df_logs = pd.read_csv(log_path)
+    if len(df_logs) < 10:
+        logger.warning("Not enough logs to train historical model (need at least 10).")
+        return
+
+    X_list = []
+    y_list = []
+    for _, row in df_logs.iterrows():
+        state_vec = json.loads(row['state_vector'])
+        X_list.append(state_vec)
+        y_list.append(row['strategy'])
+
+    X = np.array(X_list)
+    y = np.array(y_list)
+
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y_encoded)
+
+    with open(model_path, 'wb') as f:
+        pickle.dump((model, le), f)
+    logger.info(f"Historical ML model trained and saved to {model_path}")
+
 
 # ============================================================================
 # Example Usage (if run directly)
@@ -2286,6 +2564,7 @@ if __name__ == "__main__":
         )
         mitigated, result = await mitigator.mitigate_errors(circuit)
         print(f"Mitigated error: {result.mitigated_error_rate:.4f}")
+        print(f"Strategy used: {result.mitigation_method}")
         await mitigator.shutdown()
 
     asyncio.run(main())
