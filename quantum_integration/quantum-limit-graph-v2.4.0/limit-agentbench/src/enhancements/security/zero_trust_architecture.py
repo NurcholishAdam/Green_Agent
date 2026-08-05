@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Zero Trust Security Architecture for Green Agent v4.0.0
+Zero Trust Security Architecture for Green Agent v4.1.0
 Implements complete zero‑trust security model for expert routing and execution.
 ENHANCED WITH:
-- Pydantic configuration with environment support.
-- Proper async task management and cancellation.
-- Comprehensive locking for shared state.
-- Improved persistence (pickle + versioning).
-- Realistic stub implementations for authentication.
-- Dynamic rate limiting with sliding window.
-- Key rotation and revocation support.
-- Full telemetry updates.
-- Improved error handling.
-- Full type hints and docstrings.
+- Adaptive authentication level selection via Multi‑Teacher On‑Policy Distillation.
+- State‑aware choice of auth level (light, standard, enhanced) based on context.
+- Online learning from authentication outcomes.
+- Teachers: rule‑based, historical ML, stateful Q.
+- Student: linear softmax with distillation + REINFORCE.
+- Persistence for Q‑teacher weights and interaction logs.
+- Offline training for historical ML teacher.
+- Unit tests for distillation components.
+All previous features (carbon/helium tracking, predictive analytics, ledger, rate limiting, etc.) retained.
 """
 
 import asyncio
@@ -36,9 +35,15 @@ from collections import deque, defaultdict
 import os
 import pickle
 import zlib
+import random
+from abc import ABC, abstractmethod
+import pandas as pd
+from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import SGDRegressor
 from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -132,6 +137,19 @@ class ZeroTrustConfig(BaseSettings):
         'high': 0.4,
         'critical': 0.1
     })
+
+    # NEW: Distillation parameters
+    distillation_epsilon: float = Field(0.1, ge=0, le=1)
+    distillation_train_every: int = Field(10, ge=1)
+    distillation_replay_size: int = Field(2000, ge=10)
+    distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
+    distill_weight: float = Field(0.7, ge=0, le=1)
+    rl_weight: float = Field(0.3, ge=0, le=1)
+
+    # Persistence paths for distillation
+    q_weights_path: str = Field("./auth_q_weights.json")
+    interaction_logs_path: str = Field("./auth_interactions.csv")
+    historical_model_path: str = Field("./auth_historical_model.pkl")
 
     @field_validator('carbon_update_interval')
     @classmethod
@@ -356,7 +374,7 @@ class ZeroTrustPersistenceManager:
             recovery_timeout=config.circuit_breaker_recovery_timeout,
             name="persistence"
         )
-        self._version = "4.0.0"
+        self._version = "4.1.0"
         logger.info(f"ZeroTrustPersistenceManager initialized (path={self.path})")
 
     async def _upgrade_state(self, state: Dict) -> Dict:
@@ -368,6 +386,7 @@ class ZeroTrustPersistenceManager:
         # Add new fields with defaults as needed.
         if 'key_rotation_counter' not in state:
             state['key_rotation_counter'] = 0
+        # Q-weights will be saved separately
         state['version'] = self._version
         return state
 
@@ -588,7 +607,6 @@ class CarbonIntensityManager:
     async def get_current_intensity(self) -> float:
         async with self._lock:
             if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.update_interval:
-                # Release lock and call update
                 pass
         if self.last_update is None or (datetime.utcnow() - self.last_update).seconds > self.update_interval:
             await self.update_carbon_intensity(self.region)
@@ -1141,7 +1159,259 @@ class SecurityContext:
         return grant in self.authorization_grants
 
 # ============================================================================
-# Carbon-Aware Authenticator (Enhanced)
+# DISTILLATION COMPONENTS FOR AUTHENTICATION LEVEL SELECTION
+# ============================================================================
+
+@dataclass
+class AuthState:
+    """State for the distillation agent."""
+    carbon_intensity: float
+    carbon_price: float
+    helium_price: float
+    threat_level: float
+    request_sensitivity: float  # 0-1, based on security level
+    # Historical performance (from logs)
+    recent_success_rate: float
+    avg_sustainability_score: float
+
+    def to_feature_vector(self) -> np.ndarray:
+        features = [
+            min(self.carbon_intensity / 1000.0, 1.0),
+            min(self.carbon_price / 200.0, 1.0),
+            min(self.helium_price / 5.0, 1.0),
+            self.threat_level,
+            self.request_sensitivity,
+            self.recent_success_rate,
+            self.avg_sustainability_score,
+        ]
+        return np.array(features, dtype=np.float32)
+
+
+class Teacher(ABC):
+    @abstractmethod
+    def predict(self, state: AuthState) -> np.ndarray:
+        """Return probability vector over 3 auth levels."""
+        pass
+
+    @abstractmethod
+    def confidence(self, state: AuthState) -> float:
+        """Return confidence in prediction [0,1]."""
+        pass
+
+
+class AuthRuleBasedTeacher(Teacher):
+    """Rule‑based expert: uses original heuristics."""
+    LEVELS = ['light', 'standard', 'enhanced']
+
+    def predict(self, state: AuthState) -> np.ndarray:
+        probs = np.ones(3) * 0.1
+        if state.carbon_intensity > 500 or state.carbon_price > 100:
+            probs[0] = 0.8  # light
+        elif state.threat_level > 0.7 or state.request_sensitivity > 0.8:
+            probs[2] = 0.8  # enhanced
+        elif state.carbon_price > 50 and state.helium_price > 1.0:
+            probs[1] = 0.6  # standard
+        else:
+            probs[1] = 0.6  # standard default
+        return probs / probs.sum()
+
+    def confidence(self, state: AuthState) -> float:
+        if state.carbon_intensity > 500:
+            return 0.6
+        return 0.4
+
+
+class AuthHistoricalMLTeacher(Teacher):
+    """Offline trained classifier from past interactions."""
+    def __init__(self, model_path: Optional[Path] = None):
+        self.model = None
+        self.label_encoder = None
+        self.model_path = model_path or Path(ZeroTrustConfig().historical_model_path)
+        if self.model_path.exists():
+            try:
+                with open(self.model_path, 'rb') as f:
+                    self.model, self.label_encoder = pickle.load(f)
+                logger.info(f"Loaded historical ML model from {self.model_path}")
+            except Exception as e:
+                logger.error(f"Failed to load historical model: {e}")
+
+    def predict(self, state: AuthState) -> np.ndarray:
+        if self.model is None or self.label_encoder is None:
+            return np.ones(3) / 3
+        x = state.to_feature_vector().reshape(1, -1)
+        probs = self.model.predict_proba(x)[0]
+        return probs
+
+    def confidence(self, state: AuthState) -> float:
+        return 0.7 if self.model is not None else 0.0
+
+
+class AuthStatefulQTeacher(Teacher):
+    """Linear Q‑learning with state features."""
+    def __init__(self, lr: float = 0.1):
+        self.lr = lr
+        self.weights = np.zeros((7, 3))  # 7 features, 3 actions
+        self._load_state()
+
+    def _load_state(self):
+        path = Path(ZeroTrustConfig().q_weights_path)
+        if path.exists():
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                self.weights = np.array(data)
+                logger.info(f"Loaded Q‑teacher weights from {path}")
+            except Exception as e:
+                logger.error(f"Failed to load Q‑weights: {e}")
+
+    def _save_state(self):
+        path = Path(ZeroTrustConfig().q_weights_path)
+        with open(path, 'w') as f:
+            json.dump(self.weights.tolist(), f, indent=2)
+
+    def predict(self, state: AuthState) -> np.ndarray:
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        exp_q = np.exp(q - np.max(q))
+        return exp_q / exp_q.sum()
+
+    def confidence(self, state: AuthState) -> float:
+        return 0.5
+
+    def update(self, state: AuthState, action: int, reward: float):
+        x = state.to_feature_vector()
+        q_current = np.dot(x, self.weights[:, action])
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._save_state()
+
+
+class DistillationStudent:
+    def __init__(self, feature_dim: int = 7, n_classes: int = 3, lr: float = 0.01):
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+        if num_classes != self.n_classes:
+            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_biases = np.zeros(num_classes)
+            min_dim = min(self.n_classes, num_classes)
+            new_weights[:, :min_dim] = self.weights[:, :min_dim]
+            new_biases[:min_dim] = self.biases[:min_dim]
+            self.weights = new_weights
+            self.biases = new_biases
+            self.n_classes = num_classes
+        logits = state_vector @ self.weights + self.biases
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
+        current_probs = self.predict_proba(state_vector, self.n_classes)
+        logits = state_vector @ self.weights + self.biases
+
+        grad_distill = -(teacher_probs - current_probs)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        grad_rl = -reward * (one_hot - current_probs)
+
+        grad = distill_weight * grad_distill + rl_weight * grad_rl
+        self.weights -= self.lr * np.outer(state_vector, grad)
+        self.biases -= self.lr * grad
+        self.counter += 1
+
+
+class ReplayBuffer:
+    def __init__(self, max_size: int = 2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state_vec: np.ndarray, action: int, reward: float,
+             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+
+    def sample(self, batch_size: int = 32):
+        if len(self.buffer) < batch_size:
+            batch = list(self.buffer)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        return (np.array(states), actions, np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DistillationAuthOptimizer:
+    """
+    Multi‑teacher on‑policy distillation agent for authentication level selection.
+    Levels: light, standard, enhanced.
+    """
+    LEVELS = ['light', 'standard', 'enhanced']
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.teachers: List[Teacher] = [
+            AuthRuleBasedTeacher(),
+            AuthHistoricalMLTeacher(),
+            AuthStatefulQTeacher()
+        ]
+        self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
+        self.epsilon = config.get('distillation_epsilon', 0.1)
+        self.train_every = config.get('distillation_train_every', 10)
+        self.counter = 0
+
+    async def select_auth_level(self, state: AuthState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
+        n = 3
+
+        teacher_probs = np.zeros(n)
+        total_conf = 0.0
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            conf = teacher.confidence(state)
+            if len(prob) != n:
+                if len(prob) < n:
+                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
+                else:
+                    prob = prob[:n]
+            teacher_probs += prob * conf
+            total_conf += conf
+        if total_conf > 0:
+            teacher_probs /= total_conf
+        else:
+            teacher_probs = np.ones(n) / n
+
+        student_probs = self.student.predict_proba(state_vec, n)
+
+        if exploration and random.random() < self.epsilon:
+            action_idx = random.randint(0, n - 1)
+        else:
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = np.argmax(combined)
+
+        return self.LEVELS[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+        self.counter += 1
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
+            batch = self.replay_buffer.sample(8)
+            states, actions, rewards, _, teacher_probs_batch = batch
+            for i in range(len(states)):
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+
+    def get_stats(self) -> Dict:
+        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+
+
+# ============================================================================
+# Carbon-Aware Authenticator (Enhanced with Distillation)
 # ============================================================================
 
 class CarbonAwareAuthenticator:
@@ -1149,7 +1419,22 @@ class CarbonAwareAuthenticator:
         self.carbon_manager = carbon_manager
         self.auth_history = deque(maxlen=1000)
         self._lock = asyncio.Lock()
-        logger.info("Carbon-Aware Authenticator initialized with price awareness")
+
+        # NEW: Distillation optimizer
+        self.auth_optimizer = DistillationAuthOptimizer({
+            'distillation_epsilon': ZeroTrustConfig().distillation_epsilon,
+            'distillation_train_every': ZeroTrustConfig().distillation_train_every,
+            'distillation_replay_size': ZeroTrustConfig().distillation_replay_size,
+            'distillation_learning_rate': ZeroTrustConfig().distillation_learning_rate,
+        })
+
+        # Interaction tracking
+        self.interaction_log: List[Dict] = []
+        self.last_state_vec: Optional[np.ndarray] = None
+        self.last_action_idx: Optional[int] = None
+        self.last_teacher_probs: Optional[np.ndarray] = None
+
+        logger.info("Carbon-Aware Authenticator initialized with distillation")
 
     async def authenticate_with_carbon_awareness(
         self,
@@ -1157,40 +1442,53 @@ class CarbonAwareAuthenticator:
         credentials: Dict,
         carbon_intensity: Optional[float] = None,
         carbon_price: Optional[float] = None,
-        helium_price: Optional[float] = None
+        helium_price: Optional[float] = None,
+        threat_level: float = 0.3,
+        request_sensitivity: float = 0.5,
     ) -> Dict:
+        # Get current prices if not provided
         if carbon_intensity is None and self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
             carbon_price = await self.carbon_manager.get_current_carbon_price()
         else:
             carbon_intensity = carbon_intensity or 400
             carbon_price = carbon_price or 50
+
         helium_price = helium_price or 0.5
 
-        price_factor = min(2.0, carbon_price / 50.0)
-        helium_price_factor = min(2.0, helium_price / 0.5)
-        combined_price_factor = (price_factor + helium_price_factor) / 2
+        # ---- Distillation: select auth level ----
+        state = AuthState(
+            carbon_intensity=carbon_intensity,
+            carbon_price=carbon_price,
+            helium_price=helium_price,
+            threat_level=threat_level,
+            request_sensitivity=request_sensitivity,
+            recent_success_rate=self._get_recent_success_rate(),
+            avg_sustainability_score=self._get_avg_sustainability(),
+        )
+        auth_level, action_idx, state_vec, teacher_probs = await self.auth_optimizer.select_auth_level(state, exploration=True)
+        self.last_state_vec = state_vec
+        self.last_action_idx = action_idx
+        self.last_teacher_probs = teacher_probs
 
-        if carbon_intensity > 500 or combined_price_factor > 1.5:
-            auth_level = 'light'
+        # Map auth level to parameters
+        if auth_level == 'light':
             auth_factors = 1
-            sustainability_score = 0.8
-        elif carbon_intensity > 300 or combined_price_factor > 1.0:
-            auth_level = 'standard'
-            auth_factors = 2
-            sustainability_score = 0.6
-        else:
-            auth_level = 'enhanced'
-            auth_factors = 3
-            sustainability_score = 0.4
-
-        if combined_price_factor > 1.5:
             session_duration = 7200
-        elif combined_price_factor > 1.0:
+            sustainability_score = 0.8
+            carbon_impact = 'low'
+        elif auth_level == 'standard':
+            auth_factors = 2
             session_duration = 3600
-        else:
+            sustainability_score = 0.6
+            carbon_impact = 'medium'
+        else:  # enhanced
+            auth_factors = 3
             session_duration = 1800
+            sustainability_score = 0.4
+            carbon_impact = 'high'
 
+        # Record in history
         async with self._lock:
             self.auth_history.append({
                 'timestamp': datetime.utcnow().isoformat(),
@@ -1198,6 +1496,7 @@ class CarbonAwareAuthenticator:
                 'carbon_intensity': carbon_intensity,
                 'carbon_price': carbon_price,
                 'helium_price': helium_price,
+                'threat_level': threat_level,
                 'sustainability_score': sustainability_score
             })
 
@@ -1207,12 +1506,63 @@ class CarbonAwareAuthenticator:
             'carbon_intensity': carbon_intensity,
             'carbon_price': carbon_price,
             'helium_price': helium_price,
-            'carbon_impact': 'low' if auth_level == 'light' else 'medium' if auth_level == 'standard' else 'high',
+            'carbon_impact': carbon_impact,
             'auth_factors': auth_factors,
             'session_duration': session_duration,
             'sustainability_score': sustainability_score,
-            'price_factor': combined_price_factor
         }
+
+    async def record_outcome(self, success: bool, carbon_saved_kg: float, sustainability_score: float, latency_ms: float = 0.0):
+        """
+        Record the outcome of an authentication to update the distillation agent.
+        """
+        # Compute reward
+        if success:
+            reward = 0.6
+            reward += 0.2 * min(1.0, carbon_saved_kg / 0.1)
+            reward += 0.2 * sustainability_score
+        else:
+            reward = 0.0
+        reward = max(0.0, min(1.0, reward))
+
+        # Log interaction
+        self.interaction_log.append({
+            'timestamp': datetime.utcnow().isoformat(),
+            'success': success,
+            'reward': reward,
+            'carbon_saved_kg': carbon_saved_kg,
+            'sustainability_score': sustainability_score,
+        })
+        log_path = Path(ZeroTrustConfig().interaction_logs_path)
+        df_log = pd.DataFrame([self.interaction_log[-1]])
+        if log_path.exists():
+            df_log.to_csv(log_path, mode='a', header=False, index=False)
+        else:
+            df_log.to_csv(log_path, index=False)
+
+        # Update agent
+        if self.last_state_vec is not None and self.last_action_idx is not None:
+            next_state_vec = self.last_state_vec  # for simplicity, same state
+            await self.auth_optimizer.update(
+                self.last_state_vec,
+                self.last_action_idx,
+                reward,
+                next_state_vec,
+                self.last_teacher_probs
+            )
+
+    def _get_recent_success_rate(self) -> float:
+        if not self.interaction_log:
+            return 0.5
+        recent = self.interaction_log[-50:]
+        successes = sum(1 for e in recent if e['success'])
+        return successes / len(recent) if recent else 0.5
+
+    def _get_avg_sustainability(self) -> float:
+        if not self.interaction_log:
+            return 0.5
+        scores = [e['sustainability_score'] for e in self.interaction_log[-50:]]
+        return np.mean(scores) if scores else 0.5
 
     def get_carbon_auth_stats(self) -> Dict:
         if not self.auth_history:
@@ -1224,11 +1574,12 @@ class CarbonAwareAuthenticator:
             'enhanced_auths': sum(1 for a in self.auth_history if a.get('auth_level') == 'enhanced'),
             'average_sustainability': np.mean([a.get('sustainability_score', 0.5) for a in self.auth_history]),
             'average_carbon_price': np.mean([a.get('carbon_price', 50) for a in self.auth_history]),
-            'average_helium_price': np.mean([a.get('helium_price', 0.5) for a in self.auth_history])
+            'average_helium_price': np.mean([a.get('helium_price', 0.5) for a in self.auth_history]),
+            'distillation_stats': self.auth_optimizer.get_stats(),
         }
 
 # ============================================================================
-# Sustainability Security Dashboard (Enhanced with active monitor)
+# SecuritySustainability Dashboard (Enhanced with active monitor)
 # ============================================================================
 
 class SecuritySustainabilityDashboard:
@@ -1372,12 +1723,11 @@ class SecuritySustainabilityDashboard:
 
 class ZeroTrustArchitecture:
     """
-    Enhanced Zero Trust Security Architecture v4.0.0.
+    Enhanced Zero Trust Security Architecture v4.1.0 with adaptive authentication.
     """
 
     def __init__(self, config: Optional[ZeroTrustConfig] = None, **kwargs):
         if config is None:
-            # Build config from kwargs for backward compatibility
             config = ZeroTrustConfig(**{
                 k: v for k, v in kwargs.items()
                 if k in ZeroTrustConfig.model_fields
@@ -1449,7 +1799,7 @@ class ZeroTrustArchitecture:
             self._load_state_task = asyncio.create_task(self._load_state())
             self._background_tasks.append(self._load_state_task)
 
-        logger.info("Enhanced Zero Trust Architecture v4.0.0 initialized")
+        logger.info("Enhanced Zero Trust Architecture v4.1.0 initialized with distillation")
 
     def _start_background_tasks(self):
         if self.enable_carbon_intensity:
@@ -1618,7 +1968,7 @@ class ZeroTrustArchitecture:
         return min(1.0, risk)
 
     # ============================================================================
-    # Enhanced Authentication with Price Awareness
+    # Enhanced Authentication with Distillation
     # ============================================================================
 
     async def authenticate_request(
@@ -1640,10 +1990,19 @@ class ZeroTrustArchitecture:
         if self.helium_tracker:
             helium_price = await self.helium_tracker.get_current_helium_price()
 
-        # Carbon-aware authentication with price factor
+        # Get threat level and request sensitivity
+        threat_level = 0.3
+        if self.predictive_analyzer:
+            risk_pred = await self.predictive_analyzer.predict_security_risk({})
+            threat_level = risk_pred.get('predicted_risk', 0.3)
+        request_sensitivity = self._determine_security_level(request).value / 4.0  # normalize to 0-1
+
+        # ---- Distillation: select auth level ----
+        auth_level = 'standard'
         if self.enable_carbon_auth and self.carbon_authenticator:
             auth_result = await self.carbon_authenticator.authenticate_with_carbon_awareness(
-                request, credentials, carbon_intensity, carbon_price, helium_price
+                request, credentials, carbon_intensity, carbon_price, helium_price,
+                threat_level, request_sensitivity
             )
             auth_level = auth_result.get('auth_level', 'standard')
         else:
@@ -1656,6 +2015,13 @@ class ZeroTrustArchitecture:
                 request_id,
                 {'reason': 'invalid_credentials'}
             )
+            # Record outcome (failure)
+            if self.carbon_authenticator:
+                await self.carbon_authenticator.record_outcome(
+                    success=False,
+                    carbon_saved_kg=0,
+                    sustainability_score=0.0
+                )
             raise SecurityException("Invalid credentials")
 
         # Step 2: Verify identity
@@ -1666,17 +2032,27 @@ class ZeroTrustArchitecture:
                 request_id,
                 {'identity': credentials.get('identity')}
             )
+            if self.carbon_authenticator:
+                await self.carbon_authenticator.record_outcome(
+                    success=False,
+                    carbon_saved_kg=0,
+                    sustainability_score=0.0
+                )
             raise SecurityException("Identity verification failed")
 
         # Step 3: Risk assessment with price adjustment
         risk_score = await self._assess_risk(request, identity)
-
-        # Adjust risk based on carbon price
         if carbon_price > 100:
             risk_score = min(1.0, risk_score * 1.2)
 
         if risk_score > 0.7:
             if not await self._perform_step_up_auth(identity):
+                if self.carbon_authenticator:
+                    await self.carbon_authenticator.record_outcome(
+                        success=False,
+                        carbon_saved_kg=0,
+                        sustainability_score=0.0
+                    )
                 raise SecurityException("Step-up authentication failed")
 
         # Step 4: Create security context
@@ -1692,10 +2068,10 @@ class ZeroTrustArchitecture:
             sustainability_score=0.7
         )
 
-        # Track helium usage with price
+        # Track helium usage
         if self.helium_tracker:
             await self.helium_tracker.record_helium_usage(
-                'authentication', 0.01, 'auth_flow', 0.5
+                'authentication', 0.01, 'auth_flow', threat_level
             )
 
         # Update predictive analyzer
@@ -1731,6 +2107,15 @@ class ZeroTrustArchitecture:
         if self.telemetry:
             self.telemetry.increment('zt_authentications_total')
             self.telemetry.gauge('zt_risk_score', risk_score)
+
+        # ---- Record outcome (success) ----
+        if self.carbon_authenticator:
+            carbon_saved = 0.0  # could be computed from auth level selection
+            await self.carbon_authenticator.record_outcome(
+                success=True,
+                carbon_saved_kg=carbon_saved,
+                sustainability_score=auth_result.get('sustainability_score', 0.5) if self.enable_carbon_auth else 0.5
+            )
 
         return context
 
@@ -2262,6 +2647,10 @@ class ZeroTrustArchitecture:
         if self.sustainability_dashboard:
             posture['sustainability_score'] = self.sustainability_score
 
+        # Add distillation stats
+        if self.carbon_authenticator:
+            posture['distillation_stats'] = self.carbon_authenticator.auth_optimizer.get_stats()
+
         return posture
 
     def get_sustainability_report(self) -> Dict:
@@ -2319,7 +2708,7 @@ class ZeroTrustArchitecture:
             return json.dumps(self.audit_log[-1000:], default=str)
 
     async def shutdown(self):
-        logger.info("Shutting down Zero Trust Architecture v4.0.0")
+        logger.info("Shutting down Zero Trust Architecture v4.1.0")
         # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
@@ -2349,6 +2738,110 @@ async def get_zero_trust_architecture() -> ZeroTrustArchitecture:
 
 class SecurityException(Exception):
     pass
+
+# ============================================================================
+# UNIT TESTS (Phase 10)
+# ============================================================================
+import unittest
+from unittest import IsolatedAsyncioTestCase
+
+class TestDistillationComponents(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = {
+            'distillation_epsilon': 0.0,
+            'distillation_replay_size': 10,
+            'distillation_learning_rate': 0.01,
+            'distillation_train_every': 10,
+        }
+        self.optimizer = DistillationAuthOptimizer(self.config)
+
+    def test_state_feature_vector(self):
+        state = AuthState(
+            carbon_intensity=400,
+            carbon_price=50,
+            helium_price=0.5,
+            threat_level=0.3,
+            request_sensitivity=0.5,
+            recent_success_rate=0.7,
+            avg_sustainability_score=0.6,
+        )
+        vec = state.to_feature_vector()
+        self.assertEqual(len(vec), 7)
+
+    def test_rule_based_teacher(self):
+        teacher = AuthRuleBasedTeacher()
+        state = AuthState(
+            carbon_intensity=600,
+            carbon_price=50,
+            helium_price=0.5,
+            threat_level=0.3,
+            request_sensitivity=0.5,
+            recent_success_rate=0.7,
+            avg_sustainability_score=0.6,
+        )
+        probs = teacher.predict(state)
+        self.assertAlmostEqual(sum(probs), 1.0)
+        self.assertGreater(probs[0], probs[1])  # light should be highest
+
+    async def test_select_auth_level(self):
+        state = AuthState(
+            carbon_intensity=400,
+            carbon_price=50,
+            helium_price=0.5,
+            threat_level=0.3,
+            request_sensitivity=0.5,
+            recent_success_rate=0.7,
+            avg_sustainability_score=0.6,
+        )
+        level, idx, state_vec, teacher_probs = await self.optimizer.select_auth_level(state, exploration=False)
+        self.assertIn(level, self.optimizer.LEVELS)
+
+    def test_replay_buffer(self):
+        buffer = ReplayBuffer(max_size=5)
+        state_vec = np.random.randn(7)
+        buffer.push(state_vec, 0, 1.0, state_vec, np.ones(3)/3)
+        self.assertEqual(len(buffer), 1)
+        batch = buffer.sample(1)
+        self.assertEqual(len(batch[0]), 1)
+
+
+# ============================================================================
+# OFFLINE TRAINING FOR HISTORICAL ML
+# ============================================================================
+def train_historical_model(log_path: Path = Path(ZeroTrustConfig().interaction_logs_path),
+                           model_path: Path = Path(ZeroTrustConfig().historical_model_path)):
+    """
+    Train a RandomForestClassifier from past interaction logs.
+    """
+    if not log_path.exists():
+        logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
+        return
+
+    df_logs = pd.read_csv(log_path)
+    if len(df_logs) < 10:
+        logger.warning("Not enough logs to train historical model (need at least 10).")
+        return
+
+    X_list = []
+    y_list = []
+    for _, row in df_logs.iterrows():
+        state_vec = json.loads(row['state_vector'])
+        X_list.append(state_vec)
+        y_list.append(row['auth_level'])
+
+    X = np.array(X_list)
+    y = np.array(y_list)
+
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y_encoded)
+
+    with open(model_path, 'wb') as f:
+        pickle.dump((model, le), f)
+    logger.info(f"Historical ML model trained and saved to {model_path}")
+
 
 # ============================================================================
 # Example Usage
