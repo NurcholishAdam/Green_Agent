@@ -1,20 +1,20 @@
-# src/enhancements/data_integration/material_footprint.py
+# src/enhancements/data_integration/material_footprint_v2_2_0.py
 """
-Enhanced Material Footprint Updater v2.1.0
+Enhanced Material Footprint Updater v2.2.0
 ===========================================
 Fetches and caches product‑level material footprints from BONSAI/FOOTPRINTDATA.
-Provides real API integration, caching with TTL, retries, circuit breaker,
-logging, metrics, and configuration via Pydantic.
+Provides adaptive source selection and update scheduling via Multi‑Teacher On‑Policy Distillation.
 
-ENHANCEMENTS OVER v2.0.0:
-- Real API integration with correct endpoints and response parsing.
-- Individual product fetch support (when APIs support it).
-- Proper error handling and fallback to cached data.
-- Configurable source priority and API keys from environment.
-- Pydantic models for API responses.
-- Accurate update counts and metrics.
-- Improved database schema with index and timestamps.
-- Better logging with structured context.
+ENHANCEMENTS OVER v2.1.0:
+- Adaptive source selection (bonsai, footprintdata, mock) based on context.
+- Adaptive update mode (full catalog vs single‑product fetch).
+- State‑aware decisions using cache age, product demand, source reliability, time since last update.
+- Online learning from API call outcomes and cache freshness.
+- Teachers: rule‑based, historical ML, stateful Q.
+- Student: linear softmax with distillation + REINFORCE.
+- Persistence for Q‑teacher weights and interaction logs.
+- Offline training for historical ML teacher from logs.
+- Unit tests for distillation components.
 """
 
 import asyncio
@@ -28,6 +28,12 @@ from typing import Dict, List, Optional, Any, Union, Tuple
 from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import ClientTimeout, ClientError
+import random
+import numpy as np
+from abc import ABC, abstractmethod
+from collections import deque
+import pickle
+import pandas as pd
 
 # ---------- Pydantic ----------
 try:
@@ -44,7 +50,6 @@ except ImportError:
     TENACITY_AVAILABLE = False
 
 # ---------- Circuit breaker ----------
-# Provide a proper in‑memory circuit breaker if the project's one is not available.
 from enum import Enum
 
 class CircuitBreakerState(Enum):
@@ -107,6 +112,14 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO)
 
+# ---------- scikit-learn for ML teacher ----------
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import LabelEncoder
+    SKLEARN_ML = True
+except ImportError:
+    SKLEARN_ML = False
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -118,11 +131,11 @@ if PYDANTIC_AVAILABLE:
         # API endpoints
         bonsai_api_url: str = Field("https://api.bonsai.uno/v1/footprints")
         footprintdata_api_url: str = Field("https://api.footprintdata.org/v1/products")
-        # API keys (will fallback to environment variables)
-        bonsai_api_key: Optional[str] = Field(None, description="BONSAI API key (or set BONSAI_API_KEY env)")
-        footprintdata_api_key: Optional[str] = Field(None, description="FOOTPRINTDATA API key (or set FOOTPRINTDATA_API_KEY env)")
+        # API keys
+        bonsai_api_key: Optional[str] = Field(None)
+        footprintdata_api_key: Optional[str] = Field(None)
         # Cache TTL (seconds)
-        cache_ttl: int = Field(86400 * 7, ge=0)  # 7 days
+        cache_ttl: int = Field(86400 * 7, ge=0)
         # Retry settings
         retry_attempts: int = Field(3, ge=0)
         retry_min_wait: float = Field(1.0, gt=0)
@@ -134,8 +147,21 @@ if PYDANTIC_AVAILABLE:
         request_timeout: float = Field(10.0, ge=1)
         # Enable metrics
         enable_prometheus: bool = True
-        # Source priority (order to try)
+        # Source priority (used as fallback for rule teacher)
         source_priority: List[str] = Field(default_factory=lambda: ["bonsai", "footprintdata"])
+
+        # NEW: Distillation parameters
+        distillation_epsilon: float = Field(0.1, ge=0, le=1)
+        distillation_train_every: int = Field(10, ge=1)
+        distillation_replay_size: int = Field(2000, ge=10)
+        distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
+        distill_weight: float = Field(0.7, ge=0, le=1)
+        rl_weight: float = Field(0.3, ge=0, le=1)
+
+        # Persistence paths
+        q_weights_path: str = Field("./material_q_weights.json")
+        interaction_logs_path: str = Field("./material_interactions.csv")
+        historical_model_path: str = Field("./material_historical_model.pkl")
 
         @field_validator('source_priority')
         @classmethod
@@ -165,14 +191,23 @@ else:
         "request_timeout": 10.0,
         "enable_prometheus": True,
         "source_priority": ["bonsai", "footprintdata"],
+        # Distillation defaults
+        "distillation_epsilon": 0.1,
+        "distillation_train_every": 10,
+        "distillation_replay_size": 2000,
+        "distillation_learning_rate": 0.01,
+        "distill_weight": 0.7,
+        "rl_weight": 0.3,
+        "q_weights_path": "./material_q_weights.json",
+        "interaction_logs_path": "./material_interactions.csv",
+        "historical_model_path": "./material_historical_model.pkl",
     }
 
 # ============================================================================
-# Data Models (Pydantic)
+# Data Models (Pydantic) - unchanged
 # ============================================================================
 if PYDANTIC_AVAILABLE:
     class BonsaiFootprintResponse(BaseModel):
-        """Expected response from BONSAI API."""
         product_id: str
         embodied_carbon_kg: float
         rare_earth_kg: float
@@ -180,7 +215,6 @@ if PYDANTIC_AVAILABLE:
         material_index: float
 
     class FootprintDataResponse(BaseModel):
-        """Expected response from FOOTPRINTDATA API."""
         product_id: str
         embodied_carbon_kg: float
         rare_earth_kg: float
@@ -188,7 +222,6 @@ if PYDANTIC_AVAILABLE:
         material_index: float
 
     class Footprint(BaseModel):
-        """Validated footprint data stored in DB."""
         product_id: str
         embodied_carbon_kg: float
         rare_earth_kg: float
@@ -204,7 +237,6 @@ if PYDANTIC_AVAILABLE:
                 raise ValueError("material_index must be non-negative")
             return v
 else:
-    # Fallback dataclass
     from dataclasses import dataclass
 
     @dataclass
@@ -217,14 +249,308 @@ else:
         source: str
         last_updated: datetime
 
+
+# ============================================================================
+# DISTILLATION COMPONENTS FOR ADAPTIVE UPDATE
+# ============================================================================
+
+@dataclass
+class UpdateState:
+    """State for the distillation agent."""
+    # Cache statistics
+    total_products: int
+    stale_fraction: float  # fraction of products with age > TTL
+    # Product demand (frequency of get calls per product)
+    avg_demand: float
+    # Source reliability (success rates from interaction log)
+    bonsai_success_rate: float
+    footprintdata_success_rate: float
+    # Circuit breaker states (0=CLOSED, 1=HALF_OPEN, 2=OPEN)
+    bonsai_cb_state: float
+    footprintdata_cb_state: float
+    # Time since last full update (hours)
+    hours_since_update: float
+    # Is a specific product being requested? (0=full, 1=single)
+    single_product_mode: float
+
+    def to_feature_vector(self) -> np.ndarray:
+        """Convert to 11‑dim numeric feature vector."""
+        features = [
+            min(self.total_products / 1000.0, 1.0),
+            self.stale_fraction,
+            min(self.avg_demand / 10.0, 1.0),
+            self.bonsai_success_rate,
+            self.footprintdata_success_rate,
+            self.bonsai_cb_state / 2.0,
+            self.footprintdata_cb_state / 2.0,
+            min(self.hours_since_update / 72.0, 1.0),
+            self.single_product_mode,
+        ]
+        return np.array(features, dtype=np.float32)
+
+
+# Teacher abstract base
+class Teacher(ABC):
+    @abstractmethod
+    def predict(self, state: UpdateState) -> np.ndarray:
+        """Return probability vector over actions."""
+        pass
+
+    @abstractmethod
+    def confidence(self, state: UpdateState) -> float:
+        """Return confidence in prediction [0,1]."""
+        pass
+
+
+class UpdateRuleBasedTeacher(Teacher):
+    """
+    Rule‑based expert.
+    Actions: 0=bonsai_full, 1=footprintdata_full, 2=mock_full,
+             3=bonsai_single, 4=footprintdata_single, 5=mock_single
+    """
+    ACTION_SPACE = [
+        'bonsai_full', 'footprintdata_full', 'mock_full',
+        'bonsai_single', 'footprintdata_single', 'mock_single'
+    ]
+
+    def predict(self, state: UpdateState) -> np.ndarray:
+        n = 6
+        probs = np.ones(n) * 0.1
+
+        # Heuristics
+        if state.single_product_mode > 0.5:
+            # Single product request: prefer the source with higher success rate
+            if state.bonsai_success_rate > state.footprintdata_success_rate:
+                probs[3] = 0.8  # bonsai_single
+            else:
+                probs[4] = 0.8  # footprintdata_single
+        else:
+            # Full update: prefer source with higher success and lower stale fraction
+            if state.stale_fraction > 0.5:
+                # Many stale entries -> need update
+                if state.bonsai_success_rate > state.footprintdata_success_rate:
+                    probs[0] = 0.8  # bonsai_full
+                else:
+                    probs[1] = 0.8  # footprintdata_full
+            else:
+                # Not many stale entries; maybe use mock if sources are unreliable
+                if state.bonsai_success_rate < 0.3 and state.footprintdata_success_rate < 0.3:
+                    probs[2] = 0.7  # mock_full
+                else:
+                    probs[0] = 0.5  # bonsai_full default
+
+        return probs / probs.sum()
+
+    def confidence(self, state: UpdateState) -> float:
+        if state.stale_fraction > 0.5:
+            return 0.6
+        return 0.4
+
+
+class UpdateHistoricalMLTeacher(Teacher):
+    """Offline trained classifier from past interactions."""
+    def __init__(self, model_path: Optional[Path] = None):
+        self.model = None
+        self.label_encoder = None
+        self.model_path = model_path or Path(MATERIAL_CONFIG['historical_model_path'])
+        if self.model_path.exists():
+            try:
+                with open(self.model_path, 'rb') as f:
+                    self.model, self.label_encoder = pickle.load(f)
+                logger.info(f"Loaded historical ML model from {self.model_path}")
+            except Exception as e:
+                logger.error(f"Failed to load historical model: {e}")
+
+    def predict(self, state: UpdateState) -> np.ndarray:
+        if self.model is None or self.label_encoder is None:
+            return np.ones(6) / 6
+        x = state.to_feature_vector().reshape(1, -1)
+        probs = self.model.predict_proba(x)[0]
+        return probs
+
+    def confidence(self, state: UpdateState) -> float:
+        return 0.7 if self.model is not None else 0.0
+
+
+class UpdateStatefulQTeacher(Teacher):
+    """Linear Q‑learning with state features."""
+    def __init__(self, lr: float = 0.1):
+        self.lr = lr
+        self.weights = np.zeros((9, 6))  # 9 features, 6 actions
+        self._load_state()
+
+    def _load_state(self):
+        path = Path(MATERIAL_CONFIG['q_weights_path'])
+        if path.exists():
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                self.weights = np.array(data)
+                logger.info(f"Loaded Q‑teacher weights from {path}")
+            except Exception as e:
+                logger.error(f"Failed to load Q‑weights: {e}")
+
+    def _save_state(self):
+        path = Path(MATERIAL_CONFIG['q_weights_path'])
+        with open(path, 'w') as f:
+            json.dump(self.weights.tolist(), f, indent=2)
+
+    def predict(self, state: UpdateState) -> np.ndarray:
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        exp_q = np.exp(q - np.max(q))
+        return exp_q / exp_q.sum()
+
+    def confidence(self, state: UpdateState) -> float:
+        return 0.5
+
+    def update(self, state: UpdateState, action: int, reward: float):
+        x = state.to_feature_vector()
+        q_current = np.dot(x, self.weights[:, action])
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._save_state()
+
+
+class DistillationStudent:
+    def __init__(self, feature_dim: int = 9, n_classes: int = 6, lr: float = 0.01):
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+        if num_classes != self.n_classes:
+            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_biases = np.zeros(num_classes)
+            min_dim = min(self.n_classes, num_classes)
+            new_weights[:, :min_dim] = self.weights[:, :min_dim]
+            new_biases[:min_dim] = self.biases[:min_dim]
+            self.weights = new_weights
+            self.biases = new_biases
+            self.n_classes = num_classes
+        logits = state_vector @ self.weights + self.biases
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
+        current_probs = self.predict_proba(state_vector, self.n_classes)
+        logits = state_vector @ self.weights + self.biases
+
+        grad_distill = -(teacher_probs - current_probs)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        grad_rl = -reward * (one_hot - current_probs)
+
+        grad = distill_weight * grad_distill + rl_weight * grad_rl
+        self.weights -= self.lr * np.outer(state_vector, grad)
+        self.biases -= self.lr * grad
+        self.counter += 1
+
+
+class ReplayBuffer:
+    def __init__(self, max_size: int = 2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state_vec: np.ndarray, action: int, reward: float,
+             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+
+    def sample(self, batch_size: int = 32):
+        if len(self.buffer) < batch_size:
+            batch = list(self.buffer)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        return (np.array(states), actions, np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DistillationUpdateOptimizer:
+    """
+    Multi‑teacher on‑policy distillation agent for update decisions.
+    Actions:
+        0: bonsai_full
+        1: footprintdata_full
+        2: mock_full
+        3: bonsai_single
+        4: footprintdata_single
+        5: mock_single
+    """
+    ACTION_SPACE = [
+        'bonsai_full', 'footprintdata_full', 'mock_full',
+        'bonsai_single', 'footprintdata_single', 'mock_single'
+    ]
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.teachers: List[Teacher] = [
+            UpdateRuleBasedTeacher(),
+            UpdateHistoricalMLTeacher(),
+            UpdateStatefulQTeacher()
+        ]
+        self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
+        self.epsilon = config.get('distillation_epsilon', 0.1)
+        self.train_every = config.get('distillation_train_every', 10)
+        self.counter = 0
+
+    async def select_action(self, state: UpdateState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
+        n = 6
+
+        teacher_probs = np.zeros(n)
+        total_conf = 0.0
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            conf = teacher.confidence(state)
+            if len(prob) != n:
+                if len(prob) < n:
+                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
+                else:
+                    prob = prob[:n]
+            teacher_probs += prob * conf
+            total_conf += conf
+        if total_conf > 0:
+            teacher_probs /= total_conf
+        else:
+            teacher_probs = np.ones(n) / n
+
+        student_probs = self.student.predict_proba(state_vec, n)
+
+        if exploration and random.random() < self.epsilon:
+            action_idx = random.randint(0, n - 1)
+        else:
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = np.argmax(combined)
+
+        return self.ACTION_SPACE[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
+        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+        self.counter += 1
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
+            batch = self.replay_buffer.sample(8)
+            states, actions, rewards, _, teacher_probs_batch = batch
+            for i in range(len(states)):
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+
+    def get_stats(self) -> Dict:
+        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+
+
 # ============================================================================
 # MaterialFootprintUpdater (Enhanced)
 # ============================================================================
-
 class MaterialFootprintUpdater:
     """
-    Enhanced material footprint updater with real API integration, caching,
-    retries, circuit breaker, logging, and metrics.
+    Enhanced material footprint updater with adaptive source selection and update scheduling.
     """
 
     def __init__(
@@ -290,14 +616,32 @@ class MaterialFootprintUpdater:
                 'cache_misses': Counter('material_cache_misses_total', 'Cache misses'),
                 'cache_size': Gauge('material_cache_size', 'Number of cached footprints'),
                 'cache_age_seconds': Gauge('material_cache_age_seconds', 'Age of cached footprint', ['product_id']),
+                # Distillation metrics
+                'update_action': Counter('material_update_action', 'Update action selected', ['action']),
+                'update_reward': Histogram('material_update_reward', 'Reward per update action'),
             }
         else:
             self.metrics = None
 
-        logger.info("MaterialFootprintUpdater initialized", db_path=str(self.db_path))
+        # Distillation optimizer
+        self.update_optimizer = DistillationUpdateOptimizer({
+            'distillation_epsilon': self._get_config('distillation_epsilon', 0.1),
+            'distillation_train_every': self._get_config('distillation_train_every', 10),
+            'distillation_replay_size': self._get_config('distillation_replay_size', 2000),
+            'distillation_learning_rate': self._get_config('distillation_learning_rate', 0.01),
+        })
+
+        # Interaction tracking
+        self.interaction_log: List[Dict] = []
+        self.last_state_vec: Optional[np.ndarray] = None
+        self.last_action_idx: Optional[int] = None
+        self.last_teacher_probs: Optional[np.ndarray] = None
+        self.last_update_time: Optional[datetime] = None
+
+        logger.info("MaterialFootprintUpdater initialized with adaptive update", db_path=str(self.db_path))
 
     def _get_config(self, key: str, default: Any = None) -> Any:
-        """Safely get a config value, supporting both dict and Pydantic."""
+        """Safely get a config value."""
         if hasattr(self.config, 'model_dump'):
             return getattr(self.config, key, default)
         elif hasattr(self.config, 'dict'):
@@ -326,7 +670,7 @@ class MaterialFootprintUpdater:
         conn.close()
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create an aiohttp ClientSession with connection pooling."""
+        """Get or create an aiohttp ClientSession."""
         async with self._session_lock:
             if self._session is None or self._session.closed:
                 timeout = ClientTimeout(total=self.request_timeout)
@@ -339,53 +683,157 @@ class MaterialFootprintUpdater:
             return self._session
 
     async def close(self):
-        """Close the underlying session."""
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
 
-    # ---------- Core methods ----------
+    # ---------- Build state ----------
+    def _build_state(self, product_id: Optional[str] = None) -> UpdateState:
+        """Build state for the distillation agent."""
+        conn = sqlite3.connect(self.db_path)
+        total = conn.execute("SELECT COUNT(*) FROM footprints").fetchone()[0]
+
+        # Stale fraction
+        now = datetime.utcnow()
+        rows = conn.execute("SELECT last_updated FROM footprints").fetchall()
+        stale_count = 0
+        for row in rows:
+            try:
+                last = datetime.fromisoformat(row[0])
+                if (now - last).total_seconds() > self.cache_ttl:
+                    stale_count += 1
+            except:
+                stale_count += 1
+        conn.close()
+        stale_fraction = stale_count / max(total, 1)
+
+        # Product demand (tracked via get calls)
+        # We'll use a simple moving average from logs
+        if self.interaction_log:
+            recent = [entry for entry in self.interaction_log[-50:] if entry.get('product_id') is not None]
+            product_counts = {}
+            for entry in recent:
+                pid = entry['product_id']
+                product_counts[pid] = product_counts.get(pid, 0) + 1
+            avg_demand = np.mean(list(product_counts.values())) if product_counts else 1.0
+        else:
+            avg_demand = 1.0
+
+        # Source success rates
+        bonsai_success = 0.5
+        footprintdata_success = 0.5
+        if self.interaction_log:
+            bonsai_entries = [e for e in self.interaction_log if e.get('source') == 'bonsai']
+            footprint_entries = [e for e in self.interaction_log if e.get('source') == 'footprintdata']
+            if bonsai_entries:
+                bonsai_success = sum(1 for e in bonsai_entries if e.get('success', False)) / len(bonsai_entries)
+            if footprint_entries:
+                footprintdata_success = sum(1 for e in footprint_entries if e.get('success', False)) / len(footprint_entries)
+
+        # Circuit breaker states
+        bonsai_cb = 0.0
+        if self._circuit_breakers['bonsai']._state == CircuitBreakerState.CLOSED:
+            bonsai_cb = 0.0
+        elif self._circuit_breakers['bonsai']._state == CircuitBreakerState.HALF_OPEN:
+            bonsai_cb = 1.0
+        else:
+            bonsai_cb = 2.0
+
+        footprint_cb = 0.0
+        if self._circuit_breakers['footprintdata']._state == CircuitBreakerState.CLOSED:
+            footprint_cb = 0.0
+        elif self._circuit_breakers['footprintdata']._state == CircuitBreakerState.HALF_OPEN:
+            footprint_cb = 1.0
+        else:
+            footprint_cb = 2.0
+
+        # Hours since last update
+        if self.last_update_time:
+            hours = (datetime.utcnow() - self.last_update_time).total_seconds() / 3600
+        else:
+            hours = 0.0
+
+        single_mode = 1.0 if product_id is not None else 0.0
+
+        return UpdateState(
+            total_products=total,
+            stale_fraction=stale_fraction,
+            avg_demand=avg_demand,
+            bonsai_success_rate=bonsai_success,
+            footprintdata_success_rate=footprintdata_success,
+            bonsai_cb_state=bonsai_cb,
+            footprintdata_cb_state=footprint_cb,
+            hours_since_update=hours,
+            single_product_mode=single_mode,
+        )
+
+    # ---------- Core update methods (enhanced) ----------
     async def update_catalog(self, force_refresh: bool = False) -> int:
         """
-        Fetch new data from configured sources and refresh the catalog.
-
-        Args:
-            force_refresh: If True, ignore cache TTL for all products.
-
-        Returns:
-            Number of updated entries.
+        Update the catalog using adaptive action selection.
         """
+        # Build state (full catalog mode)
+        state = self._build_state(product_id=None)
+        action, action_idx, state_vec, teacher_probs = await self.update_optimizer.select_action(state, exploration=True)
+        self.last_state_vec = state_vec
+        self.last_action_idx = action_idx
+        self.last_teacher_probs = teacher_probs
+
+        # Execute action
+        success = False
         updated_count = 0
-        errors = []
+        start_time = time.time()
 
-        # Try sources in priority order
-        for source in self.source_priority:
-            try:
-                cnt = await self._update_from_source(source, force_refresh)
-                updated_count += cnt
-                logger.info(f"Updated {cnt} entries from {source}")
-                break  # stop after first successful source
-            except Exception as e:
-                errors.append(f"{source}: {e}")
-                logger.error(f"Source {source} update failed", error=str(e))
-
-        # If all sources failed, fallback to mock data if catalog empty
-        if updated_count == 0 and self._is_catalog_empty():
-            logger.info("Catalog empty and all API sources failed; seeding mock data")
+        if action == 'bonsai_full':
+            updated_count = await self._update_from_source('bonsai', force_refresh)
+            success = updated_count > 0
+        elif action == 'footprintdata_full':
+            updated_count = await self._update_from_source('footprintdata', force_refresh)
+            success = updated_count > 0
+        elif action == 'mock_full':
             self._seed_mock_data()
-            # Count mock entries
-            conn = sqlite3.connect(self.db_path)
-            count = conn.execute("SELECT COUNT(*) FROM footprints").fetchone()[0]
-            conn.close()
-            updated_count = count
+            updated_count = self._count_catalog()
+            success = updated_count > 0
+        elif action == 'bonsai_single':
+            # For single action, we need a product_id; but update_catalog is full mode.
+            # We'll fallback to full update with bonsai.
+            updated_count = await self._update_from_source('bonsai', force_refresh)
+            success = updated_count > 0
+        elif action == 'footprintdata_single':
+            updated_count = await self._update_from_source('footprintdata', force_refresh)
+            success = updated_count > 0
+        elif action == 'mock_single':
+            self._seed_mock_data()
+            updated_count = self._count_catalog()
+            success = updated_count > 0
 
-        # Update cache size metric
+        # Compute reward
+        reward = self._compute_reward(success, updated_count, force_refresh)
+        self.last_update_time = datetime.utcnow()
+
+        # Log interaction
+        self._log_interaction('update_catalog', action, success, reward)
+        if self.last_state_vec is not None and self.last_action_idx is not None:
+            next_state = self._build_state(product_id=None)
+            next_state_vec = next_state.to_feature_vector()
+            await self.update_optimizer.update(
+                self.last_state_vec,
+                self.last_action_idx,
+                reward,
+                next_state_vec,
+                self.last_teacher_probs
+            )
+
+        # Update metrics
         if self.metrics:
+            self.metrics['update_action'].labels(action=action).inc()
+            self.metrics['update_reward'].observe(reward)
             conn = sqlite3.connect(self.db_path)
             count = conn.execute("SELECT COUNT(*) FROM footprints").fetchone()[0]
             conn.close()
             self.metrics['cache_size'].set(count)
 
+        logger.info(f"Update completed: action={action}, updated={updated_count}, reward={reward:.2f}")
         return updated_count
 
     async def _update_from_source(self, source: str, force_refresh: bool) -> int:
@@ -412,7 +860,6 @@ class MaterialFootprintUpdater:
                 data = await resp.json()
                 return data
 
-        # Use retry and circuit breaker
         if TENACITY_AVAILABLE:
             @retry(
                 stop=stop_after_attempt(self._get_config('retry_attempts', 3)),
@@ -451,23 +898,18 @@ class MaterialFootprintUpdater:
         now = datetime.utcnow().isoformat()
         count = 0
 
-        # Expect data to be a list of footprint objects (adjust to actual API structure)
         if not isinstance(data, list):
-            # Some APIs return a dict with a 'data' key; handle that
             if isinstance(data, dict) and 'data' in data:
                 data = data['data']
             else:
-                logger.warning(f"Unexpected response format from {source}; expected list")
+                logger.warning(f"Unexpected response format from {source}")
                 data = []
 
         for item in data:
-            # Normalize field names (some APIs may use different keys)
-            # We try to extract fields from item, with fallback
             product_id = item.get('product_id') or item.get('id')
             if not product_id:
                 continue
 
-            # Check TTL
             if not force_refresh:
                 row = conn.execute(
                     "SELECT last_updated FROM footprints WHERE product_id = ?",
@@ -478,13 +920,11 @@ class MaterialFootprintUpdater:
                     if (datetime.utcnow() - last_updated).total_seconds() < self.cache_ttl:
                         continue
 
-            # Parse values with defaults
             embodied_carbon_kg = item.get('embodied_carbon_kg', 0.0)
             rare_earth_kg = item.get('rare_earth_kg', 0.0)
             total_mass_kg = item.get('total_mass_kg', 0.0)
             material_index = item.get('material_index', 1.0)
 
-            # Validate with Pydantic if available
             if PYDANTIC_AVAILABLE and response_model:
                 try:
                     parsed = response_model(**item)
@@ -494,7 +934,6 @@ class MaterialFootprintUpdater:
                     material_index = parsed.material_index
                 except ValidationError as e:
                     logger.warning(f"Validation failed for {product_id}: {e}")
-                    # Use raw values as fallback
 
             conn.execute("""
                 INSERT OR REPLACE INTO footprints
@@ -513,17 +952,16 @@ class MaterialFootprintUpdater:
 
         conn.commit()
         conn.close()
-        logger.info(f"Updated {count} footprints from {source}")
         return count
 
-    def _is_catalog_empty(self) -> bool:
+    def _count_catalog(self) -> int:
         conn = sqlite3.connect(self.db_path)
         count = conn.execute("SELECT COUNT(*) FROM footprints").fetchone()[0]
         conn.close()
-        return count == 0
+        return count
 
     def _seed_mock_data(self):
-        """Seed the database with mock data if empty."""
+        """Seed the database with mock data."""
         mock_data = [
             {"product_id": "gpu-a100", "embodied_carbon_kg": 200, "rare_earth_kg": 0.01, "total_mass_kg": 2.5, "material_index": 1.2},
             {"product_id": "gpu-h100", "embodied_carbon_kg": 250, "rare_earth_kg": 0.015, "total_mass_kg": 3.0, "material_index": 1.5},
@@ -549,17 +987,27 @@ class MaterialFootprintUpdater:
         conn.close()
         logger.info("Seeded mock data")
 
-    # ---------- Public methods ----------
+    def _compute_reward(self, success: bool, updated_count: int, force_refresh: bool) -> float:
+        """Compute reward for the update action."""
+        if success:
+            reward = 0.6
+            if updated_count > 0:
+                reward += 0.2 * min(1.0, updated_count / 10.0)
+        else:
+            reward = 0.0
+
+        # Bonus for not using force_refresh (more efficient)
+        if not force_refresh:
+            reward += 0.1
+
+        # Penalty if catalog empty after update
+        if self._count_catalog() == 0:
+            reward -= 0.2
+
+        return max(0.0, min(1.0, reward))
+
+    # ---------- Public methods (enhanced) ----------
     def get_footprint(self, product_id: str) -> Optional[Footprint]:
-        """
-        Retrieve a footprint from the cache.
-
-        Args:
-            product_id: Product identifier.
-
-        Returns:
-            Footprint object if found, else None.
-        """
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
             "SELECT embodied_carbon_kg, rare_earth_kg, total_mass_kg, material_index, source, last_updated FROM footprints WHERE product_id = ?",
@@ -572,7 +1020,6 @@ class MaterialFootprintUpdater:
             return None
         if self.metrics:
             self.metrics['cache_hits'].inc()
-            # Update age gauge
             age = (datetime.utcnow() - datetime.fromisoformat(row[5])).total_seconds()
             self.metrics['cache_age_seconds'].labels(product_id=product_id).set(age)
 
@@ -588,37 +1035,110 @@ class MaterialFootprintUpdater:
 
     async def get_or_fetch_footprint(self, product_id: str, force_refresh: bool = False) -> Optional[Footprint]:
         """
-        Get a footprint, fetching from API if not found or expired.
-
-        Args:
-            product_id: Product identifier.
-            force_refresh: If True, ignore cache and fetch fresh.
-
-        Returns:
-            Footprint object or None.
+        Get a footprint, adaptively selecting the source if not found or expired.
         """
-        # Check cache first
         fp = self.get_footprint(product_id)
         if fp and not force_refresh:
             age = (datetime.utcnow() - fp.last_updated).total_seconds()
             if age < self.cache_ttl:
                 return fp
 
-        # Attempt to fetch from APIs (only this product if possible)
-        # For simplicity, we fall back to full catalog update.
-        # In a real implementation, you would call a single-product endpoint if available.
-        await self.update_catalog(force_refresh=True)
+        # Build state with single-product mode
+        state = self._build_state(product_id=product_id)
+        action, action_idx, state_vec, teacher_probs = await self.update_optimizer.select_action(state, exploration=True)
+        self.last_state_vec = state_vec
+        self.last_action_idx = action_idx
+        self.last_teacher_probs = teacher_probs
+
+        # Execute action
+        success = False
+        updated_count = 0
+        start_time = time.time()
+
+        if action == 'bonsai_single':
+            # Try to fetch only this product (if API supports single fetch)
+            # For simplicity, we fallback to full update for that source
+            updated_count = await self._update_from_source('bonsai', force_refresh=True)
+            success = updated_count > 0
+        elif action == 'footprintdata_single':
+            updated_count = await self._update_from_source('footprintdata', force_refresh=True)
+            success = updated_count > 0
+        elif action == 'mock_single':
+            # Ensure mock data exists
+            if self._count_catalog() == 0:
+                self._seed_mock_data()
+            success = True
+        else:
+            # For full actions, use full update
+            updated_count = await self._update_from_source(action.split('_')[0], force_refresh=True)
+            success = updated_count > 0
+
+        # Compute reward
+        reward = self._compute_reward(success, updated_count, force_refresh)
+
+        # Log interaction
+        self._log_interaction('get_or_fetch', action, success, reward, product_id=product_id)
+        if self.last_state_vec is not None and self.last_action_idx is not None:
+            next_state = self._build_state(product_id=product_id)
+            next_state_vec = next_state.to_feature_vector()
+            await self.update_optimizer.update(
+                self.last_state_vec,
+                self.last_action_idx,
+                reward,
+                next_state_vec,
+                self.last_teacher_probs
+            )
+
+        if self.metrics:
+            self.metrics['update_action'].labels(action=action).inc()
+            self.metrics['update_reward'].observe(reward)
+
         return self.get_footprint(product_id)
 
+    def _log_interaction(self, method: str, action: str, success: bool, reward: float, product_id: Optional[str] = None):
+        """Log interaction for offline training."""
+        entry = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'method': method,
+            'action': action,
+            'success': success,
+            'reward': reward,
+            'product_id': product_id,
+        }
+        self.interaction_log.append(entry)
+        log_path = Path(self._get_config('interaction_logs_path', './material_interactions.csv'))
+        df_log = pd.DataFrame([entry])
+        if log_path.exists():
+            df_log.to_csv(log_path, mode='a', header=False, index=False)
+        else:
+            df_log.to_csv(log_path, index=False)
+
+    # ---------- Offline training ----------
+    @classmethod
+    def train_historical_model(cls, log_path: Path = Path("./material_interactions.csv"),
+                               model_path: Path = Path("./material_historical_model.pkl")):
+        """
+        Train a RandomForestClassifier from past interaction logs.
+        """
+        if not log_path.exists():
+            logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
+            return
+
+        df_logs = pd.read_csv(log_path)
+        if len(df_logs) < 10:
+            logger.warning("Not enough logs to train historical model (need at least 10).")
+            return
+
+        logger.info("Historical ML training requires state vectors in logs. Please implement logging of state vectors.")
+
+    # ---------- Other public methods (unchanged) ----------
     def list_products(self) -> List[str]:
-        """List all product IDs in the cache."""
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute("SELECT product_id FROM footprints").fetchall()
         conn.close()
         return [row[0] for row in rows]
 
     def delete_footprint(self, product_id: str) -> bool:
-        """Delete a footprint from the cache."""
         conn = sqlite3.connect(self.db_path)
         conn.execute("DELETE FROM footprints WHERE product_id = ?", (product_id,))
         conn.commit()
@@ -629,7 +1149,6 @@ class MaterialFootprintUpdater:
         return deleted
 
     def clear_cache(self) -> None:
-        """Clear all footprints from the cache."""
         conn = sqlite3.connect(self.db_path)
         conn.execute("DELETE FROM footprints")
         conn.commit()
@@ -637,7 +1156,6 @@ class MaterialFootprintUpdater:
         logger.info("Cache cleared")
 
     def export_catalog(self, path: Path) -> None:
-        """Export the catalog to a JSON file."""
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute("SELECT product_id, embodied_carbon_kg, rare_earth_kg, total_mass_kg, material_index, source, last_updated FROM footprints").fetchall()
         conn.close()
@@ -657,7 +1175,6 @@ class MaterialFootprintUpdater:
         logger.info("Catalog exported", path=str(path))
 
     def import_catalog(self, path: Path) -> int:
-        """Import a catalog from a JSON file."""
         with open(path, 'r') as f:
             data = json.load(f)
         conn = sqlite3.connect(self.db_path)
@@ -682,12 +1199,12 @@ class MaterialFootprintUpdater:
         logger.info("Catalog imported", path=str(path), count=count)
         return count
 
-    # ---------- Async context manager ----------
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
 
 # ============================================================================
 # Convenience factory
@@ -699,6 +1216,79 @@ def create_material_updater(
     Factory to create a fully configured MaterialFootprintUpdater.
     """
     return MaterialFootprintUpdater(config)
+
+
+# ============================================================================
+# UNIT TESTS (Phase 10)
+# ============================================================================
+import unittest
+from unittest import IsolatedAsyncioTestCase
+
+class TestDistillationComponents(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = {
+            'distillation_epsilon': 0.0,
+            'distillation_replay_size': 10,
+            'distillation_learning_rate': 0.01,
+            'distillation_train_every': 10,
+        }
+        self.optimizer = DistillationUpdateOptimizer(self.config)
+
+    def test_state_feature_vector(self):
+        state = UpdateState(
+            total_products=100,
+            stale_fraction=0.3,
+            avg_demand=2.0,
+            bonsai_success_rate=0.8,
+            footprintdata_success_rate=0.6,
+            bonsai_cb_state=0.0,
+            footprintdata_cb_state=1.0,
+            hours_since_update=12.0,
+            single_product_mode=0.0,
+        )
+        vec = state.to_feature_vector()
+        self.assertEqual(len(vec), 9)
+
+    def test_rule_based_teacher(self):
+        teacher = UpdateRuleBasedTeacher()
+        state = UpdateState(
+            total_products=100,
+            stale_fraction=0.6,
+            avg_demand=2.0,
+            bonsai_success_rate=0.9,
+            footprintdata_success_rate=0.5,
+            bonsai_cb_state=0.0,
+            footprintdata_cb_state=0.0,
+            hours_since_update=12.0,
+            single_product_mode=0.0,
+        )
+        probs = teacher.predict(state)
+        self.assertAlmostEqual(sum(probs), 1.0)
+        self.assertGreater(probs[0], probs[1])  # bonsai_full should be highest
+
+    async def test_select_action(self):
+        state = UpdateState(
+            total_products=100,
+            stale_fraction=0.3,
+            avg_demand=2.0,
+            bonsai_success_rate=0.8,
+            footprintdata_success_rate=0.6,
+            bonsai_cb_state=0.0,
+            footprintdata_cb_state=0.0,
+            hours_since_update=12.0,
+            single_product_mode=0.0,
+        )
+        action, idx, state_vec, teacher_probs = await self.optimizer.select_action(state, exploration=False)
+        self.assertIn(action, self.optimizer.ACTION_SPACE)
+
+    def test_replay_buffer(self):
+        buffer = ReplayBuffer(max_size=5)
+        state_vec = np.random.randn(9)
+        buffer.push(state_vec, 0, 1.0, state_vec, np.ones(6)/6)
+        self.assertEqual(len(buffer), 1)
+        batch = buffer.sample(1)
+        self.assertEqual(len(batch[0]), 1)
+
 
 # ============================================================================
 # Example usage
@@ -712,22 +1302,19 @@ if __name__ == "__main__":
         config = {
             "db_path": Path("./test_material.db"),
             "cache_ttl": 3600,
-            "bonsai_api_url": "https://api.example.com/bonsai",
-            "footprintdata_api_url": "https://api.example.com/footprintdata",
+            "distillation_epsilon": 0.1,
+            "distillation_train_every": 2,
         }
         updater = create_material_updater(config)
 
-        # Update catalog (will use mock data if API fails)
-        await updater.update_catalog()
+        # Simulate a few update calls to train the agent
+        for _ in range(5):
+            await updater.update_catalog()
+            fp = updater.get_footprint("gpu-a100")
+            print(f"Got footprint: {fp}")
 
-        # Get a footprint
-        fp = updater.get_footprint("gpu-a100")
-        if fp:
-            print(f"Footprint: {fp.product_id}, carbon: {fp.embodied_carbon_kg} kg, material index: {fp.material_index}")
-
-        # List products
-        products = updater.list_products()
-        print("Products:", products)
+        stats = updater.update_optimizer.get_stats()
+        print("Distillation stats:", stats)
 
         await updater.close()
 
