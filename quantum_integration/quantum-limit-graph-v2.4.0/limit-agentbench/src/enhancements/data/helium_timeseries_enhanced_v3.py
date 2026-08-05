@@ -105,6 +105,7 @@ except ImportError:
 # scikit-learn for ML teacher
 try:
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import LabelEncoder
     SKLEARN_ML = True
 except ImportError:
     SKLEARN_ML = False
@@ -215,7 +216,7 @@ class Config:
         return key
 
 # =============================================================================
-# Circuit Breaker (Robust) - unchanged
+# Circuit Breaker (Robust)
 # =============================================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -223,7 +224,46 @@ class CircuitBreakerState(Enum):
     HALF_OPEN = "half_open"
 
 class CircuitBreaker:
-    # ... same as original ...
+    """Circuit breaker with half-open state for external calls."""
+    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute an async function with circuit breaker protection."""
+        async with self._lock:
+            now = datetime.utcnow()
+            if self.state == CircuitBreakerState.OPEN:
+                if self.last_failure_time and (now - self.last_failure_time).total_seconds() >= self.recovery_timeout:
+                    self.state = CircuitBreakerState.HALF_OPEN
+                    self.failure_count = 0
+                    logger.info(f"Circuit breaker {self.name} entering HALF_OPEN")
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+
+        try:
+            result = await func(*args, **kwargs)
+            async with self._lock:
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+                    logger.info(f"Circuit breaker {self.name} closed after success")
+                else:
+                    self.failure_count = 0
+            return result
+        except Exception as e:
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = datetime.utcnow()
+                if self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+                    logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
+            raise e
 
 # =============================================================================
 # Data Models (Pydantic)
@@ -262,28 +302,341 @@ else:
         blockchain_anchor: bool = False
 
 # =============================================================================
-# TaskManager for Background Tasks - unchanged
+# TaskManager for Background Tasks
 # =============================================================================
 class TaskManager:
-    # ... same as original ...
+    """Supervises background tasks with auto-restart on failure."""
+    def __init__(self):
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+        self.shutdown_event = asyncio.Event()
+
+    def start_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
+        """Start a background task with auto-restart."""
+        async def wrapper():
+            backoff = 1
+            max_backoff = 300
+            while not self.shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Task '{name}' crashed", error=str(e), exc_info=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        task = asyncio.create_task(wrapper(), name=name)
+        async with self._lock:
+            self.tasks[name] = task
+        return task
+
+    async def stop_all(self):
+        self.shutdown_event.set()
+        async with self._lock:
+            for task in self.tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            self.tasks.clear()
+        logger.info("All background tasks stopped")
 
 # =============================================================================
-# Quantum-Resilient Security - unchanged
+# Quantum-Resilient Security for Dataset Signing
 # =============================================================================
 class QuantumResilientSecurity:
-    # ... same as original ...
+    """Quantum-resilient security for signing dataset metadata."""
+    def __init__(self):
+        self.pqc_algorithms = {}
+        self.pqc_available = PQC_AVAILABLE
+        self._lock = asyncio.Lock()
+        self.master_key = Config.get_master_key()
+        self.fernet = Fernet(self.master_key)
+        
+        if self.pqc_available:
+            self._initialize_pqc()
+        else:
+            logger.warning("PQC libraries not found – using ECDSA fallback.")
+    
+    def _initialize_pqc(self):
+        self.pqc_algorithms['dilithium'] = dilithium
+        self.pqc_algorithms['falcon'] = falcon
+        self.pqc_algorithms['sphincs'] = sphincs
+        logger.info("PQC algorithms loaded")
+    
+    async def generate_keypair(self, algorithm: str = 'dilithium', validity_days: int = 30) -> Dict:
+        async with self._lock:
+            if algorithm not in self.pqc_algorithms and not self.pqc_available:
+                return self._fallback_generate_keypair()
+            try:
+                if algorithm == 'dilithium':
+                    public_key, private_key = await asyncio.to_thread(
+                        self.pqc_algorithms['dilithium'].generate_keypair
+                    )
+                elif algorithm == 'falcon':
+                    public_key, private_key = await asyncio.to_thread(
+                        self.pqc_algorithms['falcon'].generate_keypair
+                    )
+                elif algorithm == 'sphincs':
+                    public_key, private_key = await asyncio.to_thread(
+                        self.pqc_algorithms['sphincs'].generate_keypair
+                    )
+                else:
+                    raise ValueError(f"Unknown algorithm: {algorithm}")
+                
+                key_id = f"{algorithm}_{uuid.uuid4().hex[:8]}"
+                expires_at = (datetime.now() + timedelta(days=validity_days)).isoformat()
+                
+                encrypted_private = self.fernet.encrypt(private_key)
+                encrypted_public = self.fernet.encrypt(public_key)
+                
+                logger.info(f"Generated keypair {key_id} with {algorithm}")
+                return {
+                    'key_id': key_id,
+                    'algorithm': algorithm,
+                    'public_key': public_key.hex() if isinstance(public_key, bytes) else str(public_key),
+                    'private_key_encrypted': encrypted_private.hex(),
+                    'expires_at': expires_at
+                }
+            except Exception as e:
+                logger.error(f"Keypair generation failed: {e}")
+                return self._fallback_generate_keypair()
+    
+    def _fallback_generate_keypair(self) -> Dict:
+        private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+        public_key = private_key.public_key()
+        public_bytes = public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        private_bytes = private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+        key_id = f"ecdsa_{uuid.uuid4().hex[:8]}"
+        expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+        encrypted_private = self.fernet.encrypt(private_bytes)
+        encrypted_public = self.fernet.encrypt(public_bytes)
+        logger.info(f"Generated fallback ECDSA keypair {key_id}")
+        return {
+            'key_id': key_id,
+            'algorithm': 'ecdsa',
+            'public_key': public_bytes.hex(),
+            'private_key_encrypted': encrypted_private.hex(),
+            'expires_at': expires_at
+        }
+    
+    async def sign_metadata(self, metadata: Dict, keypair: Dict) -> Dict:
+        data_bytes = json.dumps(metadata, sort_keys=True, default=str).encode()
+        algorithm = keypair['algorithm']
+        private_key_enc = bytes.fromhex(keypair['private_key_encrypted'])
+        private_key = self.fernet.decrypt(private_key_enc)
+        
+        if algorithm in self.pqc_algorithms:
+            try:
+                if algorithm == 'dilithium':
+                    signature = await asyncio.to_thread(
+                        self.pqc_algorithms['dilithium'].sign, data_bytes, private_key
+                    )
+                elif algorithm == 'falcon':
+                    signature = await asyncio.to_thread(
+                        self.pqc_algorithms['falcon'].sign, data_bytes, private_key
+                    )
+                elif algorithm == 'sphincs':
+                    signature = await asyncio.to_thread(
+                        self.pqc_algorithms['sphincs'].sign, data_bytes, private_key
+                    )
+                else:
+                    raise ValueError("Invalid algorithm")
+            except Exception as e:
+                logger.error(f"PQC signing failed: {e}")
+                return self._fallback_sign(metadata)
+        elif algorithm == 'ecdsa':
+            try:
+                priv = ec.load_der_private_key(private_key, password=None, backend=default_backend())
+                signature = priv.sign(data_bytes, ec.ECDSA(hashes.SHA256()))
+                signature = signature.hex()
+            except Exception as e:
+                logger.error(f"ECDSA signing failed: {e}")
+                return self._fallback_sign(metadata)
+        else:
+            return self._fallback_sign(metadata)
+        
+        return {
+            'signature': signature if isinstance(signature, str) else signature.hex(),
+            'algorithm': algorithm,
+            'key_id': keypair['key_id'],
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    def _fallback_sign(self, metadata: Dict) -> Dict:
+        data_bytes = json.dumps(metadata, sort_keys=True, default=str).encode()
+        return {
+            'signature': hashlib.sha256(data_bytes).hexdigest(),
+            'algorithm': 'sha256_fallback',
+            'key_id': 'fallback',
+            'timestamp': datetime.now().isoformat()
+        }
 
 # =============================================================================
-# Blockchain Anchoring - unchanged
+# Blockchain Anchoring (Enhanced with fallback)
 # =============================================================================
 class BlockchainAnchoring:
-    # ... same as original ...
+    def __init__(self):
+        self.web3 = None
+        self.contract = None
+        self.account = None
+        self.web3_available = False
+        if WEB3_AVAILABLE:
+            self._initialize_blockchain()
+    
+    def _initialize_blockchain(self):
+        try:
+            self.web3 = Web3(HTTPProvider(Config.BLOCKCHAIN_RPC_URL))
+            if not self.web3.is_connected():
+                raise ConnectionError("Cannot connect to blockchain RPC")
+            self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            if Config.BLOCKCHAIN_PRIVATE_KEY:
+                self.account = Account.from_key(Config.BLOCKCHAIN_PRIVATE_KEY)
+                self.web3.eth.default_account = self.account.address
+            else:
+                self.account = self.web3.eth.accounts[0]
+            contract_abi = self._load_contract_abi()
+            if Config.BLOCKCHAIN_CONTRACT_ADDRESS:
+                self.contract = self.web3.eth.contract(
+                    address=Config.BLOCKCHAIN_CONTRACT_ADDRESS,
+                    abi=contract_abi
+                )
+                self.web3_available = True
+                logger.info(f"Connected to blockchain at {Config.BLOCKCHAIN_RPC_URL}")
+            else:
+                logger.warning("Contract address not configured – blockchain anchoring will be simulated.")
+        except Exception as e:
+            logger.error(f"Blockchain initialization failed: {e}")
+            self.web3_available = False
+    
+    def _load_contract_abi(self) -> List:
+        return [
+            {"constant": False, "inputs": [{"name": "dataId", "type": "string"}, {"name": "dataHash", "type": "string"}, {"name": "metadata", "type": "string"}], "name": "recordData", "outputs": [], "type": "function"},
+            {"constant": True, "inputs": [{"name": "dataId", "type": "string"}], "name": "getRecord", "outputs": [{"name": "dataHash", "type": "string"}, {"name": "metadata", "type": "string"}], "type": "function"}
+        ]
+    
+    async def record_hash(self, data_id: str, data_hash: str, metadata: Dict) -> Dict:
+        if not self.web3_available:
+            # Fallback: store hash locally in a file
+            local_path = Path("./blockchain_hashes.json")
+            try:
+                if local_path.exists():
+                    with open(local_path, 'r') as f:
+                        records = json.load(f)
+                else:
+                    records = {}
+                records[data_id] = {'hash': data_hash, 'metadata': metadata, 'timestamp': datetime.now().isoformat()}
+                with open(local_path, 'w') as f:
+                    json.dump(records, f, indent=2)
+                logger.info(f"Recorded {data_id} locally (blockchain not available)")
+                return {'status': 'simulated', 'tx_hash': f"local_{data_id}", 'block_number': 0}
+            except Exception as e:
+                logger.error(f"Local storage failed: {e}")
+                return {'status': 'failed', 'error': str(e)}
+        try:
+            metadata_str = json.dumps(metadata)
+            nonce = self.web3.eth.get_transaction_count(self.account.address)
+            gas_estimate = self.contract.functions.recordData(data_id, data_hash, metadata_str).estimate_gas({'from': self.account.address})
+            gas_price = self.web3.eth.gas_price
+            tx = self.contract.functions.recordData(data_id, data_hash, metadata_str).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': int(gas_estimate * 1.2),
+                'gasPrice': gas_price
+            })
+            signed_tx = self.account.sign_transaction(tx)
+            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+            if receipt.status == 1:
+                block_number = receipt.blockNumber
+                logger.info(f"Recorded {data_id} on blockchain at block {block_number}")
+                return {'status': 'success', 'tx_hash': tx_hash.hex(), 'block_number': block_number}
+            else:
+                logger.error(f"Transaction failed for {data_id}")
+                return {'status': 'failed', 'error': 'transaction reverted'}
+        except Exception as e:
+            logger.error(f"Blockchain recording failed: {e}")
+            return {'status': 'failed', 'error': str(e)}
 
 # =============================================================================
-# Multi-Cloud Distributor - unchanged
+# Multi-Cloud Distributor (Real Implementation)
 # =============================================================================
 class MultiCloudDistributor:
-    # ... same as original ...
+    def __init__(self):
+        self._clients = {}
+        self._init_clients()
+
+    def _init_clients(self):
+        # AWS
+        if AWS_AVAILABLE and Config.CLOUD_AWS_ACCESS_KEY:
+            try:
+                self._clients['aws'] = boto3.client('s3',
+                    aws_access_key_id=Config.CLOUD_AWS_ACCESS_KEY,
+                    aws_secret_access_key=Config.CLOUD_AWS_SECRET_KEY,
+                    region_name=Config.CLOUD_AWS_REGION
+                )
+                logger.info("AWS S3 client initialized")
+            except Exception as e:
+                logger.error(f"AWS client init failed: {e}")
+
+        # Azure
+        if AZURE_AVAILABLE and Config.CLOUD_AZURE_CONNECTION_STRING:
+            try:
+                self._clients['azure'] = BlobServiceClient.from_connection_string(Config.CLOUD_AZURE_CONNECTION_STRING)
+                logger.info("Azure Blob client initialized")
+            except Exception as e:
+                logger.error(f"Azure client init failed: {e}")
+
+        # GCP
+        if GCP_AVAILABLE and Config.CLOUD_GCP_CREDENTIALS:
+            try:
+                self._clients['gcp'] = storage.Client.from_service_account_json(Config.CLOUD_GCP_CREDENTIALS)
+                logger.info("GCP client initialized")
+            except Exception as e:
+                logger.error(f"GCP client init failed: {e}")
+
+    async def distribute(self, file_path: Path, metadata: Dict) -> Dict:
+        """Upload the file to all configured cloud providers."""
+        results = {}
+        if not self._clients:
+            logger.warning("No cloud clients available; distribution simulated.")
+            return {'status': 'simulated', 'provider': 'none'}
+        
+        data_bytes = file_path.read_bytes()
+        key = file_path.name
+
+        # AWS
+        if 'aws' in self._clients:
+            try:
+                bucket = "helium-dataset-uploads"  # configurable
+                self._clients['aws'].put_object(Bucket=bucket, Key=key, Body=data_bytes)
+                results['aws'] = {'status': 'success', 'url': f"s3://{bucket}/{key}"}
+            except Exception as e:
+                logger.error(f"AWS upload failed: {e}")
+                results['aws'] = {'status': 'failed', 'error': str(e)}
+
+        # Azure
+        if 'azure' in self._clients:
+            try:
+                container = "helium-dataset-uploads"
+                blob_client = self._clients['azure'].get_container_client(container).get_blob_client(key)
+                blob_client.upload_blob(data_bytes, overwrite=True)
+                results['azure'] = {'status': 'success', 'url': f"azure://{container}/{key}"}
+            except Exception as e:
+                logger.error(f"Azure upload failed: {e}")
+                results['azure'] = {'status': 'failed', 'error': str(e)}
+
+        # GCP
+        if 'gcp' in self._clients:
+            try:
+                bucket = "helium-dataset-uploads"
+                bucket_obj = self._clients['gcp'].bucket(bucket)
+                blob = bucket_obj.blob(key)
+                blob.upload_from_string(data_bytes, content_type='application/octet-stream')
+                results['gcp'] = {'status': 'success', 'url': f"gs://{bucket}/{key}"}
+            except Exception as e:
+                logger.error(f"GCP upload failed: {e}")
+                results['gcp'] = {'status': 'failed', 'error': str(e)}
+
+        return results
 
 # =============================================================================
 # DISTILLATION COMPONENTS (Enhanced with Persistence & ML Training)
@@ -305,7 +658,7 @@ class GenerationOptimizationState:
     time_since_last: float
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to 12‑dim numeric feature vector."""
+        """Convert to 11‑dim numeric feature vector."""
         features = [
             self.quality_score / 100.0,
             self.regime_crisis,
@@ -342,15 +695,15 @@ class GenerationRuleBasedTeacher(Teacher):
     def predict(self, state: GenerationOptimizationState) -> np.ndarray:
         probs = np.ones(5) * 0.1
         if state.quality_score < 70:
-            probs[2] = 0.8
+            probs[2] = 0.8   # aggressive
         elif state.regime_crisis > 0.5:
-            probs[3] = 0.7
+            probs[3] = 0.7   # realistic
         elif state.price_volatility > 20:
-            probs[0] = 0.6
+            probs[0] = 0.6   # conservative
         elif state.time_since_last > 24:
-            probs[4] = 0.6
+            probs[4] = 0.6   # adaptive
         else:
-            probs[1] = 0.5
+            probs[1] = 0.5   # moderate
         return probs / probs.sum()
 
     def confidence(self, state: GenerationOptimizationState) -> float:
@@ -363,11 +716,12 @@ class GenerationHistoricalMLTeacher(Teacher):
     """Offline trained classifier from past generation logs."""
     def __init__(self, model_path: Optional[Path] = None):
         self.model = None
+        self.label_encoder = None
         self.model_path = model_path or Path(Config.HISTORICAL_MODEL_PATH)
         if self.model_path.exists():
             try:
                 with open(self.model_path, 'rb') as f:
-                    self.model = pickle.load(f)
+                    self.model, self.label_encoder = pickle.load(f)
                 logger.info(f"Loaded historical ML model from {self.model_path}")
             except Exception as e:
                 logger.error(f"Failed to load historical model: {e}")
@@ -388,7 +742,7 @@ class GenerationStatefulQTeacher(Teacher):
     def __init__(self, generator: 'EnhancedHeliumDatasetGeneratorV4', lr: float = 0.1):
         self.generator = generator
         self.lr = lr
-        self.weights = np.zeros((12, 5))  # 12 features, 5 actions
+        self.weights = np.zeros((11, 5))  # 11 features, 5 actions
         self._load_state()
 
     def _load_state(self):
@@ -430,7 +784,7 @@ class GenerationStatefulQTeacher(Teacher):
 
 
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 12, n_classes: int = 5, lr: float = 0.01):
+    def __init__(self, feature_dim: int = 11, n_classes: int = 5, lr: float = 0.01):
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
@@ -581,7 +935,7 @@ class EnhancedHeliumDatasetGeneratorV4:
         # Generation logs for historical ML training
         self.generation_logs: List[Dict] = []
 
-    # ---------- Core generation (unchanged) ----------
+    # ---------- Core generation ----------
     async def generate(self) -> Tuple[pd.DataFrame, Dict]:
         """Generate dataset with all enhancements."""
         logger.info(f"Starting dataset generation (ID: {self.generation_id})")
@@ -648,7 +1002,7 @@ class EnhancedHeliumDatasetGeneratorV4:
         logger.info(f"Dataset generated: {len(df)} rows, quality={quality_score:.1f}, reward={reward:.2f}")
         return df, metadata
 
-    # ---------- NEW: Log generation for historical ML ----------
+    # ---------- Log generation for historical ML ----------
     def _log_generation(self, state: GenerationOptimizationState, strategy: str, quality: float, reward: float):
         """Record a generation entry for offline training."""
         log_entry = {
@@ -668,7 +1022,7 @@ class EnhancedHeliumDatasetGeneratorV4:
             df_log.to_csv(log_path, index=False)
         logger.debug(f"Logged generation to {log_path}")
 
-    # ---------- NEW: Train historical ML model from logs ----------
+    # ---------- Train historical ML model from logs ----------
     @classmethod
     def train_historical_model(cls, log_path: Optional[Path] = None, model_path: Optional[Path] = None):
         """
@@ -699,7 +1053,6 @@ class EnhancedHeliumDatasetGeneratorV4:
         y = np.array(y_list)
         
         # Encode labels to numeric
-        from sklearn.preprocessing import LabelEncoder
         le = LabelEncoder()
         y_encoded = le.fit_transform(y)
         
@@ -798,39 +1151,368 @@ class EnhancedHeliumDatasetGeneratorV4:
         reward = 0.7 * quality_reward + 0.3 * anomaly_realism
         return min(1.0, max(0.0, reward))
 
-    # ---------- Generation methods (unchanged) ----------
+    # ---------- Generation methods ----------
     def _generate_synthetic(self, anomaly_multiplier: float = 1.0, trend_multiplier: float = 1.0, noise_multiplier: float = 1.0) -> pd.DataFrame:
-        # ... same as v4.1.1 ...
-        # For brevity, we reuse the code from the previous version.
-        # In a real file, this method would be fully implemented.
-        pass
+        """Core synthetic data generation with adjustable parameters."""
+        n_periods = self.params.n_periods
+        dates = pd.date_range(start=self.params.start_date, periods=n_periods, freq='M')
+        t = np.arange(n_periods)
+        
+        # Core parameters with multipliers
+        production = np.clip(
+            Config.PRODUCTION_BASE + t * Config.PRODUCTION_TREND * trend_multiplier + np.random.normal(0, 300 * noise_multiplier, n_periods),
+            20000, 35000
+        )
+        demand = np.clip(
+            Config.DEMAND_BASE + t * Config.DEMAND_TREND * trend_multiplier + np.random.normal(0, 400 * noise_multiplier, n_periods),
+            25000, 45000
+        )
+        price = Config.PRICE_BASE * np.exp(np.cumsum(np.random.normal(Config.PRICE_DRIFT * trend_multiplier, Config.PRICE_VOL * noise_multiplier, n_periods)))
+        seasonal = 1 + 0.1 * np.sin(2 * np.pi * t / 12)
+        price = price * seasonal
+        price = np.clip(price, 50, 500)
+        demand_supply_ratio = demand / production
+        shortage = np.clip((demand_supply_ratio - 0.95) * 4, 0.05, 1.0)
+        supply_risk = np.clip(0.2 + t * 0.002 * trend_multiplier + 0.1 * np.sin(2 * np.pi * t / 24) + np.random.normal(0, 0.05 * noise_multiplier, n_periods), 0.1, 0.9)
+        recycling = np.clip(0.10 + t * 0.003 * trend_multiplier + np.random.normal(0, 0.01 * noise_multiplier, n_periods), 0.05, 0.40)
+        substitution = np.clip(0.08 + t * 0.004 * trend_multiplier + np.random.normal(0, 0.01 * noise_multiplier, n_periods), 0.05, 0.50)
+        cooling = np.clip(0.85 + t * 0.005 * trend_multiplier + np.random.normal(0, 0.02 * noise_multiplier, n_periods), 0.7, 1.3)
+        geo_risk = np.clip(0.3 + 0.2 * np.sin(2 * np.pi * t / 36) + np.random.normal(0, 0.05 * noise_multiplier, n_periods), 0.1, 0.8)
+        logistics = np.clip(0.2 + t * 0.001 * trend_multiplier + np.random.normal(0, 0.05 * noise_multiplier, n_periods), 0.1, 0.7)
+        new_capacity = np.maximum(500, Config.NEW_CAPACITY_BASE + t * Config.NEW_CAPACITY_TREND * trend_multiplier + np.random.normal(0, 200 * noise_multiplier, n_periods))
+        
+        # Enhanced fields
+        scarcity_impact = np.clip(shortage * 0.6 + supply_risk * 0.4, 0, 1)
+        price_volatility = pd.Series(price).rolling(6).std().fillna(5).values
+        price_volatility = np.clip(price_volatility, 1, 30)
+        market_regime = []
+        for sc in scarcity_impact:
+            if sc > 0.7: regime = "crisis"
+            elif sc > 0.5: regime = "tightening"
+            elif sc > 0.3: regime = "normal"
+            else: regime = "stable"
+            market_regime.append(regime)
+        carbon_intensity = np.clip(Config.CARBON_BASE + Config.CARBON_RANGE * scarcity_impact + np.random.normal(0, 50 * noise_multiplier, n_periods), 50, 800)
+        renewable_pct = np.clip(Config.RENEWABLE_BASE + Config.RENEWABLE_RANGE * (1 - scarcity_impact) + np.random.normal(0, 10 * noise_multiplier, n_periods), 5, 95)
+        circularity_potential = (recycling + substitution) / 2
+        thermal_impact = cooling * scarcity_impact
+        future_supply_potential = np.clip((new_capacity / production) * 100, 0, 50)
+        capacity_utilization = production / (production + new_capacity)
+        esg_score = np.clip((recycling * 40 + (1 - supply_risk) * 30 + (1 - geo_risk) * 30) * 100, 0, 100)
+        regulatory_risk = np.clip(geo_risk * 0.5 + logistics * 0.5, 0, 1)
+        
+        df = pd.DataFrame({
+            'date': dates,
+            'global_production_tonnes': np.round(production, 0),
+            'global_demand_tonnes': np.round(demand, 0),
+            'price_index': np.round(price, 1),
+            'shortage_severity_0_1': np.round(shortage, 3),
+            'supply_risk_score_0_1': np.round(supply_risk, 3),
+            'recycling_rate_0_1': np.round(recycling, 3),
+            'substitution_feasibility_0_1': np.round(substitution, 3),
+            'cooling_load_sensitivity': np.round(cooling, 3),
+            'geopolitical_risk_index': np.round(geo_risk, 3),
+            'logistics_disruption_index': np.round(logistics, 3),
+            'new_production_capacity_tonnes': np.round(new_capacity, 0),
+            'helium_scarcity_impact': np.round(scarcity_impact, 3),
+            'price_volatility': np.round(price_volatility, 2),
+            'market_regime': market_regime,
+            'carbon_intensity_associated': np.round(carbon_intensity, 0),
+            'renewable_energy_pct': np.round(renewable_pct, 1),
+            'demand_supply_ratio': np.round(demand_supply_ratio, 3),
+            'circularity_potential': np.round(circularity_potential, 3),
+            'thermal_impact_factor': np.round(thermal_impact, 3),
+            'future_supply_potential_pct': np.round(future_supply_potential, 1),
+            'capacity_utilization_rate': np.round(capacity_utilization, 3),
+            'esg_score': np.round(esg_score, 1),
+            'regulatory_risk_score': np.round(regulatory_risk, 3)
+        })
+        return df
 
     def _inject_anomalies(self, df: pd.DataFrame, anomaly_multiplier: float) -> Tuple[pd.DataFrame, int]:
-        # ... same as v4.1.1 ...
-        pass
+        """Inject realistic anomalies with adjusted rate."""
+        df_anomaly = df.copy()
+        anomaly_count = 0
+        n_rows = len(df_anomaly)
+        effective_rate = self.params.anomaly_rate * anomaly_multiplier
+        effective_rate = min(effective_rate, 0.5)  # cap at 50%
+
+        # Anomaly Type 1: Sudden price spikes
+        n_price_spikes = int(n_rows * effective_rate * 0.3)
+        spike_indices = np.random.choice(n_rows, n_price_spikes, replace=False)
+        for idx in spike_indices:
+            df_anomaly.loc[idx, 'price_index'] *= np.random.uniform(1.5, 2.5)
+            df_anomaly.loc[idx, 'price_volatility'] *= np.random.uniform(2, 4)
+            anomaly_count += 1
+
+        # Anomaly Type 2: Production drops
+        n_prod_drops = int(n_rows * effective_rate * 0.3)
+        drop_indices = np.random.choice(n_rows, n_prod_drops, replace=False)
+        for idx in drop_indices:
+            df_anomaly.loc[idx, 'global_production_tonnes'] *= np.random.uniform(0.6, 0.85)
+            df_anomaly.loc[idx, 'shortage_severity_0_1'] = np.clip(
+                df_anomaly.loc[idx, 'shortage_severity_0_1'] * 1.5, 0, 1
+            )
+            anomaly_count += 1
+
+        # Anomaly Type 3: Data quality issues (marked as NaN)
+        n_missing = int(n_rows * effective_rate * 0.2)
+        missing_indices = np.random.choice(n_rows, n_missing, replace=False)
+        for idx in missing_indices:
+            col = np.random.choice(df_anomaly.columns)
+            df_anomaly.loc[idx, col] = np.nan
+            anomaly_count += 1
+
+        # Anomaly Type 4: Regime inconsistency
+        n_inconsistent = int(n_rows * effective_rate * 0.2)
+        inconsistent_indices = np.random.choice(n_rows, n_inconsistent, replace=False)
+        for idx in inconsistent_indices:
+            df_anomaly.loc[idx, 'helium_scarcity_impact'] = np.random.uniform(0.7, 0.9)
+            df_anomaly.loc[idx, 'price_index'] = np.random.uniform(80, 120)
+            anomaly_count += 1
+
+        return df_anomaly, anomaly_count
 
     def _add_extended_fields(self, df: pd.DataFrame) -> pd.DataFrame:
-        # ... same ...
-        pass
+        """Add fields for newer modules (regret, federated, etc.)."""
+        # Regret-based metrics (for regret optimizer)
+        df['regret_score'] = np.random.uniform(0.1, 0.9, len(df))
+        df['cvar_regret'] = np.random.uniform(0.1, 0.8, len(df))
+        # Federated learning weights (for federated module)
+        df['federated_weight'] = np.random.uniform(0.5, 1.5, len(df))
+        # Carbon efficiency (for carbon module)
+        df['carbon_efficiency'] = 1 - (df['carbon_intensity_associated'] - 200) / 600
+        df['carbon_efficiency'] = np.clip(df['carbon_efficiency'], 0.1, 0.9)
+        return df
 
     def _create_metadata(self, df: pd.DataFrame, anomaly_count: int) -> Dict:
-        # ... same ...
-        pass
+        """Create comprehensive metadata."""
+        # Calculate checksum
+        df_string = df.to_csv(index=False)
+        checksum = hashlib.sha256(df_string.encode()).hexdigest()[:16]
+        quality_score = self._calculate_quality_score(df)
+        regime_dist = df['market_regime'].value_counts().to_dict()
+        
+        # Safe serialization of params
+        if hasattr(self.params, 'dict'):
+            params_dict = self.params.dict()
+        elif hasattr(self.params, '__dict__'):
+            params_dict = self.params.__dict__
+        else:
+            params_dict = asdict(self.params)
+        
+        metadata = {
+            'version': '4.1.2',
+            'generation_id': self.generation_id,
+            'generated_at': self.generation_timestamp.isoformat(),
+            'params': params_dict,
+            'n_periods': len(df),
+            'n_columns': len(df.columns),
+            'fields': list(df.columns),
+            'quality_score': quality_score,
+            'checksum': checksum,
+            'anomaly_count': anomaly_count,
+            'market_regime_distribution': regime_dist,
+            'seed': self.seed,
+            'anomaly_rate': self.anomaly_rate,
+            'include_anomalies': self.include_anomalies
+        }
+        return metadata
 
     def _calculate_quality_score(self, df: pd.DataFrame) -> float:
-        # ... same ...
-        pass
+        """Enhanced quality score with balanced penalties."""
+        score = 100.0
+        
+        # Missing values
+        missing_pct = df.isnull().sum().sum() / (df.shape[0] * df.shape[1])
+        if missing_pct > 0:
+            score -= min(30, missing_pct * 50)  # cap penalty
+        
+        # Duplicates
+        duplicate_pct = df.duplicated().sum() / len(df)
+        if duplicate_pct > 0:
+            score -= min(20, duplicate_pct * 30)
+        
+        # Zero variance columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        zero_variance = sum(1 for col in numeric_cols if df[col].std() == 0)
+        if zero_variance > 0:
+            score -= zero_variance * 5
+        
+        # Market regime validity
+        if 'market_regime' in df.columns:
+            valid_regimes = {'crisis', 'tightening', 'normal', 'stable'}
+            invalid = set(df['market_regime'].unique()) - valid_regimes
+            if invalid:
+                score -= len(invalid) * 10
+        
+        # Scarcity-price correlation (should be positive)
+        if 'helium_scarcity_impact' in df.columns and 'price_index' in df.columns:
+            corr = df['helium_scarcity_impact'].corr(df['price_index'])
+            if corr < 0.3:
+                score -= 10
+            if corr < 0.1:
+                score -= 20
+        
+        # Check for monotonic trends (should be roughly increasing)
+        if 'global_production_tonnes' in df.columns:
+            prod_trend = np.polyfit(range(len(df)), df['global_production_tonnes'].values, 1)[0]
+            if prod_trend < -10:
+                score -= 10
+        
+        # Clamp to [0,100]
+        return max(0, min(100, score))
 
-    # ---------- Save, split, shutdown (unchanged) ----------
+    # ---------- Save, split, shutdown ----------
+    def create_train_val_test_split(self, df: pd.DataFrame,
+                                    train_ratio: float = 0.7,
+                                    val_ratio: float = 0.15) -> Dict[str, pd.DataFrame]:
+        n = len(df)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+        return {
+            'train': df.iloc[:train_end],
+            'validation': df.iloc[train_end:val_end],
+            'test': df.iloc[val_end:]
+        }
+
     def save(self, output_dir: Path = None):
-        # ... same ...
-        pass
+        output_dir = output_dir or Path(self.params.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        base_name = f"helium_timeseries_enhanced_v4_{self.generation_id}"
+        
+        # CSV
+        csv_path = output_dir / f"{base_name}.csv"
+        self.df.to_csv(csv_path, index=False)
+        logger.info(f"CSV saved to {csv_path}")
+        
+        # Parquet
+        if PARQUET_AVAILABLE:
+            parquet_path = output_dir / f"{base_name}.parquet"
+            self.df.to_parquet(parquet_path, index=False)
+            logger.info(f"Parquet saved to {parquet_path}")
+        
+        # JSON
+        json_path = output_dir / f"{base_name}.json"
+        records = self.df.to_dict(orient='records')
+        with open(json_path, 'w') as f:
+            json.dump(records, f, indent=2, default=str)
+        logger.info(f"JSON saved to {json_path}")
+        
+        # Metadata
+        metadata_path = output_dir / f"{base_name}.metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(self.metadata, f, indent=2, default=str)
+        logger.info(f"Metadata saved to {metadata_path}")
+        
+        # Train/val/test splits
+        splits = self.create_train_val_test_split(self.df)
+        for split_name, split_df in splits.items():
+            split_path = output_dir / f"{base_name}_{split_name}.csv"
+            split_df.to_csv(split_path, index=False)
+            logger.info(f"{split_name} split saved to {split_path}")
+        
+        # Cloud distribution if enabled
+        if self.params.cloud_distribution:
+            # Start a background task for distribution
+            task = self.task_manager.start_task("cloud_distribution", self._distribute, csv_path)
+            logger.info("Cloud distribution started in background")
+
+    async def _distribute(self, file_path: Path):
+        result = await self.cloud_distributor.distribute(file_path, self.metadata)
+        logger.info(f"Distributed to cloud: {result}")
 
     async def shutdown(self):
         await self.task_manager.stop_all()
 
     async def _fetch_real_data(self) -> Optional[pd.DataFrame]:
+        # Placeholder for real API fetch
         return None
+
+
+# =============================================================================
+# Module-specific export functions (unchanged)
+# =============================================================================
+def export_for_elasticity(df: pd.DataFrame, idx: int = -1) -> Dict:
+    latest = df.iloc[idx]
+    return {
+        'price_elasticity': -0.4 * (1 + latest['helium_scarcity_impact'] * 0.5),
+        'scarcity_elasticity': 0.6 * (1 - latest['capacity_utilization_rate']),
+        'cross_elasticity': 0.3 * (1 - latest['substitution_feasibility_0_1']),
+        'thermal_elasticity': latest['thermal_impact_factor'],
+        'composite_elasticity': (
+            0.4 * (1 + latest['helium_scarcity_impact'] * 0.3) +
+            0.3 * latest['circularity_potential'] +
+            0.3 * latest['regulatory_risk_score']
+        ),
+        'market_regime': latest['market_regime'],
+        'carbon_price_sensitivity': latest['esg_score'] / 100,
+        'renewable_integration': latest['renewable_energy_pct'] / 100,
+        'capacity_impact': latest['future_supply_potential_pct'] / 100
+    }
+
+def export_for_circularity(df: pd.DataFrame, idx: int = -1) -> Dict:
+    latest = df.iloc[idx]
+    return {
+        'recycling_rate': latest['recycling_rate_0_1'],
+        'recovery_efficiency': 0.85,
+        'circularity_index': latest['circularity_potential'],
+        'closed_loop_score': latest['circularity_potential'] * latest['recycling_rate_0_1'],
+        'material_circularity_indicator': (latest['recycling_rate_0_1'] + latest['substitution_feasibility_0_1']) / 2,
+        'lifecycle_extension_potential': latest['future_supply_potential_pct'] / 50,
+        'circular_economy_roi': (latest['esg_score'] / 100) * 0.15,
+        'waste_heat_recovery_potential': latest['thermal_impact_factor'] * 100,
+        'industrial_symbiosis_score': latest['capacity_utilization_rate'] * 0.8
+    }
+
+def export_for_sustainability(df: pd.DataFrame, idx: int = -1) -> Dict:
+    latest = df.iloc[idx]
+    return {
+        'esg_score': latest['esg_score'],
+        'carbon_intensity': latest['carbon_intensity_associated'],
+        'renewable_energy_pct': latest['renewable_energy_pct'],
+        'circularity_score': latest['circularity_potential'] * 100,
+        'supply_chain_risk': latest['supply_risk_score_0_1'],
+        'geopolitical_risk': latest['geopolitical_risk_index'],
+        'regulatory_risk': latest['regulatory_risk_score'],
+        'market_regime': latest['market_regime'],
+        'future_supply_potential': latest['future_supply_potential_pct'],
+        'capacity_utilization': latest['capacity_utilization_rate']
+    }
+
+def export_for_thermal(df: pd.DataFrame, idx: int = -1) -> Dict:
+    latest = df.iloc[idx]
+    return {
+        'cooling_load_sensitivity': latest['cooling_load_sensitivity'],
+        'thermal_impact_factor': latest['thermal_impact_factor'],
+        'helium_scarcity_impact': latest['helium_scarcity_impact'],
+        'carbon_intensity': latest['carbon_intensity_associated'],
+        'renewable_energy_pct': latest['renewable_energy_pct'],
+        'cooling_cost_index': latest['price_index'] / 100,
+        'free_cooling_potential': 1 - latest['helium_scarcity_impact'],
+        'waste_heat_recovery': latest['thermal_impact_factor'] * 0.5
+    }
+
+def export_for_quantum_bridge(df: pd.DataFrame, idx: int = -1) -> Dict:
+    latest = df.iloc[idx]
+    return {
+        'hamiltonian_factors': {
+            'price': latest['price_index'] / 500,
+            'scarcity': latest['helium_scarcity_impact'],
+            'supply_risk': latest['supply_risk_score_0_1'],
+            'demand_supply': latest['demand_supply_ratio'],
+            'geopolitical': latest['geopolitical_risk_index'],
+            'logistics': latest['logistics_disruption_index'],
+            'new_capacity': latest['new_production_capacity_tonnes'] / 20000,
+            'recycling': latest['recycling_rate_0_1'],
+            'substitution': latest['substitution_feasibility_0_1'],
+            'cooling': latest['cooling_load_sensitivity'],
+            'esg': latest['esg_score'] / 100
+        },
+        'market_regime': latest['market_regime'],
+        'quantum_advantage_expected': latest['price_volatility'] > 15
+    }
 
 
 # =============================================================================
@@ -891,21 +1573,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         self.assertGreater(probs[2], 0.5)  # aggressive should be highest
     
     def test_strategy_application(self):
-        state = GenerationOptimizationState(
-            quality_score=80.0,
-            regime_crisis=0.0,
-            regime_tightening=0.0,
-            regime_normal=0.0,
-            regime_stable=1.0,
-            price_volatility=10.0,
-            anomaly_rate=0.02,
-            production_trend_slope=-40,
-            demand_trend_slope=80,
-            target_quality=90,
-            time_since_last=0.0
-        )
         # Simulate a generation to get metadata
-        # We'll mock the metadata
         self.generator.metadata = {'quality_score': 75}
         multiplier = self.generator._apply_strategy('adaptive')
         self.assertEqual(multiplier[0], 1.5)  # quality < 80 -> aggressive
@@ -919,7 +1587,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         self.assertEqual(len(batch[0]), 1)
 
 # =============================================================================
-# CLI Interface (unchanged)
+# CLI Interface
 # =============================================================================
 def parse_args():
     import argparse
