@@ -138,6 +138,30 @@ class Storage:
             ).fetchone()
             return row[0] if row else None
 
+    def store_power_reading(self, reading: Dict) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS power_readings (
+                reading_id TEXT PRIMARY KEY,
+                power_watts REAL,
+                carbon_intensity REAL,
+                timestamp TEXT,
+                metadata TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO power_readings VALUES (?, ?, ?, ?, ?)",
+            (reading['reading_id'], reading['power_watts'], reading['carbon_intensity'],
+             reading['timestamp'], json.dumps(reading.get('metadata', {})))
+        )
+        conn.commit()
+
+def clean_power_readings(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM power_readings WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+
     # ----- Feedback Event Methods -----
     def store_feedback_event(self, event: Dict) -> None:
         """
