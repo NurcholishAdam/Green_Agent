@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.cuda.amp import autocast
 from typing import List, Dict, Any, Optional, Callable, Tuple
+from schemas.feedback_event import FeedbackEvent
 import logging
 from pathlib import Path
 import json
@@ -416,6 +417,26 @@ class DistillationOrchestrator:
             self.config = json.load(f)
         logger.info(f"Student loaded from {path}")
 
+    async def record_distillation_feedback(task_id, teacher_id, loss, quality, energy, carbon):
+    # Get current adaptive cost value (if available)
+        current_cost = 0.0
+        if hasattr(self, 'adaptive_cost'):
+            current_cost = sum(self.adaptive_cost.get_current_weights().values())
+
+        event = FeedbackEvent(task_id=task_id,
+            teacher_id=teacher_id,
+            selected_action="distillation",
+            quality_score=quality,
+            latency_ms=0.0,  # not applicable
+            energy_joules=energy,
+            carbon_g=carbon,
+            distillation_loss=loss,
+            feedback_type="distillation",
+            adaptive_cost_value=current_cost
+    )
+    # Publish to queue instead of synchronous record
+    await self.lifecycle_manager.queue.publish("feedback_events", event.model_dump_json())
+    
     async def _send_mopd_report(self, teacher_ids: List[str], avg_distill_loss: float, epoch: int):
         """
         Send a summary MOPD report to the AdaptiveCostFunction API.
