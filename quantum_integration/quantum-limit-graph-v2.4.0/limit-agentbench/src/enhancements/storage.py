@@ -234,6 +234,40 @@ def clean_old_substitution_results(self, days: int) -> None:
             )
             conn.commit()
 
+    def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
+    # implement as in previous integrations
+
+def store_circularity_record(self, metrics: HeliumCircularityMetrics) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS circularity_records (
+                record_id TEXT PRIMARY KEY,
+                circularity_index REAL,
+                circularity_level TEXT,
+                recycling_rate REAL,
+                recovery_efficiency REAL,
+                collection_efficiency REAL,
+                purification_efficiency REAL,
+                data_quality_score REAL,
+                tx_hash TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO circularity_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (metrics.record_id, metrics.circularity_index, metrics.circularity_level,
+             metrics.recycling_rate, metrics.recovery_efficiency, metrics.collection_efficiency,
+             metrics.purification_efficiency, metrics.data_quality_score,
+             metrics.blockchain_tx_hash or '', metrics.timestamp.isoformat())
+        )
+        conn.commit()
+
+def clean_old_circularity_records(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM circularity_records WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+        
     def store_emission_record(self, record: Dict) -> None:
     with self._get_connection() as conn:
         conn.execute("""
