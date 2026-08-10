@@ -843,6 +843,29 @@ class LifecycleManager:
         self.cloud = MultiCloudDistributor()
         self.metrics = MetricsRegistry()
 
+        # NEW: Adaptive Cost
+        self.adaptive_cost = AdaptiveCostFunction(self.storage)
+
+        # NEW: Pareto Gating
+        self.pareto_gating = ParetoGating()
+
+        # NEW: Message Queue
+        self.queue = AsyncMessageQueue(
+            queue_type=config.QUEUE_TYPE,
+            redis_url=config.REDIS_URL
+        )
+
+        # NEW: Drift Detector
+        self.drift_detector = DriftDetector(self.storage, self.adaptive_cost)
+        self.adaptive_cost.drift_detector = self.drift_detector
+
+        # NEW: Decision Audit
+        self.audit = DecisionAudit(self.storage)
+
+        # NEW: Counterfactual Benchmark
+        self.benchmark = CounterfactualBenchmark(self.storage)
+
+        
         # Domain engines (real or stub)
         if DOMAIN_ENGINES_AVAILABLE:
             self.thermal_optimizer = ThermalAwareOptimizer()
@@ -890,6 +913,12 @@ class LifecycleManager:
             loop.create_task(self._health_check_loop()),
             loop.create_task(self._key_rotation_loop()),
             loop.create_task(self._model_sync_loop()),
+            # NEW: Dashboard
+            loop.create_task(self._start_dashboard_async()),
+            # NEW: Benchmark loop
+            loop.create_task(self._benchmark_loop()),
+            # NEW: Queue consumer loop (process feedback)
+            loop.create_task(self._feedback_consumer_loop()),
         ]
         self._background_tasks.extend(tasks)
 
@@ -914,6 +943,32 @@ class LifecycleManager:
         while self._is_running:
             await asyncio.sleep(300)  # every 5 minutes
             self.optimizer._save_model()
+
+     async def _start_dashboard_async(self):
+        # Start dashboard in a thread (FastAPI requires its own loop)
+        # Actually, FastAPI runs its own event loop, so we start it in a separate thread.
+        # We just call the sync method.
+        self.audit.start_dashboard()
+
+    async def _benchmark_loop(self):
+        while self._is_running:
+            await asyncio.sleep(config.BENCHMARK_INTERVAL_DAYS * 86400)
+            try:
+                await self.benchmark.run_benchmark()
+            except Exception as e:
+                logger.error(f"Benchmark loop error: {e}")
+
+    async def _feedback_consumer_loop(self):
+        """Consume feedback events from the message queue and update adaptive cost."""
+        async def process_message(message):
+            # Deserialize message to FeedbackEvent
+            # Assume message is JSON string
+            import json
+            data = json.loads(message)
+            event = FeedbackEvent(**data)
+            await self.adaptive_cost.record_feedback(event)
+
+        await self.queue.subscribe("feedback_events", process_message)
 
     def get_health_status(self) -> Dict[str, Any]:
         active_tasks = [t for t in self._background_tasks if not t.done()]
