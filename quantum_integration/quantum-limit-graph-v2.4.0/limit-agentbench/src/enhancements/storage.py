@@ -165,6 +165,45 @@ def clean_power_readings(self, days: int) -> None:
 def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
     # implement as in previous integrations
 
+def store_elasticity_metrics(self, metrics: HeliumElasticityMetrics) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS elasticity_metrics (
+                metric_id TEXT PRIMARY KEY,
+                price_elasticity REAL,
+                scarcity_elasticity REAL,
+                cross_elasticity REAL,
+                substitution_elasticity REAL,
+                thermal_elasticity REAL,
+                composite_elasticity REAL,
+                scarcity_index REAL,
+                quality_score REAL,
+                data_quality_score REAL,
+                market_regime TEXT,
+                migration_urgency TEXT,
+                tx_hash TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO elasticity_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (metrics.metric_id, metrics.price_elasticity, metrics.scarcity_elasticity,
+             metrics.cross_elasticity, metrics.substitution_elasticity, metrics.thermal_elasticity,
+             metrics.composite_elasticity, metrics.scarcity_index, metrics.quality_score,
+             metrics.data_quality_score, metrics.market_regime, metrics.migration_urgency,
+             metrics.blockchain_tx_hash or '', metrics.timestamp.isoformat())
+        )
+        conn.commit()
+
+def clean_old_elasticity_records(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM elasticity_metrics WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+
+def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
+    # implement as in previous integrations
+
 def store_substitution_result(self, result: SubstitutionResult) -> None:
     with self._get_connection() as conn:
         conn.execute("""
