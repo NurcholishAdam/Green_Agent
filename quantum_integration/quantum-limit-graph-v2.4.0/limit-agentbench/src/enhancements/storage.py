@@ -276,6 +276,38 @@ def clean_old_substitution_results(self, days: int) -> None:
     def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
     # implement as in previous integrations
 
+    def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
+    # implement as in previous integrations
+
+def store_federated_round(self, result: FederatedRoundResult) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS federated_rounds (
+                round_id INTEGER PRIMARY KEY,
+                num_clients INTEGER,
+                global_accuracy REAL,
+                aggregated_loss REAL,
+                strategy TEXT,
+                carbon_footprint REAL,
+                energy_used REAL,
+                tx_hash TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO federated_rounds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (result.round_id, result.num_clients, result.global_accuracy,
+             result.aggregated_loss, result.strategy, result.carbon_footprint,
+             result.energy_used, result.blockchain_tx_hash or '', result.timestamp.isoformat())
+        )
+        conn.commit()
+
+def clean_old_federated_rounds(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM federated_rounds WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+
 def store_circularity_record(self, metrics: HeliumCircularityMetrics) -> None:
     with self._get_connection() as conn:
         conn.execute("""
