@@ -423,6 +423,42 @@ def save_distribution(self, result: Dict) -> None:
         )
         conn.commit()
 
+def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
+    # implement as in previous integrations
+
+def store_thermal_optimization(self, result: ThermalOptimizationResult) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS thermal_optimizations (
+                id TEXT PRIMARY KEY,
+                data TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO thermal_optimizations (id, data, timestamp) VALUES (?, ?, ?)",
+            (result.id if hasattr(result, 'id') else f"opt_{uuid.uuid4().hex[:8]}",
+             json.dumps(asdict(result), default=str), datetime.now().isoformat())
+        )
+        conn.commit()
+
+def get_state(self, key: str) -> Optional[str]:
+    with self._get_connection() as conn:
+        row = conn.execute("SELECT value FROM kv_store WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+def save_state(self, key: str, value: str) -> None:
+    with self._get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO kv_store (key, value, updated_at) VALUES (?, ?, ?)",
+                     (key, value, datetime.now().isoformat()))
+        conn.commit()
+
+def clean_thermal_records(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM thermal_optimizations WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+        
 def save_state(self, key: str, value: str) -> None:
     with self._get_connection() as conn:
         conn.execute("""
