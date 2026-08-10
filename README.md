@@ -1,412 +1,367 @@
-# 🌱 Green Agent v5.0.0
+# Green Agent: Sustainable AI Orchestration Platform with Carbon & Helium-Aware Resource Management
 
-**Sustainable AI Orchestration Platform with Carbon & Helium-Aware Resource Management**
-
-<p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.0-blue?style=for-the-badge" alt="Version 5.0.0">
-  <img src="https://img.shields.io/badge/python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
-  <img src="https://img.shields.io/badge/commits-1,328-orange?style=for-the-badge&logo=git" alt="1,328 Commits">
-  <img src="https://img.shields.io/badge/weekly_commits-167-red?style=for-the-badge" alt="167 Weekly Commits">
-  <img src="https://img.shields.io/badge/docker_ready-2_images-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker Ready">
-</p>
-
-<p align="center">
-  <b>Carbon-Aware</b> • <b>Helium-Aware</b> • <b>Quantum-Ready</b> • <b>Production-Grade</b>
-</p>
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000)](https://github.com/psf/black)
+[![DOI](https://img.shields.io/badge/DOI-10.xxxx/xxxxx-blue)](https://doi.org/...)
 
 ---
 
-## 📊 Executive Summary
+## Table of Contents
 
-Green Agent v5.0.0 is a **production-grade, 12-layer unified architecture** for carbon-aware, helium-aware AI orchestration. It uniquely addresses two critical sustainability challenges facing modern AI infrastructure:
-
-### The Dual Challenge
-
-| Challenge | Impact | Green Agent Solution |
-|-----------|--------|---------------------|
-| **🌍 Climate Change** | Data centers consume 1–2% of global electricity, producing 0.3–0.6% of global CO₂ emissions | Carbon-aware scheduling reduces footprint by **90–98%** |
-| **🎈 Helium Scarcity** | Semiconductor manufacturing (GPU production, EUV lithography) consumes 30% of global helium supply | Helium-aware optimization reduces dependency by **56%** |
-
-### Key Innovations
-
-| Feature | Description | Impact |
-|---------|-------------|--------|
-| **Dual-Axis Decision Core** | Carbon + Helium zone scheduling | 16-zone decision matrix |
-| **Real-time Helium Monitoring** | Supply chain API integration | **89% fallback success rate** |
-| **Graph-Based Policy Learning** | LIMIT graph integration | Adaptive optimization |
-| **Immutable Dual Ledger** | Carbon + Helium audit trail | **ISO 14064 compliance** |
-| **3D Pareto Benchmarking** | Energy × Time × Helium | Multi-objective optimization |
-
----
-
-## 📈 Impact Metrics & Insights
-
-### Quantified Sustainability Impact
-
-| Metric | Baseline | Green Agent v5.0 | Improvement |
-|--------|----------|-------------------|-------------|
-| **⚡ Energy Consumption** | 1.5 kWh/task | 0.18 kWh/task | **−88%** |
-| **🌿 Carbon Footprint** | 0.6 kg CO₂/task | 0.07 kg CO₂/task | **−88%** |
-| **🎈 Helium Usage** | 0.95 units/task | 0.42 units/task | **−56%** |
-| **💰 Helium Cost** (@$8.50/L) | $8.07/task | $3.57/task | **−56%** |
-| **🔄 Fallback Success Rate** | 0% | 89% | **+89%** |
-| **🎯 Scarcity-Aware Accuracy** | 0% (fails) | 72% maintained | **+72%** |
-
-### Core Impact Highlights
-
-| Metric | Value | Badge |
-|--------|-------|-------|
-| **Carbon Emissions Reduced** | 90–98% | ![Carbon Reduction](https://img.shields.io/badge/carbon_reduction-90--98%25-brightgreen?style=flat-square) |
-| **Helium Dependency Cut** | 56% | ![Helium Reduction](https://img.shields.io/badge/helium_reduction-56%25-blue?style=flat-square) |
-| **Ledger Integrity** | 99.999% | ![Integrity](https://img.shields.io/badge/integrity-99.999%25-gold?style=flat-square) |
-| **Fallback Success Rate** | 89% | ![Fallback](https://img.shields.io/badge/fallback_success-89%25-orange?style=flat-square) |
-| **Supply Chain Monitoring** | 100% | ![Monitoring](https://img.shields.io/badge/monitoring_coverage-100%25-success?style=flat-square) |
-
-### Climate Impact Details
-
-- **Zone-based scheduling** prioritizes low-carbon execution windows
-- **Green-energy shifting** to renewable-heavy periods
-- **Dynamic precision** cuts energy 30–50% when throttled
-
-### Material Scarcity Mitigation
-
-- **Fallback paths** activate when primary helium supply is constrained, with **89% fallback success rate**
-- **Alternative cooling simulation** reduces cryogenic dependency
-- **Scarcity-tolerant execution policies** enable continued operation during supply disruptions
+- [Overview](#overview)
+- [Core Philosophy](#core-philosophy)
+- [Architecture](#architecture)
+  - [Orchestration Gateway](#orchestration-gateway)
+  - [Domain Engines](#domain-engines)
+  - [Decision-Making Core](#decision-making-core)
+- [Key Features](#key-features)
+  - [Bio-Inspired Optimisation](#bio-inspired-optimisation)
+  - [Mixture-of-Experts (MoE) System](#mixture-of-experts-moe-system)
+  - [Multi-Teacher On-Policy Distillation (MOPD)](#multi-teacher-on-policy-distillation-mopd)
+  - [Carbon & Helium Awareness](#carbon--helium-awareness)
+  - [Quantum-Resilient Security](#quantum-resilient-security)
+  - [Blockchain Verification](#blockchain-verification)
+  - [Multi-Cloud Distribution & Resiliency](#multi-cloud-distribution--resiliency)
+  - [Observability & Telemetry](#observability--telemetry)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Installation](#installation)
+  - [Configuration](#configuration)
+  - [Quick Example](#quick-example)
+- [API Reference](#api-reference)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
-## 🏗️ 12-Layer Architecture Deep Dive
+## Overview
 
-### Architecture Completeness
+**Green Agent** is a next‑generation autonomous orchestration platform designed to minimise the environmental footprint of AI workloads while maximising performance, cost‑efficiency, and operational resilience. It integrates **bio‑inspired optimisation**, **mixture‑of‑experts (MoE) decision fusion**, and **multi‑teacher on‑policy distillation (MOPD)** to dynamically adapt to changing grid carbon intensity, helium (green hydrogen) pricing, cloud spot prices, and workload characteristics.
 
-| Layer | Component | Status | Key Technology |
-|-------|-----------|--------|--------------|
-| **Layer 0** | Workload + Helium Profile | ✅ Production | Task analysis, scarcity tolerance scoring |
-| **Layer 1** | Meta-Cognition + Helium Adapter | ✅ Production | Self-aware reflection, policy adaptation |
-| **Layer 2** | Neuro-Symbolic + Graph Reasoning | ✅ Production | Graph-based rules, multi-hop reasoning |
-| **Layer 3** | Dual-Axis Decision Core | ✅ Production | 16-zone matrix (60% C + 40% H) |
-| **Layer 4** | Helium-Aware ML Optimization | ✅ Production | INT4/INT8 quantization, 50% pruning |
-| **Layer 5** | Helium-Aware Data Optimization | ✅ Production | Dynamic batching, Zstd compression |
-| **Layer 6** | Distributed Execution | ✅ Production | Ray cluster, fallback paths |
-| **Layer 7** | Dual Monitoring (C + H) | ✅ Production | Prometheus, Grafana, supply chain APIs |
-| **Layer 8** | Immutable Dual Ledger | ✅ Production | DAG-based, SHA-256, ISO 14064 |
-| **Layer 9** | 3D Benchmarking | ✅ Production | Pareto frontier (Energy × Time × Helium) |
-| **Layer 10** | Quantum Integration | 🟡 Beta | VQC engine, error mitigation |
-| **Layer 11** | Dashboard & Visualization | ✅ Production | FastAPI, WebSocket, real-time updates |
+At its heart, the Green Agent orchestrates a suite of **scientific domain engines** – thermal optimisers, phase‑aware energy models, carbon‑aware NAS, marginal carbon forecasters, helium price elasticity models, and federated learning aggregators – through a centralised, async‑aware **enhancements gateway**. This gateway provides persistent storage, quantum‑resilient security, blockchain audit trails, multi‑cloud distribution, and real‑time observability.
 
-### Key Differentiators
-
-1. **Dual-axis optimization** — Only platform addressing both carbon and helium
-2. **Immutable compliance** — SHA-256 hashed audit trails meeting ISO 14064
-3. **3D Pareto frontier** — True multi-objective optimization (Energy × Time × Helium)
-4. **Quantum-ready** — VQC integration for future computational advantage
+The platform is **carbon‑aware** and **helium‑aware**, meaning it actively tracks and optimises not only direct energy consumption but also the embodied carbon and the cost/availability of green hydrogen fuel cells used in data centre backup power. This dual focus places Green Agent at the forefront of **sustainable AI** and **circular economy** practices.
 
 ---
 
-## 🧠 Reasoning Capabilities
+## Core Philosophy
 
-### Meta-Cognitive Architecture
-
-| Capability | Description | Output |
-|------------|-------------|--------|
-| **Metric Collection** | Latency, energy, carbon, memory, tool calls consistently logged | Real-time monitoring hooks |
-| **Reflection Checkpoints** | Periodic self-analysis at configurable intervals | Agent pauses to review metrics vs. budget constraints |
-| **Self-Explanation** | Generates natural language reasoning | *"I'm exceeding latency but conserving energy"* |
-| **Confidence Scoring** | Adaptive strategy scoring with pattern identification | Execution history-informed decisions |
-
-### Neuro-Symbolic Reasoning
-
-| Stage | Function | Integration |
-|-------|----------|-------------|
-| **Neural Prediction** | Neural network predicts optimal execution parameters | Based on workload profile and system state |
-| **Symbolic Validation** | Graph-based rules engine applies interpretable policies | Multi-hop reasoning through policy graphs |
-| **Knowledge Graph** | Historical context from past executions informs current decisions | Graph similarity search |
-| **Interpretable Paths** | Every decision has a traceable reasoning path | Unlike black-box neural-only systems |
-
-**Integration Flow:** `Workload Input` → `Neural Prediction` → `Symbolic Validation` → `Enhanced Decision`
+- **Autonomous Adaptation**: Continuously learn and improve from live operation without human intervention.
+- **Multi‑Objective Optimisation**: Balance carbon emissions, latency, cost, and quality.
+- **Resilience by Design**: Circuit breakers, retries, and fallback chains ensure high availability.
+- **Security First**: Post‑quantum cryptography and hardware‑grade key management.
+- **Observable by Default**: Structured logging and Prometheus metrics for full transparency.
 
 ---
 
-## 🎯 16-Zone Decision Matrix
+## Architecture
 
-### Decision Algorithm
+Green Agent is built as a layered, modular system. The core components reside in the `enhancements` module (located at `quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/`), which acts as the **orchestration gateway** for all domain engines.
 
 ```
-Step 1: Determine Zones
-  Carbon zone from grid intensity
-  Helium zone from dependency + supply
-
-Step 2: Weighted Score
-  Carbon weight = 0.6, Helium = 0.4
-
-Step 3: Map to Action
-  < 1.0: Full    | 1.0–1.8: Throttle
-  1.8–2.5: Minimal | > 2.5: Defer
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Green Agent Orchestration Gateway               │
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌───────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────────┐ │
+│  │   Config  │  │   Storage   │  │  Security   │  │  Blockchain   │ │
+│  │ (Pydantic)│  │  (SQLite)   │  │ (PQC+AES)   │  │   (Web3)     │ │
+│  └───────────┘  └─────────────┘  └─────────────┘  └───────────────┘ │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                   Decision-Making Core                          ││
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐     ││
+│  │  │ Bio-Inspired │  │ MoE Gating   │  │ MOPD Student      │     ││
+│  │  │ Optimisers   │  │ Network      │  │ Policy (RL+Dist.)│     ││
+│  │  └──────────────┘  └──────────────┘  └──────────────────┘     ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                   Domain Engines (Teachers)                     ││
+│  │  Thermal  │ PhaseEnergy │ EnergyScaler │ CarbonForecaster      ││
+│  │  DualCarbon│ CarbonNAS  │ HeliumElastic│ MaterialSubstitution  ││
+│  │  HeliumCircularity │ RegretOptimizer │ FederatedLearning      ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │              Multi-Cloud & Infrastructure Layer                  ││
+│  │  AWS (boto3)  │ Azure (blob) │ GCP (storage) │ Fallback Sims   ││
+│  └─────────────────────────────────────────────────────────────────┘│
+├─────────────────────────────────────────────────────────────────────┤
+│  Prometheus Metrics │ Structured Logging (structlog)                │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Full Decision Matrix
+### Orchestration Gateway
 
-| Carbon \ Helium | 🟢 Green (0–0.3) | 🟡 Yellow (0.3–0.6) | 🔴 Red (0.6–0.8) | ⚫ Critical (0.8+) |
-|-----------------|------------------|---------------------|------------------|-------------------|
-| **🟢 Green (0–50)** | ✅ Full (1.0) | ⚡ Throttle (0.7) | ⚠️ Defer if possible | ❌ Defer/Block |
-| **🟡 Yellow (50–200)** | ⚡ Throttle (0.8) | ⚡ Throttle (0.6) | ⚠️ Minimal (0.3) | ❌ Defer |
-| **🔴 Red (200–400)** | ⚡ Throttle (0.6) | ⚠️ Minimal (0.4) | ❌ Defer | ❌ Defer |
-| **⚫ Critical (400+)** | ⚠️ Minimal (0.3) | ❌ Defer | ❌ Defer | ❌ Block |
+- **Configuration**: Pydantic `BaseSettings` with environment variable support and strict validation.
+- **Storage**: SQLite with WAL mode, indexes, and connection pooling; stores encrypted keys, blockchain records, optimisation history, and model weights.
+- **Security**: AES‑256‑GCM authenticated encryption for private keys; post‑quantum signature algorithms (Dilithium, Falcon, SPHINCS) with ECDSA fallback; master key retrieved from HashiCorp Vault (no plaintext on disk).
+- **Blockchain**: Ethereum smart contract integration for immutable audit trails; nonce caching, dynamic gas pricing, and circuit‑breaker protection.
+- **Multi‑Cloud**: Real SDKs for AWS, Azure, GCP with retries, fallback chains, and enhanced circuit breakers.
 
-### Four Execution Actions
+### Domain Engines
 
-| Action | Power Budget | Use Case |
-|--------|------------|----------|
-| `execute_full` | 1.0 (100%) | Optimal sustainability conditions |
-| `execute_throttled` | 0.5 (50%) | One yellow zone |
-| `execute_minimal` | 0.2 (20%) | One red zone |
-| `defer / block` | 0.0 (0%) | Critical constraints |
+The platform integrates a rich ecosystem of specialised engines, each acting as a **teacher** in the MOPD framework. They are located in the same `enhancements` directory:
 
----
+- `thermal_optimizer` – Optimises cooling and thermal distribution.
+- `phase_energy_model` – Predicts energy phase shifts.
+- `energy_scaler` – Scales resources proportionally to workload.
+- `marginal_carbon` – Forecasts short‑term grid carbon intensity.
+- `dual_accountant` – Tracks and offsets carbon emissions (scope 1, 2, 3).
+- `carbon_nas` – Performs neural architecture search with carbon constraints.
+- `helium_elasticity` – Models price elasticity of green hydrogen (helium).
+- `material_substitution` – Suggests sustainable material alternatives.
+- `helium_circularity` – Monitors circularity metrics for helium‑based energy.
+- `regret_optimizer` – Minimises long‑term regret in sequential decisions.
+- `federated_learning` – Aggregates policies across distributed edge nodes.
 
-## 📉 Performance Metrics & Benchmarks
+Each engine exposes a consistent interface, enabling plug‑and‑play integration.
 
-### Key Performance Indicators (KPIs)
+### Decision‑Making Core
 
-| Metric | Baseline (No Agent) | Green Agent v5.0 (Carbon Only) | Green Agent v5.0 (Carbon + Helium) | Improvement |
-|--------|---------------------|-------------------------------|-----------------------------------|-------------|
-| **⚡ Energy Consumption** | 1.5 kWh/task | 0.22 kWh/task (−85%) | 0.18 kWh/task (−88%) | **−88%** |
-| **🌿 Carbon Footprint** | 0.6 kg CO₂/task | 0.09 kg CO₂/task (−85%) | 0.07 kg CO₂/task (−88%) | **−88%** |
-| **🎈 Helium Usage** | 0.95 units/task | 0.95 units/task (0%) | 0.42 units/task (−56%) | **−56%** |
-| **💰 Helium Cost** (@$8.50/L) | $8.07/task | $8.07/task | $3.57/task (−56%) | **−56%** |
-| **🔄 Fallback Success Rate** | 0% | 0% | 89% | **+89%** |
-| **🎯 Scarcity-Aware Accuracy** | 0% (fails) | 0% (fails) | 72% maintained | **+72%** |
-| **🛡️ Helium Resilience Score** | 0.15 | 0.15 | 0.85 | **+467%** |
+The decision‑making core is the brain of Green Agent, composed of three interleaved layers:
 
-### Real-World Test Results
+1. **Bio‑Inspired Solvers** – Provide exploratory, evolutionary solutions.
+2. **Mixture‑of‑Experts (MoE) Gating** – Dynamically weights and combines expert outputs.
+3. **Multi‑Teacher On‑Policy Distillation (MOPD)** – Distils the combined wisdom into a lightweight student policy that is continuously updated via reinforcement learning.
 
-| Workload Type | Helium Savings | Accuracy Impact | Latency Impact | Cost Savings (per task) |
-|---------------|---------------|-----------------|----------------|------------------------|
-| **LLM Training (70B)** | 58% | −22% | +180% | $4.68 |
-| **CNN Inference (ResNet)** | 62% | −15% | +95% | $5.02 |
-| **Transformer Fine-tune** | 51% | −18% | +150% | $4.12 |
-| **Quantum Circuit** | 45% | −12% | +200% | $3.60 |
-| **Data Processing (ETL)** | 35% | 0% | +40% | $2.80 |
-
-### Helium Efficiency Ranking (Top 10 Task Types)
-
-| Rank | Task Type | Helium Efficiency (tasks/unit) | Optimization Strategy | Accuracy Retained |
-|------|-----------|-------------------------------|----------------------|-------------------|
-| 1 | Quantized LLM Inference | 3.2 | INT4 + Distilled | 78% |
-| 2 | Distilled Vision | 2.8 | INT8 + Pruned 40% | 85% |
-| 3 | Pruned BERT Fine-tune | 2.5 | INT8 + Pruned 30% | 82% |
-| 4 | CPU-only ETL | 2.1 | No GPU | 100% |
-| 5 | Quantized Transformer | 1.9 | INT8 + Pruned 25% | 88% |
-| 6 | Distilled NLP | 1.7 | FP16 + Pruned 15% | 92% |
-| 7 | Standard GPU Training | 1.1 | Baseline | 100% |
-| 8 | GPU Cluster Training | 0.9 | Baseline | 100% |
-| 9 | TPU Training | 0.7 | Baseline | 100% |
-| 10 | Quantum Circuit | 0.5 | Simulator | 95% |
+This tri‑layer architecture ensures robustness, adaptability, and scalability.
 
 ---
 
-## 📊 Dashboard & Visualization
+## Key Features
 
-### Grafana Dashboard Panels (8 Pre-built)
+### Bio‑Inspired Optimisation
 
-| # | Panel | Metric | Visualization |
-|---|-------|--------|---------------|
-| 1 | **Helium Supply Scarcity Trend** | Real-time scarcity score with alerts | Time-series with threshold bands |
-| 2 | **Helium Spot Price (USD/Liter)** | Historical and current pricing | 30-day candlestick |
-| 3 | **Helium Efficiency by Hardware** | Efficiency scores per worker type | Horizontal bar chart |
-| 4 | **Fallback Usage Rate** | Fallback frequency gauge | Gauge with color thresholds |
-| 5 | **Carbon-Helium Trade-off** | Carbon vs. helium scatter | Scatter plot with Pareto frontier |
-| 6 | **Worker Pool Helium Footprint** | Usage by worker type | Pie/donut chart |
-| 7 | **Top 10 Helium-Efficient Tasks** | Leaderboard | Table with sparklines |
-| 8 | **3D Pareto Frontier** | Energy × Time × Helium | Interactive 3D surface |
+Green Agent employs a family of bio‑inspired algorithms that operate at multiple timescales:
 
-### Prometheus Metrics (30+ Exported)
+- **Genetic Algorithms (GA)** – For neural architecture search and hyperparameter tuning; uses crossover, mutation, and elitism to evolve optimal configurations.
+- **Particle Swarm Optimisation (PSO)** – For continuous optimisation of scaling factors, resource allocation, and cloud routing.
+- **Ant Colony Optimisation (ACO)** – For dynamic workload routing across cloud providers and data centres, minimising latency and energy.
+- **Simulated Annealing** – For global exploration of the configuration space during cold‑start or major environmental shifts.
 
-```prometheus
-# Helium metrics
-helium_scarcity_score{instance="green-agent"} 0.73
-helium_spot_price_usd{instance="green-agent"} 8.50
-helium_inventory_days{instance="green-agent"} 10
-helium_efficiency_tasks_per_unit{workload="gpu"} 1.47
-helium_efficiency_tasks_per_unit{workload="cpu"} 2.10
-helium_fallback_rate{instance="green-agent"} 0.11
-helium_total_usage_units{instance="green-agent"} 642.8
+These solvers are used both as **standalone optimisers** (for periodic re‑optimisation) and as **teachers** that provide candidate actions to the MOPD student.
 
-# Carbon metrics
-carbon_intensity_gco2_per_kwh{region="us-east"} 180.5
-carbon_emissions_kg_total{instance="green-agent"} 452.3
-carbon_reduction_pct{instance="green-agent"} 88.0
+### Mixture‑of‑Experts (MoE) System
 
-# System metrics
-green_agent_tasks_processed_total{instance="green-agent"} 1523
-green_agent_tasks_succeeded_total{instance="green-agent"} 1428
-green_agent_tasks_failed_total{instance="green-agent"} 95
-green_agent_execution_latency_ms{quantile="0.5"} 850
-green_agent_execution_latency_ms{quantile="0.95"} 1250
-green_agent_execution_latency_ms{quantile="0.99"} 2100
+The MoE layer dynamically selects or blends the recommendations from all domain engines. A **gating network** – itself a small neural network – takes the current state (carbon intensity, spot prices, workload, time of day, etc.) and outputs a probability distribution over experts. The final decision is either the top‑weighted expert's action or a weighted average (soft‑blending). The gating network is trained jointly with the student policy, ensuring that the system learns **when** to trust which expert.
 
-# Worker pool metrics
-worker_pool_active_workers{pool="cpu"} 8
-worker_pool_active_workers{pool="gpu_single"} 3
-worker_pool_active_workers{pool="gpu_cluster"} 1
-worker_pool_queue_size{pool="cpu"} 2
-worker_pool_queue_size{pool="gpu_single"} 5
-worker_pool_queue_size{pool="gpu_cluster"} 0
+This modular design allows the platform to:
+- **Exploit** specialised knowledge from each engine.
+- **Explore** novel combinations when uncertainty is high.
+- **Adapt** to changing environments by adjusting expert weights.
 
-# Optimization metrics
-optimization_quantization_ratio{model="llama"} 0.60
-optimization_pruning_ratio{model="llama"} 0.40
-optimization_model_size_reduction{model="llama"} 0.60
-```
+### Multi‑Teacher On‑Policy Distillation (MOPD)
 
----
+MOPD is the heart of Green Agent's learning capability. It replaces traditional rule‑based or simple bandit controllers with a **distilled student policy** that:
 
-## 📁 Repository Profile
+- **Learns from the ensemble of teachers** – all domain experts and bio‑inspired solvers – via a distillation loss (KL divergence). The teachers’ output probabilities are averaged to form a “soft target” for the student.
+- **Simultaneously optimises for real‑world rewards** – carbon saved, latency reduction, and cost savings – through a policy gradient (REINFORCE) loss.
+- **Operates on‑policy**, meaning it continuously collects experience during live execution and updates its weights in a background training loop.
 
-### Development Activity
+**Training Pipeline:**
 
-| Metric | Value |
-|--------|-------|
-| **Total Commits** | 1,328 |
-| **Commits This Week** | 167 |
-| **Active Branches** | 10 |
-| **Open Pull Requests** | 6 |
-| **License** | MIT |
-| **Primary Language** | Python 98.3% |
-| **Secondary Language** | Shell 1.7% |
-| **Docker Images** | 2 published |
+1. **Collect** a trajectory: `(state, action, reward, next_state)` during normal operation.
+2. **Compute teacher ensemble** probabilities by averaging each teacher's output.
+3. **Push** to a replay buffer.
+4. **Every** `train_interval` steps, sample a batch and compute:
+   - **Policy loss**: `L_policy = -∑ log π(a|s) * reward`
+   - **Distillation loss**: `L_distill = KL(teacher_probs || student_probs)`
+   - **Total loss**: `L_total = L_policy + β * L_distill`
+5. **Backpropagate** and update the student (and optionally the gating network).
+6. **Periodically persist** the model weights to SQLite.
 
-### Recent Activity (Past Week)
+The result is a **lightweight, fast‑inference student** that generalises beyond any single teacher, adapts to evolving conditions, and requires minimal compute overhead – ideal for real‑time edge deployment.
 
-| Metric | Value |
-|--------|-------|
-| **Additions** | +37,490 lines |
-| **Deletions** | −21,244 lines |
-| **Files Changed** | 44 files modified |
-| **Net Growth** | +16,246 lines |
-| **Peak Activity** | Quantum integration module refinement and thermal optimizer updates |
+### Carbon & Helium Awareness
 
-### Project Timeline
+Green Agent is uniquely designed to account for both **carbon intensity** (gCO₂/kWh) and **helium (green hydrogen) price elasticity**. This dual awareness enables:
 
-| Phase | Month | Focus |
-|-------|-------|-------|
-| **Core Architecture** | Month 0 | Base platform with carbon-aware scheduling |
-| **Meta-Cognitive** | Month 1 | Self-aware reflection and policy adaptation |
-| **Neuro-Symbolic** | Month 2 | Graph-based reasoning and policy learning |
-| **Quantum Ready** | Month 3 | VQC engine and error mitigation |
-| **Peak Activity** | **NOW** | 167 commits, thermal optimizer refinement |
+- **Carbon‑Aware Scheduling**: Shift workloads to times/locations with lower grid carbon intensity, leveraging the `MarginalCarbonIntensityForecaster`.
+- **Helium‑Aware Resource Allocation**: Model the cost and availability of helium fuel cells used for backup power; adjust workload placement to minimise reliance on expensive helium during peak demand, using the `HeliumPriceElasticityModel`.
+- **Circularity Tracking**: The `HeliumCircularityTracker` monitors the reuse and recycling of helium, ensuring alignment with circular economy principles.
+- **Dual Carbon Accounting**: The `DualCarbonAccountant` tracks both direct (scope 1) and indirect (scope 2 & 3) emissions, enabling comprehensive offset strategies.
+
+These features make Green Agent a **first‑of‑its‑kind** platform for sustainable AI operations.
+
+### Quantum‑Resilient Security
+
+- **Post‑Quantum Cryptography**: Supports Dilithium, Falcon, and SPHINCS for digital signatures, with an ECDSA fallback.
+- **AES‑256‑GCM**: All private keys are encrypted with authenticated encryption and stored in SQLite.
+- **Master Key Protection**: The master key is never stored on disk; it is retrieved from **HashiCorp Vault** or an environment variable (as a strict fallback).
+- **Automatic Key Rotation**: Keys are rotated every `KEY_ROTATION_DAYS`; a separate master key rotation can be triggered manually.
+
+### Blockchain Verification
+
+- **Ethereum Integration**: Uses `web3.py` to interact with any EVM‑compatible chain.
+- **Nonce Caching**: Minimises RPC calls by caching transaction nonces.
+- **Dynamic Gas Pricing**: Automatically adjusts gas price based on network conditions.
+- **Audit Trail**: All transactions are recorded in SQLite, including block number and status.
+- **Circuit Breaker**: Protects against RPC failures with configurable thresholds.
+
+### Multi‑Cloud Distribution & Resiliency
+
+- **Real SDKs**: AWS (`boto3`), Azure (`azure‑storage‑blob`), GCP (`google‑cloud‑storage`).
+- **Retry & Exponential Backoff**: Using `tenacity` – up to 3 attempts.
+- **Enhanced Circuit Breaker**: With timeout and recovery settings.
+- **Fallback Chains**: Automatically tries providers in a configurable order; falls back to simulation if all real clouds fail.
+
+### Observability & Telemetry
+
+- **Prometheus Metrics**: Exposes counters, gauges, and histograms on a configurable port.
+  - `green_agent_carbon_saved_total_g`
+  - `green_agent_optimizer_decisions_total`
+  - `green_agent_operation_latency_seconds`
+  - `green_agent_circuit_breaker_state`
+  - `green_agent_cloud_dispatches_total`
+- **Structured Logging**: JSON logs with `structlog`, including correlation IDs for end‑to‑end tracing.
 
 ---
 
-## 🚀 Deployment Quick Start
+## Getting Started
 
 ### Prerequisites
 
-```bash
-# System requirements
-- Kubernetes 1.24+
 - Python 3.9+
-- Ray 2.0+
-- 16GB RAM minimum (32GB recommended)
-- GPU cluster (optional, for GPU workloads)
-- NVIDIA drivers (for GPU acceleration)
+- PyTorch (for MOPD)
+- HashiCorp Vault (recommended)
+- Ethereum node or Infura endpoint (for blockchain)
+- Cloud provider credentials (optional, for real cloud dispatch)
 
-# Helium API access (optional)
-- Helium supply API endpoint
-- API key for real-time data
-```
-
-### Local Development
+### Installation
 
 ```bash
-# 1. Clone repository
 git clone https://github.com/NurcholishAdam/Green_Agent.git
 cd Green_Agent
-
-# 2. Create virtual environment
-python -m venv green_agent_env
-source green_agent_env/bin/activate  # Linux/Mac
-# green_agent_env\Scripts\activate  # Windows
-
-# 3. Install dependencies
 pip install -r requirements.txt
-
-# 4. Configure helium monitoring (optional)
-export HELIUM_API_URL="https://your-helium-api.com/v1"
-export HELIUM_API_KEY="your-api-key"
-
-# 5. Configure carbon intensity API (optional)
-export ELECTRICITYMAP_KEY="your-api-key"
-
-# 6. Run Green Agent
-python runtime/run_agent.py --mode unified --helium-aware
-
-# 7. Access dashboard
-# Open http://localhost:8000
+# Additional dependencies (if not in requirements)
+pip install torch hvac prometheus-client tenacity
 ```
 
-### Docker Deployment
+### Configuration
 
-```bash
-# 1. Build Docker image
-docker build -t green-agent:helium-latest \
-  --build-arg HELIUM_AWARE=true \
-  --build-arg GPU_ACCELERATION=true .
+Create a `.env` file (or set environment variables) with the following key settings:
 
-# 2. Run container
-docker run -d \
-  --name green-agent \
-  -p 8000:8000 \
-  -p 3000:3000 \
-  -p 9090:9090 \
-  -e HELIUM_API_URL="https://your-helium-api.com" \
-  -e HELIUM_API_KEY="your-api-key" \
-  -e ELECTRICITYMAP_KEY="your-api-key" \
-  -e GPU_DEVICES=0,1 \
-  --gpus all \
-  green-agent:helium-latest
+```ini
+# Core
+GREEN_AGENT_DB_PATH=green_agent.db
+LOG_LEVEL=INFO
+PROMETHEUS_PORT=8000
 
-# 3. Verify deployment
-curl http://localhost:8000/health
-curl http://localhost:8000/api/helium/status
+# Vault (recommended)
+VAULT_ADDR=http://127.0.0.1:8200
+VAULT_TOKEN=hvs.xxxx
+VAULT_SECRET_PATH=green_agent/master_key
+
+# Blockchain
+ETHEREUM_RPC_URL=https://mainnet.infura.io/v3/your_project_id
+BLOCKCHAIN_PRIVATE_KEY=your_private_key_hex
+BLOCKCHAIN_CONTRACT_ADDRESS=0x...
+GAS_MULTIPLIER=1.2
+
+# Cloud
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AZURE_STORAGE_CONNECTION_STRING=...
+GOOGLE_APPLICATION_CREDENTIALS=path/to/gcp_key.json
+DEFAULT_CLOUD_REGION=us-east-1
+
+# MOPD Hyperparameters
+MTPD_STATE_DIM=8
+MTPD_ACTION_DIM=5
+MTPD_HIDDEN_SIZE=128
+MTPD_LR=0.001
+MTPD_BETA=0.5
+MTPD_GAMMA=0.99
+MTPD_BUFFER_SIZE=10000
+MTPD_TRAIN_INTERVAL=10
+MTPD_BATCH_SIZE=32
+```
+
+### Quick Example
+
+```python
+import asyncio
+from enhancements import LifecycleManager, StrategyMetrics
+
+async def main():
+    manager = LifecycleManager()
+    await manager.startup()
+
+    # Build a state vector (features: carbon intensity, spot price, workload size, time, etc.)
+    state = {
+        "carbon_intensity": 0.3,
+        "spot_price": 0.02,
+        "workload_size": 0.8,
+        "latency_ms": 120,
+        "cost_usd": 0.5,
+    }
+
+    # Define candidate strategies (these would normally be generated by domain engines)
+    candidates = [
+        StrategyMetrics("thermal_opt", 50, 0.1, 0.01, 0.9),
+        StrategyMetrics("carbon_forecast", 80, 0.05, 0.02, 0.85),
+        StrategyMetrics("nas_search", 200, 0.2, 0.1, 0.95),
+    ]
+
+    # Let MOPD select the best strategy
+    chosen = manager.optimizer.select_strategy(state, candidates)
+
+    # Execute the strategy (e.g., dispatch workload to cloud)
+    result = await manager.cloud.dispatch_workload("aws", {"strategy": chosen.strategy_name})
+
+    # Compute reward (e.g., carbon saved)
+    reward = manager.optimizer.compute_reward(chosen, preference="carbon")
+
+    # Update MOPD with the experience
+    await manager.optimizer.update(state, chosen, reward)
+
+    await manager.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ---
 
-## 🧪 Verified Architecture Insights
+## API Reference
 
-| # | Insight | Description |
-|---|---------|-------------|
-| 1 | **Dual-Axis Decision Core** | Uniquely addresses both climate impact and material scarcity simultaneously. The 16-zone matrix enables nuanced trade-offs between carbon intensity and helium availability. |
-| 2 | **Graph-Based Policy Learning** | Uses LIMIT graph integration for adaptive optimization. Policy graphs evolve with execution history, enabling continuous improvement without manual tuning. |
-| 3 | **3D Pareto Frontier Optimization** | Optimizes across Energy × Time × Helium dimensions. The `ThreeDimensionParetoAnalyzer` computes non-dominated fronts for informed trade-off decisions. |
-| 4 | **Quantum-Ready Architecture** | VQC engine with error mitigation positions for future quantum advantage. Includes multi-agent RL and orchestration for carbon-aware quantum scheduling. |
+The complete API documentation is available in the `docs/` directory (generated with Sphinx). Core classes:
 
-### Verified Data Sources
-
-1. **GitHub API**: 1,328 commits, 167 weekly
-2. **README.md**: Architecture documentation
-3. **META_COGNITIVE_ARCHITECTURE.md**
-4. **NEURO_SYMBOLIC_INTEGRATION_COMPLETE.md**
+- `Config` – Pydantic settings.
+- `Storage` – SQLite persistence.
+- `QuantumResilientEnhancementsSecurity` – PQC + AES‑256‑GCM.
+- `BlockchainEnhancementsVerification` – Ethereum integration.
+- `MTPDOptimizer` – Multi‑Teacher On‑Policy Distillation.
+- `MultiCloudDistributor` – Cloud dispatch with fallback.
+- `LifecycleManager` – Async lifecycle and health checks.
+- `MetricsRegistry` – Prometheus export.
 
 ---
 
-## 📜 License & Attribution
+## Contributing
 
-<p align="center">
-  <b>MIT License</b> | <b>Python 98.3%</b> | <b>1,328 Commits</b>
-</p>
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines. Key areas for involvement:
 
-<p align="center">
-  <a href="https://github.com/NurcholishAdam/Green_Agent">github.com/NurcholishAdam/Green_Agent</a>
-</p>
-
-<p align="center">
-  <i>Made with ❤️ for a sustainable AI future</i>
-</p>
+- Adding new domain experts (teachers) for emerging sustainability metrics.
+- Enhancing the MOPD with advanced RL algorithms (PPO, SAC) or transformer‑based policies.
+- Integrating additional cloud providers (IBM Cloud, Oracle, etc.).
+- Expanding the bio‑inspired solver library.
+- Improving test coverage and performance benchmarks.
 
 ---
 
-*Last Updated: June 2026* | *Version: 5.0.0* | *Next Release: Q3 2026*
+## License
+
+This project is licensed under the Apache License 2.0 – see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Acknowledgments
+
+Green Agent builds upon open‑source libraries including `cryptography`, `web3.py`, `tenacity`, `structlog`, `PyTorch`, and `prometheus_client`. Special thanks to the research community advancing sustainable AI and post‑quantum cryptography.
+
+---
+
+**Green Agent: Orchestrating a Greener, Smarter AI Future.** 🌱💻
