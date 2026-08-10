@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Nested sub‑configurations
 # -----------------------------------------------------------------------------
 
+
 class TaskTypeDistribution(BaseModel):
     """Distribution of synthetic task types."""
     summarization: float = Field(0.25, ge=0.0, le=1.0)
@@ -94,7 +95,29 @@ class GreenAgentConfig(BaseSettings):
             "reverse_kl": True,
             "alpha_orm": 0.1,
             "mixed_precision": True,}
-
+        
+        # Inside class Config(BaseSettings)
+    # Pareto & Constraints
+    PARETO_QUALITY_MIN: float = Field(0.7, env="PARETO_QUALITY_MIN")
+    PARETO_LATENCY_MAX: float = Field(500.0, env="PARETO_LATENCY_MAX")
+    PARETO_CARBON_MAX: float = Field(1.0, env="PARETO_CARBON_MAX")
+    
+    # 2-Tier & Queue
+    QUEUE_TYPE: str = Field("asyncio", env="QUEUE_TYPE")  # "asyncio" or "redis"
+    REDIS_URL: Optional[str] = Field(None, env="REDIS_URL")
+    OFFLINE_BATCH_SIZE: int = Field(64, env="OFFLINE_BATCH_SIZE")
+    OFFLINE_UPDATE_INTERVAL_SEC: int = Field(300, env="OFFLINE_UPDATE_INTERVAL_SEC")
+    
+    # Drift & Safety
+    DRIFT_THRESHOLD: float = Field(0.15, env="DRIFT_THRESHOLD")
+    ROLLBACK_ENABLED: bool = Field(True, env="ROLLBACK_ENABLED")
+    
+    # Benchmark
+    BENCHMARK_INTERVAL_DAYS: int = Field(7, env="BENCHMARK_INTERVAL_DAYS")
+    
+    # Dashboard
+    DASHBOARD_PORT: int = Field(8080, env="DASHBOARD_PORT")
+    DASHBOARD_ENABLED: bool = Field(True, env="DASHBOARD_ENABLED")
 # -----------------------------------------------------------------------------
 # Initialization function (to be used in main.py)
 # -----------------------------------------------------------------------------
