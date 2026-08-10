@@ -162,6 +162,41 @@ def clean_power_readings(self, days: int) -> None:
         conn.execute("DELETE FROM power_readings WHERE timestamp < ?", (cutoff,))
         conn.commit()
 
+def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
+    # implement as in previous integrations
+
+def store_substitution_result(self, result: SubstitutionResult) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS substitution_results (
+                analysis_id TEXT PRIMARY KEY,
+                base_material TEXT,
+                substitute TEXT,
+                topsis_score REAL,
+                carbon_reduction_pct REAL,
+                cost_savings_pct REAL,
+                sustainability_score REAL,
+                confidence_score REAL,
+                quality_score REAL,
+                tx_hash TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO substitution_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (result.calculation_id, result.base_material, result.recommended_substitute,
+             result.topsis_score, result.carbon_reduction_pct, result.cost_savings_pct,
+             result.sustainability_score, result.confidence_score, result.data_quality_score,
+             result.blockchain_tx_hash or '', result.timestamp.isoformat())
+        )
+        conn.commit()
+
+def clean_old_substitution_results(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM substitution_results WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+
     # ----- Feedback Event Methods -----
     def store_feedback_event(self, event: Dict) -> None:
         """
