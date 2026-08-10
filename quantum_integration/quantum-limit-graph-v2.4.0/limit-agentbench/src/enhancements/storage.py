@@ -382,6 +382,68 @@ def clean_emission_records(self, days: int) -> None:
                 results.append(r)
             return results
 
+    def save_pqc_key(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str) -> None:
+    # implement as in previous integrations
+
+def save_optimisation(self, strategy: str, result: Dict) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS optimisation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                result TEXT,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        conn.execute("INSERT INTO optimisation_history (strategy, result, timestamp) VALUES (?, ?, ?)",
+                     (strategy, json.dumps(result), datetime.now().isoformat()))
+        conn.commit()
+
+def get_recent_optimisations(self, limit: int = 10) -> List[Dict]:
+    with self._get_connection() as conn:
+        rows = conn.execute("SELECT strategy, result, timestamp FROM optimisation_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{'strategy': r[0], 'result': json.loads(r[1]), 'timestamp': r[2]} for r in rows]
+
+def save_distribution(self, result: Dict) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS distribution_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                optimal_provider TEXT NOT NULL,
+                optimal_region TEXT NOT NULL,
+                scores TEXT,
+                data_size_gb REAL,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO distribution_history (optimal_provider, optimal_region, scores, data_size_gb, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (result['optimal_provider'], result['optimal_region'], json.dumps(result['scores']),
+             result.get('data_size_gb', 0), result['timestamp'])
+        )
+        conn.commit()
+
+def save_state(self, key: str, value: str) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)
+        """)
+        conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+
+def get_state(self, key: str) -> Optional[str]:
+    with self._get_connection() as conn:
+        row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+def clean_old_regret_records(self, days: int) -> None:
+    # Clean optimisation_history, distribution_history, etc.
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM optimisation_history WHERE timestamp < ?", (cutoff,))
+        conn.execute("DELETE FROM distribution_history WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+
     # ----- Drift Methods (store BLOBs) -----
     def save_drift_snapshot(self, snapshot_id: str, online_w: Optional[bytes], offline_w: Optional[bytes], cost: Optional[float], reason: Optional[str]) -> None:
         """
