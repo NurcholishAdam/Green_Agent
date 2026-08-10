@@ -175,6 +175,29 @@ class Storage:
             )
             conn.commit()
 
+    def store_emission_record(self, record: Dict) -> None:
+    with self._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS emission_records (
+                record_id TEXT PRIMARY KEY,
+                scope TEXT, amount_kg REAL, source TEXT,
+                location TEXT, verified INTEGER, region TEXT,
+                user_id TEXT, timestamp TEXT, metadata TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO emission_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (record['record_id'], record['scope'], record['amount_kg'], record['source'],
+             record['location'], 1 if record['verified'] else 0, record['region'],
+             record['user_id'], record['timestamp'], json.dumps(record.get('metadata', {})))
+        )
+        conn.commit()
+
+def clean_emission_records(self, days: int) -> None:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    with self._get_connection() as conn:
+        conn.execute("DELETE FROM emission_records WHERE timestamp < ?", (cutoff,))
+        conn.commit()
     def get_feedback_events(self, limit: int = 1000) -> List[Dict]:
         with self._get_connection() as conn:
             rows = conn.execute(
