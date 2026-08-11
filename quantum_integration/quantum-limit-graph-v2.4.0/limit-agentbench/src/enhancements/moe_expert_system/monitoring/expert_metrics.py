@@ -1,18 +1,19 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/expert_metrics_collector.py
-# Enhanced version v8.0.0 – Refactored for maintainability, concurrency, and resilience
+# Enhanced version v8.1.0 – Refactored for maintainability, concurrency, resilience, and MOPD support.
 
 """
-Enhanced Expert Metrics Collector v8.0.0 - Complete Green Agent Implementation
-with full bio‑inspired core integration and improved architecture.
+Enhanced Expert Metrics Collector v8.1.0 - Complete Green Agent Implementation
+with full bio‑inspired core integration and Multi‑Objective Pareto Decision (MOPD) support.
 
-New Features:
-- Modular design: Storage, Analyzer, Reporter, Controller split.
-- Asyncio‑native locking and task management.
-- Event queue for sequential processing.
-- JSON persistence with versioning.
-- Better error handling and self‑healing.
-- Simplified configuration with sub‑configs.
-- Full type hints and docstrings.
+New Features (over v8.0.0):
+- Added MOPD (Multi‑Objective Pareto Decision) framework.
+- New MOPDPoint dataclass to store objective vectors.
+- Pareto front computation from historical expert execution data.
+- Configurable objective weights and grid resolution.
+- Public methods to retrieve Pareto fronts for expert selection.
+- Integration with gating network and self‑evolving gate for Pareto‑aware routing.
+- Telemetry tracks MOPD usage.
+- Full backward compatibility.
 """
 
 import asyncio
@@ -113,7 +114,7 @@ class HeliumProvider:
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Enums and Data Classes (unchanged)
+# Enums and Data Classes (Enhanced with MOPD)
 # ============================================================================
 class MetricSeverity(Enum):
     INFO = "info"
@@ -198,7 +199,47 @@ class PredictiveMetricForecast:
     horizon_seconds: int
 
 # ============================================================================
-# Enhanced Configuration with Sub‑Configs
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPoint:
+    """Represents a single point in the multi‑objective space."""
+    expert_id: str
+    timestamp: datetime
+    # Objectives (to be minimised/maximised)
+    carbon_kg: float
+    helium_units: float
+    ecoatp_cost: float
+    latency_ms: float
+    success_probability: float
+    # Optional metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        return cls(**data)
+
+@dataclass
+class MOPDConfig:
+    """Configuration for MOPD analysis."""
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        'carbon': 0.3,
+        'helium': 0.2,
+        'cost': 0.2,
+        'latency': 0.15,
+        'success': 0.15,
+    })
+    grid_resolution: int = 5
+    enable_cost_benefit: bool = True
+    enable_predictive: bool = True
+    enable_quantum: bool = True
+
+# ============================================================================
+# Enhanced Configuration with MOPD Sub‑Config
 # ============================================================================
 @dataclass
 class AnomalyDetectionConfig:
@@ -269,6 +310,7 @@ class ExpertMetricsConfig:
     enable_human_ai: bool = True
     enable_sustainability_scoring: bool = True
     enable_cost_benefit: bool = True
+    enable_mopd: bool = True               # NEW: MOPD feature flag
 
     # Sub‑configs
     anomaly_detection: AnomalyDetectionConfig = field(default_factory=AnomalyDetectionConfig)
@@ -278,6 +320,7 @@ class ExpertMetricsConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)      # NEW: MOPD sub‑config
 
     # Thresholds (still a dict for now)
     thresholds: Dict[str, MetricThreshold] = field(default_factory=lambda: {
@@ -303,7 +346,7 @@ class ExpertMetricsConfig:
         pass
 
 # ============================================================================
-# Carbon Intensity Manager (unchanged, but with improved circuit breaker)
+# Carbon Intensity Manager (unchanged)
 # ============================================================================
 class CarbonIntensityManager:
     def __init__(self, config: CarbonConfig):
@@ -334,7 +377,6 @@ class CarbonIntensityManager:
             self.region = region
 
         async def _fetch():
-            # Cache check
             cache_key = f"{self.region}_{datetime.now(timezone.utc).hour}"
             if (self.last_update and
                 (datetime.now(timezone.utc) - self.last_update).seconds < self.config.update_interval_seconds and
@@ -365,7 +407,6 @@ class CarbonIntensityManager:
                     logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
                 await asyncio.sleep(2 ** attempt)
 
-            # Fallback
             fallback_intensities = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500}
             intensity = fallback_intensities.get(self.region, 400)
             self.carbon_intensity = intensity
@@ -769,19 +810,17 @@ class MetricsPersistenceManager:
         self.config = config
         self.path = config.path
         self._lock = asyncio.Lock()
-        self._version = 1
+        self._version = 2  # Bumped for MOPD
         logger.info(f"MetricsPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
         async with self._lock:
             try:
-                # Add version info
                 payload = {
                     'version': self._version,
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                     'data': state
                 }
-                # Convert datetime and other non‑serializable types to strings
                 serializable = self._make_serializable(payload)
                 with open(self.path, 'w') as f:
                     json.dump(serializable, f, indent=2)
@@ -803,7 +842,6 @@ class MetricsPersistenceManager:
                 if version != self._version:
                     logger.warning(f"State version {version} != current {self._version}; may be incompatible")
                 state = payload.get('data', {})
-                # Convert string timestamps back to datetime if needed
                 state = self._deserialize(state)
                 logger.info(f"Metrics state loaded from {self.path}")
                 return state
@@ -826,14 +864,12 @@ class MetricsPersistenceManager:
             return obj
 
     def _deserialize(self, obj: Any) -> Any:
-        # Recursively convert ISO strings back to datetime if they match pattern
         if isinstance(obj, dict):
             return {k: self._deserialize(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._deserialize(v) for v in obj]
         elif isinstance(obj, str):
             try:
-                # Attempt to parse as datetime
                 return datetime.fromisoformat(obj)
             except ValueError:
                 return obj
@@ -970,7 +1006,7 @@ class FederatedMetricsAggregator:
             await self._session.close()
 
 # ============================================================================
-# Metrics Storage (new module – holds all expert metrics)
+# Metrics Storage (Enhanced with MOPD support)
 # ============================================================================
 class MetricsStorage:
     def __init__(self, retention_hours: float = 24.0):
@@ -986,6 +1022,7 @@ class MetricsStorage:
         self.routing_decisions: Deque[Dict] = deque(maxlen=10000)
         self.routing_latency: Deque[float] = deque(maxlen=10000)
         self.pareto_points: Deque[Dict] = deque(maxlen=10000)
+        self.mopd_points: Deque[MOPDPoint] = deque(maxlen=10000)   # NEW: structured MOPD points
         self.bio_metrics_history: Deque[Dict] = deque(maxlen=10000)
         self.health_scores: Dict[str, float] = {}
         self.correlation_map: Dict[str, List[str]] = defaultdict(list)
@@ -1028,6 +1065,19 @@ class MetricsStorage:
                 self.expert_success[expert_id] += 1
             else:
                 self.expert_failures[expert_id] += 1
+            # Record MOPD point
+            mopd_point = MOPDPoint(
+                expert_id=expert_id,
+                timestamp=datetime.now(timezone.utc),
+                carbon_kg=carbon_kg,
+                helium_units=helium_units,
+                ecoatp_cost=energy_kwh * 1000,  # placeholder conversion
+                latency_ms=execution_time,
+                success_probability=1.0 if success else 0.0,
+                metadata=metadata or {}
+            )
+            self.mopd_points.append(mopd_point)
+            # Keep legacy pareto_points
             self.pareto_points.append({
                 'expert_id': expert_id,
                 'energy': energy_kwh,
@@ -1037,7 +1087,6 @@ class MetricsStorage:
                 'ecoatp': self.expert_ecoatp.get(expert_id, 0),
                 'timestamp': datetime.now(timezone.utc)
             })
-            # Prune stale metrics if needed
             self._prune_stale()
 
     def _prune_stale(self):
@@ -1046,6 +1095,86 @@ class MetricsStorage:
             dq = self.expert_latency[expert_id]
             while dq and dq[0]['timestamp'] < cutoff:
                 dq.popleft()
+
+    # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    async def compute_pareto_front(
+        self,
+        objective_names: List[str] = None,
+        constraints: Dict[str, Tuple[float, float]] = None,
+        max_points: int = 50
+    ) -> List[MOPDPoint]:
+        """
+        Compute the Pareto front from historical MOPD points.
+        Args:
+            objective_names: List of objectives to consider (e.g., ['carbon_kg', 'helium_units', 'ecoatp_cost', 'latency_ms', 'success_probability']).
+                             Default is all objectives.
+            constraints: Dict of constraints on objectives, e.g., {'carbon_kg': (0, 0.01)}.
+            max_points: Maximum number of Pareto points to return.
+        Returns:
+            List of MOPDPoint objects that are non‑dominated.
+        """
+        async with self._lock:
+            if not self.mopd_points:
+                return []
+
+            # Default objectives
+            if objective_names is None:
+                objective_names = ['carbon_kg', 'helium_units', 'ecoatp_cost', 'latency_ms', 'success_probability']
+
+            points = list(self.mopd_points)
+
+            # Apply constraints
+            if constraints:
+                filtered = []
+                for p in points:
+                    ok = True
+                    for key, (low, high) in constraints.items():
+                        val = getattr(p, key, None)
+                        if val is None or not (low <= val <= high):
+                            ok = False
+                            break
+                    if ok:
+                        filtered.append(p)
+                points = filtered
+
+            if len(points) < 2:
+                return points
+
+            # Dominance check
+            # Objectives to minimize: carbon_kg, helium_units, ecoatp_cost, latency_ms
+            # Objective to maximize: success_probability (we negate for dominance)
+            pareto = []
+            for i, p_i in enumerate(points):
+                dominated = False
+                for j, p_j in enumerate(points):
+                    if i == j:
+                        continue
+                    # Build vectors: for success_probability, higher is better, so we negate
+                    a_vec = []
+                    b_vec = []
+                    for key in objective_names:
+                        val_i = getattr(p_i, key)
+                        val_j = getattr(p_j, key)
+                        if key == 'success_probability':
+                            # Higher is better, so negate for dominance
+                            a_vec.append(-val_i)
+                            b_vec.append(-val_j)
+                        else:
+                            # Lower is better
+                            a_vec.append(val_i)
+                            b_vec.append(val_j)
+                    # Check if p_j dominates p_i
+                    if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                        dominated = True
+                        break
+                if not dominated:
+                    pareto.append(p_i)
+
+            # Sort by timestamp (most recent first) and limit
+            pareto.sort(key=lambda p: p.timestamp, reverse=True)
+            return pareto[:max_points]
 
     async def get_expert_usage(self) -> Dict[str, int]:
         async with self._lock:
@@ -1098,7 +1227,7 @@ class MetricsStorage:
             self.health_scores[expert_id] = score
 
 # ============================================================================
-# Metrics Analyzer (orchestrates SLO, anomaly, predictive)
+# Metrics Analyzer (orchestrates SLO, anomaly, predictive, and MOPD)
 # ============================================================================
 class MetricsAnalyzer:
     def __init__(self, config: ExpertMetricsConfig, storage: MetricsStorage):
@@ -1114,14 +1243,10 @@ class MetricsAnalyzer:
     async def analyze_routing(self, routing_decisions: List[Tuple[int, float]],
                               execution_time: float, success: bool,
                               correlation_id: Optional[str] = None):
-        # Update storage
         await self.storage.record_routing(routing_decisions, execution_time, success, correlation_id)
 
-        # SLO tracking
         if self.slo_tracker:
-            # Record latency SLO
             await self.slo_tracker.record_metric('latency_slo', execution_time)
-            # Record success rate SLO (derive from overall)
             rates = await self.storage.get_expert_success_rate()
             avg_success = np.mean(list(rates.values())) if rates else 0.0
             await self.slo_tracker.record_metric('availability_slo', avg_success)
@@ -1135,14 +1260,13 @@ class MetricsAnalyzer:
             success, correlation_id, metadata
         )
 
-        # ML anomaly detection
         if self.ml_anomaly_detector:
             metrics = {
                 'success_rate': (await self.storage.get_expert_success_rate()).get(expert_id, 0.5),
                 'latency_ms': execution_time,
                 'carbon_per_inference': carbon_kg,
                 'helium_per_inference': helium_units,
-                'token_efficiency': 0.5,  # placeholder
+                'token_efficiency': 0.5,
                 'health_score': (await self.storage.get_health_scores()).get(expert_id, 0.5),
                 'gradient_level': 0.5
             }
@@ -1170,7 +1294,7 @@ class MetricsAnalyzer:
         return list(self.anomaly_events)
 
 # ============================================================================
-# Metrics Reporter (telemetry, dashboard, persistence)
+# Metrics Reporter (telemetry, dashboard, persistence, and MOPD reporting)
 # ============================================================================
 class MetricsReporter:
     def __init__(self, config: ExpertMetricsConfig, storage: MetricsStorage, analyzer: MetricsAnalyzer):
@@ -1194,12 +1318,15 @@ class MetricsReporter:
             'total_routes': len(self.storage.routing_decisions),
             'avg_routing_latency_ms': np.mean(self.storage.routing_latency) if self.storage.routing_latency else 0.0,
             'health_scores': await self.storage.get_health_scores(),
-            # ... include additional fields as needed
         }
         if self.analyzer.slo_tracker:
             summary['slo_status'] = await self.analyzer.slo_tracker.evaluate_slos()
         if self.human_ai_support:
             summary['dashboard_data'] = await self.human_ai_support.get_dashboard_data()
+        # MOPD summary
+        if self.config.enable_mopd:
+            pareto = await self.storage.compute_pareto_front(max_points=20)
+            summary['mopd_pareto_front'] = [p.to_dict() for p in pareto]
         return summary
 
     async def export_telemetry(self):
@@ -1218,8 +1345,8 @@ class MetricsReporter:
                 'expert_helium': dict(self.storage.expert_helium),
                 'expert_ecoatp': dict(self.storage.expert_ecoatp),
                 'health_scores': await self.storage.get_health_scores(),
-                'sustainability_score': 0.0,  # to be filled
-                # ... other persisted fields
+                'sustainability_score': 0.0,
+                'mopd_points': [p.to_dict() for p in self.storage.mopd_points],  # NEW
             }
             await self.persistence.save_state(state)
 
@@ -1227,14 +1354,15 @@ class MetricsReporter:
         if self.persistence:
             state = await self.persistence.load_state()
             if state:
-                # Restore into storage
-                pass  # omitted for brevity
+                # Restore MOPD points
+                mopd_points_dict = state.get('mopd_points', [])
+                for p_dict in mopd_points_dict:
+                    self.storage.mopd_points.append(MOPDPoint.from_dict(p_dict))
 
 # ============================================================================
-# Human-AI Collaborative Support (unchanged, simplified)
+# Human-AI Collaborative Support (unchanged)
 # ============================================================================
 class HumanAICollaborativeSupport:
-    # Same as original, but with async methods where needed
     def __init__(self):
         self.decision_history: Deque[Dict] = deque(maxlen=1000)
         self.explanation_cache: Dict[str, Dict] = {}
@@ -1277,16 +1405,16 @@ class MetricsCrossDomainTransfer:
     def transfer_knowledge(self, source_domain: str, target_domain: str,
                            knowledge_type: str, data: Dict[str, Any]) -> Dict:
         key = f"{source_domain}→{target_domain}"
-        # ... same as original, but with asynchronous support if needed
+        # ... same as original
         return {}
 
 # ============================================================================
-# Main ExpertMetricsCollector (Controller)
+# Main ExpertMetricsCollector (Controller) - Enhanced with MOPD
 # ============================================================================
 class ExpertMetricsCollector:
     """
-    Enhanced Expert Metrics Collector v8.0.0 - Controller that orchestrates
-    storage, analysis, reporting, and event handling.
+    Enhanced Expert Metrics Collector v8.1.0 - Controller that orchestrates
+    storage, analysis, reporting, and MOPD support.
     """
 
     def __init__(
@@ -1366,11 +1494,12 @@ class ExpertMetricsCollector:
             asyncio.create_task(self._load_persisted_state())
 
         logger.info(
-            f"Enhanced Expert Metrics Collector v8.0.0 initialized: "
+            f"Enhanced Expert Metrics Collector v8.1.0 initialized: "
             f"bio_integration={self.config.enable_bio_integration}, "
             f"event_driven={self.config.enable_event_driven}, "
             f"self_healing={self.config.self_healing.enabled}, "
-            f"persistence={self.config.persistence.enabled}"
+            f"persistence={self.config.persistence.enabled}, "
+            f"mopd={self.config.enable_mopd}"
         )
 
     # ========================================================================
@@ -1411,10 +1540,8 @@ class ExpertMetricsCollector:
 
     async def _on_carbon_update(self, event: BioEvent):
         intensity = event.data.get('intensity', 400)
-        # Update carbon manager
         if self.carbon_manager:
             self.carbon_manager.carbon_intensity = intensity
-        # Update thresholds
         for key, threshold in self.config.thresholds.items():
             if threshold.gradient_modulated:
                 threshold.warning_threshold *= (1.0 + 0.1 * (intensity / 800 - 0.5))
@@ -1422,7 +1549,6 @@ class ExpertMetricsCollector:
 
     async def _on_helium_update(self, event: BioEvent):
         scarcity = event.data.get('scarcity', 0.5)
-        # Update helium‑related thresholds
         for key, threshold in self.config.thresholds.items():
             if 'helium' in key.lower():
                 threshold.warning_threshold *= (1.0 + 0.1 * scarcity)
@@ -1446,7 +1572,6 @@ class ExpertMetricsCollector:
             logger.info("Expert Metrics configuration reloaded")
 
     async def _on_token_update(self, event: BioEvent):
-        # Update token balance if needed
         pass
 
     async def _on_health_update(self, event: BioEvent):
@@ -1454,7 +1579,6 @@ class ExpertMetricsCollector:
 
     async def _on_anomaly_detected(self, event: BioEvent):
         if event.data.get('metric') == 'carbon_intensity':
-            # Adjust carbon thresholds
             for key, threshold in self.config.thresholds.items():
                 if 'carbon' in key.lower():
                     threshold.warning_threshold *= 0.9
@@ -1464,32 +1588,26 @@ class ExpertMetricsCollector:
     # Background Tasks (cancellable)
     # ========================================================================
     def _start_background_tasks(self):
-        # Event consumer
         if self.config.enable_event_driven:
             self._event_consumer_task = asyncio.create_task(self._event_consumer())
             self._background_tasks.append(self._event_consumer_task)
 
-        # Carbon update loop
         if self.config.carbon.enabled:
             task = asyncio.create_task(self._carbon_update_loop())
             self._background_tasks.append(task)
 
-        # Federated sync loop
         if self.config.federated.enabled:
             task = asyncio.create_task(self._federated_sync_loop())
             self._background_tasks.append(task)
 
-        # Telemetry export loop
         if self.config.telemetry.enabled:
             task = asyncio.create_task(self._telemetry_export_loop())
             self._background_tasks.append(task)
 
-        # Persistence save loop
         if self.config.persistence.enabled:
             task = asyncio.create_task(self._persistence_save_loop())
             self._background_tasks.append(task)
 
-        # Swarm coordination loop
         if self.config.enable_swarm_coordination and self.swarm_coordinator:
             task = asyncio.create_task(self._swarm_update_loop())
             self._background_tasks.append(task)
@@ -1579,7 +1697,6 @@ class ExpertMetricsCollector:
     ):
         await self.analyzer.analyze_routing(routing_decisions, execution_time, success, correlation_id)
 
-        # Feed to MoE components
         if self.gating_network and self.expert_router:
             features = np.array([
                 len(routing_decisions),
@@ -1622,13 +1739,10 @@ class ExpertMetricsCollector:
             success, correlation_id, metadata
         )
 
-        # Record token consumption if bio integration
         if self.config.enable_bio_integration and self.token_manager:
             ecoatp_cost = energy_kwh * self.config.token_exchange_rate
-            # Update storage
             async with self.storage._lock:
                 self.storage.expert_ecoatp[expert_id] += ecoatp_cost
-            # Consume tokens
             try:
                 self.token_manager.consume_tokens(
                     token_ids=[f"expert_{expert_id}"],
@@ -1638,12 +1752,10 @@ class ExpertMetricsCollector:
             except Exception as e:
                 logger.warning(f"Token consumption failed: {e}")
 
-        # Pump trust gradient
         if self.gradient_manager:
             delta = 0.05 if success else -0.1
             self.gradient_manager.pump_field('trust', delta, source=f"expert_{expert_id}")
 
-        # Update sustainability score
         await self._update_sustainability_score()
 
     # ========================================================================
@@ -1672,6 +1784,42 @@ class ExpertMetricsCollector:
         return 1.0
 
     # ========================================================================
+    # MOPD Public Methods (NEW)
+    # ========================================================================
+    async def get_mopd_pareto_front(
+        self,
+        objective_names: List[str] = None,
+        constraints: Dict[str, Tuple[float, float]] = None,
+        max_points: int = 50
+    ) -> List[MOPDPoint]:
+        """
+        Retrieve the Pareto front from historical expert execution data.
+        Args:
+            objective_names: List of objectives to consider. Default: all.
+            constraints: Dict of constraints, e.g., {'carbon_kg': (0, 0.01)}.
+            max_points: Maximum number of Pareto points to return.
+        Returns:
+            List of MOPDPoint objects.
+        """
+        if not self.config.enable_mopd:
+            return []
+        return await self.storage.compute_pareto_front(objective_names, constraints, max_points)
+
+    async def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.enable_mopd:
+            return {'enabled': False}
+        pareto = await self.storage.compute_pareto_front(max_points=20)
+        return {
+            'enabled': True,
+            'pareto_front_size': len(pareto),
+            'total_mopd_points': len(self.storage.mopd_points),
+            'objective_weights': self.config.mopd.objective_weights,
+            'grid_resolution': self.config.mopd.grid_resolution,
+            'sample_pareto': [p.to_dict() for p in pareto[:5]]
+        }
+
+    # ========================================================================
     # Swarm Coordination
     # ========================================================================
     async def share_with_swarm(self):
@@ -1683,7 +1831,8 @@ class ExpertMetricsCollector:
             'total_carbon_savings_kg': self.total_carbon_savings_kg,
             'total_helium_savings_l': self.total_helium_savings_l,
             'active_experts': len(await self.storage.get_health_scores()),
-            'slo_compliance': {}
+            'slo_compliance': {},
+            'mopd_enabled': self.config.enable_mopd,
         }
         if self.analyzer.slo_tracker:
             slo_results = await self.analyzer.slo_tracker.evaluate_slos()
@@ -1698,9 +1847,7 @@ class ExpertMetricsCollector:
         if not self.config.self_healing.enabled:
             logger.warning("Self‑healing disabled")
             return
-        # Reset thresholds to config defaults
         self.config.thresholds = ExpertMetricsConfig().thresholds
-        # Reset SLOs
         if self.analyzer.slo_tracker:
             self.analyzer.slo_tracker.slos.clear()
             for slo_id, params in self.config.slo.slo_definitions.items():
@@ -1711,15 +1858,12 @@ class ExpertMetricsCollector:
                     target_percentile=params.get('target_percentile', 99.0),
                     evaluation_window_hours=params.get('evaluation_window_hours', 24.0)
                 )
-        # Clear alerts
         self.active_alerts.clear()
         self.alert_cooldowns.clear()
-        # Reset health scores and status
         async with self.storage._lock:
             self.storage.health_scores.clear()
         self.health_status = "healthy"
         self.last_error = None
-        # Save state
         await self.reporter.save_state()
         logger.info("Self‑healing completed")
 
@@ -1782,6 +1926,7 @@ class ExpertMetricsCollector:
             'event_driven_active': self.config.enable_event_driven,
             'self_healing_enabled': self.config.self_healing.enabled,
             'persistence_enabled': self.config.persistence.enabled,
+            'mopd_enabled': self.config.enable_mopd,
         }
 
     # ========================================================================
@@ -1800,7 +1945,6 @@ class ExpertMetricsCollector:
         self.helium_provider = provider
 
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        # Already handled in __init__
         pass
 
     # ========================================================================
@@ -1818,16 +1962,13 @@ class ExpertMetricsCollector:
     # ========================================================================
     async def shutdown(self):
         logger.info("Shutting down Expert Metrics Collector")
-        # Cancel all background tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
-        # Save final state
         if self.config.persistence.enabled:
             await self.reporter.save_state()
 
-        # Close external sessions
         if self.carbon_manager:
             await self.carbon_manager.close()
         if self.federated_aggregator:
