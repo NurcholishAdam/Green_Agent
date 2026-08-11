@@ -1,9 +1,9 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/co_evolution_engine.py
-# Enhanced version v5.0.0 – Refactored for maintainability, concurrency, and resilience
+# Enhanced version v5.1.0 – Refactored for maintainability, concurrency, resilience, and MOPD support.
 
 """
-Enhanced Human-AI Co-Evolution Engine v5.0.0
-Modular, event‑driven, and robust implementation.
+Enhanced Human-AI Co-Evolution Engine v5.1.0
+Modular, event‑driven, robust, and MOPD‑aware implementation.
 """
 
 import asyncio
@@ -63,8 +63,24 @@ class HeliumProvider:
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Configuration with Sub‑Configs
+# Configuration with Sub‑Configs (Enhanced with MOPD)
 # ============================================================================
+@dataclass
+class MOPDConfig:
+    """Configuration for MOPD analysis."""
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        'cost': 0.2,
+        'impact': 0.3,
+        'time': 0.15,
+        'risk': 0.15,
+        'historical_effectiveness': 0.2,
+    })
+    grid_resolution: int = 5
+    enable_cost_benefit: bool = True
+    enable_predictive: bool = True
+    enable_quantum: bool = True
+
 @dataclass
 class CoEvolutionConfig:
     """Centralized configuration for the Co-Evolution Engine."""
@@ -113,6 +129,7 @@ class CoEvolutionConfig:
     enable_quantum_bridge: bool = True
     enable_cost_benefit: bool = True
     enable_workflow_orchestration: bool = True
+    enable_mopd: bool = True               # NEW: MOPD feature flag
 
     # Workflow triggers
     workflow_on_critical_alert: str = "adjust_co_evolution_strategy"
@@ -121,10 +138,14 @@ class CoEvolutionConfig:
     # Swarm sharing interval
     swarm_share_interval: int = 60
 
+    # MOPD sub‑config
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)
+
 # ============================================================================
-# Sentiment Analyzer (unchanged but refactored)
+# Sentiment Analyzer (unchanged)
 # ============================================================================
 class SentimentAnalyzer:
+    # ... (same as before) ...
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
         self.sentiment_keywords = {
@@ -155,6 +176,7 @@ class SentimentAnalyzer:
                           'hardly', 'scarcely', 'barely', 'no one', 'nothing', 'nowhere']
 
     def analyze_sentiment(self, text: str) -> Dict[str, Any]:
+        # ... same as original ...
         if not text or not text.strip():
             return {'score': 0.0, 'confidence': 0.0, 'sentiment': 'neutral',
                     'emotions': {}, 'key_phrases': []}
@@ -194,6 +216,7 @@ class SentimentAnalyzer:
                 'emotions': emotions, 'key_phrases': key_phrases}
 
     def _detect_emotions(self, text_lower: str) -> Dict[str, float]:
+        # ... same as original ...
         emotions = {}
         for emotion, keywords in self.emotion_keywords.items():
             count = sum(1 for keyword in keywords if keyword in text_lower)
@@ -206,6 +229,7 @@ class SentimentAnalyzer:
         return emotions
 
     def _extract_key_phrases(self, text: str) -> List[str]:
+        # ... same as original ...
         phrases = []
         quoted = re.findall(r'"([^"]*)"', text)
         if quoted:
@@ -261,6 +285,7 @@ class RecommendationPrioritizer:
 # Long-Term Impact Tracker (refactored with async)
 # ============================================================================
 class LongTermImpactTracker:
+    # ... (same as before) ...
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
         self.impact_history: Dict[str, Deque[Dict]] = defaultdict(lambda: deque(maxlen=100))
@@ -343,11 +368,12 @@ class LongTermImpactTracker:
 # Persistence Manager (JSON with versioning)
 # ============================================================================
 class CoEvolutionPersistenceManager:
+    # ... (same as before, with version bumped) ...
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
-        self._version = 1
+        self._version = 2  # Bumped for MOPD
         logger.info(f"CoEvolutionPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
@@ -420,6 +446,7 @@ class CoEvolutionPersistenceManager:
 # Telemetry Collector (unchanged)
 # ============================================================================
 class CoEvolutionTelemetry:
+    # ... (same as before) ...
     def __init__(self):
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
@@ -474,7 +501,6 @@ async def retry_async(
     *args,
     **kwargs
 ) -> Any:
-    """Retry an async function with exponential backoff."""
     for attempt in range(max_retries):
         try:
             return await func(*args, **kwargs)
@@ -514,7 +540,33 @@ class EvolutionMilestone:
         }
 
 # ============================================================================
-# Storage Module
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPlan:
+    """Represents a co‑evolution strategy with its objective vector."""
+    # Decision variables (recommendation details)
+    area: str
+    action: str
+    strategy_signature: str
+    # Objectives (to be minimised/maximised)
+    cost: float
+    impact: float
+    time_days: float
+    risk: float
+    historical_effectiveness: float
+    # Scalarised score (will be computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPlan':
+        return cls(**data)
+
+# ============================================================================
+# Storage Module (Enhanced with MOPD)
 # ============================================================================
 class CoEvolutionStorage:
     """Thread‑safe storage for all co‑evolution state."""
@@ -533,6 +585,7 @@ class CoEvolutionStorage:
             'quantum': 0.5, 'moe': 0.5, 'sustainability': 0.5,
             'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
         }
+        self.mopd_plans: List[MOPDPlan] = []  # NEW: store MOPD plans
         self._lock = asyncio.Lock()
 
     # -------------------- Feedback --------------------
@@ -668,6 +721,19 @@ class CoEvolutionStorage:
                 'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
             }
 
+    # -------------------- MOPD Plans (NEW) --------------------
+    async def add_mopd_plan(self, plan: MOPDPlan):
+        async with self._lock:
+            self.mopd_plans.append(plan)
+            if len(self.mopd_plans) > 10000:
+                self.mopd_plans = self.mopd_plans[-10000:]
+
+    async def get_mopd_plans(self, limit: Optional[int] = None) -> List[MOPDPlan]:
+        async with self._lock:
+            if limit is not None:
+                return self.mopd_plans[-limit:]
+            return self.mopd_plans.copy()
+
     # -------------------- State Snapshot --------------------
     async def to_dict(self) -> Dict:
         async with self._lock:
@@ -681,7 +747,8 @@ class CoEvolutionStorage:
                 'performance_history': list(self.performance_history),
                 'trust_history': list(self.trust_history),
                 'sustainability_trajectory': list(self.sustainability_trajectory),
-                'historical_effectiveness': self.historical_effectiveness
+                'historical_effectiveness': self.historical_effectiveness,
+                'mopd_plans': [p.to_dict() for p in self.mopd_plans],
             }
 
     async def from_dict(self, data: Dict):
@@ -700,6 +767,10 @@ class CoEvolutionStorage:
             self.trust_history = deque(data.get('trust_history', []), maxlen=1000)
             self.sustainability_trajectory = deque(data.get('sustainability_trajectory', []), maxlen=self.config.sustainability_trajectory_limit)
             self.historical_effectiveness = data.get('historical_effectiveness', {})
+            # Restore MOPD plans
+            mopd_plans = data.get('mopd_plans', [])
+            for p_dict in mopd_plans:
+                self.mopd_plans.append(MOPDPlan.from_dict(p_dict))
 
     def _dict_to_milestone(self, d: Dict) -> Optional[EvolutionMilestone]:
         try:
@@ -719,10 +790,10 @@ class CoEvolutionStorage:
             return None
 
 # ============================================================================
-# Analyzer Module
+# Analyzer Module (Enhanced with MOPD)
 # ============================================================================
 class CoEvolutionAnalyzer:
-    """Handles sentiment, prioritization, opportunity detection, and impact tracking."""
+    """Handles sentiment, prioritization, opportunity detection, impact tracking, and MOPD."""
     def __init__(
         self,
         config: CoEvolutionConfig,
@@ -737,8 +808,11 @@ class CoEvolutionAnalyzer:
         self.recommender = recommender
         self.impact_tracker = impact_tracker
 
+    # ... (existing methods: aggregate_human_feedback_with_sentiment, extract_feedback_themes_with_sentiment, identify_opportunities) ...
+    # For brevity, we keep them as before, but we'll add new MOPD methods.
+
     async def aggregate_human_feedback_with_sentiment(self) -> List[Dict[str, Any]]:
-        """Aggregate feedback from user models and collaborative decisions with sentiment analysis."""
+        # ... same as before ...
         user_models = await self.storage.get_user_models()
         decisions = await self.storage.get_collaborative_decisions()
         all_feedback = []
@@ -755,6 +829,7 @@ class CoEvolutionAnalyzer:
         return all_feedback[-self.config.feedback_history_limit:]
 
     async def extract_feedback_themes_with_sentiment(self, feedback: List[Dict]) -> Dict[str, Dict]:
+        # ... same as before ...
         keyword_map = {
             'usability': ['confusing', 'complicated', 'hard to use', 'intuitive', 'usability'],
             'performance': ['slow', 'fast', 'lag', 'responsiveness', 'performance'],
@@ -782,6 +857,7 @@ class CoEvolutionAnalyzer:
         system_state: Dict[str, Any],
         human_feedback: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
+        # ... same as before ...
         opportunities = []
         # Quantum
         q = system_state.get('components', {}).get('quantum', {})
@@ -834,10 +910,115 @@ class CoEvolutionAnalyzer:
         opportunities.sort(key=lambda x: x['priority'], reverse=True)
         return opportunities[:5]
 
+    # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    async def _compute_plan_objectives(self, rec: Dict[str, Any]) -> MOPDPlan:
+        """Compute objectives for a single recommendation."""
+        area = rec.get('area', 'general')
+        action = rec.get('action', '')
+        strategy_signature = rec.get('strategy_signature', hashlib.md5(f"{area}:{action}".encode()).hexdigest()[:12])
+
+        # Estimate objectives based on area and priority
+        cost = 1.0 - rec.get('historical_effectiveness', 0.5)  # lower cost if historically effective
+        impact = self.config.estimated_impact.get(area, 0.5) * rec.get('priority', 0.5)
+        time_days = 1.0 / (0.5 + impact)  # rough
+        risk = 1.0 - rec.get('priority', 0.5)  # lower risk for higher priority
+        historical_effectiveness = rec.get('historical_effectiveness', 0.5)
+
+        return MOPDPlan(
+            area=area,
+            action=action,
+            strategy_signature=strategy_signature,
+            cost=cost,
+            impact=impact,
+            time_days=time_days,
+            risk=risk,
+            historical_effectiveness=historical_effectiveness
+        )
+
+    async def _generate_pareto_front_for_recommendations(
+        self,
+        recommendations: List[Dict[str, Any]]
+    ) -> List[MOPDPlan]:
+        """Generate Pareto front from a list of recommendations."""
+        if not recommendations:
+            return []
+        plans = []
+        for rec in recommendations:
+            plan = await self._compute_plan_objectives(rec)
+            plans.append(plan)
+
+        # Filter dominated plans
+        objective_names = ['cost', 'impact', 'time_days', 'risk', 'historical_effectiveness']
+        # We minimise cost, time, risk; maximise impact, historical_effectiveness
+        pareto = []
+        for i, p_i in enumerate(plans):
+            dominated = False
+            for j, p_j in enumerate(plans):
+                if i == j:
+                    continue
+                # Build vectors: for max objectives, negate
+                a_vec = [
+                    p_i.cost,
+                    -p_i.impact,
+                    p_i.time_days,
+                    p_i.risk,
+                    -p_i.historical_effectiveness
+                ]
+                b_vec = [
+                    p_j.cost,
+                    -p_j.impact,
+                    p_j.time_days,
+                    p_j.risk,
+                    -p_j.historical_effectiveness
+                ]
+                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+        return pareto
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPlan]) -> Optional[MOPDPlan]:
+        if not pareto_front:
+            return None
+        weights = self.config.mopd.objective_weights
+        objective_names = ['cost', 'impact', 'time_days', 'risk', 'historical_effectiveness']
+        # Normalise across front
+        max_vals = {}
+        min_vals = {}
+        for key in objective_names:
+            vals = [getattr(p, key) for p in pareto_front]
+            max_vals[key] = max(vals)
+            min_vals[key] = min(vals)
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_names}
+
+        best = None
+        best_score = -float('inf')
+        for plan in pareto_front:
+            score = 0.0
+            for key in objective_names:
+                val = getattr(plan, key)
+                if key in ['cost', 'time_days', 'risk']:  # minimise
+                    norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                else:  # maximise
+                    norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 1.0 / len(objective_names))
+                score += weight * norm
+            if score > best_score:
+                best_score = score
+                best = plan
+        return best
+
+    # ============================================================================
+    # Enhanced Recommendation Generation with MOPD
+    # ============================================================================
     async def generate_holistic_recommendations(
         self,
         system_state: Dict[str, Any],
-        opportunities: List[Dict[str, Any]]
+        opportunities: List[Dict[str, Any]],
+        return_mopd: bool = False           # NEW
     ) -> List[Dict[str, Any]]:
         combined = {}
         for opp in opportunities:
@@ -883,6 +1064,22 @@ class CoEvolutionAnalyzer:
                 'expected_outcome': 'System-wide performance uplift',
                 'strategy_signature': 'system_wide_optimization'
             })
+
+        # MOPD: generate Pareto front and select best if enabled
+        if self.config.enable_mopd and return_mopd:
+            pareto_front = await self._generate_pareto_front_for_recommendations(recommendations)
+            if pareto_front:
+                # Store MOPD plans
+                for plan in pareto_front:
+                    await self.storage.add_mopd_plan(plan)
+                best_plan = self._select_best_from_pareto(pareto_front)
+                if best_plan:
+                    # We can reorder recommendations based on best plan, but for simplicity we just attach info
+                    return {
+                        'recommendations': recommendations,
+                        'mopd_pareto_front': [p.to_dict() for p in pareto_front],
+                        'mopd_best_plan': best_plan.to_dict()
+                    }
         return recommendations
 
     def _generate_strategy_signature(self, area: str, suggestions: List[str]) -> str:
@@ -938,9 +1135,9 @@ class CoEvolutionAnalyzer:
             return "stable"
 
     async def detect_milestone(self, impact: Dict[str, Any]) -> Optional[EvolutionMilestone]:
+        # ... same as before ...
         metrics = impact['metrics']
         if metrics.get('sustainability', 0) > 0.8:
-            # Find best area
             best_area = 'sustainability'
             details = impact.get('details', [])
             if details:
@@ -1020,7 +1217,7 @@ class CoEvolutionAnalyzer:
         return None
 
 # ============================================================================
-# Orchestrator (Main Controller)
+# Orchestrator (Main Controller) - Enhanced with MOPD
 # ============================================================================
 class CoEvolutionOrchestrator:
     """
@@ -1247,12 +1444,13 @@ class CoEvolutionOrchestrator:
             'sustainability_score': self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5),
             'milestones': len(await self.storage.get_milestones()),
             'feedback_count': len(await self.storage.get_feedback()),
-            'historical_effectiveness': historical
+            'historical_effectiveness': historical,
+            'mopd_enabled': self.config.enable_mopd,
         }
         await self.swarm_coordinator.share_predictions(payload)
 
     # ========================================================================
-    # Main Co-Evolution Cycle
+    # Main Co-Evolution Cycle (Enhanced with MOPD)
     # ========================================================================
     async def co_evolve(self) -> Dict[str, Any]:
         """Main co-evolution cycle."""
@@ -1267,11 +1465,41 @@ class CoEvolutionOrchestrator:
         if predicted:
             opportunities.extend(predicted)
 
-        recommendations = await self.analyzer.generate_holistic_recommendations(system_state, opportunities)
+        # Generate recommendations with MOPD if enabled
+        if self.config.enable_mopd:
+            rec_result = await self.analyzer.generate_holistic_recommendations(system_state, opportunities, return_mopd=True)
+            if isinstance(rec_result, dict) and 'recommendations' in rec_result:
+                recommendations = rec_result['recommendations']
+                mopd_pareto_front = rec_result.get('mopd_pareto_front', [])
+                mopd_best_plan = rec_result.get('mopd_best_plan')
+            else:
+                recommendations = rec_result
+                mopd_pareto_front = None
+                mopd_best_plan = None
+        else:
+            recommendations = await self.analyzer.generate_holistic_recommendations(system_state, opportunities)
+            mopd_pareto_front = None
+            mopd_best_plan = None
+
+        # Prioritise recommendations (ROI-based)
         historical = await self.storage.get_historical_effectiveness()
         prioritized = self.prioritizer.prioritize_recommendations(recommendations, historical)
 
-        applied = await self._apply_recommendations(prioritized[:3])
+        # Apply top recommendations (or best MOPD plan if available)
+        if self.config.enable_mopd and mopd_best_plan:
+            # Find the recommendation that matches the best MOPD plan
+            best_rec = None
+            for rec in prioritized:
+                if rec.get('strategy_signature') == mopd_best_plan['strategy_signature']:
+                    best_rec = rec
+                    break
+            if best_rec:
+                applied = await self._apply_recommendations([best_rec])
+            else:
+                applied = await self._apply_recommendations(prioritized[:3])
+        else:
+            applied = await self._apply_recommendations(prioritized[:3])
+
         impact = await self._measure_impact(applied)
 
         # Record long-term impact
@@ -1307,6 +1535,9 @@ class CoEvolutionOrchestrator:
         self.telemetry.gauge('sustainability_score', impact['metrics']['sustainability'])
         self.telemetry.gauge('performance_score', impact['metrics']['performance'])
         self.telemetry.gauge('milestone_count', len(await self.storage.get_milestones()))
+        if self.config.enable_mopd and mopd_pareto_front:
+            self.telemetry.increment('mopd_generations')
+            self.telemetry.histogram('mopd_pareto_front_size', len(mopd_pareto_front))
 
         return {
             'status': 'success' if applied else 'partial',
@@ -1316,10 +1547,13 @@ class CoEvolutionOrchestrator:
             'system_state': system_state,
             'human_feedback_count': len(human_feedback),
             'sustainability_trend': await self.analyzer.calculate_trend(),
-            'long_term_trend': self.impact_tracker.get_overall_trend()
+            'long_term_trend': self.impact_tracker.get_overall_trend(),
+            'mopd_pareto_front': mopd_pareto_front,
+            'mopd_best_plan': mopd_best_plan
         }
 
     async def _collect_system_state(self) -> Dict[str, Any]:
+        # ... (same as before) ...
         state = {'timestamp': datetime.now(timezone.utc).isoformat(), 'components': {}}
         if self.quantum_benchmark:
             try:
@@ -1392,6 +1626,7 @@ class CoEvolutionOrchestrator:
         return metrics
 
     async def _predict_opportunities(self, system_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # ... (same as before) ...
         opportunities = []
         if not self.predictive_analyzer:
             return opportunities
@@ -1582,7 +1817,7 @@ class CoEvolutionOrchestrator:
         return impact
 
     # ========================================================================
-    # Public Query Methods
+    # Public Query Methods (Enhanced with MOPD)
     # ========================================================================
     async def get_evolution_status(self) -> Dict[str, Any]:
         return {
@@ -1597,10 +1832,13 @@ class CoEvolutionOrchestrator:
             'adaptation_threshold': self.config.adaptation_threshold,
             'historical_effectiveness': await self.storage.get_historical_effectiveness(),
             'milestone_strategies': len(await self.storage.get_milestone_strategies()),
-            'long_term_trend': self.impact_tracker.get_overall_trend()
+            'long_term_trend': self.impact_tracker.get_overall_trend(),
+            'mopd_enabled': self.config.enable_mopd,
+            'mopd_plans': len(await self.storage.get_mopd_plans()),
         }
 
     async def get_feedback_sentiment_summary(self) -> Dict[str, Any]:
+        # ... same as before ...
         feedback = await self.storage.get_feedback()
         if not feedback:
             return {'status': 'no_feedback'}
@@ -1617,6 +1855,7 @@ class CoEvolutionOrchestrator:
         }
 
     async def get_milestone_summary(self) -> Dict[str, Any]:
+        # ... same as before ...
         milestones = await self.storage.get_milestones()
         if not milestones:
             return {'status': 'no_milestones'}
@@ -1634,6 +1873,41 @@ class CoEvolutionOrchestrator:
             'most_recent': milestones[-1].to_dict() if milestones else None
         }
 
+    # ============================================================================
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+    async def get_recommendation_pareto_front(
+        self,
+        system_state: Dict[str, Any],
+        opportunities: List[Dict[str, Any]]
+    ) -> List[MOPDPlan]:
+        """
+        Generate Pareto front of recommendations without actually applying them.
+        Returns a list of MOPDPlan objects.
+        """
+        if not self.config.enable_mopd:
+            return []
+        rec_result = await self.analyzer.generate_holistic_recommendations(system_state, opportunities, return_mopd=True)
+        if isinstance(rec_result, dict) and 'mopd_pareto_front' in rec_result:
+            return [MOPDPlan.from_dict(p) for p in rec_result['mopd_pareto_front']]
+        return []
+
+    async def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.enable_mopd:
+            return {'enabled': False}
+        plans = await self.storage.get_mopd_plans(20)
+        return {
+            'enabled': True,
+            'objective_weights': self.config.mopd.objective_weights,
+            'grid_resolution': self.config.mopd.grid_resolution,
+            'total_mopd_plans': len(await self.storage.get_mopd_plans()),
+            'sample_plans': [p.to_dict() for p in plans]
+        }
+
+    # ============================================================================
+    # Health Status
+    # ============================================================================
     async def get_health_status(self) -> Dict[str, Any]:
         return {
             'status': self.health_status,
@@ -1654,7 +1928,8 @@ class CoEvolutionOrchestrator:
                 'persistence_enabled': self.persistence is not None,
                 'event_driven_active': self.config.enable_event_driven,
                 'self_healing_enabled': self.config.enable_self_healing,
-                'swarm_coordination_active': self.config.enable_swarm_coordination
+                'swarm_coordination_active': self.config.enable_swarm_coordination,
+                'mopd_enabled': self.config.enable_mopd,
             }
         }
 
@@ -1794,7 +2069,7 @@ class EnhancedCoEvolutionEngine(CoEvolutionOrchestrator):
         if self.persistence:
             asyncio.create_task(self.load_state())
 
-        logger.info("Enhanced Co-Evolution Engine v5.0.0 initialized")
+        logger.info("Enhanced Co-Evolution Engine v5.1.0 initialized with MOPD")
 
     # Expose storage and analyzer methods for backward compatibility
     def get_evolution_status(self) -> Dict[str, Any]:
