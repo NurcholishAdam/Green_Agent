@@ -1,8 +1,8 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/biodiversity_impact_assessor.py
-# Enhanced version v4.0.0 – Refactored for maintainability, concurrency, and resilience
+# Enhanced version v4.1.0 – Refactored for maintainability, concurrency, resilience, and MOPD support.
 
 """
-Enhanced Biodiversity Impact Assessment v4.0.0 – Modular, event‑driven, and robust.
+Enhanced Biodiversity Impact Assessment v4.1.0 – Modular, event‑driven, robust, and MOPD‑aware.
 """
 
 import asyncio
@@ -86,7 +86,7 @@ class HeliumProvider:
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Enums and Data Classes
+# Enums and Data Classes (Enhanced with MOPD)
 # ============================================================================
 class EcosystemType(Enum):
     TROPICAL_FOREST = "tropical_forest"
@@ -134,6 +134,54 @@ class BiodiversityAssessment:
     ml_prediction: Optional[Dict] = None
     timestamp: datetime
 
+# ============================================================================
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPlan:
+    """Represents a mitigation strategy with its objective vector."""
+    # Decision variables (which mitigation strategies are chosen)
+    strategy_ids: List[str]
+    # Objectives (to be minimised/maximised)
+    habitat_impact: float
+    energy_impact: float
+    cooling_impact: float
+    resource_impact: float
+    carbon_impact: float
+    helium_impact: float
+    total_impact: float
+    cost: float
+    implementation_time_days: int
+    # Scalarised score (will be computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPlan':
+        return cls(**data)
+
+@dataclass
+class MOPDConfig:
+    """Configuration for MOPD analysis."""
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        'habitat_impact': 0.25,
+        'energy_impact': 0.20,
+        'cooling_impact': 0.15,
+        'resource_impact': 0.15,
+        'carbon_impact': 0.15,
+        'helium_impact': 0.10,
+    })
+    grid_resolution: int = 5
+    enable_cost_benefit: bool = True
+    enable_predictive: bool = True
+    enable_quantum: bool = True
+
+# ============================================================================
+# Enhanced Configuration with MOPD Sub‑Config
+# ============================================================================
 @dataclass
 class CarbonConfig:
     enabled: bool = True
@@ -200,6 +248,7 @@ class BiodiversityConfig:
     enable_cost_benefit: bool = True
     enable_time_tick_engine: bool = True
     enable_quantum_bridge: bool = True
+    enable_mopd: bool = True               # NEW: MOPD feature flag
 
     # Sub‑configs
     carbon: CarbonConfig = field(default_factory=CarbonConfig)
@@ -210,6 +259,7 @@ class BiodiversityConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)      # NEW: MOPD sub‑config
 
     # Workflow triggers
     workflow_on_critical_impact: str = "adjust_mitigation_strategy"
@@ -225,6 +275,7 @@ class BiodiversityConfig:
 # Carbon Intensity Manager (improved)
 # ============================================================================
 class CarbonIntensityManager:
+    # ... (same as before) ...
     def __init__(self, config: CarbonConfig):
         self.config = config
         self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
@@ -306,6 +357,7 @@ class CarbonIntensityManager:
 # Helium Impact Tracker (improved)
 # ============================================================================
 class HeliumImpactTracker:
+    # ... (same as before) ...
     def __init__(self, config: HeliumConfig):
         self.config = config
         self.budget_l = config.budget_l
@@ -371,6 +423,7 @@ class HeliumImpactTracker:
 # Predictive Analyzer (improved)
 # ============================================================================
 class PredictiveBiodiversityAnalyzer:
+    # ... (same as before) ...
     def __init__(self, config: PredictiveConfig):
         self.config = config
         self.history_window = config.history_window
@@ -509,6 +562,7 @@ class PredictiveBiodiversityAnalyzer:
 # ML Impact Predictor (PyTorch, with thread offload)
 # ============================================================================
 class MLImpactPredictor:
+    # ... (same as before) ...
     def __init__(self, config: MLConfig):
         self.config = config
         self.input_size = config.input_size
@@ -673,6 +727,7 @@ class MLImpactPredictor:
 # Federated Assessor (improved)
 # ============================================================================
 class FederatedBiodiversityAssessor:
+    # ... (same as before) ...
     def __init__(self, config: FederatedConfig):
         self.config = config
         self.server_url = config.server_url
@@ -776,6 +831,7 @@ class FederatedBiodiversityAssessor:
 # Human‑AI Collaborative Support (simplified)
 # ============================================================================
 class HumanAICollaborativeBiodiversity:
+    # ... (same as before) ...
     def __init__(self):
         self.feedback_history: Deque[Dict] = deque(maxlen=1000)
         self.reflection_logs: Deque[Dict] = deque(maxlen=100)
@@ -859,11 +915,12 @@ class HumanAICollaborativeBiodiversity:
 # Persistence Manager (JSON with versioning)
 # ============================================================================
 class BiodiversityPersistenceManager:
+    # ... (same as before) ...
     def __init__(self, config: PersistenceConfig):
         self.config = config
         self.path = config.path
         self._lock = asyncio.Lock()
-        self._version = 1
+        self._version = 2  # Bumped for MOPD
         logger.info(f"BiodiversityPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
@@ -936,6 +993,7 @@ class BiodiversityPersistenceManager:
 # Telemetry Collector (unchanged)
 # ============================================================================
 class BiodiversityTelemetry:
+    # ... (same as before) ...
     def __init__(self):
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
         self._lock = asyncio.Lock()
@@ -997,7 +1055,6 @@ class BiodiversityStorage:
     async def add_assessment(self, assessment: BiodiversityAssessment):
         async with self._lock:
             self.impact_history.append(assessment)
-            # Keep last 1000 assessments
             if len(self.impact_history) > 1000:
                 self.impact_history = self.impact_history[-1000:]
 
@@ -1050,8 +1107,9 @@ class BiodiversityAnalyzer:
         location: Dict[str, Any],
         energy_source: str,
         cooling_method: str,
-        use_ml_prediction: bool = False
-    ) -> BiodiversityAssessment:
+        use_ml_prediction: bool = False,
+        return_mopd: bool = False           # NEW: if True, return Pareto front of mitigation strategies
+    ) -> Dict[str, Any]:
         # Get carbon intensity
         carbon_intensity = 400
         if self.carbon_manager:
@@ -1136,9 +1194,153 @@ class BiodiversityAnalyzer:
             helium_usage_l = helium['score'] * 10  # simplistic
             self.helium_tracker.record_usage(helium_usage_l, expert_type)
 
-        return assessment
+        # MOPD: generate Pareto front of mitigation strategies if enabled
+        mopd_result = None
+        if self.config.enable_mopd and return_mopd:
+            mopd_result = await self._generate_mitigation_pareto_front(breakdown, expert_type, location)
 
-    # Assessment sub‑functions (same as original, but refactored)
+        result = asdict(assessment)
+        if mopd_result:
+            result['mopd_pareto_front'] = [p.to_dict() for p in mopd_result['pareto_front']]
+            result['mopd_best_plan'] = mopd_result['best_plan'].to_dict() if mopd_result['best_plan'] else None
+        return result
+
+    # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    async def _generate_mitigation_pareto_front(
+        self,
+        breakdown: Dict,
+        expert_type: str,
+        location: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Generate Pareto front of mitigation strategy combinations."""
+        # Define available mitigation strategies (each with effects on each objective)
+        strategies = [
+            {
+                'id': 'habitat_relocation',
+                'effect': {'habitat_impact': -0.6, 'energy_impact': 0.0, 'cooling_impact': 0.0, 'resource_impact': 0.0, 'carbon_impact': 0.0, 'helium_impact': 0.0},
+                'cost': 5.0, 'implementation_time': 3
+            },
+            {
+                'id': 'renewable_energy',
+                'effect': {'habitat_impact': 0.0, 'energy_impact': -0.7, 'cooling_impact': 0.0, 'resource_impact': 0.0, 'carbon_impact': -0.5, 'helium_impact': 0.0},
+                'cost': 3.0, 'implementation_time': 5
+            },
+            {
+                'id': 'efficient_cooling',
+                'effect': {'habitat_impact': 0.0, 'energy_impact': -0.2, 'cooling_impact': -0.5, 'resource_impact': 0.0, 'carbon_impact': -0.2, 'helium_impact': -0.3},
+                'cost': 2.5, 'implementation_time': 4
+            },
+            {
+                'id': 'circular_economy',
+                'effect': {'habitat_impact': 0.0, 'energy_impact': 0.0, 'cooling_impact': 0.0, 'resource_impact': -0.4, 'carbon_impact': -0.1, 'helium_impact': 0.0},
+                'cost': 1.5, 'implementation_time': 2
+            },
+            {
+                'id': 'carbon_offset',
+                'effect': {'habitat_impact': 0.0, 'energy_impact': 0.0, 'cooling_impact': 0.0, 'resource_impact': 0.0, 'carbon_impact': -0.3, 'helium_impact': 0.0},
+                'cost': 2.0, 'implementation_time': 1
+            },
+            {
+                'id': 'helium_recovery',
+                'effect': {'habitat_impact': 0.0, 'energy_impact': 0.0, 'cooling_impact': 0.0, 'resource_impact': 0.0, 'carbon_impact': 0.0, 'helium_impact': -0.5},
+                'cost': 4.0, 'implementation_time': 6
+            }
+        ]
+
+        # Current scores for each objective
+        base = {
+            'habitat_impact': breakdown['habitat']['score'],
+            'energy_impact': breakdown['energy']['score'],
+            'cooling_impact': breakdown['cooling']['score'],
+            'resource_impact': breakdown['resources']['score'],
+            'carbon_impact': breakdown['carbon']['score'],
+            'helium_impact': breakdown['helium']['score']
+        }
+
+        # Generate all combinations of strategies (subset of strategies)
+        # For simplicity, we generate combinations of up to 3 strategies
+        import itertools
+        plans = []
+        for r in range(0, min(4, len(strategies) + 1)):
+            for combo in itertools.combinations(strategies, r):
+                # Apply effects to base
+                plan_vals = base.copy()
+                total_cost = 0.0
+                total_time = 0
+                strategy_ids = []
+                for strat in combo:
+                    for key, effect in strat['effect'].items():
+                        plan_vals[key] = max(0.0, plan_vals[key] + effect)
+                    total_cost += strat['cost']
+                    total_time = max(total_time, strat['implementation_time'])
+                    strategy_ids.append(strat['id'])
+                # Calculate total impact as average of objectives (for now)
+                plan_total = np.mean(list(plan_vals.values()))
+                plan = MOPDPlan(
+                    strategy_ids=strategy_ids,
+                    habitat_impact=plan_vals['habitat_impact'],
+                    energy_impact=plan_vals['energy_impact'],
+                    cooling_impact=plan_vals['cooling_impact'],
+                    resource_impact=plan_vals['resource_impact'],
+                    carbon_impact=plan_vals['carbon_impact'],
+                    helium_impact=plan_vals['helium_impact'],
+                    total_impact=plan_total,
+                    cost=total_cost,
+                    implementation_time_days=total_time
+                )
+                plans.append(plan)
+
+        # Filter dominated plans using dominance check
+        objective_names = ['habitat_impact', 'energy_impact', 'cooling_impact', 'resource_impact', 'carbon_impact', 'helium_impact']
+        # We minimise all objectives (lower is better)
+        pareto = []
+        for i, p_i in enumerate(plans):
+            dominated = False
+            for j, p_j in enumerate(plans):
+                if i == j:
+                    continue
+                a_vec = [getattr(p_i, key) for key in objective_names]
+                b_vec = [getattr(p_j, key) for key in objective_names]
+                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+
+        # Select best plan using scalarisation with weights
+        best_plan = self._select_best_from_pareto(pareto)
+
+        return {'pareto_front': pareto, 'best_plan': best_plan}
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPlan]) -> Optional[MOPDPlan]:
+        if not pareto_front:
+            return None
+        weights = self.config.mopd.objective_weights
+        # Normalise objectives across Pareto front
+        objective_names = ['habitat_impact', 'energy_impact', 'cooling_impact', 'resource_impact', 'carbon_impact', 'helium_impact']
+        max_vals = {key: max(getattr(p, key) for p in pareto_front) for key in objective_names}
+        min_vals = {key: min(getattr(p, key) for p in pareto_front) for key in objective_names}
+        ranges = {key: max_vals[key] - min_vals[key] if max_vals[key] != min_vals[key] else 1.0 for key in objective_names}
+
+        best = None
+        best_score = -float('inf')
+        for plan in pareto_front:
+            score = 0.0
+            for key in objective_names:
+                val = getattr(plan, key)
+                norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 1.0 / len(objective_names))
+                score += weight * norm
+            if score > best_score:
+                best_score = score
+                best = plan
+        return best
+
+    # ============================================================================
+    # Assessment Sub‑functions (same as before)
+    # ============================================================================
     def _assess_habitat(self, location: Dict[str, Any]) -> Dict[str, Any]:
         nearest = self._find_nearest_ecosystem(location)
         if not nearest:
@@ -1251,7 +1453,6 @@ class BiodiversityAnalyzer:
                 'category': 'high' if base > 0.2 else 'moderate' if base > 0.05 else 'low'}
 
     def _find_nearest_ecosystem(self, location: Dict[str, Any]) -> Optional[str]:
-        # Simplified – could be enhanced with geospatial lookup
         if location.get('latitude', 0) < 0:
             return 'amazon_rainforest'
         elif location.get('latitude', 0) > 45:
@@ -1360,7 +1561,6 @@ class BiodiversityAnalyzer:
         assessments = []
         for expert in expert_options:
             for loc in location_options:
-                # Quick estimate
                 loc_sens = loc.get('biodiversity_sensitivity', 0.5)
                 expert_int = {
                     'energy': 0.3, 'data': 0.4, 'iot': 0.2,
@@ -1381,7 +1581,7 @@ class BiodiversityAnalyzer:
         }
 
 # ============================================================================
-# Biodiversity Reporter (reporting, telemetry, persistence)
+# Biodiversity Reporter (reporting, telemetry, persistence, and MOPD reporting)
 # ============================================================================
 class BiodiversityReporter:
     def __init__(self, config: BiodiversityConfig, storage: BiodiversityStorage, analyzer: BiodiversityAnalyzer,
@@ -1428,6 +1628,18 @@ class BiodiversityReporter:
             report['predictive_forecast'] = forecast
         if self.human_ai:
             report['human_ai_insights'] = await self.human_ai.get_insights()
+        # MOPD summary
+        if self.config.enable_mopd:
+            # Use a sample assessment to generate Pareto front (if any)
+            history = await self.storage.get_impact_history(1)
+            if history:
+                sample = history[0]
+                mopd_result = await self.analyzer._generate_mitigation_pareto_front(
+                    sample.impact_breakdown, sample.expert_type, sample.location
+                )
+                report['mopd_pareto_front_size'] = len(mopd_result['pareto_front'])
+                if mopd_result['best_plan']:
+                    report['mopd_best_plan'] = mopd_result['best_plan'].to_dict()
         return report
 
     def _calc_mitigation_effectiveness(self) -> float:
@@ -1472,7 +1684,8 @@ class BiodiversityReporter:
                 'sustainability_score': self.storage.sustainability_score,
                 'total_carbon_savings_kg': self.storage.total_carbon_savings_kg,
                 'total_helium_savings_l': self.storage.total_helium_savings_l,
-                'ml_checkpoint': self.analyzer.ml_predictor.get_checkpoint() if self.analyzer.ml_predictor else None
+                'ml_checkpoint': self.analyzer.ml_predictor.get_checkpoint() if self.analyzer.ml_predictor else None,
+                # MOPD not persisted yet (optional)
             }
             await self.persistence.save_state(state)
 
@@ -1480,7 +1693,6 @@ class BiodiversityReporter:
         if self.persistence:
             state = await self.persistence.load_state()
             if state:
-                # Restore into storage
                 self.storage.ecosystems = state.get('ecosystems', {})
                 self.storage.impact_history = state.get('impact_history', [])
                 self.storage.mitigation_strategies = state.get('mitigation_strategies', {})
@@ -1498,8 +1710,8 @@ class BiodiversityReporter:
 # ============================================================================
 class BiodiversityImpactAssessor:
     """
-    Enhanced Biodiversity Impact Assessor v4.0.0 – Controller that orchestrates
-    storage, analysis, reporting, event handling, and background tasks.
+    Enhanced Biodiversity Impact Assessor v4.1.0 – Controller that orchestrates
+    storage, analysis, reporting, event handling, and MOPD support.
     """
 
     def __init__(
@@ -1573,7 +1785,7 @@ class BiodiversityImpactAssessor:
         if self.config.persistence.enabled:
             asyncio.create_task(self._load_state())
 
-        logger.info("BiodiversityImpactAssessor v4.0.0 initialized")
+        logger.info("BiodiversityImpactAssessor v4.1.0 initialized with MOPD")
 
     # ============================================================================
     # Event Handling (via queue)
@@ -1615,7 +1827,6 @@ class BiodiversityImpactAssessor:
         intensity = event.data.get('intensity', 400)
         if self.carbon_manager:
             self.carbon_manager.carbon_intensity = intensity
-        # Adjust ecosystem sensitivity
         for eco in self.storage.ecosystems.values():
             eco.carbon_sensitivity = 0.5 + 0.5 * (intensity / 800)
 
@@ -1644,7 +1855,7 @@ class BiodiversityImpactAssessor:
             logger.info("Configuration reloaded")
 
     async def _on_token_update(self, event: BioEvent):
-        pass  # optional
+        pass
 
     async def _on_health_update(self, event: BioEvent):
         self.health_status = event.data.get('status', 'healthy')
@@ -1661,46 +1872,37 @@ class BiodiversityImpactAssessor:
     # Background Tasks (cancellable)
     # ============================================================================
     def _start_background_tasks(self):
-        # Event consumer
         if self.config.enable_event_driven:
             self._event_consumer_task = asyncio.create_task(self._event_consumer())
             self._background_tasks.append(self._event_consumer_task)
 
-        # Carbon update loop
         if self.carbon_manager:
             t = asyncio.create_task(self._carbon_update_loop())
             self._background_tasks.append(t)
 
-        # Helium accounting
         if self.helium_tracker:
             self.helium_tracker.start()
 
-        # Predictive training loop
         if self.predictive:
             t = asyncio.create_task(self._predictive_update_loop())
             self._background_tasks.append(t)
 
-        # ML training loop
         if self.ml_predictor:
             t = asyncio.create_task(self._ml_training_loop())
             self._background_tasks.append(t)
 
-        # Federated sync
         if self.federated:
             t = asyncio.create_task(self._federated_sync_loop())
             self._background_tasks.append(t)
 
-        # Telemetry export
         if self.telemetry:
             t = asyncio.create_task(self._telemetry_export_loop())
             self._background_tasks.append(t)
 
-        # Persistence save
         if self.persistence:
             t = asyncio.create_task(self._persistence_save_loop())
             self._background_tasks.append(t)
 
-        # Swarm update
         if self.config.enable_swarm_coordination and self.swarm_coordinator:
             t = asyncio.create_task(self._swarm_update_loop())
             self._background_tasks.append(t)
@@ -1736,7 +1938,6 @@ class BiodiversityImpactAssessor:
         while True:
             try:
                 if self.ml_predictor:
-                    # Use recent assessments for training
                     history = await self.storage.get_impact_history(200)
                     if len(history) >= 20:
                         training_data = []
@@ -1829,43 +2030,47 @@ class BiodiversityImpactAssessor:
         location: Dict[str, Any],
         energy_source: str,
         cooling_method: str,
-        use_ml_prediction: bool = False
+        use_ml_prediction: bool = False,
+        return_mopd: bool = False           # NEW: if True, return Pareto front
     ) -> Dict[str, Any]:
         assessment = await self.analyzer.assess_expert_impact(
-            expert_type, location, energy_source, cooling_method, use_ml_prediction
+            expert_type, location, energy_source, cooling_method, use_ml_prediction, return_mopd
         )
         # Trigger workflows if critical
-        if assessment.total_impact > 0.8 and self.workflow_orchestrator:
+        if assessment['total_impact'] > 0.8 and self.workflow_orchestrator:
             await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_impact)
 
         # Feed to gating network / self‑evolving gate
         if self.gating_network and self.expert_router:
             features = np.array([
-                assessment.total_impact,
-                (assessment.carbon_impact.get('carbon_intensity', 400) / 800),
-                assessment.sustainability_score,
-                len(assessment.mitigation_strategies)
+                assessment['total_impact'],
+                (assessment['carbon_impact'].get('carbon_intensity', 400) / 800),
+                assessment['sustainability_score'],
+                len(assessment['mitigation_strategies'])
             ])
-            reward = 1.0 - assessment.total_impact
+            reward = 1.0 - assessment['total_impact']
             self.gating_network.update(features, reward, {'expert_type': expert_type})
 
         if self.self_evolving_gate and TORCH_AVAILABLE:
-            state = torch.tensor([assessment.total_impact, assessment.sustainability_score], dtype=torch.float32)
+            state = torch.tensor([assessment['total_impact'], assessment['sustainability_score']], dtype=torch.float32)
             self.self_evolving_gate.adapt(
                 state=state,
                 chosen_expert=0,
-                reward=1.0 - assessment.total_impact,
+                reward=1.0 - assessment['total_impact'],
                 environmental_feedback={'expert_type': expert_type},
                 quantum_mode=False
             )
 
         if self.telemetry:
             self.telemetry.increment('assessments_performed')
-            self.telemetry.gauge('total_impact', assessment.total_impact)
-            self.telemetry.gauge('sustainability_score', assessment.sustainability_score)
+            self.telemetry.gauge('total_impact', assessment['total_impact'])
+            self.telemetry.gauge('sustainability_score', assessment['sustainability_score'])
+            if return_mopd and 'mopd_pareto_front' in assessment:
+                self.telemetry.increment('mopd_generations')
+                self.telemetry.histogram('mopd_pareto_front_size', len(assessment['mopd_pareto_front']))
 
-        logger.info(f"Assessment for {expert_type}: impact={assessment.total_impact:.2f}, sustainability={assessment.sustainability_score:.2f}")
-        return asdict(assessment)
+        logger.info(f"Assessment for {expert_type}: impact={assessment['total_impact']:.2f}, sustainability={assessment['sustainability_score']:.2f}")
+        return assessment
 
     async def get_biodiversity_report(self) -> Dict[str, Any]:
         return await self.reporter.generate_report()
@@ -1901,6 +2106,45 @@ class BiodiversityImpactAssessor:
             return {'status': 'disabled'}
         return await self.predictive.train()
 
+    # ============================================================================
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+    async def get_mitigation_pareto_front(
+        self,
+        expert_type: str,
+        location: Dict[str, Any],
+        energy_source: str,
+        cooling_method: str,
+        use_ml_prediction: bool = False
+    ) -> List[MOPDPlan]:
+        """
+        Generate Pareto front of mitigation strategies for a hypothetical scenario.
+        Returns a list of MOPDPlan objects.
+        """
+        if not self.config.enable_mopd:
+            return []
+        # Perform quick assessment to get breakdown
+        assessment = await self.analyzer.assess_expert_impact(
+            expert_type, location, energy_source, cooling_method, use_ml_prediction, return_mopd=True
+        )
+        if 'mopd_pareto_front' in assessment:
+            return [MOPDPlan.from_dict(p) for p in assessment['mopd_pareto_front']]
+        return []
+
+    async def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.enable_mopd:
+            return {'enabled': False}
+        return {
+            'enabled': True,
+            'objective_weights': self.config.mopd.objective_weights,
+            'grid_resolution': self.config.mopd.grid_resolution,
+            'strategies_available': 6,  # hardcoded for now
+        }
+
+    # ============================================================================
+    # Swarm Coordination
+    # ============================================================================
     async def share_with_swarm(self):
         if not self.config.enable_swarm_coordination or not self.swarm_coordinator:
             return
@@ -1912,7 +2156,8 @@ class BiodiversityImpactAssessor:
             'sustainability_score': scores['sustainability'],
             'total_carbon_savings_kg': self.storage.total_carbon_savings_kg,
             'total_helium_savings_l': self.storage.total_helium_savings_l,
-            'ecosystems_tracked': len(self.storage.ecosystems)
+            'ecosystems_tracked': len(self.storage.ecosystems),
+            'mopd_enabled': self.config.enable_mopd,
         }
         await self.swarm_coordinator.share_predictions(payload)
 
@@ -1932,7 +2177,7 @@ class BiodiversityImpactAssessor:
         self.helium_provider = provider
 
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
-        pass  # Already handled in __init__
+        pass
 
     # ============================================================================
     # Self‑Healing
@@ -1942,9 +2187,7 @@ class BiodiversityImpactAssessor:
         if not self.config.self_healing.enabled:
             logger.warning("Self‑healing disabled")
             return
-        # Reset ecosystems to defaults
         self._initialize_ecosystems()
-        # Reset scores in storage
         async with self.storage._lock:
             self.storage.local_score = 0.0
             self.storage.global_score = 0.0
@@ -1974,13 +2217,13 @@ class BiodiversityImpactAssessor:
             'event_driven_active': self.config.enable_event_driven,
             'self_healing_enabled': self.config.self_healing.enabled,
             'persistence_enabled': self.config.persistence.enabled,
+            'mopd_enabled': self.config.enable_mopd,
         }
 
     # ============================================================================
     # Helper
     # ============================================================================
     def _initialize_ecosystems(self):
-        # Default ecosystems (could be loaded from config)
         defaults = {
             'amazon_rainforest': BiodiversityMetric(
                 ecosystem_type=EcosystemType.TROPICAL_FOREST,
@@ -2020,20 +2263,16 @@ class BiodiversityImpactAssessor:
     # ============================================================================
     async def shutdown(self):
         logger.info("Shutting down Biodiversity Impact Assessor")
-        # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
-        # Stop helium tracker
         if self.helium_tracker:
             await self.helium_tracker.stop()
 
-        # Save final state
         if self.persistence:
             await self.reporter.save_state()
 
-        # Close external sessions
         if self.carbon_manager:
             await self.carbon_manager.close()
         if self.federated:
