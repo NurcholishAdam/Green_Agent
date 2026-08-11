@@ -1,9 +1,9 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/circular_computing_manager.py
-# Enhanced version v4.0.0 – Refactored for maintainability, concurrency, and resilience
+# Enhanced version v4.1.0 – Refactored for maintainability, concurrency, resilience, and MOPD support.
 
 """
-Enhanced Circular Computing Module v4.0.0
-Modular, event‑driven, and robust implementation.
+Enhanced Circular Computing Module v4.1.0
+Modular, event‑driven, robust, and MOPD‑aware implementation.
 """
 
 import asyncio
@@ -87,7 +87,7 @@ class HeliumProvider:
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Enums and Data Classes
+# Enums and Data Classes (unchanged)
 # ============================================================================
 class HardwareState(Enum):
     MANUFACTURING = "manufacturing"
@@ -124,7 +124,51 @@ class HardwareComponent:
     carbon_savings_kg: float = 0.0
 
 # ============================================================================
-# Configuration Dataclass with Sub‑Configs
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPlan:
+    """Represents a recycling strategy with its objective vector."""
+    # Decision variables
+    recycling_method: str               # 'full_recycling', 'repurposing', 'material_recovery'
+    helium_recovery: bool               # whether to attempt helium recovery
+    material_recovery_target: float     # target recovery rate (0-1)
+    use_ml_optimization: bool
+    # Objectives (to be minimised/maximised)
+    cost: float
+    carbon_saved_kg: float
+    helium_recovered_l: float
+    material_recovery_rate: float
+    time_days: float
+    sustainability_score: float
+    # Scalarised score (will be computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPlan':
+        return cls(**data)
+
+@dataclass
+class MOPDConfig:
+    """Configuration for MOPD analysis."""
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        'cost': 0.2,
+        'carbon_saved': 0.3,
+        'helium_recovered': 0.2,
+        'material_recovery': 0.15,
+        'time': 0.15,
+    })
+    grid_resolution: int = 5
+    enable_cost_benefit: bool = True
+    enable_predictive: bool = True
+    enable_quantum: bool = True
+
+# ============================================================================
+# Configuration Dataclass with Sub‑Configs (Enhanced with MOPD)
 # ============================================================================
 @dataclass
 class CarbonConfig:
@@ -192,6 +236,7 @@ class CircularComputingConfig:
     enable_cost_benefit: bool = True
     enable_time_tick_engine: bool = True
     enable_quantum_bridge: bool = True
+    enable_mopd: bool = True               # NEW: MOPD feature flag
 
     # Sub‑configs
     carbon: CarbonConfig = field(default_factory=CarbonConfig)
@@ -202,6 +247,7 @@ class CircularComputingConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)      # NEW: MOPD sub‑config
 
     # Budgets
     helium_budget_l: float = 100.0
@@ -878,7 +924,7 @@ class CircularComputingPersistenceManager:
         self.config = config
         self.path = config.path
         self._lock = asyncio.Lock()
-        self._version = 1
+        self._version = 2  # Bumped for MOPD
         logger.info(f"CircularComputingPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
@@ -995,7 +1041,7 @@ class CircularComputingTelemetry:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Storage Module
+# Storage Module (Enhanced with MOPD)
 # ============================================================================
 class CircularStorage:
     def __init__(self):
@@ -1006,6 +1052,7 @@ class CircularStorage:
         self.waste_diversion_rate = 0.0
         self.material_recovery_rate = 0.0
         self.sustainability_score = 0.0
+        self.mopd_plans: List[MOPDPlan] = []  # NEW: store MOPD plans
         self._lock = asyncio.Lock()
 
     async def add_component(self, component: HardwareComponent):
@@ -1034,6 +1081,12 @@ class CircularStorage:
             self.recycling_history.append(record)
             if len(self.recycling_history) > 10000:
                 self.recycling_history = self.recycling_history[-10000:]
+
+    async def add_mopd_plan(self, plan: MOPDPlan):
+        async with self._lock:
+            self.mopd_plans.append(plan)
+            if len(self.mopd_plans) > 10000:
+                self.mopd_plans = self.mopd_plans[-10000:]
 
     async def update_metrics(self, circularity: float, waste: float, recovery: float):
         async with self._lock:
@@ -1075,8 +1128,14 @@ class CircularStorage:
                 return self.recycling_history[-limit:]
             return self.recycling_history.copy()
 
+    async def get_mopd_plans(self, limit: Optional[int] = None) -> List[MOPDPlan]:
+        async with self._lock:
+            if limit is not None:
+                return self.mopd_plans[-limit:]
+            return self.mopd_plans.copy()
+
 # ============================================================================
-# Analyzer Module
+# Analyzer Module (Enhanced with MOPD)
 # ============================================================================
 class CircularAnalyzer:
     def __init__(
@@ -1098,75 +1157,226 @@ class CircularAnalyzer:
         self.human_ai = human_ai
         self._lock = asyncio.Lock()
 
-    async def register_component(
+    # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    async def _enumerate_recycling_strategies(
         self,
-        component_type: str,
-        materials: Dict[MaterialType, float],
-        manufacturing_carbon: float,
-        expected_lifetime_days: int = 1825,
-        helium_content_l: float = 0.0
-    ) -> str:
-        component_id = f"COMP-{datetime.now(timezone.utc).timestamp()}-{component_type}"
-        component = HardwareComponent(
-            component_id=component_id,
-            type=component_type,
-            materials=materials,
-            manufacturing_carbon=manufacturing_carbon,
-            current_state=HardwareState.MANUFACTURING,
-            deployment_date=datetime.now(timezone.utc),
-            expected_lifetime_days=expected_lifetime_days,
-            helium_content_l=helium_content_l,
-            sustainability_score=0.5
-        )
-        await self.storage.add_component(component)
-        if self.helium_manager and helium_content_l > 0:
-            self.helium_manager.register_component_helium(component_id, helium_content_l, component_type)
-        logger.info(f"Registered component {component_id}: {component_type}")
-        return component_id
+        component: HardwareComponent
+    ) -> List[MOPDPlan]:
+        """Generate all feasible recycling strategies for a component."""
+        # Decision variables:
+        # - recycling_method: 'full_recycling', 'repurposing', 'material_recovery'
+        # - helium_recovery: True/False (if helium content > 0)
+        # - material_recovery_target: 0.5, 0.75, 0.95
+        # - use_ml_optimization: True/False
 
-    async def deploy_component(self, component_id: str):
-        await self.storage.update_component_state(component_id, HardwareState.DEPLOYED)
-        logger.info(f"Deployed component {component_id}")
+        recycling_methods = ['full_recycling', 'repurposing', 'material_recovery']
+        helium_recovery_options = [False]
+        if component.helium_content_l > 0:
+            helium_recovery_options = [False, True]
+        material_targets = [0.5, 0.75, 0.95]
+        use_ml_options = [True, False]
 
-    async def record_utilization(self, component_id: str, utilization_rate: float):
+        plans = []
+        for method in recycling_methods:
+            for hr in helium_recovery_options:
+                for target in material_targets:
+                    for use_ml in use_ml_options:
+                        plan = MOPDPlan(
+                            recycling_method=method,
+                            helium_recovery=hr,
+                            material_recovery_target=target,
+                            use_ml_optimization=use_ml,
+                            cost=0.0,
+                            carbon_saved_kg=0.0,
+                            helium_recovered_l=0.0,
+                            material_recovery_rate=0.0,
+                            time_days=0.0,
+                            sustainability_score=0.0
+                        )
+                        plans.append(plan)
+        return plans
+
+    async def _compute_plan_objectives(
+        self,
+        plan: MOPDPlan,
+        component: HardwareComponent
+    ) -> MOPDPlan:
+        """Calculate cost, carbon saved, helium recovered, material recovery, time for a given plan."""
+        # Base estimates
+        cost = 0.0
+        carbon_saved = component.manufacturing_carbon * 0.8  # baseline for recycling
+        helium_recovered = 0.0
+        material_recovery = 0.0
+        time_days = 0.0
+        sustainability = 0.5
+
+        # Adjust based on decision variables
+        if plan.recycling_method == 'full_recycling':
+            cost = 5.0
+            carbon_saved = component.manufacturing_carbon * 0.8
+            material_recovery = 0.95
+            time_days = 10
+        elif plan.recycling_method == 'repurposing':
+            cost = 2.0
+            carbon_saved = component.manufacturing_carbon * 0.5
+            material_recovery = 0.7
+            time_days = 5
+        elif plan.recycling_method == 'material_recovery':
+            cost = 3.0
+            carbon_saved = component.manufacturing_carbon * 0.6
+            material_recovery = plan.material_recovery_target
+            time_days = 7
+
+        # Helium recovery
+        if plan.helium_recovery and self.helium_manager:
+            helium_recovered = self.helium_manager.calculate_recovery(component.component_id)
+            if helium_recovered > 0:
+                cost += 2.0
+                time_days += 3
+                # Carbon saving from helium recovery (avoided extraction)
+                carbon_saved += helium_recovered * 5.0  # approximate
+
+        # ML optimization might improve efficiency
+        if plan.use_ml_optimization and self.ml_selector:
+            ml_result = await self.ml_selector.select_component({
+                'age_days': (datetime.now(timezone.utc) - component.deployment_date).days,
+                'utilization': np.mean(component.utilization_history[-50:]) if component.utilization_history else 0.5,
+                'maintenance_count': len(component.maintenance_log),
+                'carbon_footprint': component.manufacturing_carbon,
+                'helium_content': component.helium_content_l,
+                'recycling_potential': 0.8,
+                'reliability': 0.9,
+                'cost_efficiency': 0.7
+            })
+            if ml_result and ml_result.get('score', 0) > 0.5:
+                material_recovery *= 1.05
+                carbon_saved *= 1.1
+                cost *= 0.95
+
+        # Sustainability score (simple calculation)
+        sustainability = (material_recovery * 0.4 +
+                         (carbon_saved / component.manufacturing_carbon) * 0.3 +
+                         (helium_recovered / component.helium_content_l if component.helium_content_l > 0 else 0) * 0.3)
+
+        plan.cost = cost
+        plan.carbon_saved_kg = carbon_saved
+        plan.helium_recovered_l = helium_recovered
+        plan.material_recovery_rate = min(1.0, material_recovery)
+        plan.time_days = time_days
+        plan.sustainability_score = min(1.0, max(0.0, sustainability))
+        return plan
+
+    async def _generate_pareto_front_for_recycling(
+        self,
+        component_id: str
+    ) -> List[MOPDPlan]:
+        """Generate Pareto front of recycling strategies."""
         component = await self.storage.get_component(component_id)
-        if component:
-            component.utilization_history.append(utilization_rate)
-            if len(component.utilization_history) > 100:
-                recent = np.mean(component.utilization_history[-100:])
-                if recent < 0.3:
-                    await self._suggest_repurposing(component)
-                elif recent > 0.9:
-                    await self._suggest_maintenance(component)
+        if not component:
+            return []
 
-    async def _suggest_repurposing(self, component: HardwareComponent):
-        logger.info(f"Suggesting repurposing for {component.component_id}: utilization below threshold")
-        new_manufacturing_carbon = component.manufacturing_carbon
-        repurposing_carbon = component.manufacturing_carbon * 0.1
-        carbon_saved = new_manufacturing_carbon - repurposing_carbon
-        if carbon_saved > 0:
-            logger.info(f"Repurposing would save {carbon_saved:.2f} kg CO2")
+        plans = await self._enumerate_recycling_strategies(component)
+        computed_plans = []
+        for plan in plans:
+            computed = await self._compute_plan_objectives(plan, component)
+            computed_plans.append(computed)
 
-    async def _suggest_maintenance(self, component: HardwareComponent):
-        logger.info(f"Suggesting maintenance for {component.component_id}: utilization above threshold")
-        component.maintenance_log.append({
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'type': 'preventive',
-            'reason': 'high_utilization'
-        })
+        # Filter dominated plans
+        objective_names = ['cost', 'carbon_saved_kg', 'helium_recovered_l', 'material_recovery_rate', 'time_days']
+        # We minimise cost and time; maximise carbon_saved, helium_recovered, material_recovery
+        pareto = []
+        for i, p_i in enumerate(computed_plans):
+            dominated = False
+            for j, p_j in enumerate(computed_plans):
+                if i == j:
+                    continue
+                # Build vectors: for max objectives, negate
+                a_vec = [
+                    p_i.cost,
+                    -p_i.carbon_saved_kg,
+                    -p_i.helium_recovered_l,
+                    -p_i.material_recovery_rate,
+                    p_i.time_days
+                ]
+                b_vec = [
+                    p_j.cost,
+                    -p_j.carbon_saved_kg,
+                    -p_j.helium_recovered_l,
+                    -p_j.material_recovery_rate,
+                    p_j.time_days
+                ]
+                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+        return pareto
 
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPlan]) -> Optional[MOPDPlan]:
+        if not pareto_front:
+            return None
+        weights = self.config.mopd.objective_weights
+        objective_names = ['cost', 'carbon_saved_kg', 'helium_recovered_l', 'material_recovery_rate', 'time_days']
+        # Normalise across front
+        max_vals = {}
+        min_vals = {}
+        for key in objective_names:
+            vals = [getattr(p, key) for p in pareto_front]
+            max_vals[key] = max(vals)
+            min_vals[key] = min(vals)
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_names}
+
+        best = None
+        best_score = -float('inf')
+        for plan in pareto_front:
+            score = 0.0
+            for key in objective_names:
+                val = getattr(plan, key)
+                if key in ['cost', 'time_days']:  # minimise
+                    norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                else:  # maximise
+                    norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 1.0 / len(objective_names))
+                score += weight * norm
+            if score > best_score:
+                best_score = score
+                best = plan
+        return best
+
+    # ============================================================================
+    # Core Recycling Method (Enhanced with MOPD)
+    # ============================================================================
     async def recycle_component(
         self,
         component_id: str,
-        use_ml_optimization: bool = False
+        use_ml_optimization: bool = False,
+        return_mopd: bool = False           # NEW: if True, return Pareto front
     ) -> Dict[str, Any]:
         component = await self.storage.get_component(component_id)
         if not component:
             return {'error': 'Component not found'}
 
-        # ML optimization (optional)
+        # MOPD: generate Pareto front if requested
+        pareto_front = None
+        best_plan = None
+        if self.config.enable_mopd and return_mopd:
+            pareto_front = await self._generate_pareto_front_for_recycling(component_id)
+            if pareto_front:
+                # Store MOPD plans
+                for plan in pareto_front:
+                    await self.storage.add_mopd_plan(plan)
+                best_plan = self._select_best_from_pareto(pareto_front)
+                if best_plan:
+                    # Override decision variables based on best plan
+                    # Use the best plan's parameters for actual recycling
+                    use_ml_optimization = best_plan.use_ml_optimization
+                    # We could also adjust other parameters, but for simplicity we just note it.
+
+        # ML optimization (if requested or from best plan)
         ml_result = None
-        if self.ml_selector and use_ml_optimization:
+        if use_ml_optimization and self.ml_selector:
             ml_result = await self.ml_selector.select_component({
                 'age_days': (datetime.now(timezone.utc) - component.deployment_date).days,
                 'utilization': np.mean(component.utilization_history[-50:]) if component.utilization_history else 0.5,
@@ -1249,6 +1459,13 @@ class CircularAnalyzer:
 
         if self.human_ai:
             record['human_ai_insights'] = await self.human_ai.get_insights()
+
+        # Add MOPD info to record
+        if self.config.enable_mopd and return_mopd:
+            if pareto_front:
+                record['mopd_pareto_front'] = [p.to_dict() for p in pareto_front]
+            if best_plan:
+                record['mopd_best_plan'] = best_plan.to_dict()
 
         logger.info(f"Recycled {component_id}: {avg_recovery:.1%} recovery, {carbon_saved:.2f} kg CO2 saved")
         return record
@@ -1367,7 +1584,7 @@ class CircularAnalyzer:
         }
 
 # ============================================================================
-# Reporter Module
+# Reporter Module (Enhanced with MOPD)
 # ============================================================================
 class CircularReporter:
     def __init__(
@@ -1449,6 +1666,11 @@ class CircularReporter:
         if self.human_ai:
             report['human_ai_insights'] = await self.human_ai.get_insights()
 
+        # MOPD summary
+        if self.config.enable_mopd:
+            mopd_plans = await self.storage.get_mopd_plans(20)
+            report['mopd_plans'] = [p.to_dict() for p in mopd_plans]
+
         return report
 
     async def get_sustainability_report(self) -> Dict[str, Any]:
@@ -1475,6 +1697,8 @@ class CircularReporter:
             recs.append("Increase federated participation for better circularity insights")
         if metrics['material_recovery_rate'] < 0.5:
             recs.append("Improve material recovery rate through better recycling processes")
+        if self.config.enable_mopd:
+            recs.append("Consider using MOPD to explore trade-offs among recycling strategies")
         return recs or ["All circularity metrics are within acceptable ranges"]
 
     async def export_telemetry(self):
@@ -1504,6 +1728,7 @@ class CircularReporter:
                     '_total_recovered': self.helium_manager._total_recovered if self.helium_manager else 0.0,
                 } if self.helium_manager else None,
                 'ml_checkpoint': self.analyzer.ml_selector.get_checkpoint() if self.analyzer.ml_selector else None,
+                'mopd_plans': [p.to_dict() for p in await self.storage.get_mopd_plans()],  # NEW
             }
             await self.persistence.save_state(state)
 
@@ -1541,14 +1766,18 @@ class CircularReporter:
                 ml_cp = state.get('ml_checkpoint')
                 if ml_cp and self.analyzer.ml_selector:
                     self.analyzer.ml_selector.load_checkpoint(ml_cp)
+                # Restore MOPD plans
+                mopd_plans = state.get('mopd_plans', [])
+                for p_dict in mopd_plans:
+                    await self.storage.add_mopd_plan(MOPDPlan.from_dict(p_dict))
 
 # ============================================================================
-# Main Controller
+# Main Controller (Enhanced with MOPD)
 # ============================================================================
 class CircularComputingManager:
     """
-    Enhanced Circular Computing Manager v4.0.0
-    Controller that orchestrates storage, analysis, reporting, and event handling.
+    Enhanced Circular Computing Manager v4.1.0
+    Controller that orchestrates storage, analysis, reporting, and MOPD support.
     """
 
     def __init__(
@@ -1642,7 +1871,7 @@ class CircularComputingManager:
         if self.config.persistence.enabled:
             asyncio.create_task(self.reporter.load_state())
 
-        logger.info("Circular Computing Manager v4.0.0 initialized")
+        logger.info("Circular Computing Manager v4.1.0 initialized with MOPD")
 
     # ============================================================================
     # Event Handling (via queue)
@@ -1890,7 +2119,7 @@ class CircularComputingManager:
                 await asyncio.sleep(120)
 
     # ============================================================================
-    # Public API – Delegated to Analyzer and Reporter
+    # Public API – Delegated to Analyzer and Reporter (Enhanced with MOPD)
     # ============================================================================
     async def register_component(
         self,
@@ -1911,8 +2140,13 @@ class CircularComputingManager:
     async def record_utilization(self, component_id: str, utilization_rate: float):
         await self.analyzer.record_utilization(component_id, utilization_rate)
 
-    async def recycle_component(self, component_id: str, use_ml_optimization: bool = False) -> Dict[str, Any]:
-        result = await self.analyzer.recycle_component(component_id, use_ml_optimization)
+    async def recycle_component(
+        self,
+        component_id: str,
+        use_ml_optimization: bool = False,
+        return_mopd: bool = False           # NEW
+    ) -> Dict[str, Any]:
+        result = await self.analyzer.recycle_component(component_id, use_ml_optimization, return_mopd)
 
         # Feed to MoE components
         if self.gating_network and self.expert_router:
@@ -1944,6 +2178,9 @@ class CircularComputingManager:
             self.telemetry.increment('recycles_performed')
             self.telemetry.gauge('carbon_saved', result.get('carbon_saved_kg', 0))
             self.telemetry.gauge('sustainability_score', await self.storage.get_metrics()['sustainability_score'])
+            if return_mopd and 'mopd_pareto_front' in result:
+                self.telemetry.increment('mopd_generations')
+                self.telemetry.histogram('mopd_pareto_front_size', len(result['mopd_pareto_front']))
 
         # Trigger workflow if sustainability score is low
         if (await self.storage.get_metrics())['sustainability_score'] < 0.4 and self.workflow_orchestrator:
@@ -1975,6 +2212,35 @@ class CircularComputingManager:
     async def train_predictive_model(self) -> Dict:
         return await self.analyzer.train_predictive_model()
 
+    # ============================================================================
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+    async def get_recycling_pareto_front(
+        self,
+        component_id: str
+    ) -> List[MOPDPlan]:
+        """
+        Generate Pareto front of recycling strategies for a given component.
+        Returns a list of MOPDPlan objects.
+        """
+        if not self.config.enable_mopd:
+            return []
+        pareto_front = await self.analyzer._generate_pareto_front_for_recycling(component_id)
+        return pareto_front
+
+    async def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.enable_mopd:
+            return {'enabled': False}
+        plans = await self.storage.get_mopd_plans(20)
+        return {
+            'enabled': True,
+            'objective_weights': self.config.mopd.objective_weights,
+            'grid_resolution': self.config.mopd.grid_resolution,
+            'total_mopd_plans': len(await self.storage.get_mopd_plans()),
+            'sample_plans': [p.to_dict() for p in plans]
+        }
+
     async def share_with_swarm(self):
         if not self.config.enable_swarm_coordination or not self.swarm_coordinator:
             return
@@ -1986,7 +2252,8 @@ class CircularComputingManager:
             'circularity_score': metrics['circularity_score'],
             'total_components': stats['total_components'],
             'material_recovery_rate': metrics['material_recovery_rate'],
-            'helium_position': self.helium_manager.get_position() if self.helium_manager else {}
+            'helium_position': self.helium_manager.get_position() if self.helium_manager else {},
+            'mopd_enabled': self.config.enable_mopd,
         }
         await self.swarm_coordinator.share_predictions(payload)
 
@@ -2061,6 +2328,7 @@ class CircularComputingManager:
             'self_healing_enabled': self.config.self_healing.enabled,
             'swarm_coordination_active': self.config.enable_swarm_coordination,
             'persistence_enabled': self.config.persistence.enabled,
+            'mopd_enabled': self.config.enable_mopd,
         }
 
     # ============================================================================
