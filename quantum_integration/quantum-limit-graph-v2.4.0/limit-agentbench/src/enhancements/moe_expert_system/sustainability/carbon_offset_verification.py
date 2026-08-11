@@ -1,9 +1,9 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/automated_carbon_offset_verification.py
-# Enhanced version v4.0.0 – Refactored for maintainability, concurrency, and resilience
+# Enhanced version v4.1.0 – Refactored for maintainability, concurrency, resilience, and MOPD support.
 
 """
-Enhanced Automated Carbon Offset Verification System v4.0.0
-Modular, event‑driven, and robust implementation.
+Enhanced Automated Carbon Offset Verification System v4.1.0
+Modular, event‑driven, robust, and MOPD‑aware implementation.
 """
 
 import asyncio
@@ -90,7 +90,7 @@ class HeliumProvider:
     def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Enums and Data Classes
+# Enums and Data Classes (Enhanced with MOPD)
 # ============================================================================
 class OffsetRegistry(Enum):
     VERRA = "verra"
@@ -203,7 +203,55 @@ class RealTimeCarbonAccount:
     budget_status: str  # "compliant", "warning", "exceeded"
 
 # ============================================================================
-# Configuration Dataclass with Sub‑Configs
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPlan:
+    """Represents a carbon offset strategy with its objective vector."""
+    # Decision variables
+    credit_id: str
+    registry: OffsetRegistry
+    project_type: ProjectType
+    amount_to_retire_kg: float
+    use_ml_verification: bool
+    verify_satellite: bool
+    verify_sensors: bool
+    verify_additionality: bool
+    # Objectives (to be minimised/maximised)
+    cost: float
+    carbon_savings_kg: float
+    helium_impact_l: float
+    verification_confidence: float
+    verification_time_ms: float
+    sustainability_score: float
+    # Scalarised score (will be computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPlan':
+        return cls(**data)
+
+@dataclass
+class MOPDConfig:
+    """Configuration for MOPD analysis."""
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        'cost': 0.2,
+        'carbon_savings': 0.3,
+        'helium_impact': 0.2,
+        'verification_confidence': 0.15,
+        'verification_time': 0.15,
+    })
+    grid_resolution: int = 5
+    enable_cost_benefit: bool = True
+    enable_predictive: bool = True
+    enable_quantum: bool = True
+
+# ============================================================================
+# Configuration Dataclass with Sub‑Configs (Enhanced with MOPD)
 # ============================================================================
 @dataclass
 class CarbonConfig:
@@ -275,6 +323,7 @@ class CarbonOffsetConfig:
     enable_cost_benefit: bool = True
     enable_time_tick_engine: bool = True
     enable_quantum_bridge: bool = True
+    enable_mopd: bool = True               # NEW: MOPD feature flag
 
     # Sub‑configs
     carbon: CarbonConfig = field(default_factory=CarbonConfig)
@@ -285,6 +334,7 @@ class CarbonOffsetConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)      # NEW: MOPD sub‑config
 
     # Budgets
     carbon_budget_kg: float = 1000.0
@@ -339,7 +389,6 @@ class CarbonIntensityManager:
             self.region = region
 
         async def _fetch():
-            # Cache check
             cache_key = f"{self.region}_{datetime.now(timezone.utc).hour}"
             if (self.last_update and
                 (datetime.now(timezone.utc) - self.last_update).seconds < self.config.update_interval_seconds and
@@ -370,7 +419,6 @@ class CarbonIntensityManager:
                     logger.error(f"Carbon API error: {e}, attempt {attempt+1}")
                 await asyncio.sleep(2 ** attempt)
 
-            # Fallback
             fallback_intensities = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500}
             intensity = fallback_intensities.get(self.region, 400)
             self.carbon_intensity = intensity
@@ -452,7 +500,6 @@ class HeliumEmissionTracker:
         }
 
     def calculate_helium_offset_from_carbon(self, carbon_credit_kg: float) -> float:
-        # Assuming 1 kg CO2 offset allows for 0.05 L helium usage
         return carbon_credit_kg * 0.05
 
 # ============================================================================
@@ -1191,7 +1238,7 @@ class CarbonOffsetPersistenceManager:
         self.config = config
         self.path = config.path
         self._lock = asyncio.Lock()
-        self._version = 1
+        self._version = 2  # Bumped for MOPD
         logger.info(f"CarbonOffsetPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
@@ -1314,6 +1361,7 @@ class CarbonOffsetStorage:
     def __init__(self):
         self.verification_records: List[Dict] = []
         self.sustainability_score = 0.0
+        self.mopd_plans: List[MOPDPlan] = []  # NEW: store MOPD plans
         self._lock = asyncio.Lock()
 
     async def add_record(self, record: Dict):
@@ -1321,6 +1369,18 @@ class CarbonOffsetStorage:
             self.verification_records.append(record)
             if len(self.verification_records) > 10000:
                 self.verification_records = self.verification_records[-10000:]
+
+    async def add_mopd_plan(self, plan: MOPDPlan):
+        async with self._lock:
+            self.mopd_plans.append(plan)
+            if len(self.mopd_plans) > 10000:
+                self.mopd_plans = self.mopd_plans[-10000:]
+
+    async def get_mopd_plans(self, limit: Optional[int] = None) -> List[MOPDPlan]:
+        async with self._lock:
+            if limit is not None:
+                return self.mopd_plans[-limit:]
+            return self.mopd_plans.copy()
 
     async def get_records(self, limit: Optional[int] = None) -> List[Dict]:
         async with self._lock:
@@ -1349,7 +1409,7 @@ class CarbonOffsetStorage:
             }
 
 # ============================================================================
-# Analyzer Module
+# Analyzer Module (Enhanced with MOPD)
 # ============================================================================
 class CarbonOffsetAnalyzer:
     def __init__(
@@ -1380,7 +1440,6 @@ class CarbonOffsetAnalyzer:
         self.accountant = accountant
         self.human_ai = human_ai
 
-        # Circuit breakers for external services
         self._blockchain_circuit = CircuitBreaker("blockchain_api")
         self._satellite_circuit = CircuitBreaker("satellite_api")
         self._sensor_circuit = CircuitBreaker("sensor_api")
@@ -1388,6 +1447,185 @@ class CarbonOffsetAnalyzer:
 
         self._lock = asyncio.Lock()
 
+    # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    async def _enumerate_strategies(
+        self,
+        credit_id: str,
+        registry: OffsetRegistry,
+        project_id: str,
+        project_location: Dict[str, float],
+        project_area_km2: float,
+        project_type: Optional[ProjectType] = None
+    ) -> List[MOPDPlan]:
+        """Generate all feasible offset strategies."""
+        # Decision variables:
+        # - amount_to_retire_kg: sample a few values around available
+        # - use_ml_verification: True/False
+        # - verify_satellite: True/False
+        # - verify_sensors: True/False
+        # - verify_additionality: True/False
+
+        available_amount = 1000.0  # assume from credit
+        amount_options = [available_amount * 0.25, available_amount * 0.5, available_amount * 0.75, available_amount * 1.0]
+
+        use_ml_options = [True, False]
+        sat_options = [True, False]
+        sensor_options = [True, False]
+        add_options = [True, False]
+
+        plans = []
+        for amount in amount_options:
+            for use_ml in use_ml_options:
+                for sat in sat_options:
+                    for sensor in sensor_options:
+                        for add in add_options:
+                            plan = MOPDPlan(
+                                credit_id=credit_id,
+                                registry=registry,
+                                project_type=project_type or ProjectType.REFORESTATION,
+                                amount_to_retire_kg=amount,
+                                use_ml_verification=use_ml,
+                                verify_satellite=sat,
+                                verify_sensors=sensor,
+                                verify_additionality=add,
+                                cost=0.0,
+                                carbon_savings_kg=0.0,
+                                helium_impact_l=0.0,
+                                verification_confidence=0.0,
+                                verification_time_ms=0.0,
+                                sustainability_score=0.0
+                            )
+                            plans.append(plan)
+        return plans
+
+    async def _compute_plan_objectives(self, plan: MOPDPlan) -> MOPDPlan:
+        """Calculate cost, carbon savings, helium impact, confidence, time for a given plan."""
+        # Base assumptions
+        cost = 0.0
+        carbon_savings = plan.amount_to_retire_kg
+        helium_impact = -plan.amount_to_retire_kg * 0.05  # negative means offset (good)
+        confidence = 0.5
+        time_ms = 1000.0
+
+        # Adjust based on verification methods
+        if plan.verify_satellite:
+            cost += 10.0
+            confidence += 0.15
+            time_ms += 2000.0
+        if plan.verify_sensors:
+            cost += 5.0
+            confidence += 0.1
+            time_ms += 1000.0
+        if plan.verify_additionality:
+            cost += 20.0
+            confidence += 0.2
+            time_ms += 3000.0
+        if plan.use_ml_verification:
+            cost += 2.0
+            confidence += 0.1
+            time_ms += 500.0
+
+        # Clamp confidence
+        confidence = min(1.0, confidence)
+
+        # If no verification, confidence is low
+        if not plan.verify_satellite and not plan.verify_sensors and not plan.verify_additionality and not plan.use_ml_verification:
+            confidence = 0.3
+
+        plan.cost = cost
+        plan.carbon_savings_kg = carbon_savings
+        plan.helium_impact_l = helium_impact
+        plan.verification_confidence = confidence
+        plan.verification_time_ms = time_ms
+        plan.sustainability_score = confidence * 0.7 + (1.0 - helium_impact / 10) * 0.3
+        return plan
+
+    async def _generate_pareto_front_for_offset(
+        self,
+        credit_id: str,
+        registry: OffsetRegistry,
+        project_id: str,
+        project_location: Dict[str, float],
+        project_area_km2: float,
+        project_type: Optional[ProjectType] = None
+    ) -> List[MOPDPlan]:
+        """Generate Pareto front of offset strategies."""
+        plans = await self._enumerate_strategies(
+            credit_id, registry, project_id, project_location, project_area_km2, project_type
+        )
+        computed_plans = []
+        for plan in plans:
+            computed = await self._compute_plan_objectives(plan)
+            computed_plans.append(computed)
+
+        # Filter dominated plans
+        objective_names = ['cost', 'carbon_savings_kg', 'helium_impact_l', 'verification_confidence', 'verification_time_ms']
+        # We minimise cost, helium_impact, verification_time; maximise carbon_savings, verification_confidence
+        pareto = []
+        for i, p_i in enumerate(computed_plans):
+            dominated = False
+            for j, p_j in enumerate(computed_plans):
+                if i == j:
+                    continue
+                # Build vectors: for maximisation, we negate
+                a_vec = [
+                    p_i.cost,
+                    -p_i.carbon_savings_kg,
+                    p_i.helium_impact_l,
+                    -p_i.verification_confidence,
+                    p_i.verification_time_ms
+                ]
+                b_vec = [
+                    p_j.cost,
+                    -p_j.carbon_savings_kg,
+                    p_j.helium_impact_l,
+                    -p_j.verification_confidence,
+                    p_j.verification_time_ms
+                ]
+                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+        return pareto
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPlan]) -> Optional[MOPDPlan]:
+        if not pareto_front:
+            return None
+        weights = self.config.mopd.objective_weights
+        objective_names = ['cost', 'carbon_savings_kg', 'helium_impact_l', 'verification_confidence', 'verification_time_ms']
+        # Normalise across front
+        max_vals = {}
+        min_vals = {}
+        for key in objective_names:
+            vals = [getattr(p, key) for p in pareto_front]
+            max_vals[key] = max(vals)
+            min_vals[key] = min(vals)
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_names}
+
+        best = None
+        best_score = -float('inf')
+        for plan in pareto_front:
+            score = 0.0
+            for key in objective_names:
+                val = getattr(plan, key)
+                # For objectives to minimise, we invert: 1 - (val - min)/range
+                if key in ['cost', 'helium_impact_l', 'verification_time_ms']:
+                    norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                else:  # maximise
+                    norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 1.0 / len(objective_names))
+                score += weight * norm
+            if score > best_score:
+                best_score = score
+                best = plan
+        return best
+
+    # ============================================================================
+    # Core Verification Method (Enhanced with MOPD)
+    # ============================================================================
     async def verify_and_retire(
         self,
         credit_id: str,
@@ -1397,7 +1635,8 @@ class CarbonOffsetAnalyzer:
         project_area_km2: float,
         amount_to_retire_kg: float,
         project_type: Optional[ProjectType] = None,
-        use_ml_verification: bool = False
+        use_ml_verification: bool = False,
+        return_mopd: bool = False           # NEW: if True, return Pareto front
     ) -> Dict[str, Any]:
         result = {
             'credit_id': credit_id,
@@ -1570,6 +1809,19 @@ class CarbonOffsetAnalyzer:
             insights = self.human_ai.get_insights()
             result['human_ai_insights'] = insights
 
+        # MOPD: generate Pareto front if requested
+        if self.config.enable_mopd and return_mopd:
+            pareto_front = await self._generate_pareto_front_for_offset(
+                credit_id, registry, project_id, project_location, project_area_km2, project_type
+            )
+            # Store MOPD plans
+            for plan in pareto_front:
+                await self.storage.add_mopd_plan(plan)
+            result['mopd_pareto_front'] = [p.to_dict() for p in pareto_front]
+            best_plan = self._select_best_from_pareto(pareto_front)
+            if best_plan:
+                result['mopd_best_plan'] = best_plan.to_dict()
+
         # Store record
         await self.storage.add_record(result)
 
@@ -1625,7 +1877,7 @@ class CarbonOffsetAnalyzer:
         return await self.predictive.train()
 
 # ============================================================================
-# Reporter Module
+# Reporter Module (Enhanced with MOPD)
 # ============================================================================
 class CarbonOffsetReporter:
     def __init__(
@@ -1699,6 +1951,11 @@ class CarbonOffsetReporter:
         if self.human_ai:
             summary['human_ai_insights'] = await self.human_ai.get_insights()
 
+        # MOPD summary
+        if self.config.enable_mopd:
+            mopd_plans = await self.storage.get_mopd_plans(20)
+            summary['mopd_plans'] = [p.to_dict() for p in mopd_plans]
+
         return summary
 
     async def get_sustainability_report(self) -> Dict[str, Any]:
@@ -1728,6 +1985,9 @@ class CarbonOffsetReporter:
 
         if self.federated and len(self.federated.participants) < 2:
             recs.append("Increase federated participation for better verification")
+
+        if self.config.enable_mopd:
+            recs.append("Consider using MOPD to explore trade-offs in verification strategies")
 
         return recs or ["All sustainability metrics are within acceptable ranges"]
 
@@ -1760,6 +2020,7 @@ class CarbonOffsetReporter:
                     '_total_offsets': self.helium_tracker._total_offsets if self.helium_tracker else 0.0,
                 },
                 'ml_checkpoint': self.analyzer.ml_verifier.get_checkpoint() if self.analyzer.ml_verifier else None,
+                'mopd_plans': [p.to_dict() for p in await self.storage.get_mopd_plans()],  # NEW
             }
             await self.persistence.save_state(state)
 
@@ -1800,13 +2061,18 @@ class CarbonOffsetReporter:
                 if ml_cp and self.analyzer.ml_verifier:
                     self.analyzer.ml_verifier.load_checkpoint(ml_cp)
 
+                # Restore MOPD plans
+                mopd_plans = state.get('mopd_plans', [])
+                for p_dict in mopd_plans:
+                    await self.storage.add_mopd_plan(MOPDPlan.from_dict(p_dict))
+
 # ============================================================================
-# Main Controller
+# Main Controller (Enhanced with MOPD)
 # ============================================================================
 class AutomatedCarbonOffsetVerification:
     """
-    Enhanced Automated Carbon Offset Verification System v4.0.0
-    Controller that orchestrates storage, analysis, reporting, and event handling.
+    Enhanced Automated Carbon Offset Verification System v4.1.0
+    Controller that orchestrates storage, analysis, reporting, and MOPD support.
     """
 
     def __init__(
@@ -1918,7 +2184,7 @@ class AutomatedCarbonOffsetVerification:
         if self.config.persistence.enabled:
             asyncio.create_task(self.reporter.load_state())
 
-        logger.info("Automated Carbon Offset Verification System v4.0.0 initialized")
+        logger.info("Automated Carbon Offset Verification System v4.1.0 initialized with MOPD")
 
     # ============================================================================
     # Event Handling (via queue)
@@ -1994,56 +2260,47 @@ class AutomatedCarbonOffsetVerification:
             logger.info("Configuration reloaded")
 
     async def _on_token_update(self, event: BioEvent):
-        pass  # optional
+        pass
 
     async def _on_health_update(self, event: BioEvent):
         self.health_status = event.data.get('status', 'healthy')
 
     async def _on_anomaly_detected(self, event: BioEvent):
         if event.data.get('metric') == 'carbon_intensity':
-            # Increase verification stringency
-            pass  # placeholder
+            pass
 
     # ============================================================================
     # Background Tasks (cancellable)
     # ============================================================================
     def _start_background_tasks(self):
-        # Event consumer
         if self.config.enable_event_driven:
             self._event_consumer_task = asyncio.create_task(self._event_consumer())
             self._background_tasks.append(self._event_consumer_task)
 
-        # Carbon update loop
         if self.carbon_manager:
             t = asyncio.create_task(self._carbon_update_loop())
             self._background_tasks.append(t)
 
-        # Predictive training loop
         if self.predictive:
             t = asyncio.create_task(self._predictive_update_loop())
             self._background_tasks.append(t)
 
-        # ML training loop
         if self.ml_verifier:
             t = asyncio.create_task(self._ml_training_loop())
             self._background_tasks.append(t)
 
-        # Federated sync
         if self.federated:
             t = asyncio.create_task(self._federated_sync_loop())
             self._background_tasks.append(t)
 
-        # Telemetry export
         if self.telemetry:
             t = asyncio.create_task(self._telemetry_export_loop())
             self._background_tasks.append(t)
 
-        # Persistence save
         if self.persistence:
             t = asyncio.create_task(self._persistence_save_loop())
             self._background_tasks.append(t)
 
-        # Swarm update
         if self.config.enable_swarm_coordination and self.swarm_coordinator:
             t = asyncio.create_task(self._swarm_update_loop())
             self._background_tasks.append(t)
@@ -2164,7 +2421,7 @@ class AutomatedCarbonOffsetVerification:
                 await asyncio.sleep(120)
 
     # ============================================================================
-    # Public API
+    # Public API (Enhanced with MOPD)
     # ============================================================================
     async def verify_and_retire_offset(
         self,
@@ -2175,11 +2432,12 @@ class AutomatedCarbonOffsetVerification:
         project_area_km2: float,
         amount_to_retire_kg: float,
         project_type: Optional[ProjectType] = None,
-        use_ml_verification: bool = False
+        use_ml_verification: bool = False,
+        return_mopd: bool = False           # NEW
     ) -> Dict[str, Any]:
         result = await self.analyzer.verify_and_retire(
             credit_id, registry, project_id, project_location, project_area_km2,
-            amount_to_retire_kg, project_type, use_ml_verification
+            amount_to_retire_kg, project_type, use_ml_verification, return_mopd
         )
 
         # Trigger workflows on critical conditions
@@ -2216,6 +2474,9 @@ class AutomatedCarbonOffsetVerification:
             if result.get('overall_success'):
                 self.telemetry.increment('verifications_success')
             self.telemetry.gauge('sustainability_score', await self.storage.get_sustainability_score())
+            if return_mopd and 'mopd_pareto_front' in result:
+                self.telemetry.increment('mopd_generations')
+                self.telemetry.histogram('mopd_pareto_front_size', len(result['mopd_pareto_front']))
 
         logger.info(
             f"Offset verification complete: {credit_id} - "
@@ -2237,6 +2498,42 @@ class AutomatedCarbonOffsetVerification:
     async def train_predictive_model(self) -> Dict:
         return await self.analyzer.train_predictive_model()
 
+    # ============================================================================
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+    async def get_offset_pareto_front(
+        self,
+        credit_id: str,
+        registry: OffsetRegistry,
+        project_id: str,
+        project_location: Dict[str, float],
+        project_area_km2: float,
+        project_type: Optional[ProjectType] = None
+    ) -> List[MOPDPlan]:
+        """
+        Generate Pareto front of offset strategies without actually retiring.
+        Returns a list of MOPDPlan objects.
+        """
+        if not self.config.enable_mopd:
+            return []
+        pareto_front = await self.analyzer._generate_pareto_front_for_offset(
+            credit_id, registry, project_id, project_location, project_area_km2, project_type
+        )
+        return pareto_front
+
+    async def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.enable_mopd:
+            return {'enabled': False}
+        plans = await self.storage.get_mopd_plans(20)
+        return {
+            'enabled': True,
+            'objective_weights': self.config.mopd.objective_weights,
+            'grid_resolution': self.config.mopd.grid_resolution,
+            'total_mopd_plans': len(await self.storage.get_mopd_plans()),
+            'sample_plans': [p.to_dict() for p in plans]
+        }
+
     async def share_with_swarm(self):
         if not self.config.enable_swarm_coordination or not self.swarm_coordinator:
             return
@@ -2247,7 +2544,8 @@ class AutomatedCarbonOffsetVerification:
             'total_verifications': stats['total'],
             'success_rate': stats['success_rate'],
             'carbon_position': self.accountant.get_current_position().__dict__,
-            'helium_position': self.helium_tracker.get_position() if self.helium_tracker else {}
+            'helium_position': self.helium_tracker.get_position() if self.helium_tracker else {},
+            'mopd_enabled': self.config.enable_mopd,
         }
         await self.swarm_coordinator.share_predictions(payload)
 
@@ -2275,26 +2573,19 @@ class AutomatedCarbonOffsetVerification:
             logger.warning("Self‑healing disabled")
             return
 
-        # Reset budgets
         self.accountant.carbon_budget_kg = self.config.carbon_budget_kg
         if self.helium_tracker:
             self.helium_tracker.budget_l = self.config.helium_budget_l
 
-        # Reset sustainability score
         await self.storage.update_sustainability_score(0.0)
 
-        # Trim verification records (keep last 10)
         records = await self.storage.get_records()
         if len(records) > 10:
-            # We need to clear and re-add the last 10
             async with self.storage._lock:
                 self.storage.verification_records = records[-10:]
 
-        # Reset health status
         self.health_status = "healthy"
         self.last_error = None
-
-        # Save state
         await self.reporter.save_state()
         logger.info("Self‑healing completed")
 
@@ -2314,6 +2605,7 @@ class AutomatedCarbonOffsetVerification:
             'event_driven_active': self.config.enable_event_driven,
             'self_healing_enabled': self.config.self_healing.enabled,
             'persistence_enabled': self.config.persistence.enabled,
+            'mopd_enabled': self.config.enable_mopd,
         }
 
     # ============================================================================
@@ -2321,22 +2613,18 @@ class AutomatedCarbonOffsetVerification:
     # ============================================================================
     async def shutdown(self):
         logger.info("Shutting down Automated Carbon Offset Verification System")
-        # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
-        # Stop accounting loops
         if self.accountant:
             await self.accountant.stop()
         if self.helium_tracker:
             await self.helium_tracker.stop()
 
-        # Save final state
         if self.persistence:
             await self.reporter.save_state()
 
-        # Close external sessions
         if self.carbon_manager:
             await self.carbon_manager.close()
         if self.federated:
