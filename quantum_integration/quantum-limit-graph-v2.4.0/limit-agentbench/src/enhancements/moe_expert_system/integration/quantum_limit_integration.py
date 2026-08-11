@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-Enhanced Quantum LIMIT Graph Integrator v7.1.0
-Complete Green Agent Implementation with full bio‑inspired core integration.
+Enhanced Quantum LIMIT Graph Integrator v7.2.0
+Complete Green Agent Implementation with full bio‑inspired core integration and MOPD support.
 
-Enhancements over v7.0.0:
-- Replaced insecure pickle with JSON + zlib persistence and custom encoders/decoders.
-- Fixed async anti-patterns: no asyncio.run() inside sync methods.
-- Added comprehensive error handling and fallbacks.
-- Unified circuit breaker for all external calls.
-- Made magic numbers configurable.
-- Added locks for shared state.
-- Removed dead code and unused imports.
-- Refactored validate_expert_plan into smaller modular functions.
-- Added type hints and docstrings.
-- Improved persistence with versioning and migration stubs.
-- Enhanced telemetry with more metrics.
-- Added unit test stubs.
+Enhancements over v7.1.0:
+- Added MOPD (Multi‑Objective Pareto Decision) framework.
+- New MOPDPlan dataclass to represent quantum execution strategies.
+- Pareto front generation for quantum job execution alternatives.
+- Selection of best plan via scalarisation with configurable weights.
+- Extended propose to return MOPDProposal with Pareto front.
+- Added get_work_pareto_front method.
+- Telemetry tracks MOPD usage.
+- Full backward compatibility.
 """
 
 import asyncio
@@ -113,7 +109,7 @@ except ImportError as e:
             return await func(*args, **kwargs)
 
 # ============================================================================
-# Configuration Dataclass (Enhanced with magic numbers)
+# Configuration Dataclass (Enhanced with MOPD)
 # ============================================================================
 @dataclass
 class QuantumLimitIntegratorConfig:
@@ -136,6 +132,7 @@ class QuantumLimitIntegratorConfig:
     enable_telemetry: bool = True
     enable_persistence: bool = True
     enable_event_driven: bool = True
+    enable_mopd: bool = True               # NEW: MOPD feature flag
 
     # Tunable parameters
     carbon_api_region: str = "us-east"
@@ -174,6 +171,16 @@ class QuantumLimitIntegratorConfig:
     carbon_price_base: float = 50.0
     helium_price_base: float = 0.5
     harvester_confidence_alpha: float = 0.1
+
+    # MOPD-specific parameters (NEW)
+    mopd_objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        'carbon': 0.3,
+        'helium': 0.2,
+        'cost': 0.2,
+        'latency': 0.15,
+        'success_prob': 0.15,
+    })
+    mopd_grid_resolution: int = 5   # number of discrete alternatives for continuous variables
 
     def __post_init__(self):
         for key, value in self.__dict__.items():
@@ -338,6 +345,35 @@ class VisualizationData:
     metrics: Dict[str, float] = field(default_factory=dict)
 
 # ============================================================================
+# MOPDPlan - NEW Dataclass for Pareto execution plans
+# ============================================================================
+@dataclass
+class MOPDPlan:
+    """Represents a quantum execution strategy with its computed objectives."""
+    # Decision variables
+    backend: QuantumBackend
+    error_mitigation: QuantumErrorMitigation
+    shots: int
+    priority: int
+    use_quantum_bridge: bool
+    token_allocation: float
+    # Objectives (to be minimised/maximised)
+    carbon_kg: float = 0.0
+    helium_units: float = 0.0
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    success_probability: float = 0.0
+    # Scalarised score (will be computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPlan':
+        return cls(**data)
+
+# ============================================================================
 # Serialization helpers (JSON encoders/decoders)
 # ============================================================================
 def json_encoder(obj):
@@ -350,7 +386,7 @@ def json_encoder(obj):
         return list(obj)
     if hasattr(obj, 'to_dict'):
         return obj.to_dict()
-    if isinstance(obj, (QuantumResource, QuantumCircuitJob, AdaptiveBoundary, QuantumNode, VisualizationData)):
+    if isinstance(obj, (QuantumResource, QuantumCircuitJob, AdaptiveBoundary, QuantumNode, VisualizationData, MOPDPlan)):
         return asdict(obj)
     # Fallback for other objects
     try:
@@ -376,7 +412,7 @@ class QuantumLimitPersistence:
     def __init__(self, path: str):
         self.path = path
         self._lock = asyncio.Lock()
-        self._version = "7.1.0"
+        self._version = "7.2.0"  # Updated version
 
     async def save(self, state: Dict[str, Any]) -> bool:
         async with self._lock:
@@ -553,7 +589,7 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Enhanced Predictive Limit Analyzer (unchanged, but improved)
+# Enhanced Predictive Limit Analyzer (unchanged)
 # ============================================================================
 class PredictiveLimitAnalyzer:
     def __init__(self, config: QuantumLimitIntegratorConfig, history_window: int = 100):
@@ -1423,11 +1459,11 @@ class LimitCrossDomainTransfer:
         return {'total_transfers': total_transfers, 'domain_pairs': domain_pairs, 'knowledge_types': list(self.knowledge_base.keys())}
 
 # ============================================================================
-# Enhanced Quantum Limit Graph Integrator (Main Class) – v7.1.0
+# Enhanced Quantum Limit Graph Integrator (Main Class) – v7.2.0 with MOPD
 # ============================================================================
 class QuantumLimitGraphIntegrator(BaseExpert):
     """
-    Enhanced Quantum LIMIT Graph Integrator v7.1.0 - Complete Green Agent Implementation
+    Enhanced Quantum LIMIT Graph Integrator v7.2.0 - Complete Green Agent Implementation with MOPD.
     """
 
     def __init__(
@@ -1503,6 +1539,7 @@ class QuantumLimitGraphIntegrator(BaseExpert):
         self.enable_telemetry = self.config.enable_telemetry
         self.enable_persistence = self.config.enable_persistence
         self.enable_event_driven = self.config.enable_event_driven
+        self.enable_mopd = self.config.enable_mopd               # NEW
 
         # Unified circuit breaker for external calls
         self._circuit_breaker = CircuitBreaker(
@@ -1580,8 +1617,9 @@ class QuantumLimitGraphIntegrator(BaseExpert):
         self._start_background_tasks()
 
         logger.info(
-            f"Quantum LIMIT Graph Integrator v7.1.0 initialized: "
+            f"Quantum LIMIT Graph Integrator v7.2.0 initialized: "
             f"expert_id={self.expert_id}, "
+            f"mopd={self.enable_mopd}, "
             f"bio_integration={self.enable_bio_integration}, "
             f"carbon_intensity={self.enable_carbon_intensity}, "
             f"predictive={self.enable_predictive}, "
@@ -2018,11 +2056,197 @@ class QuantumLimitGraphIntegrator(BaseExpert):
         pass
 
     # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    async def _enumerate_execution_plans(
+        self,
+        job_requirements: Dict[str, Any]
+    ) -> List[MOPDPlan]:
+        """Generate all feasible quantum execution plans."""
+        # Decision variables:
+        # - backend: available backends
+        # - error_mitigation: options
+        # - shots: sample a few values
+        # - priority: 0,1,2
+        # - use_quantum_bridge: True/False if available
+        # - token_allocation: sample around required amount
+
+        available_backends = [b for b in self.backends.keys() if self.backends[b].is_available]
+        if not available_backends:
+            available_backends = [QuantumBackend.SIMULATOR]
+
+        error_mitigation_options = [QuantumErrorMitigation.NONE]
+        if self.enable_error_mitigation:
+            error_mitigation_options = list(QuantumErrorMitigation)
+
+        shots_options = [100, 500, 1000, 2000]
+        priority_options = [0, 1, 2]
+        use_quantum_bridge_options = [False]
+        if self.quantum_bridge and self.enable_mopd:
+            use_quantum_bridge_options = [False, True]
+
+        # Token allocation: base amount based on job complexity
+        base_tokens = job_requirements.get('estimated_energy_kwh', 0.001) * 1000 * self.config.quantum_cost_multiplier
+        token_allocation_options = [base_tokens * 0.5, base_tokens, base_tokens * 2.0]
+
+        plans = []
+        for backend in available_backends:
+            for em in error_mitigation_options:
+                for shots in shots_options:
+                    for priority in priority_options:
+                        for use_quantum_bridge in use_quantum_bridge_options:
+                            for token_alloc in token_allocation_options:
+                                plan = MOPDPlan(
+                                    backend=backend,
+                                    error_mitigation=em,
+                                    shots=shots,
+                                    priority=priority,
+                                    use_quantum_bridge=use_quantum_bridge,
+                                    token_allocation=token_alloc
+                                )
+                                plans.append(plan)
+        return plans
+
+    async def _compute_plan_objectives(self, plan: MOPDPlan, job_requirements: Dict[str, Any]) -> MOPDPlan:
+        """Calculate carbon, helium, cost, latency, success probability for a given plan."""
+        # Base values (simulator, no error mitigation, 1000 shots, priority 0)
+        carbon_kg = 0.001
+        helium_units = 0.0001
+        cost_usd = 1.0
+        latency_ms = 100.0
+        success_prob = 0.95
+
+        # Adjust based on backend
+        backend_resource = self.backends.get(plan.backend)
+        if backend_resource:
+            carbon_kg = backend_resource.carbon_per_second * 1.0  # per second basis, we'll scale
+            helium_units = backend_resource.helium_per_second * 1.0
+            cost_usd = backend_resource.total_token_cost_per_second * 1.0
+            latency_ms = backend_resource.estimated_wait_seconds * 1000 + 100  # wait + execution
+            success_prob = 1.0 - backend_resource.gate_error_rate * 10
+
+        # Adjust for error mitigation
+        if plan.error_mitigation == QuantumErrorMitigation.ZNE:
+            latency_ms *= 1.5
+            cost_usd *= 1.2
+            success_prob = min(1.0, success_prob * 1.05)
+        elif plan.error_mitigation == QuantumErrorMitigation.PEC:
+            latency_ms *= 2.0
+            cost_usd *= 1.5
+            success_prob = min(1.0, success_prob * 1.1)
+        elif plan.error_mitigation == QuantumErrorMitigation.DD:
+            latency_ms *= 1.2
+            cost_usd *= 1.1
+            success_prob = min(1.0, success_prob * 1.03)
+        elif plan.error_mitigation == QuantumErrorMitigation.M3:
+            latency_ms *= 1.1
+            cost_usd *= 1.1
+            success_prob = min(1.0, success_prob * 1.02)
+
+        # Shots
+        if plan.shots > 1000:
+            latency_ms *= plan.shots / 1000
+            cost_usd *= plan.shots / 1000
+            carbon_kg *= plan.shots / 1000
+            helium_units *= plan.shots / 1000
+            success_prob = min(1.0, success_prob * (1.0 + 0.01 * (plan.shots / 1000 - 1)))
+
+        # Priority: higher priority means faster but more cost
+        if plan.priority > 0:
+            latency_ms *= (1.0 - 0.1 * plan.priority)
+            cost_usd *= (1.0 + 0.2 * plan.priority)
+            success_prob = min(1.0, success_prob * (1.0 + 0.02 * plan.priority))
+
+        # Quantum bridge: if used, can reduce latency and cost but may have overhead
+        if plan.use_quantum_bridge:
+            latency_ms *= 0.8
+            cost_usd *= 0.9
+            success_prob = min(1.0, success_prob * 0.98)
+
+        # Token allocation: affects cost and success
+        cost_usd += plan.token_allocation * 0.1
+        success_prob += 0.01 * (plan.token_allocation / (self.config.token_normalization_factor / 10))
+
+        # Clamp values
+        plan.carbon_kg = max(0, carbon_kg)
+        plan.helium_units = max(0, helium_units)
+        plan.cost_usd = max(0, cost_usd)
+        plan.latency_ms = max(0, latency_ms)
+        plan.success_probability = min(1.0, max(0.0, success_prob))
+        return plan
+
+    async def _generate_pareto_front_for_quantum_job(
+        self,
+        job_requirements: Dict[str, Any]
+    ) -> List[MOPDPlan]:
+        """Generate a Pareto‑optimal set of execution plans for a quantum job."""
+        plans = await self._enumerate_execution_plans(job_requirements)
+        computed_plans = []
+        for plan in plans:
+            computed = await self._compute_plan_objectives(plan, job_requirements)
+            computed_plans.append(computed)
+
+        # Filter dominated plans
+        objective_keys = ['carbon_kg', 'helium_units', 'cost_usd', 'latency_ms', 'success_probability']
+        pareto = []
+        for i, plan_a in enumerate(computed_plans):
+            dominated = False
+            for j, plan_b in enumerate(computed_plans):
+                if i == j:
+                    continue
+                # For success_probability, higher is better -> we negate for dominance
+                a_vec = [plan_a.carbon_kg, plan_a.helium_units, plan_a.cost_usd, plan_a.latency_ms, -plan_a.success_probability]
+                b_vec = [plan_b.carbon_kg, plan_b.helium_units, plan_b.cost_usd, plan_b.latency_ms, -plan_b.success_probability]
+                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(plan_a)
+        return pareto
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPlan]) -> Optional[MOPDPlan]:
+        """Select the best plan using scalarisation with current MOPD weights."""
+        if not pareto_front:
+            return None
+        weights = self.config.mopd_objective_weights
+        # Normalise objectives across Pareto front
+        carbon_vals = [p.carbon_kg for p in pareto_front]
+        helium_vals = [p.helium_units for p in pareto_front]
+        cost_vals = [p.cost_usd for p in pareto_front]
+        latency_vals = [p.latency_ms for p in pareto_front]
+        success_vals = [p.success_probability for p in pareto_front]
+
+        max_carbon = max(carbon_vals) if carbon_vals else 1
+        max_helium = max(helium_vals) if helium_vals else 1
+        max_cost = max(cost_vals) if cost_vals else 1
+        max_latency = max(latency_vals) if latency_vals else 1
+        max_success = max(success_vals) if success_vals else 1
+
+        best = None
+        best_score = -float('inf')
+        for plan in pareto_front:
+            carbon_norm = 1 - (plan.carbon_kg / max_carbon) if max_carbon > 0 else 0
+            helium_norm = 1 - (plan.helium_units / max_helium) if max_helium > 0 else 0
+            cost_norm = 1 - (plan.cost_usd / max_cost) if max_cost > 0 else 0
+            latency_norm = 1 - (plan.latency_ms / max_latency) if max_latency > 0 else 0
+            success_norm = plan.success_probability / max_success if max_success > 0 else 0
+            score = (weights['carbon'] * carbon_norm +
+                     weights['helium'] * helium_norm +
+                     weights['cost'] * cost_norm +
+                     weights['latency'] * latency_norm +
+                     weights['success_prob'] * success_norm)
+            if score > best_score:
+                best_score = score
+                best = plan
+        return best
+
+    # ============================================================================
     # Public Methods (including BaseExpert interface)
     # ============================================================================
     async def propose(self, context: dict) -> dict:
         """
         Generate sustainability recommendations for the MoE router.
+        If MOPD is enabled, returns a full MOPDProposal with Pareto front.
         """
         try:
             carbon_intensity = context.get('carbon_intensity', 0.5) * 800
@@ -2046,10 +2270,22 @@ class QuantumLimitGraphIntegrator(BaseExpert):
             if forecast:
                 explanation += f" Trend forecast: {forecast.get('trend', 'stable')}."
 
+            # MOPD integration: if enabled and context contains job requirements, generate Pareto front
+            pareto_front = None
+            if self.enable_mopd and 'job_requirements' in context:
+                job_reqs = context['job_requirements']
+                pareto_front = await self._generate_pareto_front_for_quantum_job(job_reqs)
+                if pareto_front:
+                    best_plan = self._select_best_from_pareto(pareto_front)
+                    if best_plan:
+                        recommendations['best_plan'] = best_plan.to_dict()
+                        explanation += f" Selected plan: backend={best_plan.backend.value}, error_mitigation={best_plan.error_mitigation.value}."
+
             return {
                 'recommendations': recommendations,
-                'options': [],
-                'explanation': explanation
+                'options': [p.to_dict() for p in pareto_front] if pareto_front else [],
+                'explanation': explanation,
+                'pareto_front': [p.to_dict() for p in pareto_front] if pareto_front else None
             }
         except Exception as e:
             logger.error(f"Propose failed: {e}")
@@ -2070,6 +2306,7 @@ class QuantumLimitGraphIntegrator(BaseExpert):
             'event_driven': self.enable_event_driven,
             'bio_integrated': self.enable_bio_integration,
             'circuit_breaker_state': self._circuit_breaker.state if hasattr(self._circuit_breaker, 'state') else 'unknown',
+            'mopd_enabled': self.enable_mopd,
         }
 
     async def self_heal(self):
@@ -2123,11 +2360,13 @@ class QuantumLimitGraphIntegrator(BaseExpert):
         expert_plan: Dict[str, Any],
         quantum_enhanced: bool = False,
         user_id: Optional[str] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        return_pareto: bool = False   # NEW: if True, include Pareto front for quantum jobs
     ) -> Tuple[bool, Dict[str, Any]]:
         """
         Validate an expert plan against planetary boundaries, carbon/helium limits,
         token budget, compartment health, and other constraints.
+        If return_pareto is True and quantum_enhanced is True, include Pareto front.
         """
         try:
             validation_results = {}
@@ -2227,6 +2466,22 @@ class QuantumLimitGraphIntegrator(BaseExpert):
                 if not tokens_reserved:
                     is_valid = False
 
+                # MOPD: generate Pareto front for quantum job if requested
+                if self.enable_mopd and return_pareto:
+                    job_reqs = {
+                        'estimated_energy_kwh': expert_plan.get('estimated_energy_kwh', 0.001),
+                        'quantum_capable': expert_plan.get('quantum_capable', True),
+                    }
+                    pareto_front = await self._generate_pareto_front_for_quantum_job(job_reqs)
+                    if pareto_front:
+                        validation_results['pareto_front'] = [p.to_dict() for p in pareto_front]
+                        best_plan = self._select_best_from_pareto(pareto_front)
+                        if best_plan:
+                            validation_results['best_plan'] = best_plan.to_dict()
+                            # Optionally adjust plan based on best_plan
+                            expert_plan['recommended_backend'] = best_plan.backend.value
+                            expert_plan['error_mitigation'] = best_plan.error_mitigation.value
+
             # Bio‑inspired signals
             if self.enable_bio_integration:
                 validation_results['harvester_confidence'] = self._get_harvester_confidence()
@@ -2306,7 +2561,8 @@ class QuantumLimitGraphIntegrator(BaseExpert):
                     'user_adaptive': self.enable_user_adaptive,
                     'collaborative': self.enable_human_ai_collab,
                     'cross_federated': self.enable_cross_federation,
-                    'dynamic_pricing': self.enable_dynamic_pricing
+                    'dynamic_pricing': self.enable_dynamic_pricing,
+                    'mopd': self.enable_mopd
                 })
 
             return is_valid, validation_results
@@ -2385,6 +2641,16 @@ class QuantumLimitGraphIntegrator(BaseExpert):
 
         return validated_plans
 
+    # ============================================================================
+    # Public method to get Pareto front without executing (NEW)
+    # ============================================================================
+    async def get_work_pareto_front(self, job_requirements: Dict[str, Any]) -> List[MOPDPlan]:
+        """Return the Pareto front for a hypothetical quantum job without executing it."""
+        if not self.enable_mopd:
+            return []
+        pareto_front = await self._generate_pareto_front_for_quantum_job(job_requirements)
+        return pareto_front
+
     def get_federation_status(self) -> Dict[str, Any]:
         status = {
             'quantum_backend': self.quantum_backend,
@@ -2393,7 +2659,8 @@ class QuantumLimitGraphIntegrator(BaseExpert):
             'backends': len(self.backends),
             'active_jobs': len(self.active_jobs),
             'sustainability_score': self.sustainability_score,
-            'total_carbon_savings_kg': self.total_carbon_savings_kg
+            'total_carbon_savings_kg': self.total_carbon_savings_kg,
+            'mopd_enabled': self.enable_mopd,
         }
         if self.enable_federated_learning and self.federated_learning:
             status['federated'] = self.federated_learning.get_federation_status()
@@ -2423,6 +2690,7 @@ class QuantumLimitGraphIntegrator(BaseExpert):
             'cross_federation_active': self.enable_cross_federation,
             'dynamic_pricing_active': self.enable_dynamic_pricing,
             'predictive_active': self.enable_predictive,
+            'mopd_enabled': self.enable_mopd,
             'recommendations': self._generate_sustainability_recommendations()
         }
         if self.enable_predictive:
@@ -2452,6 +2720,8 @@ class QuantumLimitGraphIntegrator(BaseExpert):
         for resource, data in boundary_status.items():
             if data.get('utilization', 0) > self.config.carbon_utilization_warning_threshold:
                 recommendations.append(f"High {resource} utilization - consider load balancing")
+        if self.enable_mopd:
+            recommendations.append("Use MOPD to explore Pareto-optimal quantum execution plans")
         return recommendations or ["Sustainability is on track"]
 
 # ============================================================================
@@ -2479,11 +2749,12 @@ async def example():
     config = QuantumLimitIntegratorConfig(
         enable_carbon_intensity=True,
         enable_predictive=True,
-        enable_dynamic_pricing=True
+        enable_dynamic_pricing=True,
+        enable_mopd=True
     )
     integrator = QuantumLimitGraphIntegrator(config=config)
 
-    # Simulate a validation
+    # Simulate a validation with MOPD
     plan = {
         'expert_id': 'quantum_expert_01',
         'estimated_carbon_kg': 0.01,
@@ -2491,7 +2762,7 @@ async def example():
         'estimated_energy_kwh': 0.05,
         'quantum_capable': True
     }
-    is_valid, result = await integrator.validate_expert_plan(plan, quantum_enhanced=True)
+    is_valid, result = await integrator.validate_expert_plan(plan, quantum_enhanced=True, return_pareto=True)
     print(f"Valid: {is_valid}, result: {result}")
 
     # Get report
