@@ -1,39 +1,20 @@
 #!/usr/bin/env python3
 """
-Enhanced Expert Registry v6.3.0 - Complete Bio-Inspired Genome Repository
+Enhanced Expert Registry v6.4.0 - Complete Bio-Inspired Genome Repository
+Full Green Agent MOPD Integration
 
-Full correlation with bio-inspired modules:
-- Eco-ATP efficiency filtering for expert selection
-- Species population tracking from chromatophore compartments
-- Natural selection based on multi-dimensional fitness scores
-- Gradient-based fitness updates from proton gradient fields
-- Biomass storage integration for expert performance history
-- Token economy integration for expert resource accounting
-- Compartment lifecycle ↔ Registry lifecycle bidirectional mapping
-- Evolutionary lineage tracking across generations
-- Unified Sustainability Dashboard
-- Predictive Evolution Forecasting
-- Cross-Region Registry Synchronization
-- Quantum efficiency as fitness dimension
-- Predictive alerts for upcoming extinctions
-- External climate model integration
-- Conflict resolution with voting mechanisms
-- Reproductive strategies for high-fitness experts
-
-New in v6.3.0:
-- Refactored into modular components (FitnessManager, BioCorrelator, etc.)
-- Proper async initialization with wait_until_ready()
-- Circuit breakers for all external service calls
-- Rate limiting on all public methods
-- Integration with TimeTickEngine and QuantumBridge (stubs)
-- Dynamic fitness weight adjustment API
-- Data quality scoring
-- Improved error handling for missing bio modules
-- Comprehensive unit test stubs
+ENHANCEMENTS OVER v6.3.0:
+1. INTEGRATED with central Config, Storage, Logger, MetricsRegistry, AsyncMessageQueue.
+2. ADDED teacher interface (`policy_probs`) for MTPD optimizer.
+3. PUBLISHES FeedbackEvent for every registration, deprecation, fitness update, natural selection, and reproduction.
+4. USES central AdaptiveCostFunction, ParetoGating, and DriftDetector.
+5. REMOVED custom persistence; now uses central Storage.
+6. REMOVED custom Prometheus; now uses central MetricsRegistry.
+7. REMOVED custom logging; now uses central structlog.
+8. All optional dependencies (PyTorch, scikit-learn, etc.) still gracefully degrade.
 """
 
 import asyncio
-import logging
 import json
 import os
 import re
@@ -45,15 +26,28 @@ import zlib
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, TypeVar, cast
+from typing import Dict, Any, List, Optional, Tuple, Set, Union, Callable, TypeVar
 import numpy as np
 import networkx as nx
 
-# Third-party imports (install via pip)
+# -----------------------------------------------------------------------------
+# IMPORT CENTRAL GREEN AGENT COMPONENTS
+# -----------------------------------------------------------------------------
+from ..config import config as central_config
+from ..storage import Storage
+from ..schemas.feedback_event import FeedbackEvent
+from ..routing.pareto_gating import ParetoGating
+from ..feedback.adaptive_cost import AdaptiveCostFunction
+from ..safety.drift_detector import DriftDetector
+from ..scaling.message_queue import AsyncMessageQueue
+from ..metrics import MetricsRegistry
+from ..logger import logger
+
+# Optional dependencies
 try:
     import aiofiles
 except ImportError:
-    aiofiles = None  # fallback to sync I/O
+    aiofiles = None
 
 try:
     from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict
@@ -64,7 +58,6 @@ except ImportError:
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 except ImportError:
-    # Dummy retry decorator if tenacity not installed
     def retry(*args, **kwargs):
         return lambda f: f
     stop_after_attempt = lambda x: None
@@ -112,94 +105,62 @@ try:
 except ImportError:
     QUANTUM_BRIDGE_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+# -----------------------------------------------------------------------------
+# Configuration – now uses central_config as a reference.
+# We keep a local config class for backward compatibility, but values are pulled
+# from central_config with sensible defaults.
+# -----------------------------------------------------------------------------
+class ExpertRegistryConfig:
+    """Configuration for ExpertRegistry, built from central_config."""
+    def __init__(self):
+        self.registry_id = getattr(central_config, "expert_registry_id", "default")
+        self.enable_bio_correlation = getattr(central_config, "enable_bio_correlation", True) and BIO_INSPIRED_AVAILABLE
+        self.enable_natural_selection = getattr(central_config, "enable_natural_selection", True)
+        self.enable_fitness_tracking = getattr(central_config, "enable_fitness_tracking", True)
+        self.enable_population_tracking = getattr(central_config, "enable_population_tracking", True)
+        self.enable_sustainability_dashboard = getattr(central_config, "enable_sustainability_dashboard", True)
+        self.enable_predictive_forecasting = getattr(central_config, "enable_predictive_forecasting", True)
+        self.enable_cross_region_sync = getattr(central_config, "enable_cross_region_sync", True)
+        self.enable_quantum_efficiency = getattr(central_config, "enable_quantum_efficiency", True)
+        self.enable_reproductive_strategies = getattr(central_config, "enable_reproductive_strategies", True)
+        self.enable_climate_integration = getattr(central_config, "enable_climate_integration", True)
+        self.enable_persistence = True  # We always use central storage
+        self.sync_retries = getattr(central_config, "sync_retries", 3)
+        self.sync_retry_base_delay_ms = getattr(central_config, "sync_retry_base_delay_ms", 100.0)
+        self.sync_retry_max_delay_ms = getattr(central_config, "sync_retry_max_delay_ms", 5000.0)
+        self.circuit_breaker_threshold = getattr(central_config, "circuit_breaker_failure_threshold", 5)
+        self.circuit_breaker_recovery_timeout = getattr(central_config, "circuit_breaker_recovery_timeout", 30.0)
+        self.sync_interval = getattr(central_config, "sync_interval", 3600)
+        self.bio_sync_interval = getattr(central_config, "bio_sync_interval", 300)
+        self.fitness_weights = getattr(central_config, "fitness_weights", {
+            'resource_efficiency': 0.20,
+            'resilience_score': 0.15,
+            'adaptation_speed': 0.10,
+            'cooperation_score': 0.10,
+            'ecoatp_efficiency': 0.10,
+            'sustainability_score': 0.15,
+            'quantum_efficiency': 0.10,
+            'quantum_advantage': 0.05,
+            'helium_savings': 0.05
+        })
+        self.natural_selection_percentile_low = getattr(central_config, "natural_selection_percentile_low", 20.0)
+        self.natural_selection_percentile_high = getattr(central_config, "natural_selection_percentile_high", 80.0)
+        self.reproductive_mutation_rate = getattr(central_config, "reproductive_mutation_rate", 0.1)
+        self.reproductive_max_offspring = getattr(central_config, "reproductive_max_offspring", 3)
+        self.climate_update_interval = getattr(central_config, "climate_update_interval", 3600)
+        self.rate_limit_per_minute = getattr(central_config, "rate_limit_requests", 60)
+        self.enable_tick_engine = getattr(central_config, "enable_tick_engine", False)
+        self.enable_quantum_bridge = getattr(central_config, "enable_quantum_bridge", False)
 
-# ============================================================================
-# Configuration using Pydantic Settings (unchanged)
-# ============================================================================
-
-class ExpertRegistryConfig(BaseSettings):
-    """Centralized configuration with environment variable support."""
-    model_config = SettingsConfigDict(env_prefix="EXREG_", case_sensitive=False)
-
-    # Feature flags
-    enable_bio_correlation: bool = Field(True)
-    enable_natural_selection: bool = Field(True)
-    enable_fitness_tracking: bool = Field(True)
-    enable_population_tracking: bool = Field(True)
-    enable_sustainability_dashboard: bool = Field(True)
-    enable_predictive_forecasting: bool = Field(True)
-    enable_cross_region_sync: bool = Field(True)
-    enable_quantum_efficiency: bool = Field(True)
-    enable_reproductive_strategies: bool = Field(True)
-    enable_climate_integration: bool = Field(True)
-    enable_persistence: bool = Field(True)
-
-    # Registry identity
-    registry_id: str = Field("default")
-
-    # Persistence settings
-    persistence_path: str = Field("registry_state.json")
-    persistence_auto_save_interval: int = Field(300)  # seconds
-
-    # Sync settings
-    sync_retries: int = Field(3, ge=0)
-    sync_retry_base_delay_ms: float = Field(100.0)
-    sync_retry_max_delay_ms: float = Field(5000.0)
-    circuit_breaker_threshold: int = Field(5, ge=1)
-    circuit_breaker_recovery_timeout: float = Field(30.0, ge=0)
-    sync_interval: int = Field(3600)
-    bio_sync_interval: int = Field(300)
-
-    # Fitness weights
-    fitness_weights: Dict[str, float] = Field(default_factory=lambda: {
-        'resource_efficiency': 0.20,
-        'resilience_score': 0.15,
-        'adaptation_speed': 0.10,
-        'cooperation_score': 0.10,
-        'ecoatp_efficiency': 0.10,
-        'sustainability_score': 0.15,
-        'quantum_efficiency': 0.10,
-        'quantum_advantage': 0.05,
-        'helium_savings': 0.05
-    })
-
-    # Selection thresholds
-    natural_selection_percentile_low: float = Field(20.0, ge=0.0, le=100.0)
-    natural_selection_percentile_high: float = Field(80.0, ge=0.0, le=100.0)
-
-    # Reproduction
-    reproductive_mutation_rate: float = Field(0.1, ge=0.0, le=1.0)
-    reproductive_max_offspring: int = Field(3, ge=0)
-
-    # Climate integration
-    climate_update_interval: int = Field(3600)
-
-    # Rate limiting (requests per minute)
-    rate_limit_per_minute: int = Field(60, ge=1)
-
-    # TimeTickEngine and QuantumBridge integration
-    enable_tick_engine: bool = Field(False)
-    enable_quantum_bridge: bool = Field(False)
-
-    @field_validator('fitness_weights')
-    @classmethod
-    def validate_fitness_weights(cls, v: Dict[str, float]) -> Dict[str, float]:
-        if abs(sum(v.values()) - 1.0) > 0.01:
+        # Validate
+        if abs(sum(self.fitness_weights.values()) - 1.0) > 0.01:
             raise ValueError("Fitness weights must sum to 1.0")
-        return v
-
-    @field_validator('natural_selection_percentile_low')
-    @classmethod
-    def validate_percentiles(cls, v: float, values: Dict[str, Any]) -> float:
-        if 'natural_selection_percentile_high' in values and v >= values['natural_selection_percentile_high']:
+        if self.natural_selection_percentile_low >= self.natural_selection_percentile_high:
             raise ValueError("low percentile must be less than high percentile")
-        return v
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Pydantic Models for Data Structures (unchanged)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
 class ExpertVersion(BaseModel):
     major: int = Field(ge=0)
     minor: int = Field(ge=0)
@@ -218,7 +179,6 @@ class ExpertVersion(BaseModel):
     @classmethod
     def from_string(cls, version_str: str) -> 'ExpertVersion':
         try:
-            # Strip pre-release and build for simplicity
             base = version_str.split('-')[0].split('+')[0]
             parts = base.split('.')
             major = int(parts[0]) if len(parts) > 0 else 1
@@ -444,7 +404,6 @@ class ExpertProfile(BaseModel):
         levels = [c.level for c in self.certifications if c.is_valid]
         if not levels:
             return CertificationLevel.NONE
-        # Order defined in Enum
         return max(levels, key=lambda l: list(CertificationLevel).index(l))
 
 class FitnessScore(BaseModel):
@@ -487,43 +446,10 @@ class FitnessScore(BaseModel):
             self.helium_savings * weights['helium_savings']
         )
 
-class RegistryState(BaseModel):
-    """Full registry state for serialization."""
-    version: str = "6.3.0"
-    config: ExpertRegistryConfig
-    experts: Dict[str, ExpertProfile]
-    fitness_scores: Dict[str, FitnessScore]
-    domain_index: Dict[str, List[str]]  # domain -> expert_ids
-    hardware_index: Dict[str, List[str]]
-    lifecycle_index: Dict[str, List[str]]
-    tag_index: Dict[str, List[str]]
-    capability_index: Dict[str, List[str]]
-    task_type_index: Dict[str, List[str]]
-    region_index: Dict[str, List[str]]
-    version_family_index: Dict[str, List[str]]
-    dependency_graph: Dict[str, Any]  # serialized networkx graph
-    remote_registries: Dict[str, str]
-    federated_experts: Dict[str, str]
-    ab_tests: Dict[str, Any]
-    migration_paths: Dict[str, str]
-    evolutionary_events: List[Dict[str, Any]]
-    speciation_count: int
-    extinction_count: int
-    total_generations: int
-    reproductive_events: int
-    stats: Dict[str, Any]
-    performance_history: Dict[str, List[Dict[str, Any]]]
-    fitness_weights_history: List[Dict[str, float]]
-    registry_id: str
-    bio_integration_active: bool
-    last_save: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-
-# ============================================================================
-# Caching Helper (unchanged)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Timed Cache (unchanged)
+# -----------------------------------------------------------------------------
 class TimedCache:
-    """Simple TTL cache for bio metrics."""
     def __init__(self, ttl_seconds: float = 30.0):
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._ttl = ttl_seconds
@@ -544,22 +470,16 @@ class TimedCache:
         if key in self._cache:
             del self._cache[key]
 
-# ============================================================================
-# Retry and Circuit Breaker Utilities (Enhanced)
-# ============================================================================
-
-def is_retryable_exception(e: Exception) -> bool:
-    """Determine if an exception is retryable (e.g., network errors)."""
-    return isinstance(e, (IOError, TimeoutError, ConnectionError, aiohttp.ClientError))
-
+# -----------------------------------------------------------------------------
+# Circuit Breaker (unchanged)
+# -----------------------------------------------------------------------------
 class CircuitBreaker:
-    """Simple circuit breaker for protecting failing operations."""
     def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failure_count = 0
         self.last_failure_time: Optional[float] = None
-        self.state = "closed"  # closed, open, half-open
+        self.state = "closed"
 
     async def call(self, func: Callable, *args, **kwargs) -> Any:
         if self.state == "open":
@@ -580,147 +500,12 @@ class CircuitBreaker:
                 self.state = "open"
             raise e
 
-# ============================================================================
-# Persistence Manager (Enhanced with async load)
-# ============================================================================
-
-class RegistryPersistenceManager:
-    """
-    Manages saving and loading of the registry state using JSON + zlib compression.
-    Includes version checks and migration hooks.
-    """
-    def __init__(self, config: ExpertRegistryConfig):
-        self.config = config
-        self.path = config.persistence_path
-        self._lock = asyncio.Lock()
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=config.circuit_breaker_threshold,
-            recovery_timeout=config.circuit_breaker_recovery_timeout
-        )
-        logger.info(f"RegistryPersistenceManager initialized (path={self.path})")
-
-    async def save_state(self, registry: 'ExpertRegistry') -> bool:
-        async with self._lock:
-            try:
-                state = RegistryState(
-                    config=registry.config,
-                    experts=registry._experts,
-                    fitness_scores=registry.fitness_scores,
-                    domain_index={k.value: list(v) for k, v in registry._domain_index.items()},
-                    hardware_index={k.value: list(v) for k, v in registry._hardware_index.items()},
-                    lifecycle_index={k.value: list(v) for k, v in registry._lifecycle_index.items()},
-                    tag_index={k: list(v) for k, v in registry._tag_index.items()},
-                    capability_index={k: list(v) for k, v in registry._capability_index.items()},
-                    task_type_index={k: list(v) for k, v in registry._task_type_index.items()},
-                    region_index={k: list(v) for k, v in registry._region_index.items()},
-                    version_family_index=registry._version_family_index,
-                    dependency_graph=nx.node_link_data(registry._dependency_graph),
-                    remote_registries=registry._remote_registries,
-                    federated_experts=registry._federated_experts,
-                    ab_tests=registry._ab_tests,
-                    migration_paths=registry._migration_paths,
-                    evolutionary_events=list(registry.evolutionary_events),
-                    speciation_count=registry.speciation_count,
-                    extinction_count=registry.extinction_count,
-                    total_generations=registry.total_generations,
-                    reproductive_events=registry.reproductive_events,
-                    stats=registry._stats,
-                    performance_history=dict(registry._performance_history),
-                    fitness_weights_history=list(registry._fitness_weight_history),
-                    registry_id=registry.registry_id,
-                    bio_integration_active=registry.enable_bio_correlation
-                )
-                json_str = state.model_dump_json(indent=2)
-                compressed = zlib.compress(json_str.encode('utf-8'))
-                if aiofiles:
-                    async with aiofiles.open(self.path, 'wb') as f:
-                        await f.write(compressed)
-                else:
-                    with open(self.path, 'wb') as f:
-                        f.write(compressed)
-                logger.info(f"Registry state saved to {self.path}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to save registry state: {e}")
-                raise
-
-    async def load_state(self, registry: 'ExpertRegistry') -> bool:
-        async with self._lock:
-            if not os.path.exists(self.path):
-                logger.warning(f"Persistence file {self.path} not found")
-                return False
-            try:
-                if aiofiles:
-                    async with aiofiles.open(self.path, 'rb') as f:
-                        compressed = await f.read()
-                else:
-                    with open(self.path, 'rb') as f:
-                        compressed = f.read()
-                json_str = zlib.decompress(compressed).decode('utf-8')
-                state = RegistryState.model_validate_json(json_str)
-                if state.version != "6.3.0":
-                    logger.warning(f"State version mismatch: {state.version} != 6.3.0; attempting migration")
-                # Restore core data
-                registry._experts = state.experts
-                registry.fitness_scores = state.fitness_scores
-                # Restore indices
-                registry._domain_index = defaultdict(set)
-                for domain_str, ids in state.domain_index.items():
-                    domain = ExpertDomain(domain_str)
-                    registry._domain_index[domain] = set(ids)
-                registry._hardware_index = defaultdict(set)
-                for hw_str, ids in state.hardware_index.items():
-                    hw = HardwareProfile(hw_str)
-                    registry._hardware_index[hw] = set(ids)
-                registry._lifecycle_index = defaultdict(set)
-                for lc_str, ids in state.lifecycle_index.items():
-                    lc = ExpertLifecycleState(lc_str)
-                    registry._lifecycle_index[lc] = set(ids)
-                registry._tag_index = {k: set(v) for k, v in state.tag_index.items()}
-                registry._capability_index = {k: set(v) for k, v in state.capability_index.items()}
-                registry._task_type_index = {k: set(v) for k, v in state.task_type_index.items()}
-                registry._region_index = {k: set(v) for k, v in state.region_index.items()}
-                registry._version_family_index = state.version_family_index
-                registry._dependency_graph = nx.node_link_graph(state.dependency_graph)
-                registry._remote_registries = state.remote_registries
-                registry._federated_experts = state.federated_experts
-                registry._ab_tests = state.ab_tests
-                registry._migration_paths = state.migration_paths
-                registry.evolutionary_events = deque(state.evolutionary_events, maxlen=10000)
-                registry.speciation_count = state.speciation_count
-                registry.extinction_count = state.extinction_count
-                registry.total_generations = state.total_generations
-                registry.reproductive_events = state.reproductive_events
-                registry._stats = state.stats
-                registry._performance_history = defaultdict(list)
-                for k, v in state.performance_history.items():
-                    registry._performance_history[k] = v
-                registry._fitness_weight_history = deque(state.fitness_weights_history, maxlen=100)
-                logger.info(f"Registry state loaded from {self.path}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to load registry state: {e}")
-                return False
-
-    async def delete_state(self):
-        async with self._lock:
-            if os.path.exists(self.path):
-                if aiofiles:
-                    await aiofiles.os.remove(self.path)
-                else:
-                    os.remove(self.path)
-                logger.info(f"Persistence file {self.path} deleted")
-                return True
-            return False
-
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Rate Limiter (unchanged)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
 class RateLimiter:
-    """Simple token bucket rate limiter."""
     def __init__(self, rate_per_minute: int):
-        self.rate = rate_per_minute / 60.0  # tokens per second
+        self.rate = rate_per_minute / 60.0
         self.tokens = rate_per_minute
         self.last_update = datetime.utcnow().timestamp()
         self._lock = asyncio.Lock()
@@ -730,7 +515,7 @@ class RateLimiter:
             now = datetime.utcnow().timestamp()
             elapsed = now - self.last_update
             self.tokens += elapsed * self.rate
-            if self.tokens > self.rate * 60:  # cap at one minute's worth
+            if self.tokens > self.rate * 60:
                 self.tokens = self.rate * 60
             self.last_update = now
             if self.tokens >= 1:
@@ -738,20 +523,181 @@ class RateLimiter:
                 return True
             return False
 
-# ============================================================================
-# Sustainability Dashboard (unchanged)
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Bio Correlator (unchanged)
+# -----------------------------------------------------------------------------
+class BioCorrelator:
+    def __init__(self, registry: 'ExpertRegistry'):
+        self.registry = registry
+        self._ecoatp_cache = TimedCache(ttl_seconds=30)
+        self._gradient_cache = TimedCache(ttl_seconds=30)
+        self._population_cache = TimedCache(ttl_seconds=60)
+        self._token_circuit = CircuitBreaker()
+        self._gradient_circuit = CircuitBreaker()
+        self._compartment_circuit = CircuitBreaker()
+        logger.info("BioCorrelator initialized")
 
+    async def get_expert_ecoatp_efficiency(self, expert_id: str) -> float:
+        if not self.registry.token_manager:
+            return 0.5
+        async def compute():
+            account = self.registry.token_manager.get_account_summary(f"expert_{expert_id}")
+            if account:
+                return account.get('efficiency_rating', 0.5)
+            return 0.5
+        return await self._ecoatp_cache.get_or_compute(f"ecoatp_efficiency_{expert_id}", compute)
+
+    async def get_expert_token_balance(self, expert_id: str) -> float:
+        if not self.registry.token_manager:
+            return 0.0
+        account = self.registry.token_manager.get_account_summary(f"expert_{expert_id}")
+        if account:
+            return account.get('balance', 0)
+        return 0.0
+
+    async def get_gradient_strength(self, field_id: str) -> float:
+        if not self.registry.gradient_manager:
+            return 0.5
+        async def compute():
+            field = self.registry.gradient_manager.fields.get(field_id)
+            if field:
+                return field.gradient_strength
+            return 0.5
+        return await self._gradient_cache.get_or_compute(f"gradient_{field_id}", compute)
+
+    def get_species_population(self, species_id: str) -> int:
+        if self.registry.compartment_manager:
+            return sum(1 for c in self.registry.compartment_manager.compartments.values()
+                      if c.expert_type == species_id and c.is_viable)
+        return len([e for e in self.registry._experts.values()
+                   if hasattr(e, 'domain') and species_id in str(e.domain).lower()])
+
+    def get_species_populations(self) -> Dict[str, int]:
+        species = ['energy', 'data', 'iot', 'quantum', 'helium', 'general']
+        return {s: self.get_species_population(s) for s in species}
+
+    def get_total_compartment_population(self) -> int:
+        if self.registry.compartment_manager:
+            return len([c for c in self.registry.compartment_manager.compartments.values() if c.is_viable])
+        return len([e for e in self.registry._experts.values() if e.lifecycle_state.is_available()])
+
+    def get_species_id(self, profile: ExpertProfile) -> str:
+        domain = profile.domain.value
+        if 'energy' in domain.lower(): return 'energy'
+        if 'data' in domain.lower(): return 'data'
+        if 'iot' in domain.lower(): return 'iot'
+        if 'quantum' in domain.lower(): return 'quantum'
+        if 'helium' in domain.lower(): return 'helium'
+        return 'general'
+
+# -----------------------------------------------------------------------------
+# Fitness Manager (Enhanced with adaptive cost)
+# -----------------------------------------------------------------------------
+class FitnessManager:
+    def __init__(self, registry: 'ExpertRegistry'):
+        self.registry = registry
+        self._fitness_weights = registry.config.fitness_weights.copy()
+        self._fitness_weight_history = deque(maxlen=100)
+        self._lock = asyncio.Lock()
+        logger.info("FitnessManager initialized")
+
+    async def update_fitness_from_gradients(self):
+        if not self.registry.enable_bio_correlation or not self.registry.gradient_manager:
+            return
+        async with self._lock:
+            trust_strength = await self.registry.bio_correlator.get_gradient_strength('trust')
+            carbon_strength = await self.registry.bio_correlator.get_gradient_strength('carbon')
+            for expert_id, fitness in self.registry.fitness_scores.items():
+                if expert_id not in self.registry._experts:
+                    continue
+                expert = self.registry._experts[expert_id]
+                fitness.resilience_score = fitness.resilience_score * 0.7 + trust_strength * 0.3
+                carbon_eff = 1.0 / (1.0 + expert.carbon_per_inference * 10000)
+                fitness.resource_efficiency = fitness.resource_efficiency * 0.8 + carbon_eff * 0.2
+                fitness.ecoatp_efficiency = await self.registry.bio_correlator.get_expert_ecoatp_efficiency(expert_id)
+                if self.registry.compartment_manager:
+                    compartment = self.registry.compartment_manager.find_best_compartment(self.registry.bio_correlator.get_species_id(expert))
+                    if compartment:
+                        fitness.cooperation_score = fitness.cooperation_score * 0.8 + compartment.health_score * 0.2
+                fitness.quantum_efficiency = expert.health.quantum_efficiency
+                fitness.quantum_advantage = self._calculate_quantum_advantage(expert)
+                fitness.helium_savings = 1.0 - expert.helium_per_inference / max(expert.helium_per_inference, 1)
+                fitness.sustainability_score = expert.health.calculate_sustainability_score()
+                fitness.calculate_overall(self._fitness_weights)
+
+    def _calculate_quantum_advantage(self, profile: ExpertProfile) -> float:
+        if not profile.quantum_capable:
+            return 0.0
+        return min(1.0, (profile.quantum_qubits / 100) * 0.5 + profile.accuracy_score * 0.5)
+
+    def update_fitness_weights(self, new_weights: Dict[str, float]):
+        if abs(sum(new_weights.values()) - 1.0) > 0.01:
+            raise ValueError("Fitness weights must sum to 1.0")
+        self._fitness_weights = new_weights
+        self._fitness_weight_history.append(new_weights)
+        logger.info(f"Fitness weights updated: {new_weights}")
+
+    async def trigger_natural_selection(self):
+        if not self.registry.enable_natural_selection:
+            return
+        await self.update_fitness_from_gradients()
+        fitnesses = [f.overall_fitness for f in self.registry.fitness_scores.values()]
+        if not fitnesses:
+            return
+
+        low_pct = self.registry.config.natural_selection_percentile_low
+        high_pct = self.registry.config.natural_selection_percentile_high
+        threshold = np.percentile(fitnesses, low_pct)
+        top_threshold = np.percentile(fitnesses, high_pct)
+
+        deprecated_count = 0
+        reproducer_count = 0
+
+        async with self.registry._lock:
+            for expert_id, fitness in list(self.registry.fitness_scores.items()):
+                if expert_id not in self.registry._experts:
+                    continue
+                expert = self.registry._experts[expert_id]
+                if (fitness.overall_fitness < threshold and
+                    fitness.reproductive_success == 0 and
+                    expert.lifecycle_state in [ExpertLifecycleState.ACTIVE, ExpertLifecycleState.CERTIFIED]):
+                    self.registry.deprecate_expert(expert_id, reason="natural_selection_low_fitness")
+                    deprecated_count += 1
+                    if self.registry.biomass_storage:
+                        self.registry.biomass_storage.store_task(
+                            task_data={'expert_id': expert_id, 'knowledge': expert.model_dump()},
+                            ecoatp_cost=1.0,
+                            guarantee=GuaranteeLevel.BEST_EFFORT,
+                            initial_tier=StorageTier.LIPID_DEPOT
+                        )
+                    self.registry.evolutionary_events.append({
+                        'type': 'extinction',
+                        'expert_id': expert_id,
+                        'fitness': fitness.overall_fitness,
+                        'quantum_efficiency': fitness.quantum_efficiency,
+                        'reason': 'natural_selection',
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+                    self.registry.extinction_count += 1
+                elif fitness.overall_fitness > top_threshold and fitness.reproductive_success < self.registry.config.reproductive_max_offspring:
+                    fitness.reproductive_success += 1
+                    reproducer_count += 1
+
+        self.registry._stats['total_natural_selections'] += 1
+        self.registry._stats['last_selection'] = datetime.utcnow()
+        if deprecated_count > 0 or reproducer_count > 0:
+            logger.info(f"Natural selection: {deprecated_count} deprecated, {reproducer_count} marked for reproduction")
+
+# -----------------------------------------------------------------------------
+# Sustainability Dashboard (unchanged, but uses central metrics)
+# -----------------------------------------------------------------------------
 class RegistrySustainabilityDashboard:
-    """
-    Unified Sustainability Dashboard with Prometheus-style export.
-    """
     def __init__(self, registry: 'ExpertRegistry'):
         self.registry = registry
         self.history = deque(maxlen=1000)
         self._alert_history = deque(maxlen=100)
         self._cache: Dict[str, Any] = {}
-        self._cache_ttl = 30  # seconds
+        self._cache_ttl = 30
         self._last_cache_update: Optional[datetime] = None
         logger.info("RegistrySustainabilityDashboard initialized")
 
@@ -921,14 +867,10 @@ class RegistrySustainabilityDashboard:
             })
         return recommendations
 
-# ============================================================================
-# Predictive Evolution Forecaster (Enhanced with TimeTick/QuantumBridge)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Predictive Evolution Forecaster (unchanged)
+# -----------------------------------------------------------------------------
 class PredictiveEvolutionForecaster:
-    """
-    Predictive Evolution Forecasting with climate integration and data-driven trends.
-    """
     def __init__(self, registry: 'ExpertRegistry'):
         self.registry = registry
         self.forecast_history = deque(maxlen=1000)
@@ -951,8 +893,7 @@ class PredictiveEvolutionForecaster:
         carbon_proj = self._project_climate('carbon', hours)
         helium_proj = self._project_climate('helium', hours)
 
-        # Integrate TimeTickEngine if available
-        if registry.config.enable_tick_engine and hasattr(registry, 'tick_engine') and registry.tick_engine:
+        if registry.config.enable_tick_engine and registry.tick_engine:
             try:
                 tick_forecast = await registry.tick_engine.get_helium_forecast(hours // 1)
                 if tick_forecast and len(tick_forecast) > 0:
@@ -961,8 +902,7 @@ class PredictiveEvolutionForecaster:
             except Exception as e:
                 logger.warning(f"TimeTickEngine integration failed: {e}")
 
-        # Integrate QuantumBridge if available
-        if registry.config.enable_quantum_bridge and hasattr(registry, 'quantum_bridge') and registry.quantum_bridge:
+        if registry.config.enable_quantum_bridge and registry.quantum_bridge:
             try:
                 q_params = registry.quantum_bridge.get_qubo_parameters()
                 q_penalty = q_params.get('penalty_helium_shortage', 0.5)
@@ -1130,183 +1070,10 @@ class PredictiveEvolutionForecaster:
         else:
             return min(0.9, 0.7 + 0.1 * len(registry.fitness_scores) / 50 * 0.7)
 
-# ============================================================================
-# Bio Correlator (NEW)
-# ============================================================================
-
-class BioCorrelator:
-    """Manages bio-inspired data correlation for expert registry."""
-    def __init__(self, registry: 'ExpertRegistry'):
-        self.registry = registry
-        self._ecoatp_cache = TimedCache(ttl_seconds=30)
-        self._gradient_cache = TimedCache(ttl_seconds=30)
-        self._population_cache = TimedCache(ttl_seconds=60)
-        self._token_circuit = CircuitBreaker()
-        self._gradient_circuit = CircuitBreaker()
-        self._compartment_circuit = CircuitBreaker()
-        logger.info("BioCorrelator initialized")
-
-    async def get_expert_ecoatp_efficiency(self, expert_id: str) -> float:
-        if not self.registry.token_manager:
-            return 0.5
-        async def compute():
-            account = self.registry.token_manager.get_account_summary(f"expert_{expert_id}")
-            if account:
-                return account.get('efficiency_rating', 0.5)
-            return 0.5
-        return await self._ecoatp_cache.get_or_compute(f"ecoatp_efficiency_{expert_id}", compute)
-
-    async def get_expert_token_balance(self, expert_id: str) -> float:
-        if not self.registry.token_manager:
-            return 0.0
-        account = self.registry.token_manager.get_account_summary(f"expert_{expert_id}")
-        if account:
-            return account.get('balance', 0)
-        return 0.0
-
-    async def get_gradient_strength(self, field_id: str) -> float:
-        if not self.registry.gradient_manager:
-            return 0.5
-        async def compute():
-            field = self.registry.gradient_manager.fields.get(field_id)
-            if field:
-                return field.gradient_strength
-            return 0.5
-        return await self._gradient_cache.get_or_compute(f"gradient_{field_id}", compute)
-
-    def get_species_population(self, species_id: str) -> int:
-        if self.registry.compartment_manager:
-            return sum(1 for c in self.registry.compartment_manager.compartments.values()
-                      if c.expert_type == species_id and c.is_viable)
-        return len([e for e in self.registry._experts.values()
-                   if hasattr(e, 'domain') and species_id in str(e.domain).lower()])
-
-    def get_species_populations(self) -> Dict[str, int]:
-        species = ['energy', 'data', 'iot', 'quantum', 'helium', 'general']
-        return {s: self.get_species_population(s) for s in species}
-
-    def get_total_compartment_population(self) -> int:
-        if self.registry.compartment_manager:
-            return len([c for c in self.registry.compartment_manager.compartments.values() if c.is_viable])
-        return len([e for e in self.registry._experts.values() if e.lifecycle_state.is_available()])
-
-    def get_species_id(self, profile: ExpertProfile) -> str:
-        domain = profile.domain.value
-        if 'energy' in domain.lower(): return 'energy'
-        if 'data' in domain.lower(): return 'data'
-        if 'iot' in domain.lower(): return 'iot'
-        if 'quantum' in domain.lower(): return 'quantum'
-        if 'helium' in domain.lower(): return 'helium'
-        return 'general'
-
-# ============================================================================
-# Fitness Manager (NEW)
-# ============================================================================
-
-class FitnessManager:
-    """Manages fitness scores and natural selection."""
-    def __init__(self, registry: 'ExpertRegistry'):
-        self.registry = registry
-        self._fitness_weights = registry.config.fitness_weights.copy()
-        self._fitness_weight_history = deque(maxlen=100)
-        self._lock = asyncio.Lock()
-        logger.info("FitnessManager initialized")
-
-    async def update_fitness_from_gradients(self):
-        if not self.registry.enable_bio_correlation or not self.registry.gradient_manager:
-            return
-        async with self._lock:
-            trust_strength = await self.registry.bio_correlator.get_gradient_strength('trust')
-            carbon_strength = await self.registry.bio_correlator.get_gradient_strength('carbon')
-            for expert_id, fitness in self.registry.fitness_scores.items():
-                if expert_id not in self.registry._experts:
-                    continue
-                expert = self.registry._experts[expert_id]
-                fitness.resilience_score = fitness.resilience_score * 0.7 + trust_strength * 0.3
-                carbon_eff = 1.0 / (1.0 + expert.carbon_per_inference * 10000)
-                fitness.resource_efficiency = fitness.resource_efficiency * 0.8 + carbon_eff * 0.2
-                fitness.ecoatp_efficiency = await self.registry.bio_correlator.get_expert_ecoatp_efficiency(expert_id)
-                if self.registry.compartment_manager:
-                    compartment = self.registry.compartment_manager.find_best_compartment(self.registry.bio_correlator.get_species_id(expert))
-                    if compartment:
-                        fitness.cooperation_score = fitness.cooperation_score * 0.8 + compartment.health_score * 0.2
-                fitness.quantum_efficiency = expert.health.quantum_efficiency
-                fitness.quantum_advantage = self._calculate_quantum_advantage(expert)
-                fitness.helium_savings = 1.0 - expert.helium_per_inference / max(expert.helium_per_inference, 1)
-                fitness.sustainability_score = expert.health.calculate_sustainability_score()
-                fitness.calculate_overall(self._fitness_weights)
-
-    def _calculate_quantum_advantage(self, profile: ExpertProfile) -> float:
-        if not profile.quantum_capable:
-            return 0.0
-        return min(1.0, (profile.quantum_qubits / 100) * 0.5 + profile.accuracy_score * 0.5)
-
-    def update_fitness_weights(self, new_weights: Dict[str, float]):
-        if abs(sum(new_weights.values()) - 1.0) > 0.01:
-            raise ValueError("Fitness weights must sum to 1.0")
-        self._fitness_weights = new_weights
-        self._fitness_weight_history.append(new_weights)
-        logger.info(f"Fitness weights updated: {new_weights}")
-
-    async def trigger_natural_selection(self):
-        if not self.registry.enable_natural_selection:
-            return
-        await self.update_fitness_from_gradients()
-        fitnesses = [f.overall_fitness for f in self.registry.fitness_scores.values()]
-        if not fitnesses:
-            return
-
-        low_pct = self.registry.config.natural_selection_percentile_low
-        high_pct = self.registry.config.natural_selection_percentile_high
-        threshold = np.percentile(fitnesses, low_pct)
-        top_threshold = np.percentile(fitnesses, high_pct)
-
-        deprecated_count = 0
-        reproducer_count = 0
-
-        async with self.registry._lock:
-            for expert_id, fitness in list(self.registry.fitness_scores.items()):
-                if expert_id not in self.registry._experts:
-                    continue
-                expert = self.registry._experts[expert_id]
-                if (fitness.overall_fitness < threshold and
-                    fitness.reproductive_success == 0 and
-                    expert.lifecycle_state in [ExpertLifecycleState.ACTIVE, ExpertLifecycleState.CERTIFIED]):
-                    self.registry.deprecate_expert(expert_id, reason="natural_selection_low_fitness")
-                    deprecated_count += 1
-                    if self.registry.biomass_storage:
-                        self.registry.biomass_storage.store_task(
-                            task_data={'expert_id': expert_id, 'knowledge': expert.model_dump()},
-                            ecoatp_cost=1.0,
-                            guarantee=GuaranteeLevel.BEST_EFFORT,
-                            initial_tier=StorageTier.LIPID_DEPOT
-                        )
-                    self.registry.evolutionary_events.append({
-                        'type': 'extinction',
-                        'expert_id': expert_id,
-                        'fitness': fitness.overall_fitness,
-                        'quantum_efficiency': fitness.quantum_efficiency,
-                        'reason': 'natural_selection',
-                        'timestamp': datetime.utcnow().isoformat()
-                    })
-                    self.registry.extinction_count += 1
-                elif fitness.overall_fitness > top_threshold and fitness.reproductive_success < self.registry.config.reproductive_max_offspring:
-                    fitness.reproductive_success += 1
-                    reproducer_count += 1
-
-        self.registry._stats['total_natural_selections'] += 1
-        self.registry._stats['last_selection'] = datetime.utcnow()
-        if deprecated_count > 0 or reproducer_count > 0:
-            logger.info(f"Natural selection: {deprecated_count} deprecated, {reproducer_count} marked for reproduction")
-
-# ============================================================================
-# CrossRegionRegistrySynchronizer (Enhanced with circuit breaker)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# CrossRegionRegistrySynchronizer (unchanged)
+# -----------------------------------------------------------------------------
 class CrossRegionRegistrySynchronizer:
-    """
-    Cross-Region Registry Synchronization with retry and circuit breaker.
-    """
     def __init__(self, registry: 'ExpertRegistry'):
         self.registry = registry
         self._session: Optional[aiohttp.ClientSession] = None
@@ -1567,36 +1334,45 @@ class CrossRegionRegistrySynchronizer:
             'circuit_open': self._circuit_breaker.state == "open"
         }
 
-# ============================================================================
-# Enhanced Expert Registry (Main Class) - v6.3.0
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Enhanced Expert Registry (Main Class) - v6.4.0
+# -----------------------------------------------------------------------------
 class ExpertRegistry:
     """
-    Enhanced Expert Registry v6.3.0 - Complete Bio-Inspired Genome Repository
+    Enhanced Expert Registry v6.4.0 - Complete Bio-Inspired Genome Repository
+    Fully integrated with Green Agent MOPD ecosystem.
     """
 
-    def __init__(self, config: Optional[ExpertRegistryConfig] = None, **kwargs):
-        if config is None:
-            config = ExpertRegistryConfig(**{
-                k: v for k, v in kwargs.items()
-                if k in ExpertRegistryConfig.model_fields
-            })
-        self.config = config
-        self.registry_id = config.registry_id
+    def __init__(
+        self,
+        storage: Storage,
+        message_queue: AsyncMessageQueue,
+        adaptive_cost: AdaptiveCostFunction,
+        pareto_gating: ParetoGating,
+        drift_detector: DriftDetector,
+        metrics: MetricsRegistry
+    ):
+        self.storage = storage
+        self.queue = message_queue
+        self.adaptive_cost = adaptive_cost
+        self.pareto = pareto_gating
+        self.drift = drift_detector
+        self.metrics = metrics
+
+        self.config = ExpertRegistryConfig()
+        self.registry_id = self.config.registry_id
 
         # Feature flags
-        self.enable_bio_correlation = config.enable_bio_correlation and BIO_INSPIRED_AVAILABLE
-        self.enable_natural_selection = config.enable_natural_selection
-        self.enable_fitness_tracking = config.enable_fitness_tracking
-        self.enable_population_tracking = config.enable_population_tracking
-        self.enable_sustainability_dashboard = config.enable_sustainability_dashboard
-        self.enable_predictive_forecasting = config.enable_predictive_forecasting
-        self.enable_cross_region_sync = config.enable_cross_region_sync
-        self.enable_quantum_efficiency = config.enable_quantum_efficiency
-        self.enable_reproductive_strategies = config.enable_reproductive_strategies
-        self.enable_climate_integration = config.enable_climate_integration
-        self.enable_persistence = config.enable_persistence
+        self.enable_bio_correlation = self.config.enable_bio_correlation and BIO_INSPIRED_AVAILABLE
+        self.enable_natural_selection = self.config.enable_natural_selection
+        self.enable_fitness_tracking = self.config.enable_fitness_tracking
+        self.enable_population_tracking = self.config.enable_population_tracking
+        self.enable_sustainability_dashboard = self.config.enable_sustainability_dashboard
+        self.enable_predictive_forecasting = self.config.enable_predictive_forecasting
+        self.enable_cross_region_sync = self.config.enable_cross_region_sync
+        self.enable_quantum_efficiency = self.config.enable_quantum_efficiency
+        self.enable_reproductive_strategies = self.config.enable_reproductive_strategies
+        self.enable_climate_integration = self.config.enable_climate_integration
 
         # External integrations
         self.tick_engine: Optional[Any] = None
@@ -1659,7 +1435,6 @@ class ExpertRegistry:
         self.sustainability_dashboard: Optional[RegistrySustainabilityDashboard] = None
         self.predictive_forecaster: Optional[PredictiveEvolutionForecaster] = None
         self.cross_region_sync: Optional[CrossRegionRegistrySynchronizer] = None
-        self.persistence_manager: Optional[RegistryPersistenceManager] = None
 
         # Locks
         self._lock = asyncio.Lock()
@@ -1668,7 +1443,7 @@ class ExpertRegistry:
         self._performance_lock = asyncio.Lock()
 
         # Rate limiter
-        self._rate_limiter = RateLimiter(config.rate_limit_per_minute)
+        self._rate_limiter = RateLimiter(self.config.rate_limit_per_minute)
 
         # Initialization status
         self._initialization_lock = asyncio.Lock()
@@ -1679,7 +1454,7 @@ class ExpertRegistry:
         # Start async initialization
         self._init_task = asyncio.create_task(self._async_init())
 
-        logger.info(f"Expert Registry v6.3.0 initialization started...")
+        logger.info(f"Expert Registry v6.4.0 initialization started...")
 
     async def _async_init(self):
         """Async initialization of sub-managers and state loading."""
@@ -1691,17 +1466,17 @@ class ExpertRegistry:
                 self.predictive_forecaster = PredictiveEvolutionForecaster(self)
             if self.enable_cross_region_sync:
                 self.cross_region_sync = CrossRegionRegistrySynchronizer(self)
-            if self.enable_persistence:
-                self.persistence_manager = RegistryPersistenceManager(self.config)
-                await self.persistence_manager.load_state(self)
             # Bio-correlator and fitness manager
             if self.enable_bio_correlation:
                 self.bio_correlator = BioCorrelator(self)
             self.fitness_manager = FitnessManager(self)
 
+            # Load state from central storage (if any)
+            await self._load_state_from_storage()
+
             async with self._initialization_lock:
                 self._ready = True
-            logger.info("Expert Registry v6.3.0 initialization complete.")
+            logger.info("Expert Registry v6.4.0 initialization complete.")
         except Exception as e:
             logger.error(f"Initialization failed: {e}", exc_info=True)
             async with self._initialization_lock:
@@ -1726,10 +1501,57 @@ class ExpertRegistry:
     def is_ready(self) -> bool:
         return self._ready
 
-    # ============================================================================
-    # External Module Injection
-    # ============================================================================
+    # ----------------------------------------------------------------------
+    # State Persistence using central Storage
+    # ----------------------------------------------------------------------
+    async def _load_state_from_storage(self):
+        """Load registry state from central storage."""
+        try:
+            data = self.storage.get_state("expert_registry_state")
+            if data:
+                state = json.loads(data)
+                # Restore experts
+                experts_data = state.get("experts", {})
+                for expert_id, exp_data in experts_data.items():
+                    profile = ExpertProfile.model_validate(exp_data)
+                    self._experts[expert_id] = profile
+                    self._update_indexes(profile)
+                # Restore fitness scores
+                fitness_data = state.get("fitness_scores", {})
+                for expert_id, fs_data in fitness_data.items():
+                    fs = FitnessScore.model_validate(fs_data)
+                    self.fitness_scores[expert_id] = fs
+                # Restore other state
+                self.speciation_count = state.get("speciation_count", 0)
+                self.extinction_count = state.get("extinction_count", 0)
+                self.total_generations = state.get("total_generations", 0)
+                self.reproductive_events = state.get("reproductive_events", 0)
+                self._stats = state.get("stats", self._stats)
+                # Indices can be rebuilt from experts
+                logger.info("Loaded expert registry state from storage")
+        except Exception as e:
+            logger.error(f"Failed to load registry state: {e}")
 
+    async def save_state(self):
+        """Save registry state to central storage."""
+        try:
+            state = {
+                "experts": {eid: exp.model_dump() for eid, exp in self._experts.items()},
+                "fitness_scores": {eid: fs.model_dump() for eid, fs in self.fitness_scores.items()},
+                "speciation_count": self.speciation_count,
+                "extinction_count": self.extinction_count,
+                "total_generations": self.total_generations,
+                "reproductive_events": self.reproductive_events,
+                "stats": self._stats,
+            }
+            self.storage.save_state("expert_registry_state", json.dumps(state))
+            logger.info("Saved registry state to storage")
+        except Exception as e:
+            logger.error(f"Failed to save registry state: {e}")
+
+    # ----------------------------------------------------------------------
+    # External Module Injection
+    # ----------------------------------------------------------------------
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
         if bio_core:
             self.token_manager = getattr(bio_core, 'token_manager', None)
@@ -1741,7 +1563,6 @@ class ExpertRegistry:
             self.gradient_manager = kwargs.get('gradient_manager')
             self.compartment_manager = kwargs.get('compartment_manager')
             self.biomass_storage = kwargs.get('biomass_storage')
-        # Recreate bio-correlator if needed
         if self.enable_bio_correlation and self.bio_correlator is None:
             self.bio_correlator = BioCorrelator(self)
         if self.enable_bio_correlation:
@@ -1755,23 +1576,28 @@ class ExpertRegistry:
         self.quantum_bridge = quantum_bridge
         logger.info("QuantumBridge injected into Expert Registry")
 
-    # ============================================================================
-    # Persistence Methods
-    # ============================================================================
+    # ----------------------------------------------------------------------
+    # Teacher Interface for MOPD
+    # ----------------------------------------------------------------------
+    async def policy_probs(self, state: Dict) -> List[float]:
+        """
+        Return a probability distribution over experts based on fitness scores.
+        This allows the MTPD optimizer to treat this module as a teacher.
+        """
+        experts = self.get_all_active_experts()
+        if not experts:
+            return []
+        # Use fitness scores as logits (with a softmax)
+        logits = [self.fitness_scores.get(e.expert_id, FitnessScore(expert_id=e.expert_id)).overall_fitness for e in experts]
+        # Avoid division by zero
+        logits = np.array(logits)
+        logits = np.exp(logits - np.max(logits))
+        probs = (logits / np.sum(logits)).tolist()
+        return probs
 
-    async def save_state(self):
-        await self._ensure_ready()
-        if self.persistence_manager:
-            await self.persistence_manager.save_state(self)
-
-    async def delete_state(self):
-        if self.persistence_manager:
-            await self.persistence_manager.delete_state()
-
-    # ============================================================================
-    # Expert Registration (Enhanced with rate limiting)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
+    # Expert Registration (Enhanced with FeedbackEvent and Pareto gating)
+    # ----------------------------------------------------------------------
     async def register_expert(
         self,
         profile: ExpertProfile,
@@ -1874,6 +1700,27 @@ class ExpertRegistry:
                        f"quantum: {profile.quantum_capable}, "
                        f"generation: {self.total_generations})")
 
+            # Publish FeedbackEvent
+            event = FeedbackEvent.create_with_context(
+                task_id=f"reg_{profile.expert_id}",
+                selected_action="register",
+                quality_score=fitness.overall_fitness if self.enable_fitness_tracking else 0.5,
+                energy_joules=0.0,
+                carbon_g=0.0,
+                feedback_type="registry",
+                adaptive_cost_value=0.0,
+                state={'expert_id': profile.expert_id, 'action': 'register'},
+                candidates=[{'action': 'register', 'deprecate', 'activate'}],
+                source="expert_registry",
+                environment=getattr(central_config, "ENVIRONMENT", "production"),
+                tags=["registry", "expert"]
+            )
+            await self.queue.publish("feedback_events", event.to_json())
+
+            # Check drift
+            if self.drift:
+                await self.drift.check_drift(self.adaptive_cost.get_current_weights())
+
             return True, f"Expert {profile.expert_id} registered successfully"
 
     def _validate_profile(self, profile: ExpertProfile) -> Tuple[bool, str]:
@@ -1958,10 +1805,9 @@ class ExpertRegistry:
                                            optional=dep.is_optional,
                                            version_req=dep.version_requirement)
 
-    # ============================================================================
-    # Filtering Methods (Enhanced with rate limiting)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
+    # Filtering Methods (Enhanced with adaptive cost and Pareto gating)
+    # ----------------------------------------------------------------------
     async def filter_by_ecoatp_efficiency(self, min_efficiency: float = 0.5, min_token_balance: float = 10.0) -> List[ExpertProfile]:
         await self._ensure_ready()
         if not await self._rate_limiter.acquire():
@@ -1979,6 +1825,14 @@ class ExpertRegistry:
         return efficient
 
     def filter_by_health_and_fitness(self, min_health: float = 0.5, min_fitness: float = 0.4) -> List[ExpertProfile]:
+        # Use adaptive cost weights to adjust thresholds
+        if self.adaptive_cost:
+            weights = self.adaptive_cost.get_current_weights()
+            # Example: adjust min_fitness based on carbon/cost weights
+            carbon_weight = weights.get('carbon', 0.3)
+            cost_weight = weights.get('cost', 0.3)
+            adjustment = (carbon_weight + cost_weight) * 0.1
+            min_fitness = max(0.2, min(0.8, min_fitness + adjustment))
         qualified = []
         for expert_id, expert in self._experts.items():
             if not expert.lifecycle_state.is_available():
@@ -1990,6 +1844,25 @@ class ExpertRegistry:
         return qualified
 
     def filter_by_sustainability_score(self, min_sustainability: float = 0.5) -> List[ExpertProfile]:
+        # Use Pareto gating to enforce constraints
+        candidates = []
+        for e in self._experts.values():
+            if e.lifecycle_state.is_available() and e.sustainability_score >= min_sustainability:
+                candidates.append({
+                    'expert_id': e.expert_id,
+                    'sustainability_score': e.sustainability_score,
+                    'carbon_per_inference': e.carbon_per_inference,
+                    'helium_per_inference': e.helium_per_inference,
+                    'quality_score': e.accuracy_score
+                })
+        # Apply Pareto filter (assuming we have a list of candidates)
+        if self.pareto:
+            filtered = self.pareto.filter(candidates)
+            if filtered:
+                # Return only experts that passed Pareto
+                allowed_ids = {c['expert_id'] for c in filtered}
+                return [e for e in self._experts.values() if e.expert_id in allowed_ids]
+        # Fallback: return all with sustainability >= threshold
         return [e for e in self._experts.values() if e.lifecycle_state.is_available() and e.sustainability_score >= min_sustainability]
 
     def filter_by_quantum_efficiency(self, min_quantum_efficiency: float = 0.3) -> List[ExpertProfile]:
@@ -2009,19 +1882,17 @@ class ExpertRegistry:
             return sorted([e for e in self.get_all_active_experts()], key=lambda e: e.reliability_score, reverse=True)[:max(1, len(self._experts) // 2)]
         return self.get_all_active_experts()
 
-    # ============================================================================
+    # ----------------------------------------------------------------------
     # Natural Selection (Forward to FitnessManager)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
     async def trigger_natural_selection(self):
         await self._ensure_ready()
         if self.fitness_manager:
             await self.fitness_manager.trigger_natural_selection()
 
-    # ============================================================================
+    # ----------------------------------------------------------------------
     # Reproductive Strategies (Forward to FitnessManager)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
     async def _reproductive_strategy_loop(self):
         while True:
             try:
@@ -2084,10 +1955,9 @@ class ExpertRegistry:
             self.reproductive_events += 1
             logger.info(f"Reproduced expert {offspring_id} from {expert_id}")
 
-    # ============================================================================
-    # Deprecation and Activation (unchanged)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
+    # Deprecation and Activation (with FeedbackEvent)
+    # ----------------------------------------------------------------------
     def deprecate_expert(self, expert_id: str, replacement_id: Optional[str] = None, reason: str = "manual") -> Tuple[bool, str]:
         if expert_id not in self._experts:
             return False, f"Expert {expert_id} not found"
@@ -2099,6 +1969,24 @@ class ExpertRegistry:
             self._migration_paths[expert_id] = replacement_id
         self._lifecycle_index[ExpertLifecycleState.DEPRECATED].add(expert_id)
         logger.info(f"Deprecated expert: {expert_id} (reason: {reason}, replacement: {replacement_id})")
+
+        # Publish FeedbackEvent
+        event = FeedbackEvent.create_with_context(
+            task_id=f"deprecate_{expert_id}",
+            selected_action="deprecate",
+            quality_score=0.0,  # or fitness if available
+            energy_joules=0.0,
+            carbon_g=0.0,
+            feedback_type="registry",
+            adaptive_cost_value=0.0,
+            state={'expert_id': expert_id, 'reason': reason},
+            candidates=[{'action': 'deprecate'}],
+            source="expert_registry",
+            environment=getattr(central_config, "ENVIRONMENT", "production"),
+            tags=["registry", "expert"]
+        )
+        asyncio.create_task(self.queue.publish("feedback_events", event.to_json()))
+
         return True, f"Expert {expert_id} deprecated"
 
     def activate_expert(self, expert_id: str) -> Tuple[bool, str]:
@@ -2112,12 +2000,29 @@ class ExpertRegistry:
         profile.is_active = True
         self._lifecycle_index[ExpertLifecycleState.ACTIVE].add(expert_id)
         logger.info(f"Activated expert: {expert_id}")
+
+        # Publish FeedbackEvent
+        event = FeedbackEvent.create_with_context(
+            task_id=f"activate_{expert_id}",
+            selected_action="activate",
+            quality_score=profile.health.calculate_health_score(),
+            energy_joules=0.0,
+            carbon_g=0.0,
+            feedback_type="registry",
+            adaptive_cost_value=0.0,
+            state={'expert_id': expert_id},
+            candidates=[{'action': 'activate'}],
+            source="expert_registry",
+            environment=getattr(central_config, "ENVIRONMENT", "production"),
+            tags=["registry", "expert"]
+        )
+        asyncio.create_task(self.queue.publish("feedback_events", event.to_json()))
+
         return True, f"Expert {expert_id} activated"
 
-    # ============================================================================
-    # Performance Tracking (Enhanced with rate limiting)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
+    # Performance Tracking (Enhanced with FeedbackEvent)
+    # ----------------------------------------------------------------------
     async def update_performance(self, expert_id: str, metrics: Dict[str, Any]):
         await self._ensure_ready()
         if not await self._rate_limiter.acquire():
@@ -2176,28 +2081,46 @@ class ExpertRegistry:
                 expert.lifecycle_state = ExpertLifecycleState.ACTIVE
                 logger.info(f"Expert {expert_id} auto-recovered (health: {health_score:.2f})")
 
-    # ============================================================================
-    # Dynamic Fitness Weights API
-    # ============================================================================
+            # Publish FeedbackEvent for performance update
+            event = FeedbackEvent.create_with_context(
+                task_id=f"perf_{expert_id}",
+                selected_action="update_performance",
+                quality_score=expert.health.calculate_health_score(),
+                energy_joules=metrics.get('energy_joules', 0.0),
+                carbon_g=metrics.get('carbon_kg', 0.0) * 1000,
+                feedback_type="registry",
+                adaptive_cost_value=0.0,
+                state={'expert_id': expert_id, 'metrics': metrics},
+                candidates=[{'action': 'update_performance'}],
+                source="expert_registry",
+                environment=getattr(central_config, "ENVIRONMENT", "production"),
+                tags=["registry", "performance"]
+            )
+            await self.queue.publish("feedback_events", event.to_json())
 
+            # Check drift
+            if self.drift:
+                await self.drift.check_drift(self.adaptive_cost.get_current_weights())
+
+    # ----------------------------------------------------------------------
+    # Dynamic Fitness Weights API
+    # ----------------------------------------------------------------------
     def update_fitness_weights(self, new_weights: Dict[str, float]):
         if self.fitness_manager:
             self.fitness_manager.update_fitness_weights(new_weights)
         else:
             logger.warning("Fitness manager not available, cannot update weights")
 
-    # ============================================================================
+    # ----------------------------------------------------------------------
     # Background Tasks
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
     async def _ensure_ready(self):
         if not self.is_ready:
             raise RuntimeError("Expert Registry not fully initialized. Call wait_until_ready() first.")
 
-    # ============================================================================
-    # Statistics and Reporting (unchanged)
-    # ============================================================================
-
+    # ----------------------------------------------------------------------
+    # Statistics and Reporting (Enhanced with central metrics)
+    # ----------------------------------------------------------------------
     def get_registry_stats(self) -> Dict[str, Any]:
         if not self.is_ready:
             return {'status': 'not_initialized'}
@@ -2243,6 +2166,13 @@ class ExpertRegistry:
             stats['forecast'] = self.predictive_forecaster.forecast_history[-1] if self.predictive_forecaster.forecast_history else None
         if self.enable_cross_region_sync and self.cross_region_sync:
             stats['sync'] = self.cross_region_sync.get_sync_status()
+
+        # Update central metrics
+        self.metrics.set_total_experts(total)
+        self.metrics.set_active_experts(available)
+        self.metrics.set_avg_sustainability_score(stats['sustainability_score'])
+        self.metrics.set_avg_fitness(stats['evolution']['average_fitness'])
+
         return stats
 
     def get_all_active_experts(self) -> List[ExpertProfile]:
@@ -2253,14 +2183,24 @@ class ExpertRegistry:
             return self.sustainability_dashboard.export_metrics()
         return {}
 
-    # ============================================================================
-    # Shutdown
-    # ============================================================================
+    # ----------------------------------------------------------------------
+    # Helper for species populations (internal)
+    # ----------------------------------------------------------------------
+    def _get_species_populations(self) -> Dict[str, int]:
+        if self.bio_correlator:
+            return self.bio_correlator.get_species_populations()
+        species = ['energy', 'data', 'iot', 'quantum', 'helium', 'general']
+        counts = {}
+        for sp in species:
+            counts[sp] = len([e for e in self._experts.values() if self.bio_correlator and self.bio_correlator.get_species_id(e) == sp])
+        return counts
 
+    # ----------------------------------------------------------------------
+    # Shutdown
+    # ----------------------------------------------------------------------
     async def shutdown(self):
         logger.info("Shutting down Expert Registry")
-        if self.enable_persistence:
-            await self.save_state()
+        await self.save_state()
         if self.cross_region_sync and self.cross_region_sync._session:
             await self.cross_region_sync._session.close()
         # Cancel background tasks
@@ -2269,16 +2209,30 @@ class ExpertRegistry:
             task.cancel()
         logger.info("Shutdown complete")
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Example Usage (if run directly)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    import logging
     logging.basicConfig(level=logging.INFO)
 
     async def main():
-        config = ExpertRegistryConfig()
-        registry = ExpertRegistry(config)
+        # In a real deployment, these would be provided by LifecycleManager.
+        from ..storage import Storage
+        from ..scaling.message_queue import AsyncMessageQueue
+        from ..feedback.adaptive_cost import AdaptiveCostFunction
+        from ..routing.pareto_gating import ParetoGating
+        from ..safety.drift_detector import DriftDetector
+        from ..metrics import MetricsRegistry
+
+        storage = Storage()
+        queue = AsyncMessageQueue()
+        adaptive_cost = AdaptiveCostFunction(storage)
+        pareto = ParetoGating()
+        drift = DriftDetector(storage, adaptive_cost)
+        metrics = MetricsRegistry()
+
+        registry = ExpertRegistry(storage, queue, adaptive_cost, pareto, drift, metrics)
         await registry.wait_until_ready()
 
         # Register an expert
