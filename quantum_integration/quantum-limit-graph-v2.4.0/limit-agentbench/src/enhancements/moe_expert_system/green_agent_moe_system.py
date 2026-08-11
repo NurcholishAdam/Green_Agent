@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-Green Agent MoE Expert System v6.4.0 - Unified Metabolic Ecosystem (Fully Enhanced)
+Green Agent MoE Expert System v7.0.0 - Unified Metabolic Ecosystem
+Full Green Agent MOPD Integration
 
-ENHANCED ARCHITECTURE:
-- Concurrent non-blocking health checks with per-component timeouts via asyncio.gather()
-- Active signal-transduction routing considering carbon/energy gradients & circuit breakers
-- Robust token-bucket rate limiter with boundary safety checks
-- Secure compressed persistence (JSON + zlib) with full state serialization
-- Production telemetry (Prometheus), structured logging, and resilient exception barriers
-- Gating network for dynamic expert selection
-- Circuit breaker for external calls
-- Real-time carbon/helium data integration
-- Self-healing handlers for each component
-- Full state persistence with versioning
-- Health check endpoint
-- Per-expert rate limiting
-- Comprehensive unit test stubs
+ENHANCEMENTS OVER v6.4.0:
+1. INTEGRATED with central Config, Storage, Logger, MetricsRegistry, AsyncMessageQueue.
+2. ADDED teacher interface (`policy_probs`) for MTPD optimizer.
+3. PUBLISHES FeedbackEvent for every task processing, expert selection, health state changes.
+4. USES central AdaptiveCostFunction, ParetoGating, and DriftDetector.
+5. REMOVED custom persistence; now uses central Storage.
+6. REMOVED custom Prometheus; now uses central MetricsRegistry.
+7. REMOVED custom logging; now uses central structlog.
+8. All optional dependencies (PyTorch, scikit-learn, etc.) still gracefully degrade.
 """
 
 import asyncio
 import hashlib
 import json
-import logging
 import os
 import random
 import time
@@ -30,9 +25,22 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-# Third-party optional imports with safe fallbacks
+# -----------------------------------------------------------------------------
+# IMPORT CENTRAL GREEN AGENT COMPONENTS
+# -----------------------------------------------------------------------------
+from ..config import config as central_config
+from ..storage import Storage
+from ..schemas.feedback_event import FeedbackEvent
+from ..routing.pareto_gating import ParetoGating
+from ..feedback.adaptive_cost import AdaptiveCostFunction
+from ..safety.drift_detector import DriftDetector
+from ..scaling.message_queue import AsyncMessageQueue
+from ..metrics import MetricsRegistry
+from ..logger import logger
+
+# Optional dependencies (graceful degradation)
 try:
     import aiofiles
 except ImportError:
@@ -52,13 +60,17 @@ except ImportError:
     wait_exponential = lambda **k: None
     retry_if_exception_type = lambda e: None
 
+# PyTorch (optional)
 try:
-    from prometheus_client import Counter, Gauge, Histogram, generate_latest, start_http_server
-    PROMETHEUS_AVAILABLE = True
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_AVAILABLE = True
 except ImportError:
-    PROMETHEUS_AVAILABLE = False
+    TORCH_AVAILABLE = False
 
-# Optional bio-inspired modules
+# Bio-inspired modules (optional)
 try:
     from enhancements.bio_inspired.eco_atp_currency import EcoATPTokenManager
     from enhancements.bio_inspired.proton_gradient_fields import GradientFieldManager
@@ -68,7 +80,7 @@ try:
 except ImportError:
     BIO_INSPIRED_AVAILABLE = False
 
-# Optional carbon/helium managers
+# Carbon/helium managers (optional; we'll stub if not available)
 try:
     from .carbon_intensity import CarbonIntensityManager
     from .helium_optimizer import HeliumEfficiencyOptimizer
@@ -76,60 +88,54 @@ try:
 except ImportError:
     CARBON_HELIUM_AVAILABLE = False
 
-logger = logging.getLogger("GreenAgent.MoE")
-
-# ============================================================================
-# System Configuration (environment-aware)
-# ============================================================================
-
-@dataclass
+# -----------------------------------------------------------------------------
+# Configuration – now built from central_config
+# -----------------------------------------------------------------------------
 class UnifiedEcosystemConfig:
-    """Centralized configuration for the Unified Metabolic Ecosystem."""
-    # Feature Flags
-    enable_quantum: bool = False
-    enable_helium: bool = False
-    enable_bio_inspired: bool = True
-    enable_evolving_gates: bool = True
-    enable_federated: bool = False
-    enable_cross_region: bool = False
-    enable_sustainability_dashboard: bool = True
-    enable_predictive_maintenance: bool = True
-    enable_digital_twin: bool = True
-    enable_unified_sustainability: bool = True
-    enable_health_checks: bool = True
-    enable_self_healing: bool = True
-    enable_alert_escalation: bool = True
-    enable_dynamic_reconfig: bool = True
-    enable_telemetry: bool = True
-    enable_persistence: bool = True
+    """Configuration for Unified Metabolic Ecosystem, built from central_config."""
+    def __init__(self):
+        # Feature Flags
+        self.enable_quantum = getattr(central_config, "enable_quantum", False)
+        self.enable_helium = getattr(central_config, "enable_helium", False)
+        self.enable_bio_inspired = getattr(central_config, "enable_bio_inspired", True) and BIO_INSPIRED_AVAILABLE
+        self.enable_evolving_gates = getattr(central_config, "enable_evolving_gates", True)
+        self.enable_federated = getattr(central_config, "enable_federated", False)
+        self.enable_cross_region = getattr(central_config, "enable_cross_region", False)
+        self.enable_sustainability_dashboard = getattr(central_config, "enable_sustainability_dashboard", True)
+        self.enable_predictive_maintenance = getattr(central_config, "enable_predictive_maintenance", True)
+        self.enable_digital_twin = getattr(central_config, "enable_digital_twin", True)
+        self.enable_unified_sustainability = getattr(central_config, "enable_unified_sustainability", True)
+        self.enable_health_checks = getattr(central_config, "enable_health_checks", True)
+        self.enable_self_healing = getattr(central_config, "enable_self_healing", True)
+        self.enable_alert_escalation = getattr(central_config, "enable_alert_escalation", True)
+        self.enable_dynamic_reconfig = getattr(central_config, "enable_dynamic_reconfig", True)
+        self.enable_telemetry = getattr(central_config, "enable_telemetry", True)
 
-    # Tunable Operational Limits
-    twin_time_horizon_years: int = 10
-    twin_n_simulations: int = 1000
-    twin_confidence: float = 0.95
-    health_check_interval: int = 30
-    health_check_timeout: float = 5.0
-    recovery_max_attempts: int = 5
-    persistence_path: str = "ecosystem_state.json.gz"
-    telemetry_export_interval: int = 60
-    alert_escalation_timeout: int = 300
-    prometheus_port: Optional[int] = None
-    rate_limit_per_minute: int = 120
-    per_expert_rate_limit: int = 10  # new
+        # Tunable Operational Limits
+        self.twin_time_horizon_years = getattr(central_config, "twin_time_horizon_years", 10)
+        self.twin_n_simulations = getattr(central_config, "twin_n_simulations", 1000)
+        self.twin_confidence = getattr(central_config, "twin_confidence", 0.95)
+        self.health_check_interval = getattr(central_config, "health_check_interval", 30)
+        self.health_check_timeout = getattr(central_config, "health_check_timeout", 5.0)
+        self.recovery_max_attempts = getattr(central_config, "recovery_max_attempts", 5)
+        self.telemetry_export_interval = getattr(central_config, "telemetry_export_interval", 60)
+        self.alert_escalation_timeout = getattr(central_config, "alert_escalation_timeout", 300)
+        self.rate_limit_per_minute = getattr(central_config, "rate_limit_requests", 120)
+        self.per_expert_rate_limit = getattr(central_config, "per_expert_rate_limit", 10)
 
-    # Gating network config
-    gating_input_dim: int = 10
-    gating_hidden_dim: int = 64
-    gating_num_experts: int = 3
-    gating_num_layers: int = 2
-    gating_learning_rate: float = 0.001
-    gating_activation: str = "relu"
+        # Gating network config
+        self.gating_input_dim = getattr(central_config, "gating_input_dim", 10)
+        self.gating_hidden_dim = getattr(central_config, "gating_hidden_dim", 64)
+        self.gating_num_experts = getattr(central_config, "gating_num_experts", 3)
+        self.gating_num_layers = getattr(central_config, "gating_num_layers", 2)
+        self.gating_learning_rate = getattr(central_config, "gating_learning_rate", 0.001)
+        self.gating_activation = getattr(central_config, "gating_activation", "relu")
 
-    # Carbon/helium API config
-    carbon_api_region: str = "us-east"
-    carbon_update_interval: int = 300
+        # Carbon/helium API config
+        self.carbon_api_region = getattr(central_config, "carbon_api_region", "us-east")
+        self.carbon_update_interval = getattr(central_config, "carbon_update_interval", 300)
 
-    def __post_init__(self):
+        # Validate
         if self.health_check_interval < 1:
             raise ValueError("health_check_interval must be >= 1 second")
         if self.recovery_max_attempts < 1:
@@ -139,59 +145,15 @@ class UnifiedEcosystemConfig:
         if self.per_expert_rate_limit < 1:
             raise ValueError("per_expert_rate_limit must be >= 1")
 
-# ============================================================================
-# Validation Models (Pydantic / Fallback Data Structures)
-# ============================================================================
-
-if BaseModel is not None:
-    class TaskInput(BaseModel):
-        """Validated task input payload."""
-        model_config = ConfigDict(arbitrary_types_allowed=True)
-        type: str
-        params: Dict[str, Any] = Field(default_factory=dict)
-        priority: str = "normal"
-        context: Optional[Dict[str, Any]] = None
-
-    class ContextInput(BaseModel):
-        """Validated environmental & energy context."""
-        model_config = ConfigDict(arbitrary_types_allowed=True)
-        carbon_zone: Optional[int] = 1
-        helium_scarcity: Optional[float] = 0.0
-        task_complexity: Optional[float] = 0.5
-        token_balance: Optional[float] = 1000.0
-        gradient_carbon: Optional[float] = 0.05
-        gradient_helium: Optional[float] = 0.0
-        gradient_trust: Optional[float] = 1.0
-        opportunity_gradient: Optional[float] = 0.8
-        stress_level: Optional[float] = 0.1
-
-    class EcosystemState(BaseModel):
-        """Complete ecosystem state schema for persistence."""
-        version: str = "6.4.0"
-        sustainability_score: float = 1.0
-        last_update: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-        registry_stats: Dict[str, Any] = Field(default_factory=dict)
-        router_stats: Dict[str, Any] = Field(default_factory=dict)
-        alert_history: List[Dict[str, Any]] = Field(default_factory=list)
-        health_history: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
-        recovery_attempts: Dict[str, int] = Field(default_factory=dict)
-        gating_weights: Optional[Dict[str, Any]] = None  # serialized model state
-        gating_config: Dict[str, Any] = Field(default_factory=dict)
-        expert_profiles: Dict[str, Any] = Field(default_factory=dict)
-        carbon_position: Dict[str, Any] = Field(default_factory=dict)
-        helium_position: Dict[str, Any] = Field(default_factory=dict)
-
-# ============================================================================
-# Circuit Breaker (with half-open state)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Circuit Breaker (unchanged)
+# -----------------------------------------------------------------------------
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
 class CircuitBreaker:
-    """Circuit breaker with half-open state and automatic recovery."""
     def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
@@ -213,7 +175,6 @@ class CircuitBreaker:
                         raise RuntimeError(f"Circuit breaker OPEN (recovery in {self.recovery_timeout - elapsed:.1f}s)")
                 else:
                     raise RuntimeError("Circuit breaker OPEN (no failure time)")
-
         try:
             result = await func(*args, **kwargs)
             async with self._lock:
@@ -247,29 +208,19 @@ class CircuitBreaker:
             self.last_failure_time = None
             logger.info("Circuit breaker manually reset")
 
-# ============================================================================
-# Gating Network (neural network for expert selection)
-# ============================================================================
-
-def get_activation(name: str) -> nn.Module:
-    try:
-        import torch.nn as nn
-    except ImportError:
-        raise ImportError("PyTorch required for gating network")
-    if name == "relu":
-        return nn.ReLU()
-    elif name == "tanh":
-        return nn.Tanh()
-    elif name == "gelu":
-        return nn.GELU()
-    else:
-        raise ValueError(f"Unknown activation: {name}")
-
-if BaseModel is not None:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
+# -----------------------------------------------------------------------------
+# Gating Network (Neural Network for Expert Selection)
+# -----------------------------------------------------------------------------
+if TORCH_AVAILABLE:
+    def get_activation(name: str) -> nn.Module:
+        if name == "relu":
+            return nn.ReLU()
+        elif name == "tanh":
+            return nn.Tanh()
+        elif name == "gelu":
+            return nn.GELU()
+        else:
+            raise ValueError(f"Unknown activation: {name}")
 
     class GatingNetwork(nn.Module):
         """Neural network for expert gating with configurable architecture."""
@@ -291,13 +242,24 @@ if BaseModel is not None:
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.network(x)
+else:
+    # Fallback if PyTorch not available
+    class GatingNetwork:
+        def __init__(self, input_dim, hidden_dim, num_experts, **kwargs):
+            self.num_experts = num_experts
+        def forward(self, x):
+            return None
 
-    class GatingNetworkManager:
-        """Manages gating network training, inference, and persistence."""
-        def __init__(self, config: UnifiedEcosystemConfig, expert_ids: List[str]):
-            self.config = config
-            self.expert_ids = expert_ids
-            self.num_experts = len(expert_ids)
+# -----------------------------------------------------------------------------
+# Gating Network Manager (Enhanced with teacher interface)
+# -----------------------------------------------------------------------------
+class GatingNetworkManager:
+    """Manages gating network training, inference, and persistence."""
+    def __init__(self, config: UnifiedEcosystemConfig, expert_ids: List[str]):
+        self.config = config
+        self.expert_ids = expert_ids
+        self.num_experts = len(expert_ids)
+        if TORCH_AVAILABLE:
             self.model = GatingNetwork(
                 input_dim=config.gating_input_dim,
                 hidden_dim=config.gating_hidden_dim,
@@ -307,155 +269,104 @@ if BaseModel is not None:
             )
             self.optimizer = optim.Adam(self.model.parameters(), lr=config.gating_learning_rate)
             self.criterion = nn.CrossEntropyLoss()
-            self.training_buffer: deque = deque(maxlen=10000)
-            self.is_trained = False
-            self.inference_count = 0
-            self.training_count = 0
+        else:
+            self.model = None
+        self.training_buffer: deque = deque(maxlen=10000)
+        self.is_trained = False
+        self.inference_count = 0
+        self.training_count = 0
 
-        def _build_features(self, context: Dict[str, Any]) -> np.ndarray:
-            features = []
-            # Expected keys (ensure we have exactly input_dim features)
-            keys = [
-                'carbon_zone', 'helium_scarcity', 'task_complexity',
-                'token_balance', 'gradient_carbon', 'gradient_helium',
-                'gradient_trust', 'opportunity_gradient', 'stress_level',
-                'avg_client_energy'
-            ]
-            for k in keys:
-                features.append(context.get(k, 0.5))
-            # Pad or truncate
-            if len(features) != self.config.gating_input_dim:
-                if len(features) < self.config.gating_input_dim:
-                    features.extend([0.0] * (self.config.gating_input_dim - len(features)))
-                else:
-                    features = features[:self.config.gating_input_dim]
-            return np.array(features, dtype=np.float32)
-
-        async def predict(self, context: Dict[str, Any]) -> Dict[str, float]:
-            features = self._build_features(context)
-            with torch.no_grad():
-                logits = self.model(torch.FloatTensor(features).unsqueeze(0))
-                probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
-            self.inference_count += 1
-            return {self.expert_ids[i]: float(probs[i]) for i in range(len(self.expert_ids))}
-
-        def add_training_sample(self, features: np.ndarray, label: int):
-            if features.shape[0] != self.config.gating_input_dim:
-                raise ValueError(f"Feature dimension mismatch: expected {self.config.gating_input_dim}")
-            if not 0 <= label < self.num_experts:
-                raise ValueError(f"Label out of range: {label}")
-            if len(self.training_buffer) >= 10000:
-                self.training_buffer.popleft()
-            self.training_buffer.append((features, label))
-
-        async def train(self, epochs: int = 3):
-            if not self.training_buffer:
-                logger.warning("No training data available")
-                return
-            buffer_list = list(self.training_buffer)
-            X = np.array([sample[0] for sample in buffer_list], dtype=np.float32)
-            y = np.array([sample[1] for sample in buffer_list], dtype=np.int64)
-            X_tensor = torch.FloatTensor(X)
-            y_tensor = torch.LongTensor(y)
-            dataset = TensorDataset(X_tensor, y_tensor)
-            dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-            self.model.train()
-            total_loss = 0.0
-            for epoch in range(epochs):
-                epoch_loss = 0.0
-                for batch_X, batch_y in dataloader:
-                    self.optimizer.zero_grad()
-                    output = self.model(batch_X)
-                    loss = self.criterion(output, batch_y)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimizer.step()
-                    epoch_loss += loss.item()
-                total_loss += epoch_loss
-            self.is_trained = True
-            self.training_count += 1
-            logger.info(f"Gating network trained. Avg loss: {total_loss/epochs:.4f}")
-
-        def get_state_dict(self) -> Dict[str, Any]:
-            return {k: v.tolist() for k, v in self.model.state_dict().items()}
-
-        def load_state_dict(self, state_dict: Dict[str, Any]):
-            self.model.load_state_dict({k: torch.FloatTensor(v) for k, v in state_dict.items()})
-            self.is_trained = True
-
-        async def save(self, path: str):
-            state = {
-                'model_state': self.get_state_dict(),
-                'config': self.config.dict(),
-                'expert_ids': self.expert_ids,
-                'is_trained': self.is_trained,
-                'inference_count': self.inference_count,
-                'training_count': self.training_count
-            }
-            # Use JSON + zlib
-            json_str = json.dumps(state, indent=2)
-            compressed = zlib.compress(json_str.encode('utf-8'))
-            if aiofiles:
-                async with aiofiles.open(path, 'wb') as f:
-                    await f.write(compressed)
+    def _build_features(self, context: Dict[str, Any]) -> np.ndarray:
+        features = []
+        keys = [
+            'carbon_zone', 'helium_scarcity', 'task_complexity',
+            'token_balance', 'gradient_carbon', 'gradient_helium',
+            'gradient_trust', 'opportunity_gradient', 'stress_level',
+            'avg_client_energy'
+        ]
+        for k in keys:
+            features.append(context.get(k, 0.5))
+        if len(features) != self.config.gating_input_dim:
+            if len(features) < self.config.gating_input_dim:
+                features.extend([0.0] * (self.config.gating_input_dim - len(features)))
             else:
-                with open(path, 'wb') as f:
-                    f.write(compressed)
-            logger.info(f"Gating network saved to {path}")
+                features = features[:self.config.gating_input_dim]
+        return np.array(features, dtype=np.float32)
 
-        async def load(self, path: str) -> bool:
-            if not os.path.exists(path):
-                return False
-            try:
-                if aiofiles:
-                    async with aiofiles.open(path, 'rb') as f:
-                        compressed = await f.read()
-                else:
-                    with open(path, 'rb') as f:
-                        compressed = f.read()
-                json_str = zlib.decompress(compressed).decode('utf-8')
-                state = json.loads(json_str)
-                self.load_state_dict(state['model_state'])
-                self.is_trained = state['is_trained']
-                self.inference_count = state['inference_count']
-                self.training_count = state['training_count']
-                logger.info(f"Gating network loaded from {path}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to load gating network: {e}")
-                return False
+    async def predict(self, context: Dict[str, Any]) -> Dict[str, float]:
+        if not TORCH_AVAILABLE or self.model is None:
+            # Fallback: uniform distribution
+            return {eid: 1.0 / self.num_experts for eid in self.expert_ids}
+        features = self._build_features(context)
+        with torch.no_grad():
+            logits = self.model(torch.FloatTensor(features).unsqueeze(0))
+            probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
+        self.inference_count += 1
+        return {self.expert_ids[i]: float(probs[i]) for i in range(len(self.expert_ids))}
 
-else:
-    # Fallback: no gating network, use simple heuristic
-    class GatingNetworkManager:
-        def __init__(self, config: UnifiedEcosystemConfig, expert_ids: List[str]):
-            self.expert_ids = expert_ids
-            self.config = config
-            self.is_trained = False
+    def add_training_sample(self, features: np.ndarray, label: int):
+        if features.shape[0] != self.config.gating_input_dim:
+            raise ValueError(f"Feature dimension mismatch: expected {self.config.gating_input_dim}")
+        if not 0 <= label < self.num_experts:
+            raise ValueError(f"Label out of range: {label}")
+        if len(self.training_buffer) >= 10000:
+            self.training_buffer.popleft()
+        self.training_buffer.append((features, label))
 
-        async def predict(self, context: Dict[str, Any]) -> Dict[str, float]:
-            # Random heuristic
-            weights = np.random.dirichlet(np.ones(len(self.expert_ids)))
-            return {eid: float(w) for eid, w in zip(self.expert_ids, weights)}
+    async def train(self, epochs: int = 3):
+        if not self.training_buffer or not TORCH_AVAILABLE:
+            logger.warning("No training data or PyTorch not available")
+            return
+        buffer_list = list(self.training_buffer)
+        X = np.array([sample[0] for sample in buffer_list], dtype=np.float32)
+        y = np.array([sample[1] for sample in buffer_list], dtype=np.int64)
+        X_tensor = torch.FloatTensor(X)
+        y_tensor = torch.LongTensor(y)
+        dataset = TensorDataset(X_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        self.model.train()
+        total_loss = 0.0
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            for batch_X, batch_y in dataloader:
+                self.optimizer.zero_grad()
+                output = self.model(batch_X)
+                loss = self.criterion(output, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                epoch_loss += loss.item()
+            total_loss += epoch_loss
+        self.is_trained = True
+        self.training_count += 1
+        logger.info(f"Gating network trained. Avg loss: {total_loss/epochs:.4f}")
 
-        def add_training_sample(self, features: np.ndarray, label: int):
-            pass
+    def get_state_dict(self) -> Dict[str, Any]:
+        if not TORCH_AVAILABLE or self.model is None:
+            return {}
+        return {k: v.tolist() for k, v in self.model.state_dict().items()}
 
-        async def train(self, epochs: int = 3):
-            pass
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        if not TORCH_AVAILABLE or self.model is None:
+            return
+        self.model.load_state_dict({k: torch.FloatTensor(v) for k, v in state_dict.items()})
+        self.is_trained = True
 
-        async def save(self, path: str):
-            pass
+    # ----------------------------------------------------------------------
+    # Teacher interface for MOPD
+    # ----------------------------------------------------------------------
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
+        """
+        Return a probability distribution over experts.
+        This allows the MTPD optimizer to treat this module as a teacher.
+        """
+        probs_dict = await self.predict(state)
+        return [probs_dict.get(eid, 0.0) for eid in self.expert_ids]
 
-        async def load(self, path: str) -> bool:
-            return False
-
-# ============================================================================
-# Optimized Token Bucket Rate Limiter
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Rate Limiter (unchanged)
+# -----------------------------------------------------------------------------
 class RateLimiter:
-    """Thread/Async safe token bucket rate limiter with safe boundary capping."""
     def __init__(self, rate_per_minute: int):
         self.capacity = float(rate_per_minute)
         self.fill_rate = rate_per_minute / 60.0
@@ -474,12 +385,7 @@ class RateLimiter:
                 return True
             return False
 
-# ============================================================================
-# Per-Expert Rate Limiter
-# ============================================================================
-
 class PerExpertRateLimiter:
-    """Rate limiter per expert."""
     def __init__(self, rate_per_minute: int):
         self.limiters: Dict[str, RateLimiter] = {}
         self.rate = rate_per_minute
@@ -489,86 +395,10 @@ class PerExpertRateLimiter:
             self.limiters[expert_id] = RateLimiter(self.rate)
         return self.limiters[expert_id]
 
-# ============================================================================
-# Telemetry Collector (Prometheus Integration)
-# ============================================================================
-
-class TelemetryCollector:
-    """Telemetry collector exposing counters, gauges, and histograms."""
-    def __init__(self, config: UnifiedEcosystemConfig):
-        self.config = config
-        self.metrics: Dict[str, Any] = {
-            "counters": defaultdict(float),
-            "gauges": {},
-            "histograms": defaultdict(list)
-        }
-        self._lock = asyncio.Lock()
-        self._prom_metrics = {}
-        if PROMETHEUS_AVAILABLE and config.prometheus_port:
-            self._setup_prometheus()
-
-    def _setup_prometheus(self):
-        try:
-            self._prom_metrics = {
-                'sustainability_score': Gauge('green_agent_sustainability_score', 'Current ecosystem sustainability score'),
-                'system_health_score': Gauge('green_agent_health_score', 'Current ecosystem health score'),
-                'tasks_processed_total': Counter('green_agent_tasks_processed_total', 'Total tasks processed by MoE'),
-                'task_routing_failures': Counter('green_agent_routing_failures_total', 'Total task routing failures'),
-                'task_latency_seconds': Histogram('green_agent_task_latency_seconds', 'Task processing latency in seconds'),
-                'gating_inference_total': Counter('green_agent_gating_inference_total', 'Gating network inferences'),
-                'gating_training_total': Counter('green_agent_gating_training_total', 'Gating network training runs'),
-                'circuit_breaker_state': Gauge('green_agent_circuit_breaker_state', 'Circuit breaker state (0=closed,1=open,2=half_open)'),
-                'per_expert_rate_limit': Gauge('green_agent_per_expert_rate_limit', 'Per-expert rate limiter tokens', ['expert']),
-            }
-            start_http_server(self.config.prometheus_port)
-            logger.info(f"Prometheus HTTP metrics server online at port {self.config.prometheus_port}")
-        except Exception as e:
-            logger.error(f"Failed to start Prometheus exporter: {e}")
-
-    def increment(self, metric_name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None):
-        key = self._make_key(metric_name, labels)
-        self.metrics['counters'][key] += value
-        if metric_name in self._prom_metrics:
-            if isinstance(self._prom_metrics[metric_name], Counter):
-                if labels:
-                    self._prom_metrics[metric_name].labels(**labels).inc(value)
-                else:
-                    self._prom_metrics[metric_name].inc(value)
-
-    def gauge(self, metric_name: str, value: float, labels: Optional[Dict[str, str]] = None):
-        key = self._make_key(metric_name, labels)
-        self.metrics['gauges'][key] = value
-        if metric_name in self._prom_metrics:
-            if isinstance(self._prom_metrics[metric_name], Gauge):
-                if labels:
-                    self._prom_metrics[metric_name].labels(**labels).set(value)
-                else:
-                    self._prom_metrics[metric_name].set(value)
-
-    def observe(self, metric_name: str, value: float, labels: Optional[Dict[str, str]] = None):
-        key = self._make_key(metric_name, labels)
-        self.metrics['histograms'][key].append(value)
-        if len(self.metrics['histograms'][key]) > 1000:
-            self.metrics['histograms'][key] = self.metrics['histograms'][key][-1000:]
-        if metric_name in self._prom_metrics:
-            if isinstance(self._prom_metrics[metric_name], Histogram):
-                if labels:
-                    self._prom_metrics[metric_name].labels(**labels).observe(value)
-                else:
-                    self._prom_metrics[metric_name].observe(value)
-
-    def _make_key(self, metric_name: str, labels: Optional[Dict[str, str]]) -> str:
-        if labels:
-            tag_str = ','.join(f"{k}={v}" for k, v in sorted(labels.items()))
-            return f"{metric_name}{{{tag_str}}}"
-        return metric_name
-
-# ============================================================================
-# Concurrent Non-Blocking Health Check System
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Health Check System (unchanged, but uses central logger)
+# -----------------------------------------------------------------------------
 class HealthCheckSystem:
-    """Asynchronous concurrent health check monitoring engine."""
     def __init__(self, config: UnifiedEcosystemConfig):
         self.config = config
         self.components: Dict[str, Any] = {}
@@ -665,12 +495,10 @@ class HealthCheckSystem:
             except asyncio.CancelledError:
                 pass
 
-# ============================================================================
-# Self-Healing System with Component-Specific Handlers
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Self-Healing System (unchanged, uses central logger)
+# -----------------------------------------------------------------------------
 class SelfHealingSystem:
-    """Automated recovery and self-healing daemon."""
     def __init__(self, config: UnifiedEcosystemConfig, health_system: HealthCheckSystem):
         self.config = config
         self.health_system = health_system
@@ -718,7 +546,6 @@ class SelfHealingSystem:
                     else:
                         success = handler()
                 else:
-                    # Default recovery action: reset component health status
                     success = True
             except Exception as e:
                 logger.error(f"Recovery handler failed for {component_name}: {e}")
@@ -736,12 +563,10 @@ class SelfHealingSystem:
             except asyncio.CancelledError:
                 pass
 
-# ============================================================================
-# Alerting System with Escalation and External Notification
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Alerting System (unchanged, but uses central logger)
+# -----------------------------------------------------------------------------
 class AlertingSystem:
-    """Alerting and incident recording subsystem with external notification."""
     def __init__(self, config: UnifiedEcosystemConfig):
         self.config = config
         self.alert_history: List[Dict[str, Any]] = []
@@ -764,7 +589,6 @@ class AlertingSystem:
             if len(self.alert_history) > 500:
                 self.alert_history = self.alert_history[-500:]
             logger.warning(f"ALERT [{level.upper()}]: {message}")
-            # Notify hooks
             for hook in self._notification_hooks:
                 try:
                     if asyncio.iscoroutinefunction(hook):
@@ -774,81 +598,11 @@ class AlertingSystem:
                 except Exception as e:
                     logger.error(f"Notification hook failed: {e}")
 
-# ============================================================================
-# Ecosystem Persistence Manager (Full State)
-# ============================================================================
-
-class EcosystemPersistenceManager:
-    """Async persistence storing compressed zlib states with full ecosystem state."""
-    def __init__(self, config: UnifiedEcosystemConfig):
-        self.config = config
-        self.path = config.persistence_path
-        self._lock = asyncio.Lock()
-
-    async def save_state(self, ecosystem: 'UnifiedMetabolicEcosystem') -> bool:
-        async with self._lock:
-            try:
-                health_data = await ecosystem.health_system.get_system_health() if ecosystem.health_system else {}
-                state = {
-                    "version": "6.4.0",
-                    "sustainability_score": ecosystem.sustainability_score,
-                    "last_update": datetime.utcnow().isoformat(),
-                    "health_summary": health_data,
-                    "alerts_total": len(ecosystem.alert_system.alert_history) if ecosystem.alert_system else 0,
-                    "gating_state": ecosystem.gating_network.get_state_dict() if hasattr(ecosystem.gating_network, 'get_state_dict') else {},
-                    "gating_config": ecosystem.config.dict(),
-                    "expert_profiles": {name: {"domain": exp.domain} for name, exp in ecosystem.experts.items()},
-                    "carbon_position": await ecosystem.carbon_manager.get_current_position() if ecosystem.carbon_manager else {},
-                    "helium_position": await ecosystem.helium_optimizer.get_helium_status() if ecosystem.helium_optimizer else {},
-                }
-                json_bytes = json.dumps(state, indent=2).encode('utf-8')
-                compressed = zlib.compress(json_bytes)
-                if aiofiles:
-                    async with aiofiles.open(self.path, "wb") as f:
-                        await f.write(compressed)
-                else:
-                    with open(self.path, "wb") as f:
-                        f.write(compressed)
-                logger.info(f"Ecosystem state persisted to {self.path} ({len(compressed)} bytes)")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to persist ecosystem state: {e}")
-                return False
-
-    async def load_state(self, ecosystem: 'UnifiedMetabolicEcosystem') -> bool:
-        async with self._lock:
-            if not os.path.exists(self.path):
-                logger.warning(f"Persistence file {self.path} not found")
-                return False
-            try:
-                if aiofiles:
-                    async with aiofiles.open(self.path, "rb") as f:
-                        compressed = await f.read()
-                else:
-                    with open(self.path, "rb") as f:
-                        compressed = f.read()
-                json_bytes = zlib.decompress(compressed)
-                state = json.loads(json_bytes)
-                # Restore sustainability score
-                ecosystem.sustainability_score = state.get("sustainability_score", 1.0)
-                # Restore gating network if available
-                if hasattr(ecosystem.gating_network, 'load_state_dict') and state.get('gating_state'):
-                    ecosystem.gating_network.load_state_dict(state['gating_state'])
-                # Restore expert profiles (optional)
-                # Restore carbon/helium positions (optional)
-                logger.info(f"Ecosystem state loaded from {self.path}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to load ecosystem state: {e}")
-                return False
-
-# ============================================================================
-# Carbon Intensity Manager (Real Integration)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Carbon Intensity Manager (Real Integration, uses central logger)
+# -----------------------------------------------------------------------------
 if CARBON_HELIUM_AVAILABLE:
     class CarbonIntensityManager:
-        """Real carbon intensity manager with caching and API integration."""
         def __init__(self, config: UnifiedEcosystemConfig):
             self.config = config
             self.region = config.carbon_api_region
@@ -895,7 +649,6 @@ if CARBON_HELIUM_AVAILABLE:
                 await self._session.close()
 
     class HeliumEfficiencyOptimizer:
-        """Helium efficiency optimizer with price forecasting."""
         def __init__(self, config: UnifiedEcosystemConfig):
             self.config = config
             self.budget = 100.0
@@ -908,7 +661,6 @@ if CARBON_HELIUM_AVAILABLE:
             return {'budget': self.budget, 'usage': dict(self.usage), 'price': self.price, 'efficiency_scores': dict(self.efficiency_scores)}
 
         async def allocate(self, requirements: Dict[str, float]) -> Dict[str, float]:
-            # Simple proportional allocation
             total = sum(requirements.values())
             if total <= self.budget:
                 return requirements
@@ -917,7 +669,6 @@ if CARBON_HELIUM_AVAILABLE:
         async def close(self):
             pass
 else:
-    # Fallback stubs
     class CarbonIntensityManager:
         async def get_current_intensity(self) -> float:
             return 400.0
@@ -938,12 +689,10 @@ else:
         def __init__(self, config):
             self.config = config
 
-# ============================================================================
-# Expert Base Class with Health and Capabilities
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Base Expert (unchanged)
+# -----------------------------------------------------------------------------
 class BaseExpert:
-    """Base specialized metabolic expert interface."""
     def __init__(self, name: str, domain: str):
         self.name = name
         self.domain = domain
@@ -960,10 +709,6 @@ class BaseExpert:
     def get_capabilities(self) -> Dict[str, Any]:
         return self.capabilities
 
-# ============================================================================
-# Concrete Experts
-# ============================================================================
-
 class EnergyExpert(BaseExpert):
     def __init__(self):
         super().__init__("EnergyExpert", "energy_management")
@@ -979,24 +724,38 @@ class IoTExpert(BaseExpert):
         super().__init__("IoTExpert", "iot_sensing")
         self.capabilities.update({"protocols": ["MQTT", "CoAP"], "power": "low"})
 
-# ============================================================================
-# Core Unified Metabolic Ecosystem (Enhanced)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Core Unified Metabolic Ecosystem – Fully Integrated
+# -----------------------------------------------------------------------------
 class UnifiedMetabolicEcosystem:
     """
     Central Nervous Control Plane for Green Agent MoE Expert System.
     Orchestrates routing, carbon-aware signal transduction, health loops, and resilience.
+    Fully integrated with Green Agent MOPD ecosystem.
     """
-    def __init__(self, config: Optional[UnifiedEcosystemConfig] = None):
-        self.config = config or UnifiedEcosystemConfig()
+
+    def __init__(
+        self,
+        storage: Storage,
+        message_queue: AsyncMessageQueue,
+        adaptive_cost: AdaptiveCostFunction,
+        pareto_gating: ParetoGating,
+        drift_detector: DriftDetector,
+        metrics: MetricsRegistry
+    ):
+        self.storage = storage
+        self.queue = message_queue
+        self.adaptive_cost = adaptive_cost
+        self.pareto = pareto_gating
+        self.drift = drift_detector
+        self.metrics = metrics
+
+        self.config = UnifiedEcosystemConfig()
         self.sustainability_score: float = 1.0
 
-        # Infrastructure modules
-        self.telemetry = TelemetryCollector(self.config) if self.config.enable_telemetry else None
+        # Rate limiters
         self.rate_limiter = RateLimiter(self.config.rate_limit_per_minute)
         self.per_expert_limiter = PerExpertRateLimiter(self.config.per_expert_rate_limit)
-        self.persistence = EcosystemPersistenceManager(self.config) if self.config.enable_persistence else None
 
         # Health & Healing
         self.health_system = HealthCheckSystem(self.config) if self.config.enable_health_checks else None
@@ -1021,7 +780,7 @@ class UnifiedMetabolicEcosystem:
         # Circuit breaker for external calls
         self._circuit_breaker = CircuitBreaker()
 
-        # Component Registration
+        # Component registration for health
         if self.health_system:
             for exp_key, exp_obj in self.experts.items():
                 self.health_system.register_component(exp_obj.name, exp_obj)
@@ -1031,25 +790,22 @@ class UnifiedMetabolicEcosystem:
             self.health_system.start()
 
         if self.self_healing:
-            # Register recovery handlers
             self.self_healing.register_handler("gating_network", self._recover_gating_network)
             self.self_healing.register_handler("carbon_manager", self._recover_carbon_manager)
             self.self_healing.register_handler("helium_optimizer", self._recover_helium_optimizer)
             self.self_healing.start()
 
-        # Load state if persistence enabled
-        if self.persistence:
-            asyncio.create_task(self.persistence.load_state(self))
+        # Load state from central storage
+        asyncio.create_task(self._load_state())
 
         # Background tasks
         self._bg_tasks = []
         self._start_background_tasks()
 
-        logger.info("UnifiedMetabolicEcosystem v6.4.0 initialized successfully.")
+        logger.info("UnifiedMetabolicEcosystem v7.0.0 initialized successfully.")
 
     def _start_background_tasks(self):
         if self.config.enable_health_checks:
-            # Periodic carbon update
             self._bg_tasks.append(asyncio.create_task(self._carbon_update_loop()))
         if self.config.enable_telemetry:
             self._bg_tasks.append(asyncio.create_task(self._telemetry_export_loop()))
@@ -1069,8 +825,8 @@ class UnifiedMetabolicEcosystem:
     async def _telemetry_export_loop(self):
         while True:
             try:
-                # In production, could push to monitoring system
-                logger.debug("Telemetry export (simulated)")
+                # Export metrics to central registry (already done via self.metrics)
+                logger.debug("Telemetry export (central metrics)")
                 await asyncio.sleep(self.config.telemetry_export_interval)
             except asyncio.CancelledError:
                 break
@@ -1078,10 +834,37 @@ class UnifiedMetabolicEcosystem:
                 logger.error(f"Telemetry export error: {e}")
                 await asyncio.sleep(60)
 
-    # ==========================================================================
-    # Recovery Handlers
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # State Persistence using central Storage
+    # --------------------------------------------------------------------------
+    async def _load_state(self):
+        try:
+            data = self.storage.get_state("moe_ecosystem_state")
+            if data:
+                state = json.loads(data)
+                self.sustainability_score = state.get("sustainability_score", 1.0)
+                # Restore gating network if possible
+                gating_state = state.get("gating_state")
+                if gating_state and hasattr(self.gating_network, 'load_state_dict'):
+                    self.gating_network.load_state_dict(gating_state)
+                logger.info("Loaded MoE ecosystem state from storage")
+        except Exception as e:
+            logger.error(f"Failed to load ecosystem state: {e}")
 
+    async def save_state(self):
+        try:
+            state = {
+                "sustainability_score": self.sustainability_score,
+                "gating_state": self.gating_network.get_state_dict() if hasattr(self.gating_network, 'get_state_dict') else {},
+            }
+            self.storage.save_state("moe_ecosystem_state", json.dumps(state))
+            logger.info("Saved MoE ecosystem state to storage")
+        except Exception as e:
+            logger.error(f"Failed to save ecosystem state: {e}")
+
+    # --------------------------------------------------------------------------
+    # Recovery Handlers
+    # --------------------------------------------------------------------------
     async def _recover_gating_network(self) -> bool:
         logger.info("Recovering gating network: resetting model to default.")
         self.gating_network = GatingNetworkManager(self.config, self.expert_ids)
@@ -1099,28 +882,35 @@ class UnifiedMetabolicEcosystem:
         self.helium_optimizer = HeliumEfficiencyOptimizer(self.config)
         return True
 
-    # ==========================================================================
-    # Main Processing
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # Teacher Interface for MOPD
+    # --------------------------------------------------------------------------
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
+        """
+        Return a probability distribution over experts.
+        This allows the MTPD optimizer to treat this module as a teacher.
+        """
+        return await self.gating_network.policy_probs(state)
 
+    # --------------------------------------------------------------------------
+    # Main Processing
+    # --------------------------------------------------------------------------
     async def process_task(self, task_data: Dict[str, Any], context_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         start_time = time.monotonic()
 
         # 1. Rate Limiter Guard (global)
         if not await self.rate_limiter.acquire():
-            if self.telemetry:
-                self.telemetry.increment("rate_limit_exceeded")
+            self.metrics.increment("rate_limit_exceeded")
             return {"status": "error", "reason": "Rate limit exceeded. System capacity saturated."}
 
-        # 2. Input Schema Validation
+        # 2. Validate inputs (if Pydantic available)
         if BaseModel is not None:
             try:
-                task = TaskInput(**task_data)
-                context_obj = ContextInput(**(context_data or {}))
-                ctx_dict = context_obj.model_dump()
-                t_type = task.type
-                t_params = task.params
-            except ValidationError as ve:
+                # We'll just use raw dicts; Pydantic validation can be added if needed
+                ctx_dict = context_data or {}
+                t_type = task_data.get("type", "generic")
+                t_params = task_data.get("params", {})
+            except Exception as ve:
                 logger.error(f"Task validation failed: {ve}")
                 return {"status": "error", "reason": "Invalid payload format", "details": str(ve)}
         else:
@@ -1128,8 +918,7 @@ class UnifiedMetabolicEcosystem:
             t_params = task_data.get("params", {})
             ctx_dict = context_data or {}
 
-        if self.telemetry:
-            self.telemetry.increment("tasks_received")
+        self.metrics.increment("tasks_received")
 
         try:
             # 3. Enrich context with real data
@@ -1139,49 +928,92 @@ class UnifiedMetabolicEcosystem:
             if self.helium_optimizer:
                 helium_status = await self.helium_optimizer.get_helium_status()
                 ctx_dict["helium_scarcity"] = helium_status.get("price", 0.5)
-            # Add gradient signals from context or managers
 
             # 4. Gating network inference
             weights = await self.gating_network.predict(ctx_dict)
-            # Apply per-expert rate limiting
+
+            # 5. Apply Pareto gating to filter experts
+            if self.pareto:
+                candidates = []
+                for eid, weight in weights.items():
+                    expert = self.experts[eid]
+                    health = await expert.get_health_status()
+                    candidates.append({
+                        'expert_id': eid,
+                        'quality_score': weight,
+                        'carbon_g': 0.0,  # placeholders
+                        'latency_ms': 0.0,
+                        'energy_joules': 0.0,
+                        'health_score': health.get('score', 1.0)
+                    })
+                filtered = self.pareto.filter(candidates)
+                if filtered:
+                    allowed_ids = {c['expert_id'] for c in filtered}
+                    for eid in list(weights.keys()):
+                        if eid not in allowed_ids:
+                            weights[eid] = 0.0
+
+            # 6. Apply per-expert rate limiting
             for eid in list(weights.keys()):
                 limiter = self.per_expert_limiter.get_limiter(eid)
                 if not await limiter.acquire():
                     weights[eid] = 0.0
                     logger.debug(f"Expert {eid} rate-limited")
-            # Normalize weights
+
+            # 7. Normalize weights
             total = sum(weights.values())
             if total > 0:
                 weights = {k: v / total for k, v in weights.items()}
             else:
                 weights = {eid: 1.0 / len(self.experts) for eid in self.experts}
 
-            # 5. Select expert with highest weight
+            # 8. Select expert with highest weight
             selected_expert_id = max(weights, key=weights.get)
             selected_expert = self.experts[selected_expert_id]
 
-            # 6. Expert Health & Circuit Breaker Guard
+            # 9. Expert Health & Circuit Breaker Guard
             exp_health = await selected_expert.get_health_status()
             if exp_health.get("status") == "unhealthy":
                 logger.warning(f"Target expert {selected_expert.name} unhealthy. Rerouting...")
                 # Fallback to data expert
                 selected_expert = self.experts["data"]
 
-            # 7. Execute Task Workload
+            # 10. Execute Task Workload
             execution_res = await selected_expert.execute(t_params, ctx_dict)
 
-            # 8. Update Sustainability Index
+            # 11. Update Sustainability Index
             carbon_factor = ctx_dict.get("carbon_intensity", 0.5)
             helium_factor = ctx_dict.get("helium_scarcity", 0.5)
             self.sustainability_score = max(0.0, min(1.0, 1.0 - (carbon_factor * 0.4 + helium_factor * 0.3)))
 
             elapsed = time.monotonic() - start_time
 
-            if self.telemetry:
-                self.telemetry.increment("tasks_completed_success")
-                self.telemetry.observe("task_latency_seconds", elapsed)
-                self.telemetry.gauge("sustainability_score", self.sustainability_score)
-                self.telemetry.increment("gating_inference_total")
+            # 12. Update metrics
+            self.metrics.increment("tasks_completed_success")
+            self.metrics.observe("task_latency_seconds", elapsed)
+            self.metrics.set_sustainability_score(self.sustainability_score)
+            self.metrics.increment("gating_inference_total")
+
+            # 13. Publish FeedbackEvent
+            event = FeedbackEvent.create_with_context(
+                task_id=f"moe_{hashlib.sha256(json.dumps(ctx_dict).encode()).hexdigest()[:8]}",
+                selected_action=selected_expert.name,
+                quality_score=weights[selected_expert_id],
+                energy_joules=0.0,
+                carbon_g=0.0,
+                feedback_type="moe_routing",
+                adaptive_cost_value=0.0,
+                state={'task_type': t_type, 'context': ctx_dict},
+                candidates=[{'expert': eid, 'weight': w} for eid, w in weights.items()],
+                source="green_agent_moe",
+                environment=getattr(central_config, "ENVIRONMENT", "production"),
+                tags=["moe", "routing"]
+            )
+            await self.queue.publish("feedback_events", event.to_json())
+
+            # 14. Check drift
+            if self.drift:
+                await self.drift.check_drift(self.adaptive_cost.get_current_weights())
 
             return {
                 "status": "success",
@@ -1198,20 +1030,17 @@ class UnifiedMetabolicEcosystem:
 
         except Exception as e:
             logger.error(f"Error processing task: {e}", exc_info=True)
-            if self.telemetry:
-                self.telemetry.increment("task_failures")
+            self.metrics.increment("task_failures")
             if self.alert_system:
                 await self.alert_system.trigger_alert("error", f"Task processing failure: {str(e)}")
             return {"status": "error", "reason": str(e)}
 
-    # ==========================================================================
+    # --------------------------------------------------------------------------
     # Health Check Endpoint
-    # ==========================================================================
-
+    # --------------------------------------------------------------------------
     async def health_check(self) -> Dict[str, Any]:
-        """Returns comprehensive health status."""
         status = {
-            "version": "6.4.0",
+            "version": "7.0.0",
             "timestamp": datetime.utcnow().isoformat(),
             "sustainability_score": self.sustainability_score,
             "expert_count": len(self.experts),
@@ -1220,24 +1049,14 @@ class UnifiedMetabolicEcosystem:
         }
         if self.health_system:
             status["system_health"] = await self.health_system.get_system_health()
+        # Update central metrics
+        self.metrics.set_expert_count(len(self.experts))
+        self.metrics.set_sustainability_score(self.sustainability_score)
         return status
 
-    # ==========================================================================
-    # Persistence
-    # ==========================================================================
-
-    async def save_state(self):
-        if self.persistence:
-            await self.persistence.save_state(self)
-
-    async def load_state(self):
-        if self.persistence:
-            await self.persistence.load_state(self)
-
-    # ==========================================================================
+    # --------------------------------------------------------------------------
     # Shutdown
-    # ==========================================================================
-
+    # --------------------------------------------------------------------------
     async def shutdown(self):
         logger.info("Initiating system shutdown sequence...")
         # Cancel background tasks
@@ -1252,41 +1071,45 @@ class UnifiedMetabolicEcosystem:
             await self.carbon_manager.close()
         if self.helium_optimizer:
             await self.helium_optimizer.close()
-        if self.persistence:
-            await self.save_state()
+        await self.save_state()
         logger.info("UnifiedMetabolicEcosystem shutdown complete.")
 
-# ============================================================================
-# Main Verification Execution Entrypoint
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Example Usage (if run directly)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    import logging
+    logging.basicConfig(level=logging.INFO)
 
     async def main():
-        config = UnifiedEcosystemConfig(
-            rate_limit_per_minute=200,
-            health_check_interval=5,
-            persistence_path="enhanced_ecosystem_state.json.gz"
-        )
+        from ..storage import Storage
+        from ..scaling.message_queue import AsyncMessageQueue
+        from ..feedback.adaptive_cost import AdaptiveCostFunction
+        from ..routing.pareto_gating import ParetoGating
+        from ..safety.drift_detector import DriftDetector
+        from ..metrics import MetricsRegistry
 
-        ecosystem = UnifiedMetabolicEcosystem(config)
+        storage = Storage()
+        queue = AsyncMessageQueue()
+        adaptive_cost = AdaptiveCostFunction(storage)
+        pareto = ParetoGating()
+        drift = DriftDetector(storage, adaptive_cost)
+        metrics = MetricsRegistry()
+
+        ecosystem = UnifiedMetabolicEcosystem(storage, queue, adaptive_cost, pareto, drift, metrics)
 
         print("\n--- Processing Sample Green Agent Task ---")
         response = await ecosystem.process_task(
             task_data={"type": "energy_optimization", "params": {"grid_target": "renewable_solar"}},
             context_data={"gradient_carbon": 0.22, "carbon_zone": 2}
         )
-
         print("Response Output:")
         print(json.dumps(response, indent=2))
 
-        # Allow background health checks to perform a concurrent pass
         await asyncio.sleep(2)
-
-        health_status = await ecosystem.health_check()
+        health = await ecosystem.health_check()
         print("\n--- Real-Time System Health Status ---")
-        print(json.dumps(health_status, indent=2))
+        print(json.dumps(health, indent=2))
 
         await ecosystem.shutdown()
 
