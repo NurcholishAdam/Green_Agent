@@ -2,6 +2,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator, ConfigD
 from typing import Optional, Dict, List, Literal
 from enum import Enum
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ==============================================
 # Enums for compression methods and quantization
@@ -18,6 +21,43 @@ class QuantizationMethod(str, Enum):
     INT8_DYNAMIC = "int8_dynamic"
     INT8_STATIC = "int8_static"
     FP16 = "fp16"
+
+# ==============================================
+# MOPD Configuration (NEW)
+# ==============================================
+
+class MOPDConfig(BaseModel):
+    """
+    Configuration for Multi‑Objective Pareto Decision (MOPD) in model compression.
+    """
+    enabled: bool = Field(
+        True,
+        description="Enable MOPD‑aware compression selection"
+    )
+    objective_weights: Dict[str, float] = Field(
+        default_factory=lambda: {
+            'accuracy': 0.4,
+            'energy': 0.3,
+            'carbon': 0.2,
+            'material': 0.1,
+        },
+        description="Weights for scalarising Pareto front (must sum to 1)"
+    )
+    grid_resolution: int = Field(
+        5,
+        ge=2,
+        description="Number of discrete points for sampling (e.g., for weight combinations)"
+    )
+    enable_cost_benefit: bool = Field(True)
+    enable_predictive: bool = Field(True)
+
+    @model_validator(mode='after')
+    def check_weights(self):
+        """Ensure objective weights sum to 1."""
+        total = sum(self.objective_weights.values())
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"MOPD objective weights must sum to 1, got {total}")
+        return self
 
 # ==============================================
 # Enhanced Sustainability Configuration
@@ -133,7 +173,13 @@ class SustainabilityConfig(BaseModel):
     recompress_interval_seconds: int = Field(3600, ge=60)
 
     # ========== Versioning ==========
-    version: str = Field("1.0", description="Configuration schema version")
+    version: str = Field("1.1", description="Configuration schema version")
+
+    # ========== MOPD Configuration (NEW) ==========
+    mopd: MOPDConfig = Field(
+        default_factory=MOPDConfig,
+        description="Multi‑Objective Pareto Decision settings"
+    )
 
     # Pydantic v2 configuration
     model_config = ConfigDict(env_prefix="SUSTAINABILITY_")
@@ -210,6 +256,14 @@ class SustainabilityConfig(BaseModel):
             return {k: v / total for k, v in weights.items()}
         return weights
 
+    def get_mopd_weights(self) -> Dict[str, float]:
+        """Return the MOPD objective weights (for Pareto selection)."""
+        return self.mopd.objective_weights
+
+    def is_mopd_enabled(self) -> bool:
+        """Return whether MOPD is enabled."""
+        return self.mopd.enabled
+
     # ---------- Serialization Helpers ----------
     def to_dict(self) -> Dict:
         """Export configuration as a dictionary (excluding None values)."""
@@ -226,12 +280,6 @@ class SustainabilityConfig(BaseModel):
         return cls()
 
 # ==============================================
-# Logger for warning messages
-# ==============================================
-import logging
-logger = logging.getLogger(__name__)
-
-# ==============================================
 # Convenience exports
 # ==============================================
 
@@ -239,4 +287,5 @@ __all__ = [
     "SustainabilityConfig",
     "CompressionMethod",
     "QuantizationMethod",
+    "MOPDConfig",
 ]
