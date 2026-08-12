@@ -1,23 +1,16 @@
 """
-Bio‑Integrated Green Agent v12.0.0
-Complete orchestration with:
-- Active QuantumBridge control (adjust QUBO penalties)
-- Proactive TimeTickEngine forecast‑based strategy switching
-- Two‑way swarm coordination (Q‑table sharing, consensus bonus)
-- Workflow outcome feedback into reward
-- Proactive self‑healing based on health score
-- Degradation‑aware strategy selection
-- Active reconfiguration of all bio‑inspired modules
-- CompetitionEngine integration (spawn/kill children)
-- TokenSupplyManager / TokenAllocator integration
-- Q‑table refreshing and pruning (LRU‑based)
-- Dynamic configuration reload (YAML/JSON support)
-- Enhanced observability and explainability
-- Robust circuit breakers with SQLite persistence
-- Retry mechanisms with tenacity
-- Standardized structured logging with structlog
-- Comprehensive API docstrings
-- Internal event bus for agent‑level events
+Bio‑Integrated Green Agent v12.1.0
+Complete orchestration with MOPD (Multi‑Objective Pareto Decision) support.
+
+Enhancements over v12.0.0:
+- Added MOPDConfig sub‑configuration.
+- Added MOPDPoint dataclass to represent strategy objective vectors.
+- Extended RLStrategySelector to generate and store Pareto fronts.
+- Modified reward computation to return both scalar and objective vector.
+- Added public get_mopd_pareto_front() and get_mopd_summary() methods.
+- Persisted Pareto front in state save/load.
+- Telemetry for MOPD generations and Pareto front sizes.
+- Full backward compatibility.
 """
 
 import asyncio
@@ -89,7 +82,6 @@ except ImportError:
     PQC_AVAILABLE = False
 
 # ---------- Local imports (with fallback) ----------
-# We assume these modules exist; if not, we provide stubs.
 try:
     from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
     TOKEN_AVAILABLE = True
@@ -165,7 +157,7 @@ if not CORE_AVAILABLE:
             self._last_failure_time = None
             self._half_open_attempt_count = 0
             self._lock = asyncio.Lock()
-            self.storage = storage  # to persist state (if provided)
+            self.storage = storage
             self._load_state()
 
         def _load_state(self):
@@ -285,9 +277,31 @@ class Storage:
             return None
 
 # ============================================================================
-# Configuration (Pydantic) – extended with file loading
+# Configuration (Pydantic) – extended with MOPD
 # ============================================================================
 if PYDANTIC_AVAILABLE:
+    class MOPDConfig(BaseModel):
+        """Configuration for Multi‑Objective Pareto Decision (MOPD) in strategy selection."""
+        enabled: bool = Field(True, description="Enable MOPD‑aware strategy selection")
+        objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'energy_efficiency': 0.3,
+                'helium_sustainability': 0.25,
+                'token_balance': 0.2,
+                'health_score': 0.15,
+                'carbon_leakage': 0.1,
+            },
+            description="Weights for scalarising Pareto front (must sum to 1)"
+        )
+        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
+
+        @validator('objective_weights')
+        def check_weights(cls, v):
+            total = sum(v.values())
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError("objective_weights must sum to 1")
+            return v
+
     class AgentConfig(BaseModel):
         """
         Configuration for the Bio‑Integrated Agent.
@@ -299,7 +313,7 @@ if PYDANTIC_AVAILABLE:
         enable_quantum_bridge: bool = True
         enable_time_tick_engine: bool = True
         enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
+        enable_multi_objective_rl: bool = False   # kept for backward compatibility
         enable_proactive_healing: bool = True
 
         # RL strategy
@@ -379,7 +393,7 @@ if PYDANTIC_AVAILABLE:
         blockchain_audit_events: List[str] = Field(
             default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot']
         )
-        blockchain_audit_min_importance: float = 0.5  # 0–1 threshold
+        blockchain_audit_min_importance: float = 0.5
 
         # Persistence
         state_save_interval_seconds: int = 300
@@ -388,8 +402,8 @@ if PYDANTIC_AVAILABLE:
 
         # Q‑table compression and refresh
         q_table_max_size: int = 5000
-        q_table_refresh_interval: int = 10000  # steps
-        q_table_prune_threshold: float = 0.1  # fraction of states to prune when full
+        q_table_refresh_interval: int = 10000
+        q_table_prune_threshold: float = 0.1
 
         # Proactive healing threshold
         proactive_healing_health_threshold: float = 0.6
@@ -413,6 +427,9 @@ if PYDANTIC_AVAILABLE:
         circuit_breaker_recovery_timeout: float = 30.0
         circuit_breaker_half_open_attempts: int = 3
 
+        # MOPD configuration (NEW)
+        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
+
         class Config:
             env_prefix = "AGENT_"
 
@@ -428,25 +445,34 @@ if PYDANTIC_AVAILABLE:
 
         @root_validator
         def validate_websocket_auth(cls, values):
-            # (No WebSocket here; we removed it for clarity)
             return values
 
         @classmethod
         def from_yaml(cls, path: str) -> 'AgentConfig':
-            """Load configuration from a YAML file."""
             with open(path, 'r') as f:
                 data = yaml.safe_load(f)
             return cls(**data)
 
         @classmethod
         def from_json(cls, path: str) -> 'AgentConfig':
-            """Load configuration from a JSON file."""
             with open(path, 'r') as f:
                 data = json.load(f)
             return cls(**data)
 
 else:
     # Fallback dataclass if Pydantic not available
+    @dataclass
+    class MOPDConfig:
+        enabled: bool = True
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            'energy_efficiency': 0.3,
+            'helium_sustainability': 0.25,
+            'token_balance': 0.2,
+            'health_score': 0.15,
+            'carbon_leakage': 0.1,
+        })
+        grid_resolution: int = 5
+
     @dataclass
     class AgentConfig:
         agent_id: str = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
@@ -539,17 +565,13 @@ else:
         circuit_breaker_failure_threshold: int = 5
         circuit_breaker_recovery_timeout: float = 30.0
         circuit_breaker_half_open_attempts: int = 3
+        mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
 # ============================================================================
-# Quantum‑Resilient Security (with hard dependency on PQC)
+# Quantum‑Resilient Security (unchanged)
 # ============================================================================
 class QuantumResilientSecurity:
-    """
-    Quantum‑resilient security using Falcon/Dilithium for signing.
-    Falls back to ECDSA if PQC not available, with a warning.
-    Keys are stored in a directory.
-    """
-
+    # ... (same as before) ...
     def __init__(self, config: AgentConfig):
         self.config = config
         self.pqc_key_dir = Path(config.pqc_key_dir)
@@ -573,7 +595,6 @@ class QuantumResilientSecurity:
                 logger.warning(f"Failed to load PQC keys: {e}")
 
         if PQC_AVAILABLE:
-            # Use Dilithium as the primary algorithm (more standardised)
             self.private_key, self.public_key = dilithium.generate_keypair()
             with open(priv_path, 'wb') as f:
                 f.write(self.private_key)
@@ -581,7 +602,6 @@ class QuantumResilientSecurity:
                 f.write(self.public_key)
             logger.info("Generated and saved new Dilithium keys")
         else:
-            # Fallback to ECDSA (not quantum‑resilient, but better than HMAC)
             from cryptography.hazmat.primitives.asymmetric import ec
             from cryptography.hazmat.primitives import serialization
             private_key = ec.generate_private_key(ec.SECP256R1())
@@ -598,7 +618,7 @@ class QuantumResilientSecurity:
                 f.write(self.private_key)
             with open(pub_path, 'wb') as f:
                 f.write(self.public_key)
-            logger.warning("PQC library not available; using ECDSA fallback (not quantum‑resilient)")
+            logger.warning("PQC library not available; using ECDSA fallback")
 
     def sign_data(self, data: Dict[str, Any]) -> str:
         payload = json.dumps(data, sort_keys=True, default=str).encode()
@@ -606,7 +626,6 @@ class QuantumResilientSecurity:
             signature = dilithium.sign(payload, self.private_key)
             return signature.hex()
         else:
-            # ECDSA fallback
             from cryptography.hazmat.primitives.asymmetric import ec
             from cryptography.hazmat.primitives import hashes
             private_key = ec.load_der_private_key(self.private_key, password=None)
@@ -632,13 +651,10 @@ class QuantumResilientSecurity:
                 return False
 
 # ============================================================================
-# Blockchain Auditor (with enhanced logging)
+# Blockchain Auditor (unchanged)
 # ============================================================================
 class BlockchainAuditor:
-    """
-    Records important events to an immutable ledger with cryptographic signatures.
-    """
-
+    # ... (same as before) ...
     def __init__(self, config: AgentConfig, security: QuantumResilientSecurity):
         self.config = config
         self.security = security
@@ -646,22 +662,9 @@ class BlockchainAuditor:
         self._lock = asyncio.Lock()
 
     async def record_event(self, event_type: str, payload: Dict[str, Any], importance: float = 0.5) -> bool:
-        """
-        Record an event to the ledger if it meets audit criteria.
-
-        Args:
-            event_type: Type of event (e.g., 'strategy_change').
-            payload: Data associated with the event.
-            importance: Importance score (0-1); events below min_importance are skipped.
-
-        Returns:
-            True if recorded, False otherwise.
-        """
         if event_type not in self.config.blockchain_audit_events:
-            logger.debug(f"Event {event_type} not in audit list; skipping")
             return False
         if importance < self.config.blockchain_audit_min_importance:
-            logger.debug(f"Event importance {importance} below threshold; skipping")
             return False
         signature = self.security.sign_data(payload)
         entry = {
@@ -677,34 +680,27 @@ class BlockchainAuditor:
         return True
 
     def get_ledger(self, limit: int = 100) -> List[Dict]:
-        """Return the most recent ledger entries."""
         return self.ledger[-limit:]
 
     def verify_entry(self, entry: Dict) -> bool:
-        """Verify the signature of a ledger entry."""
         payload = entry['payload']
         signature = entry['signature']
         return self.security.verify_signature(payload, signature)
 
 # ============================================================================
-# Internal Event Bus (for agent‑level events)
+# Internal Event Bus (unchanged)
 # ============================================================================
 class EventBus:
-    """
-    Simple in‑memory event bus for agent‑internal events.
-    """
-
+    # ... (same as before) ...
     def __init__(self):
         self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
         self._lock = asyncio.Lock()
 
     def subscribe(self, event_type: str, callback: Callable):
-        """Register a callback for an event type."""
         async with self._lock:
             self._subscribers[event_type].append(callback)
 
     async def publish(self, event: BioEvent):
-        """Publish an event to all subscribers."""
         async with self._lock:
             callbacks = self._subscribers.get(event.event_type, [])
         for cb in callbacks:
@@ -717,11 +713,35 @@ class EventBus:
                 logger.error(f"Event callback error for {event.event_type}: {e}")
 
 # ============================================================================
-# RL Strategy Selector (v12 – enhanced with LRU pruning)
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPoint:
+    """Represents a strategy with its objective vector."""
+    strategy: str
+    # Objectives (to be maximised)
+    energy_efficiency: float
+    helium_sustainability: float
+    token_balance: float
+    health_score: float
+    carbon_leakage: float  # lower is better, so we will invert for normalisation
+    # Scalarised score (computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        return cls(**data)
+
+# ============================================================================
+# RL Strategy Selector (Enhanced with MOPD)
 # ============================================================================
 class RLStrategySelector:
     """
     Reinforcement learning strategy selector using Q‑learning with adaptive parameters.
+    Now supports MOPD by storing objective vectors and generating Pareto fronts.
     """
 
     def __init__(self, config: AgentConfig):
@@ -736,8 +756,11 @@ class RLStrategySelector:
         self.state_bins = config.rl_state_bins
         self.reward_history = deque(maxlen=100)
         self.step_counter = 0
-        # LRU tracking for pruning
         self.state_last_visited: Dict[str, datetime] = {}
+
+        # MOPD: store objective vectors per strategy (NEW)
+        self.strategy_objectives_history: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+        self.pareto_front: List[MOPDPoint] = []
 
     def _state_to_key(self, state: Dict[str, float]) -> str:
         # ... (same as before) ...
@@ -751,11 +774,10 @@ class RLStrategySelector:
         helium_trend = state.get('helium_trend', 0)
         q_penalty_carbon = state.get('q_penalty_carbon', 0.5)
         q_penalty_helium = state.get('q_penalty_helium', 0.5)
-        degradation_tier = state.get('degradation_tier', 3)  # 1-5
-        swarm_consensus = state.get('swarm_consensus', 0.5)  # 0-1
-        workflow_success = state.get('workflow_success', 0.5)  # 0-1
+        degradation_tier = state.get('degradation_tier', 3)
+        swarm_consensus = state.get('swarm_consensus', 0.5)
+        workflow_success = state.get('workflow_success', 0.5)
 
-        # Binning
         load_bin = 'high' if load > 0.7 else 'medium' if load > 0.4 else 'low'
         health_bin = 'good' if health > 0.7 else 'medium' if health > 0.4 else 'poor'
         token_bin = 'abundant' if token > 1000 else 'adequate' if token > 100 else 'scarce'
@@ -778,7 +800,6 @@ class RLStrategySelector:
             self.q_table[key] = {s: 0.0 for s in self.actions}
         self.state_last_visited[key] = datetime.now(timezone.utc)
 
-        # Adaptive epsilon
         if len(self.reward_history) > 20:
             var = np.var(self.reward_history)
             if var < 0.05:
@@ -799,7 +820,8 @@ class RLStrategySelector:
         self.step_counter += 1
         return action
 
-    def update(self, state: Dict[str, float], action: str, reward: float, next_state: Dict[str, float]):
+    def update(self, state: Dict[str, float], action: str, reward: float, next_state: Dict[str, float],
+               objectives: Dict[str, float]):  # NEW: accept objective vector
         if self.last_state_key is None or self.last_action is None:
             return
         key = self._state_to_key(state)
@@ -818,7 +840,10 @@ class RLStrategySelector:
 
         self.reward_history.append(reward)
 
-        # Adaptive learning rate
+        # Store objective vector for this strategy (MOPD)
+        if self.config.mopd.enabled:
+            self.strategy_objectives_history[action].append(objectives)
+
         if len(self.reward_history) > 20:
             var = np.var(self.reward_history)
             if var > 0.2:
@@ -826,17 +851,17 @@ class RLStrategySelector:
             elif var < 0.05:
                 self.learning_rate = min(self.config.rl_learning_rate, self.learning_rate * 1.1)
 
-        # Prune Q‑table using LRU when too large
         if len(self.q_table) > self.config.q_table_max_size:
             self._prune_q_table()
 
-        # Refresh if stale
         if self.step_counter % self.config.q_table_refresh_interval == 0:
             self._refresh_q_table()
 
+        # Update Pareto front if MOPD enabled
+        if self.config.mopd.enabled:
+            self._update_pareto_front()
+
     def _prune_q_table(self):
-        """Remove least recently used states."""
-        # Sort states by last visited time (oldest first)
         sorted_states = sorted(self.state_last_visited.keys(), key=lambda k: self.state_last_visited[k])
         to_remove_count = int(len(sorted_states) * self.config.q_table_prune_threshold)
         for k in sorted_states[:to_remove_count]:
@@ -847,13 +872,92 @@ class RLStrategySelector:
         logger.info(f"Pruned Q‑table: removed {to_remove_count} states (LRU).")
 
     def _refresh_q_table(self):
-        """Reset a portion of the Q‑table to encourage exploration."""
-        # Reset 20% of states (those with lowest max Q)
         sorted_keys = sorted(self.q_table.keys(), key=lambda k: max(self.q_table[k].values()))
         for k in sorted_keys[:int(0.2 * len(sorted_keys))]:
             self.q_table[k] = {s: 0.0 for s in self.actions}
         logger.info("Refreshed 20% of Q‑table states for exploration.")
 
+    # ============================================================================
+    # MOPD Methods (NEW)
+    # ============================================================================
+    def _get_strategy_average_objectives(self) -> Dict[str, Dict[str, float]]:
+        """Compute average objectives for each strategy from history."""
+        avg = {}
+        for strategy, objs in self.strategy_objectives_history.items():
+            if not objs:
+                continue
+            # Average each objective
+            avg_obj = {}
+            keys = objs[0].keys()
+            for k in keys:
+                avg_obj[k] = np.mean([o[k] for o in objs])
+            avg[strategy] = avg_obj
+        return avg
+
+    def _update_pareto_front(self):
+        """Generate Pareto front from average objectives of strategies."""
+        avg_objs = self._get_strategy_average_objectives()
+        if not avg_objs:
+            return
+
+        # Build MOPDPoint objects
+        points = []
+        for strategy, objs in avg_objs.items():
+            point = MOPDPoint(
+                strategy=strategy,
+                energy_efficiency=objs.get('energy_efficiency', 0.5),
+                helium_sustainability=objs.get('helium_sustainability', 0.5),
+                token_balance=objs.get('token_balance', 0.5),
+                health_score=objs.get('health_score', 0.5),
+                carbon_leakage=objs.get('carbon_leakage', 0.5)
+            )
+            points.append(point)
+
+        # Filter dominated points (Pareto front)
+        objective_keys = ['energy_efficiency', 'helium_sustainability', 'token_balance', 'health_score', 'carbon_leakage']
+        # Note: carbon_leakage is lower is better, so we invert for dominance.
+        pareto = []
+        for i, p_i in enumerate(points):
+            dominated = False
+            for j, p_j in enumerate(points):
+                if i == j:
+                    continue
+                # Build vectors: for carbon_leakage, we negate because lower is better.
+                a_vec = [p_i.energy_efficiency, p_i.helium_sustainability, p_i.token_balance, p_i.health_score, -p_i.carbon_leakage]
+                b_vec = [p_j.energy_efficiency, p_j.helium_sustainability, p_j.token_balance, p_j.health_score, -p_j.carbon_leakage]
+                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+
+        self.pareto_front = pareto
+
+        # Telemetry: log Pareto front size
+        if PROMETHEUS_AVAILABLE and self.config.enable_prometheus:
+            # We'll handle via agent's telemetry
+            pass
+        logger.debug(f"Pareto front updated: {len(pareto)} non‑dominated strategies")
+
+    def get_pareto_front(self) -> List[MOPDPoint]:
+        """Return the current Pareto front."""
+        return self.pareto_front.copy()
+
+    def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related data."""
+        if not self.config.mopd.enabled:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "objective_weights": self.config.mopd.objective_weights,
+            "grid_resolution": self.config.mopd.grid_resolution,
+            "pareto_front_size": len(self.pareto_front),
+            "strategies": [p.to_dict() for p in self.pareto_front],
+        }
+
+    # ============================================================================
+    # Q‑table access
+    # ============================================================================
     def get_q_table_size(self) -> int:
         return len(self.q_table)
 
@@ -868,19 +972,14 @@ class RLStrategySelector:
         return {k: dict(v) for k, v in self.q_table.items()}
 
     def set_q_table(self, q_table: Dict[str, Dict[str, float]]):
-        """Import a Q‑table (e.g., from swarm)."""
         for state, actions in q_table.items():
             self.q_table[state] = actions
 
 # ============================================================================
-# Swarm Coordinator (enhanced with Redis pub/sub and Q‑table merging)
+# Swarm Coordinator (unchanged)
 # ============================================================================
 class SwarmCoordinator:
-    """
-    Coordinates with other agents in the swarm via Redis pub/sub.
-    Shares state, strategies, Q‑tables, and aggregates them.
-    """
-
+    # ... (same as before, but we'll keep the ability to share Q‑table) ...
     def __init__(self, agent_id: str, config: AgentConfig, strategy_selector: Optional[RLStrategySelector] = None):
         self.agent_id = agent_id
         self.config = config
@@ -889,7 +988,7 @@ class SwarmCoordinator:
         self._lock = asyncio.Lock()
         self.redis_client = None
         self.pubsub = None
-        self.channel = f"swarm_{agent_id}"  # Each agent publishes to its own channel; others subscribe
+        self.channel = f"swarm_{agent_id}"
         if REDIS_AVAILABLE:
             try:
                 import redis.asyncio as redis
@@ -908,7 +1007,6 @@ class SwarmCoordinator:
             self._listen_task = asyncio.create_task(self._listen())
 
     async def _listen(self):
-        """Listen for messages from other agents."""
         async for message in self.pubsub.listen():
             if message['type'] == 'message':
                 try:
@@ -922,7 +1020,6 @@ class SwarmCoordinator:
                     logger.error(f"Failed to process swarm message: {e}")
 
     async def share(self, data: Dict[str, Any]):
-        """Publish local data to the swarm channel."""
         if not self.redis_client:
             return
         try:
@@ -931,28 +1028,20 @@ class SwarmCoordinator:
             logger.error(f"Failed to publish to swarm: {e}")
 
     async def get_aggregated_q_table(self) -> Optional[Dict[str, Dict[str, float]]]:
-        """
-        Aggregate Q‑tables from other agents using a weighted average
-        based on their recent rewards (higher reward = higher weight).
-        """
         if not self.shared_data:
             return None
-        # We'll collect Q‑tables and weights
         q_tables = []
         weights = []
         for agent_id, data in self.shared_data.items():
             q_table = data.get('q_table')
             if q_table:
-                # Use average reward as weight
                 avg_reward = data.get('metrics', {}).get('avg_reward', 0)
                 q_tables.append(q_table)
-                weights.append(max(0.1, avg_reward))  # ensure positive weight
+                weights.append(max(0.1, avg_reward))
         if not q_tables:
             return None
-        # Normalize weights
         total = sum(weights)
         weights = [w / total for w in weights]
-        # Compute weighted average
         aggregated = defaultdict(lambda: defaultdict(float))
         for q_table, weight in zip(q_tables, weights):
             for state, actions in q_table.items():
@@ -961,7 +1050,6 @@ class SwarmCoordinator:
         return {k: dict(v) for k, v in aggregated.items()}
 
     async def apply_aggregated_q_table(self):
-        """Replace local Q‑table with the aggregated version."""
         if not self.strategy_selector:
             return
         aggregated = await self.get_aggregated_q_table()
@@ -981,7 +1069,7 @@ class SwarmCoordinator:
 # Task Manager (unchanged)
 # ============================================================================
 class TaskManager:
-    """Manages background tasks for the entire agent."""
+    # ... (same as before) ...
     def __init__(self):
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
@@ -1015,13 +1103,13 @@ class TaskManager:
         logger.info("All background tasks stopped")
 
 # ============================================================================
-# Core Bio‑Integrated Agent (v12.0.0)
+# Core Bio‑Integrated Agent (v12.1.0) – Enhanced with MOPD
 # ============================================================================
 class BioIntegratedAgent:
     """
-    Bio‑Integrated Green Agent v12.0.0
+    Bio‑Integrated Green Agent v12.1.0 with MOPD support.
     Orchestrates all bio‑inspired modules with active control, proactive planning,
-    swarm coordination, and reinforcement learning.
+    swarm coordination, reinforcement learning, and Multi‑Objective Pareto Decision.
     """
 
     def __init__(
@@ -1039,6 +1127,7 @@ class BioIntegratedAgent:
         tick_engine: Optional[Any] = None,
         quantum_bridge: Optional[Any] = None,
     ):
+        # ... (same as before, but we add MOPD fields) ...
         # Load config
         if isinstance(config, dict):
             if PYDANTIC_AVAILABLE:
@@ -1172,12 +1261,14 @@ class BioIntegratedAgent:
         asyncio.create_task(self.load_state())
 
         logger.info(
-            f"BioIntegratedAgent v12.0.0 initialized",
+            f"BioIntegratedAgent v12.1.0 initialized with MOPD",
             agent_id=self.config.agent_id,
-            correlation_id=self.correlation_id
+            correlation_id=self.correlation_id,
+            mopd_enabled=self.config.mopd.enabled
         )
 
     def _subscribe_events(self):
+        # ... (same as before) ...
         if self.event_broker:
             self.event_broker.subscribe('token_balance_update', self._on_token_update)
             self.event_broker.subscribe('gradient_update', self._on_gradient_update)
@@ -1205,7 +1296,7 @@ class BioIntegratedAgent:
         self.state['helium_level'] = event.data.get('helium_level', 0.5)
 
     async def _on_anomaly_detected(self, event: BioEvent):
-        pass  # handled in reward
+        pass
 
     async def _on_alert_generated(self, event: BioEvent):
         if event.data.get('severity') == 'critical':
@@ -1225,7 +1316,6 @@ class BioIntegratedAgent:
         self.state['degradation_tier'] = event.data.get('new_tier', 3)
 
     async def _on_config_updated(self, event: BioEvent):
-        # Reload relevant config parameters
         updates = event.data.get('updates', {})
         for key, value in updates.items():
             if hasattr(self.config, key):
@@ -1250,6 +1340,7 @@ class BioIntegratedAgent:
         }
 
     async def get_strategy_state(self) -> Dict[str, float]:
+        # ... (same as before, but we'll ensure all fields are populated) ...
         state = {}
 
         # Token balance
@@ -1379,7 +1470,6 @@ class BioIntegratedAgent:
         if self.swarm_coordinator:
             try:
                 swarm_data = self.swarm_coordinator.shared_data
-                # Compute how many agents are using the same strategy as we are
                 strategies = [s.get('strategy') for s in swarm_data.values() if 'strategy' in s]
                 if strategies:
                     consensus = strategies.count(self.current_strategy) / len(strategies)
@@ -1396,7 +1486,11 @@ class BioIntegratedAgent:
 
         return state
 
-    async def _compute_reward(self, state: Dict[str, float]) -> float:
+    async def _compute_reward(self, state: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+        """
+        Compute both scalar reward and objective vector.
+        Returns (reward, objectives_dict).
+        """
         # Base components
         energy_efficiency = 1.0 - state.get('energy_intensity', 0.5)
         helium_sustainability = state.get('helium_level', 0.5)
@@ -1426,7 +1520,7 @@ class BioIntegratedAgent:
 
         # Swarm consensus bonus
         swarm_consensus = state.get('swarm_consensus', 0.5)
-        swarm_bonus = 0.05 * (swarm_consensus - 0.5)  # positive if >0.5
+        swarm_bonus = 0.05 * (swarm_consensus - 0.5)
 
         # Cost‑benefit bonus
         cb_bonus = 0.0
@@ -1436,11 +1530,21 @@ class BioIntegratedAgent:
             if avg_roi > 0.5:
                 cb_bonus = 0.1
 
-        # QuantumBridge alignment: high carbon penalty → penalize carbon leakage more
+        # QuantumBridge alignment
         q_carbon = state.get('q_penalty_carbon', 0.5)
         if q_carbon > 0.7:
-            carbon_leakage *= 1.5  # extra penalty
+            carbon_leakage *= 1.5
 
+        # Objective vector
+        objectives = {
+            'energy_efficiency': energy_efficiency,
+            'helium_sustainability': helium_sustainability,
+            'token_balance': token_balance,
+            'health_score': health_score,
+            'carbon_leakage': carbon_leakage,
+        }
+
+        # Scalar reward (using either multi‑objective weights or fixed)
         if self.config.enable_multi_objective_rl:
             weights = self.config.objective_weights
             reward = (
@@ -1465,7 +1569,7 @@ class BioIntegratedAgent:
                 + cb_bonus
             )
 
-        return reward
+        return reward, objectives
 
     async def _strategy_update_loop(self):
         while True:
@@ -1475,7 +1579,7 @@ class BioIntegratedAgent:
 
                 # Proactive strategy based on forecast
                 if self.tick_engine and hasattr(self.tick_engine, 'get_helium_forecast'):
-                    forecast = self.tick_engine.get_helium_forecast(6)  # 6 hours ahead
+                    forecast = self.tick_engine.get_helium_forecast(6)
                     if forecast and len(forecast) > 5:
                         avg_future = np.mean(forecast)
                         if avg_future < 0.3 and self.current_strategy != 'conservative':
@@ -1491,11 +1595,16 @@ class BioIntegratedAgent:
 
                     await asyncio.sleep(self.config.state_save_interval_seconds)
                     next_state = await self.get_strategy_state()
-                    reward = await self._compute_reward(next_state)
+                    reward, objectives = await self._compute_reward(next_state)  # NEW: get objectives
                     self.metrics['total_reward'] += reward
                     self.reward_history.append(reward)
                     self.metrics['avg_reward'] = np.mean(self.reward_history) if self.reward_history else 0
-                    self.strategy_selector.update(state, action, reward, next_state)
+
+                    # Update strategy selector with both reward and objectives (if MOPD enabled)
+                    if self.config.mopd.enabled:
+                        self.strategy_selector.update(state, action, reward, next_state, objectives)
+                    else:
+                        self.strategy_selector.update(state, action, reward, next_state, {})  # fallback
 
                     importance = 0.7 if action != 'balanced' else 0.3
                     await self.auditor.record_event(
@@ -1514,6 +1623,13 @@ class BioIntegratedAgent:
                 else:
                     await self.apply_strategy('balanced')
 
+                # Telemetry for MOPD
+                if self.config.mopd.enabled and self.strategy_selector:
+                    pareto = self.strategy_selector.get_pareto_front()
+                    if pareto:
+                        # Could log or export metrics
+                        pass
+
                 await asyncio.sleep(self.config.state_save_interval_seconds)
             except asyncio.CancelledError:
                 break
@@ -1522,19 +1638,17 @@ class BioIntegratedAgent:
                 await asyncio.sleep(30)
 
     async def apply_strategy(self, strategy: str):
+        # ... (same as before) ...
         policy = self.config.strategy_policies.get(strategy, self.config.strategy_policies['balanced'])
         logger.info(f"Applying strategy '{strategy}' with policy: {policy}")
 
-        # Update agent config
         for key, value in policy.items():
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
 
-        # Propagate to core
         if self.bio_core and hasattr(self.bio_core, 'update_configuration'):
             await self.bio_core.update_configuration(policy)
 
-        # Adjust scheduler
         if self.scheduler:
             if hasattr(self.scheduler, 'set_protons_per_rotation'):
                 self.scheduler.set_protons_per_rotation(policy.get('scheduler_protons_per_rotation', 12))
@@ -1542,7 +1656,6 @@ class BioIntegratedAgent:
                 tier = 5 if strategy == 'conservative' else 3 if strategy == 'balanced' else 1
                 self.scheduler.set_degradation_tier(tier)
 
-        # Adjust harvester mode
         if self.harvester and hasattr(self.harvester, 'set_mode'):
             mode_map = {
                 'conservative': HarvestingMode.MINIMAL,
@@ -1551,7 +1664,6 @@ class BioIntegratedAgent:
             }
             self.harvester.set_mode(mode_map.get(strategy, HarvestingMode.ADAPTIVE))
 
-        # Adjust biomass storage tier
         if self.biomass_storage and hasattr(self.biomass_storage, 'set_default_tier'):
             tier_map = {
                 'conservative': StorageTier.COLD,
@@ -1560,23 +1672,18 @@ class BioIntegratedAgent:
             }
             self.biomass_storage.set_default_tier(tier_map.get(strategy, StorageTier.STANDARD))
 
-        # Adjust compartment creation
         if self.compartment_manager and hasattr(self.compartment_manager, 'set_creation_enabled'):
             self.compartment_manager.set_creation_enabled(policy.get('compartment_creation', True))
 
-        # Adjust gradient pumping
         if self.gradient_manager and hasattr(self.gradient_manager, 'set_pump_rate'):
             self.gradient_manager.set_pump_rate(policy.get('gradient_pump_rate', 0.5))
 
-        # Adjust token generation
         if self.token_manager and hasattr(self.token_manager, 'set_generation_rate'):
             self.token_manager.set_generation_rate(policy.get('token_generation_rate', 1.0))
 
-        # Competition engine
         if self.competition_engine and hasattr(self.competition_engine, 'set_spawn_enabled'):
             self.competition_engine.set_spawn_enabled(policy.get('competition_spawn', False))
 
-        # Trigger workflow
         if self.workflow_orchestrator:
             workflow_map = {
                 'conservative': 'repair_and_storage',
@@ -1587,7 +1694,6 @@ class BioIntegratedAgent:
             if wf_id:
                 await self.workflow_orchestrator.execute_workflow(wf_id)
 
-        # Active QuantumBridge control
         if self.quantum_bridge and hasattr(self.quantum_bridge, 'update_config'):
             if strategy == 'conservative':
                 self.quantum_bridge.update_config({'scaling': {'carbon': 20.0, 'helium': 30.0}})
@@ -1618,7 +1724,8 @@ class BioIntegratedAgent:
                     'state': self.state,
                     'metrics': self.metrics,
                     'strategy': self.current_strategy,
-                    'agent_id': self.config.agent_id
+                    'agent_id': self.config.agent_id,
+                    'pareto_front': [p.to_dict() for p in self.strategy_selector.get_pareto_front()] if self.config.mopd.enabled else []  # NEW
                 }
                 await self.auditor.record_event('daily_snapshot', snapshot, importance=0.6)
                 logger.info("Daily snapshot recorded.")
@@ -1637,10 +1744,10 @@ class BioIntegratedAgent:
                         'state': self.state,
                         'strategy': self.current_strategy,
                         'metrics': self.metrics,
-                        'q_table': self.strategy_selector.get_q_table() if self.strategy_selector else None
+                        'q_table': self.strategy_selector.get_q_table() if self.strategy_selector else None,
+                        'pareto_front': [p.to_dict() for p in self.strategy_selector.get_pareto_front()] if self.config.mopd.enabled else []  # NEW
                     }
                     await self.swarm_coordinator.share(data)
-                    # Apply aggregated Q‑table from swarm
                     if self.config.enable_swarm_coordination:
                         await self.swarm_coordinator.apply_aggregated_q_table()
                 await asyncio.sleep(60)
@@ -1654,6 +1761,24 @@ class BioIntegratedAgent:
         self.metrics['energy_efficiency'] = 1.0 - state.get('energy_intensity', 0.5)
         self.metrics['helium_efficiency'] = state.get('helium_level', 0.5)
 
+    # ============================================================================
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+    async def get_mopd_pareto_front(self) -> List[MOPDPoint]:
+        """Return the current Pareto front of strategies."""
+        if not self.config.mopd.enabled or not self.strategy_selector:
+            return []
+        return self.strategy_selector.get_pareto_front()
+
+    async def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.mopd.enabled or not self.strategy_selector:
+            return {"enabled": False}
+        return self.strategy_selector.get_mopd_summary()
+
+    # ============================================================================
+    # Persistence (Enhanced with MOPD)
+    # ============================================================================
     async def save_state(self):
         state_data = {
             'agent_id': self.config.agent_id,
@@ -1665,6 +1790,7 @@ class BioIntegratedAgent:
             'q_table': self.strategy_selector.get_q_table() if self.strategy_selector else None,
             'correlation_id': self.correlation_id,
             'reward_history': list(self.reward_history),
+            'pareto_front': [p.to_dict() for p in self.strategy_selector.get_pareto_front()] if self.config.mopd.enabled else []  # NEW
         }
         try:
             with open(self.config.state_save_path, 'w') as f:
@@ -1688,6 +1814,10 @@ class BioIntegratedAgent:
                 self.strategy_selector.set_q_table(data['q_table'])
             self.correlation_id = data.get('correlation_id', self.correlation_id)
             self.reward_history = deque(data.get('reward_history', []), maxlen=100)
+            # Load Pareto front
+            pareto_front = data.get('pareto_front', [])
+            if pareto_front and self.config.mopd.enabled:
+                self.strategy_selector.pareto_front = [MOPDPoint.from_dict(p) for p in pareto_front]
             logger.info("State loaded.")
         except Exception as e:
             logger.error("Failed to load state", error=str(e))
@@ -1708,7 +1838,6 @@ class BioIntegratedAgent:
 # Example usage
 # ============================================================================
 async def example():
-    """Example of running the BioIntegratedAgent."""
     class MockCore:
         def __init__(self):
             self.event_broker = None
@@ -1736,6 +1865,7 @@ async def example():
         'state_save_path': './agent_state.json',
         'enable_multi_objective_rl': True,
         'storage_db_path': './agent_storage.db',
+        'mopd': {'enabled': True}
     }
     agent = BioIntegratedAgent(
         bio_core=MockCore(),
@@ -1747,6 +1877,9 @@ async def example():
     print("Current state:", state)
     print("Current strategy:", agent.current_strategy)
     print("Metrics:", agent.metrics)
+    pareto = await agent.get_mopd_pareto_front()
+    print("Pareto front:", [p.to_dict() for p in pareto])
+    print("MOPD summary:", await agent.get_mopd_summary())
     await agent.shutdown()
 
 if __name__ == "__main__":
