@@ -1,30 +1,25 @@
 """
-Enhanced Photosynthetic Harvester v9.0.0
-Complete implementation with all improvements and fixes:
-- Proper JWT authentication using PyJWT
-- Redis checkpoint cleanup for old checkpoints
-- Full Redis pub/sub for swarm coordination
-- Retry mechanisms with tenacity for external calls
-- Improved genetic optimizer with more realistic simulation
-- Diversity preservation in child competition
-- API docstrings for all public methods
-- Support for YAML/JSON configuration files
-- Optimized file persistence with caching
-- Standardized structured logging with structlog
-- Comprehensive test stubs (pytest)
+Enhanced Photosynthetic Harvester v9.1.0
+Complete implementation with architectural improvements:
+- Interface-based components (Dependency Inversion)
+- Central event bus for decoupled communication
+- Global circuit breaker for external services
+- JSON-based persistence with schema versioning
+- Grouped configuration (sub-configs)
+- Trace IDs for structured logging
+- WebSocket rate limiting and TLS support
 """
 
 import asyncio
 import logging
 import json
-import pickle
 import hashlib
 import os
 import math
 import random
 import time
 import uuid
-from typing import Dict, Any, List, Optional, Tuple, Union, Set, Callable, Awaitable
+from typing import Dict, Any, List, Optional, Tuple, Union, Set, Callable, Awaitable, Protocol
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -35,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 import weakref
 import inspect
-import yaml  # for config file support
+import yaml
 
 # Third-party imports
 try:
@@ -136,23 +131,49 @@ class CircuitBreakerOpenError(HarvesterError):
     pass
 
 # ============================================================================
-# Circuit Breaker Pattern
+# Event Bus (Decoupled Communication)
 # ============================================================================
+class EventBus:
+    """
+    Simple in-memory event bus for internal communication.
+    Components can subscribe to events and publish them.
+    """
+    def __init__(self):
+        self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self._lock = asyncio.Lock()
 
+    def subscribe(self, event_type: str, callback: Callable):
+        self._subscribers[event_type].append(callback)
+
+    async def publish(self, event_type: str, data: Any):
+        async with self._lock:
+            callbacks = self._subscribers.get(event_type, [])
+        for cb in callbacks:
+            asyncio.create_task(cb(data))
+
+# ============================================================================
+# Trace Context for Observability
+# ============================================================================
+class TraceContext:
+    """Holds trace ID for request correlation."""
+    def __init__(self, trace_id: Optional[str] = None):
+        self.trace_id = trace_id or str(uuid.uuid4())
+
+    def get_logger(self, base_logger):
+        """Return a logger with trace_id bound."""
+        return base_logger.bind(trace_id=self.trace_id)
+
+# ============================================================================
+# Circuit Breaker Pattern (Global)
+# ============================================================================
 class CircuitBreakerState(Enum):
-    CLOSED = "closed"      # Normal operation
-    OPEN = "open"          # Failing, requests fail fast
-    HALF_OPEN = "half_open" # Testing recovery
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 class CircuitBreaker:
     """
     Circuit breaker for external service calls to prevent cascading failures.
-    
-    Attributes:
-        name (str): Unique name for identification.
-        failure_threshold (int): Number of failures before opening.
-        recovery_timeout (float): Seconds to wait before attempting recovery.
-        half_open_attempts (int): Number of allowed attempts in half‑open state.
     """
     def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0,
                  half_open_attempts: int = 3):
@@ -167,19 +188,6 @@ class CircuitBreaker:
         self._lock = asyncio.Lock()
 
     async def call(self, func: Callable, *args, **kwargs):
-        """
-        Execute the function with circuit breaker protection.
-        
-        Args:
-            func: Async callable to execute.
-            *args, **kwargs: Arguments to pass to func.
-        
-        Returns:
-            Result of func.
-        
-        Raises:
-            CircuitBreakerOpenError: If circuit breaker is OPEN.
-        """
         async with self._lock:
             if self._state == CircuitBreakerState.OPEN:
                 if (datetime.now(timezone.utc) - self._last_failure_time).total_seconds() > self.recovery_timeout:
@@ -218,23 +226,35 @@ class CircuitBreaker:
     def state(self) -> CircuitBreakerState:
         return self._state
 
-# ============================================================================
-# Centralized Task Manager
-# ============================================================================
+# Global circuit breaker registry
+class GlobalCircuitBreaker:
+    """Singleton registry for circuit breakers."""
+    _instance = None
+    _breakers: Dict[str, CircuitBreaker] = {}
 
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def get_or_create(self, name: str, **kwargs) -> CircuitBreaker:
+        if name not in self._breakers:
+            self._breakers[name] = CircuitBreaker(name, **kwargs)
+        return self._breakers[name]
+
+# ============================================================================
+# Centralized Task Manager (unchanged, but enhanced with event bus)
+# ============================================================================
 class TaskManager:
-    """
-    Manages background tasks for the entire harvester with restart and exponential backoff.
-    All tasks are registered here and can be gracefully stopped.
-    """
-    def __init__(self):
+    """Manages background tasks with restart and exponential backoff."""
+    def __init__(self, event_bus: Optional[EventBus] = None):
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self._lock = asyncio.Lock()
         self._task_coroutines: Dict[str, Callable[[], Awaitable[None]]] = {}
+        self.event_bus = event_bus or EventBus()
 
     def start_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
-        """Start a background task and register it."""
         async def wrapper():
             backoff = 1
             max_backoff = 300
@@ -253,7 +273,6 @@ class TaskManager:
         return task
 
     async def stop_all(self):
-        """Gracefully stop all tasks."""
         self.shutdown_event.set()
         async with self._lock:
             for task in self.tasks.values():
@@ -263,41 +282,30 @@ class TaskManager:
         logger.info("All background tasks stopped")
 
     def register_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
-        """Register a coroutine to be started later (e.g., after dependencies are ready)."""
         self._task_coroutines[name] = (coro_func, args, kwargs)
 
     def start_registered_tasks(self):
-        """Start all registered tasks."""
         for name, (coro_func, args, kwargs) in self._task_coroutines.items():
             self.start_task(name, coro_func, *args, **kwargs)
         self._task_coroutines.clear()
 
 # ============================================================================
-# Configuration (Pydantic) - Enhanced with file loading
+# Configuration (Grouped Pydantic Models)
 # ============================================================================
-
 if PYDANTIC_AVAILABLE:
-    class HarvesterConfig(BaseModel):
-        """
-        Central configuration for Photosynthetic Harvester with validation.
-        Supports environment variables (HARVESTER_*) and YAML/JSON file loading.
-        """
-        # General
-        harvester_id: str = "primary"
-        latitude: float = Field(0.0, ge=-90, le=90)
-        longitude: float = Field(0.0, ge=-180, le=180)
-        enable_persistence: bool = True
-        persistence_backend: str = "memory"  # redis, file, memory
-        persistence_retention_days: int = Field(30, ge=1)
-        checkpoint_interval: int = Field(300, ge=10)
-        
-        # Pigment defaults
+    class PigmentConfig(BaseModel):
         default_repair_rate: float = Field(0.01, ge=0.001, le=0.1)
         damage_threshold: float = Field(0.8, ge=0.5, le=1.0)
         photoinhibition_rate: float = Field(0.001, ge=0.0001, le=0.01)
         safe_excitation_level: float = Field(0.7, ge=0.5, le=0.95)
-        
-        # Reaction center
+        lstm_sequence_length: int = Field(20, ge=5)
+        lstm_epochs: int = Field(5, ge=1)
+        lstm_batch_size: int = Field(16, ge=1)
+        lstm_model_dir: str = "./lstm_models"
+        fallback_model: str = "moving_average"  # moving_average, arima, linear
+        arima_order: Tuple[int, int, int] = (1, 1, 1)
+
+    class ReactionCenterConfig(BaseModel):
         base_quantum_efficiency: float = Field(0.85, ge=0.3, le=0.98)
         min_efficiency: float = Field(0.3, ge=0.1, le=0.5)
         max_efficiency: float = Field(0.98, ge=0.9, le=1.0)
@@ -306,114 +314,127 @@ if PYDANTIC_AVAILABLE:
         token_scarcity_threshold: float = 5000
         demand_response_factor: float = Field(0.5, ge=0.1, le=1.0)
         repair_rate: float = Field(0.005, ge=0.001, le=0.02)
-        
-        # Predictive models
-        lstm_sequence_length: int = Field(20, ge=5)
-        lstm_epochs: int = Field(5, ge=1)
-        lstm_batch_size: int = Field(16, ge=1)
-        lstm_model_dir: str = "./lstm_models"
-        fallback_model: str = "moving_average"  # moving_average, arima, linear
-        arima_order: Tuple[int, int, int] = (1, 1, 1)
-        
-        # Health monitoring
+
+    class HealthConfig(BaseModel):
         efficiency_warning_threshold: float = 0.6
         efficiency_critical_threshold: float = 0.3
         damage_warning_threshold: float = 0.4
         damage_critical_threshold: float = 0.7
         harvest_rate_min: float = 0.1
         prediction_accuracy_min: float = 0.7
-        
-        # Self-healing
         max_healing_attempts: int = Field(3, ge=1)
         healing_cooldown: int = Field(300, ge=10)
-        
-        # Child harvesters
+
+    class GeneticConfig(BaseModel):
+        population_size: int = Field(20, ge=5)
+        mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
+        crossover_rate: float = Field(0.7, ge=0.0, le=1.0)
+        generations: int = Field(10, ge=1)
+        tournament_size: int = Field(3, ge=2)
+        evolution_interval: int = Field(86400, ge=3600)
+        simulation_cycles: int = Field(50, ge=10)
+
+    class ChildConfig(BaseModel):
         max_children: int = Field(10, ge=1)
         competition_interval: int = Field(3600, ge=60)
         replacement_threshold: float = Field(0.3, ge=0.1, le=0.5)
         performance_window: int = Field(100, ge=10)
-        
-        # Swarm coordination
-        swarm_update_interval: int = Field(120, ge=10)
-        
-        # WebSocket
-        enable_websocket: bool = False
-        websocket_host: str = "0.0.0.0"
-        websocket_port: int = Field(8765, ge=1024, le=65535)
-        websocket_auth_token: Optional[str] = None
-        websocket_use_jwt: bool = False
-        websocket_jwt_secret: Optional[str] = None
-        
-        # Genetic optimizer
-        genetic_population_size: int = Field(20, ge=5)
-        genetic_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
-        genetic_crossover_rate: float = Field(0.7, ge=0.0, le=1.0)
-        genetic_generations: int = Field(10, ge=1)
-        genetic_tournament_size: int = Field(3, ge=2)
-        genetic_evolution_interval: int = Field(86400, ge=3600)
-        genetic_simulation_cycles: int = Field(50, ge=10)  # cycles to simulate for fitness
-        
-        # Prometheus
+
+    class SwarmConfig(BaseModel):
+        update_interval: int = Field(120, ge=10)
+        redis_url: Optional[str] = None
+
+    class WebSocketConfig(BaseModel):
+        enable: bool = False
+        host: str = "0.0.0.0"
+        port: int = Field(8765, ge=1024, le=65535)
+        auth_token: Optional[str] = None
+        use_jwt: bool = False
+        jwt_secret: Optional[str] = None
+        rate_limit_per_minute: int = Field(60, ge=1)
+        tls_enabled: bool = False
+        tls_cert: Optional[str] = None
+        tls_key: Optional[str] = None
+
+    class PersistenceConfig(BaseModel):
+        enable: bool = True
+        backend: str = "memory"  # redis, file, memory
+        retention_days: int = Field(30, ge=1)
+        checkpoint_interval: int = Field(300, ge=10)
+        redis_url: Optional[str] = None
+        base_dir: str = "./harvester_data"
+
+    class HarvesterConfig(BaseModel):
+        harvester_id: str = "primary"
+        latitude: float = Field(0.0, ge=-90, le=90)
+        longitude: float = Field(0.0, ge=-180, le=180)
         enable_prometheus: bool = False
-        
-        # Circuit breaker
         circuit_breaker_failure_threshold: int = Field(5, ge=1)
         circuit_breaker_recovery_timeout: float = Field(30.0, ge=5.0)
         circuit_breaker_half_open_attempts: int = Field(3, ge=1)
-        
+
+        pigment: PigmentConfig = Field(default_factory=PigmentConfig)
+        reaction_center: ReactionCenterConfig = Field(default_factory=ReactionCenterConfig)
+        health: HealthConfig = Field(default_factory=HealthConfig)
+        genetic: GeneticConfig = Field(default_factory=GeneticConfig)
+        child: ChildConfig = Field(default_factory=ChildConfig)
+        swarm: SwarmConfig = Field(default_factory=SwarmConfig)
+        websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
+        persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
+
         class Config:
             env_prefix = "HARVESTER_"
-            
+
         @validator('latitude')
         def validate_latitude(cls, v):
             if not -90 <= v <= 90:
                 raise ValueError('latitude must be between -90 and 90')
             return v
-        
+
         @validator('longitude')
         def validate_longitude(cls, v):
             if not -180 <= v <= 180:
                 raise ValueError('longitude must be between -180 and 180')
             return v
-        
+
         @root_validator
         def validate_websocket_auth(cls, values):
-            if values.get('enable_websocket'):
-                if values.get('websocket_use_jwt') and not values.get('websocket_jwt_secret'):
+            ws = values.get('websocket')
+            if ws and ws.enable:
+                if ws.use_jwt and not ws.jwt_secret:
                     raise ValueError('JWT secret required when use_jwt is True')
-                if not values.get('websocket_use_jwt') and not values.get('websocket_auth_token'):
+                if not ws.use_jwt and not ws.auth_token:
                     raise ValueError('Either auth token or JWT must be set when WebSocket is enabled')
             return values
-        
+
         @classmethod
         def from_yaml(cls, path: str) -> 'HarvesterConfig':
-            """Load configuration from a YAML file."""
             with open(path, 'r') as f:
                 data = yaml.safe_load(f)
             return cls(**data)
-        
+
         @classmethod
         def from_json(cls, path: str) -> 'HarvesterConfig':
-            """Load configuration from a JSON file."""
             with open(path, 'r') as f:
                 data = json.load(f)
             return cls(**data)
-
 else:
-    # Fallback dataclass if Pydantic not available
+    # Fallback dataclass with flat fields (simplified)
     @dataclass
-    class HarvesterConfig:
-        harvester_id: str = "primary"
-        latitude: float = 0.0
-        longitude: float = 0.0
-        enable_persistence: bool = True
-        persistence_backend: str = "memory"
-        persistence_retention_days: int = 30
-        checkpoint_interval: int = 300
+    class PigmentConfig:
         default_repair_rate: float = 0.01
         damage_threshold: float = 0.8
         photoinhibition_rate: float = 0.001
         safe_excitation_level: float = 0.7
+        lstm_sequence_length: int = 20
+        lstm_epochs: int = 5
+        lstm_batch_size: int = 16
+        lstm_model_dir: str = "./lstm_models"
+        fallback_model: str = "moving_average"
+        arima_order: Tuple[int, int, int] = (1, 1, 1)
+
+    @dataclass
+    class ReactionCenterConfig:
         base_quantum_efficiency: float = 0.85
         min_efficiency: float = 0.3
         max_efficiency: float = 0.98
@@ -422,12 +443,9 @@ else:
         token_scarcity_threshold: float = 5000
         demand_response_factor: float = 0.5
         repair_rate: float = 0.005
-        lstm_sequence_length: int = 20
-        lstm_epochs: int = 5
-        lstm_batch_size: int = 16
-        lstm_model_dir: str = "./lstm_models"
-        fallback_model: str = "moving_average"
-        arima_order: Tuple[int, int, int] = (1, 1, 1)
+
+    @dataclass
+    class HealthConfig:
         efficiency_warning_threshold: float = 0.6
         efficiency_critical_threshold: float = 0.3
         damage_warning_threshold: float = 0.4
@@ -436,36 +454,104 @@ else:
         prediction_accuracy_min: float = 0.7
         max_healing_attempts: int = 3
         healing_cooldown: int = 300
+
+    @dataclass
+    class GeneticConfig:
+        population_size: int = 20
+        mutation_rate: float = 0.2
+        crossover_rate: float = 0.7
+        generations: int = 10
+        tournament_size: int = 3
+        evolution_interval: int = 86400
+        simulation_cycles: int = 50
+
+    @dataclass
+    class ChildConfig:
         max_children: int = 10
         competition_interval: int = 3600
         replacement_threshold: float = 0.3
         performance_window: int = 100
-        swarm_update_interval: int = 120
-        enable_websocket: bool = False
-        websocket_host: str = "0.0.0.0"
-        websocket_port: int = 8765
-        websocket_auth_token: Optional[str] = None
-        websocket_use_jwt: bool = False
-        websocket_jwt_secret: Optional[str] = None
-        genetic_population_size: int = 20
-        genetic_mutation_rate: float = 0.2
-        genetic_crossover_rate: float = 0.7
-        genetic_generations: int = 10
-        genetic_tournament_size: int = 3
-        genetic_evolution_interval: int = 86400
-        genetic_simulation_cycles: int = 50
+
+    @dataclass
+    class SwarmConfig:
+        update_interval: int = 120
+        redis_url: Optional[str] = None
+
+    @dataclass
+    class WebSocketConfig:
+        enable: bool = False
+        host: str = "0.0.0.0"
+        port: int = 8765
+        auth_token: Optional[str] = None
+        use_jwt: bool = False
+        jwt_secret: Optional[str] = None
+        rate_limit_per_minute: int = 60
+        tls_enabled: bool = False
+        tls_cert: Optional[str] = None
+        tls_key: Optional[str] = None
+
+    @dataclass
+    class PersistenceConfig:
+        enable: bool = True
+        backend: str = "memory"
+        retention_days: int = 30
+        checkpoint_interval: int = 300
+        redis_url: Optional[str] = None
+        base_dir: str = "./harvester_data"
+
+    @dataclass
+    class HarvesterConfig:
+        harvester_id: str = "primary"
+        latitude: float = 0.0
+        longitude: float = 0.0
         enable_prometheus: bool = False
         circuit_breaker_failure_threshold: int = 5
         circuit_breaker_recovery_timeout: float = 30.0
         circuit_breaker_half_open_attempts: int = 3
+        pigment: PigmentConfig = field(default_factory=PigmentConfig)
+        reaction_center: ReactionCenterConfig = field(default_factory=ReactionCenterConfig)
+        health: HealthConfig = field(default_factory=HealthConfig)
+        genetic: GeneticConfig = field(default_factory=GeneticConfig)
+        child: ChildConfig = field(default_factory=ChildConfig)
+        swarm: SwarmConfig = field(default_factory=SwarmConfig)
+        websocket: WebSocketConfig = field(default_factory=WebSocketConfig)
+        persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
 
 # ============================================================================
-# Pigment Health and Data Structures
+# Interface Definitions (Dependency Inversion)
 # ============================================================================
+class IPigmentArray(Protocol):
+    async def sense_environment(self, environmental_data: Dict[str, float]) -> Dict[str, float]: ...
+    async def get_predictions(self) -> Dict[str, Dict[str, Any]]: ...
+    def get_pigment_health_summary(self) -> Dict[str, float]: ...
+    def get_circadian_summary(self) -> Dict[str, float]: ...
+    async def stop(self): ...
 
+class IReactionCenter(Protocol):
+    async def harvest_cycle(self, excitations: Dict[str, float]) -> Dict[str, Any]: ...
+    def get_efficiency_stats(self) -> Dict[str, Any]: ...
+    async def stop(self): ...
+
+class IHealthMonitor(Protocol):
+    def collect_metrics(self, harvester_state: Dict[str, Any]) -> Dict[str, Any]: ...
+    def get_metrics(self) -> Dict[str, Any]: ...
+    def get_recommendations(self) -> List[Dict[str, Any]]: ...
+
+class ISelfHealer(Protocol):
+    async def apply_healing(self, issue_type: str) -> bool: ...
+
+class IPersistence(Protocol):
+    async def save_state(self, state: Dict[str, Any]) -> bool: ...
+    async def load_state(self) -> Optional[Dict[str, Any]]: ...
+    async def save_checkpoint(self, checkpoint: Dict[str, Any]) -> bool: ...
+    async def load_latest_checkpoint(self) -> Optional[Tuple[str, Dict[str, Any]]]: ...
+    async def delete_old_checkpoints(self, retention_days: int): ...
+
+# ============================================================================
+# Pigment Health and Data Structures (unchanged)
+# ============================================================================
 @dataclass
 class PigmentHealth:
-    """Tracks health and damage of a pigment."""
     pigment_name: str
     health: float = 1.0
     damage: float = 0.0
@@ -475,12 +561,10 @@ class PigmentHealth:
     overexposure_events: int = 0
 
     def apply_damage(self, amount: float):
-        """Apply damage to the pigment."""
         self.damage = min(1.0, self.damage + amount)
         self.health = max(0.0, 1.0 - self.damage)
 
     def repair(self, rate: Optional[float] = None):
-        """Repair the pigment by reducing damage."""
         rate = rate or self.recovery_rate
         self.damage = max(0.0, self.damage - rate)
         self.health = min(1.0, self.health + rate)
@@ -493,26 +577,21 @@ class HarvestingMode(Enum):
     OFF = "off"
 
 # ============================================================================
-# LSTM Persistence (Enhanced with fallback)
+# LSTM Persistence (unchanged)
 # ============================================================================
-
 class LSTMPersistence:
-    """Handles saving and loading LSTM models."""
-    
     def __init__(self, model_dir: str):
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
-    
+
     def save_model(self, pigment_name: str, model: 'tf.keras.Model'):
-        """Save LSTM model to disk."""
         if not TENSORFLOW_AVAILABLE:
             return
         path = os.path.join(self.model_dir, f"{pigment_name}.keras")
         model.save(path)
         logger.info("LSTM model saved", pigment=pigment_name, path=path)
-    
+
     def load_model(self, pigment_name: str) -> Optional['tf.keras.Model']:
-        """Load LSTM model from disk."""
         if not TENSORFLOW_AVAILABLE:
             return None
         path = os.path.join(self.model_dir, f"{pigment_name}.keras")
@@ -526,26 +605,19 @@ class LSTMPersistence:
         return None
 
 # ============================================================================
-# Fallback Prediction Models (Enhanced with ARIMA)
+# Fallback Prediction Models (unchanged)
 # ============================================================================
-
 class FallbackPredictor:
-    """
-    Provides simple prediction models when LSTM is unavailable.
-    Supports moving average, linear extrapolation, and ARIMA (simulated).
-    """
     def __init__(self, model_type: str = "moving_average", window_size: int = 20, arima_order: Tuple[int, int, int] = (1, 1, 1)):
         self.model_type = model_type
         self.window_size = window_size
         self.history = deque(maxlen=window_size)
         self.arima_order = arima_order
-    
+
     def update(self, value: float):
-        """Update history with new value."""
         self.history.append(value)
-    
+
     def predict(self, steps: int = 1) -> List[float]:
-        """Predict future values."""
         if not self.history:
             return [0.0] * steps
         if self.model_type == "moving_average":
@@ -562,13 +634,9 @@ class FallbackPredictor:
                 preds.append(coeffs[0] * (len(self.history) - 1 + i) + coeffs[1])
             return preds
         elif self.model_type == "arima":
-            # Simple ARIMA(1,1,1) simulation: differencing + AR1 + MA1
-            # For demonstration, we implement a basic version.
             if len(self.history) < 3:
                 return [self.history[-1]] * steps
-            # Differencing
             diff = [self.history[i] - self.history[i-1] for i in range(1, len(self.history))]
-            # AR(1) coefficient (simple estimate)
             if len(diff) > 1:
                 ar1 = np.corrcoef(diff[:-1], diff[1:])[0,1]
                 if np.isnan(ar1):
@@ -576,7 +644,6 @@ class FallbackPredictor:
             else:
                 ar1 = 0.0
             last_diff = diff[-1] if diff else 0
-            # Predict next diff
             next_diff = ar1 * last_diff
             pred = self.history[-1] + next_diff
             return [pred] * steps
@@ -584,57 +651,42 @@ class FallbackPredictor:
             return [self.history[-1]] * steps
 
 # ============================================================================
-# Advanced Circadian Model
+# Advanced Circadian Model (unchanged)
 # ============================================================================
-
 class AdvancedCircadianModel:
-    """Models circadian rhythm with seasonal and geographic components."""
-    
     def __init__(self, latitude: float = 0.0, longitude: float = 0.0):
         self.latitude = latitude
         self.longitude = longitude
-    
+
     def get_solar_elevation(self, dt: Optional[datetime] = None) -> float:
-        """Return solar elevation angle in radians (simplified)."""
         if dt is None:
             dt = datetime.now(timezone.utc)
-        # Simplified model: elevation = sin(2π * hour/24) * cos(latitude) + offset
-        # This is a placeholder; a real implementation would use more accurate astronomy.
         hour = dt.hour + dt.minute/60.0
-        # Assume peak at solar noon (12:00) and adjust for longitude
-        # For simplicity, just use sine wave with peak at 12.
-        elevation = math.sin(math.pi * (hour - 6) / 12)  # peak at 12, 0 at 6 and 18
-        return max(0, elevation)  # only daylight
-    
+        elevation = math.sin(math.pi * (hour - 6) / 12)
+        return max(0, elevation)
+
     def get_multiplier(self, pigment: Dict[str, Any]) -> float:
-        """Return circadian multiplier for a pigment based on its peak hours."""
         peak_hours = pigment.get('circadian_peak_hours', list(range(24)))
         now = datetime.now(timezone.utc)
         hour = now.hour
         if hour in peak_hours:
             return 1.0
-        # Gradually decrease based on distance from nearest peak hour
         distance = min(abs(h - hour) for h in peak_hours)
         return max(0.2, 1.0 - distance / 12.0)
 
 # ============================================================================
-# Environmental Anomaly Detector
+# Environmental Anomaly Detector (unchanged)
 # ============================================================================
-
 class EnvironmentalAnomalyDetector:
-    """Detects anomalies in environmental data streams."""
-    
     def __init__(self, window_size: int = 100, std_threshold: float = 3.0):
         self.history = defaultdict(lambda: deque(maxlen=window_size))
         self.std_threshold = std_threshold
-    
+
     def update(self, data: Dict[str, float]):
-        """Update history with new data."""
         for key, value in data.items():
             self.history[key].append(value)
-    
+
     def detect(self, data: Dict[str, float]) -> Dict[str, bool]:
-        """Detect anomalies in the given data."""
         anomalies = {}
         for key, value in data.items():
             if key in self.history and len(self.history[key]) > 10:
@@ -650,16 +702,14 @@ class EnvironmentalAnomalyDetector:
         return anomalies
 
 # ============================================================================
-# Enhanced Pigment Array (Full Implementation)
+# Enhanced Pigment Array (implements IPigmentArray)
 # ============================================================================
-
-class EnhancedPigmentArray:
-    """Multi-spectral pigment array with adaptive sensitivity and health tracking."""
-    
-    def __init__(self, config: HarvesterConfig, task_manager: TaskManager):
+class EnhancedPigmentArray(IPigmentArray):
+    def __init__(self, config: HarvesterConfig, task_manager: TaskManager, event_bus: EventBus):
         self.config = config
         self.task_manager = task_manager
-        # Pigment definitions
+        self.event_bus = event_bus
+        # Pigment definitions (unchanged)
         self.pigments = {
             'chlorophyll_a': {
                 'target': 'renewable_availability',
@@ -668,9 +718,9 @@ class EnhancedPigmentArray:
                 'response_time_ms': 100,
                 'saturation_threshold': 0.9,
                 'noise_floor': 0.05,
-                'photoinhibition_rate': config.photoinhibition_rate,
-                'safe_excitation_level': config.safe_excitation_level,
-                'repair_rate': config.default_repair_rate,
+                'photoinhibition_rate': config.pigment.photoinhibition_rate,
+                'safe_excitation_level': config.pigment.safe_excitation_level,
+                'repair_rate': config.pigment.default_repair_rate,
                 'circadian_peak_hours': [10, 11, 12, 13, 14],
                 'specialization': 'solar',
                 'energy_conversion_factor': 0.01,
@@ -685,7 +735,7 @@ class EnhancedPigmentArray:
                 'noise_floor': 0.03,
                 'photoinhibition_rate': 0.0005,
                 'safe_excitation_level': 0.8,
-                'repair_rate': config.default_repair_rate * 1.5,
+                'repair_rate': config.pigment.default_repair_rate * 1.5,
                 'circadian_peak_hours': list(range(24)),
                 'specialization': 'carbon',
                 'energy_conversion_factor': 0.001,
@@ -700,7 +750,7 @@ class EnhancedPigmentArray:
                 'noise_floor': 0.1,
                 'photoinhibition_rate': 0.0002,
                 'safe_excitation_level': 0.9,
-                'repair_rate': config.default_repair_rate * 2.0,
+                'repair_rate': config.pigment.default_repair_rate * 2.0,
                 'circadian_peak_hours': list(range(24)),
                 'specialization': 'thermal',
                 'energy_conversion_factor': 0.01,
@@ -715,7 +765,7 @@ class EnhancedPigmentArray:
                 'noise_floor': 0.08,
                 'photoinhibition_rate': 0.0003,
                 'safe_excitation_level': 0.85,
-                'repair_rate': config.default_repair_rate * 1.2,
+                'repair_rate': config.pigment.default_repair_rate * 1.2,
                 'circadian_peak_hours': list(range(24)),
                 'specialization': 'edge',
                 'energy_conversion_factor': 0.005,
@@ -730,80 +780,63 @@ class EnhancedPigmentArray:
                 'noise_floor': 0.01,
                 'photoinhibition_rate': 0.0001,
                 'safe_excitation_level': 0.95,
-                'repair_rate': config.default_repair_rate * 2.5,
+                'repair_rate': config.pigment.default_repair_rate * 2.5,
                 'circadian_peak_hours': list(range(24)),
                 'specialization': 'protection',
                 'energy_conversion_factor': 0.02,
                 'critical_threshold': 0.95
             }
         }
-        # Vectorized arrays for performance
         self._pigment_names = list(self.pigments.keys())
         self._targets = np.array([self.pigments[p]['target'] for p in self._pigment_names])
         self._sensitivities = np.array([self.pigments[p]['sensitivity'] for p in self._pigment_names])
         self._safe_levels = np.array([self.pigments[p]['safe_excitation_level'] for p in self._pigment_names])
         self._saturation_thresholds = np.array([self.pigments[p]['saturation_threshold'] for p in self._pigment_names])
         self._noise_floors = np.array([self.pigments[p]['noise_floor'] for p in self._pigment_names])
-        
-        # Health tracking
+
         self.pigment_health: Dict[str, PigmentHealth] = {
             name: PigmentHealth(pigment_name=name, recovery_rate=self.pigments[name]['repair_rate'])
             for name in self._pigment_names
         }
         self._health_lock = asyncio.Lock()
-        
-        # Excitation history
         self.excitation_history: Dict[str, deque] = {
             name: deque(maxlen=500) for name in self._pigment_names
         }
         self._history_lock = asyncio.Lock()
-        
-        # Circadian model
         self.circadian_model = AdvancedCircadianModel(config.latitude, config.longitude)
-        
-        # Prediction models
         self.prediction_models: Dict[str, Dict[str, Any]] = {}
         self.lstm_predictors = {} if TENSORFLOW_AVAILABLE else {}
-        self.lstm_persistence = LSTMPersistence(config.lstm_model_dir) if TENSORFLOW_AVAILABLE else None
+        self.lstm_persistence = LSTMPersistence(config.pigment.lstm_model_dir) if TENSORFLOW_AVAILABLE else None
         self.fallback_predictors = {
-            name: FallbackPredictor(model_type=config.fallback_model, window_size=config.lstm_sequence_length,
-                                   arima_order=config.arima_order if config.fallback_model == "arima" else None)
+            name: FallbackPredictor(model_type=config.pigment.fallback_model,
+                                   window_size=config.pigment.lstm_sequence_length,
+                                   arima_order=config.pigment.arima_order if config.pigment.fallback_model == "arima" else None)
             for name in self._pigment_names
         }
-        
-        # Anomaly detector
         self.anomaly_detector = EnvironmentalAnomalyDetector()
-        
-        # Background loops via central TaskManager
         self.task_manager.start_task("pigment_repair", self._repair_loop)
         self.task_manager.start_task("pigment_adaptation", self._adaptation_loop)
         self.task_manager.start_task("pigment_anomaly", self._anomaly_detection_loop)
-        
-        # Thread pool for parallel processing
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
-        
         logger.info("Enhanced Pigment Array initialized", pigments=len(self.pigments))
-    
+
     async def _repair_loop(self):
-        """Background repair loop."""
         while True:
             try:
                 async with self._health_lock:
                     for health in self.pigment_health.values():
                         if health.damage > 0:
                             health.repair()
-                await asyncio.sleep(60)  # every minute
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Repair loop error", error=str(e))
                 await asyncio.sleep(60)
-    
+
     async def _adaptation_loop(self):
-        """Background adaptation loop to adjust sensitivities based on performance."""
         while True:
             try:
-                # Adapt sensitivities based on recent performance
                 async with self._history_lock:
                     for name, hist in self.excitation_history.items():
                         if len(hist) < 10:
@@ -814,44 +847,35 @@ class EnhancedPigmentArray:
                             self.pigments[name]['sensitivity'] *= 0.95
                         elif avg_excitation < target * 0.8:
                             self.pigments[name]['sensitivity'] *= 1.05
-                        # Clamp
                         self.pigments[name]['sensitivity'] = np.clip(
                             self.pigments[name]['sensitivity'],
                             0.5 * self.pigments[name]['base_sensitivity'],
                             2.0 * self.pigments[name]['base_sensitivity']
                         )
-                await asyncio.sleep(300)  # every 5 minutes
+                await asyncio.sleep(300)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Adaptation loop error", error=str(e))
                 await asyncio.sleep(300)
-    
+
     async def _anomaly_detection_loop(self):
-        """Background anomaly detection loop."""
         while True:
             try:
-                # This loop just updates the detector with recent data; detection is done in sense_environment
-                # We'll process historical data periodically to update statistics
-                await asyncio.sleep(3600)  # hourly
+                await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Anomaly detection loop error", error=str(e))
                 await asyncio.sleep(3600)
-    
+
     async def sense_environment(self, environmental_data: Dict[str, float]) -> Dict[str, float]:
-        """Process environmental data and return excitation levels per pigment."""
-        # Update anomaly detector
         self.anomaly_detector.update(environmental_data)
         anomalies = self.anomaly_detector.detect(environmental_data)
-        
-        # Apply circadian multiplier
         circadian_multipliers = {}
         for name, pigment in self.pigments.items():
             circadian_multipliers[name] = self.circadian_model.get_multiplier(pigment)
-        
-        # Compute excitation levels
+
         excitations = {}
         async with self._health_lock:
             for name in self._pigment_names:
@@ -861,50 +885,42 @@ class EnhancedPigmentArray:
                 sensitivity = pigment['sensitivity']
                 circadian = circadian_multipliers[name]
                 health = self.pigment_health[name].health
-                
-                # Apply saturation and noise
+
                 excitation = raw_value * sensitivity * circadian * health
                 excitation = np.clip(excitation, 0.0, pigment['saturation_threshold'])
                 if random.random() < pigment['noise_floor']:
                     excitation += random.uniform(-0.05, 0.05)
                 excitation = max(0.0, excitation)
-                
-                # Record excitation
+
                 async with self._history_lock:
                     self.excitation_history[name].append(excitation)
-                
-                # Check for photoinhibition
+
                 if excitation > pigment['safe_excitation_level']:
                     damage = (excitation - pigment['safe_excitation_level']) * pigment['photoinhibition_rate']
                     self.pigment_health[name].apply_damage(damage)
                     self.pigment_health[name].overexposure_events += 1
-                
+
                 excitations[name] = excitation
-        
-        # Update fallback predictors
+
         for name, val in excitations.items():
             self.fallback_predictors[name].update(val)
-        
+
         return excitations
-    
+
     async def get_predictions(self) -> Dict[str, Dict[str, Any]]:
-        """Get predictions for each pigment (medium and long term)."""
         predictions = {}
         for name in self._pigment_names:
             pred = {}
-            # Use LSTM if available and trained
             if name in self.lstm_predictors and TENSORFLOW_AVAILABLE:
                 try:
                     model = self.lstm_predictors[name]
-                    # Get recent history as numpy array
                     async with self._history_lock:
                         hist = list(self.excitation_history[name])
-                    if len(hist) >= self.config.lstm_sequence_length:
-                        seq = np.array(hist[-self.config.lstm_sequence_length:]).reshape(1, -1, 1)
+                    if len(hist) >= self.config.pigment.lstm_sequence_length:
+                        seq = np.array(hist[-self.config.pigment.lstm_sequence_length:]).reshape(1, -1, 1)
                         pred['medium_term_300s'] = float(model.predict(seq, verbose=0)[0][0])
                         pred['confidence'] = 0.9
                     else:
-                        # Fallback
                         pred['medium_term_300s'] = self.fallback_predictors[name].predict(1)[0]
                         pred['confidence'] = 0.5
                 except Exception as e:
@@ -912,70 +928,62 @@ class EnhancedPigmentArray:
                     pred['medium_term_300s'] = self.fallback_predictors[name].predict(1)[0]
                     pred['confidence'] = 0.5
             else:
-                # Use fallback
                 pred['medium_term_300s'] = self.fallback_predictors[name].predict(1)[0]
                 pred['confidence'] = 0.5
             predictions[name] = pred
         return predictions
-    
+
     def get_pigment_health_summary(self) -> Dict[str, float]:
-        """Return a summary of health metrics for all pigments."""
         summary = {}
         async with self._health_lock:
             for name, health in self.pigment_health.items():
                 summary[name] = health.health
         return summary
-    
+
     def get_circadian_summary(self) -> Dict[str, float]:
-        """Return current circadian multipliers for each pigment."""
         return {name: self.circadian_model.get_multiplier(pigment) for name, pigment in self.pigments.items()}
-    
+
     async def stop(self):
-        """Stop background tasks (called by parent)."""
-        # Tasks are managed centrally, so nothing to do here.
         pass
 
 # ============================================================================
-# Enhanced Reaction Center (Full Implementation)
+# Enhanced Reaction Center (implements IReactionCenter)
 # ============================================================================
-
-class EnhancedReactionCenter:
-    """Reaction center for converting excitations to Eco-ATP."""
-    
+class EnhancedReactionCenter(IReactionCenter):
     def __init__(self, config: HarvesterConfig, task_manager: TaskManager,
-                 token_manager=None, gradient_manager=None):
+                 token_manager=None, gradient_manager=None, event_bus: Optional[EventBus] = None):
         self.config = config
         self.task_manager = task_manager
         self.token_manager = token_manager
         self.gradient_manager = gradient_manager
-        self.base_quantum_efficiency = config.base_quantum_efficiency
-        self.current_efficiency = config.base_quantum_efficiency
-        self.min_efficiency = config.min_efficiency
-        self.max_efficiency = config.max_efficiency
-        self.demand_modulation_enabled = config.demand_modulation_enabled
-        self.token_abundance_threshold = config.token_abundance_threshold
-        self.token_scarcity_threshold = config.token_scarcity_threshold
-        self.demand_response_factor = config.demand_response_factor
-        self.repair_rate = config.repair_rate
-        self.damage_threshold = config.damage_threshold
+        self.event_bus = event_bus
+        self.base_quantum_efficiency = config.reaction_center.base_quantum_efficiency
+        self.current_efficiency = config.reaction_center.base_quantum_efficiency
+        self.min_efficiency = config.reaction_center.min_efficiency
+        self.max_efficiency = config.reaction_center.max_efficiency
+        self.demand_modulation_enabled = config.reaction_center.demand_modulation_enabled
+        self.token_abundance_threshold = config.reaction_center.token_abundance_threshold
+        self.token_scarcity_threshold = config.reaction_center.token_scarcity_threshold
+        self.demand_response_factor = config.reaction_center.demand_response_factor
+        self.repair_rate = config.reaction_center.repair_rate
+        self.damage_threshold = config.health.damage_threshold
         self.cumulative_damage = 0.0
         self.conversion_history = deque(maxlen=2000)
         self.efficiency_history = deque(maxlen=100)
-        self.performance_metrics = {'peak_efficiency': config.base_quantum_efficiency, 'avg_conversion_rate': 0.0, 'total_conversions': 0}
+        self.performance_metrics = {'peak_efficiency': config.reaction_center.base_quantum_efficiency,
+                                   'avg_conversion_rate': 0.0, 'total_conversions': 0}
         self._lock = asyncio.Lock()
         self.task_manager.start_task("rc_maintenance", self._maintenance_loop)
         self.task_manager.start_task("rc_performance", self._performance_loop)
         logger.info("Enhanced Reaction Center initialized")
-    
+
     async def _maintenance_loop(self):
-        """Periodic maintenance to repair cumulative damage."""
         while True:
             try:
                 async with self._lock:
                     if self.cumulative_damage > 0:
                         repair = min(self.cumulative_damage, self.repair_rate)
                         self.cumulative_damage -= repair
-                        # Adjust efficiency
                         self.current_efficiency = self.base_quantum_efficiency * (1 - self.cumulative_damage)
                         self.current_efficiency = np.clip(self.current_efficiency, self.min_efficiency, self.max_efficiency)
                 await asyncio.sleep(60)
@@ -984,9 +992,8 @@ class EnhancedReactionCenter:
             except Exception as e:
                 logger.error("Maintenance loop error", error=str(e))
                 await asyncio.sleep(60)
-    
+
     async def _performance_loop(self):
-        """Periodic performance metrics update."""
         while True:
             try:
                 async with self._lock:
@@ -994,66 +1001,64 @@ class EnhancedReactionCenter:
                         self.performance_metrics['avg_conversion_rate'] = sum(self.conversion_history) / len(self.conversion_history)
                         self.performance_metrics['peak_efficiency'] = max(self.performance_metrics['peak_efficiency'],
                                                                           self.current_efficiency)
-                await asyncio.sleep(300)  # every 5 min
+                await asyncio.sleep(300)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Performance loop error", error=str(e))
                 await asyncio.sleep(300)
-    
+
     async def harvest_cycle(self, excitations: Dict[str, float]) -> Dict[str, Any]:
-        """Process excitations and produce Eco-ATP."""
         async with self._lock:
-            # Determine demand modulation
             demand_factor = 1.0
             if self.demand_modulation_enabled and self.token_manager:
-                summary = self.token_manager.get_account_summary(None)  # Assume global summary
+                summary = self.token_manager.get_account_summary(None)
                 if summary:
                     total_tokens = summary.get('total_supply', 0)
                     if total_tokens > self.token_abundance_threshold:
                         demand_factor = 1.0 - self.demand_response_factor * 0.5
                     elif total_tokens < self.token_scarcity_threshold:
                         demand_factor = 1.0 + self.demand_response_factor
-                # Also consider gradient field if available
                 if self.gradient_manager:
                     gradient_intensity = self.gradient_manager.get_intensity()
                     demand_factor *= (1 + 0.1 * gradient_intensity)
-            
-            # Compute total energy from excitations
+
             total_excitation = sum(excitations.values())
-            # Apply efficiency (including damage)
             efficiency = self.current_efficiency * demand_factor
             efficiency = np.clip(efficiency, self.min_efficiency, self.max_efficiency)
-            
-            # Convert to Eco-ATP
-            eco_atp_generated = total_excitation * efficiency * 0.1  # scaling factor
+
+            eco_atp_generated = total_excitation * efficiency * 0.1
             self.total_conversions += eco_atp_generated
             self.conversion_history.append(eco_atp_generated)
             self.efficiency_history.append(efficiency)
-            
-            # Apply damage from high efficiency operation
+
             if efficiency > 0.9:
                 self.cumulative_damage += 0.001
             elif efficiency < 0.3:
-                self.cumulative_damage += 0.005  # low efficiency may indicate stress
-            
-            # Update metrics
+                self.cumulative_damage += 0.005
+
             self.performance_metrics['total_conversions'] = self.total_conversions
-            
-            # If token manager exists, credit account
+
             if self.token_manager and hasattr(self.token_manager, 'credit'):
-                # Assume token_manager has a credit method
                 self.token_manager.credit(self.account_id, eco_atp_generated)
-            
+
+            # Publish event
+            if self.event_bus:
+                await self.event_bus.publish("harvest_completed", {
+                    "eco_atp_generated": eco_atp_generated,
+                    "efficiency": efficiency,
+                    "demand_factor": demand_factor,
+                    "total_excitation": total_excitation
+                })
+
             return {
                 'eco_atp_generated': eco_atp_generated,
                 'efficiency': efficiency,
                 'demand_factor': demand_factor,
                 'total_excitation': total_excitation
             }
-    
+
     def get_efficiency_stats(self) -> Dict[str, Any]:
-        """Return current efficiency statistics."""
         async with self._lock:
             return {
                 'current_efficiency': self.current_efficiency,
@@ -1063,31 +1068,28 @@ class EnhancedReactionCenter:
                 'peak_efficiency': self.performance_metrics['peak_efficiency'],
                 'total_conversions': self.performance_metrics['total_conversions']
             }
-    
+
     async def stop(self):
-        """Stop background tasks (managed centrally)."""
         pass
 
 # ============================================================================
-# HealthMonitor (Full Implementation)
+# HealthMonitor (implements IHealthMonitor)
 # ============================================================================
-
-class HealthMonitor:
-    """Monitors harvester health and generates recommendations."""
-    
-    def __init__(self, config: HarvesterConfig, harvester_id: str):
+class HealthMonitor(IHealthMonitor):
+    def __init__(self, config: HarvesterConfig, harvester_id: str, event_bus: Optional[EventBus] = None):
         self.config = config
         self.harvester_id = harvester_id
+        self.event_bus = event_bus
         self.metrics: Dict[str, Any] = {}
         self.recommendations: List[Dict[str, Any]] = []
         self.alert_history = deque(maxlen=100)
         self.thresholds = {
-            'efficiency_warning': config.efficiency_warning_threshold,
-            'efficiency_critical': config.efficiency_critical_threshold,
-            'damage_warning': config.damage_warning_threshold,
-            'damage_critical': config.damage_critical_threshold,
-            'harvest_rate_min': config.harvest_rate_min,
-            'prediction_accuracy_min': config.prediction_accuracy_min
+            'efficiency_warning': config.health.efficiency_warning_threshold,
+            'efficiency_critical': config.health.efficiency_critical_threshold,
+            'damage_warning': config.health.damage_warning_threshold,
+            'damage_critical': config.health.damage_critical_threshold,
+            'harvest_rate_min': config.health.harvest_rate_min,
+            'prediction_accuracy_min': config.health.prediction_accuracy_min
         }
         if config.enable_prometheus and PROMETHEUS_AVAILABLE:
             self.prometheus_metrics = {
@@ -1099,79 +1101,69 @@ class HealthMonitor:
         else:
             self.prometheus_metrics = None
         logger.info("HealthMonitor initialized")
-    
+
     def collect_metrics(self, harvester_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Collect metrics from the harvester state and update internal metrics."""
         self.metrics['timestamp'] = datetime.now(timezone.utc).isoformat()
         self.metrics['harvester_id'] = self.harvester_id
-        
-        # Extract relevant fields
         self.metrics['total_harvested'] = harvester_state.get('total_harvested', 0)
         self.metrics['harvest_cycles'] = harvester_state.get('harvest_cycles', 0)
         self.metrics['efficiency'] = harvester_state.get('efficiency', 0)
         self.metrics['mode'] = harvester_state.get('mode', 'unknown')
-        
-        # Pigment health
         pigment_health = harvester_state.get('pigment_health', {})
         self.metrics['pigment_health'] = pigment_health
         overall_health = np.mean(list(pigment_health.values())) if pigment_health else 1.0
         self.metrics['overall_health'] = overall_health
-        
-        # Predictions confidence
         predictions = harvester_state.get('predictions', {})
         confidences = [p.get('confidence', 0.5) for p in predictions.values()]
         avg_confidence = np.mean(confidences) if confidences else 0.5
         self.metrics['prediction_confidence'] = avg_confidence
-        
-        # Update Prometheus if available
+
         if self.prometheus_metrics:
             self.prometheus_metrics['harvesting_rate'].set(self.metrics.get('total_harvested', 0))
             for pigment, health in pigment_health.items():
                 self.prometheus_metrics['pigment_health'].labels(pigment=pigment).set(health)
-            self.prometheus_metrics['mode_transitions'].inc()  # simplistic
+            self.prometheus_metrics['mode_transitions'].inc()
             self.prometheus_metrics['prediction_accuracy'].observe(avg_confidence)
-        
-        # Generate recommendations based on thresholds
+
         self.recommendations = self._generate_recommendations(harvester_state)
-        
+
+        if self.event_bus and self.recommendations:
+            asyncio.create_task(self.event_bus.publish("health_recommendation", self.recommendations))
+
         return self.metrics.copy()
-    
+
     def _generate_recommendations(self, harvester_state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Generate health recommendations."""
         recs = []
         efficiency = harvester_state.get('efficiency', 1.0)
         if efficiency < self.thresholds['efficiency_warning']:
             recs.append({'type': 'warning', 'message': 'Efficiency below warning threshold', 'severity': 'medium'})
         if efficiency < self.thresholds['efficiency_critical']:
             recs.append({'type': 'critical', 'message': 'Efficiency critical, immediate action needed', 'severity': 'high'})
-        
         overall_health = self.metrics.get('overall_health', 1.0)
         if overall_health < self.thresholds['damage_warning']:
             recs.append({'type': 'warning', 'message': 'Pigment health below warning threshold', 'severity': 'medium'})
         if overall_health < self.thresholds['damage_critical']:
             recs.append({'type': 'critical', 'message': 'Pigment health critical, initiate healing', 'severity': 'high'})
-        
         return recs
-    
+
     def get_metrics(self) -> Dict[str, Any]:
         return self.metrics.copy()
-    
+
     def get_recommendations(self) -> List[Dict[str, Any]]:
         return self.recommendations.copy()
 
 # ============================================================================
-# SelfHealer (Full Implementation)
+# SelfHealer (implements ISelfHealer, uses event bus)
 # ============================================================================
-
-class SelfHealer:
-    """Applies healing strategies to address specific issues."""
-    
-    def __init__(self, harvester: 'EnhancedPhotosyntheticHarvester', config: HarvesterConfig):
+class SelfHealer(ISelfHealer):
+    def __init__(self, harvester: 'EnhancedPhotosyntheticHarvester', config: HarvesterConfig,
+                 event_bus: Optional[EventBus] = None):
         self.harvester = harvester
         self.config = config
+        self.event_bus = event_bus
         self.healing_attempts: Dict[str, int] = {}
-        self.max_attempts = config.max_healing_attempts
-        self.cooldown_period = config.healing_cooldown
+        self.max_attempts = config.health.max_healing_attempts
+        self.cooldown_period = config.health.healing_cooldown
         self.healing_strategies = {
             'photoinhibition': self._apply_photoinhibition_healing,
             'prediction_drift': self._recalibrate_predictions,
@@ -1179,68 +1171,54 @@ class SelfHealer:
             'efficiency_collapse': self._restore_efficiency
         }
         logger.info("SelfHealer initialized")
-    
+
     async def apply_healing(self, issue_type: str) -> bool:
-        """Apply a healing strategy for a given issue type."""
         if issue_type not in self.healing_strategies:
             logger.warning("Unknown healing strategy", issue_type=issue_type)
             return False
-        
-        # Check attempt count and cooldown
         attempts = self.healing_attempts.get(issue_type, 0)
         if attempts >= self.max_attempts:
             logger.warning("Max healing attempts reached for", issue_type=issue_type)
             return False
-        
-        # Apply healing
         try:
             await self.healing_strategies[issue_type]()
             self.healing_attempts[issue_type] = attempts + 1
             logger.info("Healing applied", issue_type=issue_type, attempts=attempts+1)
+            if self.event_bus:
+                await self.event_bus.publish("healing_applied", {"issue_type": issue_type, "attempts": attempts+1})
             return True
         except Exception as e:
             logger.error("Healing failed", issue_type=issue_type, error=str(e))
             return False
-    
+
     async def _apply_photoinhibition_healing(self):
-        """Reduce photoinhibition by lowering pigment sensitivities and increasing repair."""
         async with self.harvester.pigments._health_lock:
             for pigment, health in self.harvester.pigments.pigment_health.items():
-                # Increase repair rate temporarily
                 health.recovery_rate *= 1.5
                 health.repair()
-                # Lower sensitivity to reduce overexposure
                 self.harvester.pigments.pigments[pigment]['sensitivity'] *= 0.8
-        # Also reduce reaction center damage
         async with self.harvester.reaction_center._lock:
             self.harvester.reaction_center.cumulative_damage *= 0.8
         logger.info("Photoinhibition healing applied")
-    
+
     async def _recalibrate_predictions(self):
-        """Recalibrate prediction models by retraining on recent data."""
-        # This could trigger retraining of LSTM or fallback models
-        # For simplicity, we reset the fallback predictors to use recent history
         for name in self.harvester.pigments._pigment_names:
             predictor = self.harvester.pigments.fallback_predictors[name]
-            # Clear history and refill with recent data
             async with self.harvester.pigments._history_lock:
                 hist = list(self.harvester.pigments.excitation_history[name])
             predictor.history.clear()
             for val in hist[-50:]:
                 predictor.update(val)
         logger.info("Prediction recalibration applied")
-    
+
     async def _stimulate_gradients(self):
-        """Stimulate gradient fields to boost harvesting."""
         if self.harvester.gradient_manager:
-            # Increase gradient intensity temporarily
             await self.harvester.gradient_manager.increase_intensity(0.2)
             logger.info("Gradient stimulation applied")
         else:
             logger.warning("No gradient manager available for stimulation")
-    
+
     async def _restore_efficiency(self):
-        """Restore reaction center efficiency by repairing damage."""
         async with self.harvester.reaction_center._lock:
             self.harvester.reaction_center.cumulative_damage = max(0, self.harvester.reaction_center.cumulative_damage - 0.1)
             self.harvester.reaction_center.current_efficiency = self.harvester.reaction_center.base_quantum_efficiency * (
@@ -1254,34 +1232,25 @@ class SelfHealer:
         logger.info("Efficiency restoration applied")
 
 # ============================================================================
-# Persistence Backend
+# Persistence Backend (improved with JSON and schema versioning)
 # ============================================================================
-
 class PersistenceBackend:
     """Abstract base for persistence backends."""
-    
     async def save(self, key: str, data: Any) -> bool:
         raise NotImplementedError
-    
     async def load(self, key: str) -> Optional[Any]:
         raise NotImplementedError
-    
     async def delete(self, key: str) -> bool:
         raise NotImplementedError
 
 class MemoryBackend(PersistenceBackend):
-    """In-memory persistence (volatile)."""
-    
     def __init__(self):
         self._store = {}
-    
     async def save(self, key: str, data: Any) -> bool:
         self._store[key] = data
         return True
-    
     async def load(self, key: str) -> Optional[Any]:
         return self._store.get(key)
-    
     async def delete(self, key: str) -> bool:
         if key in self._store:
             del self._store[key]
@@ -1289,32 +1258,42 @@ class MemoryBackend(PersistenceBackend):
         return False
 
 class FileBackend(PersistenceBackend):
-    """File-based persistence with caching."""
-    
     def __init__(self, base_dir: str = "./harvester_data"):
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
-        self._cache = {}  # simple in-memory cache for frequent reads/writes
+        self._cache = {}
         self._cache_lock = asyncio.Lock()
-    
+
     def _get_path(self, key: str) -> str:
-        return os.path.join(self.base_dir, f"{key}.pkl")
-    
+        return os.path.join(self.base_dir, f"{key}.json")
+
     async def save(self, key: str, data: Any) -> bool:
         path = self._get_path(key)
         try:
-            with open(path, 'wb') as f:
-                pickle.dump(data, f)
-            # Update cache
+            # Convert to JSON with version
+            serialized = {
+                "version": "1.0",
+                "data": data
+            }
+            with open(path, 'w') as f:
+                json.dump(serialized, f, default=self._json_default)
             async with self._cache_lock:
                 self._cache[key] = data
             return True
         except Exception as e:
             logger.error("File save failed", key=key, error=str(e))
             return False
-    
+
+    def _json_default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        raise TypeError(f"Object of type {type(obj)} not JSON serializable")
+
     async def load(self, key: str) -> Optional[Any]:
-        # Check cache first
         async with self._cache_lock:
             if key in self._cache:
                 return self._cache[key]
@@ -1322,16 +1301,17 @@ class FileBackend(PersistenceBackend):
         if not os.path.exists(path):
             return None
         try:
-            with open(path, 'rb') as f:
-                data = pickle.load(f)
-            # Update cache
+            with open(path, 'r') as f:
+                serialized = json.load(f)
+            version = serialized.get("version", "1.0")
+            data = serialized["data"]
             async with self._cache_lock:
                 self._cache[key] = data
             return data
         except Exception as e:
             logger.error("File load failed", key=key, error=str(e))
             return None
-    
+
     async def delete(self, key: str) -> bool:
         path = self._get_path(key)
         if os.path.exists(path):
@@ -1347,34 +1327,45 @@ class FileBackend(PersistenceBackend):
         return False
 
 class RedisBackend(PersistenceBackend):
-    """Redis-based persistence."""
-    
     def __init__(self, redis_client):
         self.redis = redis_client
-    
+        self.circuit_breaker = GlobalCircuitBreaker().get_or_create("redis")
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
            retry=retry_if_exception_type(redis.ConnectionError))
     async def save(self, key: str, data: Any) -> bool:
-        try:
-            serialized = pickle.dumps(data)
+        async def _save():
+            serialized = json.dumps(data, default=self._json_default)
             await self.redis.set(key, serialized)
             return True
-        except Exception as e:
-            logger.error("Redis save failed", key=key, error=str(e))
+        try:
+            return await self.circuit_breaker.call(_save)
+        except CircuitBreakerOpenError:
+            logger.warning("Circuit breaker open, falling back to memory?")
             return False
-    
+
+    def _json_default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        raise TypeError(f"Object of type {type(obj)} not JSON serializable")
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
            retry=retry_if_exception_type(redis.ConnectionError))
     async def load(self, key: str) -> Optional[Any]:
-        try:
+        async def _load():
             data = await self.redis.get(key)
             if data is None:
                 return None
-            return pickle.loads(data)
-        except Exception as e:
-            logger.error("Redis load failed", key=key, error=str(e))
+            return json.loads(data)
+        try:
+            return await self.circuit_breaker.call(_load)
+        except CircuitBreakerOpenError:
             return None
-    
+
     async def delete(self, key: str) -> bool:
         try:
             await self.redis.delete(key)
@@ -1382,16 +1373,14 @@ class RedisBackend(PersistenceBackend):
         except Exception as e:
             logger.error("Redis delete failed", key=key, error=str(e))
             return False
-    
+
     async def delete_old_checkpoints(self, prefix: str, retention_days: int):
-        """Delete Redis keys with prefix older than retention_days."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
         pattern = f"{prefix}:checkpoint:*"
         cursor = 0
         while True:
             cursor, keys = await self.redis.scan(cursor, match=pattern)
             for key in keys:
-                # Parse timestamp from key name (format: ...:{timestamp})
                 parts = key.split(':')
                 if len(parts) >= 3:
                     timestamp_str = parts[-1]
@@ -1405,63 +1394,53 @@ class RedisBackend(PersistenceBackend):
             if cursor == 0:
                 break
 
-class PersistentHarvesterState:
-    """Manages state persistence for the harvester."""
-    
+class PersistentHarvesterState(IPersistence):
     def __init__(self, harvester_id: str, config: HarvesterConfig):
         self.harvester_id = harvester_id
         self.config = config
         self.backend: PersistenceBackend
-        if config.persistence_backend == "redis" and REDIS_AVAILABLE:
-            # Assume redis client is passed or created
-            self.backend = RedisBackend(redis.from_url("redis://localhost:6379"))
-        elif config.persistence_backend == "file":
-            self.backend = FileBackend(f"./harvester_data/{harvester_id}")
+        if config.persistence.backend == "redis" and REDIS_AVAILABLE:
+            redis_url = config.persistence.redis_url or "redis://localhost:6379"
+            self.backend = RedisBackend(redis.from_url(redis_url))
+        elif config.persistence.backend == "file":
+            self.backend = FileBackend(config.persistence.base_dir)
         else:
             self.backend = MemoryBackend()
         self._lock = asyncio.Lock()
-        logger.info("Persistence initialized", backend=config.persistence_backend)
-    
+        logger.info("Persistence initialized", backend=config.persistence.backend)
+
     async def save_state(self, state: Dict[str, Any]) -> bool:
-        """Save the full state of the harvester."""
         key = f"{self.harvester_id}:state"
         async with self._lock:
             return await self.backend.save(key, state)
-    
+
     async def load_state(self) -> Optional[Dict[str, Any]]:
-        """Load the full state of the harvester."""
         key = f"{self.harvester_id}:state"
         async with self._lock:
             return await self.backend.load(key)
-    
+
     async def save_checkpoint(self, checkpoint: Dict[str, Any]) -> bool:
-        """Save a checkpoint (with timestamp)."""
         timestamp = datetime.now(timezone.utc).isoformat()
         key = f"{self.harvester_id}:checkpoint:{timestamp}"
         async with self._lock:
             return await self.backend.save(key, checkpoint)
-    
+
     async def load_latest_checkpoint(self) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """Load the most recent checkpoint."""
-        # For file backend, we need to list files; for simplicity, we use a fixed key for latest.
-        # More advanced implementation could scan.
         key = f"{self.harvester_id}:checkpoint:latest"
         async with self._lock:
             data = await self.backend.load(key)
             if data:
                 return (key, data)
         return None
-    
+
     async def delete_old_checkpoints(self, retention_days: int):
-        """Delete checkpoints older than retention_days."""
         if isinstance(self.backend, FileBackend):
             cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
             for f in os.listdir(self.backend.base_dir):
                 if f.startswith(f"{self.harvester_id}:checkpoint:"):
-                    # Parse timestamp from filename (format: ...:{timestamp})
                     parts = f.split(':')
                     if len(parts) >= 3:
-                        timestamp_str = parts[-1].replace('.pkl', '')
+                        timestamp_str = parts[-1].replace('.json', '')
                         try:
                             timestamp = datetime.fromisoformat(timestamp_str)
                             if timestamp < cutoff:
@@ -1473,51 +1452,71 @@ class PersistentHarvesterState:
             await self.backend.delete_old_checkpoints(self.harvester_id, retention_days)
 
 # ============================================================================
-# WebSocket Server (Full with JWT support)
+# WebSocket Server (with rate limiting and TLS)
 # ============================================================================
-
 class HarvesterWebSocketServer:
-    """WebSocket server for real-time harvester stats and control."""
-    
     def __init__(self, config: HarvesterConfig):
         self.config = config
-        self.host = config.websocket_host
-        self.port = config.websocket_port
-        self.auth_token = config.websocket_auth_token
-        self.use_jwt = config.websocket_use_jwt
-        self.jwt_secret = config.websocket_jwt_secret
+        self.host = config.websocket.host
+        self.port = config.websocket.port
+        self.auth_token = config.websocket.auth_token
+        self.use_jwt = config.websocket.use_jwt
+        self.jwt_secret = config.websocket.jwt_secret
+        self.tls_enabled = config.websocket.tls_enabled
+        self.tls_cert = config.websocket.tls_cert
+        self.tls_key = config.websocket.tls_key
+        self.rate_limit = config.websocket.rate_limit_per_minute
         self.connections: Set[websockets.WebSocketServerProtocol] = set()
         self.stream_interval = 1.0
         self.is_running = False
         self.server = None
         self._broadcast_queue = asyncio.Queue()
         self._lock = asyncio.Lock()
+        self._rate_limiter = defaultdict(lambda: deque(maxlen=self.rate_limit))
+        self._rate_limit_lock = asyncio.Lock()
         if not WEBSOCKET_AVAILABLE:
             logger.warning("WebSocket support not available")
-    
+
     async def start(self):
         if not WEBSOCKET_AVAILABLE:
             return
         try:
-            self.server = await websockets.serve(self._handle_connection, self.host, self.port)
+            ssl_context = None
+            if self.tls_enabled:
+                import ssl
+                ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                ssl_context.load_cert_chain(self.tls_cert, self.tls_key)
+            self.server = await websockets.serve(self._handle_connection, self.host, self.port, ssl=ssl_context)
             self.is_running = True
-            logger.info("WebSocket server started", host=self.host, port=self.port)
+            logger.info("WebSocket server started", host=self.host, port=self.port, tls=self.tls_enabled)
         except Exception as e:
             logger.error("Failed to start WebSocket server", error=str(e))
-    
+
     async def stop(self):
         if self.server:
             self.server.close()
             await self.server.wait_closed()
             self.is_running = False
-            # Close all connections
             async with self._lock:
                 for ws in self.connections:
                     await ws.close(1000, "Server shutting down")
                 self.connections.clear()
             logger.info("WebSocket server stopped")
-    
+
     async def _handle_connection(self, websocket: websockets.WebSocketServerProtocol, path):
+        # Rate limiting per IP (simplified)
+        client_ip = websocket.remote_address[0]
+        async with self._rate_limit_lock:
+            timestamps = self._rate_limiter[client_ip]
+            now = time.time()
+            # Keep only timestamps from last minute
+            while timestamps and now - timestamps[0] > 60:
+                timestamps.popleft()
+            if len(timestamps) >= self.rate_limit:
+                await websocket.close(1008, "Rate limit exceeded")
+                return
+            timestamps.append(now)
+
         # Authentication
         if self.auth_token or self.use_jwt:
             try:
@@ -1549,9 +1548,8 @@ class HarvesterWebSocketServer:
         finally:
             async with self._lock:
                 self.connections.remove(websocket)
-    
+
     def _verify_jwt(self, token: str) -> bool:
-        """Verify JWT token with signature and expiration."""
         if not JWT_AVAILABLE:
             logger.warning("PyJWT not installed, using simple token comparison")
             return token == self.jwt_secret if self.jwt_secret else False
@@ -1566,19 +1564,16 @@ class HarvesterWebSocketServer:
         except jwt.InvalidTokenError:
             logger.warning("Invalid JWT")
             return False
-    
+
     async def _handle_message(self, websocket, message: str):
-        """Handle incoming messages."""
         try:
             data = json.loads(message)
             msg_type = data.get('type')
             if msg_type == 'subscribe':
-                # Add subscription filters if needed
                 pass
             elif msg_type == 'ping':
                 await websocket.send(json.dumps({'type': 'pong'}))
             elif msg_type == 'control':
-                # Control messages: set_mode, trigger_healing, start_evolution, etc.
                 action = data.get('action')
                 if action == 'set_mode':
                     mode = data.get('mode')
@@ -1599,9 +1594,8 @@ class HarvesterWebSocketServer:
                     await websocket.send(json.dumps({'type': 'control_response', 'status': 'error', 'message': 'Unknown action'}))
         except Exception as e:
             logger.error("Error handling message", error=str(e))
-    
+
     async def broadcast(self, data: Dict[str, Any]):
-        """Broadcast data to all connected clients."""
         if not self.connections:
             return
         message = json.dumps(data)
@@ -1611,9 +1605,8 @@ class HarvesterWebSocketServer:
                     await ws.send(message)
                 except Exception as e:
                     logger.error("Broadcast failed to client", error=str(e))
-    
+
     async def broadcast_loop(self, harvester_stats_provider: Callable[[], Dict[str, Any]]):
-        """Background loop to broadcast stats periodically."""
         while self.is_running:
             try:
                 stats = harvester_stats_provider()
@@ -1626,21 +1619,17 @@ class HarvesterWebSocketServer:
                 await asyncio.sleep(5)
 
 # ============================================================================
-# Genetic Optimizer (Safe Implementation using Simulation)
+# Genetic Optimizer (unchanged, but uses config.genetic)
 # ============================================================================
-
 class HarvesterGeneticOptimizer:
-    """
-    Genetic algorithm to evolve harvester parameters using simulation snapshots.
-    """
     def __init__(self, harvester: 'EnhancedPhotosyntheticHarvester', config: HarvesterConfig):
         self.harvester = harvester
         self.config = config
-        self.population_size = config.genetic_population_size
-        self.mutation_rate = config.genetic_mutation_rate
-        self.crossover_rate = config.genetic_crossover_rate
-        self.generations = config.genetic_generations
-        self.tournament_size = config.genetic_tournament_size
+        self.population_size = config.genetic.population_size
+        self.mutation_rate = config.genetic.mutation_rate
+        self.crossover_rate = config.genetic.crossover_rate
+        self.generations = config.genetic.generations
+        self.tournament_size = config.genetic.tournament_size
         self.best_individual = None
         self.best_fitness = -float('inf')
         self.evolution_history = []
@@ -1651,10 +1640,9 @@ class HarvesterGeneticOptimizer:
             'repair_rates': (0.005, 0.05),
             'demand_response_factor': (0.1, 1.0)
         }
-        # Store recent environmental data for simulation
-        self.recent_data = deque(maxlen=config.genetic_simulation_cycles * 2)
+        self.recent_data = deque(maxlen=config.genetic.simulation_cycles * 2)
         logger.info("Harvester Genetic Optimizer initialized")
-    
+
     def _initialize_individual(self) -> Dict:
         ind = {
             'conversion_factors': {},
@@ -1668,18 +1656,16 @@ class HarvesterGeneticOptimizer:
             ind['sensitivity_multipliers'][p] = random.uniform(*self.param_bounds['sensitivity_multipliers'])
             ind['repair_rates'][p] = random.uniform(*self.param_bounds['repair_rates'])
         return ind
-    
+
     def _initialize_population(self) -> List[Dict]:
         return [self._initialize_individual() for _ in range(self.population_size)]
-    
+
     def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
-        """Single-point crossover for each parameter group."""
         child = {}
         for param_group in ['conversion_factors', 'sensitivity_multipliers', 'repair_rates']:
             child[param_group] = {}
             pigments = list(parent1[param_group].keys())
             if random.random() < self.crossover_rate:
-                # Choose random split point
                 split = random.randint(0, len(pigments)-1)
                 for i, p in enumerate(pigments):
                     if i < split:
@@ -1687,33 +1673,28 @@ class HarvesterGeneticOptimizer:
                     else:
                         child[param_group][p] = parent2[param_group][p]
             else:
-                # No crossover, take from one parent
                 if random.random() < 0.5:
                     child[param_group] = parent1[param_group].copy()
                 else:
                     child[param_group] = parent2[param_group].copy()
-        # For scalar parameters
         if random.random() < self.crossover_rate:
             child['demand_response_factor'] = (parent1['demand_response_factor'] + parent2['demand_response_factor']) / 2
         else:
             child['demand_response_factor'] = parent1['demand_response_factor'] if random.random() < 0.5 else parent2['demand_response_factor']
         return child
-    
+
     def _mutate(self, individual: Dict) -> Dict:
-        """Mutate individual with given mutation rate."""
         mutant = {}
         for param_group in ['conversion_factors', 'sensitivity_multipliers', 'repair_rates']:
             mutant[param_group] = {}
             for p, val in individual[param_group].items():
                 if random.random() < self.mutation_rate:
-                    # Mutate within bounds
                     bounds = self.param_bounds[param_group] if param_group != 'repair_rates' else self.param_bounds['repair_rates']
                     new_val = val * random.uniform(0.8, 1.2)
                     new_val = np.clip(new_val, bounds[0], bounds[1])
                     mutant[param_group][p] = new_val
                 else:
                     mutant[param_group][p] = val
-        # Mutate demand_response_factor
         if random.random() < self.mutation_rate:
             bounds = self.param_bounds['demand_response_factor']
             new_val = individual['demand_response_factor'] * random.uniform(0.8, 1.2)
@@ -1721,26 +1702,18 @@ class HarvesterGeneticOptimizer:
         else:
             mutant['demand_response_factor'] = individual['demand_response_factor']
         return mutant
-    
+
     def _tournament_select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
-        """Select individual via tournament."""
         tournament_indices = random.sample(range(len(population)), self.tournament_size)
         best_idx = max(tournament_indices, key=lambda i: fitness_scores[i])
         return population[best_idx]
-    
+
     async def _evaluate_individual_simulation(self, individual: Dict) -> float:
-        """
-        Evaluate fitness by running a simulation on historical data without affecting live state.
-        Enhanced with more realistic factors: circadian, health dynamics, and demand response.
-        """
         if not self.recent_data:
             return 0.0
-        
         total_score = 0.0
         cycles = 0
-        # Simulate over multiple historical data points
         for env_data in self.recent_data:
-            # Compute excitations for each pigment
             excitations = []
             for pigment_name, pigment in self.harvester.pigments.pigments.items():
                 target_key = pigment['target']
@@ -1751,29 +1724,20 @@ class HarvesterGeneticOptimizer:
                 excitation = np.clip(excitation, 0, 1.0)
                 excitations.append(excitation * conversion)
             total_excitation = sum(excitations)
-            
-            # Simulate reaction center efficiency with damage
             efficiency = 0.85 * (1 - 0.01 * total_excitation)
             efficiency *= individual['demand_response_factor']
-            # Simulate pigment health decay and repair
             health = 1.0
             for pigment_name in self.harvester.pigments.pigments:
                 repair = individual['repair_rates'][pigment_name]
-                # Damage proportional to excitation
                 damage = 0.001 * total_excitation
                 health = max(0, health - damage + repair * 0.1)
             health = min(1.0, health)
-            
-            # Include circadian effect
-            circadian = self.harvester.pigments.circadian_model.get_multiplier(pigment)
-            # Assume average circadian effect
             circadian_avg = np.mean([self.harvester.pigments.circadian_model.get_multiplier(p) for p in self.harvester.pigments.pigments.values()])
             total_score += total_excitation * efficiency * health * circadian_avg
             cycles += 1
-        
         avg_score = total_score / cycles if cycles > 0 else 0.0
         return avg_score
-    
+
     async def evolve(self, generations: Optional[int] = None) -> Dict:
         async with self._lock:
             if generations is None:
@@ -1781,7 +1745,6 @@ class HarvesterGeneticOptimizer:
             population = self._initialize_population()
             best_fitness = -float('inf')
             best_ind = None
-            
             for gen in range(generations):
                 fitness_scores = await asyncio.gather(*[
                     self._evaluate_individual_simulation(ind) for ind in population
@@ -1791,7 +1754,6 @@ class HarvesterGeneticOptimizer:
                 if gen_best_fitness > best_fitness:
                     best_fitness = gen_best_fitness
                     best_ind = population[gen_best_idx].copy()
-                
                 new_population = []
                 for _ in range(self.population_size):
                     parent1 = self._tournament_select(population, fitness_scores)
@@ -1801,26 +1763,23 @@ class HarvesterGeneticOptimizer:
                     new_population.append(child)
                 population = new_population
                 logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
-            
             if best_fitness > self.best_fitness:
                 self.best_fitness = best_fitness
                 self.best_individual = best_ind
                 await self._apply_individual(best_ind)
                 logger.info(f"Applied best individual with fitness {best_fitness:.4f}")
-            
             self.evolution_history.append({'timestamp': datetime.now(timezone.utc), 'best_fitness': best_fitness})
             return {'best_fitness': best_fitness, 'best_individual': best_ind}
-    
+
     async def _apply_individual(self, individual: Dict):
-        """Apply the parameters to the live harvester (with locking)."""
         async with self.harvester._state_lock:
             pigments = self.harvester.pigments.pigments
             for p in pigments:
                 pigments[p]['energy_conversion_factor'] = individual['conversion_factors'][p]
                 pigments[p]['sensitivity'] = individual['sensitivity_multipliers'][p] * pigments[p]['base_sensitivity']
                 self.harvester.pigments.pigment_health[p].recovery_rate = individual['repair_rates'][p]
-            self.harvester.config.demand_response_factor = individual['demand_response_factor']
-    
+            self.harvester.config.reaction_center.demand_response_factor = individual['demand_response_factor']
+
     def get_status(self) -> Dict[str, Any]:
         return {
             'best_fitness': self.best_fitness,
@@ -1829,27 +1788,23 @@ class HarvesterGeneticOptimizer:
         }
 
 # ============================================================================
-# Competition Engine (Enhanced with diversity preservation)
+# Competition Engine (unchanged, but uses config.child)
 # ============================================================================
-
 class ChildHarvesterCompetition:
-    """Manages competition between child harvesters."""
-    
     def __init__(self, parent: 'EnhancedPhotosyntheticHarvester', config: HarvesterConfig):
         self.parent = parent
         self.config = config
-        self.competition_interval = config.competition_interval
-        self.replacement_threshold = config.replacement_threshold
-        self.performance_window = config.performance_window
+        self.competition_interval = config.child.competition_interval
+        self.replacement_threshold = config.child.replacement_threshold
+        self.performance_window = config.child.performance_window
         self._lock = asyncio.Lock()
         logger.info("Child Harvester Competition initialized")
-    
+
     async def run_competition(self):
         async with self._lock:
             children = list(self.parent.child_harvesters.values())
             if len(children) < 2:
                 return
-            
             performance = {}
             for child in children:
                 stats = child.get_harvesting_stats()
@@ -1857,28 +1812,21 @@ class ChildHarvesterCompetition:
                 total = stats.get('total_harvested', 0)
                 avg = total / max(cycles, 1)
                 performance[child.harvester_id] = avg
-            
             if not performance:
                 return
-            
             sorted_perf = sorted(performance.items(), key=lambda x: x[1])
             bottom_count = max(1, int(len(sorted_perf) * self.replacement_threshold))
             bottom = [cid for cid, _ in sorted_perf[:bottom_count]]
             top = [cid for cid, _ in sorted_perf[-bottom_count:]]
             if not top:
                 return
-            
-            # Diversity preservation: keep at least one child with distinct parameter set
             diversity_pool = []
             for child_id, child in self.parent.child_harvesters.items():
                 if child_id not in bottom:
                     diversity_pool.append(child_id)
             if diversity_pool and len(bottom) == len(children):
-                # Keep the most diverse one (based on parameter variance) from bottom
-                # Simplified: randomly pick one to keep
                 keep_id = random.choice(bottom)
                 bottom = [bid for bid in bottom if bid != keep_id]
-            
             for child_id in bottom:
                 top_id = random.choice(top)
                 top_child = self.parent.child_harvesters.get(top_id)
@@ -1886,7 +1834,6 @@ class ChildHarvesterCompetition:
                     continue
                 new_child = self.parent.spawn_child_with_config(top_child)
                 if new_child:
-                    # Mutate parameters slightly
                     for pigment_name, config in new_child.pigments.pigments.items():
                         if random.random() < 0.3:
                             config['sensitivity'] = config['base_sensitivity'] * random.uniform(0.8, 1.2)
@@ -1894,7 +1841,7 @@ class ChildHarvesterCompetition:
                     self.parent.remove_child(child_id)
                     self.parent.child_harvesters[new_child.harvester_id] = new_child
                     logger.info("Replaced child", old=child_id, new=new_child.harvester_id)
-    
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             'competition_interval': self.competition_interval,
@@ -1903,33 +1850,28 @@ class ChildHarvesterCompetition:
         }
 
 # ============================================================================
-# Swarm Coordinator (Enhanced with Redis pub/sub)
+# Swarm Coordinator (unchanged, uses config.swarm)
 # ============================================================================
-
 class SwarmCoordinator:
-    """Coordinates with other harvesters in a swarm."""
-    
     def __init__(self, parent: 'EnhancedPhotosyntheticHarvester', config: HarvesterConfig):
         self.parent = parent
         self.config = config
         self.shared_predictions: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
-        # Redis pubsub for distributed coordination (optional)
         self.redis_client = None
         self.pubsub = None
         self.channel = f"harvester_swarm_{self.parent.harvester_id}"
         if REDIS_AVAILABLE:
             try:
-                self.redis_client = redis.from_url("redis://localhost:6379")
-                # Subscribe to channel
+                redis_url = config.swarm.redis_url or "redis://localhost:6379"
+                self.redis_client = redis.from_url(redis_url)
                 self.pubsub = self.redis_client.pubsub()
                 asyncio.create_task(self._listen())
             except:
                 self.redis_client = None
         logger.info("Swarm Coordinator initialized")
-    
+
     async def _listen(self):
-        """Listen for messages from other harvesters."""
         if not self.pubsub:
             return
         await self.pubsub.subscribe(self.channel)
@@ -1938,12 +1880,11 @@ class SwarmCoordinator:
                 try:
                     data = json.loads(message['data'])
                     async with self._lock:
-                        # Merge remote predictions into shared_predictions
                         for harvester_id, preds in data.items():
                             self.shared_predictions[harvester_id] = preds
                 except Exception as e:
                     logger.error("Failed to process swarm message", error=str(e))
-    
+
     async def share_predictions(self):
         async with self._lock:
             all_preds = {}
@@ -1953,8 +1894,6 @@ class SwarmCoordinator:
                 child_preds = await child.pigments.get_predictions()
                 all_preds[child_id] = child_preds
             self.shared_predictions = all_preds
-            
-            # Determine mode based on aggregate predictions
             high_count = 0
             total = 0
             for preds in all_preds.values():
@@ -1970,24 +1909,16 @@ class SwarmCoordinator:
                     self.parent.set_mode(HarvestingMode.CONSERVATIVE)
                 else:
                     self.parent.set_mode(HarvestingMode.MODULATED)
-            
-            # If Redis available, publish predictions
             if self.redis_client:
                 await self.redis_client.publish(self.channel, json.dumps(all_preds))
-    
+
     def get_shared_predictions(self) -> Dict[str, Dict[str, Any]]:
         return self.shared_predictions.copy()
 
 # ============================================================================
-# Enhanced Photosynthetic Harvester (Main Class with all enhancements)
+# Enhanced Photosynthetic Harvester (Main Class with interfaces)
 # ============================================================================
-
 class EnhancedPhotosyntheticHarvester:
-    """
-    Enhanced Photosynthetic Harvester v9.0.0
-    Complete implementation with all improvements.
-    """
-    
     def __init__(self, config: Optional[HarvesterConfig] = None,
                  token_manager: Optional[Any] = None,
                  gradient_manager: Optional[Any] = None):
@@ -1995,23 +1926,27 @@ class EnhancedPhotosyntheticHarvester:
         self.harvester_id = self.config.harvester_id
         self.token_manager = token_manager
         self.gradient_manager = gradient_manager
-        
-        # Central task manager
-        self._task_manager = TaskManager()
-        
-        # Sub-modules with config injection and task manager
-        self.pigments = EnhancedPigmentArray(self.config, self._task_manager)
-        self.reaction_center = EnhancedReactionCenter(self.config, self._task_manager, token_manager, gradient_manager)
-        self.health_monitor = HealthMonitor(self.config, self.harvester_id)
-        self.self_healer = SelfHealer(self, self.config)
+
+        # Event bus
+        self.event_bus = EventBus()
+
+        # Central task manager with event bus
+        self._task_manager = TaskManager(event_bus=self.event_bus)
+
+        # Sub-modules with dependency injection (interfaces)
+        self.pigments = EnhancedPigmentArray(self.config, self._task_manager, self.event_bus)
+        self.reaction_center = EnhancedReactionCenter(self.config, self._task_manager,
+                                                     token_manager, gradient_manager, self.event_bus)
+        self.health_monitor = HealthMonitor(self.config, self.harvester_id, self.event_bus)
+        self.self_healer = SelfHealer(self, self.config, self.event_bus)
         self.persistence = PersistentHarvesterState(self.harvester_id, self.config)
         self.websocket_server = None
-        if self.config.enable_websocket and WEBSOCKET_AVAILABLE:
+        if self.config.websocket.enable and WEBSOCKET_AVAILABLE:
             self.websocket_server = HarvesterWebSocketServer(self.config)
-            self.websocket_server._parent_harvester = self  # for control messages
+            self.websocket_server._parent_harvester = self
             self._task_manager.start_task("websocket_server", self.websocket_server.start)
             self._task_manager.start_task("websocket_broadcast", self._websocket_broadcast_loop)
-        
+
         # Harvesting state
         self.mode = HarvestingMode.FULL
         self.total_harvested = 0.0
@@ -2032,38 +1967,36 @@ class EnhancedPhotosyntheticHarvester:
             'successful_cycles': 0,
             'failed_cycles': 0
         }
-        
+
         # New components
         self.genetic_optimizer = HarvesterGeneticOptimizer(self, self.config)
         self.competition_engine = ChildHarvesterCompetition(self, self.config)
         self.swarm_coordinator = SwarmCoordinator(self, self.config)
-        
+
         # Locks
         self._state_lock = asyncio.Lock()
         self._child_lock = asyncio.Lock()
         self._prediction_lock = asyncio.Lock()
-        
+
         # Register and start background loops
         self._register_tasks()
         self._task_manager.start_registered_tasks()
-        
+
         # Restore state
-        if self.config.enable_persistence:
+        if self.config.persistence.enable:
             asyncio.create_task(self._restore_state())
-        
+
         logger.info("Enhanced Photosynthetic Harvester initialized", id=self.harvester_id)
-    
+
     def _register_tasks(self):
-        """Register all background tasks with the central task manager."""
         self._task_manager.register_task("predictive_window", self._predictive_window_loop)
         self._task_manager.register_task("metrics", self._metrics_loop)
         self._task_manager.register_task("genetic_evolution", self._genetic_evolution_loop)
         self._task_manager.register_task("competition", self._competition_loop)
         self._task_manager.register_task("swarm_coordination", self._swarm_coordination_loop)
         self._task_manager.register_task("checkpoint", self._checkpoint_loop)
-    
+
     async def _predictive_window_loop(self):
-        """Background loop to update predictive windows."""
         while True:
             try:
                 predictions = await self.pigments.get_predictions()
@@ -2071,15 +2004,14 @@ class EnhancedPhotosyntheticHarvester:
                     if pred.get('medium_term_300s', 0) > 0.7:
                         peak_time = datetime.now(timezone.utc) + timedelta(seconds=300)
                         self.predicted_peaks[pigment] = peak_time
-                await asyncio.sleep(60)  # every minute
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Predictive window loop error", error=str(e))
                 await asyncio.sleep(60)
-    
+
     async def _metrics_loop(self):
-        """Background loop to update metrics and health."""
         while True:
             try:
                 stats = await self.get_harvesting_stats()
@@ -2089,71 +2021,65 @@ class EnhancedPhotosyntheticHarvester:
                     if rec['severity'] == 'high':
                         issue_type = rec['type']
                         await self.self_healer.apply_healing(issue_type)
-                await asyncio.sleep(30)  # every 30 seconds
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Metrics loop error", error=str(e))
                 await asyncio.sleep(30)
-    
+
     async def _genetic_evolution_loop(self):
-        """Background loop for genetic evolution."""
         while True:
             try:
                 if self.harvest_cycles > 50 and not self.is_child:
                     logger.info("Starting genetic evolution...")
-                    result = await self.genetic_optimizer.evolve(generations=self.config.genetic_generations)
+                    result = await self.genetic_optimizer.evolve(generations=self.config.genetic.generations)
                     logger.info("Evolution complete", fitness=result['best_fitness'])
-                await asyncio.sleep(self.config.genetic_evolution_interval)
+                await asyncio.sleep(self.config.genetic.evolution_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Genetic evolution loop error", error=str(e))
                 await asyncio.sleep(3600)
-    
+
     async def _competition_loop(self):
-        """Background loop for child competition."""
         while True:
             try:
                 if not self.is_child and len(self.child_harvesters) >= 2:
                     await self.competition_engine.run_competition()
-                await asyncio.sleep(self.config.competition_interval)
+                await asyncio.sleep(self.config.child.competition_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Competition loop error", error=str(e))
                 await asyncio.sleep(300)
-    
+
     async def _swarm_coordination_loop(self):
-        """Background loop for swarm coordination."""
         while True:
             try:
                 await self.swarm_coordinator.share_predictions()
-                await asyncio.sleep(self.config.swarm_update_interval)
+                await asyncio.sleep(self.config.swarm.update_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Swarm coordination error", error=str(e))
                 await asyncio.sleep(300)
-    
+
     async def _checkpoint_loop(self):
-        """Background loop to save checkpoints."""
         while True:
             try:
-                if self.config.enable_persistence:
+                if self.config.persistence.enable:
                     await self._checkpoint()
-                    # Clean old checkpoints periodically
-                    if random.random() < 0.01:  # ~1% chance per iteration
-                        await self.persistence.delete_old_checkpoints(self.config.persistence_retention_days)
-                await asyncio.sleep(self.config.checkpoint_interval)
+                    if random.random() < 0.01:
+                        await self.persistence.delete_old_checkpoints(self.config.persistence.retention_days)
+                await asyncio.sleep(self.config.persistence.checkpoint_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Checkpoint loop error", error=str(e))
                 await asyncio.sleep(300)
-    
+
     async def _websocket_broadcast_loop(self):
-        """Background loop for WebSocket broadcasting."""
         if not self.websocket_server:
             return
         while self.websocket_server.is_running:
@@ -2166,10 +2092,9 @@ class EnhancedPhotosyntheticHarvester:
             except Exception as e:
                 logger.error("WebSocket broadcast error", error=str(e))
                 await asyncio.sleep(5)
-    
+
     async def _restore_state(self):
-        """Restore harvester state from persistence."""
-        if not self.config.enable_persistence:
+        if not self.config.persistence.enable:
             return
         state = await self.persistence.load_state()
         if state:
@@ -2184,16 +2109,15 @@ class EnhancedPhotosyntheticHarvester:
                         self.pigments.pigment_health[name].damage = health_data.get('damage', 0.0)
                 rc_state = state.get('reaction_center', {})
                 self.reaction_center.cumulative_damage = rc_state.get('cumulative_damage', 0.0)
-                self.reaction_center.current_efficiency = rc_state.get('current_efficiency', self.config.base_quantum_efficiency)
+                self.reaction_center.current_efficiency = rc_state.get('current_efficiency', self.config.reaction_center.base_quantum_efficiency)
                 self.peak_harvest_rate = state.get('peak_harvest_rate', 0.0)
                 self.harvesting_efficiency = state.get('harvesting_efficiency', 0.0)
             logger.info("State restored", id=self.harvester_id)
         else:
             logger.info("No previous state found")
-    
+
     async def _checkpoint(self):
-        """Save current state as checkpoint."""
-        if not self.config.enable_persistence:
+        if not self.config.persistence.enable:
             return
         async with self._state_lock:
             state = {
@@ -2213,14 +2137,18 @@ class EnhancedPhotosyntheticHarvester:
             }
         await self.persistence.save_checkpoint(state)
         await self.persistence.save_state(state)
-    
+
     async def harvest_cycle(self, environmental_data: Dict[str, float]) -> Dict[str, Any]:
-        """Perform a full harvesting cycle."""
         try:
+            # Create trace context for this cycle
+            trace = TraceContext()
+            cycle_logger = trace.get_logger(logger)
+            cycle_logger.info("Starting harvest cycle", trace_id=trace.trace_id)
+
             excitations = await self.pigments.sense_environment(environmental_data)
             rc_result = await self.reaction_center.harvest_cycle(excitations)
             eco_atp = rc_result['eco_atp_generated']
-            
+
             async with self._state_lock:
                 self.total_harvested += eco_atp
                 self.harvest_cycles += 1
@@ -2232,9 +2160,9 @@ class EnhancedPhotosyntheticHarvester:
                                                                     eco_atp)
                 self.performance_metrics['successful_cycles'] += 1
                 self.performance_metrics['uptime'] = (datetime.now(timezone.utc) - self.performance_metrics['start_time']).total_seconds()
-            
+
             self.genetic_optimizer.recent_data.append(environmental_data.copy())
-            
+
             stats = await self.get_harvesting_stats()
             self.health_monitor.collect_metrics(stats)
             recs = self.health_monitor.get_recommendations()
@@ -2242,7 +2170,8 @@ class EnhancedPhotosyntheticHarvester:
                 if rec['severity'] == 'high':
                     issue_type = rec['type']
                     await self.self_healer.apply_healing(issue_type)
-            
+
+            cycle_logger.info("Harvest cycle complete", eco_atp=eco_atp, efficiency=rc_result['efficiency'])
             return {
                 'eco_atp_generated': eco_atp,
                 'total_harvested': self.total_harvested,
@@ -2252,21 +2181,20 @@ class EnhancedPhotosyntheticHarvester:
                 'mode': self.mode.value
             }
         except Exception as e:
-            logger.error("Harvest cycle failed", error=str(e))
             async with self._state_lock:
                 self.performance_metrics['failed_cycles'] += 1
+            logger.error("Harvest cycle failed", error=str(e), exc_info=True)
             raise
-    
+
     async def spawn_child(self, specialization: str) -> Optional['EnhancedPhotosyntheticHarvester']:
-        """Spawn a child harvester with a given specialization."""
         async with self._child_lock:
-            if len(self.child_harvesters) >= self.config.max_children:
+            if len(self.child_harvesters) >= self.config.child.max_children:
                 logger.warning("Max children reached")
                 return None
             child_id = f"{self.harvester_id}_child_{specialization}_{uuid.uuid4().hex[:8]}"
             child_config = self.config.copy(deep=True)
             child_config.harvester_id = child_id
-            child_config.enable_websocket = False
+            child_config.websocket.enable = False
             child = EnhancedPhotosyntheticHarvester(
                 config=child_config,
                 token_manager=self.token_manager,
@@ -2281,17 +2209,16 @@ class EnhancedPhotosyntheticHarvester:
             self.child_harvesters[child_id] = child
             logger.info("Spawned child harvester", id=child_id, specialization=specialization)
             return child
-    
+
     async def spawn_child_with_config(self, template: 'EnhancedPhotosyntheticHarvester') -> Optional['EnhancedPhotosyntheticHarvester']:
-        """Spawn a child harvester copying a template's configuration."""
         async with self._child_lock:
-            if len(self.child_harvesters) >= self.config.max_children:
+            if len(self.child_harvesters) >= self.config.child.max_children:
                 logger.warning("Max children reached")
                 return None
             child_id = f"{self.harvester_id}_child_clone_{uuid.uuid4().hex[:8]}"
             child_config = template.config.copy(deep=True)
             child_config.harvester_id = child_id
-            child_config.enable_websocket = False
+            child_config.websocket.enable = False
             child = EnhancedPhotosyntheticHarvester(
                 config=child_config,
                 token_manager=self.token_manager,
@@ -2305,21 +2232,20 @@ class EnhancedPhotosyntheticHarvester:
             self.child_harvesters[child_id] = child
             logger.info("Spawned child from template", id=child_id)
             return child
-    
+
     async def remove_child(self, child_id: str):
         async with self._child_lock:
             if child_id in self.child_harvesters:
                 asyncio.create_task(self.child_harvesters[child_id].shutdown())
                 del self.child_harvesters[child_id]
                 logger.info("Removed child harvester", id=child_id)
-    
+
     def set_mode(self, mode: HarvestingMode):
         async with self._state_lock:
             self.mode = mode
             logger.info("Mode changed", mode=mode.value)
-    
+
     async def shutdown(self):
-        """Gracefully shut down all components."""
         logger.info("Shutting down harvester", id=self.harvester_id)
         await self._task_manager.stop_all()
         if self.websocket_server:
@@ -2328,10 +2254,10 @@ class EnhancedPhotosyntheticHarvester:
             for child in self.child_harvesters.values():
                 await child.shutdown()
             self.child_harvesters.clear()
-        if self.config.enable_persistence:
+        if self.config.persistence.enable:
             await self._checkpoint()
         logger.info("Harvester shutdown complete")
-    
+
     async def get_harvesting_stats(self) -> Dict[str, Any]:
         async with self._state_lock:
             stats = {
@@ -2359,16 +2285,9 @@ class EnhancedPhotosyntheticHarvester:
             return stats
 
 # ============================================================================
-# Deprecated legacy wrapper (removed)
-# ============================================================================
-# The PhotosyntheticHarvester class has been removed. Use EnhancedPhotosyntheticHarvester directly.
-
-# ============================================================================
 # Helper functions
 # ============================================================================
-
 def create_harvester(config: Union[Dict, HarvesterConfig] = None) -> EnhancedPhotosyntheticHarvester:
-    """Factory function to create a configured harvester."""
     if isinstance(config, dict):
         if PYDANTIC_AVAILABLE:
             config = HarvesterConfig(**config)
@@ -2378,7 +2297,7 @@ def create_harvester(config: Union[Dict, HarvesterConfig] = None) -> EnhancedPho
 
 async def example_usage():
     logging.basicConfig(level=logging.INFO)
-    config = HarvesterConfig(enable_persistence=False)
+    config = HarvesterConfig(persistence=HarvesterConfig.persistence_class(enable=False))
     harvester = EnhancedPhotosyntheticHarvester(config=config)
     env_data = {'renewable_availability': 0.8, 'carbon_intensity': 200, 'waste_heat': 0.3, 'edge_availability': 0.6, 'system_overload': 0.1}
     for _ in range(10):
