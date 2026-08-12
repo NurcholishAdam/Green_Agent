@@ -1,19 +1,18 @@
 """
-TimeTickEngine v3.2 – Enhanced simulation driver with configurable data sources,
-interpolation, checkpointing, metrics, and graceful shutdown.
+TimeTickEngine v3.3 – Enhanced simulation driver with MOPD support.
 
 Supports:
 - CSV data loading with validation and configurable date column.
 - Live data feed integration (via callback or async generator).
 - Interpolation methods: linear, quadratic, spline, time‑based.
-- Checkpoint saving/loading to resume simulations (with harvester state integration).
-- Metrics collection (total harvested, average efficiency, etc.) with extensible custom metrics.
+- Checkpoint saving/loading to resume simulations.
+- Metrics collection (total harvested, average efficiency, etc.).
 - Graceful stop via stop() method.
-- Async context manager for clean resource management.
-- Configurable date format and checkpoint retention.
-- Data hash validation for checkpoint compatibility.
-- Improved live data handling and error recovery.
-- Removed extraneous methods; improved type hints and logging.
+- Async context manager.
+- **Multi‑policy simulation** for Pareto front generation.
+- **MOPD (Multi‑Objective Pareto Decision)** with configurable weights.
+- **Persistence of Pareto fronts** in checkpoints.
+- **Telemetry** for MOPD generations and Pareto front sizes.
 """
 
 import asyncio
@@ -50,9 +49,30 @@ except ImportError:
     TQDM_AVAILABLE = False
 
 # ============================================================================
-# Configuration (Pydantic or dataclass)
+# Configuration (Pydantic or dataclass) – Enhanced with MOPD
 # ============================================================================
 if PYDANTIC_AVAILABLE:
+    class MOPDConfig(BaseModel):
+        """Configuration for Multi‑Objective Pareto Decision."""
+        enabled: bool = Field(True, description="Enable MOPD‑aware multi‑policy simulation")
+        objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'total_harvested': 0.3,
+                'avg_efficiency': 0.3,
+                'carbon_saved': 0.2,
+                'helium_saved': 0.2,
+            },
+            description="Weights for scalarising Pareto front (must sum to 1)"
+        )
+        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
+
+        @validator('objective_weights')
+        def check_weights(cls, v):
+            total = sum(v.values())
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError("objective_weights must sum to 1")
+            return v
+
     class TimeTickConfig(BaseModel):
         """Configuration for TimeTickEngine."""
         data_source: str = Field(..., description="Path to CSV or 'live' for real‑time.")
@@ -77,6 +97,8 @@ if PYDANTIC_AVAILABLE:
         )
         # Custom metrics storage limit
         max_custom_metrics_entries: int = Field(1000, ge=1, description="Maximum number of custom metric entries to keep.")
+        # MOPD configuration
+        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
 
         @validator('interpolation_method')
         def validate_interpolation(cls, v):
@@ -98,6 +120,17 @@ if PYDANTIC_AVAILABLE:
             return values
 else:
     @dataclass
+    class MOPDConfig:
+        enabled: bool = True
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            'total_harvested': 0.3,
+            'avg_efficiency': 0.3,
+            'carbon_saved': 0.2,
+            'helium_saved': 0.2,
+        })
+        grid_resolution: int = 5
+
+    @dataclass
     class TimeTickConfig:
         data_source: str = "csv"
         csv_path: Optional[str] = None
@@ -116,6 +149,7 @@ else:
         live_fetch_interval: float = 1.0
         live_data_callback: Optional[Callable] = None
         max_custom_metrics_entries: int = 1000
+        mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
 # ============================================================================
 # Protocols for loose coupling
@@ -147,6 +181,39 @@ class SimulationState:
     harvester_state: Optional[Dict[str, Any]] = None
     data_hash: Optional[str] = None  # hash of the data file for validation
     timestamp: str
+    # MOPD additions
+    pareto_front: Optional[List[Dict[str, Any]]] = None  # serialised MOPDPoint list
+    current_policy_id: Optional[str] = None  # if multi‑policy, which one is active
+
+# ============================================================================
+# MOPD Data Classes (NEW)
+# ============================================================================
+@dataclass
+class MOPDPoint:
+    """Represents a single policy with its objective values."""
+    policy_id: str
+    # Decision variables (can be extended)
+    harvester_mode: str
+    # Objectives (to be minimised/maximised)
+    total_harvested: float
+    avg_efficiency: float
+    carbon_saved: float
+    helium_saved: float
+    # Scalarised score (computed later)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        return cls(**data)
+
+@dataclass
+class Policy:
+    """A policy defines a simulation scenario with a harvester mode."""
+    policy_id: str
+    harvester_mode: str
 
 # ============================================================================
 # Metrics Collector (extensible with capped storage)
@@ -169,13 +236,11 @@ class MetricsCollector:
         self.modes.append(result.get('mode', 'unknown'))
         self.timestamps.append(datetime.now())
 
-        # Record any custom metrics present (e.g., pigment health)
         for key, value in result.items():
             if key not in ['eco_atp_generated', 'efficiency', 'mode']:
                 if key not in self.custom_metrics:
                     self.custom_metrics[key] = []
                 self.custom_metrics[key].append(value)
-                # Trim if over limit
                 if len(self.custom_metrics[key]) > self._max_custom_entries:
                     self.custom_metrics[key] = self.custom_metrics[key][-self._max_custom_entries:]
 
@@ -188,7 +253,6 @@ class MetricsCollector:
             'mode_counts': {mode: self.modes.count(mode) for mode in set(self.modes)},
             'duration_hours': (self.timestamps[-1] - self.timestamps[0]).total_seconds() / 3600 if self.timestamps else 0
         }
-        # Add custom metrics summary (average, min, max) based on last _max_custom_entries
         for key, values in self.custom_metrics.items():
             if values:
                 recent = values[-self._max_custom_entries:]
@@ -198,7 +262,6 @@ class MetricsCollector:
         return summary
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize the entire collector to a dict for checkpointing."""
         return {
             'total_harvested': self.total_harvested,
             'harvest_cycles': self.harvest_cycles,
@@ -211,7 +274,6 @@ class MetricsCollector:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'MetricsCollector':
-        """Restore a MetricsCollector from a dict."""
         collector = cls(max_custom_entries=data.get('max_custom_entries', 1000))
         collector.total_harvested = data.get('total_harvested', 0.0)
         collector.harvest_cycles = data.get('harvest_cycles', 0)
@@ -222,44 +284,36 @@ class MetricsCollector:
         return collector
 
 # ============================================================================
-# Live Data Feed (for real‑time simulation)
+# Live Data Feed (unchanged)
 # ============================================================================
 class LiveDataFeed:
-    """
-    Handles fetching live data via a callback or async generator.
-    Provides a consistent interface for the TimeTickEngine.
-    """
+    """Handles fetching live data via a callback or async generator."""
     def __init__(self, config: TimeTickConfig):
         self.config = config
         self._callback = config.live_data_callback
         self._running = False
         self._last_data: Optional[Dict[str, float]] = None
-        self._backoff = 0.5  # initial backoff seconds
+        self._backoff = 0.5
 
     async def fetch(self) -> Dict[str, float]:
-        """Fetch the latest data using the callback or fallback."""
         if self._callback:
             try:
                 data = await self._callback()
                 if data is not None:
                     self._last_data = data
-                    self._backoff = 0.5  # reset backoff on success
+                    self._backoff = 0.5
                     return data
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error("Live data callback failed: %s", e)
-                # Exponential backoff
                 self._backoff = min(self._backoff * 2, 30.0)
                 await asyncio.sleep(self._backoff)
-        # If no callback or failure, return last known data or default
         if self._last_data is None:
-            # Provide default values from config value_columns (set to 0.5)
             return {col: 0.5 for col in self.config.value_columns}
         return self._last_data
 
     async def run(self):
-        """Background task to continuously fetch data."""
         self._running = True
         while self._running:
             try:
@@ -277,12 +331,11 @@ class LiveDataFeed:
         self._running = False
 
 # ============================================================================
-# Enhanced TimeTickEngine
+# Enhanced TimeTickEngine (with MOPD)
 # ============================================================================
 class TimeTickEngine:
     """
-    Enhanced simulation driver with configurable data sources, interpolation,
-    checkpointing, metrics, and graceful shutdown.
+    Enhanced simulation driver with MOPD support for multi‑policy evaluation.
     """
 
     def __init__(self,
@@ -300,11 +353,9 @@ class TimeTickEngine:
         self.harvester = harvester
         self.translator = translator
 
-        # Validate translator
         if not (callable(translator) or hasattr(translator, 'translate_row')):
             raise ValueError("translator must be a callable or have a translate_row method")
 
-        # Load configuration
         if isinstance(config, dict):
             if PYDANTIC_AVAILABLE:
                 self.config = TimeTickConfig(**config)
@@ -313,7 +364,6 @@ class TimeTickEngine:
         elif isinstance(config, TimeTickConfig):
             self.config = config
         else:
-            # Default config (requires csv_path)
             self.config = TimeTickConfig(data_source="csv", csv_path="helium_data.csv")
 
         # Internal state
@@ -324,7 +374,11 @@ class TimeTickEngine:
         self._current_index = 0
         self._checkpoint_path = None
         self._live_feed: Optional[LiveDataFeed] = None
-        self._data_hash: Optional[str] = None  # hash of loaded data file
+        self._data_hash: Optional[str] = None
+
+        # MOPD state
+        self._mopd_results: Dict[str, Dict[str, Any]] = {}  # policy_id -> metrics summary
+        self._pareto_front: List[MOPDPoint] = []
 
         # Ensure checkpoint directory exists
         if self.config.enable_checkpointing:
@@ -332,13 +386,11 @@ class TimeTickEngine:
 
         logger.info("TimeTickEngine initialized with config: %s", self.config)
 
+    # ============================================================================
+    # Data Loading (unchanged)
+    # ============================================================================
     async def load_data(self, csv_path: Optional[str] = None):
-        """
-        Load and preprocess data from CSV.
-        If csv_path is provided, overrides the config.
-        """
         if self.config.data_source == 'live':
-            # Live data: no CSV loading, but we still need a feed
             self._live_feed = LiveDataFeed(self.config)
             logger.info("Live data feed initialized.")
             return
@@ -349,7 +401,6 @@ class TimeTickEngine:
 
         logger.info("Loading CSV from %s", path)
 
-        # Compute hash of the file for checkpoint validation
         try:
             with open(path, 'rb') as f:
                 self._data_hash = hashlib.md5(f.read()).hexdigest()
@@ -363,13 +414,11 @@ class TimeTickEngine:
             logger.error("Failed to read CSV: %s", e)
             raise
 
-        # Validate columns
         required = [self.config.date_column] + self.config.value_columns
         missing = [col for col in required if col not in df.columns]
         if missing:
             raise ValueError(f"Missing columns in CSV: {missing}")
 
-        # Parse dates with optional format
         try:
             if self.config.date_format:
                 df[self.config.date_column] = pd.to_datetime(df[self.config.date_column],
@@ -381,7 +430,6 @@ class TimeTickEngine:
 
         df = df.sort_values(self.config.date_column)
 
-        # Filter dates
         if self.config.start_date:
             start = pd.to_datetime(self.config.start_date)
             df = df[df[self.config.date_column] >= start]
@@ -389,19 +437,13 @@ class TimeTickEngine:
             end = pd.to_datetime(self.config.end_date)
             df = df[df[self.config.date_column] <= end]
 
-        # Store monthly data (might be daily or other frequency; we'll resample to daily)
         self.df_monthly = df
-
-        # Interpolate to daily
         self._interpolate_daily()
 
         logger.info("Loaded %d monthly rows, interpolated to %d daily ticks.",
                     len(self.df_monthly), len(self.daily_df))
 
     def _interpolate_daily(self):
-        """
-        Interpolate monthly data to daily using the configured method.
-        """
         if self.df_monthly.empty:
             logger.warning("No data after filtering; daily DataFrame will be empty.")
             self.daily_df = pd.DataFrame(columns=['date'] + self.config.value_columns)
@@ -414,7 +456,6 @@ class TimeTickEngine:
             freq='D'
         )
 
-        # Select only numeric columns for interpolation
         numeric_cols = [col for col in self.config.value_columns if col in df_monthly.columns]
 
         try:
@@ -423,7 +464,6 @@ class TimeTickEngine:
             elif self.config.interpolation_method == 'quadratic':
                 self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='quadratic')
             elif self.config.interpolation_method == 'spline':
-                # Spline may require scipy; fallback to linear if it fails
                 try:
                     self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='spline')
                 except Exception as e:
@@ -437,22 +477,19 @@ class TimeTickEngine:
             logger.error("Interpolation failed: %s", e)
             raise
 
-        # Reset index to have date as a column
         self.daily_df = self.daily_df.reset_index()
         self.daily_df.rename(columns={'index': 'date'}, inplace=True)
-
-        # Fill any remaining NaNs with forward fill
         self.daily_df = self.daily_df.fillna(method='ffill').fillna(method='bfill')
 
+    # ============================================================================
+    # Single Policy Simulation (original)
+    # ============================================================================
     async def run_simulation(self,
                              start_index: Optional[int] = None,
                              post_tick_callback: Optional[Callable[[int, pd.Series, Dict[str, Any]], Awaitable[None]]] = None):
         """
         Run the simulation over all daily ticks, optionally resuming from a checkpoint.
-
-        Args:
-            start_index: Resume from this index (overrides checkpoint).
-            post_tick_callback: Async function called after each tick with (index, row, result).
+        This runs a single policy (the current harvester configuration).
         """
         if self.config.data_source == 'csv' and self.daily_df is None:
             raise RuntimeError("Data not loaded. Call load_data() first.")
@@ -460,14 +497,12 @@ class TimeTickEngine:
         if start_index is not None:
             self._current_index = start_index
         else:
-            # Attempt to load checkpoint
             if self.config.enable_checkpointing:
                 self._load_checkpoint()
 
         self._stop_event.clear()
         self._running = True
 
-        # If live data, start background feed
         if self.config.data_source == 'live' and self._live_feed:
             live_task = asyncio.create_task(self._live_feed.run())
         else:
@@ -477,7 +512,6 @@ class TimeTickEngine:
 
         logger.info("Starting simulation from index %d", self._current_index)
 
-        # Optional progress bar for CSV
         pbar = None
         if TQDM_AVAILABLE and self.config.data_source == 'csv' and total_ticks:
             pbar = tqdm(total=total_ticks, initial=self._current_index, desc="Simulating")
@@ -492,10 +526,8 @@ class TimeTickEngine:
                     if pbar:
                         pbar.update(1)
                 else:
-                    # Live data: use latest from feed
                     if self._live_feed:
                         data = await self._live_feed.fetch()
-                        # Build a pseudo-row with date
                         row = pd.Series({'date': datetime.now()})
                         for k, v in data.items():
                             row[k] = v
@@ -503,22 +535,17 @@ class TimeTickEngine:
                         logger.error("No live data feed available.")
                         break
 
-                # Translate row to harvester input
                 env_data = self._translate_row(row)
                 if env_data is None:
-                    # Skip this tick
                     if self.config.data_source == 'csv':
                         self._current_index += 1
                     continue
 
-                # Run harvest cycle
                 result = await self.harvester.harvest_cycle(env_data)
 
-                # Record metrics
                 if self.config.metrics_enabled:
                     self.metrics.record(result)
 
-                # Optional callback
                 if post_tick_callback:
                     try:
                         if asyncio.iscoroutinefunction(post_tick_callback):
@@ -528,17 +555,14 @@ class TimeTickEngine:
                     except Exception as e:
                         logger.error("Post-tick callback failed: %s", e)
 
-                # Log every 30 days (for CSV)
                 if self.config.data_source == 'csv' and self._current_index % 30 == 0:
                     logger.info("Day %d: harvested %.2f Eco‑ATP",
                                 self._current_index, result.get('eco_atp_generated', 0))
 
-                # Save checkpoint
                 if self.config.enable_checkpointing and self.config.data_source == 'csv':
                     if self._current_index % self.config.checkpoint_interval == 0:
                         await self._save_checkpoint(self._current_index)
 
-                # Tick delay
                 await asyncio.sleep(self.config.tick_interval_seconds)
 
                 if self.config.data_source == 'csv':
@@ -547,7 +571,6 @@ class TimeTickEngine:
         except asyncio.CancelledError:
             logger.info("Simulation cancelled.")
             self._running = False
-            # Save final checkpoint
             if self.config.enable_checkpointing and self.config.data_source == 'csv':
                 await self._save_checkpoint(self._current_index)
             raise
@@ -570,31 +593,188 @@ class TimeTickEngine:
             logger.info("Simulation finished. Total harvested: %.2f", self.metrics.total_harvested)
 
     def stop(self):
-        """Request graceful stop of the simulation."""
         self._stop_event.set()
         self._running = False
         logger.info("Stop requested.")
 
     def _translate_row(self, row: pd.Series) -> Optional[Dict[str, float]]:
-        """
-        Translate a row of data into environmental data for the harvester.
-        Uses the translator provided at initialization.
-        """
         try:
             if callable(self.translator):
                 return self.translator(row)
             elif hasattr(self.translator, 'translate_row'):
                 return self.translator.translate_row(row)
             else:
-                # Fallback: raise error as translator is invalid
                 raise TypeError("translator is not a callable nor has translate_row method")
         except Exception as e:
             logger.error("Row translation failed: %s", e)
             return None
 
-    async def _save_checkpoint(self, current_index: int):
+    # ============================================================================
+    # MOPD Multi‑Policy Simulation (NEW)
+    # ============================================================================
+    async def run_multi_policy_simulation(
+        self,
+        policies: List[Policy],
+        post_policy_callback: Optional[Callable[[Policy, Dict[str, Any]], Awaitable[None]]] = None
+    ) -> List[MOPDPoint]:
+        """
+        Run a simulation for each policy, collect objectives, and generate the Pareto front.
+        The harvester's mode is set for each policy, and the simulation runs from start to end.
+
+        Args:
+            policies: List of Policy objects (each with a harvester_mode).
+            post_policy_callback: Optional callback after each policy completes.
+
+        Returns:
+            List of MOPDPoint objects representing the Pareto front.
+        """
+        if not self.config.mopd.enabled:
+            logger.warning("MOPD is disabled; multi‑policy simulation will not generate Pareto front.")
+            return []
+
+        if self.config.data_source == 'csv' and self.daily_df is None:
+            raise RuntimeError("Data not loaded. Call load_data() first.")
+
+        # Store original harvester mode to restore later
+        original_mode = getattr(self.harvester, 'mode', None)
+
+        self._mopd_results = {}
+        self._pareto_front = []
+
+        logger.info("Starting multi‑policy simulation with %d policies.", len(policies))
+
+        for policy in policies:
+            logger.info("Running policy: %s (mode: %s)", policy.policy_id, policy.harvester_mode)
+
+            # Set harvester mode
+            if hasattr(self.harvester, 'set_mode'):
+                self.harvester.set_mode(policy.harvester_mode)
+
+            # Reset metrics for this policy
+            self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
+
+            # Run simulation (from start, no checkpoint resuming)
+            try:
+                await self.run_simulation(start_index=0)
+            except Exception as e:
+                logger.error("Policy %s failed: %s", policy.policy_id, e)
+                continue
+
+            # Extract objectives from metrics
+            summary = self.metrics.get_summary()
+            # Compute carbon savings and helium savings (example: based on custom metrics)
+            carbon_saved = summary.get('avg_carbon_impact', 0.0)  # placeholder
+            helium_saved = summary.get('avg_helium_usage', 0.0)   # placeholder
+
+            # Build MOPDPoint
+            point = MOPDPoint(
+                policy_id=policy.policy_id,
+                harvester_mode=policy.harvester_mode,
+                total_harvested=summary['total_harvested'],
+                avg_efficiency=summary['avg_efficiency'],
+                carbon_saved=carbon_saved,
+                helium_saved=helium_saved,
+            )
+            self._mopd_results[policy.policy_id] = {
+                'metrics': summary,
+                'point': point,
+            }
+
+            if post_policy_callback:
+                try:
+                    if asyncio.iscoroutinefunction(post_policy_callback):
+                        await post_policy_callback(policy, summary)
+                    else:
+                        post_policy_callback(policy, summary)
+                except Exception as e:
+                    logger.error("Post‑policy callback failed: %s", e)
+
+        # Generate Pareto front from all points
+        points = [data['point'] for data in self._mopd_results.values()]
+        if points:
+            self._pareto_front = self._filter_pareto(points)
+            # Select best plan using MOPD weights
+            best_plan = self._select_best_from_pareto(self._pareto_front)
+            if best_plan:
+                logger.info("Best policy: %s with scalarised score %.3f",
+                            best_plan.policy_id, best_plan.scalarised_score)
+
+        # Restore harvester mode
+        if hasattr(self.harvester, 'set_mode') and original_mode is not None:
+            self.harvester.set_mode(original_mode)
+
+        # Save checkpoint with Pareto front
+        if self.config.enable_checkpointing:
+            await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
+
+        # Telemetry
+        if self.config.metrics_enabled:
+            logger.info("MOPD generation: %d policies, Pareto front size: %d",
+                        len(policies), len(self._pareto_front))
+
+        return self._pareto_front
+
+    # ---------- MOPD Helper Methods ----------
+    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
+        """Return non‑dominated points."""
+        if not points:
+            return []
+
+        pareto = []
+        objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
+        # For all objectives, higher is better.
+        for i, p_i in enumerate(points):
+            dominated = False
+            for j, p_j in enumerate(points):
+                if i == j:
+                    continue
+                a_vec = [getattr(p_i, k) for k in objective_keys]
+                b_vec = [getattr(p_j, k) for k in objective_keys]
+                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+        return pareto
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
+        """Select best point using scalarisation with objective weights."""
+        if not pareto_front:
+            return None
+
+        weights = self.config.mopd.objective_weights
+        objective_keys = list(weights.keys())
+
+        # Normalise objectives across Pareto front
+        max_vals = {}
+        min_vals = {}
+        for key in objective_keys:
+            vals = [getattr(p, key) for p in pareto_front]
+            max_vals[key] = max(vals)
+            min_vals[key] = min(vals)
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in objective_keys:
+                val = getattr(point, key)
+                # Higher is better, so normalise as (val - min) / range
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 0.0)
+                score += weight * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
+
+    # ============================================================================
+    # Checkpointing (Enhanced with MOPD)
+    # ============================================================================
+    async def _save_checkpoint(self, current_index: int, pareto_front: Optional[List[MOPDPoint]] = None):
         """Save current simulation state to a checkpoint file."""
-        # Attempt to get harvester state if available
         harvester_state = None
         try:
             if hasattr(self.harvester, 'get_harvesting_stats'):
@@ -603,15 +783,20 @@ class TimeTickEngine:
         except Exception as e:
             logger.warning("Could not retrieve harvester state for checkpoint: %s", e)
 
-        # Determine current date string
         if self.config.data_source == 'csv' and self.daily_df is not None and current_index < len(self.daily_df):
             current_date_str = self.daily_df.iloc[current_index]['date'].isoformat()
         else:
             current_date_str = datetime.now().isoformat()
 
-        # Serialize metrics
         metrics_summary = self.metrics.get_summary()
         metrics_data = self.metrics.to_dict()
+
+        # Serialise Pareto front if provided
+        pareto_front_dict = None
+        if pareto_front is not None:
+            pareto_front_dict = [p.to_dict() for p in pareto_front]
+        elif self._pareto_front:
+            pareto_front_dict = [p.to_dict() for p in self._pareto_front]
 
         state = SimulationState(
             current_index=current_index,
@@ -622,22 +807,22 @@ class TimeTickEngine:
             metrics_data=metrics_data,
             harvester_state=harvester_state,
             data_hash=self._data_hash,
-            timestamp=datetime.now().isoformat()
+            timestamp=datetime.now().isoformat(),
+            pareto_front=pareto_front_dict,
+            current_policy_id=None  # Not needed for single policy
         )
-        # Use timestamp in filename to keep versions
+
         filename = f"simulation_{self.harvester.__class__.__name__}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
         checkpoint_path = Path(self.config.checkpoint_dir) / filename
         try:
             with open(checkpoint_path, 'wb') as f:
                 pickle.dump(state, f)
             logger.debug("Checkpoint saved at index %d to %s", current_index, checkpoint_path)
-            # Clean up old checkpoints
             self._cleanup_old_checkpoints()
         except Exception as e:
             logger.warning("Failed to save checkpoint: %s", e)
 
     def _cleanup_old_checkpoints(self):
-        """Remove oldest checkpoint files beyond max_checkpoints."""
         pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
         checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
         if len(checkpoint_files) > self.config.max_checkpoints:
@@ -649,7 +834,6 @@ class TimeTickEngine:
                     logger.warning("Failed to remove old checkpoint %s: %s", old_file, e)
 
     def _load_checkpoint(self) -> bool:
-        """Load the latest checkpoint and validate compatibility."""
         pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
         checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
         if not checkpoint_files:
@@ -660,28 +844,29 @@ class TimeTickEngine:
             with open(latest, 'rb') as f:
                 state = pickle.load(f)
 
-            # Validate data hash (if present)
             if self._data_hash is not None and state.data_hash is not None:
                 if state.data_hash != self._data_hash:
                     logger.warning("Data hash mismatch: checkpoint may be incompatible. Resuming from start.")
                     return False
 
             self._current_index = state.current_index
-            # Restore metrics
             if state.metrics_data:
                 self.metrics = MetricsCollector.from_dict(state.metrics_data)
             else:
-                # Fallback to older checkpoint format
                 self.metrics.total_harvested = state.total_harvested
                 self.metrics.harvest_cycles = state.harvest_cycles
 
-            # Restore harvester state if possible
             if state.harvester_state and hasattr(self.harvester, 'restore_state'):
                 try:
                     self.harvester.restore_state(state.harvester_state)
                     logger.info("Restored harvester state from checkpoint.")
                 except Exception as e:
                     logger.warning("Failed to restore harvester state: %s", e)
+
+            # Restore Pareto front if present
+            if state.pareto_front:
+                self._pareto_front = [MOPDPoint.from_dict(p) for p in state.pareto_front]
+                logger.info("Restored Pareto front with %d points.", len(self._pareto_front))
 
             logger.info("Resumed from checkpoint: index %d, date %s, file %s",
                         state.current_index, state.current_date, latest)
@@ -690,18 +875,34 @@ class TimeTickEngine:
             logger.warning("Failed to load checkpoint: %s", e)
             return False
 
+    # ============================================================================
+    # Public API – MOPD Query Methods (NEW)
+    # ============================================================================
+    def get_pareto_front(self) -> List[MOPDPoint]:
+        """Return the current Pareto front (if any)."""
+        return self._pareto_front.copy()
+
+    def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.mopd.enabled:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "objective_weights": self.config.mopd.objective_weights,
+            "grid_resolution": self.config.mopd.grid_resolution,
+            "pareto_front_size": len(self._pareto_front),
+            "num_policies_evaluated": len(self._mopd_results),
+        }
+
+    # ============================================================================
+    # General Public Methods (unchanged)
+    # ============================================================================
     def get_metrics(self) -> Dict[str, Any]:
-        """Return current simulation metrics."""
         return self.metrics.get_summary()
 
     async def shutdown(self):
-        """
-        Gracefully shut down the simulation.
-        Saves a final checkpoint if enabled.
-        """
         if self._running:
             self.stop()
-            # Wait a moment for stop to propagate
             await asyncio.sleep(0.1)
         if self.config.enable_checkpointing and self._current_index > 0 and self.config.data_source == 'csv':
             await self._save_checkpoint(self._current_index)
@@ -713,23 +914,41 @@ class TimeTickEngine:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.shutdown()
 
+
 # ============================================================================
 # Example usage
 # ============================================================================
 if __name__ == "__main__":
     # Mock harvester
     class MockHarvester:
+        def __init__(self):
+            self.mode = "standard"
+
         async def harvest_cycle(self, env_data):
+            # Simulate different harvest based on mode
+            if self.mode == "aggressive":
+                multiplier = 1.5
+            elif self.mode == "conservative":
+                multiplier = 0.8
+            else:
+                multiplier = 1.0
             return {
-                'eco_atp_generated': env_data.get('helium_helium_supply', 0) * 10,
+                'eco_atp_generated': env_data.get('helium_supply', 0.5) * multiplier * 10,
                 'account_balance': 1000,
-                'efficiency': 0.85,
-                'mode': 'ADAPTIVE'
+                'efficiency': 0.85 * multiplier,
+                'mode': self.mode,
+                'carbon_impact': 0.1 * multiplier,
+                'helium_usage': env_data.get('helium_demand', 0.5) * multiplier
             }
+
         async def get_harvesting_stats(self):
-            return {'harvester_id': 'mock'}
+            return {'harvester_id': 'mock', 'mode': self.mode}
+
         def restore_state(self, state):
             pass
+
+        def set_mode(self, mode):
+            self.mode = mode
 
     # Mock translator
     class MockTranslator:
@@ -745,7 +964,7 @@ if __name__ == "__main__":
                 'helium_demand': row.get('helium_demand', 0.5)
             }
 
-    # Configuration (example)
+    # Configuration with MOPD enabled
     config = {
         'data_source': 'csv',
         'csv_path': 'helium_data.csv',
@@ -755,21 +974,41 @@ if __name__ == "__main__":
         'enable_checkpointing': True,
         'checkpoint_interval': 50,
         'metrics_enabled': True,
-        'max_checkpoints': 3
+        'max_checkpoints': 3,
+        'mopd': {
+            'enabled': True,
+            'objective_weights': {
+                'total_harvested': 0.3,
+                'avg_efficiency': 0.3,
+                'carbon_saved': 0.2,
+                'helium_saved': 0.2,
+            }
+        }
     }
 
     async def main():
         harvester = MockHarvester()
         translator = MockTranslator()
-
         engine = TimeTickEngine(harvester, translator, config)
 
         try:
             await engine.load_data()
-            await engine.run_simulation()
+
+            # Run single policy simulation (original)
+            # await engine.run_simulation()
+
+            # Run multi‑policy simulation with MOPD
+            policies = [
+                Policy(policy_id="standard", harvester_mode="standard"),
+                Policy(policy_id="aggressive", harvester_mode="aggressive"),
+                Policy(policy_id="conservative", harvester_mode="conservative"),
+            ]
+            pareto_front = await engine.run_multi_policy_simulation(policies)
+            print("Pareto front size:", len(pareto_front))
+            for p in pareto_front:
+                print(f"Policy {p.policy_id}: total_harvested={p.total_harvested:.2f}, avg_efficiency={p.avg_efficiency:.2f}, carbon_saved={p.carbon_saved:.2f}, helium_saved={p.helium_saved:.2f}, scalarised={p.scalarised_score:.3f}")
+
         finally:
             await engine.shutdown()
-
-        print("Final metrics:", engine.get_metrics())
 
     asyncio.run(main())
