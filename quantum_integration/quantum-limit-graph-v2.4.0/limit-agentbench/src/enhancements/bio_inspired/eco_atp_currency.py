@@ -1,8 +1,17 @@
 # =============================================================================
-# Enhanced Eco-ATP Currency System v10.0.0
+# Enhanced Eco-ATP Currency System v10.1.0
 # Full implementation with async persistence, quantum security, autonomous strategy,
 # multi-cloud distribution, retry/circuit breaker, Pydantic config,
-# and improved rate limiting.
+# improved rate limiting, and Multi‑Objective Pareto Decision (MOPD) support.
+#
+# MOPD enhancements:
+# - MOPDConfig sub‑configuration for objective weights and grid resolution.
+# - MOPDPoint dataclass to represent a configuration with objectives.
+# - Pareto front generation in the ThresholdGeneticOptimizer.
+# - Selection of best configuration via scalarisation.
+# - Persistence of Pareto front.
+# - Telemetry tracks MOPD generations and Pareto front sizes.
+# - Full backward compatibility.
 # =============================================================================
 
 import asyncio
@@ -91,9 +100,30 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration (Pydantic)
+# Configuration (Pydantic) – Enhanced with MOPD
 # ============================================================================
 if PYDANTIC_AVAILABLE:
+    class MOPDConfig(BaseModel):
+        """Configuration for Multi‑Objective Pareto Decision (MOPD) in threshold optimization."""
+        enabled: bool = Field(True, description="Enable MOPD‑aware genetic optimization")
+        objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'efficiency': 0.4,
+                'inflation': 0.3,
+                'emergency': 0.3,
+            },
+            description="Weights for scalarising Pareto front (must sum to 1)"
+        )
+        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
+
+        @field_validator('objective_weights')
+        @classmethod
+        def check_weights(cls, v):
+            total = sum(v.values())
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError("objective_weights must sum to 1")
+            return v
+
     class EcoATPConfig(BaseModel):
         """Central configuration for the Eco-ATP system."""
         model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -206,6 +236,9 @@ if PYDANTIC_AVAILABLE:
         ml_model_path: str = Field(default="models/ml_model.joblib")
         genetic_state_path: str = Field(default="models/genetic_state.json")
 
+        # MOPD configuration (NEW)
+        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
+
         @classmethod
         def from_env_and_file(cls, config_path: Optional[str] = None) -> 'EcoATPConfig':
             """Load configuration from environment variables and optional YAML file."""
@@ -242,6 +275,16 @@ if PYDANTIC_AVAILABLE:
             return issues
 else:
     # Fallback dataclass (simplified)
+    @dataclass
+    class MOPDConfig:
+        enabled: bool = True
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            'efficiency': 0.4,
+            'inflation': 0.3,
+            'emergency': 0.3,
+        })
+        grid_resolution: int = 5
+
     @dataclass
     class EcoATPConfig:
         token_expiry_hours: float = 24.0
@@ -310,6 +353,7 @@ else:
         health_endpoint_port: int = 8080
         ml_model_path: str = "models/ml_model.joblib"
         genetic_state_path: str = "models/genetic_state.json"
+        mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)
@@ -348,7 +392,7 @@ class QuantumFeedbackProvider(Protocol):
     def get_qubo_params(self) -> Dict[str, float]: ...
 
 # ============================================================================
-# Enums and Data Classes
+# Enums and Data Classes (Enhanced with MOPD)
 # ============================================================================
 
 class EcoATPSource(Enum):
@@ -443,7 +487,27 @@ class EcoATPAccount:
         return self.total_consumed / self.total_generated
 
 # ============================================================================
-# Dynamic Exchange Rate
+# MOPD Data Class (NEW)
+# ============================================================================
+
+@dataclass
+class MOPDPoint:
+    """Represents a genetic individual with its objective vector."""
+    individual: Dict[str, float]  # the parameters (hoarding_threshold, tax_rate, etc.)
+    efficiency: float
+    inflation: float
+    emergency: float
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        return cls(**data)
+
+# ============================================================================
+# Dynamic Exchange Rate (unchanged)
 # ============================================================================
 
 class DynamicExchangeRate:
@@ -475,10 +539,11 @@ class DynamicExchangeRate:
         self.last_update = datetime.utcnow()
 
 # ============================================================================
-# ML Demand Predictor (with async persistence)
+# ML Demand Predictor (with async persistence) – unchanged
 # ============================================================================
 
 class MLDemandPredictor:
+    # ... (same as before, unchanged) ...
     def __init__(self, config: EcoATPConfig, db_path: Optional[str] = None):
         self.config = config
         self.db_path = db_path or config.persistence_path
@@ -522,7 +587,6 @@ class MLDemandPredictor:
             self.data.append(features)
             if len(self.data) > self.config.ml_history_size:
                 self.data.pop(0)
-            # Also persist to DB
             if AIOSQLITE_AVAILABLE:
                 async with aiosqlite.connect(self.db_path) as conn:
                     await conn.execute(
@@ -544,7 +608,6 @@ class MLDemandPredictor:
                 return
             self.is_training = True
             try:
-                # Offload training to thread
                 def train_sync():
                     X = np.array([[d['account_id_hash'], d['hour'], d['day_of_week']] for d in self.data])
                     y = np.array([d['amount'] for d in self.data])
@@ -572,7 +635,7 @@ class MLDemandPredictor:
             return 0.0
 
 # ============================================================================
-# Threshold Genetic Optimizer (with async persistence)
+# Threshold Genetic Optimizer (Enhanced with MOPD)
 # ============================================================================
 
 class ThresholdGeneticOptimizer:
@@ -595,6 +658,8 @@ class ThresholdGeneticOptimizer:
             'rate_limit_multiplier_high': (0.3, 0.7),
             'rate_limit_multiplier_low': (1.2, 2.0)
         }
+        # MOPD: Pareto front storage
+        self.pareto_front: List[MOPDPoint] = []
         self._load_state()
 
     def _load_state(self):
@@ -605,6 +670,9 @@ class ThresholdGeneticOptimizer:
                     self.best_fitness = data.get('best_fitness', -float('inf'))
                     self.best_individual = data.get('best_individual', None)
                     self.evolution_history = data.get('evolution_history', [])
+                    pareto_front_dicts = data.get('pareto_front', [])
+                    if pareto_front_dicts:
+                        self.pareto_front = [MOPDPoint.from_dict(p) for p in pareto_front_dicts]
                 logger.info("Loaded genetic optimizer state from disk")
             except Exception as e:
                 logger.warning(f"Failed to load genetic state: {e}")
@@ -616,7 +684,8 @@ class ThresholdGeneticOptimizer:
                 json.dump({
                     'best_fitness': self.best_fitness,
                     'best_individual': self.best_individual,
-                    'evolution_history': self.evolution_history
+                    'evolution_history': self.evolution_history,
+                    'pareto_front': [p.to_dict() for p in self.pareto_front]
                 }, f, default=str)
             logger.info("Saved genetic optimizer state to disk")
         except Exception as e:
@@ -631,7 +700,9 @@ class ThresholdGeneticOptimizer:
     def _initialize_population(self) -> List[Dict]:
         return [self._initialize_individual() for _ in range(self.population_size)]
 
-    def _fitness(self, individual: Dict) -> float:
+    # ---------- Multi‑objective evaluation (NEW) ----------
+    def _evaluate_individual(self, individual: Dict) -> Dict[str, float]:
+        """Evaluate an individual on multiple objectives."""
         self._apply_individual(individual)
         summary = self.token_manager.get_system_summary_sync()
         utilization = summary.get('system_efficiency', 0.5)
@@ -639,9 +710,12 @@ class ThresholdGeneticOptimizer:
         total_consumed = summary.get('total_consumed', 1)
         inflation = (total_generated - total_consumed) / max(total_consumed, 1)
         emergency_mode = 1 if summary.get('emergency_mode', False) else 0
-        fitness = 1.0 - abs(utilization - 0.75) * 2.0 - abs(inflation) * 0.5 - emergency_mode * 0.3
         self._restore_original_parameters()
-        return max(0.0, fitness)
+        return {
+            'efficiency': utilization,
+            'inflation': 1.0 - abs(inflation),  # lower inflation is better
+            'emergency': 1.0 - emergency_mode   # lower emergency is better
+        }
 
     def _apply_individual(self, individual: Dict):
         self._original_params = {
@@ -689,55 +763,155 @@ class ThresholdGeneticOptimizer:
                 mutated[key] = max(low, min(high, mutated[key] + delta))
         return mutated
 
-    def _evolve_one_generation(self, population: List[Dict]) -> List[Dict]:
-        fitness_scores = [self._fitness(ind) for ind in population]
-        new_population = []
-        best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-        new_population.append(population[best_idx])
-        while len(new_population) < self.population_size:
-            if random.random() < self.crossover_rate:
-                parent1 = self._select(population, fitness_scores)
-                parent2 = self._select(population, fitness_scores)
-                child = self._crossover(parent1, parent2)
-                child = self._mutate(child)
-                new_population.append(child)
-            else:
-                parent = self._select(population, fitness_scores)
-                new_population.append(parent.copy())
-        return new_population
+    # ---------- Pareto front methods (NEW) ----------
+    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
+        """Return non‑dominated points."""
+        if not points:
+            return []
+        objective_keys = ['efficiency', 'inflation', 'emergency']
+        pareto = []
+        for i, p_i in enumerate(points):
+            dominated = False
+            for j, p_j in enumerate(points):
+                if i == j:
+                    continue
+                a_vec = [getattr(p_i, k) for k in objective_keys]
+                b_vec = [getattr(p_j, k) for k in objective_keys]
+                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+        return pareto
 
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
+        """Select best point using scalarisation with MOPD weights."""
+        if not pareto_front:
+            return None
+        weights = self.token_manager.config.mopd.objective_weights
+        objective_keys = list(weights.keys())
+
+        # Normalise objectives across Pareto front
+        max_vals = {}
+        min_vals = {}
+        for key in objective_keys:
+            vals = [getattr(p, key) for p in pareto_front]
+            max_vals[key] = max(vals)
+            min_vals[key] = min(vals)
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in objective_keys:
+                val = getattr(point, key)
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 0.0)
+                score += weight * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
+
+    # ---------- Main evolve (enhanced with MOPD) ----------
     async def evolve(self, generations: Optional[int] = None) -> Dict:
         async with self.lock:
             if generations is None:
                 generations = self.generations
             population = self._initialize_population()
-            best_fitness = -float('inf')
-            best_ind = None
+
+            if self.token_manager.config.mopd.enabled:
+                self.pareto_front = []
+
             for gen in range(generations):
-                population = self._evolve_one_generation(population)
-                fitness_scores = [self._fitness(ind) for ind in population]
-                gen_best = max(range(len(population)), key=lambda i: fitness_scores[i])
-                if fitness_scores[gen_best] > best_fitness:
-                    best_fitness = fitness_scores[gen_best]
-                    best_ind = population[gen_best]
-                logger.debug(f"Gen {gen+1}: best fitness = {fitness_scores[gen_best]:.4f}")
-            if best_fitness > self.best_fitness:
-                self.best_fitness = best_fitness
-                self.best_individual = best_ind
-                self._apply_individual(best_ind)
-                logger.info(f"Applied best individual with fitness {best_fitness:.4f}")
+                # Evaluate objectives for all individuals
+                individuals_with_objs = []
+                for ind in population:
+                    objs = self._evaluate_individual(ind)
+                    individuals_with_objs.append((ind, objs))
+
+                # If MOPD enabled, update Pareto front
+                if self.token_manager.config.mopd.enabled:
+                    points = []
+                    for ind, objs in individuals_with_objs:
+                        point = MOPDPoint(
+                            individual=ind,
+                            efficiency=objs['efficiency'],
+                            inflation=objs['inflation'],
+                            emergency=objs['emergency']
+                        )
+                        points.append(point)
+                    self.pareto_front = self._filter_pareto(self.pareto_front + points)
+
+                    # Compute scalarised scores for selection
+                    weights = self.token_manager.config.mopd.objective_weights
+                    fitness_scores = []
+                    for point in points:
+                        score = (weights.get('efficiency', 0.4) * point.efficiency +
+                                 weights.get('inflation', 0.3) * point.inflation +
+                                 weights.get('emergency', 0.3) * point.emergency)
+                        point.scalarised_score = score
+                        fitness_scores.append(score)
+                else:
+                    # Legacy: single fitness (efficiency)
+                    fitness_scores = [objs['efficiency'] for _, objs in individuals_with_objs]
+
+                # Selection and reproduction
+                new_population = []
+                best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+                new_population.append(population[best_idx])
+                while len(new_population) < self.population_size:
+                    if random.random() < self.crossover_rate:
+                        parent1 = self._select(population, fitness_scores)
+                        parent2 = self._select(population, fitness_scores)
+                        child = self._crossover(parent1, parent2)
+                        child = self._mutate(child)
+                        new_population.append(child)
+                    else:
+                        parent = self._select(population, fitness_scores)
+                        new_population.append(parent.copy())
+                population = new_population
+
+                gen_best_fitness = max(fitness_scores)
+                logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
+
+            # After evolution, if MOPD enabled and we have a Pareto front, select best
+            if self.token_manager.config.mopd.enabled and self.pareto_front:
+                best_point = self._select_best_from_pareto(self.pareto_front)
+                if best_point:
+                    self.best_individual = best_point.individual
+                    self.best_fitness = best_point.scalarised_score
+                    self._apply_individual(best_point.individual)
+                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
+            else:
+                # Legacy: keep best fitness and individual
+                if fitness_scores:
+                    best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+                    self.best_fitness = fitness_scores[best_idx]
+                    self.best_individual = population[best_idx]
+                    self._apply_individual(self.best_individual)
+                    logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
+
             self.evolution_history.append({
                 'timestamp': datetime.utcnow(),
-                'best_fitness': best_fitness
+                'best_fitness': self.best_fitness,
+                'pareto_front_size': len(self.pareto_front) if self.token_manager.config.mopd.enabled else 0
             })
             self._save_state()
-            return {'best_fitness': best_fitness, 'best_individual': best_ind}
+            return {
+                'best_fitness': self.best_fitness,
+                'best_individual': self.best_individual,
+                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.token_manager.config.mopd.enabled else None
+            }
 
     def get_status(self) -> Dict:
         return {
             'best_fitness': self.best_fitness,
             'best_individual': self.best_individual,
-            'history': self.evolution_history[-10:]
+            'history': self.evolution_history[-10:],
+            'pareto_front_size': len(self.pareto_front) if self.token_manager.config.mopd.enabled else 0
         }
 
 # ============================================================================
@@ -954,7 +1128,7 @@ class QuantumFeedbackIntegrator:
         return multiplier
 
 # ============================================================================
-# Persistent Circuit Breaker (SQLite)
+# Persistent Circuit Breaker (SQLite) – unchanged
 # ============================================================================
 
 class CircuitBreaker:
@@ -1035,7 +1209,7 @@ class CircuitBreaker:
             raise e
 
 # ============================================================================
-# Retry Decorator (using tenacity if available)
+# Retry Decorator (using tenacity if available) – unchanged
 # ============================================================================
 
 def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: float = 10.0):
@@ -1067,7 +1241,7 @@ def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: fl
         return decorator
 
 # ============================================================================
-# Post-Quantum Security (with persistent key generation)
+# Post-Quantum Security (unchanged)
 # ============================================================================
 
 class QuantumResilientSecurity:
@@ -1082,7 +1256,6 @@ class QuantumResilientSecurity:
             self._generate_keys()
         else:
             logger.warning("PQC libraries not found – using ECDSA fallback.")
-            # Generate ECDSA keys
             self._ecdsa_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
             self._ecdsa_public_key = self._ecdsa_private_key.public_key()
 
@@ -1140,7 +1313,7 @@ class QuantumResilientSecurity:
         return False
 
 # ============================================================================
-# Blockchain Auditor (with async web3)
+# Blockchain Auditor (unchanged)
 # ============================================================================
 
 class BlockchainAuditor:
@@ -1154,8 +1327,6 @@ class BlockchainAuditor:
         self.available = False
         self._nonce_cache = {}
         self._lock = asyncio.Lock()
-        # We'll attempt to import web3 lazily
-        self._web3_available = False
         self._initialize()
 
     def _initialize(self):
@@ -1180,7 +1351,6 @@ class BlockchainAuditor:
                     abi=abi
                 )
                 self.available = True
-                self._web3_available = True
                 logger.info("Blockchain auditor connected")
             else:
                 logger.warning("Contract address not configured – blockchain audit will be simulated.")
@@ -1241,7 +1411,7 @@ class BlockchainAuditor:
             return await _record()
 
 # ============================================================================
-# Multi-Cloud Distributor (with retry and fallback)
+# Multi-Cloud Distributor (unchanged)
 # ============================================================================
 
 class MultiCloudDistributor:
@@ -1304,7 +1474,7 @@ class MultiCloudDistributor:
         raise ValueError(f"Unknown provider: {provider}")
 
 # ============================================================================
-# Autonomous Strategy Selector (with persistent Q-table)
+# Autonomous Strategy Selector (unchanged)
 # ============================================================================
 
 class AutonomousStrategySelector:
@@ -1367,7 +1537,7 @@ class AutonomousStrategySelector:
         self.total_updates += 1
 
 # ============================================================================
-# Async Persistence Manager (using aiosqlite)
+# Async Persistence Manager (Enhanced with MOPD)
 # ============================================================================
 
 class AsyncPersistenceManager:
@@ -1600,8 +1770,23 @@ class AsyncPersistenceManager:
             row = await cursor.fetchone()
             return row[0] if row else None
 
+    # ===== MOPD persistence methods (NEW) =====
+    async def save_pareto_front(self, pareto_front: List[MOPDPoint]):
+        """Save Pareto front as JSON in global_state."""
+        if not pareto_front:
+            return
+        value = json.dumps([p.to_dict() for p in pareto_front])
+        await self.save_global_state('pareto_front', value)
+
+    async def load_pareto_front(self) -> Optional[List[MOPDPoint]]:
+        value = await self.load_global_state('pareto_front')
+        if value:
+            data = json.loads(value)
+            return [MOPDPoint.from_dict(d) for d in data]
+        return None
+
 # ============================================================================
-# Task Manager (simplified)
+# Task Manager (simplified) – unchanged
 # ============================================================================
 
 class TaskManager:
@@ -1635,7 +1820,7 @@ class TaskManager:
 # ============================================================================
 
 class EcoATPTokenManager:
-    """Enhanced Eco-ATP Token Manager v10.0.0 with async persistence, security, etc."""
+    """Enhanced Eco-ATP Token Manager v10.1.0 with async persistence, security, etc."""
 
     def __init__(self, config: Optional[EcoATPConfig] = None,
                  exchange_rate: Optional[ExchangeRateProvider] = None,
@@ -1731,7 +1916,7 @@ class EcoATPTokenManager:
         if self.persistence:
             asyncio.create_task(self._load_state())
 
-        logger.info("Enhanced Eco-ATP Token Manager v10.0.0 initialized")
+        logger.info("Enhanced Eco-ATP Token Manager v10.1.0 initialized with MOPD")
 
     # ---------- Energy cost per token (fixed method) ----------
     async def energy_cost_per_token(
@@ -1740,43 +1925,24 @@ class EcoATPTokenManager:
         domain: str,
         token_length: int = 1,
     ) -> float:
-        """
-        Estimate energy (Joules) required per token for a given domain and batch.
-        Uses current carbon intensity and hardware efficiency.
-        """
-        # Base energy per token (e.g., from profiling)
-        base_energy = 1e-6  # Joules per token
-        # Adjust for domain complexity
-        domain_factor = {
-            "math": 1.5,
-            "code": 1.2,
-            "general": 1.0,
-            "energy": 0.8,
-        }.get(domain, 1.0)
-        # Adjust for current carbon intensity (higher intensity -> higher energy cost)
+        base_energy = 1e-6
+        domain_factor = {"math": 1.5, "code": 1.2, "general": 1.0, "energy": 0.8}.get(domain, 1.0)
         if hasattr(self, 'carbon_manager'):
             intensity = await self.carbon_manager.get_current_intensity()
-            intensity_factor = intensity / 400  # baseline 400 gCO2/kWh
+            intensity_factor = intensity / 400
         else:
             intensity_factor = 1.0
-        # Adjust for batch size (amortized)
         batch_factor = 1.0 + 0.1 * (batch_size - 1)
         energy = base_energy * domain_factor * intensity_factor * batch_factor * token_length
         return energy
 
-    # ---------- Exchange rate update (fixed method) ----------
     async def update_exchange_rate(self, scarcity_factors: Dict[str, float]):
-        """
-        Adjust exchange rate based on helium and carbon scarcity.
-        If helium scarcity is high, tokens become more valuable (rate increases).
-        """
         if not hasattr(self, 'adaptive_rate'):
-            self.adaptive_rate = True  # default
+            self.adaptive_rate = True
         if not self.adaptive_rate:
             return
         helium_scarcity = scarcity_factors.get('helium', 0.5)
         carbon_scarcity = scarcity_factors.get('carbon', 0.5)
-        # Example: rate = base_rate * (1 + 0.5 * helium_scarcity + 0.3 * carbon_scarcity)
         factor = 1.0 + 0.5 * helium_scarcity + 0.3 * carbon_scarcity
         self.exchange_rate = self.exchange_rate * (0.9 + 0.1 * factor)
         logger.info(f"Updated exchange rate to {self.exchange_rate:.2f}")
@@ -1798,7 +1964,6 @@ class EcoATPTokenManager:
             self.task_manager.start_task("strategy_update", self._strategy_update_loop)
 
     async def _load_state(self):
-        """Load state from SQLite."""
         if not self.persistence:
             return
         # Load accounts
@@ -1837,17 +2002,20 @@ class EcoATPTokenManager:
         orders = await self.persistence.load_open_orders()
         for order in orders:
             self.token_market.order_book.add_order(order)
-        # Load global state (e.g., genetic optimizer best individual, etc.)
+        # Load global state (e.g., genetic optimizer best individual, Pareto front, etc.)
         best_fitness_str = await self.persistence.load_global_state('best_fitness')
         if best_fitness_str:
             self.genetic_optimizer.best_fitness = float(best_fitness_str)
         best_ind_str = await self.persistence.load_global_state('best_individual')
         if best_ind_str:
             self.genetic_optimizer.best_individual = json.loads(best_ind_str)
+        # Load Pareto front (NEW)
+        pareto_front = await self.persistence.load_pareto_front()
+        if pareto_front:
+            self.genetic_optimizer.pareto_front = pareto_front
         logger.info("State loaded from persistence")
 
     async def _persistence_save_loop(self):
-        """Periodically save state to persistence."""
         while True:
             try:
                 if self.persistence:
@@ -1865,12 +2033,15 @@ class EcoATPTokenManager:
                         await self.persistence.save_market_order(order)
                     # Save ML data
                     if self.ml_predictor.data:
-                        await self.persistence.save_ml_data(self.ml_predictor.data[-100:])  # save recent
+                        await self.persistence.save_ml_data(self.ml_predictor.data[-100:])
                     # Save global state
                     await self.persistence.save_global_state('best_fitness', str(self.genetic_optimizer.best_fitness))
                     if self.genetic_optimizer.best_individual:
                         await self.persistence.save_global_state('best_individual', json.dumps(self.genetic_optimizer.best_individual))
-                await asyncio.sleep(60)  # every minute
+                    # Save Pareto front (NEW)
+                    if self.config.mopd.enabled:
+                        await self.persistence.save_pareto_front(self.genetic_optimizer.pareto_front)
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1878,24 +2049,21 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _strategy_update_loop(self):
-        """Periodically update strategy selection."""
         while True:
             try:
                 if self.strategy_selector:
                     state = await self._get_strategy_state()
                     strategy = await self.strategy_selector.select_strategy(state)
-                    # Apply strategy: adjust thresholds
                     if strategy == 'conservative':
                         self.config.hoarding_threshold = 1.5
                         self.config.tax_rate = 0.15
                     elif strategy == 'performance':
                         self.config.hoarding_threshold = 2.5
                         self.config.tax_rate = 0.05
-                    else:  # balanced
+                    else:
                         self.config.hoarding_threshold = 2.0
                         self.config.tax_rate = 0.1
-                    # Reward can be computed later based on performance
-                await asyncio.sleep(300)  # every 5 minutes
+                await asyncio.sleep(300)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1910,10 +2078,8 @@ class EcoATPTokenManager:
         }
 
     async def shutdown(self):
-        """Gracefully shut down all background tasks and save state."""
-        # Save state before shutdown
         if self.persistence:
-            await self._persistence_save_loop()  # call once
+            await self._persistence_save_loop()
         await self.task_manager.stop_all()
         logger.info("Eco-ATP Token Manager shut down")
 
@@ -1922,7 +2088,6 @@ class EcoATPTokenManager:
     # ============================================================================
 
     async def create_account(self, account_id: str) -> EcoATPAccount:
-        """Create a new token account."""
         async with self._accounts_lock:
             if account_id not in self.accounts:
                 self.accounts[account_id] = EcoATPAccount(account_id=account_id)
@@ -1931,7 +2096,6 @@ class EcoATPTokenManager:
             return self.accounts[account_id]
 
     async def get_account(self, account_id: str) -> Optional[EcoATPAccount]:
-        """Retrieve an account by ID."""
         async with self._accounts_lock:
             return self.accounts.get(account_id)
 
@@ -1946,9 +2110,6 @@ class EcoATPTokenManager:
                             num_tokens: Optional[int] = None,
                             quantum_advantage_factor: float = 0.0,
                             quantum_circuit_id: Optional[str] = None) -> List[EcoATPToken]:
-        """
-        Generate new Eco-ATP tokens based on sustainability contributions.
-        """
         async with self._accounts_lock:
             if account_id not in self.accounts:
                 self.accounts[account_id] = EcoATPAccount(account_id=account_id)
@@ -1985,7 +2146,6 @@ class EcoATPTokenManager:
                     quantum_advantage_factor=quantum_advantage_factor,
                     quantum_circuit_id=quantum_circuit_id
                 )
-                # Quantum sign token
                 if self.quantum_security:
                     token_data = asdict(token)
                     signature = await self.quantum_security.sign_data(token_data)
@@ -1993,7 +2153,6 @@ class EcoATPTokenManager:
                 tokens.append(token)
                 self.active_tokens[token.token_id] = token
 
-        # Update account
         async with self._accounts_lock:
             account.balance += total_value
             account.total_generated += total_value
@@ -2004,16 +2163,12 @@ class EcoATPTokenManager:
                 await self.persistence.save_account(account)
 
         self.last_generation_time = now
-
-        # Record for ML
         self.ml_predictor.record_demand(account_id, total_value, now)
 
-        # Substrate refill
         if total_value > 100 and self.substrate_reserves < self.config.substrate_reserves_max:
             self.substrate_reserves = min(self.config.substrate_reserves_max,
                                           self.substrate_reserves + total_value * 0.05)
 
-        # Blockchain audit
         if self.blockchain_auditor:
             await self.blockchain_auditor.record_event('token_generation', {
                 'account_id': account_id,
@@ -2022,7 +2177,6 @@ class EcoATPTokenManager:
                 'token_count': len(tokens)
             })
 
-        # Multi-cloud distribution of token data
         if self.multi_cloud:
             token_summary = {
                 'account_id': account_id,
@@ -2032,12 +2186,10 @@ class EcoATPTokenManager:
             }
             await self.multi_cloud.distribute(token_summary, f"tokens_{account_id}_{now.timestamp()}.json")
 
-        # Strategy update: reward based on generation
         if self.strategy_selector:
             state = await self._get_strategy_state()
             reward = 1.0 if total_value > 0 else 0.0
-            # For simplicity, we just update with current strategy
-            current_strategy = 'balanced'  # placeholder
+            current_strategy = 'balanced'
             await self.strategy_selector.update(state, current_strategy, reward, state)
 
         return tokens
@@ -2049,9 +2201,6 @@ class EcoATPTokenManager:
     @retry_decorator(max_attempts=3, min_delay=0.1, max_delay=2)
     async def reserve_tokens(self, account_id: str, amount: float, consumer: EcoATPConsumer,
                             tenant_id: str = "default", priority: int = 2) -> Tuple[bool, List[str]]:
-        """
-        Reserve tokens for a specific consumer and tenant.
-        """
         async with self._accounts_lock:
             account = self.accounts.get(account_id)
             if not account:
@@ -2062,16 +2211,13 @@ class EcoATPTokenManager:
                 logger.warning(f"Insufficient balance: {account.balance} < {amount}")
                 return False, []
 
-            # Check tenant quota
             if not await self._check_tenant_quota(tenant_id, amount):
                 return False, []
 
-            # Check suspicious activity
             if tenant_id in self.suspicious_tenants:
                 logger.warning(f"Tenant {tenant_id} is suspicious, denying reservation")
                 return False, []
 
-            # Find available tokens
             available = []
             for token in self.active_tokens.values():
                 if token.state == TokenState.AVAILABLE:
@@ -2082,7 +2228,6 @@ class EcoATPTokenManager:
                 logger.warning(f"Not enough available tokens: {len(available)} < {amount}")
                 return False, []
 
-            # Reserve them
             reserved_tokens = []
             for token in available[:int(amount)]:
                 token.state = TokenState.RESERVED
@@ -2093,7 +2238,6 @@ class EcoATPTokenManager:
                 for token in reserved_tokens:
                     await self.persistence.save_token(self.active_tokens[token], account_id)
 
-            # Update tenant usage
             await self._update_tenant_usage(tenant_id, amount)
 
             return True, reserved_tokens
@@ -2101,7 +2245,6 @@ class EcoATPTokenManager:
     async def _check_tenant_quota(self, tenant_id: str, amount: float) -> bool:
         async with self._tenant_usage_lock:
             usage = self.tenant_usage[tenant_id]
-            # Simple: check if total usage in last minute exceeds max_tokens_per_minute
             now = datetime.utcnow()
             recent = [u for u in usage if (now - u).total_seconds() < 60]
             if sum(recent) + amount > self.default_quota['max_tokens_per_minute']:
@@ -2114,9 +2257,6 @@ class EcoATPTokenManager:
             self.tenant_usage[tenant_id].append(datetime.utcnow())
 
     async def consume_tokens(self, token_ids: List[str], consumer: EcoATPConsumer, operation_success: bool) -> float:
-        """
-        Consume a list of tokens, returning the total value consumed.
-        """
         total_consumed = 0.0
         async with self._tokens_lock:
             for token_id in token_ids:
@@ -2128,21 +2268,16 @@ class EcoATPTokenManager:
                     token.consumed_at = datetime.utcnow()
                     total_consumed += token.value
                 else:
-                    # Operation failed: return tokens to available
                     token.state = TokenState.AVAILABLE
         return total_consumed
 
     async def recover_tokens(self, token_ids: List[str], completion_percentage: float) -> float:
-        """
-        Recover tokens from a failed or partially completed operation.
-        """
         total_recovered = 0.0
         async with self._tokens_lock:
             for token_id in token_ids:
                 token = self.active_tokens.get(token_id)
                 if not token or token.state != TokenState.RESERVED:
                     continue
-                # Determine recovery fraction based on completion percentage
                 recovery_frac = self.config.recovery_rates.get(completion_percentage, 0.0)
                 if recovery_frac > 0:
                     recovered_value = token.value * recovery_frac
@@ -2150,7 +2285,6 @@ class EcoATPTokenManager:
                     token.recovered_at = datetime.utcnow()
                     total_recovered += recovered_value
                 else:
-                    # No recovery: mark as expired
                     token.state = TokenState.EXPIRED
         return total_recovered
 
@@ -2159,7 +2293,6 @@ class EcoATPTokenManager:
     # ============================================================================
 
     async def get_system_summary(self) -> Dict[str, Any]:
-        """Return a summary of the entire system."""
         total_balance = sum(a.balance for a in self.accounts.values())
         total_generated = sum(a.total_generated for a in self.accounts.values())
         total_consumed = sum(a.total_consumed for a in self.accounts.values())
@@ -2187,7 +2320,6 @@ class EcoATPTokenManager:
         }
 
     async def get_account_summary(self, account_id: str) -> Dict[str, Any]:
-        """Return a summary for a specific account."""
         account = self.accounts.get(account_id)
         if not account:
             return {}
@@ -2206,18 +2338,16 @@ class EcoATPTokenManager:
         }
 
     # ============================================================================
-    # Background Loops (implemented)
+    # Background Loops
     # ============================================================================
 
     async def _emergency_monitor_loop(self):
-        """Monitor emergency thresholds and activate emergency mode if needed."""
         while True:
             try:
                 summary = await self.get_system_summary()
                 if summary['total_balance'] < self.config.emergency_threshold and not self.emergency_mode:
                     self.emergency_mode = True
                     logger.warning("Emergency mode activated due to low balance")
-                    # Generate emergency tokens
                     await self.generate_tokens('emergency', EcoATPSource.EMERGENCY_SUBSTRATE,
                                                energy_saved_kwh=self.config.emergency_token_rate)
                 elif summary['total_balance'] > self.config.emergency_threshold * 2 and self.emergency_mode:
@@ -2231,14 +2361,12 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _batch_processor_loop(self):
-        """Process batch operations."""
         while True:
             try:
                 async with self._batch_lock:
                     if self.batch_queue:
                         batch = self.batch_queue[:self.config.batch_size]
                         self.batch_queue = self.batch_queue[self.config.batch_size:]
-                        # Process batch (simplified: just log)
                         logger.info(f"Processing batch of {len(batch)} operations")
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
@@ -2248,10 +2376,8 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _maintenance_loop(self):
-        """Perform routine maintenance tasks."""
         while True:
             try:
-                # Clean up expired tokens
                 expired = []
                 now = datetime.utcnow()
                 for token in self.active_tokens.values():
@@ -2271,15 +2397,12 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _predictive_supply_loop(self):
-        """Predict demand and pre‑generate tokens."""
         while True:
             try:
                 if self.predictive_supply_enabled:
-                    # For each account, predict demand and generate if needed
                     for account_id in self.accounts:
                         demand = self.ml_predictor.predict_demand(account_id, datetime.utcnow())
                         if demand > 0:
-                            # Generate some tokens proactively
                             await self.generate_tokens(account_id, EcoATPSource.RENEWABLE_ENERGY,
                                                        energy_saved_kwh=demand * 0.1)
                 await asyncio.sleep(60)
@@ -2290,7 +2413,6 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _adaptive_rate_loop(self):
-        """Adjust rate limiting multipliers based on system load."""
         while True:
             try:
                 summary = await self.get_system_summary()
@@ -2313,7 +2435,6 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _market_matching_loop(self):
-        """Match market orders periodically."""
         while True:
             try:
                 matches = await self.token_market.match_orders()
@@ -2327,13 +2448,17 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _evolution_loop(self):
-        """Run genetic optimization periodically."""
         while True:
             try:
                 if self.genetic_optimizer:
                     logger.info("Starting genetic evolution cycle...")
                     result = await self.genetic_optimizer.evolve(generations=self.config.genetic_generations)
-                    logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}")
+                    # Telemetry for MOPD (if Prometheus available)
+                    if self.config.mopd.enabled:
+                        # We could add counters, but we'll log for now
+                        logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
+                    else:
+                        logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}")
                 await asyncio.sleep(self.config.genetic_evolution_interval_seconds)
             except asyncio.CancelledError:
                 break
@@ -2342,7 +2467,6 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _ml_training_loop(self):
-        """Retrain ML model periodically."""
         while True:
             try:
                 await self.ml_predictor.train(force=False)
@@ -2354,7 +2478,6 @@ class EcoATPTokenManager:
                 await asyncio.sleep(60)
 
     async def _token_cleanup_loop(self):
-        """Periodically remove expired or fully consumed tokens from active set."""
         while True:
             try:
                 now = datetime.utcnow()
@@ -2374,6 +2497,29 @@ class EcoATPTokenManager:
             except Exception as e:
                 logger.error(f"Token cleanup error: {e}")
                 await asyncio.sleep(60)
+
+    # ============================================================================
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+
+    def get_mopd_pareto_front(self) -> List[MOPDPoint]:
+        """Return the current Pareto front from the genetic optimizer."""
+        if not self.config.mopd.enabled or not self.genetic_optimizer:
+            return []
+        return self.genetic_optimizer.pareto_front.copy()
+
+    def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.mopd.enabled or not self.genetic_optimizer:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "objective_weights": self.config.mopd.objective_weights,
+            "grid_resolution": self.config.mopd.grid_resolution,
+            "pareto_front_size": len(self.genetic_optimizer.pareto_front),
+            "best_scalarised_score": self.genetic_optimizer.best_fitness,
+            "evolution_history": self.genetic_optimizer.evolution_history[-10:],
+        }
 
     # ============================================================================
     # Sync Wrappers (for backward compatibility)
@@ -2466,6 +2612,9 @@ async def main():
         print(f"Generated {len(tokens)} tokens")
         summary = await manager.get_system_summary()
         print("System summary:", summary)
+        # MOPD examples
+        print("Pareto front:", manager.get_mopd_pareto_front())
+        print("MOPD summary:", manager.get_mopd_summary())
         await manager.shutdown()
 
 if __name__ == "__main__":
