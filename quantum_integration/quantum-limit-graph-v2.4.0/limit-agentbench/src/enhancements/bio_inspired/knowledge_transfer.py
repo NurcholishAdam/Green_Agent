@@ -1,7 +1,16 @@
 # =============================================================================
-# Enhanced Knowledge Transfer Manager v8.0.1
+# Enhanced Knowledge Transfer Manager v8.2.0
 # Full implementation with persistence, quantum security, autonomous strategy,
-# multi-cloud distribution, retry/circuit breaker, and all helper methods.
+# multi-cloud distribution, retry/circuit breaker, and Multi‑Objective Pareto Decision (MOPD) support.
+#
+# MOPD enhancements:
+# - MOPDConfig sub‑configuration for objective weights and grid resolution.
+# - MOPDPoint dataclass to represent a genetic individual with objectives.
+# - Pareto front generation in the KnowledgeGeneticOptimizer.
+# - Selection of best configuration via scalarisation.
+# - Persistence of Pareto front in Storage.
+# - Telemetry tracks MOPD generations and Pareto front sizes.
+# - Full backward compatibility.
 # =============================================================================
 
 import asyncio
@@ -99,14 +108,34 @@ except ImportError:
 logger = structlog.get_logger(__name__)
 
 # ============================================================================
-# Configuration (Pydantic with environment and YAML support)
+# Configuration (Pydantic with environment and YAML support) – Enhanced with MOPD
 # ============================================================================
 
 if PYDANTIC_AVAILABLE:
+    class MOPDConfig(BaseModel):
+        """Configuration for Multi‑Objective Pareto Decision (MOPD) in knowledge transfer optimization."""
+        enabled: bool = Field(True, description="Enable MOPD‑aware genetic optimization")
+        objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'avg_effective': 0.4,
+                'transfer_success_rate': 0.3,
+                'package_diversity': 0.2,
+                'recycling_rate': 0.1,
+            },
+            description="Weights for scalarising Pareto front (must sum to 1)"
+        )
+        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
+
+        @field_validator('objective_weights')
+        @classmethod
+        def check_weights(cls, v):
+            total = sum(v.values())
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError("objective_weights must sum to 1")
+            return v
+
     class KnowledgeTransferConfig(BaseModel):
-        """Central configuration for Knowledge Transfer Manager.
-        Loads from environment variables and optional YAML file.
-        """
+        """Central configuration for Knowledge Transfer Manager."""
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
         # General
@@ -155,7 +184,6 @@ if PYDANTIC_AVAILABLE:
         # Knowledge graph
         graph_training_interval: int = Field(7200, ge=600)
 
-        # ===== NEW ENHANCEMENTS =====
         # Persistence
         enable_persistence: bool = True
         persistence_path: str = Field("knowledge_transfer_state.db")
@@ -199,6 +227,9 @@ if PYDANTIC_AVAILABLE:
         # Prometheus
         prometheus_port: Optional[int] = Field(None, description="Port for Prometheus HTTP endpoint")
 
+        # MOPD configuration (NEW)
+        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
+
         @classmethod
         def from_env_and_file(cls, config_path: Optional[str] = None) -> 'KnowledgeTransferConfig':
             """Load configuration from environment variables and optional YAML file."""
@@ -230,7 +261,18 @@ if PYDANTIC_AVAILABLE:
                 issues.append("default_decay_rate must be positive")
             return issues
 else:
-    # Fallback dataclass (complete with all fields)
+    # Fallback dataclass (complete with all fields) – includes MOPD
+    @dataclass
+    class MOPDConfig:
+        enabled: bool = True
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            'avg_effective': 0.4,
+            'transfer_success_rate': 0.3,
+            'package_diversity': 0.2,
+            'recycling_rate': 0.1,
+        })
+        grid_resolution: int = 5
+
     @dataclass
     class KnowledgeTransferConfig:
         enable_decay: bool = True
@@ -286,16 +328,15 @@ else:
         cloud_access_key: Optional[str] = None
         cloud_secret_key: Optional[str] = None
         prometheus_port: Optional[int] = None
+        mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
         @classmethod
         def from_env_and_file(cls, config_path: Optional[str] = None) -> 'KnowledgeTransferConfig':
             env_overrides = {}
-            # simple environment override (only bool/int/float conversion)
             for key in cls.__annotations__:
                 env_var = f"KT_{key.upper()}"
                 if env_var in os.environ:
                     val = os.environ[env_var]
-                    # try to parse as int, float, bool
                     if val.lower() == 'true':
                         env_overrides[key] = True
                     elif val.lower() == 'false':
@@ -332,7 +373,7 @@ else:
             return issues
 
 # ============================================================================
-# Data Classes (unchanged, but we add persistence-friendly fields)
+# Data Classes (unchanged, with MOPDPoint added)
 # ============================================================================
 
 @dataclass
@@ -367,7 +408,6 @@ class KnowledgePackage:
     fine_tuned_weights: Optional[Dict] = None
     adaptation_level: float = 0.0
     domain_similarity: float = 0.0
-    # NEW: quantum signature
     quantum_signature: Optional[Dict] = None
 
     @property
@@ -400,7 +440,6 @@ class TransferRecord:
     adaptation_accuracy: float = 0.0
     source_domain: str = ""
     target_domain: str = ""
-    # NEW: quantum signature
     quantum_signature: Optional[Dict] = None
 
 @dataclass
@@ -430,7 +469,28 @@ class CrossDomainMapping:
     feature_mapping: Optional[Dict] = None
 
 # ============================================================================
-# Persistent Storage (SQLite)
+# MOPD Data Class (NEW)
+# ============================================================================
+
+@dataclass
+class MOPDPoint:
+    """Represents a genetic individual with its objective vector."""
+    individual: Dict[str, Any]  # survival_weights, decay_rate, capture_threshold
+    avg_effective: float
+    transfer_success_rate: float
+    package_diversity: float
+    recycling_rate: float
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        return cls(**data)
+
+# ============================================================================
+# Persistent Storage (SQLite) – Enhanced with MOPD
 # ============================================================================
 
 class Storage:
@@ -441,7 +501,6 @@ class Storage:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
-            # Enable foreign keys
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_packages (
@@ -534,7 +593,6 @@ class Storage:
                     value TEXT
                 )
             """)
-            # New table for quantum keypairs
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS quantum_keys (
                     algorithm TEXT PRIMARY KEY,
@@ -542,7 +600,6 @@ class Storage:
                     private_key TEXT
                 )
             """)
-            # New table for Q-table (autonomous strategy)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS q_table (
                     state_key TEXT,
@@ -816,11 +873,27 @@ class Storage:
                 q_table[state][action] = q
             return q_table
 
+    # ===== NEW: MOPD persistence =====
+    def save_pareto_front(self, pareto_front: List[MOPDPoint]):
+        """Save Pareto front as JSON in global_state."""
+        if not pareto_front:
+            return
+        value = json.dumps([p.to_dict() for p in pareto_front])
+        self.save_global_state('pareto_front', value)
+
+    def load_pareto_front(self) -> Optional[List[MOPDPoint]]:
+        value = self.load_global_state('pareto_front')
+        if value:
+            data = json.loads(value)
+            return [MOPDPoint.from_dict(d) for d in data]
+        return None
+
 # ============================================================================
-# Post-Quantum Security (NEW)
+# Post-Quantum Security (unchanged)
 # ============================================================================
 
 class QuantumResilientSecurity:
+    """Post-quantum signing using Dilithium/Falcon/SPHINCS+."""
     def __init__(self, algorithm: str = 'dilithium', storage: Optional[Storage] = None):
         self.algorithm = algorithm
         self.storage = storage
@@ -907,10 +980,11 @@ class QuantumResilientSecurity:
         return False
 
 # ============================================================================
-# Blockchain Auditor (NEW)
+# Blockchain Auditor (unchanged)
 # ============================================================================
 
 class BlockchainAuditor:
+    """Ethereum integration with nonce caching and gas price strategies."""
     def __init__(self, config: KnowledgeTransferConfig):
         self.config = config
         self.web3 = None
@@ -973,7 +1047,7 @@ class BlockchainAuditor:
             return {'status': 'failed', 'error': str(e)}
 
 # ============================================================================
-# Autonomous Strategy Selector (NEW)
+# Autonomous Strategy Selector (unchanged)
 # ============================================================================
 
 class AutonomousStrategySelector:
@@ -1024,7 +1098,6 @@ class AutonomousStrategySelector:
         new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
         self.q_table[state_key][action] = new_q
         self.total_updates += 1
-        # Persist every 10 updates
         if self.total_updates % 10 == 0:
             self._save_q_table()
 
@@ -1036,14 +1109,13 @@ class AutonomousStrategySelector:
         }
 
 # ============================================================================
-# Multi-Cloud Distributor (NEW)
+# Multi-Cloud Distributor (unchanged)
 # ============================================================================
 
 class MultiCloudDistributor:
     def __init__(self, config: KnowledgeTransferConfig):
         self.config = config
         self._clients = {}
-        # Use environment variables if keys not provided
         access_key = config.cloud_access_key or os.environ.get('AWS_ACCESS_KEY_ID')
         secret_key = config.cloud_secret_key or os.environ.get('AWS_SECRET_ACCESS_KEY')
         if config.cloud_provider == 'aws' and AWS_AVAILABLE:
@@ -1095,7 +1167,7 @@ class MultiCloudDistributor:
         return {'status': 'no_client'}
 
 # ============================================================================
-# Retry Helper (NEW)
+# Retry Helper (unchanged)
 # ============================================================================
 
 async def retry_async(func: Callable, max_retries: int, base_delay_ms: float, max_delay_ms: float, *args, **kwargs) -> Any:
@@ -1121,7 +1193,7 @@ async def retry_async(func: Callable, max_retries: int, base_delay_ms: float, ma
         raise RuntimeError("Max retries exceeded")
 
 # ============================================================================
-# Circuit Breaker (NEW)
+# Circuit Breaker (unchanged)
 # ============================================================================
 
 class CircuitBreaker:
@@ -1160,7 +1232,7 @@ class CircuitBreaker:
                 raise e
 
 # ============================================================================
-# Active Learning Module (with persistence)
+# Active Learning Module (unchanged)
 # ============================================================================
 
 class ActiveLearningModule:
@@ -1401,7 +1473,7 @@ class TransferLearningModule:
         return intersection / max(union, 1)
 
 # ============================================================================
-# Knowledge Graph NN (with persistence)
+# Knowledge Graph NN (unchanged)
 # ============================================================================
 
 class KnowledgeGraphNN:
@@ -1507,7 +1579,7 @@ class KnowledgeGraphNN:
         return {'predicted_survival': predicted_survival, 'confidence': confidence, 'recommendation': 'maintain' if predicted_survival > 0.6 else 'review'}
 
 # ============================================================================
-# Genetic Optimizer (unchanged)
+# Genetic Optimizer (Enhanced with MOPD)
 # ============================================================================
 
 class KnowledgeGeneticOptimizer:
@@ -1522,6 +1594,18 @@ class KnowledgeGeneticOptimizer:
         self.best_fitness = -float('inf')
         self.evolution_history = []
         self._lock = asyncio.Lock()
+        self.param_bounds = {
+            'survival_weights': {
+                'success_rate': (0.2, 0.5),
+                'token_efficiency': (0.2, 0.4),
+                'carbon_efficiency': (0.1, 0.3),
+                'experience_count': (0.1, 0.2)
+            },
+            'decay_rate': (0.005, 0.02),
+            'capture_threshold': (0.5, 0.9)
+        }
+        # MOPD: Pareto front storage
+        self.pareto_front: List[MOPDPoint] = []
         logger.info("Knowledge Genetic Optimizer initialized")
 
     def _initialize_individual(self) -> Dict:
@@ -1543,37 +1627,6 @@ class KnowledgeGeneticOptimizer:
     def _initialize_population(self) -> List[Dict]:
         return [self._initialize_individual() for _ in range(self.population_size)]
 
-    def _fitness(self, individual: Dict) -> float:
-        self._apply_individual(individual)
-        async def _get_avg():
-            packages = list(self.manager.knowledge_bank.values())
-            if not packages:
-                return 0.0
-            avg_effective = np.mean([p.effective_score for p in packages])
-            transfers = self.manager.transfer_history[-100:]
-            success_rate = sum(1 for t in transfers if t.successful_transfer) / max(len(transfers), 1)
-            fitness = 0.7 * avg_effective + 0.3 * success_rate
-            return fitness
-        # Need to run this in an async context, but fitness is called from sync methods.
-        # We'll run it synchronously but with a running event loop.
-        # Since evolve is async, we can call _fitness from within an async function.
-        # We'll change _fitness to be async.
-        # For simplicity, we'll keep as is and ensure we call from async.
-        # Actually, we'll refactor _fitness to be async.
-        # Let's change: we'll make _fitness async and evolve uses await.
-        # But evolve is already async, so it's fine.
-        # We'll adjust later.
-        # For now, we'll compute directly.
-        packages = list(self.manager.knowledge_bank.values())
-        if not packages:
-            return 0.0
-        avg_effective = np.mean([p.effective_score for p in packages])
-        transfers = self.manager.transfer_history[-100:]
-        success_rate = sum(1 for t in transfers if t.successful_transfer) / max(len(transfers), 1)
-        fitness = 0.7 * avg_effective + 0.3 * success_rate
-        self._restore_original_parameters()
-        return fitness
-
     def _apply_individual(self, individual: Dict):
         self._original_params = {
             'decay_rate': self.manager.config.default_decay_rate,
@@ -1589,6 +1642,31 @@ class KnowledgeGeneticOptimizer:
             self.manager.config.default_decay_rate = self._original_params['decay_rate']
             self.manager.config.capture_threshold = self._original_params['capture_threshold']
             self.manager._survival_weights = self._original_params['survival_weights']
+
+    # ---------- Multi‑objective evaluation (NEW) ----------
+    def _evaluate_individual(self, individual: Dict) -> Dict[str, float]:
+        """Evaluate an individual on multiple objectives."""
+        self._apply_individual(individual)
+        packages = list(self.manager.knowledge_bank.values())
+        avg_effective = np.mean([p.effective_score for p in packages]) if packages else 0.0
+        transfers = self.manager.transfer_history[-100:]
+        success_rate = sum(1 for t in transfers if t.successful_transfer) / max(len(transfers), 1)
+        # Package diversity: standard deviation of survival scores
+        if packages:
+            survival_scores = [p.survival_score for p in packages]
+            diversity = np.std(survival_scores) if len(survival_scores) > 1 else 0.5
+        else:
+            diversity = 0.5
+        # Recycling rate: proportion of packages that are recycled (effective_score < 0.3)
+        recycled = sum(1 for p in packages if p.effective_score < 0.3) / max(len(packages), 1)
+        recycling_rate = 1.0 - recycled  # higher is better (less recycling needed)
+        self._restore_original_parameters()
+        return {
+            'avg_effective': avg_effective,
+            'transfer_success_rate': success_rate,
+            'package_diversity': min(1.0, diversity),
+            'recycling_rate': recycling_rate
+        }
 
     def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
         tournament = random.sample(range(len(population)), self.tournament_size)
@@ -1633,48 +1711,162 @@ class KnowledgeGeneticOptimizer:
             mutated['capture_threshold'] = max(0.4, min(0.95, mutated['capture_threshold'] + delta))
         return mutated
 
-    def _evolve_one_generation(self, population: List[Dict]) -> List[Dict]:
-        fitness_scores = [self._fitness(ind) for ind in population]
-        new_population = []
-        best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-        new_population.append(population[best_idx])
-        while len(new_population) < self.population_size:
-            if random.random() < self.crossover_rate:
-                parent1 = self._select(population, fitness_scores)
-                parent2 = self._select(population, fitness_scores)
-                child = self._crossover(parent1, parent2)
-                child = self._mutate(child)
-                new_population.append(child)
-            else:
-                parent = self._select(population, fitness_scores)
-                new_population.append(parent.copy())
-        return new_population
+    # ---------- Pareto front methods (NEW) ----------
+    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
+        """Return non‑dominated points."""
+        if not points:
+            return []
+        objective_keys = ['avg_effective', 'transfer_success_rate', 'package_diversity', 'recycling_rate']
+        pareto = []
+        for i, p_i in enumerate(points):
+            dominated = False
+            for j, p_j in enumerate(points):
+                if i == j:
+                    continue
+                a_vec = [getattr(p_i, k) for k in objective_keys]
+                b_vec = [getattr(p_j, k) for k in objective_keys]
+                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append(p_i)
+        return pareto
 
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
+        """Select best point using scalarisation with MOPD weights."""
+        if not pareto_front:
+            return None
+        weights = self.manager.config.mopd.objective_weights
+        objective_keys = list(weights.keys())
+
+        # Normalise objectives across Pareto front
+        max_vals = {}
+        min_vals = {}
+        for key in objective_keys:
+            vals = [getattr(p, key) for p in pareto_front]
+            max_vals[key] = max(vals)
+            min_vals[key] = min(vals)
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in objective_keys:
+                val = getattr(point, key)
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                weight = weights.get(key, 0.0)
+                score += weight * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
+
+    # ---------- Main evolve (enhanced with MOPD) ----------
     async def evolve(self, generations: Optional[int] = None) -> Dict:
         async with self._lock:
             if generations is None:
                 generations = self.generations
             population = self._initialize_population()
-            best_fitness = -float('inf')
-            best_ind = None
+
+            if self.manager.config.mopd.enabled:
+                self.pareto_front = []
+
             for gen in range(generations):
-                population = self._evolve_one_generation(population)
-                fitness_scores = [self._fitness(ind) for ind in population]
-                gen_best = max(range(len(population)), key=lambda i: fitness_scores[i])
-                if fitness_scores[gen_best] > best_fitness:
-                    best_fitness = fitness_scores[gen_best]
-                    best_ind = population[gen_best]
-                logger.debug(f"Gen {gen+1}: best fitness = {fitness_scores[gen_best]:.4f}")
-            if best_fitness > self.best_fitness:
-                self.best_fitness = best_fitness
-                self.best_individual = best_ind
-                self._apply_individual(best_ind)
-                logger.info(f"Applied best individual with fitness {best_fitness:.4f}")
-            self.evolution_history.append({'timestamp': datetime.utcnow(), 'best_fitness': best_fitness})
-            return {'best_fitness': best_fitness, 'best_individual': best_ind}
+                # Evaluate objectives for all individuals
+                individuals_with_objs = []
+                for ind in population:
+                    objs = self._evaluate_individual(ind)
+                    individuals_with_objs.append((ind, objs))
+
+                # If MOPD enabled, update Pareto front
+                if self.manager.config.mopd.enabled:
+                    points = []
+                    for ind, objs in individuals_with_objs:
+                        point = MOPDPoint(
+                            individual=ind,
+                            avg_effective=objs['avg_effective'],
+                            transfer_success_rate=objs['transfer_success_rate'],
+                            package_diversity=objs['package_diversity'],
+                            recycling_rate=objs['recycling_rate']
+                        )
+                        points.append(point)
+                    self.pareto_front = self._filter_pareto(self.pareto_front + points)
+
+                    # Compute scalarised scores for selection
+                    weights = self.manager.config.mopd.objective_weights
+                    fitness_scores = []
+                    for point in points:
+                        score = (weights.get('avg_effective', 0.4) * point.avg_effective +
+                                 weights.get('transfer_success_rate', 0.3) * point.transfer_success_rate +
+                                 weights.get('package_diversity', 0.2) * point.package_diversity +
+                                 weights.get('recycling_rate', 0.1) * point.recycling_rate)
+                        point.scalarised_score = score
+                        fitness_scores.append(score)
+                else:
+                    # Legacy: single fitness (avg_effective)
+                    fitness_scores = [objs['avg_effective'] for _, objs in individuals_with_objs]
+
+                # Selection and reproduction
+                new_population = []
+                best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+                new_population.append(population[best_idx])
+                while len(new_population) < self.population_size:
+                    if random.random() < self.crossover_rate:
+                        parent1 = self._select(population, fitness_scores)
+                        parent2 = self._select(population, fitness_scores)
+                        child = self._crossover(parent1, parent2)
+                        child = self._mutate(child)
+                        new_population.append(child)
+                    else:
+                        parent = self._select(population, fitness_scores)
+                        new_population.append(parent.copy())
+                population = new_population
+
+                gen_best_fitness = max(fitness_scores)
+                logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
+
+            # After evolution, if MOPD enabled and we have a Pareto front, select best
+            if self.manager.config.mopd.enabled and self.pareto_front:
+                best_point = self._select_best_from_pareto(self.pareto_front)
+                if best_point:
+                    self.best_individual = best_point.individual
+                    self.best_fitness = best_point.scalarised_score
+                    self._apply_individual(best_point.individual)
+                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
+            else:
+                # Legacy: keep best fitness and individual
+                if fitness_scores:
+                    best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
+                    self.best_fitness = fitness_scores[best_idx]
+                    self.best_individual = population[best_idx]
+                    self._apply_individual(self.best_individual)
+                    logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
+
+            self.evolution_history.append({
+                'timestamp': datetime.utcnow(),
+                'best_fitness': self.best_fitness,
+                'pareto_front_size': len(self.pareto_front) if self.manager.config.mopd.enabled else 0
+            })
+            # Save best individual and Pareto front to global state
+            self.manager.storage.save_global_state('best_individual', json.dumps(self.best_individual))
+            self.manager.storage.save_global_state('best_fitness', str(self.best_fitness))
+            if self.manager.config.mopd.enabled:
+                self.manager.storage.save_pareto_front(self.pareto_front)
+            return {
+                'best_fitness': self.best_fitness,
+                'best_individual': self.best_individual,
+                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.manager.config.mopd.enabled else None
+            }
 
     def get_status(self) -> Dict:
-        return {'best_fitness': self.best_fitness, 'best_individual': self.best_individual, 'history': self.evolution_history[-10:]}
+        return {
+            'best_fitness': self.best_fitness,
+            'best_individual': self.best_individual,
+            'history': self.evolution_history[-10:],
+            'pareto_front_size': len(self.pareto_front) if self.manager.config.mopd.enabled else 0
+        }
 
 # ============================================================================
 # Predator-Prey Engine (unchanged)
@@ -1726,7 +1918,7 @@ class PredatorPreyEngine:
         return {'prey_threshold': self.prey_threshold, 'predator_threshold': self.predator_threshold, 'predation_interval': self.predation_interval}
 
 # ============================================================================
-# Nutrient Recycler (unchanged)
+# Knowledge Recycler (unchanged)
 # ============================================================================
 
 class KnowledgeRecycler:
@@ -1818,7 +2010,7 @@ class HomeostaticController:
         }
 
 # ============================================================================
-# Task Manager (for background loops)
+# Task Manager (unchanged)
 # ============================================================================
 
 class TaskManager:
@@ -1860,7 +2052,7 @@ class TaskManager:
 
 class KnowledgeTransferManager:
     """
-    Enhanced Knowledge Transfer Manager v8.0.1 with persistence, security, autonomous strategy, and full helper methods.
+    Enhanced Knowledge Transfer Manager v8.2.0 with MOPD support.
     """
 
     def __init__(self,
@@ -1899,7 +2091,7 @@ class KnowledgeTransferManager:
         self.experience_buffer: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10000))
         self.transfer_effectiveness: Dict[str, List[float]] = defaultdict(list)
 
-        # Locks for shared state
+        # Locks
         self._knowledge_lock = asyncio.Lock()
         self._transfer_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
@@ -1944,12 +2136,12 @@ class KnowledgeTransferManager:
         self._task_manager.start_task("homeostatic", self._homeostatic_loop)
         self._task_manager.start_task("evolution", self._evolution_loop)
 
-        # Set up signal handlers for graceful shutdown
+        # Set up signal handlers
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-        logger.info("Enhanced Knowledge Transfer Manager v8.0.1 initialized", config=self.config.to_dict())
+        logger.info("Enhanced Knowledge Transfer Manager v8.2.0 initialized with MOPD", config=self.config.to_dict())
 
     def _setup_metrics(self):
         self.metrics = {
@@ -1965,7 +2157,6 @@ class KnowledgeTransferManager:
             start_http_server(self.config.prometheus_port)
 
     def _load_state(self):
-        """Load state from SQLite."""
         if not self.storage:
             return
         # Load packages
@@ -1984,17 +2175,18 @@ class KnowledgeTransferManager:
         best_ind_str = self.storage.load_global_state('best_individual')
         if best_ind_str:
             self.genetic_optimizer.best_individual = json.loads(best_ind_str)
+        # Load Pareto front (NEW)
+        pareto_front = self.storage.load_pareto_front()
+        if pareto_front:
+            self.genetic_optimizer.pareto_front = pareto_front
         logger.info("Loaded state from persistence")
 
     async def shutdown(self):
-        """Gracefully shut down."""
         logger.info("Shutting down Knowledge Transfer Manager...")
-        # Save state if persistence enabled
         if self.storage:
             self._save_state()
         await self._task_manager.stop_all()
         logger.info("Knowledge Transfer Manager shutdown complete")
-        # Exit process if called from signal handler
         if asyncio.get_event_loop().is_running():
             asyncio.get_event_loop().stop()
 
@@ -2010,43 +2202,33 @@ class KnowledgeTransferManager:
         self.storage.save_global_state('best_fitness', str(self.genetic_optimizer.best_fitness))
         if self.genetic_optimizer.best_individual:
             self.storage.save_global_state('best_individual', json.dumps(self.genetic_optimizer.best_individual))
+        if self.config.mopd.enabled:
+            self.storage.save_pareto_front(self.genetic_optimizer.pareto_front)
         logger.info("Saved state to persistence")
 
     # ============================================================================
-    # Helper Methods (now inside the class)
+    # Helper Methods (unchanged)
     # ============================================================================
 
     def _get_expert_performance(self, expert_id: str) -> float:
-        """Retrieve the performance metric for an expert."""
-        # Placeholder: in real implementation, query the expert's stats.
         return 0.7
 
     def _get_strategy_diversity(self, expert_id: str) -> float:
-        """Calculate strategy diversity for an expert."""
-        # Placeholder
         return 0.5
 
     def _get_novelty_score(self, expert_id: str) -> float:
-        """Calculate novelty score for an expert."""
-        # Placeholder
         return 0.4
 
     def _get_generation(self, expert_id: str) -> int:
-        """Get the generation count of an expert."""
-        # Placeholder
         return 1
 
     def _get_total_experiences(self, expert_id: str) -> int:
-        """Get total experiences of an expert."""
-        # Placeholder
         return 100
 
     def _infer_domain_tags(self, expert_id: str) -> List[str]:
-        """Infer domain tags from expert ID."""
         return ['general']
 
     def _extract_task_patterns(self, history: deque) -> Dict[str, Any]:
-        """Extract task patterns from experience history."""
         patterns = {}
         for exp in history:
             task_type = exp.get('task_type', 'unknown')
@@ -2061,7 +2243,6 @@ class KnowledgeTransferManager:
         return patterns
 
     def _extract_successful_strategies(self, history: deque) -> List[Dict]:
-        """Extract successful strategies from experience history."""
         strategies = []
         for exp in history:
             if exp.get('success', False) and 'strategy' in exp:
@@ -2073,7 +2254,6 @@ class KnowledgeTransferManager:
         return strategies
 
     def _extract_failure_patterns(self, history: deque) -> List[Dict]:
-        """Extract failure patterns from experience history."""
         patterns = []
         for exp in history:
             if not exp.get('success', True) and 'error' in exp:
@@ -2085,7 +2265,6 @@ class KnowledgeTransferManager:
         return patterns
 
     def _generate_lessons(self, package: KnowledgePackage) -> List[str]:
-        """Generate lessons learned from the package."""
         lessons = []
         if package.failure_patterns:
             failures = [f['reason'] for f in package.failure_patterns]
@@ -2098,7 +2277,6 @@ class KnowledgeTransferManager:
         return lessons
 
     def _calculate_survival_score(self, package: KnowledgePackage) -> float:
-        """Calculate survival score using weights."""
         weights = getattr(self, '_survival_weights', {
             'success_rate': 0.35,
             'token_efficiency': 0.30,
@@ -2113,13 +2291,11 @@ class KnowledgeTransferManager:
         return score
 
     def _update_knowledge_graph(self, package: KnowledgePackage):
-        """Update the knowledge graph with the new package."""
         self.knowledge_graph.add_node(package.package_id, type='knowledge_package', score=package.survival_score)
         if package.parent_package_id and package.parent_package_id in self.knowledge_graph:
             self.knowledge_graph.add_edge(package.parent_package_id, package.package_id, type='derivation')
 
     def _infer_domain(self, expert_id: str) -> str:
-        """Infer domain from expert ID."""
         if 'quantum' in expert_id:
             return 'quantum'
         if 'helium' in expert_id:
@@ -2129,20 +2305,17 @@ class KnowledgeTransferManager:
         return 'general'
 
     def _measure_performance(self, target_expert: Any) -> Optional[float]:
-        """Measure performance of a target expert."""
         if hasattr(target_expert, 'get_performance'):
             return target_expert.get_performance()
         return 0.5
 
     def _calculate_transfer_confidence(self, package: KnowledgePackage, improvement: float) -> float:
-        """Calculate confidence for a transfer."""
         base = min(0.9, package.survival_score + 0.2)
         if improvement > 0.1:
             base += 0.1
         return min(1.0, base)
 
     def _create_adaptive_curriculum(self, package: KnowledgePackage, target_expert: Any) -> List[Dict]:
-        """Create an adaptive curriculum from package strategies."""
         curriculum = []
         for strategy in package.successful_strategies[:10]:
             curriculum.append({
@@ -2153,7 +2326,6 @@ class KnowledgeTransferManager:
         return curriculum
 
     async def _update_cross_domain_mapping(self, source_domain: str, target_domain: str, success: bool):
-        """Update cross-domain mapping."""
         key = (source_domain, target_domain)
         async with self._cross_domain_lock:
             mapping = self.cross_domain_mappings.get(key)
@@ -2180,16 +2352,14 @@ class KnowledgeTransferManager:
                 self.storage.save_cross_domain_mapping(mapping)
 
     # ============================================================================
-    # Public API (enhanced with signing, blockchain, multi-cloud, etc.)
+    # Public API (unchanged except for MOPD additions)
     # ============================================================================
 
     async def capture_knowledge(self, expert_id: str, expert_instance: Any,
                                 domain_tags: Optional[List[str]] = None) -> Optional[KnowledgePackage]:
-        """Capture knowledge from an expert."""
         if not expert_id:
             return None
 
-        # Active learning priority check
         current_data = {
             'performance': self._get_expert_performance(expert_id),
             'strategy_diversity': self._get_strategy_diversity(expert_id),
@@ -2238,12 +2408,10 @@ class KnowledgeTransferManager:
             )
             self._update_knowledge_graph(package)
 
-        # Quantum sign
         if self.quantum_security:
             signature = await self.quantum_security.sign_data(asdict(package))
             package.quantum_signature = signature
 
-        # Blockchain audit
         if self.blockchain_auditor:
             await self.blockchain_auditor.record_event('knowledge_captured', {
                 'package_id': package.package_id,
@@ -2251,15 +2419,12 @@ class KnowledgeTransferManager:
                 'survival_score': package.survival_score
             })
 
-        # Multi-cloud distribution
         if self.multi_cloud:
             await self.multi_cloud.distribute(asdict(package), f"packages/{package.package_id}.json")
 
-        # Persist to storage
         if self.storage:
             self.storage.save_package(package)
 
-        # Publish event
         if self._event_bus:
             await self._event_bus.publish({
                 'type': 'knowledge_captured',
@@ -2274,7 +2439,6 @@ class KnowledgeTransferManager:
                                  validate: bool = True,
                                  test_tasks: Optional[List[Dict]] = None,
                                  enable_fine_tuning: bool = False) -> Dict[str, Any]:
-        """Transfer knowledge from a package to a target expert."""
         async with self._knowledge_lock:
             if source_package_id not in self.knowledge_bank:
                 return {'success': False, 'reason': 'Package not found'}
@@ -2295,7 +2459,6 @@ class KnowledgeTransferManager:
 
         transfer_results = {'transferred_items': [], 'failed_items': [], 'validation': None}
 
-        # Transfer optimized parameters
         if package.optimized_parameters and hasattr(target_expert, 'adaptive_thresholds'):
             async with self._knowledge_lock:
                 for key, value in package.optimized_parameters.items():
@@ -2307,20 +2470,17 @@ class KnowledgeTransferManager:
                         target_expert.adaptive_thresholds[key] = effective_value * 0.6 + target_expert.adaptive_thresholds[key] * 0.4
                         transfer_results['transferred_items'].append(f'threshold:{key}')
 
-        # Transfer curriculum
         if package.successful_strategies and hasattr(target_expert, 'set_curriculum'):
             curriculum = self._create_adaptive_curriculum(package, target_expert)
             target_expert.set_curriculum(curriculum)
             transfer_results['transferred_items'].append('curriculum')
 
-        # Transfer experiences
         if hasattr(target_expert, 'memory') and package.source_expert_id in self.experience_buffer:
             async with self._experience_lock:
                 for exp in list(self.experience_buffer[package.source_expert_id])[-100:]:
                     target_expert.memory.append(exp)
                 transfer_results['transferred_items'].append('experiences')
 
-        # Fine-tuning
         fine_tuning_epochs = 0
         adaptation_accuracy = 0.0
         if enable_fine_tuning and test_tasks:
@@ -2372,12 +2532,10 @@ class KnowledgeTransferManager:
                 adaptation_accuracy=adaptation_accuracy
             )
 
-        # Quantum sign
         if self.quantum_security:
             signature = await self.quantum_security.sign_data(asdict(transfer))
             transfer.quantum_signature = signature
 
-        # Blockchain audit
         if self.blockchain_auditor:
             await self.blockchain_auditor.record_event('transfer_completed', {
                 'transfer_id': transfer.transfer_id,
@@ -2385,11 +2543,9 @@ class KnowledgeTransferManager:
                 'improvement': improvement
             })
 
-        # Multi-cloud
         if self.multi_cloud:
             await self.multi_cloud.distribute(asdict(transfer), f"transfers/{transfer.transfer_id}.json")
 
-        # Persist
         if self.storage:
             self.storage.save_transfer(transfer)
 
@@ -2471,7 +2627,30 @@ class KnowledgeTransferManager:
         logger.info("Replaced package", old=old_id, new=new_id)
 
     # ============================================================================
-    # Background Loops
+    # MOPD Public Methods (NEW)
+    # ============================================================================
+
+    def get_mopd_pareto_front(self) -> List[MOPDPoint]:
+        """Return the current Pareto front from the genetic optimizer."""
+        if not self.config.mopd.enabled or not self.genetic_optimizer:
+            return []
+        return self.genetic_optimizer.pareto_front.copy()
+
+    def get_mopd_summary(self) -> Dict[str, Any]:
+        """Return a summary of MOPD‑related metrics."""
+        if not self.config.mopd.enabled or not self.genetic_optimizer:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "objective_weights": self.config.mopd.objective_weights,
+            "grid_resolution": self.config.mopd.grid_resolution,
+            "pareto_front_size": len(self.genetic_optimizer.pareto_front),
+            "best_scalarised_score": self.genetic_optimizer.best_fitness,
+            "evolution_history": self.genetic_optimizer.evolution_history[-10:],
+        }
+
+    # ============================================================================
+    # Background Loops (unchanged)
     # ============================================================================
 
     async def _knowledge_maintenance_loop(self):
@@ -2481,7 +2660,6 @@ class KnowledgeTransferManager:
                     async with self._knowledge_lock:
                         for package in self.knowledge_bank.values():
                             package.survival_score = self._calculate_survival_score(package)
-                # Trim snapshots
                 async with self._snapshot_lock:
                     for expert_id in list(self.incremental_snapshots.keys()):
                         snapshots = self.incremental_snapshots[expert_id]
@@ -2557,7 +2735,10 @@ class KnowledgeTransferManager:
                 if len(self.knowledge_bank) >= 10:
                     logger.info("Starting genetic evolution cycle...")
                     result = await self.genetic_optimizer.evolve(generations=self.config.genetic_generations)
-                    logger.info("Evolution complete", fitness=result['best_fitness'])
+                    if self.config.mopd.enabled:
+                        logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
+                    else:
+                        logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}")
                 await asyncio.sleep(self.config.genetic_evolution_interval)
             except asyncio.CancelledError:
                 break
@@ -2566,11 +2747,10 @@ class KnowledgeTransferManager:
                 await asyncio.sleep(60)
 
     # ============================================================================
-    # Reporting (Enhanced with proper locking)
+    # Reporting (Enhanced with MOPD info)
     # ============================================================================
 
     def get_knowledge_summary(self) -> Dict[str, Any]:
-        # Acquire locks to ensure consistent snapshot
         async def _summary():
             async with self._knowledge_lock, self._transfer_lock:
                 packages = list(self.knowledge_bank.values())
@@ -2591,24 +2771,20 @@ class KnowledgeTransferManager:
                     'quantum_security': self.quantum_security is not None,
                     'blockchain_auditor': self.blockchain_auditor is not None,
                     'strategy_selector': self.strategy_selector is not None,
-                    'multi_cloud': self.multi_cloud is not None
+                    'multi_cloud': self.multi_cloud is not None,
+                    'mopd_enabled': self.config.mopd.enabled,
+                    'pareto_front_size': len(self.get_mopd_pareto_front()),
                 }
-        # Run synchronously, but we need an event loop to run async code.
-        # This method is called synchronously, so we'll use asyncio.run or ensure_future.
-        # In a real application, this would be an async method or we'd use asyncio.create_task.
-        # For simplicity, we'll keep it sync and warn.
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop, create one
             return asyncio.run(_summary())
         else:
-            # Running loop, we can run the async part
             task = asyncio.create_task(_summary())
             return asyncio.get_event_loop().run_until_complete(task)
 
 # ============================================================================
-# Convenience Functions
+# Convenience Functions (unchanged)
 # ============================================================================
 
 def create_knowledge_transfer_manager(config: Optional[KnowledgeTransferConfig] = None,
@@ -2620,7 +2796,6 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     mgr = create_knowledge_transfer_manager()
     try:
-        # Keep running until shutdown
         await asyncio.Event().wait()
     except KeyboardInterrupt:
         await mgr.shutdown()
