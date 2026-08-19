@@ -17,6 +17,15 @@ ENHANCEMENTS OVER v16.0.0:
 8. Refactored monolithic manager into smaller managers.
 9. OpenTelemetry integration (if available).
 10. Removed stale stubs and improved fallback mechanisms.
+
+NEW IN v17.0.0+ (ENHANCED WITH bio_inspired, moe_system, MODP):
+- Adaptive verification strategy selection using ContextualBandit.
+- Multi‑objective decision making via ParetoOptimizer (MODP).
+- Context‑aware routing using ExpertRouter (MoE).
+- Bio‑inspired evolution of verification strategies via GeneticPolicyGenerator.
+- Feedback loop for continuous online learning.
+- Periodic strategy evolution in background tasks.
+- New API endpoints for optimization and feedback.
 """
 
 import asyncio
@@ -192,6 +201,38 @@ try:
 except ImportError:
     SUSTAINABILITY_MODULES_AVAILABLE = False
 
+# =============================================================================
+# ENHANCED MODULES IMPORTS (with graceful fallback)
+# =============================================================================
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator
+    from enhancements.moe_system import ExpertRouter
+    from enhancements.MODP import ParetoOptimizer
+    from enhancements.contextual_bandit import ContextualBandit
+    ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+    # Fallback stubs
+    class GeneticPolicyGenerator:
+        def __init__(self, *args, **kwargs): pass
+        def evolve(self, population, fitness_fn, generations=10, population_size=20):
+            return population[0] if population else {}
+    class ExpertRouter:
+        def __init__(self, *args, **kwargs): pass
+        def encode(self, context): return [0.0]*5
+        def select(self, encoded): return "ethereum_zk"
+    class ParetoOptimizer:
+        def __init__(self, *args, **kwargs): pass
+        def evaluate(self, objectives, weights):
+            return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
+    class ContextualBandit:
+        def __init__(self, action_space, fallback_solver, *args, **kwargs):
+            self.actions = action_space
+        def select_action(self, context):
+            return self.actions[0], 0.0, "fallback"
+        def update(self, context, action, reward): pass
+        def seed_safe_policy(self, context, policy): pass
+
 # -----------------------------------------------------------------------------
 # Configuration & Logging
 # -----------------------------------------------------------------------------
@@ -275,7 +316,7 @@ DATA_VERSION = 17
 CARBON_INTENSITY_API_URL = "https://api.electricitymap.org/v3/carbon-intensity"
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION (Grouped sub-models)
+# CONFIGURATION (Grouped sub-models) – extended with optimizer settings
 # -----------------------------------------------------------------------------
 if PYDANTIC_AVAILABLE:
     class DatabaseConfig(BaseModel):
@@ -339,6 +380,20 @@ if PYDANTIC_AVAILABLE:
                 raise ValueError(f'LOG_LEVEL must be one of {allowed}')
             return v.upper()
 
+    class OptimizerConfig(BaseModel):
+        modp_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'carbon': 0.3,
+                'gas': 0.2,
+                'latency': 0.2,
+                'certainty': 0.3,
+            }
+        )
+        bandit_min_trials: int = Field(5, ge=1)
+        bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
+        bio_generations: int = Field(10, ge=1)
+        bio_population_size: int = Field(20, ge=2)
+
     class VerificationConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix='VERIFICATION_', case_sensitive=False)
 
@@ -352,6 +407,7 @@ if PYDANTIC_AVAILABLE:
         api: APIConfig = Field(default_factory=APIConfig)
         carbon: CarbonConfig = Field(default_factory=CarbonConfig)
         zk: ZKConfig = Field(default_factory=ZKConfig)
+        optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
 
         master_key: str = Field('', description='Hex string of master key for PQC')
 
@@ -378,6 +434,14 @@ else:
         data_retention_days: int = 365
         log_level: str = 'INFO'
         data_version: int = 17
+
+    @dataclass
+    class OptimizerConfig:
+        modp_weights: Dict[str, float] = field(default_factory=lambda: {'carbon':0.3, 'gas':0.2, 'latency':0.2, 'certainty':0.3})
+        bandit_min_trials: int = 5
+        bandit_confidence_threshold: float = 0.6
+        bio_generations: int = 10
+        bio_population_size: int = 20
 
     @dataclass
     class DatabaseConfig:
@@ -442,6 +506,7 @@ else:
         api: APIConfig = field(default_factory=APIConfig)
         carbon: CarbonConfig = field(default_factory=CarbonConfig)
         zk: ZKConfig = field(default_factory=ZKConfig)
+        optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
         master_key: str = ''
 
         def get_master_key_bytes(self) -> bytes:
@@ -828,6 +893,144 @@ class MultiCloudVerificationDistribution(ICloudDistributor):
     pass
 
 # -----------------------------------------------------------------------------
+# ENHANCED AUTONOMOUS VERIFICATION OPTIMIZER (replaces stub)
+# -----------------------------------------------------------------------------
+class AutonomousVerificationOptimizer:
+    """
+    Adaptive optimizer for verification strategies using ContextualBandit,
+    ParetoOptimizer, ExpertRouter, and GeneticPolicyGenerator.
+    """
+    def __init__(self, config: VerificationConfig, storage: IVerificationStorage):
+        self.config = config
+        self.storage = storage
+        self._lock = asyncio.Lock()
+
+        # Enhanced modules
+        self.modp = ParetoOptimizer() if ENHANCEMENTS_AVAILABLE else None
+        self.moe = ExpertRouter() if ENHANCEMENTS_AVAILABLE else None
+        self.bio = GeneticPolicyGenerator() if ENHANCEMENTS_AVAILABLE else None
+
+        # Initial action space (verification strategies)
+        self.action_space = [
+            {"name": "ethereum_zk", "params": {"chain": "ethereum", "proof": "groth16"}},
+            {"name": "polygon_plonk", "params": {"chain": "polygon", "proof": "plonk"}},
+            {"name": "arbitrum_stark", "params": {"chain": "arbitrum", "proof": "stark"}},
+            {"name": "optimism_zk", "params": {"chain": "optimism", "proof": "zk"}},
+            {"name": "ethereum_standard", "params": {"chain": "ethereum", "proof": "none"}},
+        ]
+
+        # Bandit fallback
+        def fallback(context):
+            return {"name": "ethereum_zk", "params": {"chain": "ethereum", "proof": "groth16"}}
+
+        self.bandit = ContextualBandit(
+            action_space=self.action_space,
+            fallback_solver=fallback,
+            min_trials_before_bandit=config.optimizer.bandit_min_trials,
+            confidence_threshold=config.optimizer.bandit_confidence_threshold,
+        ) if ENHANCEMENTS_AVAILABLE else None
+
+        # State for learning
+        self.recent_rewards = deque(maxlen=100)
+        self._load_state()
+
+    async def _load_state(self):
+        """Load bandit and MODP state from storage (if persistent)."""
+        # In production, we'd query optimization_history or a dedicated state table.
+        pass
+
+    async def _save_state(self):
+        pass
+
+    async def select_strategy(self, context: Dict) -> Dict:
+        """
+        Select the best verification strategy using the bandit (or fallback).
+        """
+        if not self.bandit:
+            return self._fallback_strategy(context)
+
+        # Encode context using MoE (if available)
+        encoded_context = context
+        if self.moe:
+            encoded_context = self.moe.encode(context)
+
+        # Select via bandit
+        strategy, confidence, source = self.bandit.select_action(encoded_context)
+        if strategy is None:
+            strategy = self._fallback_strategy(context)
+
+        # Compute MODP utility (to be used as reward after execution)
+        # We'll compute it from the current context (e.g., carbon intensity, gas price, latency)
+        objectives = {
+            "carbon": context.get("carbon_intensity", 400) / 1000,
+            "gas": context.get("gas_price_gwei", 50) / 200,
+            "latency": context.get("latency_estimate", 0.5),
+            "certainty": context.get("certainty_desired", 0.9),
+        }
+        utility = self.modp.evaluate(objectives, self.config.optimizer.modp_weights) if self.modp else 0.0
+
+        result = {
+            'strategy': strategy,
+            'confidence': confidence,
+            'source': source,
+            'utility': utility,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        # Store in optimization_history (if we have storage)
+        # self.storage.save_optimization(strategy['name'], result)
+
+        AUTONOMOUS_OPTIMIZATIONS.labels(strategy=strategy['name'], status='selected').inc()
+        return result
+
+    async def update_feedback(self, context: Dict, strategy: Dict, reward: float):
+        """
+        Update bandit with actual outcome.
+        """
+        if self.bandit:
+            self.bandit.update(context, strategy, reward)
+            self.recent_rewards.append(reward)
+
+        # Bio‑inspired expansion: if rewards are consistently low, evolve new strategies
+        if len(self.recent_rewards) > 20 and np.mean(self.recent_rewards) < 0.3 and self.bio:
+            new_strategies = await self.evolve_strategies()
+            if new_strategies:
+                for s in new_strategies:
+                    if s not in self.action_space:
+                        self.action_space.append(s)
+                        self.bandit.actions = self.action_space
+                logger.info("Bio‑inspired expansion: added new strategies.")
+
+    async def evolve_strategies(self) -> List[Dict]:
+        """
+        Generate new verification strategies using bio‑inspired evolution.
+        """
+        if not self.bio:
+            return []
+        # Use a fitness function based on recent rewards
+        def fitness(policy):
+            # In practice, evaluate policy on historical data.
+            return np.mean(self.recent_rewards) if self.recent_rewards else 0.5
+
+        new_strategies = self.bio.evolve(
+            population=self.action_space,
+            fitness_fn=fitness,
+            generations=self.config.optimizer.bio_generations,
+            population_size=self.config.optimizer.bio_population_size,
+        )
+        return new_strategies
+
+    def _fallback_strategy(self, context) -> Dict:
+        return {"name": "ethereum_zk", "params": {"chain": "ethereum", "proof": "groth16"}}
+
+    def get_optimization_stats(self) -> Dict:
+        return {
+            'total_optimizations': 0,  # would fetch from storage
+            'strategies': [s['name'] for s in self.action_space],
+            'recent_rewards': list(self.recent_rewards),
+        }
+
+# -----------------------------------------------------------------------------
 # ENHANCED VERIFICATION MANAGER v17.0.0 with Dependency Injection
 # -----------------------------------------------------------------------------
 class EnhancedVerificationManagerV17:
@@ -848,9 +1051,9 @@ class EnhancedVerificationManagerV17:
         self.multi_chain = multi_chain
         self.cloud_distributor = cloud_distributor
 
-        # Other components (some may be internal)
+        # Other components
         self.quantum_security = QuantumResilientVerificationSecurity(storage)
-        self.autonomous_optimizer = AutonomousVerificationOptimizer(storage, self.state)
+        self.autonomous_optimizer = AutonomousVerificationOptimizer(config, storage)  # Enhanced!
         self.monitor = RealTimeVerificationMonitor(config)
         self.dashboard = VerificationAnalyticsDashboard()
         self.health_scorer = VerificationHealthScorer()
@@ -881,6 +1084,7 @@ class EnhancedVerificationManagerV17:
         logger.info("  ✅ TaskManager for background task supervision.")
         logger.info("  ✅ Database migrations and schema versioning.")
         logger.info("  ✅ Grouped configuration.")
+        logger.info("  ✅ Enhanced AutonomousVerificationOptimizer with ContextualBandit, MODP, MoE, and Bio‑inspired evolution.")
 
     def _register_background_tasks(self):
         self.task_manager.register_task("health_check", self._health_check_loop)
@@ -892,6 +1096,8 @@ class EnhancedVerificationManagerV17:
         self.task_manager.register_task("blockchain_integrity", self._blockchain_integrity_loop)
         self.task_manager.register_task("auto_optimize", self._auto_optimize_loop)
         self.task_manager.register_task("cloud_sync", self._cloud_sync_loop)
+        # New task: evolve strategies periodically
+        self.task_manager.register_task("evolve_strategies", self._evolve_strategies_loop)
 
     async def start(self):
         self._running = True
@@ -920,7 +1126,27 @@ class EnhancedVerificationManagerV17:
                 logger.error(f"Cleanup error: {e}")
                 await asyncio.sleep(3600)
 
-    # ... other loops similarly
+    async def _auto_optimize_loop(self):
+        """Background task to periodically re-optimize strategy selection (if needed)."""
+        while not self.task_manager.shutdown_event.is_set():
+            try:
+                # This could trigger re-evaluation of current strategies
+                await asyncio.sleep(600)
+            except Exception as e:
+                logger.error(f"Auto optimize error: {e}")
+                await asyncio.sleep(60)
+
+    async def _evolve_strategies_loop(self):
+        """Periodically trigger bio‑inspired evolution of verification strategies."""
+        while not self.task_manager.shutdown_event.is_set():
+            await asyncio.sleep(3600)  # every hour
+            try:
+                if ENHANCEMENTS_AVAILABLE and self.autonomous_optimizer.bio:
+                    new_strategies = await self.autonomous_optimizer.evolve_strategies()
+                    if new_strategies:
+                        logger.info(f"Evolved {len(new_strategies)} new verification strategies.")
+            except Exception as e:
+                logger.error(f"Evolution loop error: {e}")
 
     async def _process_queue(self):
         while self._running:
@@ -959,6 +1185,15 @@ class EnhancedVerificationManagerV17:
             'future': future
         })
         return await future
+
+    # New methods for optimization
+    async def select_verification_strategy(self, context: Dict) -> Dict:
+        """Public API to get the best verification strategy for a given context."""
+        return await self.autonomous_optimizer.select_strategy(context)
+
+    async def update_verification_feedback(self, context: Dict, strategy: Dict, reward: float):
+        """Public API to provide feedback on a verification outcome."""
+        await self.autonomous_optimizer.update_feedback(context, strategy, reward)
 
     async def health_check(self) -> Dict:
         # Aggregated health check using injected dependencies
@@ -1034,6 +1269,28 @@ if FASTAPI_AVAILABLE:
         result = await manager.register_batch(source, volume_liters, purity, certification_level, carbon_aware, urgency)
         return result
 
+    # New endpoints for optimization
+    @app.post("/verification/optimize")
+    async def optimize_strategy(context: Dict, user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
+        if not manager:
+            raise HTTPException(status_code=503, detail="Manager not initialized")
+        return await manager.select_verification_strategy(context)
+
+    @app.post("/verification/feedback")
+    async def feedback(context: Dict, strategy: Dict, reward: float,
+                       user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
+        if not manager:
+            raise HTTPException(status_code=503, detail="Manager not initialized")
+        await manager.update_verification_feedback(context, strategy, reward)
+        return {"status": "feedback recorded"}
+
+    @app.post("/verification/evolve")
+    async def evolve_strategies(user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
+        if not manager:
+            raise HTTPException(status_code=503, detail="Manager not initialized")
+        new_strategies = await manager.autonomous_optimizer.evolve_strategies()
+        return {"new_strategies": new_strategies}
+
     # ... other endpoints
 
     @app.on_event("startup")
@@ -1072,6 +1329,7 @@ async def main():
     print("=" * 80)
     print("Enhanced Blockchain Helium Verification v17.0.0 - Enterprise Quantum Resilience")
     print("WITH DEPENDENCY INJECTION, TASK MANAGER, GLOBAL CIRCUIT BREAKER")
+    print("AND INTEGRATED bio_inspired, moe_system, MODP")
     print("=" * 80)
 
     # Bootstrap
@@ -1112,6 +1370,26 @@ async def main():
     print(f"   Sustainability Score: {result.sustainability_score:.1f}")
     print(f"   Blockchain Integrity TX: {result.blockchain_tx_hash[:16] if result.blockchain_tx_hash else 'N/A'}...")
     print(f"   Cloud Distribution: {result.cloud_distribution['optimal_provider']}")
+
+    # Demo: optimize strategy
+    context = {
+        "source": "Test Source",
+        "volume_liters": 10000.0,
+        "purity": 0.995,
+        "certification_level": "gold",
+        "carbon_aware": True,
+        "urgency": "normal",
+        "carbon_intensity": 400,
+        "gas_price_gwei": 50,
+        "latency_estimate": 0.5,
+        "certainty_desired": 0.9,
+    }
+    opt_result = await manager.select_verification_strategy(context)
+    print(f"\n🔍 Optimized Strategy: {opt_result['strategy']['name']} (confidence: {opt_result['confidence']:.3f}, source: {opt_result['source']})")
+
+    # Demo: provide feedback
+    await manager.update_verification_feedback(context, opt_result['strategy'], 0.85)
+    print("   Feedback recorded.")
 
     health = await manager.health_check()
     print(f"\n🏥 Health: {health['health_score']:.1f} - {'healthy' if health['healthy'] else 'degraded'}")
