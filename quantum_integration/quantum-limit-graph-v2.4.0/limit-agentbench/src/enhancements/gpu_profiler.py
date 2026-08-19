@@ -1,13 +1,25 @@
 """
 gpu_profiler.py
 
-Real-time hardware metrics collector using pynvml and psutil.
-Fully integrated with Phase 1 requirements.
+Enhanced real‑time hardware metrics collector with:
+- GPU (NVML), CPU, memory, disk, network I/O.
+- Cumulative energy tracking.
+- Multi‑GPU support.
+- Persistent SQLite history.
+- Streaming callbacks.
+- Direct integration with MODP, bio_inspired, and moe_system.
 """
+
 import time
 import psutil
 import threading
-from typing import Dict, Any, Optional
+import sqlite3
+import json
+import os
+import logging
+from typing import Dict, Any, Optional, List, Callable
+from dataclasses import dataclass, field
+from collections import deque
 
 # NVML is optional; fail gracefully if not installed
 try:
@@ -17,18 +29,302 @@ try:
 except (ImportError, pynvml.NVMLError):
     NVML_AVAILABLE = False
 
+# ----------------------------------------------------------------------
+# Optional imports for integration with other modules (stubs if missing)
+# ----------------------------------------------------------------------
+try:
+    from enhancements.MODP import ParetoOptimizer
+except ImportError:
+    class ParetoOptimizer:
+        def evaluate(self, metrics, weights):
+            return sum(metrics.get(k, 0) * weights.get(k, 1) for k in metrics)
+
+try:
+    from enhancements.bio_inspired import FitnessEvaluator
+except ImportError:
+    class FitnessEvaluator:
+        def evaluate(self, metrics):
+            return 0.0
+
+try:
+    from enhancements.moe_system import ContextEncoder
+except ImportError:
+    class ContextEncoder:
+        def encode(self, metrics):
+            return [metrics.get("gpu_utilization_pct", 0),
+                    metrics.get("cpu_utilization_pct", 0),
+                    metrics.get("gpu_memory_used_mb", 0) / 1000]
+
+# ----------------------------------------------------------------------
+# Enhanced GPUProfiler
+# ----------------------------------------------------------------------
+
+@dataclass
+class ProfilerConfig:
+    """Configuration for the profiler."""
+    sample_interval: float = 0.5
+    enable_history: bool = True
+    history_db_path: str = "gpu_metrics.db"
+    max_history_days: int = 7
+    enable_callbacks: bool = True
+    callback_cooldown: float = 0.1  # minimum time between callbacks
 
 class GPUProfiler:
-    """Collects GPU, CPU, and Disk metrics with minimal overhead."""
+    """
+    Enhanced profiler with:
+    - Multi‑GPU support.
+    - Cumulative energy tracking.
+    - Network I/O.
+    - Persistent history (SQLite).
+    - Streaming callbacks.
+    - Integration with MODP, bio_inspired, and moe_system.
+    """
 
-    def __init__(self, sample_interval_sec: float = 0.5):
-        self.sample_interval = sample_interval_sec
+    def __init__(
+        self,
+        config: Optional[ProfilerConfig] = None,
+        modp_weights: Optional[Dict[str, float]] = None,
+        bio_evaluator: Optional[Any] = None,
+        moe_encoder: Optional[Any] = None,
+    ):
+        self.config = config or ProfilerConfig()
+        self.modp_weights = modp_weights or {
+            "energy_efficiency": 0.3,
+            "carbon_efficiency": 0.3,
+            "memory_efficiency": 0.2,
+            "throughput": 0.2,
+        }
+        self.bio = bio_evaluator if bio_evaluator else FitnessEvaluator()
+        self.moe = moe_encoder if moe_encoder else ContextEncoder()
+
+        # Internal state
         self._running = False
         self._thread = None
+        self._lock = threading.Lock()
         self._latest_metrics = {}
+        self._callbacks = []          # list of (callback_fn, cooldown, last_call)
         self._disk_io_start = psutil.disk_io_counters()
+        self._net_io_start = psutil.net_io_counters()
         self._last_disk_time = time.time()
+        self._last_net_time = time.time()
+        self._energy_cumulative_gpu_joules = 0.0
+        self._energy_cumulative_cpu_joules = 0.0
+        self._last_power_sample_time = time.time()
 
+        # History
+        self._conn = None
+        if self.config.enable_history:
+            self._init_history()
+
+    # --------------------- History (SQLite) ---------------------
+    def _init_history(self):
+        """Initialize SQLite database for metrics history."""
+        try:
+            self._conn = sqlite3.connect(self.config.history_db_path, check_same_thread=False)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS metrics (
+                    timestamp REAL,
+                    gpu_util REAL,
+                    gpu_mem_used_mb REAL,
+                    gpu_power_watts REAL,
+                    cpu_util REAL,
+                    cpu_mem_used_mb REAL,
+                    disk_read_gbps REAL,
+                    disk_write_gbps REAL,
+                    net_recv_gbps REAL,
+                    net_sent_gbps REAL,
+                    energy_gpu_joules REAL,
+                    energy_cpu_joules REAL,
+                    PRIMARY KEY (timestamp)
+                )
+            """)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # Clean old records
+            self._clean_history()
+        except Exception as e:
+            logging.warning(f"Failed to initialize history: {e}")
+            self._conn = None
+
+    def _clean_history(self):
+        """Remove records older than max_history_days."""
+        if not self._conn:
+            return
+        cutoff = time.time() - self.config.max_history_days * 86400
+        self._conn.execute("DELETE FROM metrics WHERE timestamp < ?", (cutoff,))
+        self._conn.commit()
+
+    def _store_metrics(self, metrics: Dict[str, Any]):
+        """Store a snapshot in the database."""
+        if not self._conn:
+            return
+        try:
+            self._conn.execute("""
+                INSERT INTO metrics (
+                    timestamp, gpu_util, gpu_mem_used_mb, gpu_power_watts,
+                    cpu_util, cpu_mem_used_mb, disk_read_gbps, disk_write_gbps,
+                    net_recv_gbps, net_sent_gbps, energy_gpu_joules, energy_cpu_joules
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                metrics.get("timestamp", time.time()),
+                metrics.get("gpu_utilization_pct", 0),
+                metrics.get("gpu_memory_used_mb", 0),
+                metrics.get("gpu_power_watts", 0),
+                metrics.get("cpu_utilization_pct", 0),
+                metrics.get("cpu_memory_used_mb", 0),
+                metrics.get("disk_read_bandwidth_gbps", 0),
+                metrics.get("disk_write_bandwidth_gbps", 0),
+                metrics.get("net_recv_bandwidth_gbps", 0),
+                metrics.get("net_sent_bandwidth_gbps", 0),
+                metrics.get("energy_gpu_joules", 0),
+                metrics.get("energy_cpu_joules", 0),
+            ))
+            self._conn.commit()
+        except Exception as e:
+            logging.warning(f"Failed to store metrics: {e}")
+
+    # --------------------- Callback System ---------------------
+    def register_callback(self, callback: Callable[[Dict[str, Any]], None],
+                          cooldown: float = 0.1):
+        """Register a function to be called when new metrics arrive."""
+        self._callbacks.append((callback, cooldown, 0.0))
+
+    def _trigger_callbacks(self, metrics: Dict[str, Any]):
+        """Call registered callbacks, respecting cooldowns."""
+        now = time.time()
+        for i, (cb, cd, last) in enumerate(self._callbacks):
+            if now - last >= cd:
+                try:
+                    cb(metrics)
+                except Exception as e:
+                    logging.error(f"Callback error: {e}")
+                self._callbacks[i] = (cb, cd, now)
+
+    # --------------------- Core Sampling ---------------------
+    def _snapshot(self) -> Dict[str, Any]:
+        """Collect a comprehensive metrics snapshot."""
+        metrics = {}
+        now = time.time()
+        metrics["timestamp"] = now
+
+        # ---- GPU Metrics (NVML) ----
+        if NVML_AVAILABLE:
+            try:
+                device_count = pynvml.nvmlDeviceGetCount()
+                metrics["gpu_count"] = device_count
+                # We'll aggregate across all GPUs for simplicity, but can add per‑GPU if needed.
+                total_used = 0
+                total_free = 0
+                total_power = 0.0
+                max_util = 0.0
+                avg_temp = 0.0
+                for i in range(device_count):
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
+                    temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                    total_used += mem_info.used / 1024**2
+                    total_free += mem_info.free / 1024**2
+                    total_power += power
+                    max_util = max(max_util, util.gpu / 100.0)
+                    avg_temp += temp
+                avg_temp /= device_count
+                metrics["gpu_memory_total_mb"] = (total_used + total_free)
+                metrics["gpu_memory_used_mb"] = total_used
+                metrics["gpu_memory_free_mb"] = total_free
+                metrics["gpu_utilization_pct"] = max_util
+                metrics["gpu_power_watts"] = total_power
+                metrics["gpu_temp_c"] = avg_temp
+                # Per‑process memory (optional)
+                # Could be added using nvmlDeviceGetComputeRunningProcesses
+            except Exception as e:
+                logging.warning(f"NVML snapshot error: {e}")
+        else:
+            metrics["gpu_available"] = False
+
+        # ---- CPU & Memory ----
+        vm = psutil.virtual_memory()
+        metrics["cpu_memory_total_mb"] = vm.total / 1024**2
+        metrics["cpu_memory_free_mb"] = vm.available / 1024**2
+        metrics["cpu_memory_used_mb"] = vm.used / 1024**2
+        metrics["cpu_utilization_pct"] = psutil.cpu_percent(interval=None) / 100.0
+
+        # ---- Disk I/O ----
+        disk_io = psutil.disk_io_counters()
+        if self._disk_io_start and now - self._last_disk_time > 0.5:
+            delta = now - self._last_disk_time
+            read_bytes = disk_io.read_bytes - self._disk_io_start.read_bytes
+            write_bytes = disk_io.write_bytes - self._disk_io_start.write_bytes
+            metrics["disk_read_bandwidth_gbps"] = (read_bytes / delta) * 8 / 1e9
+            metrics["disk_write_bandwidth_gbps"] = (write_bytes / delta) * 8 / 1e9
+        self._disk_io_start = disk_io
+        self._last_disk_time = now
+
+        # ---- Network I/O ----
+        net_io = psutil.net_io_counters()
+        if self._net_io_start and now - self._last_net_time > 0.5:
+            delta = now - self._last_net_time
+            recv_bytes = net_io.bytes_recv - self._net_io_start.bytes_recv
+            sent_bytes = net_io.bytes_sent - self._net_io_start.bytes_sent
+            metrics["net_recv_bandwidth_gbps"] = (recv_bytes / delta) * 8 / 1e9
+            metrics["net_sent_bandwidth_gbps"] = (sent_bytes / delta) * 8 / 1e9
+        self._net_io_start = net_io
+        self._last_net_time = now
+
+        # ---- Cumulative Energy ----
+        # GPU energy: approximate from power * time
+        elapsed = now - self._last_power_sample_time
+        if "gpu_power_watts" in metrics:
+            gpu_energy = metrics["gpu_power_watts"] * elapsed
+            self._energy_cumulative_gpu_joules += gpu_energy
+        # CPU energy: estimate from TDP or use psutil's sensors if available
+        # For simplicity, use a rough estimate (CPU power ~ 0.5 * TDP * util)
+        cpu_tdp = 65  # placeholder, could be detected
+        cpu_power = cpu_tdp * metrics["cpu_utilization_pct"]
+        cpu_energy = cpu_power * elapsed
+        self._energy_cumulative_cpu_joules += cpu_energy
+
+        metrics["energy_gpu_joules"] = self._energy_cumulative_gpu_joules
+        metrics["energy_cpu_joules"] = self._energy_cumulative_cpu_joules
+        self._last_power_sample_time = now
+
+        # ---- Derived metrics for MODP ----
+        metrics["energy_efficiency"] = self._compute_energy_efficiency(metrics)
+        metrics["carbon_efficiency"] = self._compute_carbon_efficiency(metrics)
+        metrics["memory_efficiency"] = self._compute_memory_efficiency(metrics)
+        metrics["throughput"] = metrics.get("tokens_per_sec", 0)  # injected from executor
+
+        return metrics
+
+    # --------------------- Derived Metric Helpers ---------------------
+    def _compute_energy_efficiency(self, metrics: Dict[str, Any]) -> float:
+        """Compute energy efficiency (tokens per joule)."""
+        tokens = metrics.get("tokens_per_sec", 0)
+        total_power = metrics.get("gpu_power_watts", 0) + 50  # estimate CPU
+        if total_power > 0:
+            return tokens / total_power
+        return 0.0
+
+    def _compute_carbon_efficiency(self, metrics: Dict[str, Any]) -> float:
+        """Compute carbon efficiency (tokens per kg CO2)."""
+        # Requires carbon intensity from external source; we'll use a placeholder.
+        carbon_intensity = 200.0  # gCO2/kWh
+        total_energy = metrics.get("energy_gpu_joules", 0) / 3600 / 1000  # kWh
+        carbon_kg = total_energy * carbon_intensity / 1000
+        tokens = metrics.get("tokens_per_sec", 0)
+        if carbon_kg > 0:
+            return tokens / carbon_kg
+        return 0.0
+
+    def _compute_memory_efficiency(self, metrics: Dict[str, Any]) -> float:
+        """Compute memory efficiency (used / total)."""
+        total = metrics.get("gpu_memory_total_mb", 1)
+        used = metrics.get("gpu_memory_used_mb", 0)
+        if total > 0:
+            return used / total
+        return 0.0
+
+    # --------------------- Public Methods ---------------------
     def start(self):
         """Start background sampling."""
         if self._running:
@@ -38,64 +334,124 @@ class GPUProfiler:
         self._thread.start()
 
     def stop(self):
+        """Stop background sampling and close DB."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._conn:
+            self._conn.close()
 
     def _sample_loop(self):
         while self._running:
-            self._latest_metrics = self._snapshot()
-            time.sleep(self.sample_interval)
-
-    def _snapshot(self) -> Dict[str, Any]:
-        """Take a one-shot snapshot (used if background is off)."""
-        metrics = {}
-
-        # ---- GPU Metrics (NVML) ----
-        if NVML_AVAILABLE:
-            try:
-                device_count = pynvml.nvmlDeviceGetCount()
-                if device_count > 0:
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
-
-                    metrics["gpu_name"] = pynvml.nvmlDeviceGetName(handle)
-                    metrics["gpu_memory_total_mb"] = mem_info.total / 1024**2
-                    metrics["gpu_memory_free_mb"] = mem_info.free / 1024**2
-                    metrics["gpu_memory_used_mb"] = mem_info.used / 1024**2
-                    metrics["gpu_utilization_pct"] = util.gpu / 100.0
-                    metrics["gpu_power_watts"] = power
-                    metrics["gpu_temp_c"] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-            except Exception:
-                # Fallback if NVML fails mid-flight
-                pass
-        else:
-            metrics["gpu_available"] = False
-
-        # ---- CPU & System Memory (PSUTIL) ----
-        vm = psutil.virtual_memory()
-        metrics["cpu_memory_total_mb"] = vm.total / 1024**2
-        metrics["cpu_memory_free_mb"] = vm.available / 1024**2
-        metrics["cpu_utilization_pct"] = psutil.cpu_percent(interval=None) / 100.0
-
-        # ---- Disk I/O Bandwidth ----
-        now = time.time()
-        disk_io = psutil.disk_io_counters()
-        if self._disk_io_start and now - self._last_disk_time > 0.5:
-            delta_time = now - self._last_disk_time
-            read_bytes = disk_io.read_bytes - self._disk_io_start.read_bytes
-            write_bytes = disk_io.write_bytes - self._disk_io_start.write_bytes
-            metrics["disk_read_bandwidth_gbps"] = (read_bytes / delta_time) * 8 / 1e9
-            metrics["disk_write_bandwidth_gbps"] = (write_bytes / delta_time) * 8 / 1e9
-        self._disk_io_start = disk_io
-        self._last_disk_time = now
-
-        return metrics
+            metrics = self._snapshot()
+            with self._lock:
+                self._latest_metrics = metrics
+            # Store history
+            if self.config.enable_history:
+                self._store_metrics(metrics)
+            # Trigger callbacks
+            if self.config.enable_callbacks:
+                self._trigger_callbacks(metrics)
+            time.sleep(self.config.sample_interval)
 
     def get_current_metrics(self) -> Dict[str, Any]:
-        """Return latest sampled metrics or take a fresh snapshot."""
+        """Return the latest snapshot (or take one if not running)."""
         if self._running:
-            return self._latest_metrics.copy()
+            with self._lock:
+                return self._latest_metrics.copy()
         return self._snapshot()
+
+    # --------------------- Integration Interfaces ---------------------
+    def get_modp_utility(self, metrics: Optional[Dict[str, Any]] = None) -> float:
+        """Return a scalar utility using MODP weights."""
+        if metrics is None:
+            metrics = self.get_current_metrics()
+        # MODP evaluates multiple objectives
+        objectives = {
+            "energy_efficiency": metrics.get("energy_efficiency", 0),
+            "carbon_efficiency": metrics.get("carbon_efficiency", 0),
+            "memory_efficiency": metrics.get("memory_efficiency", 0),
+            "throughput": metrics.get("throughput", 0),
+        }
+        # Use the MODP module (or fallback weighted sum)
+        return ParetoOptimizer().evaluate(objectives, self.modp_weights)
+
+    def get_bio_fitness(self, policy: Dict[str, Any]) -> float:
+        """Return a fitness score for a given policy using bio_inspired evaluator."""
+        # The bio evaluator could use current metrics to judge policy quality.
+        metrics = self.get_current_metrics()
+        return self.bio.evaluate(metrics, policy)
+
+    def get_moe_context(self) -> List[float]:
+        """Return a context vector for the MoE router."""
+        metrics = self.get_current_metrics()
+        return self.moe.encode(metrics)
+
+    # --------------------- Utility ---------------------
+    def get_history(self, start_time: float = 0, end_time: float = None) -> List[Dict]:
+        """Retrieve historical metrics from database."""
+        if not self._conn:
+            return []
+        if end_time is None:
+            end_time = time.time()
+        cursor = self._conn.execute("""
+            SELECT timestamp, gpu_util, gpu_mem_used_mb, gpu_power_watts,
+                   cpu_util, cpu_mem_used_mb, disk_read_gbps, disk_write_gbps,
+                   net_recv_gbps, net_sent_gbps, energy_gpu_joules, energy_cpu_joules
+            FROM metrics
+            WHERE timestamp BETWEEN ? AND ?
+            ORDER BY timestamp
+        """, (start_time, end_time))
+        rows = cursor.fetchall()
+        return [
+            {
+                "timestamp": row[0],
+                "gpu_utilization_pct": row[1],
+                "gpu_memory_used_mb": row[2],
+                "gpu_power_watts": row[3],
+                "cpu_utilization_pct": row[4],
+                "cpu_memory_used_mb": row[5],
+                "disk_read_bandwidth_gbps": row[6],
+                "disk_write_bandwidth_gbps": row[7],
+                "net_recv_bandwidth_gbps": row[8],
+                "net_sent_bandwidth_gbps": row[9],
+                "energy_gpu_joules": row[10],
+                "energy_cpu_joules": row[11],
+            }
+            for row in rows
+        ]
+
+
+# ----------------------------------------------------------------------
+# Example usage
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    # Create profiler with history and callbacks
+    profiler = GPUProfiler()
+    profiler.start()
+
+    # Register a callback that prints metrics
+    def print_metrics(metrics):
+        print(f"GPU util: {metrics.get('gpu_utilization_pct', 0)*100:.1f}%, "
+              f"Power: {metrics.get('gpu_power_watts', 0):.1f}W")
+    profiler.register_callback(print_metrics, cooldown=1.0)
+
+    # Simulate running
+    time.sleep(5)
+
+    # Get MODP utility
+    utility = profiler.get_modp_utility()
+    print(f"MODP utility: {utility:.3f}")
+
+    # Get context for MoE
+    context = profiler.get_moe_context()
+    print(f"MoE context: {context}")
+
+    # Retrieve history
+    history = profiler.get_history(start_time=time.time()-10)
+    print(f"History entries: {len(history)}")
+
+    profiler.stop()
