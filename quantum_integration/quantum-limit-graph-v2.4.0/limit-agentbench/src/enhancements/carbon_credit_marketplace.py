@@ -20,6 +20,13 @@ ENHANCEMENTS OVER v4.0.0:
 - Batch purchase and retire endpoints
 - Data retention policy enforcement
 - Full pytest test suite stubs
+
+NEW IN v5.0.0+:
+- Adaptive project selection using ContextualBandit, ParetoOptimizer, ExpertRouter, and GeneticPolicyGenerator.
+- Multi‑objective scoring of projects.
+- Context‑aware routing.
+- Feedback loop for continuous learning.
+- New API endpoints for optimization.
 """
 
 import asyncio
@@ -174,6 +181,38 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 # =============================================================================
+# ENHANCED MODULES IMPORTS (with graceful fallback)
+# =============================================================================
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator
+    from enhancements.moe_system import ExpertRouter
+    from enhancements.MODP import ParetoOptimizer
+    from enhancements.contextual_bandit import ContextualBandit
+    ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+    # Fallback stubs
+    class GeneticPolicyGenerator:
+        def __init__(self, *args, **kwargs): pass
+        def evolve(self, population, fitness_fn, generations=10, population_size=20):
+            return population[0] if population else {}
+    class ExpertRouter:
+        def __init__(self, *args, **kwargs): pass
+        def encode(self, context): return [0.0]*5
+        def select(self, encoded): return "default"
+    class ParetoOptimizer:
+        def __init__(self, *args, **kwargs): pass
+        def evaluate(self, objectives, weights):
+            return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
+    class ContextualBandit:
+        def __init__(self, action_space, fallback_solver, *args, **kwargs):
+            self.actions = action_space
+        def select_action(self, context):
+            return self.actions[0], 0.0, "fallback"
+        def update(self, context, action, reward): pass
+        def seed_safe_policy(self, context, policy): pass
+
+# =============================================================================
 # CONFIGURATION (Grouped sub‑models)
 # =============================================================================
 
@@ -229,6 +268,20 @@ class GeneralConfig(BaseModel):
     log_level: str = Field("INFO")
     prometheus_port: int = Field(9090)
 
+class OptimizerConfig(BaseModel):
+    modp_weights: Dict[str, float] = Field(
+        default_factory=lambda: {
+            'price': 0.25,
+            'vintage': 0.25,
+            'biodiversity': 0.20,
+            'carbon_intensity': 0.30,
+        }
+    )
+    bandit_min_trials: int = Field(5, ge=1)
+    bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
+    bio_generations: int = Field(10, ge=1)
+    bio_population_size: int = Field(20, ge=2)
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CARBON_", case_sensitive=False)
 
@@ -239,6 +292,7 @@ class Settings(BaseSettings):
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     carbon: CarbonConfig = Field(default_factory=CarbonConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
 
     API_HOST: str = Field("0.0.0.0")
     API_PORT: int = Field(8000)
@@ -1213,8 +1267,14 @@ class AutoOffsetEngine(IAutoOffsetEngine):
         # Delegate to marketplace's internal logic
         await self.marketplace._perform_offset(emissions_kg, reason)
 
-# ---------- Autonomous Optimizer ----------
+# =============================================================================
+# ENHANCED AUTONOMOUS OPTIMIZER (replaces original)
+# =============================================================================
 class AutonomousOptimizer:
+    """
+    Adaptive optimizer for project selection and offset thresholds using
+    ContextualBandit, ParetoOptimizer, ExpertRouter, and GeneticPolicyGenerator.
+    """
     def __init__(self, config: Settings, marketplace: 'CarbonCreditMarketplace'):
         self.config = config
         self.marketplace = marketplace
@@ -1222,7 +1282,151 @@ class AutonomousOptimizer:
         self.threshold_history = deque(maxlen=100)
         self.success_history = deque(maxlen=100)
 
+        # Enhanced modules
+        self.modp = ParetoOptimizer() if ENHANCEMENTS_AVAILABLE else None
+        self.moe = ExpertRouter() if ENHANCEMENTS_AVAILABLE else None
+        self.bio = GeneticPolicyGenerator() if ENHANCEMENTS_AVAILABLE else None
+
+        # Initial action space: selection strategies (could be different scoring functions)
+        self.action_space = [
+            {"name": "balanced", "params": {"price_weight": 0.3, "vintage_weight": 0.3, "biodiversity_weight": 0.2, "carbon_weight": 0.2}},
+            {"name": "price_focused", "params": {"price_weight": 0.6, "vintage_weight": 0.1, "biodiversity_weight": 0.1, "carbon_weight": 0.2}},
+            {"name": "green_focused", "params": {"price_weight": 0.1, "vintage_weight": 0.2, "biodiversity_weight": 0.3, "carbon_weight": 0.4}},
+            {"name": "vintage_focused", "params": {"price_weight": 0.2, "vintage_weight": 0.5, "biodiversity_weight": 0.2, "carbon_weight": 0.1}},
+        ]
+
+        # Bandit fallback
+        def fallback(context):
+            return {"name": "balanced", "params": {"price_weight": 0.3, "vintage_weight": 0.3, "biodiversity_weight": 0.2, "carbon_weight": 0.2}}
+
+        self.bandit = ContextualBandit(
+            action_space=self.action_space,
+            fallback_solver=fallback,
+            min_trials_before_bandit=config.optimizer.bandit_min_trials,
+            confidence_threshold=config.optimizer.bandit_confidence_threshold,
+        ) if ENHANCEMENTS_AVAILABLE else None
+
+        # State for learning
+        self.recent_rewards = deque(maxlen=100)
+        self._last_selection = {"project": None, "strategy": None, "context": None}
+        self._load_state()
+
+    async def _load_state(self):
+        """Load bandit and MODP state from DB (if persistent)."""
+        # In production, we'd query a state table.
+        pass
+
+    async def _save_state(self):
+        pass
+
+    async def select_best_project(self, projects: List['CreditProject'], amount_kg: float, context: Dict = None) -> Optional['CreditProject']:
+        """
+        Select the best project using the bandit (or fallback).
+        """
+        if not projects:
+            return None
+
+        # Encode context using MoE (if available)
+        encoded_context = context or {}
+        if self.moe:
+            encoded_context = self.moe.encode({
+                "amount_kg": amount_kg,
+                "carbon_intensity": context.get("carbon_intensity", 400) if context else 400,
+                "user_role": context.get("user_role", "viewer"),
+                "urgency": context.get("urgency", "normal"),
+                "project_count": len(projects),
+            })
+
+        # Select strategy via bandit
+        strategy, confidence, source = self.bandit.select_action(encoded_context)
+        if strategy is None:
+            strategy = self._fallback_strategy(encoded_context)
+
+        # Score projects using the selected strategy's weights
+        scored = []
+        for p in projects:
+            score = self._score_project(p, strategy['params'])
+            scored.append((p, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Find first project with enough available credits
+        for p, _ in scored:
+            if p.available_credits_kg >= amount_kg:
+                # Record the selection for future feedback
+                self._last_selection = {"project": p, "strategy": strategy, "context": encoded_context}
+                return p
+        return None
+
+    def _score_project(self, project: 'CreditProject', weights: Dict[str, float]) -> float:
+        """
+        Score a project using MODP (if available) or a weighted sum.
+        """
+        if self.modp:
+            # Multi‑objective evaluation using MODP
+            objectives = {
+                "price": 1 - (project.price_per_kg_usd / 2.0),  # normalize
+                "vintage": (project.metadata.get('vintage', 2020) - 2020) / 5.0,
+                "biodiversity": project.co_benefits.get('biodiversity', 0),
+                "carbon_intensity": 1 - (project.metadata.get('carbon_intensity', 400) / 1000),
+            }
+            # Use MODP weights from config or override with strategy weights
+            return self.modp.evaluate(objectives, weights)
+        else:
+            # Fallback weighted sum (original)
+            score = 0
+            score += (1 - project.price_per_kg_usd / 2.0) * weights.get("price_weight", 0.3)
+            score += 0.2  # base
+            vintage = project.metadata.get('vintage', 2020)
+            if vintage >= 2023:
+                score += weights.get("vintage_weight", 0.3) * 0.3
+            elif vintage >= 2022:
+                score += weights.get("vintage_weight", 0.3) * 0.2
+            co_benefits = project.co_benefits or {}
+            sdg_count = len(co_benefits.get('sdg', []))
+            score += min(sdg_count / 5, 0.2) * weights.get("biodiversity_weight", 0.2)
+            biodiversity = co_benefits.get('biodiversity', 0)
+            score += biodiversity * 0.1 * weights.get("biodiversity_weight", 0.2)
+            return score
+
+    async def update_feedback(self, context: Dict, strategy: Dict, reward: float):
+        """
+        Update bandit with actual outcome.
+        """
+        if self.bandit:
+            self.bandit.update(context, strategy, reward)
+            self.recent_rewards.append(reward)
+
+        # Bio‑inspired expansion: if rewards are consistently low, evolve new strategies
+        if len(self.recent_rewards) > 20 and np.mean(self.recent_rewards) < 0.3 and self.bio:
+            new_strategies = await self.evolve_strategies()
+            if new_strategies:
+                for s in new_strategies:
+                    if s not in self.action_space:
+                        self.action_space.append(s)
+                        self.bandit.actions = self.action_space
+                logger.info("Bio‑inspired expansion: added new selection strategies.")
+
+    async def evolve_strategies(self) -> List[Dict]:
+        """
+        Generate new selection strategies using bio‑inspired evolution.
+        """
+        if not self.bio:
+            return []
+        # Use a fitness function based on recent rewards
+        def fitness(policy):
+            # In practice, evaluate policy on historical data.
+            return np.mean(self.recent_rewards) if self.recent_rewards else 0.5
+
+        new_strategies = self.bio.evolve(
+            population=self.action_space,
+            fitness_fn=fitness,
+            generations=self.config.optimizer.bio_generations,
+            population_size=self.config.optimizer.bio_population_size,
+        )
+        return new_strategies
+
     async def optimize_offset_threshold(self) -> float:
+        # Original heuristic remains, but could also be evolved.
         async with self._lock:
             if len(self.success_history) < 10:
                 return self.config.general.auto_offset_threshold_kg
@@ -1240,104 +1444,16 @@ class AutonomousOptimizer:
         async with self._lock:
             self.success_history.append(success)
 
-    async def select_best_project(self, projects: List['CreditProject'], amount_kg: float) -> Optional['CreditProject']:
-        if not projects:
-            return None
-        scored = []
-        for p in projects:
-            score = 0
-            score += (1 - p.price_per_kg_usd / 2.0) * 0.3
-            score += 0.2
-            vintage = p.metadata.get('vintage', 2020)
-            if vintage >= 2023:
-                score += 0.3
-            elif vintage >= 2022:
-                score += 0.2
-            co_benefits = p.co_benefits or {}
-            sdg_count = len(co_benefits.get('sdg', []))
-            score += min(sdg_count / 5, 0.2)
-            biodiversity = co_benefits.get('biodiversity', 0)
-            score += biodiversity * 0.1
-            scored.append((p, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        best = scored[0][0]
-        if best.available_credits_kg < amount_kg:
-            for p, _ in scored[1:]:
-                if p.available_credits_kg >= amount_kg:
-                    return p
-            return None
-        return best
+    def _fallback_strategy(self, context) -> Dict:
+        return {"name": "balanced", "params": {"price_weight": 0.3, "vintage_weight": 0.3, "biodiversity_weight": 0.2, "carbon_weight": 0.2}}
 
-# ---------- Async Database Manager (with migrations) ----------
-class AsyncDatabaseManager:
-    def __init__(self, config: Settings):
-        self.config = config
-        self.db_path = config.database.path
-        self.engine: Optional[AsyncEngine] = None
-        self.async_session: Optional[async_sessionmaker] = None
-        self._init_db()
-
-    def _init_db(self):
-        if not SQLALCHEMY_ASYNC_AVAILABLE:
-            logger.warning("SQLAlchemy async not available, falling back to sync SQLite")
-            from sqlalchemy import create_engine
-            self.engine = create_engine(f"sqlite:///{self.db_path}")
-            self.async_session = None
-            Base.metadata.create_all(self.engine)
-            return
-        db_url = f"sqlite+aiosqlite:///{self.db_path}"
-        self.engine = create_async_engine(db_url, poolclass=NullPool)
-        self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
-        # Run migrations
-        import asyncio
-        asyncio.create_task(self._apply_migrations())
-
-    async def _apply_migrations(self):
-        # Create schema_version table if not exists, then apply migrations
-        async with self.engine.begin() as conn:
-            await conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS schema_version (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                )
-            """))
-            result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
-            row = result.fetchone()
-            current_ver = row[0] if row else 0
-
-            if current_ver < 1:
-                # Create all tables
-                await conn.run_sync(Base.metadata.create_all)
-                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"))
-                current_ver = 1
-
-            if current_ver < 2:
-                # Add pqc_keys table if not already created
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS pqc_keys (
-                        key_id TEXT PRIMARY KEY,
-                        algorithm TEXT NOT NULL,
-                        public_key TEXT NOT NULL,
-                        private_key TEXT NOT NULL,
-                        expires_at TEXT NOT NULL
-                    )
-                """))
-                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))"))
-                current_ver = 2
-
-            # ... additional migrations as needed
-
-    async def get_session(self) -> AsyncSession:
-        if not self.async_session:
-            from sqlalchemy.orm import sessionmaker
-            Session = sessionmaker(bind=self.engine)
-            return Session()
-        return self.async_session()
-
-    async def close(self):
-        if self.engine:
-            if hasattr(self.engine, 'dispose'):
-                await self.engine.dispose()
+    def get_optimization_stats(self) -> Dict:
+        return {
+            'strategies': [s['name'] for s in self.action_space],
+            'recent_rewards': list(self.recent_rewards),
+            'threshold': self.config.general.auto_offset_threshold_kg,
+            'total_feedback': len(self.recent_rewards),
+        }
 
 # =============================================================================
 # DATABASE MODELS (SQLAlchemy)
@@ -1495,6 +1611,7 @@ class CarbonCreditMarketplace:
         self.task_manager.register_task("reconcile", self._reconciliation_loop)
         self.task_manager.register_task("archive", self._archive_loop)
         self.task_manager.register_task("price_update", self._price_update_loop)
+        self.task_manager.register_task("evolve_strategies", self._evolve_strategies_loop)
 
     async def start(self):
         self._running = True
@@ -1542,6 +1659,18 @@ class CarbonCreditMarketplace:
                 await asyncio.sleep(3600)
             except Exception as e:
                 logger.error("Price update loop error", error=str(e))
+                await asyncio.sleep(60)
+
+    async def _evolve_strategies_loop(self):
+        """Periodically trigger bio‑inspired evolution of selection strategies."""
+        while not self.task_manager.shutdown_event.is_set():
+            try:
+                if ENHANCEMENTS_AVAILABLE and self.optimizer.bio:
+                    await self.optimizer.evolve_strategies()
+                    logger.info("Periodic strategy evolution completed")
+                await asyncio.sleep(3600)  # every hour
+            except Exception as e:
+                logger.error("Evolution loop error", error=str(e))
                 await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
@@ -1618,7 +1747,11 @@ class CarbonCreditMarketplace:
 
         if available >= emissions_kg:
             projects = await self.list_projects(status="verified")
-            best_project = await self.optimizer.select_best_project(projects, emissions_kg)
+            best_project = await self.optimizer.select_best_project(
+                projects,
+                emissions_kg,
+                context={"carbon_intensity": intensity if intensity else 400, "urgency": "auto"}
+            )
             if best_project:
                 await self._retire_from_existing(emissions_kg, reason, best_project)
                 AUTO_OFFSET_SUCCESS.inc()
@@ -1629,7 +1762,11 @@ class CarbonCreditMarketplace:
         else:
             missing = emissions_kg - available
             projects = await self.list_projects(status="verified")
-            best_project = await self.optimizer.select_best_project(projects, missing)
+            best_project = await self.optimizer.select_best_project(
+                projects,
+                missing,
+                context={"carbon_intensity": intensity if intensity else 400, "urgency": "auto"}
+            )
             if best_project:
                 await self.purchase_credits(
                     CreditPurchaseRequest(
@@ -1685,7 +1822,7 @@ class CarbonCreditMarketplace:
                             break
 
     # ------------------------------------------------------------------
-    # Public API methods (same as before, but using injected dependencies)
+    # Public API methods (using injected dependencies)
     # ------------------------------------------------------------------
     async def refresh_projects(self, force: bool = False) -> List[CreditProject]:
         await self._refresh_projects(force)
@@ -2009,6 +2146,11 @@ class CarbonCreditMarketplace:
                 components["carbon"] = {"status": "failed", "error": str(e)}
         else:
             components["carbon"] = {"status": "not configured"}
+        # Optimizer health
+        if ENHANCEMENTS_AVAILABLE and self.optimizer.bandit:
+            components["optimizer"] = {"status": "ok", "strategies": len(self.optimizer.action_space)}
+        else:
+            components["optimizer"] = {"status": "fallback"}
         overall_ok = all(v.get("status") == "ok" for v in components.values() if v.get("status") != "not configured")
         return {
             "status": "ok" if overall_ok else "degraded",
@@ -2228,7 +2370,6 @@ async def export_data(format: str = "json", user: Dict = Depends(require_role("a
 async def circuit_breakers(user: Dict = Depends(require_role("admin"))):
     if not marketplace:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    # Expose global circuit breaker metrics
     return {name: cb.get_metrics() for name, cb in GlobalCircuitBreaker()._breakers.items()}
 
 @app.websocket("/ws")
@@ -2242,6 +2383,39 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         await marketplace.ws_manager.disconnect(websocket)
+
+# =============================================================================
+# NEW OPTIMIZATION ENDPOINTS
+# =============================================================================
+@app.post("/optimization/select")
+async def optimize_select(context: Dict, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
+    if not marketplace:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    projects = await marketplace.list_projects(status="verified")
+    best = await marketplace.optimizer.select_best_project(projects, context.get("amount_kg", 1000), context)
+    if best:
+        return {"project": best.dict(), "strategy": marketplace.optimizer._last_selection["strategy"]}
+    return {"error": "No suitable project"}
+
+@app.post("/optimization/feedback")
+async def optimization_feedback(context: Dict, strategy: Dict, reward: float, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
+    if not marketplace:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    await marketplace.optimizer.update_feedback(context, strategy, reward)
+    return {"status": "feedback recorded"}
+
+@app.post("/optimization/evolve")
+async def optimization_evolve(user: Dict = Depends(require_role("admin")), _: None = Depends(rate_limit)):
+    if not marketplace:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    new_strategies = await marketplace.optimizer.evolve_strategies()
+    return {"new_strategies": new_strategies}
+
+@app.get("/optimization/stats")
+async def optimization_stats(user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
+    if not marketplace:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    return marketplace.optimizer.get_optimization_stats()
 
 # ---------- Startup & Shutdown ----------
 @app.on_event("startup")
