@@ -1,28 +1,19 @@
+#!/usr/bin/env python3
 """
-MoE Expert System – Expert Module (Enhanced v2.2.0) with MOPD Support
+MoE Expert System – Expert Module (Enhanced v2.3.0) with MOPD Support
 
 This package provides the core experts used in the mixture‑of‑experts framework.
 Each expert implements a specific optimization domain (energy, data, IoT, quantum, helium).
 All experts now support Multi‑Objective Pareto Decision (MOPD) through a standardised interface.
 
-Usage:
-    from enhancements.moe_expert_system.experts import get_expert, create_expert, BaseExpert
-
-    # Get the EnergyExpert class directly
-    EnergyExpert = get_expert('EnergyExpert')
-
-    # Or instantiate with configuration, bio_core, and MOPD config
-    expert = create_expert('EnergyExpert', bio_core=my_core, config={...}, mopd_config={...})
-
-    # Alternatively, import directly:
-    from enhancements.moe_expert_system.experts import EnergyExpert
-
-Available experts:
-    - EnergyExpert    : Optimizes energy consumption with renewable, cooling, and federated learning.
-    - DataExpert      : Handles data compression, caching, and efficient storage.
-    - IoTExpert       : Manages IoT device energy and communication.
-    - QuantumExpert   : Optimizes quantum circuit execution and resource allocation.
-    - HeliumExpert    : Manages helium usage and recovery in cryogenic systems.
+ENHANCEMENTS OVER v2.2.0:
+1. FIXED: Abstract `propose` renamed to `propose_async` to match actual expert implementations.
+2. FIXED: `get_health_status` is now async; `get_capabilities` is async too (with sync fallback).
+3. ADDED: Optional `policy_probs` method for teacher interface in MTPD.
+4. ADDED: Base-level hooks for bio‑inspired ATP spend/earn and gradient pumping.
+5. ADDED: Base support for central Green Agent components (Storage, AsyncMessageQueue, MetricsRegistry, AdaptiveCostFunction, ParetoGating, DriftDetector) via constructor injection.
+6. IMPROVED: Registry now checks for `propose_async` and `policy_probs` presence.
+7. ENHANCED: `MOPDConfig` now includes optional central MOPD component references.
 """
 
 import logging
@@ -32,7 +23,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import asyncio
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +47,9 @@ class MOPDConfig:
     enable_predictive: bool = True
     enable_quantum: bool = True
     # Additional common parameters can be added here
+    adaptive_cost: Optional[Any] = None          # Reference to central AdaptiveCostFunction
+    pareto_gating: Optional[Any] = None          # Reference to central ParetoGating
+    drift_detector: Optional[Any] = None         # Reference to central DriftDetector
 
 # ============================================================================
 # Standardised Proposal Result Type
@@ -63,7 +57,7 @@ class MOPDConfig:
 @dataclass
 class MOPDProposal:
     """
-    Standard return type for `propose` method in MOPD‑aware experts.
+    Standard return type for `propose_async` method in MOPD‑aware experts.
     """
     recommendations: Dict[str, Any]               # single preferred action
     options: List[Dict[str, Any]]                 # list of trade‑off options (could be Pareto front)
@@ -84,14 +78,12 @@ def is_dominated(solution_a: Dict[str, Any],
     a_vec = []
     b_vec = []
     for key in objective_keys:
-        # If objective is to be minimized, negate (so that larger is better)
         if key in ['cost', 'latency']:
             a_vec.append(-solution_a.get(key, 0))
             b_vec.append(-solution_b.get(key, 0))
         else:
             a_vec.append(solution_a.get(key, 0))
             b_vec.append(solution_b.get(key, 0))
-    # b dominates a if b is >= a in all and > in at least one
     return all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec))
 
 def filter_pareto_front(solutions: List[Dict[str, Any]],
@@ -118,7 +110,6 @@ def scalarise(solutions: List[Dict[str, Any]],
     Assumes objectives are already normalised (or will be normalised inside).
     Returns list of (solution, score).
     """
-    # Normalise each objective across solutions (min‑max scaling)
     norm_solutions = []
     for key in objective_keys:
         vals = [sol.get(key, 0) for sol in solutions]
@@ -126,14 +117,12 @@ def scalarise(solutions: List[Dict[str, Any]],
         max_val = max(vals)
         range_val = max_val - min_val if max_val != min_val else 1
         for i, sol in enumerate(solutions):
-            # For minimization, we invert
             if key in ['cost', 'latency']:
                 norm_val = (max_val - sol.get(key, 0)) / range_val
             else:
                 norm_val = (sol.get(key, 0) - min_val) / range_val
             sol[f'_norm_{key}'] = norm_val
 
-    # Compute weighted sum
     scored = []
     for sol in solutions:
         score = 0.0
@@ -151,9 +140,45 @@ class BaseExpert(ABC):
     Abstract base for all MoE experts.
     All concrete experts must implement the methods defined here.
     MOPD‑aware methods are now part of the core interface.
+
+    ENHANCEMENTS v2.3.0:
+    - Abstract `propose` renamed to `propose_async`.
+    - `get_health_status` is async.
+    - `get_capabilities` is async (sync fallback provided).
+    - Optional `policy_probs` for teacher interface.
+    - Base hooks for ATP spending/earning and gradient pumping.
+    - Base constructor accepts central Green Agent components (with defaults None).
     """
+
     __expert_version__: str = "0.0.0"          # Override per expert
     __expert_description__: str = ""           # Override per expert
+
+    def __init__(self,
+                 storage: Optional[Any] = None,
+                 message_queue: Optional[Any] = None,
+                 adaptive_cost: Optional[Any] = None,
+                 pareto_gating: Optional[Any] = None,
+                 drift_detector: Optional[Any] = None,
+                 metrics: Optional[Any] = None,
+                 **kwargs):
+        """
+        Constructor accepts central Green Agent components.
+        Subclasses should call super().__init__() and optionally set these attributes.
+        """
+        self.storage = storage
+        self.queue = message_queue
+        self.adaptive_cost = adaptive_cost
+        self.pareto = pareto_gating
+        self.drift = drift_detector
+        self.metrics = metrics
+        # Bio-inspired core (if injected later, can be set via set_bio_core)
+        self.bio_core = None
+        self.token_manager = None
+        self.gradient_manager = None
+        self.compartment_manager = None
+        self.biomass_storage = None
+        self.harvester = None
+        self.scheduler = None
 
     def __init_subclass__(cls, **kwargs):
         """Ensure subclasses define version and description."""
@@ -163,47 +188,72 @@ class BaseExpert(ABC):
             raise TypeError(f"{cls.__name__} must define __expert_description__")
         super().__init_subclass__(**kwargs)
 
+    def set_bio_core(self, bio_core: Any):
+        """Inject bio‑inspired core and extract managers."""
+        self.bio_core = bio_core
+        if bio_core:
+            self.token_manager = getattr(bio_core, 'token_manager', None)
+            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
+            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
+            self.harvester = getattr(bio_core, 'harvester', None)
+            self.scheduler = getattr(bio_core, 'scheduler', None)
+
+    # ===== Bio‑inspired helper hooks (subclasses can call these) =====
+    async def spend_atp(self, amount: float, consumer: str = "expert"):
+        """Spend ATP tokens. Returns True if successful, False otherwise."""
+        if self.token_manager:
+            try:
+                return await self.token_manager.spend(consumer, amount)
+            except Exception as e:
+                logger.debug(f"ATP spend failed: {e}")
+        return False
+
+    async def earn_atp(self, amount: float, source: str = "expert"):
+        """Earn ATP tokens. Returns True if successful, False otherwise."""
+        if self.token_manager:
+            try:
+                return await self.token_manager.earn(source, amount)
+            except Exception as e:
+                logger.debug(f"ATP earn failed: {e}")
+        return False
+
+    async def pump_gradient(self, field: str, delta: float, source: str = "expert"):
+        """Pump a gradient field (e.g., 'trust', 'carbon', 'helium')."""
+        if self.gradient_manager:
+            try:
+                return self.gradient_manager.pump_field(field, delta, source=source)
+            except Exception as e:
+                logger.debug(f"Gradient pump failed: {e}")
+        return False
+
+    # ===== MOPD‑specific abstract methods =====
     @abstractmethod
-    async def propose(self, context: dict) -> MOPDProposal:
+    async def propose_async(self, context: dict) -> MOPDProposal:
         """
         Generate a recommendation based on the provided context.
-
-        Args:
-            context: A dictionary containing relevant input data.
-
-        Returns:
-            A MOPDProposal containing:
-                - recommendations: single preferred action set
-                - options: list of trade‑off options
-                - explanation: natural‑language description
-                - pareto_front: (optional) full Pareto front
+        Subclasses should implement this async method.
         """
         pass
 
     @abstractmethod
-    def get_health_status(self) -> Dict[str, Any]:
+    async def get_health_status(self) -> Dict[str, Any]:
         """
-        Return health metrics of the expert.
-
-        Returns:
-            A dictionary with at least 'status' and optionally 'last_error',
-            'thresholds', 'persistence_enabled', etc.
+        Return health metrics of the expert (async).
         """
         pass
 
     @abstractmethod
     async def shutdown(self):
         """
-        Gracefully shut down the expert and any background tasks.
+        Gracefully shut down the expert and any background tasks (async).
         """
         pass
 
-    # ===== MOPD‑specific abstract methods =====
     @abstractmethod
     async def get_pareto_front(self, context: dict) -> List[Dict[str, Any]]:
         """
         Return a list of Pareto‑optimal solutions for the given context.
-        This method is used when the expert is queried directly for the front.
         """
         pass
 
@@ -228,18 +278,46 @@ class BaseExpert(ABC):
         """
         pass
 
+    # ===== Optional teacher policy for MTPD =====
+    async def policy_probs(self, state: Dict) -> List[float]:
+        """
+        Return a probability distribution over strategies/actions.
+        Default implementation returns uniform distribution.
+        Subclasses can override with context-aware multi-objective scoring.
+        """
+        # Use a simple uniform distribution based on number of supported tasks
+        if hasattr(self, 'supported_task_types') and self.supported_task_types:
+            n = len(self.supported_task_types)
+            return [1.0 / n] * n
+        return [0.5, 0.5]  # fallback
+
     # ===== Optional lifecycle methods =====
     async def initialize(self):
         """Perform one‑time setup after instantiation."""
         pass
 
-    def get_capabilities(self) -> Dict[str, Any]:
-        """Return the expert's capabilities for routing and gating."""
+    async def get_capabilities(self) -> Dict[str, Any]:
+        """
+        Return the expert's capabilities for routing and gating (async).
+        """
+        health_status = await self.get_health_status()
         return {
             'name': self.__class__.__name__,
             'version': self.__expert_version__,
             'description': self.__expert_description__,
-            'health_status': self.get_health_status(),
+            'health_status': health_status,
+            'mopd_weights': self.get_objective_weights(),
+            'mopd_config': self.get_mopd_config(),
+        }
+
+    def get_capabilities_sync(self) -> Dict[str, Any]:
+        """
+        Synchronous version of get_capabilities (health status omitted or default).
+        """
+        return {
+            'name': self.__class__.__name__,
+            'version': self.__expert_version__,
+            'description': self.__expert_description__,
             'mopd_weights': self.get_objective_weights(),
             'mopd_config': self.get_mopd_config(),
         }
@@ -277,7 +355,7 @@ def register_expert(name: str, expert_class: Type[BaseExpert]) -> None:
     if name in _EXPERT_REGISTRY:
         raise ValueError(f"Expert '{name}' is already registered.")
     # Check MOPD compliance (warn if methods are not overridden)
-    for method in ['get_pareto_front', 'set_objective_weights', 'get_objective_weights', 'get_mopd_config']:
+    for method in ['get_pareto_front', 'set_objective_weights', 'get_objective_weights', 'get_mopd_config', 'propose_async']:
         if not hasattr(expert_class, method) or getattr(expert_class, method) is BaseExpert.__dict__.get(method):
             logger.warning(f"Expert '{name}' does not implement MOPD method '{method}'. "
                            f"It may not fully support MOPD. Consider updating the expert.")
@@ -287,15 +365,6 @@ def register_expert(name: str, expert_class: Type[BaseExpert]) -> None:
 def get_expert(name: str) -> Type[BaseExpert]:
     """
     Retrieve an expert class by its registered name.
-
-    Args:
-        name: The expert's class name (e.g., 'EnergyExpert').
-
-    Returns:
-        The expert class.
-
-    Raises:
-        ValueError: If the name is not registered.
     """
     if name not in _EXPERT_REGISTRY:
         raise ValueError(f"Expert '{name}' is not registered.")
@@ -308,12 +377,6 @@ def list_experts() -> List[str]:
 def unregister_expert(name: str) -> None:
     """
     Unregister an expert.
-
-    Args:
-        name: The expert's name.
-
-    Raises:
-        ValueError: If the name is not registered.
     """
     if name not in _EXPERT_REGISTRY:
         raise ValueError(f"Expert '{name}' is not registered.")
@@ -328,28 +391,20 @@ def create_expert(
     bio_core: Optional[Any] = None,
     config: Optional[Dict[str, Any]] = None,
     mopd_config: Optional[Union[Dict[str, Any], MOPDConfig]] = None,
+    storage: Optional[Any] = None,
+    message_queue: Optional[Any] = None,
+    adaptive_cost: Optional[Any] = None,
+    pareto_gating: Optional[Any] = None,
+    drift_detector: Optional[Any] = None,
+    metrics: Optional[Any] = None,
     **kwargs: Any,
 ) -> BaseExpert:
     """
-    Create an instance of an expert.
-
-    Args:
-        name: The expert's class name.
-        bio_core: Optional reference to the bio‑inspired core for event subscriptions,
-                  circuit breakers, etc.
-        config: Optional configuration dictionary passed to the expert's constructor.
-        mopd_config: Optional MOPD configuration. Can be a dict or MOPDConfig object.
-        **kwargs: Additional keyword arguments to pass to the expert's constructor.
-
-    Returns:
-        An instance of the expert class.
-
-    Raises:
-        ValueError: If the name is not registered.
+    Create an instance of an expert, injecting central components and bio_core.
     """
     expert_class = get_expert(name)
 
-    # Build argument dict from provided kwargs plus bio_core, config, mopd_config
+    # Build argument dict from provided kwargs plus bio_core, config, mopd_config and central components
     init_kwargs = kwargs.copy()
     if bio_core is not None:
         init_kwargs['bio_core'] = bio_core
@@ -359,11 +414,16 @@ def create_expert(
         if isinstance(mopd_config, dict):
             mopd_config = MOPDConfig(**mopd_config)
         init_kwargs['mopd_config'] = mopd_config
+    # Central components are passed to base __init__ (if accepted)
+    for key, val in [('storage', storage), ('message_queue', message_queue),
+                     ('adaptive_cost', adaptive_cost), ('pareto_gating', pareto_gating),
+                     ('drift_detector', drift_detector), ('metrics', metrics)]:
+        if val is not None:
+            init_kwargs[key] = val
 
     # Use inspect to see which parameters are accepted
     sig = inspect.signature(expert_class.__init__)
     params = sig.parameters
-    # Filter out any kwargs that are not in the constructor signature
     filtered_kwargs = {}
     for k, v in init_kwargs.items():
         if k in params:
@@ -371,12 +431,16 @@ def create_expert(
         else:
             logger.debug(f"Argument '{k}' not accepted by {name}.__init__; ignoring.")
 
-    # If the constructor has **kwargs, we can pass all
+    # If constructor has **kwargs, we can pass all
     if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
         filtered_kwargs = init_kwargs
 
     # Instantiate
-    return expert_class(**filtered_kwargs)
+    expert = expert_class(**filtered_kwargs)
+    # Inject bio_core if the expert has a set_bio_core method (in case constructor didn't accept it)
+    if bio_core is not None and hasattr(expert, 'set_bio_core'):
+        expert.set_bio_core(bio_core)
+    return expert
 
 # ============================================================================
 # Helper: shutdown multiple experts with MOPD cleanup
@@ -405,18 +469,13 @@ async def get_experts_capabilities(experts: List[BaseExpert]) -> List[Dict[str, 
     """
     caps = []
     for expert in experts:
-        base = expert.get_capabilities()
-        # Add MOPD‑specific info (already in get_capabilities, but we can also include current weights)
+        base = await expert.get_capabilities()
         caps.append(base)
     return caps
 
 # ============================================================================
 # Backward Compatibility: eager imports for direct access
 # ============================================================================
-# We attempt to import each expert and register it if successful.
-# If an import fails, the expert will not be available.
-# We conditionally include only the ones that succeed in __all__.
-
 _imported_experts: Dict[str, Type[BaseExpert]] = {}
 
 try:
@@ -462,7 +521,6 @@ except ImportError as e:
 # ============================================================================
 # __all__ – control what is exported with 'from ... import *'
 # ============================================================================
-# Only include experts that were successfully imported.
 __all__ = [
     'BaseExpert',
     'get_expert',
