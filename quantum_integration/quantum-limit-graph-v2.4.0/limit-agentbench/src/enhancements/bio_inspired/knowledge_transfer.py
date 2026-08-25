@@ -6,7 +6,7 @@
 # MOPD enhancements:
 # - MOPDConfig sub‑configuration for objective weights and grid resolution.
 # - MOPDPoint dataclass to represent a genetic individual with objectives.
-# - Pareto front generation in the KnowledgeGeneticOptimizer.
+# - Pareto front generation in the KnowledgeGeneticOptimizer (now NSGA‑II).
 # - Selection of best configuration via scalarisation.
 # - Persistence of Pareto front in Storage.
 # - Telemetry tracks MOPD generations and Pareto front sizes.
@@ -1579,7 +1579,7 @@ class KnowledgeGraphNN:
         return {'predicted_survival': predicted_survival, 'confidence': confidence, 'recommendation': 'maintain' if predicted_survival > 0.6 else 'review'}
 
 # ============================================================================
-# Genetic Optimizer (Enhanced with MOPD)
+# Enhanced Knowledge Genetic Optimizer (NSGA‑II)
 # ============================================================================
 
 class KnowledgeGeneticOptimizer:
@@ -1604,10 +1604,15 @@ class KnowledgeGeneticOptimizer:
             'decay_rate': (0.005, 0.02),
             'capture_threshold': (0.5, 0.9)
         }
-        # MOPD: Pareto front storage
+        # Pareto front storage
         self.pareto_front: List[MOPDPoint] = []
-        logger.info("Knowledge Genetic Optimizer initialized")
+        # Evaluation cache: key = tuple of sorted individual items -> objectives
+        self._eval_cache: Dict[Tuple[Any, ...], Dict[str, float]] = {}
+        logger.info("Knowledge Genetic Optimizer initialized (NSGA‑II)")
 
+    # ----------------------------------------------------------------------
+    # Initialization
+    # ----------------------------------------------------------------------
     def _initialize_individual(self) -> Dict:
         ind = {
             'survival_weights': {
@@ -1619,6 +1624,7 @@ class KnowledgeGeneticOptimizer:
             'decay_rate': random.uniform(0.005, 0.02),
             'capture_threshold': random.uniform(0.5, 0.9)
         }
+        # Normalize survival weights
         total = sum(ind['survival_weights'].values())
         for k in ind['survival_weights']:
             ind['survival_weights'][k] /= total
@@ -1627,6 +1633,9 @@ class KnowledgeGeneticOptimizer:
     def _initialize_population(self) -> List[Dict]:
         return [self._initialize_individual() for _ in range(self.population_size)]
 
+    # ----------------------------------------------------------------------
+    # Parameter application (with snapshot/restore)
+    # ----------------------------------------------------------------------
     def _apply_individual(self, individual: Dict):
         self._original_params = {
             'decay_rate': self.manager.config.default_decay_rate,
@@ -1643,109 +1652,407 @@ class KnowledgeGeneticOptimizer:
             self.manager.config.capture_threshold = self._original_params['capture_threshold']
             self.manager._survival_weights = self._original_params['survival_weights']
 
-    # ---------- Multi‑objective evaluation (NEW) ----------
+    # ----------------------------------------------------------------------
+    # Evaluation (with caching)
+    # ----------------------------------------------------------------------
     def _evaluate_individual(self, individual: Dict) -> Dict[str, float]:
-        """Evaluate an individual on multiple objectives."""
+        """Evaluate an individual on multiple objectives, using cache."""
+        # Create a cache key: tuple of (key, value) pairs, with nested dict converted to sorted items
+        key = self._individual_to_cache_key(individual)
+        if key in self._eval_cache:
+            return self._eval_cache[key]
+
+        # Apply individual parameters temporarily
         self._apply_individual(individual)
-        packages = list(self.manager.knowledge_bank.values())
-        avg_effective = np.mean([p.effective_score for p in packages]) if packages else 0.0
-        transfers = self.manager.transfer_history[-100:]
-        success_rate = sum(1 for t in transfers if t.successful_transfer) / max(len(transfers), 1)
-        # Package diversity: standard deviation of survival scores
-        if packages:
-            survival_scores = [p.survival_score for p in packages]
-            diversity = np.std(survival_scores) if len(survival_scores) > 1 else 0.5
-        else:
-            diversity = 0.5
-        # Recycling rate: proportion of packages that are recycled (effective_score < 0.3)
-        recycled = sum(1 for p in packages if p.effective_score < 0.3) / max(len(packages), 1)
-        recycling_rate = 1.0 - recycled  # higher is better (less recycling needed)
-        self._restore_original_parameters()
-        return {
-            'avg_effective': avg_effective,
-            'transfer_success_rate': success_rate,
-            'package_diversity': min(1.0, diversity),
-            'recycling_rate': recycling_rate
-        }
-
-    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
-        tournament = random.sample(range(len(population)), self.tournament_size)
-        best_idx = max(tournament, key=lambda i: fitness_scores[i])
-        return population[best_idx]
-
-    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
-        child = {}
-        child['survival_weights'] = {}
-        for k in parent1['survival_weights']:
-            if random.random() < 0.5:
-                child['survival_weights'][k] = parent1['survival_weights'][k]
+        try:
+            packages = list(self.manager.knowledge_bank.values())
+            avg_effective = np.mean([p.effective_score for p in packages]) if packages else 0.0
+            transfers = self.manager.transfer_history[-100:]
+            success_rate = sum(1 for t in transfers if t.successful_transfer) / max(len(transfers), 1)
+            # Package diversity: std of survival scores
+            if packages:
+                survival_scores = [p.survival_score for p in packages]
+                diversity = np.std(survival_scores) if len(survival_scores) > 1 else 0.5
             else:
-                child['survival_weights'][k] = parent2['survival_weights'][k]
-            if random.random() < 0.3:
-                child['survival_weights'][k] = (parent1['survival_weights'][k] + parent2['survival_weights'][k]) / 2
-        total = sum(child['survival_weights'].values())
-        for k in child['survival_weights']:
-            child['survival_weights'][k] /= total
-        child['decay_rate'] = parent1['decay_rate'] if random.random() < 0.5 else parent2['decay_rate']
-        if random.random() < 0.3:
-            child['decay_rate'] = (parent1['decay_rate'] + parent2['decay_rate']) / 2
-        child['capture_threshold'] = parent1['capture_threshold'] if random.random() < 0.5 else parent2['capture_threshold']
-        if random.random() < 0.3:
-            child['capture_threshold'] = (parent1['capture_threshold'] + parent2['capture_threshold']) / 2
-        return child
+                diversity = 0.5
+            # Recycling rate: higher is better (fewer packages needing recycling)
+            recycled = sum(1 for p in packages if p.effective_score < 0.3) / max(len(packages), 1)
+            recycling_rate = 1.0 - recycled
+            objectives = {
+                'avg_effective': avg_effective,
+                'transfer_success_rate': success_rate,
+                'package_diversity': min(1.0, diversity),
+                'recycling_rate': recycling_rate
+            }
+        finally:
+            self._restore_original_parameters()
 
-    def _mutate(self, individual: Dict) -> Dict:
+        self._eval_cache[key] = objectives
+        return objectives
+
+    def _individual_to_cache_key(self, individual: Dict) -> Tuple[Any, ...]:
+        """Convert individual to a hashable tuple for caching."""
+        # Sort keys and convert survival_weights to a sorted tuple
+        survival_weights_tuple = tuple(sorted(individual['survival_weights'].items()))
+        key = (
+            survival_weights_tuple,
+            individual['decay_rate'],
+            individual['capture_threshold']
+        )
+        return key
+
+    # ----------------------------------------------------------------------
+    # NSGA‑II core methods
+    # ----------------------------------------------------------------------
+    def _fast_non_dominated_sort(self, population: List[Dict], objectives: Dict[Tuple[Any, ...], Dict[str, float]]) -> List[List[Dict]]:
+        """Returns a list of fronts (each front is a list of individuals)."""
+        fronts = []
+        domination_count = {ind_key: 0 for ind_key in objectives}
+        dominated_solutions = {ind_key: [] for ind_key in objectives}
+
+        for p_key, p_obj in objectives.items():
+            for q_key, q_obj in objectives.items():
+                if p_key == q_key:
+                    continue
+                # p dominates q if p is better or equal in all objectives and strictly better in at least one
+                p_better = all(p_obj[k] >= q_obj[k] for k in p_obj)
+                p_strict = any(p_obj[k] > q_obj[k] for k in p_obj)
+                if p_better and p_strict:
+                    dominated_solutions[p_key].append(q_key)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[p_key] += 1
+
+            if domination_count[p_key] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p_key)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p_key in fronts[i]:
+                for q_key in dominated_solutions[p_key]:
+                    domination_count[q_key] -= 1
+                    if domination_count[q_key] == 0:
+                        next_front.append(q_key)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+
+        # Convert keys back to individuals
+        key_to_ind = {self._individual_to_cache_key(ind): ind for ind in population}
+        return [[key_to_ind[key] for key in front] for front in fronts]
+
+    def _crowding_distance(self, front: List[Dict], objectives: Dict[Tuple[Any, ...], Dict[str, float]]) -> Dict[Tuple[Any, ...], float]:
+        """Assign crowding distance to each individual in a front."""
+        if not front:
+            return {}
+        distances = {self._individual_to_cache_key(ind): 0.0 for ind in front}
+        obj_keys = list(next(iter(objectives.values())).keys())
+        for obj in obj_keys:
+            sorted_front = sorted(front, key=lambda ind: objectives[self._individual_to_cache_key(ind)][obj])
+            distances[self._individual_to_cache_key(sorted_front[0])] = float('inf')
+            distances[self._individual_to_cache_key(sorted_front[-1])] = float('inf')
+            obj_min = objectives[self._individual_to_cache_key(sorted_front[0])][obj]
+            obj_max = objectives[self._individual_to_cache_key(sorted_front[-1])][obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                key = self._individual_to_cache_key(sorted_front[i])
+                prev_key = self._individual_to_cache_key(sorted_front[i-1])
+                next_key = self._individual_to_cache_key(sorted_front[i+1])
+                distances[key] += (objectives[next_key][obj] - objectives[prev_key][obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[Dict]], crowding: Dict[Tuple[Any, ...], float]) -> Dict:
+        """Binary tournament selection based on rank and crowding distance."""
+        ind1 = random.choice(population)
+        ind2 = random.choice(population)
+        rank1 = self._get_rank(ind1, fronts)
+        rank2 = self._get_rank(ind2, fronts)
+        if rank1 < rank2:
+            return ind1
+        elif rank2 < rank1:
+            return ind2
+        else:
+            # Same front: compare crowding distance
+            key1 = self._individual_to_cache_key(ind1)
+            key2 = self._individual_to_cache_key(ind2)
+            if crowding.get(key1, 0) > crowding.get(key2, 0):
+                return ind1
+            else:
+                return ind2
+
+    def _get_rank(self, individual: Dict, fronts: List[List[Dict]]) -> int:
+        for i, front in enumerate(fronts):
+            if individual in front:
+                return i
+        return len(fronts)  # should not happen
+
+    def _sbx_crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
+        """Simulated Binary Crossover for continuous parameters."""
+        child1, child2 = {}, {}
+        # Crossover survival weights
+        child1['survival_weights'] = {}
+        child2['survival_weights'] = {}
+        for k in self.param_bounds['survival_weights']:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                low, high = self.param_bounds['survival_weights'][k]
+                val1 = 0.5 * ((1 + beta) * parent1['survival_weights'][k] + (1 - beta) * parent2['survival_weights'][k])
+                val2 = 0.5 * ((1 - beta) * parent1['survival_weights'][k] + (1 + beta) * parent2['survival_weights'][k])
+                val1 = max(low, min(high, val1))
+                val2 = max(low, min(high, val2))
+                child1['survival_weights'][k] = val1
+                child2['survival_weights'][k] = val2
+            else:
+                child1['survival_weights'][k] = parent1['survival_weights'][k]
+                child2['survival_weights'][k] = parent2['survival_weights'][k]
+        # Normalize survival weights
+        total1 = sum(child1['survival_weights'].values())
+        for k in child1['survival_weights']:
+            child1['survival_weights'][k] /= total1
+        total2 = sum(child2['survival_weights'].values())
+        for k in child2['survival_weights']:
+            child2['survival_weights'][k] /= total2
+
+        # Crossover decay_rate
+        low, high = self.param_bounds['decay_rate']
+        if random.random() < 0.5:
+            u = random.random()
+            if u <= 0.5:
+                beta = (2 * u) ** (1 / (20 + 1))
+            else:
+                beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+            val1 = 0.5 * ((1 + beta) * parent1['decay_rate'] + (1 - beta) * parent2['decay_rate'])
+            val2 = 0.5 * ((1 - beta) * parent1['decay_rate'] + (1 + beta) * parent2['decay_rate'])
+            child1['decay_rate'] = max(low, min(high, val1))
+            child2['decay_rate'] = max(low, min(high, val2))
+        else:
+            child1['decay_rate'] = parent1['decay_rate']
+            child2['decay_rate'] = parent2['decay_rate']
+
+        # Crossover capture_threshold
+        low, high = self.param_bounds['capture_threshold']
+        if random.random() < 0.5:
+            u = random.random()
+            if u <= 0.5:
+                beta = (2 * u) ** (1 / (20 + 1))
+            else:
+                beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+            val1 = 0.5 * ((1 + beta) * parent1['capture_threshold'] + (1 - beta) * parent2['capture_threshold'])
+            val2 = 0.5 * ((1 - beta) * parent1['capture_threshold'] + (1 + beta) * parent2['capture_threshold'])
+            child1['capture_threshold'] = max(low, min(high, val1))
+            child2['capture_threshold'] = max(low, min(high, val2))
+        else:
+            child1['capture_threshold'] = parent1['capture_threshold']
+            child2['capture_threshold'] = parent2['capture_threshold']
+
+        return child1, child2
+
+    def _polynomial_mutation(self, individual: Dict) -> Dict:
+        """Polynomial mutation for continuous parameters."""
         mutated = individual.copy()
-        for k in mutated['survival_weights']:
+        mutated['survival_weights'] = individual['survival_weights'].copy()
+        # Mutate survival weights
+        for k in self.param_bounds['survival_weights']:
             if random.random() < self.mutation_rate:
-                delta = random.uniform(-0.1, 0.1)
-                mutated['survival_weights'][k] = max(0.05, min(0.8, mutated['survival_weights'][k] + delta))
+                low, high = self.param_bounds['survival_weights'][k]
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutated['survival_weights'][k] = mutated['survival_weights'][k] + delta * (high - low)
+                mutated['survival_weights'][k] = max(low, min(high, mutated['survival_weights'][k]))
+        # Normalize survival weights
         total = sum(mutated['survival_weights'].values())
         for k in mutated['survival_weights']:
             mutated['survival_weights'][k] /= total
+        # Mutate decay_rate
         if random.random() < self.mutation_rate:
-            delta = random.uniform(-0.002, 0.002)
-            mutated['decay_rate'] = max(0.002, min(0.03, mutated['decay_rate'] + delta))
+            low, high = self.param_bounds['decay_rate']
+            u = random.random()
+            if u < 0.5:
+                delta = (2 * u) ** (1 / (20 + 1)) - 1
+            else:
+                delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+            mutated['decay_rate'] = mutated['decay_rate'] + delta * (high - low)
+            mutated['decay_rate'] = max(low, min(high, mutated['decay_rate']))
+        # Mutate capture_threshold
         if random.random() < self.mutation_rate:
-            delta = random.uniform(-0.05, 0.05)
-            mutated['capture_threshold'] = max(0.4, min(0.95, mutated['capture_threshold'] + delta))
+            low, high = self.param_bounds['capture_threshold']
+            u = random.random()
+            if u < 0.5:
+                delta = (2 * u) ** (1 / (20 + 1)) - 1
+            else:
+                delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+            mutated['capture_threshold'] = mutated['capture_threshold'] + delta * (high - low)
+            mutated['capture_threshold'] = max(low, min(high, mutated['capture_threshold']))
         return mutated
 
-    # ---------- Pareto front methods (NEW) ----------
-    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
-        """Return non‑dominated points."""
-        if not points:
-            return []
-        objective_keys = ['avg_effective', 'transfer_success_rate', 'package_diversity', 'recycling_rate']
-        pareto = []
-        for i, p_i in enumerate(points):
-            dominated = False
-            for j, p_j in enumerate(points):
-                if i == j:
-                    continue
-                a_vec = [getattr(p_i, k) for k in objective_keys]
-                b_vec = [getattr(p_j, k) for k in objective_keys]
-                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
-                    dominated = True
-                    break
-            if not dominated:
-                pareto.append(p_i)
-        return pareto
+    # ----------------------------------------------------------------------
+    # Dynamic objective weighting
+    # ----------------------------------------------------------------------
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        """Adjust weights based on current system state."""
+        weights = self.manager.config.mopd.objective_weights.copy()
+        # Get current system metrics
+        packages = list(self.manager.knowledge_bank.values())
+        if packages:
+            avg_effective = np.mean([p.effective_score for p in packages])
+            if avg_effective < 0.4:
+                weights['avg_effective'] = min(0.6, weights['avg_effective'] * 1.5)
+        transfers = self.manager.transfer_history[-50:]
+        if transfers:
+            success_rate = sum(1 for t in transfers if t.successful_transfer) / len(transfers)
+            if success_rate < 0.3:
+                weights['transfer_success_rate'] = min(0.6, weights['transfer_success_rate'] * 1.5)
+        # Normalize
+        total = sum(weights.values())
+        return {k: v / total for k, v in weights.items()}
 
-    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with MOPD weights."""
+    # ----------------------------------------------------------------------
+    # Main evolve (NSGA‑II)
+    # ----------------------------------------------------------------------
+    async def evolve(self, generations: Optional[int] = None) -> Dict:
+        async with self._lock:
+            if generations is None:
+                generations = self.generations
+
+            population = self._initialize_population()
+            objectives = {}
+            for ind in population:
+                key = self._individual_to_cache_key(ind)
+                objectives[key] = self._evaluate_individual(ind)
+
+            if self.manager.config.mopd.enabled:
+                self.pareto_front = []
+
+            for gen in range(generations):
+                # Create offspring population
+                offspring = []
+                while len(offspring) < self.population_size:
+                    # Need fronts and crowding for tournament
+                    pop_objectives = {k: objectives[k] for k in objectives if k in [self._individual_to_cache_key(i) for i in population]}
+                    fronts = self._fast_non_dominated_sort(population, pop_objectives)
+                    crowding = {}
+                    for front in fronts:
+                        front_crowding = self._crowding_distance(front, pop_objectives)
+                        crowding.update(front_crowding)
+                    parent1 = self._tournament_selection(population, fronts, crowding)
+                    parent2 = self._tournament_selection(population, fronts, crowding)
+                    if random.random() < self.crossover_rate:
+                        child1, child2 = self._sbx_crossover(parent1, parent2)
+                        child1 = self._polynomial_mutation(child1)
+                        child2 = self._polynomial_mutation(child2)
+                        offspring.extend([child1, child2])
+                    else:
+                        offspring.append(self._polynomial_mutation(parent1.copy()))
+                offspring = offspring[:self.population_size]
+
+                # Evaluate offspring
+                for ind in offspring:
+                    key = self._individual_to_cache_key(ind)
+                    if key not in objectives:
+                        objectives[key] = self._evaluate_individual(ind)
+
+                # Combine parent and offspring
+                combined = population + offspring
+                # Remove duplicates by cache key
+                unique_keys = {}
+                for ind in combined:
+                    key = self._individual_to_cache_key(ind)
+                    unique_keys[key] = ind
+                combined = list(unique_keys.values())
+
+                # Non‑dominated sorting on combined
+                combined_objectives = {self._individual_to_cache_key(ind): objectives[self._individual_to_cache_key(ind)] for ind in combined}
+                fronts = self._fast_non_dominated_sort(combined, combined_objectives)
+
+                # Select next population using NSGA‑II environmental selection
+                new_population = []
+                for front in fronts:
+                    if len(new_population) + len(front) <= self.population_size:
+                        new_population.extend(front)
+                    else:
+                        crowding = self._crowding_distance(front, combined_objectives)
+                        sorted_front = sorted(front, key=lambda ind: crowding.get(self._individual_to_cache_key(ind), 0), reverse=True)
+                        remaining = self.population_size - len(new_population)
+                        new_population.extend(sorted_front[:remaining])
+                        break
+
+                population = new_population
+
+                # Update Pareto front (first front)
+                pop_objectives = {self._individual_to_cache_key(ind): objectives[self._individual_to_cache_key(ind)] for ind in population}
+                fronts_pop = self._fast_non_dominated_sort(population, pop_objectives)
+                if fronts_pop:
+                    pareto_individuals = fronts_pop[0]
+                    self.pareto_front = []
+                    for ind in pareto_individuals:
+                        obj = pop_objectives[self._individual_to_cache_key(ind)]
+                        self.pareto_front.append(MOPDPoint(
+                            individual=ind,
+                            avg_effective=obj['avg_effective'],
+                            transfer_success_rate=obj['transfer_success_rate'],
+                            package_diversity=obj['package_diversity'],
+                            recycling_rate=obj['recycling_rate']
+                        ))
+                logger.debug(f"Generation {gen+1}/{generations}: population={len(population)}, Pareto front={len(self.pareto_front)}")
+
+            # After evolution, select best individual using dynamic weights
+            weights = self._compute_dynamic_weights()
+            if self.manager.config.mopd.enabled and self.pareto_front:
+                best_point = self._select_best_from_pareto(self.pareto_front, weights)
+                if best_point:
+                    self.best_individual = best_point.individual
+                    self.best_fitness = best_point.scalarised_score
+                    self._apply_individual(best_point.individual)
+                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
+            else:
+                # Fallback: pick best by weighted sum from population
+                pop_objectives = {self._individual_to_cache_key(ind): objectives[self._individual_to_cache_key(ind)] for ind in population}
+                best_ind = max(population, key=lambda ind: sum(weights[k] * pop_objectives[self._individual_to_cache_key(ind)][k] for k in weights))
+                best_obj = pop_objectives[self._individual_to_cache_key(best_ind)]
+                self.best_individual = best_ind
+                self.best_fitness = sum(weights[k] * best_obj[k] for k in weights)
+                self._apply_individual(best_ind)
+                logger.info(f"Applied best individual with scalarised fitness {self.best_fitness:.4f}")
+
+            # Record history
+            self.evolution_history.append({
+                'timestamp': datetime.utcnow(),
+                'best_fitness': self.best_fitness,
+                'pareto_front_size': len(self.pareto_front) if self.manager.config.mopd.enabled else 0,
+                'dynamic_weights': weights,
+                'generation_count': generations
+            })
+            # Save state
+            self.manager.storage.save_global_state('best_individual', json.dumps(self.best_individual))
+            self.manager.storage.save_global_state('best_fitness', str(self.best_fitness))
+            if self.manager.config.mopd.enabled:
+                self.manager.storage.save_pareto_front(self.pareto_front)
+            return {
+                'best_fitness': self.best_fitness,
+                'best_individual': self.best_individual,
+                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.manager.config.mopd.enabled else None,
+                'dynamic_weights': weights
+            }
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint], weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
         if not pareto_front:
             return None
-        weights = self.manager.config.mopd.objective_weights
+        if weights is None:
+            weights = self.manager.config.mopd.objective_weights
         objective_keys = list(weights.keys())
 
-        # Normalise objectives across Pareto front
-        max_vals = {}
-        min_vals = {}
-        for key in objective_keys:
-            vals = [getattr(p, key) for p in pareto_front]
-            max_vals[key] = max(vals)
-            min_vals[key] = min(vals)
+        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
         ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
 
         best = None
@@ -1755,117 +2062,20 @@ class KnowledgeGeneticOptimizer:
             for key in objective_keys:
                 val = getattr(point, key)
                 norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                weight = weights.get(key, 0.0)
-                score += weight * norm
+                score += weights.get(key, 0.0) * norm
             point.scalarised_score = score
             if score > best_score:
                 best_score = score
                 best = point
         return best
 
-    # ---------- Main evolve (enhanced with MOPD) ----------
-    async def evolve(self, generations: Optional[int] = None) -> Dict:
-        async with self._lock:
-            if generations is None:
-                generations = self.generations
-            population = self._initialize_population()
-
-            if self.manager.config.mopd.enabled:
-                self.pareto_front = []
-
-            for gen in range(generations):
-                # Evaluate objectives for all individuals
-                individuals_with_objs = []
-                for ind in population:
-                    objs = self._evaluate_individual(ind)
-                    individuals_with_objs.append((ind, objs))
-
-                # If MOPD enabled, update Pareto front
-                if self.manager.config.mopd.enabled:
-                    points = []
-                    for ind, objs in individuals_with_objs:
-                        point = MOPDPoint(
-                            individual=ind,
-                            avg_effective=objs['avg_effective'],
-                            transfer_success_rate=objs['transfer_success_rate'],
-                            package_diversity=objs['package_diversity'],
-                            recycling_rate=objs['recycling_rate']
-                        )
-                        points.append(point)
-                    self.pareto_front = self._filter_pareto(self.pareto_front + points)
-
-                    # Compute scalarised scores for selection
-                    weights = self.manager.config.mopd.objective_weights
-                    fitness_scores = []
-                    for point in points:
-                        score = (weights.get('avg_effective', 0.4) * point.avg_effective +
-                                 weights.get('transfer_success_rate', 0.3) * point.transfer_success_rate +
-                                 weights.get('package_diversity', 0.2) * point.package_diversity +
-                                 weights.get('recycling_rate', 0.1) * point.recycling_rate)
-                        point.scalarised_score = score
-                        fitness_scores.append(score)
-                else:
-                    # Legacy: single fitness (avg_effective)
-                    fitness_scores = [objs['avg_effective'] for _, objs in individuals_with_objs]
-
-                # Selection and reproduction
-                new_population = []
-                best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                new_population.append(population[best_idx])
-                while len(new_population) < self.population_size:
-                    if random.random() < self.crossover_rate:
-                        parent1 = self._select(population, fitness_scores)
-                        parent2 = self._select(population, fitness_scores)
-                        child = self._crossover(parent1, parent2)
-                        child = self._mutate(child)
-                        new_population.append(child)
-                    else:
-                        parent = self._select(population, fitness_scores)
-                        new_population.append(parent.copy())
-                population = new_population
-
-                gen_best_fitness = max(fitness_scores)
-                logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
-
-            # After evolution, if MOPD enabled and we have a Pareto front, select best
-            if self.manager.config.mopd.enabled and self.pareto_front:
-                best_point = self._select_best_from_pareto(self.pareto_front)
-                if best_point:
-                    self.best_individual = best_point.individual
-                    self.best_fitness = best_point.scalarised_score
-                    self._apply_individual(best_point.individual)
-                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
-            else:
-                # Legacy: keep best fitness and individual
-                if fitness_scores:
-                    best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                    self.best_fitness = fitness_scores[best_idx]
-                    self.best_individual = population[best_idx]
-                    self._apply_individual(self.best_individual)
-                    logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
-
-            self.evolution_history.append({
-                'timestamp': datetime.utcnow(),
-                'best_fitness': self.best_fitness,
-                'pareto_front_size': len(self.pareto_front) if self.manager.config.mopd.enabled else 0
-            })
-            # Save best individual and Pareto front to global state
-            self.manager.storage.save_global_state('best_individual', json.dumps(self.best_individual))
-            self.manager.storage.save_global_state('best_fitness', str(self.best_fitness))
-            if self.manager.config.mopd.enabled:
-                self.manager.storage.save_pareto_front(self.pareto_front)
-            return {
-                'best_fitness': self.best_fitness,
-                'best_individual': self.best_individual,
-                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.manager.config.mopd.enabled else None
-            }
-
     def get_status(self) -> Dict:
         return {
             'best_fitness': self.best_fitness,
             'best_individual': self.best_individual,
             'history': self.evolution_history[-10:],
-            'pareto_front_size': len(self.pareto_front) if self.manager.config.mopd.enabled else 0
+            'pareto_front_size': len(self.pareto_front) if self.manager.config.mopd.enabled else 0,
+            'cache_size': len(self._eval_cache)
         }
 
 # ============================================================================
