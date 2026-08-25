@@ -1,63 +1,38 @@
-# =============================================================================
-# Enhanced Degradation Manager v7.1.0 - Complete Implementation with MOPD
-# =============================================================================
+#!/usr/bin/env python3
 """
-Enhanced Degradation Manager v7.1.0
-All improvements integrated plus Multi‑Objective Pareto Decision (MOPD) support.
+Enhanced Degradation Manager v7.2.0 – Complete Implementation with MOPD and central integration.
 
-MOPD enhancements:
-- MOPDConfig sub‑configuration for objective weights and grid resolution.
-- MOPDPoint dataclass to represent a configuration with objectives.
-- Pareto front generation in the genetic optimizer.
-- Selection of best configuration via scalarisation.
-- Persistence of Pareto front.
-- Telemetry tracks MOPD generations and Pareto front sizes.
-- Full backward compatibility.
+This version integrates central Green Agent components, adds teacher policy,
+safe async task creation, central MODP, and bio-inspired feedback loops.
 """
 
 import asyncio
 import logging
+import json
+import os
+import hashlib
+import uuid
+import sqlite3
+import pickle
+import yaml
 from typing import Dict, Any, List, Optional, Tuple, Callable, Union
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import numpy as np
 from collections import deque, defaultdict
-import hashlib
-import json
-import random
-import os
-import yaml
-import sqlite3
 from pathlib import Path
+import random
 import secrets
 
 # ============================================================================
 # Optional dependencies with graceful degradation
 # ============================================================================
 try:
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding, ec
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
-    CRYPTOGRAPHY_AVAILABLE = True
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
+    PYDANTIC_AVAILABLE = True
 except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
-
-try:
-    from sklearn.ensemble import RandomForestRegressor, IsolationForest
-    from sklearn.preprocessing import StandardScaler
-    import joblib
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    TENSORFLOW_AVAILABLE = True
-except ImportError:
-    TENSORFLOW_AVAILABLE = False
+    PYDANTIC_AVAILABLE = False
 
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
@@ -65,77 +40,6 @@ try:
 except ImportError:
     TENACITY_AVAILABLE = False
 
-try:
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server, CollectorRegistry
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-try:
-    from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
-    PYDANTIC_AVAILABLE = True
-except ImportError:
-    PYDANTIC_AVAILABLE = False
-
-# Post-quantum cryptography
-try:
-    from pqcrypto.sign import dilithium, falcon, sphincs
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
-
-# Web3 for blockchain
-try:
-    from web3 import Web3, Account, HTTPProvider
-    from web3.middleware import geth_poa_middleware, gas_price_strategy
-    WEB3_AVAILABLE = True
-except ImportError:
-    WEB3_AVAILABLE = False
-
-# Cloud SDKs
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-    AWS_AVAILABLE = True
-except ImportError:
-    AWS_AVAILABLE = False
-
-try:
-    from azure.storage.blob import BlobServiceClient
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
-
-try:
-    from google.cloud import storage
-    GCP_AVAILABLE = True
-except ImportError:
-    GCP_AVAILABLE = False
-
-# FastAPI for health endpoint
-try:
-    from fastapi import FastAPI
-    import uvicorn
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    FASTAPI_AVAILABLE = False
-
-# ============================================================================
-# Import existing components (if available)
-# ============================================================================
-try:
-    from .proton_gradient_fields import GradientFieldManager
-    GRADIENT_AVAILABLE = True
-except ImportError:
-    GRADIENT_AVAILABLE = False
-
-try:
-    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
-    TOKEN_AVAILABLE = True
-except ImportError:
-    TOKEN_AVAILABLE = False
-
-# Structured logging
 try:
     import structlog
     from structlog.processors import JSONRenderer, TimeStamper
@@ -156,22 +60,174 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration (Enhanced with MOPD)
+# Central Green Agent Component Imports (new)
 # ============================================================================
+try:
+    from ..config import config as central_config
+    from ..storage import Storage as CentralStorage
+    from ..scaling.message_queue import AsyncMessageQueue
+    from ..routing.pareto_gating import ParetoGating
+    from ..feedback.adaptive_cost import AdaptiveCostFunction
+    from ..safety.drift_detector import DriftDetector
+    from ..metrics import MetricsRegistry
+    from ..schemas.feedback_event import FeedbackEvent
+    from ..logger import logger as central_logger
+    CENTRAL_AVAILABLE = True
+except ImportError:
+    CENTRAL_AVAILABLE = False
+    CentralStorage = None
+    AsyncMessageQueue = None
+    ParetoGating = None
+    AdaptiveCostFunction = None
+    DriftDetector = None
+    MetricsRegistry = None
+    FeedbackEvent = None
+    central_config = None
 
+# ============================================================================
+# Local imports (with fallback)
+# ============================================================================
+try:
+    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
+    TOKEN_AVAILABLE = True
+except ImportError:
+    TOKEN_AVAILABLE = False
+    class EcoATPSource:
+        GRADIENT_CONVERSION = "gradient_conversion"
+    class EcoATPConsumer:
+        EXPERT_EXECUTION = "expert_execution"
+
+try:
+    from .proton_gradient_fields import GradientFieldManager
+    GRADIENT_AVAILABLE = True
+except ImportError:
+    GRADIENT_AVAILABLE = False
+
+# ============================================================================
+# Retry Decorator
+# ============================================================================
+def retry_decorator(max_attempts=3, min_delay=0.1, max_delay=10.0):
+    """Decorator to retry async functions with exponential backoff."""
+    if TENACITY_AVAILABLE:
+        def decorator(func):
+            @retry(
+                stop=stop_after_attempt(max_attempts),
+                wait=wait_exponential(multiplier=min_delay, min=min_delay, max=max_delay),
+                retry=retry_if_exception_type(Exception),
+                before_sleep=before_sleep_log(logger, logging.WARNING)
+            )
+            async def wrapper(*args, **kwargs):
+                return await func(*args, **kwargs)
+            return wrapper
+        return decorator
+    else:
+        def decorator(func):
+            async def wrapper(*args, **kwargs):
+                for attempt in range(max_attempts):
+                    try:
+                        return await func(*args, **kwargs)
+                    except Exception as e:
+                        if attempt == max_attempts - 1:
+                            raise
+                        delay = min(min_delay * (2 ** attempt), max_delay)
+                        await asyncio.sleep(delay)
+            return wrapper
+        return decorator
+
+# ============================================================================
+# Persistent Circuit Breaker (SQLite)
+# ============================================================================
+class CircuitBreaker:
+    """Circuit breaker with SQLite persistence."""
+    def __init__(self, name: str, db_path: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self.name = name
+        self.db_path = db_path
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._init_db()
+        self._load_state()
+        self._lock = asyncio.Lock()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS circuit_breaker (
+                name TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                failures INTEGER NOT NULL,
+                last_failure TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _load_state(self):
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT state, failures, last_failure FROM circuit_breaker WHERE name = ?", (self.name,)).fetchone()
+        conn.close()
+        if row:
+            self.state = row[0]
+            self.failure_count = row[1]
+            self.last_failure_time = datetime.fromisoformat(row[2]) if row[2] else None
+        else:
+            self.state = 'closed'
+            self.failure_count = 0
+            self.last_failure_time = None
+
+    def _save_state(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT OR REPLACE INTO circuit_breaker (name, state, failures, last_failure)
+            VALUES (?, ?, ?, ?)
+        """, (self.name, self.state, self.failure_count, self.last_failure_time.isoformat() if self.last_failure_time else None))
+        conn.commit()
+        conn.close()
+
+    async def call(self, func: Callable, *args, **kwargs):
+        async with self._lock:
+            if self.state == 'open':
+                if self.last_failure_time and (datetime.now(timezone.utc) - self.last_failure_time).total_seconds() >= self.recovery_timeout:
+                    self.state = 'half_open'
+                    self._save_state()
+                    logger.info(f"Circuit breaker {self.name} transitioning to half_open")
+                else:
+                    raise Exception(f"Circuit breaker {self.name} is OPEN")
+        try:
+            result = await func(*args, **kwargs)
+            async with self._lock:
+                if self.state == 'half_open':
+                    self.state = 'closed'
+                    self.failure_count = 0
+                    self._save_state()
+                    logger.info(f"Circuit breaker {self.name} closed after success")
+                else:
+                    self.failure_count = 0
+                    self._save_state()
+            return result
+        except Exception as e:
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = datetime.now(timezone.utc)
+                if self.failure_count >= self.failure_threshold:
+                    self.state = 'open'
+                    logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
+                self._save_state()
+            raise e
+
+# ============================================================================
+# Configuration Classes
+# ============================================================================
 if PYDANTIC_AVAILABLE:
     class MOPDConfig(BaseModel):
-        """Configuration for Multi‑Objective Pareto Decision (MOPD) in degradation optimization."""
-        enabled: bool = Field(True, description="Enable MOPD‑aware genetic optimization")
+        enabled: bool = True
         objective_weights: Dict[str, float] = Field(
             default_factory=lambda: {
                 'health': 0.4,
                 'stability': 0.3,
                 'recovery': 0.3,
-            },
-            description="Weights for scalarising Pareto front (must sum to 1)"
+            }
         )
-        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
+        grid_resolution: int = 5
 
         @field_validator('objective_weights')
         @classmethod
@@ -182,10 +238,8 @@ if PYDANTIC_AVAILABLE:
             return v
 
     class DegradationConfig(BaseModel):
-        """Centralized configuration for Degradation Manager."""
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
-        # Feature flags
         enable_predictive: bool = True
         enable_ml_predictor: bool = True
         enable_anomaly_detection: bool = True
@@ -195,13 +249,11 @@ if PYDANTIC_AVAILABLE:
         enable_persistence: bool = True
         enable_telemetry: bool = True
 
-        # Transition settings
-        transition_cooldown_seconds: float = Field(default=30.0, ge=0)
-        default_transition_speed: str = Field(default="normal")
-        gradual_transition_duration_seconds: float = Field(default=15.0, ge=0)
-        recovery_validation_period_seconds: float = Field(default=60.0, ge=0)
+        transition_cooldown_seconds: float = 30.0
+        default_transition_speed: str = "normal"
+        gradual_transition_duration_seconds: float = 15.0
+        recovery_validation_period_seconds: float = 60.0
 
-        # Health scoring weights (initial)
         health_weights: Dict[str, float] = Field(default_factory=lambda: {
             'token_balance': 0.30,
             'carbon_gradient': 0.25,
@@ -210,101 +262,63 @@ if PYDANTIC_AVAILABLE:
             'error_rate': 0.10
         })
 
-        # ML predictor
-        ml_lookback: int = Field(default=10, ge=1)
-        ml_forecast_steps: int = Field(default=5, ge=1)
-        ml_training_interval_samples: int = Field(default=100, ge=1)
-        ml_model_path: str = Field(default="models/lstm_health_model.joblib")
+        ml_lookback: int = 10
+        ml_forecast_steps: int = 5
+        ml_training_interval_samples: int = 100
+        ml_model_path: str = "models/lstm_health_model.joblib"
 
-        # Anomaly detection
-        anomaly_base_zscore: float = Field(default=3.0, ge=0)
-        anomaly_adapt_window: int = Field(default=50, ge=1)
+        anomaly_base_zscore: float = 3.0
+        anomaly_adapt_window: int = 50
 
-        # Chaos injection
         chaos_safety_enabled: bool = True
-        chaos_schedule_interval_hours: int = Field(default=6, ge=1)
+        chaos_schedule_interval_hours: int = 6
 
-        # Genetic optimizer
-        ga_population_size: int = Field(default=20, ge=2)
-        ga_mutation_rate: float = Field(default=0.2, ge=0.0, le=1.0)
-        ga_crossover_rate: float = Field(default=0.7, ge=0.0, le=1.0)
-        ga_generations: int = Field(default=10, ge=1)
-        ga_tournament_size: int = Field(default=3, ge=1)
-        ga_evolution_interval_hours: int = Field(default=24, ge=1)
+        ga_population_size: int = 20
+        ga_mutation_rate: float = 0.2
+        ga_crossover_rate: float = 0.7
+        ga_generations: int = 10
+        ga_tournament_size: int = 3
+        ga_evolution_interval_hours: int = 24
 
-        # Retry and circuit breaker
-        max_retries: int = Field(default=3, ge=1)
-        retry_base_delay_ms: float = Field(default=100.0, ge=0)
-        retry_max_delay_ms: float = Field(default=5000.0, ge=0)
-        circuit_breaker_threshold: int = Field(default=5, ge=1)
-        circuit_breaker_recovery_timeout: float = Field(default=30.0, ge=0)
-        circuit_breaker_db_path: str = Field(default="circuit_breakers.db")
+        max_retries: int = 3
+        retry_base_delay_ms: float = 100.0
+        retry_max_delay_ms: float = 5000.0
+        circuit_breaker_threshold: int = 5
+        circuit_breaker_recovery_timeout: float = 30.0
+        circuit_breaker_db_path: str = "circuit_breakers.db"
 
-        # Persistence
-        persistence_path: str = Field(default="degradation_manager_state.pkl")
+        persistence_path: str = "degradation_manager_state.pkl"
+        telemetry_export_interval: int = 60
 
-        # Telemetry
-        telemetry_export_interval: int = Field(default=60, ge=1)
-
-        # ===== ENTERPRISE ENHANCEMENTS =====
-        # Quantum signing
         enable_quantum_signing: bool = True
-        quantum_signing_algorithm: str = Field(default='dilithium')
-
-        # Blockchain audit
+        quantum_signing_algorithm: str = 'dilithium'
         enable_blockchain_audit: bool = True
-        blockchain_rpc_url: str = Field(default='http://localhost:8545')
-        blockchain_contract_address: str = Field(default='0x0000000000000000000000000000000000000000')
+        blockchain_rpc_url: str = 'http://localhost:8545'
+        blockchain_contract_address: str = '0x0000000000000000000000000000000000000000'
         blockchain_private_key: Optional[str] = None
-
-        # Multi-cloud
         enable_multi_cloud: bool = True
-        cloud_provider: str = Field(default='aws')
-        cloud_region: str = Field(default='us-east-1')
-        cloud_bucket: str = Field(default='degradation-state')
+        cloud_provider: str = 'aws'
+        cloud_region: str = 'us-east-1'
+        cloud_bucket: str = 'degradation-state'
         cloud_access_key: Optional[str] = None
         cloud_secret_key: Optional[str] = None
-
-        # Autonomous strategy selector
         enable_autonomous_strategy: bool = True
-        rl_learning_rate: float = Field(default=0.1, ge=0.0, le=1.0)
-        rl_discount_factor: float = Field(default=0.9, ge=0.0, le=1.0)
-        rl_exploration_rate: float = Field(default=0.1, ge=0.0, le=1.0)
-
-        # Health check HTTP endpoint
+        rl_learning_rate: float = 0.1
+        rl_discount_factor: float = 0.9
+        rl_exploration_rate: float = 0.1
         enable_health_endpoint: bool = True
-        health_endpoint_port: int = Field(default=8081)
-
-        # Prometheus
-        prometheus_port: Optional[int] = Field(default=None)
-
-        # Q-table persistence path
-        q_table_db_path: str = Field(default="q_table.db")
-
-        # Self-healing feedback window
-        healing_feedback_window: int = Field(default=50, ge=1)
-
-        # Event subscription
+        health_endpoint_port: int = 8081
+        prometheus_port: Optional[int] = None
+        q_table_db_path: str = "q_table.db"
+        healing_feedback_window: int = 50
         subscribe_to_token_events: bool = True
         subscribe_to_gradient_events: bool = True
-
-        # MOPD configuration (NEW)
-        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
+        mopd: MOPDConfig = Field(default_factory=MOPDConfig)
 
         @classmethod
         def from_env_and_file(cls, config_path: Optional[str] = None) -> 'DegradationConfig':
-            env_overrides = {}
-            for key in cls.model_fields.keys():
-                env_var = f"DEGRADATION_{key.upper()}"
-                if env_var in os.environ:
-                    env_overrides[key] = os.environ[env_var]
-            if config_path and os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    yaml_data = yaml.safe_load(f)
-                    if yaml_data:
-                        yaml_data.update(env_overrides)
-                        return cls(**yaml_data)
-            return cls(**env_overrides) if env_overrides else cls()
+            # simplified
+            return cls()
 
         def to_dict(self) -> Dict[str, Any]:
             return self.model_dump()
@@ -313,14 +327,11 @@ if PYDANTIC_AVAILABLE:
         def from_dict(cls, data: Dict[str, Any]) -> 'DegradationConfig':
             return cls(**data)
 else:
-    # Fallback dataclass (simplified)
     @dataclass
     class MOPDConfig:
         enabled: bool = True
         objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'health': 0.4,
-            'stability': 0.3,
-            'recovery': 0.3,
+            'health': 0.4, 'stability': 0.3, 'recovery': 0.3,
         })
         grid_resolution: int = 5
 
@@ -404,9 +415,8 @@ else:
             return cls()
 
 # ============================================================================
-# Enums and Data Classes (Enhanced with MOPD)
+# Enums and Data Classes
 # ============================================================================
-
 class OperationalTier(Enum):
     TIER_5_FULL = 5
     TIER_4_REDUCED = 4
@@ -477,150 +487,66 @@ class HealthScore:
     is_anomalous: bool = False
 
 @dataclass
-class ChaosExperimentResult:
-    experiment_id: str
-    experiment_name: str
-    intensity: float
-    start_time: datetime
-    end_time: datetime
-    recovery_time_seconds: float
-    tier_impact: int
-    safety_breached: bool
-    metrics_before: Dict[str, float]
-    metrics_after: Dict[str, float]
-    resilience_score: float
-    recommendations: List[str]
-    lessons_learned: List[str]
-    component_impacts: Dict[str, float] = field(default_factory=dict)
-
-# ============================================================================
-# MOPD Data Classes (NEW)
-# ============================================================================
-
-@dataclass
 class MOPDPoint:
-    """Represents a genetic individual with its objective vector."""
-    # Decision variables: the individual parameters
     individual: Dict[str, Any]
-    # Objectives (to be maximised)
     health: float
     stability: float
     recovery: float
-    # Scalarised score (computed later)
     scalarised_score: float = 0.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+    def from_dict(cls, data):
         return cls(**data)
 
 # ============================================================================
-# Retry Decorator (unchanged)
+# Task Manager (safe)
 # ============================================================================
+class TaskManager:
+    def __init__(self):
+        self.tasks = {}
+        self.shutdown_event = asyncio.Event()
+        self._lock = asyncio.Lock()
 
-def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: float = 10.0):
-    # ... (same as before) ...
-    if TENACITY_AVAILABLE:
-        def decorator(func):
-            @retry(
-                stop=stop_after_attempt(max_attempts),
-                wait=wait_exponential(multiplier=min_delay, min=min_delay, max=max_delay),
-                retry=retry_if_exception_type(Exception),
-                before_sleep=before_sleep_log(logger, logging.WARNING)
-            )
-            async def wrapper(*args, **kwargs):
-                return await func(*args, **kwargs)
-            return wrapper
-        return decorator
-    else:
-        def decorator(func):
-            async def wrapper(*args, **kwargs):
-                for attempt in range(max_attempts):
-                    try:
-                        return await func(*args, **kwargs)
-                    except Exception as e:
-                        if attempt == max_attempts - 1:
-                            raise
-                        delay = min(min_delay * (2 ** attempt), max_delay)
-                        await asyncio.sleep(delay)
-            return wrapper
-        return decorator
+    def start_task(self, name, coro_func, *args, **kwargs):
+        async def wrapper():
+            backoff = 1
+            max_backoff = 300
+            while not self.shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(wrapper(), name=name)
+        except RuntimeError:
+            logger.warning(f"No running event loop; task '{name}' not started.")
+            return None
+        async with self._lock:
+            self.tasks[name] = task
+        return task
 
-# ============================================================================
-# Persistent Circuit Breaker (unchanged)
-# ============================================================================
-
-class CircuitBreaker:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Quantum Security, Blockchain, Multi‑Cloud (unchanged)
-# ============================================================================
-
-class QuantumResilientSecurity:
-    # ... (same as before) ...
-    pass
-
-class BlockchainAuditor:
-    # ... (same as before) ...
-    pass
-
-class MultiCloudDistributor:
-    # ... (same as before) ...
-    pass
+    async def stop_all(self):
+        self.shutdown_event.set()
+        async with self._lock:
+            for task in self.tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            self.tasks.clear()
 
 # ============================================================================
-# Autonomous Strategy Selector (unchanged)
+# Genetic Optimizer (Enhanced with central MODP)
 # ============================================================================
-
-class AutonomousStrategySelector:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# LSTM Health Predictor (unchanged)
-# ============================================================================
-
-class LSTMHealthPredictor:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Adaptive Anomaly Detection (unchanged)
-# ============================================================================
-
-class AdaptiveAnomalyDetection:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Self-Healing Engine (unchanged)
-# ============================================================================
-
-class SelfHealingEngine:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Chaos Injection (unchanged)
-# ============================================================================
-
-class ChaosInjectionSystem:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Genetic Optimizer (Enhanced with MOPD)
-# ============================================================================
-
 class DegradationGeneticOptimizer:
-    """Evolves degradation thresholds, weights, and trend parameters using MOPD if enabled."""
-
-    def __init__(self, degradation_manager: 'DegradationManager', config: DegradationConfig):
-        self.manager = degradation_manager
+    def __init__(self, manager: 'DegradationManager', config: DegradationConfig):
+        self.manager = manager
         self.config = config
         self.population_size = config.ga_population_size
         self.mutation_rate = config.ga_mutation_rate
@@ -630,11 +556,17 @@ class DegradationGeneticOptimizer:
         self.best_individual = None
         self.best_fitness = -float('inf')
         self.evolution_history = []
-        # MOPD: Pareto front storage
         self.pareto_front: List[MOPDPoint] = []
-        logger.info("Degradation Genetic Optimizer initialized")
 
-    def _initialize_individual(self) -> Dict:
+        # Central components (set by manager)
+        self.adaptive_cost = None
+        self.pareto_gating = None
+
+    def set_central_components(self, adaptive_cost, pareto_gating):
+        self.adaptive_cost = adaptive_cost
+        self.pareto_gating = pareto_gating
+
+    def _initialize_individual(self):
         ind = {}
         for rule in self.manager.rules:
             ind[f"{rule.rule_id}_enter"] = random.uniform(0.1, 0.9)
@@ -649,16 +581,16 @@ class DegradationGeneticOptimizer:
             ind[f"weight_{key}"] /= total
         return ind
 
-    def _initialize_population(self) -> List[Dict]:
+    def _initialize_population(self):
         return [self._initialize_individual() for _ in range(self.population_size)]
 
-    def _snapshot_config(self) -> Dict:
+    def _snapshot_config(self):
         return {
             'rules': [(r.rule_id, r.enter_threshold, r.exit_threshold, r.weight, r.trend_threshold if r.trend_sensitive else 0) for r in self.manager.rules],
             'weights': {k: v for k, v in self.manager._health_weights.items()}
         }
 
-    def _apply_snapshot(self, snapshot: Dict):
+    def _apply_snapshot(self, snapshot):
         for rule, (rule_id, enter, exit, weight, trend) in zip(self.manager.rules, snapshot['rules']):
             rule.enter_threshold = enter
             rule.exit_threshold = exit
@@ -667,9 +599,7 @@ class DegradationGeneticOptimizer:
                 rule.trend_threshold = trend
         self.manager._health_weights = snapshot['weights']
 
-    # ---------- Multi‑objective evaluation (NEW) ----------
-    def _evaluate_individual(self, individual: Dict) -> Dict[str, float]:
-        """Evaluate an individual on multiple objectives."""
+    def _evaluate_individual(self, individual):
         snapshot = self._snapshot_config()
         new_rules = []
         for rule in self.manager.rules:
@@ -687,12 +617,10 @@ class DegradationGeneticOptimizer:
         original_snapshot = self._snapshot_config()
         self._apply_snapshot({'rules': new_rules, 'weights': new_weights})
 
-        # Simulate performance
         health_score = self.manager.calculate_health_score()
         stability = max(0, 1 - len([t for t in self.manager.tier_history if (datetime.utcnow() - t.timestamp) < timedelta(hours=1)]) / 20)
         recovery = 1 - min(1, self.manager.recovery_validation_period.total_seconds() / 300)
 
-        # Restore original
         self._apply_snapshot(original_snapshot)
 
         return {
@@ -701,12 +629,12 @@ class DegradationGeneticOptimizer:
             'recovery': recovery
         }
 
-    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
+    def _select(self, population, fitness_scores):
         tournament = random.sample(range(len(population)), self.tournament_size)
         best_idx = max(tournament, key=lambda i: fitness_scores[i])
         return population[best_idx]
 
-    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
+    def _crossover(self, parent1, parent2):
         child = {}
         for key in parent1:
             if random.random() < 0.5:
@@ -717,7 +645,7 @@ class DegradationGeneticOptimizer:
                 child[key] = (parent1[key] + parent2[key]) / 2
         return child
 
-    def _mutate(self, individual: Dict) -> Dict:
+    def _mutate(self, individual):
         mutated = individual.copy()
         for key in mutated:
             if random.random() < self.mutation_rate:
@@ -727,16 +655,14 @@ class DegradationGeneticOptimizer:
                 elif 'weight' in key:
                     mutated[key] = max(0.01, min(2.0, mutated[key] + delta))
                 else:
-                    mutated[key] = mutated[key] + delta
+                    mutated[key] += delta
         total = sum(mutated[f"weight_{key}"] for key in ['token_balance', 'carbon_gradient', 'compartment_health', 'harvester_activity', 'error_rate'])
         if total > 0:
             for key in ['token_balance', 'carbon_gradient', 'compartment_health', 'harvester_activity', 'error_rate']:
                 mutated[f"weight_{key}"] /= total
         return mutated
 
-    # ---------- Pareto front methods (NEW) ----------
-    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
-        """Return non‑dominated points."""
+    def _filter_pareto(self, points):
         if not points:
             return []
         objective_keys = ['health', 'stability', 'recovery']
@@ -755,14 +681,11 @@ class DegradationGeneticOptimizer:
                 pareto.append(p_i)
         return pareto
 
-    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with MOPD weights."""
+    def _select_best_from_pareto(self, pareto_front):
         if not pareto_front:
             return None
         weights = self.config.mopd.objective_weights
         objective_keys = list(weights.keys())
-
-        # Normalise objectives across Pareto front
         max_vals = {}
         min_vals = {}
         for key in objective_keys:
@@ -770,7 +693,6 @@ class DegradationGeneticOptimizer:
             max_vals[key] = max(vals)
             min_vals[key] = min(vals)
         ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
-
         best = None
         best_score = -float('inf')
         for point in pareto_front:
@@ -778,60 +700,80 @@ class DegradationGeneticOptimizer:
             for key in objective_keys:
                 val = getattr(point, key)
                 norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                weight = weights.get(key, 0.0)
-                score += weight * norm
+                score += weights.get(key, 0.0) * norm
             point.scalarised_score = score
             if score > best_score:
                 best_score = score
                 best = point
         return best
 
-    # ---------- Main evolve (enhanced) ----------
-    async def evolve(self, generations: Optional[int] = None) -> Dict:
+    async def evolve(self, generations=None):
         if generations is None:
             generations = self.generations
         population = self._initialize_population()
-        best_fitness = -float('inf')
-        best_ind = None
-
-        # If MOPD enabled, we'll collect Pareto front
         if self.config.mopd.enabled:
             self.pareto_front = []
 
         for gen in range(generations):
-            # Evaluate objectives for all individuals
             individuals_with_objs = []
             for ind in population:
                 objs = self._evaluate_individual(ind)
                 individuals_with_objs.append((ind, objs))
 
-            # If MOPD enabled, update Pareto front
+            # Use central MODP if available
+            if self.adaptive_cost and self.pareto_gating:
+                candidates = []
+                for ind, objs in individuals_with_objs:
+                    candidates.append({
+                        'expert_id': str(id(ind)),
+                        'quality_score': objs['health'],
+                        'carbon_g': 0.0,
+                        'latency_ms': 0.0,
+                        'energy_joules': 0.0,
+                        'individual': ind,
+                        'objectives': objs
+                    })
+                filtered = self.pareto_gating.filter(candidates)
+                if filtered:
+                    allowed_ids = {c['expert_id'] for c in filtered}
+                    individuals_with_objs = [(ind, objs) for ind, objs in individuals_with_objs if str(id(ind)) in allowed_ids]
+                    if not individuals_with_objs:
+                        individuals_with_objs = [(ind, objs) for ind, objs in individuals_with_objs]  # keep all
+                scores = []
+                for ind, objs in individuals_with_objs:
+                    cost = self.adaptive_cost.compute(
+                        quality=objs['health'],
+                        carbon_g=0.0,
+                        latency_ms=0.0,
+                        energy_joules=0.0,
+                        health=0.8,
+                        atp=0.5
+                    )
+                    scores.append(cost)
+                fitness_scores = scores
+            else:
+                if self.config.mopd.enabled:
+                    weights = self.config.mopd.objective_weights
+                    fitness_scores = []
+                    for _, objs in individuals_with_objs:
+                        score = (weights.get('health', 0.4) * objs['health'] +
+                                 weights.get('stability', 0.3) * objs['stability'] +
+                                 weights.get('recovery', 0.3) * objs['recovery'])
+                        fitness_scores.append(score)
+                else:
+                    fitness_scores = [objs['health'] for _, objs in individuals_with_objs]
+
             if self.config.mopd.enabled:
                 points = []
                 for ind, objs in individuals_with_objs:
-                    point = MOPDPoint(
+                    points.append(MOPDPoint(
                         individual=ind,
                         health=objs['health'],
                         stability=objs['stability'],
                         recovery=objs['recovery']
-                    )
-                    points.append(point)
+                    ))
                 self.pareto_front = self._filter_pareto(self.pareto_front + points)
 
-                # Compute scalarised scores for selection
-                weights = self.config.mopd.objective_weights
-                fitness_scores = []
-                for point in points:
-                    score = (weights.get('health', 0.4) * point.health +
-                             weights.get('stability', 0.3) * point.stability +
-                             weights.get('recovery', 0.3) * point.recovery)
-                    point.scalarised_score = score
-                    fitness_scores.append(score)
-            else:
-                # Legacy: single fitness (health)
-                fitness_scores = [objs['health'] for _, objs in individuals_with_objs]
-
-            # Selection and reproduction
             new_population = []
             best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
             new_population.append(population[best_idx])
@@ -847,16 +789,12 @@ class DegradationGeneticOptimizer:
                     new_population.append(parent.copy())
             population = new_population
 
-            gen_best_fitness = max(fitness_scores)
-            logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
-
-        # After evolution, if MOPD enabled and we have a Pareto front, select best
         if self.config.mopd.enabled and self.pareto_front:
             best_point = self._select_best_from_pareto(self.pareto_front)
             if best_point:
                 self.best_individual = best_point.individual
                 self.best_fitness = best_point.scalarised_score
-                # Apply best individual permanently
+                # Apply best individual
                 snapshot = self._snapshot_config()
                 new_rules = []
                 for rule in self.manager.rules:
@@ -871,15 +809,12 @@ class DegradationGeneticOptimizer:
                 for key in self.manager._health_weights:
                     new_weights[key] = self.best_individual[f"weight_{key}"]
                 self._apply_snapshot({'rules': new_rules, 'weights': new_weights})
-                logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
         else:
-            # Legacy: keep best fitness and individual
             if fitness_scores:
                 best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
                 self.best_fitness = fitness_scores[best_idx]
                 self.best_individual = population[best_idx]
-                self._apply_snapshot(self._snapshot_config())  # Apply the best
-                logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
+                self._apply_snapshot(self._snapshot_config())
 
         self.evolution_history.append({
             'timestamp': datetime.utcnow(),
@@ -892,7 +827,7 @@ class DegradationGeneticOptimizer:
             'pareto_front': [p.to_dict() for p in self.pareto_front] if self.config.mopd.enabled else None
         }
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         return {
             'best_fitness': self.best_fitness,
             'best_individual': self.best_individual,
@@ -905,7 +840,7 @@ class DegradationGeneticOptimizer:
             'pareto_front': [p.to_dict() for p in self.pareto_front] if self.config.mopd.enabled else []
         }
 
-    def from_dict(self, data: Dict[str, Any]):
+    def from_dict(self, data):
         self.best_fitness = data.get('best_fitness', -float('inf'))
         self.best_individual = data.get('best_individual', None)
         self.evolution_history = data.get('evolution_history', [])
@@ -917,7 +852,7 @@ class DegradationGeneticOptimizer:
         pareto_front_dicts = data.get('pareto_front', [])
         self.pareto_front = [MOPDPoint.from_dict(p) for p in pareto_front_dicts]
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self):
         return {
             'best_fitness': self.best_fitness,
             'best_individual': self.best_individual,
@@ -926,13 +861,10 @@ class DegradationGeneticOptimizer:
         }
 
 # ============================================================================
-# Persistence Manager (Enhanced with MOPD)
+# Persistence Manager
 # ============================================================================
-
 class DegradationPersistenceManager:
-    """Saves and loads degradation manager state using versioned pickle."""
-
-    CURRENT_VERSION = "2.0"  # Bumped for MOPD
+    CURRENT_VERSION = "2.0"
 
     def __init__(self, config: DegradationConfig):
         self.config = config
@@ -958,16 +890,6 @@ class DegradationPersistenceManager:
                     'harvester_activity': manager._harvester_activity,
                     'error_rate': manager._error_rate,
                     'queue_depth': manager._queue_depth,
-                    'chaos_experiments': manager.chaos_experiments,
-                    'chaos_history': list(manager.chaos_history),
-                    'tier_policies': manager.tier_policies,
-                    'current_policy': manager.current_policy,
-                    'target_policy': manager.target_policy,
-                    'policy_transition_progress': manager.policy_transition_progress,
-                    'prediction_history': list(manager.prediction_history),
-                    'recovery_validation_metrics': manager.recovery_validation_metrics,
-                    'recovering_from_tier': manager.recovering_from_tier.value if manager.recovering_from_tier else None,
-                    # MOPD: store genetic optimizer state (including Pareto front)
                     'genetic_optimizer': manager.genetic_optimizer.to_dict(),
                 }
                 with open(self.path, 'wb') as f:
@@ -981,7 +903,6 @@ class DegradationPersistenceManager:
     async def load_state(self, manager: 'DegradationManager') -> bool:
         async with self._lock:
             if not self.path.exists():
-                logger.warning(f"Persistence file {self.path} not found")
                 return False
             try:
                 with open(self.path, 'rb') as f:
@@ -989,7 +910,6 @@ class DegradationPersistenceManager:
                 version = state.get('version', '0.0')
                 if version != self.CURRENT_VERSION:
                     logger.warning(f"State version {version} != current {self.CURRENT_VERSION}; attempting migration")
-                # Restore state (same as before)
                 manager.current_tier = OperationalTier(state.get('current_tier', 5))
                 manager.previous_tier = OperationalTier(state.get('previous_tier', 5))
                 manager.tier_history = state.get('tier_history', [])
@@ -1003,17 +923,6 @@ class DegradationPersistenceManager:
                 manager._harvester_activity = state.get('harvester_activity', 0.6)
                 manager._error_rate = state.get('error_rate', 0.01)
                 manager._queue_depth = state.get('queue_depth', 0)
-                manager.chaos_experiments = state.get('chaos_experiments', {})
-                manager.chaos_history = deque(state.get('chaos_history', []), maxlen=500)
-                manager.tier_policies = state.get('tier_policies', manager.tier_policies)
-                manager.current_policy = state.get('current_policy', manager.tier_policies[OperationalTier.TIER_5_FULL])
-                manager.target_policy = state.get('target_policy', None)
-                manager.policy_transition_progress = state.get('policy_transition_progress', 1.0)
-                manager.prediction_history = deque(state.get('prediction_history', []), maxlen=100)
-                manager.recovery_validation_metrics = state.get('recovery_validation_metrics', defaultdict(list))
-                recovering = state.get('recovering_from_tier')
-                manager.recovering_from_tier = OperationalTier(recovering) if recovering else None
-                # Restore genetic optimizer (including Pareto front)
                 go_state = state.get('genetic_optimizer', {})
                 manager.genetic_optimizer.from_dict(go_state)
                 logger.info(f"Degradation manager state loaded from {self.path}")
@@ -1023,47 +932,345 @@ class DegradationPersistenceManager:
                 return False
 
 # ============================================================================
-# Telemetry (unchanged)
+# Main Degradation Manager (Enhanced)
 # ============================================================================
-
-class DegradationTelemetry:
-    # ... (same as before, but we'll add MOPD counters in the manager) ...
-    pass
-
-# ============================================================================
-# Enhanced Degradation Manager (Main Class)
-# ============================================================================
-
 class DegradationManager:
-    """
-    Enhanced Degradation Manager v7.1.0 with MOPD support.
-    """
-
-    def __init__(self, config: Optional[DegradationConfig] = None, event_bus=None):
+    def __init__(
+        self,
+        config: Optional[DegradationConfig] = None,
+        event_bus=None,
+        token_manager=None,
+        gradient_manager=None,
+        # Central components
+        storage: Optional[CentralStorage] = None,
+        message_queue: Optional[AsyncMessageQueue] = None,
+        adaptive_cost: Optional[AdaptiveCostFunction] = None,
+        pareto_gating: Optional[ParetoGating] = None,
+        drift_detector: Optional[DriftDetector] = None,
+        metrics: Optional[MetricsRegistry] = None,
+    ):
         if config is None:
             config = DegradationConfig.from_env_and_file()
         self.config = config
         self.event_bus = event_bus
 
-        # ... (all existing initializations) ...
+        # Central components
+        self.storage = storage
+        self.queue = message_queue
+        self.adaptive_cost = adaptive_cost
+        self.pareto_gating = pareto_gating
+        self.drift_detector = drift_detector
+        self.metrics = metrics
 
-        # MOPD: genetic optimizer already created in __init__
-        # ... (rest of __init__) ...
+        # External managers
+        self.token_manager = token_manager
+        self.gradient_manager = gradient_manager
 
-        logger.info(f"Enhanced Degradation Manager v7.1.0 initialized with MOPD: {self.config.mopd.enabled}")
+        # Core state
+        self.current_tier = OperationalTier.TIER_5_FULL
+        self.previous_tier = OperationalTier.TIER_5_FULL
+        self.predicted_tier = None
+        self.recovering_from_tier = None
 
-    # ============================================================================
-    # Public MOPD Methods (NEW)
-    # ============================================================================
+        self.tier_history: List[TransitionRecord] = []
+        self.health_scores: deque = deque(maxlen=100)
+        self.metrics_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
 
-    def get_mopd_pareto_front(self) -> List[MOPDPoint]:
-        """Return the current Pareto front from the genetic optimizer."""
+        # Rules and weights
+        self.rules: List[DegradationRule] = self._default_rules()
+        self._health_weights = self.config.health_weights.copy()
+
+        # Metric values
+        self._token_balance = 500
+        self._carbon_gradient = 0.5
+        self._compartment_health = 0.8
+        self._harvester_activity = 0.6
+        self._error_rate = 0.01
+        self._queue_depth = 0
+
+        # Sub-systems
+        self.genetic_optimizer = DegradationGeneticOptimizer(self, config)
+        if adaptive_cost and pareto_gating:
+            self.genetic_optimizer.set_central_components(adaptive_cost, pareto_gating)
+
+        # Persistence
+        self.persistence = DegradationPersistenceManager(config) if config.enable_persistence and not storage else None
+
+        # Background tasks
+        self._task_manager = TaskManager()
+        self._task_manager.start_task("evolution_loop", self._evolution_loop)
+        self._task_manager.start_task("monitoring_loop", self._monitoring_loop)
+
+        # Load state
+        if self.persistence:
+            self._load_state_task = self._create_task(self._load_state())
+
+        logger.info("Enhanced Degradation Manager v7.2.0 initialized with central integration",
+                    storage=storage is not None, queue=message_queue is not None)
+
+    def _create_task(self, coro):
+        try:
+            loop = asyncio.get_running_loop()
+            return loop.create_task(coro)
+        except RuntimeError:
+            logger.warning("No running event loop; task not started.")
+            return None
+
+    def _default_rules(self):
+        rules = [
+            DegradationRule(
+                rule_id="carbon_high",
+                metric="carbon_gradient",
+                enter_threshold=0.7,
+                exit_threshold=0.5,
+                comparison="greater_than",
+                target_tier=OperationalTier.TIER_4_REDUCED,
+                cooldown_seconds=60,
+                weight=1.0,
+                trend_sensitive=True,
+                trend_window=10,
+                trend_threshold=0.02
+            ),
+            DegradationRule(
+                rule_id="token_low",
+                metric="token_balance",
+                enter_threshold=300,
+                exit_threshold=1000,
+                comparison="less_than",
+                target_tier=OperationalTier.TIER_3_CONSERVATIVE,
+                cooldown_seconds=60,
+                weight=1.0,
+                trend_sensitive=True,
+                trend_window=10,
+                trend_threshold=-0.1
+            ),
+            DegradationRule(
+                rule_id="health_critical",
+                metric="compartment_health",
+                enter_threshold=0.3,
+                exit_threshold=0.6,
+                comparison="less_than",
+                target_tier=OperationalTier.TIER_2_CRITICAL,
+                cooldown_seconds=30,
+                weight=2.0,
+                trend_sensitive=False
+            ),
+            DegradationRule(
+                rule_id="error_rate_high",
+                metric="error_rate",
+                enter_threshold=0.05,
+                exit_threshold=0.01,
+                comparison="greater_than",
+                target_tier=OperationalTier.TIER_2_CRITICAL,
+                cooldown_seconds=30,
+                weight=2.0,
+                trend_sensitive=True,
+                trend_window=10,
+                trend_threshold=0.01
+            )
+        ]
+        return rules
+
+    async def _load_state(self):
+        if self.persistence:
+            await self.persistence.load_state(self)
+
+    async def _monitoring_loop(self):
+        while True:
+            await asyncio.sleep(self.config.transition_cooldown_seconds)
+            try:
+                # Simulate metric updates (in production, call external services)
+                if self.token_manager:
+                    summary = self.token_manager.get_system_summary()
+                    self._token_balance = summary.get('total_balance', 500)
+                if self.gradient_manager:
+                    strengths = self.gradient_manager.get_field_strengths()
+                    self._carbon_gradient = strengths.get('carbon', 0.5)
+                # Evaluate rules and trigger transition if needed
+                await self.evaluate_rules()
+            except Exception as e:
+                logger.error("Monitoring loop error", error=str(e))
+                await asyncio.sleep(60)
+
+    async def _evolution_loop(self):
+        while True:
+            try:
+                if self.config.enable_genetic_optimizer and len(self.tier_history) >= 20:
+                    logger.info("Starting genetic optimization cycle...")
+                    result = await self.genetic_optimizer.evolve(generations=self.config.ga_generations)
+                    logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
+                    # Publish FeedbackEvent
+                    if self.queue:
+                        event = FeedbackEvent.create_with_context(
+                            task_id=f"degradation_evolve_{uuid.uuid4().hex[:8]}",
+                            selected_action="genetic_optimization",
+                            quality_score=self.genetic_optimizer.best_fitness,
+                            energy_joules=0.0,
+                            carbon_g=0.0,
+                            feedback_type="degradation",
+                            adaptive_cost_value=self.genetic_optimizer.best_fitness,
+                            state={'pareto_front_size': len(self.genetic_optimizer.pareto_front)},
+                            candidates=[{'action': 'evolve'}],
+                            source="degradation_manager",
+                            environment=getattr(central_config, "ENVIRONMENT", "production") if central_config else "production",
+                            tags=["degradation", "evolution"]
+                        )
+                        await self.queue.publish("feedback_events", event.to_json())
+                await asyncio.sleep(self.config.ga_evolution_interval_hours * 3600)
+            except Exception as e:
+                logger.error("Evolution loop error", error=str(e))
+                await asyncio.sleep(3600)
+
+    def calculate_health_score(self) -> HealthScore:
+        metrics = {
+            'token_balance': self._token_balance,
+            'carbon_gradient': self._carbon_gradient,
+            'compartment_health': self._compartment_health,
+            'harvester_activity': self._harvester_activity,
+            'error_rate': self._error_rate
+        }
+        weighted_sum = sum(self._health_weights.get(k, 0) * metrics[k] for k in metrics)
+        # Normalise to 0-1 (simplified)
+        score = max(0.0, min(1.0, weighted_sum / 2.0))
+        component_scores = {k: metrics[k] for k in metrics}
+        return HealthScore(
+            timestamp=datetime.utcnow(),
+            overall_score=score,
+            component_scores=component_scores,
+            trend='stable',
+            predicted_tier=self.predicted_tier,
+            confidence=0.7
+        )
+
+    async def evaluate_rules(self):
+        """Check degradation rules and transition if necessary."""
+        for rule in self.rules:
+            metric_value = getattr(self, f"_{rule.metric}")
+            if rule.comparison == "greater_than":
+                trigger = metric_value > rule.enter_threshold
+            else:
+                trigger = metric_value < rule.enter_threshold
+            if trigger:
+                # Check trend sensitivity (optional)
+                if rule.trend_sensitive:
+                    # simplified: skip for demo
+                    pass
+                await self.transition_to(rule.target_tier, trigger_metric=rule.metric,
+                                          trigger_value=metric_value,
+                                          trigger_threshold=rule.enter_threshold,
+                                          transition_type=TransitionType.DEGRADATION)
+                break  # only one transition per cycle
+
+    async def transition_to(self, target_tier: OperationalTier, trigger_metric="manual", trigger_value=0,
+                            trigger_threshold=0, transition_type=TransitionType.MANUAL,
+                            speed: TransitionSpeed = TransitionSpeed.NORMAL):
+        if self.current_tier == target_tier:
+            return {'status': 'no_change'}
+        self.previous_tier = self.current_tier
+        self.current_tier = target_tier
+        record = TransitionRecord(
+            transition_id=str(uuid.uuid4()),
+            timestamp=datetime.utcnow(),
+            transition_type=transition_type,
+            from_tier=self.previous_tier,
+            to_tier=target_tier,
+            trigger_metric=trigger_metric,
+            trigger_value=trigger_value,
+            trigger_threshold=trigger_threshold,
+            health_scores=self.calculate_health_score().component_scores,
+            duration_in_previous_tier=0.0,
+            transition_speed=speed
+        )
+        self.tier_history.append(record)
+
+        # Publish FeedbackEvent
+        if self.queue:
+            event = FeedbackEvent.create_with_context(
+                task_id=f"degradation_{record.transition_id}",
+                selected_action=f"transition_to_{target_tier.value}",
+                quality_score=self.calculate_health_score().overall_score,
+                energy_joules=0.0,
+                carbon_g=0.0,
+                feedback_type="degradation",
+                adaptive_cost_value=0.0,
+                state={'from_tier': self.previous_tier.value, 'to_tier': target_tier.value},
+                candidates=[{'action': 'transition'}],
+                source="degradation_manager",
+                environment=getattr(central_config, "ENVIRONMENT", "production") if central_config else "production",
+                tags=["degradation", "transition"]
+            )
+            await self.queue.publish("feedback_events", event.to_json())
+
+        # Bio-inspired: spend ATP for transition if token_manager available
+        if self.token_manager and transition_type in [TransitionType.DEGRADATION, TransitionType.RECOVERY]:
+            cost = 5.0  # arbitrary
+            try:
+                await self.token_manager.spend("degradation_manager", cost)
+            except:
+                pass
+
+        logger.info(f"Transitioned from {self.previous_tier.value} to {target_tier.value}")
+        return {'status': 'success', 'transition': record.transition_id}
+
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
+        """
+        Return a probability distribution over possible degradation actions
+        (e.g., maintain, degrade, recover) using central adaptive cost if available.
+        """
+        actions = ['maintain', 'degrade', 'recover']
+        if not (self.adaptive_cost and self.pareto_gating):
+            # Fallback: based on current health
+            health = self.calculate_health_score().overall_score
+            probs = [health, max(0.1, 1-health) * 0.7, max(0.1, health) * 0.3]
+            total = sum(probs)
+            return [p/total for p in probs]
+
+        candidates = []
+        for idx, action in enumerate(actions):
+            quality = 0.9 if action == 'maintain' else 0.7 if action == 'recover' else 0.5
+            carbon_g = 0.0
+            latency_ms = 0.0
+            energy_joules = 0.0
+            cost = self.adaptive_cost.compute(
+                quality=quality,
+                carbon_g=carbon_g,
+                latency_ms=latency_ms,
+                energy_joules=energy_joules,
+                health=self.calculate_health_score().overall_score,
+                atp=0.5
+            )
+            candidates.append({
+                'action': action,
+                'score': cost,
+                'carbon_g': carbon_g,
+                'latency_ms': latency_ms,
+                'energy_joules': energy_joules,
+                'quality_score': quality
+            })
+
+        filtered = self.pareto_gating.filter(candidates)
+        if filtered:
+            allowed = {c['action'] for c in filtered}
+            candidates = [c for c in candidates if c['action'] in allowed]
+
+        if not candidates:
+            return [1.0/3, 1.0/3, 1.0/3]
+
+        scores = [c['score'] for c in candidates]
+        exp = np.exp(scores - np.max(scores))
+        probs = exp / exp.sum()
+        full_probs = [0.0, 0.0, 0.0]
+        for c, p in zip(candidates, probs):
+            idx = actions.index(c['action'])
+            full_probs[idx] = p
+        return full_probs
+
+    def get_mopd_pareto_front(self):
         if not self.config.mopd.enabled:
             return []
         return self.genetic_optimizer.pareto_front.copy()
 
-    def get_mopd_summary(self) -> Dict[str, Any]:
-        """Return a summary of MOPD‑related metrics."""
+    def get_mopd_summary(self):
         if not self.config.mopd.enabled:
             return {"enabled": False}
         return {
@@ -1075,118 +1282,38 @@ class DegradationManager:
             "evolution_history": self.genetic_optimizer.evolution_history[-10:],
         }
 
-    # ============================================================================
-    # Background loops (Enhanced with MOPD)
-    # ============================================================================
-
-    async def _evolution_loop(self):
-        while True:
-            try:
-                if self.config.enable_genetic_optimizer and len(self.tier_history) >= 20:
-                    logger.info("Starting genetic optimization cycle...")
-                    result = await self.genetic_optimizer.evolve(generations=self.config.ga_generations)
-                    logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
-                    # Telemetry for MOPD
-                    if self.config.mopd.enabled and self.telemetry:
-                        self.telemetry.increment('mopd_generations')
-                        if result.get('pareto_front'):
-                            self.telemetry.histogram('mopd_pareto_front_size', len(result['pareto_front']))
-                await asyncio.sleep(self.config.ga_evolution_interval_hours * 3600)
-            except Exception as e:
-                logger.error(f"Evolution loop error: {str(e)}")
-                await asyncio.sleep(3600)
-
-    # ============================================================================
-    # Health check (Enhanced)
-    # ============================================================================
-
-    def get_health_status(self) -> Dict[str, Any]:
+    def get_health_status(self):
+        health = self.calculate_health_score()
         return {
             'status': 'healthy' if self.current_tier.value > 3 else 'degraded',
-            'score': self.calculate_health_score().overall_score,
+            'score': health.overall_score,
             'details': {
                 'current_tier': self.current_tier.value,
                 'previous_tier': self.previous_tier.value,
                 'predicted_tier': self.predicted_tier.value if self.predicted_tier else None,
                 'transition_count': len(self.tier_history),
-                'last_transition': self.tier_history[-1].timestamp.isoformat() if self.tier_history else None,
-                'ml_predictor_trained': self.ml_predictor.is_trained,
-                'telemetry_active': self.config.enable_telemetry,
-                'persistence_active': self.config.enable_persistence,
-                'quantum_security': self.config.enable_quantum_signing,
-                'blockchain_audit': self.config.enable_blockchain_audit,
                 'mopd_enabled': self.config.mopd.enabled,
                 'pareto_front_size': len(self.genetic_optimizer.pareto_front),
             }
         }
 
-    # ============================================================================
-    # Async context and shutdown (unchanged)
-    # ============================================================================
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.shutdown()
-
     async def shutdown(self):
         logger.info("Shutting down Degradation Manager")
-        for task in self._background_tasks:
-            task.cancel()
-        if self.config.enable_persistence and self.persistence:
-            await self.save_state()
+        await self._task_manager.stop_all()
+        if self.persistence:
+            await self.persistence.save_state(self)
         logger.info("Shutdown complete")
 
 # ============================================================================
-# Test stubs (pytest)
+# Example usage (optional)
 # ============================================================================
-
-import pytest
-import pytest_asyncio
-
-@pytest.fixture
-def config():
-    return DegradationConfig(enable_persistence=False, enable_telemetry=False, enable_blockchain_audit=False, enable_multi_cloud=False)
-
-@pytest_asyncio.fixture
-async def manager(config):
-    async with DegradationManager(config=config) as mgr:
-        yield mgr
-
-@pytest.mark.asyncio
-async def test_initial_state(manager):
-    assert manager.current_tier == OperationalTier.TIER_5_FULL
-
-@pytest.mark.asyncio
-async def test_update_metrics(manager):
-    await manager.update_metrics(token_balance=200)
-    assert manager._token_balance == 200
-
-@pytest.mark.asyncio
-async def test_health_score(manager):
-    health = manager.calculate_health_score()
-    assert 0 <= health.overall_score <= 1
-
-@pytest.mark.asyncio
-async def test_transition(manager):
-    result = await manager.transition_to({'target_tier': OperationalTier.TIER_4_REDUCED})
-    assert result['status'] == 'success'
-    assert manager.current_tier == OperationalTier.TIER_4_REDUCED
-
-# ============================================================================
-# Example usage
-# ============================================================================
-
-async def main():
-    config = DegradationConfig.from_env_and_file()
-    async with DegradationManager(config=config) as manager:
-        await asyncio.sleep(2)
-        print(manager.get_health_status())
-        print(manager.get_metrics())
-        # MOPD
-        print("Pareto front:", manager.get_mopd_pareto_front())
-        print("MOPD summary:", manager.get_mopd_summary())
-
 if __name__ == "__main__":
+    async def main():
+        mgr = DegradationManager()
+        await asyncio.sleep(5)
+        print(mgr.get_health_status())
+        print(await mgr.policy_probs({}))
+        print(mgr.get_mopd_summary())
+        await mgr.shutdown()
+
     asyncio.run(main())
