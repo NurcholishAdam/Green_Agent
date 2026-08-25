@@ -8,11 +8,12 @@ All improvements integrated plus Multi‑Objective Pareto Decision (MOPD) suppor
 MOPD enhancements:
 - MOPDConfig sub‑configuration for objective weights and grid resolution.
 - MOPDPoint dataclass to represent a configuration with objectives.
-- Pareto front generation in the CoreGeneticOptimizer.
+- Pareto front generation in the CoreGeneticOptimizer (now NSGA‑II).
 - Selection of best configuration via scalarisation.
 - Persistence of Pareto front.
 - Telemetry tracks MOPD generations and Pareto front sizes.
 - Full backward compatibility.
+- Change detection to trigger early re‑optimization.
 """
 
 import asyncio
@@ -26,6 +27,7 @@ import importlib
 import hashlib
 import pickle
 import sqlite3
+import uuid
 from typing import Dict, Any, List, Optional, Tuple, Protocol, Callable, Set, Union, TypeVar
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -1250,11 +1252,11 @@ class ConfigurationVersionManager:
         return diff
 
 # ============================================================================
-# Genetic Optimizer (Enhanced with MOPD)
+# Enhanced CoreGeneticOptimizer (NSGA‑II)
 # ============================================================================
 
 class CoreGeneticOptimizer:
-    """Genetic optimizer that uses configuration snapshots for safe evaluation."""
+    """NSGA‑II based genetic optimizer for multi‑objective parameter tuning."""
     def __init__(self, core: 'EnhancedBioInspiredCore'):
         self.core = core
         self.population_size = 20
@@ -1273,9 +1275,15 @@ class CoreGeneticOptimizer:
             'anomaly_zscore_threshold': (2.0, 5.0),
             'module_retirement_threshold': (0.1, 0.4)
         }
-        # MOPD: Pareto front storage
+        # Pareto front storage
         self.pareto_front: List[MOPDPoint] = []
+        # Evaluation cache: key = tuple of sorted individual items -> objectives
+        self._eval_cache: Dict[Tuple[Any, ...], Dict[str, float]] = {}
+        self._last_summary_signature: Optional[str] = None  # for change detection
 
+    # ----------------------------------------------------------------------
+    # Initialization and parameter helpers
+    # ----------------------------------------------------------------------
     def _initialize_individual(self) -> Dict:
         ind = {}
         for key, (low, high) in self.param_bounds.items():
@@ -1306,11 +1314,18 @@ class CoreGeneticOptimizer:
         self.core._anomaly_detector.zscore_threshold = snapshot['anomaly_zscore_threshold']
         self.core._module_retirement_threshold = snapshot['module_retirement_threshold']
 
-    # ---------- Multi‑objective evaluation (NEW) ----------
+    # ----------------------------------------------------------------------
+    # Evaluation (with caching)
+    # ----------------------------------------------------------------------
     def _evaluate_individual(self, individual: Dict) -> Dict[str, float]:
-        """Evaluate an individual on multiple objectives."""
-        snapshot = self._snapshot_config()
-        # Modify snapshot with individual's parameters
+        """Evaluate an individual on multiple objectives, using cache."""
+        key = tuple(sorted(individual.items()))
+        if key in self._eval_cache:
+            return self._eval_cache[key]
+
+        # Save original config
+        original_snapshot = self._snapshot_config()
+        # Apply individual params
         modified = {
             'health_check_interval_seconds': individual['health_check_interval_seconds'],
             'circuit_breaker_threshold': individual['circuit_breaker_threshold'],
@@ -1318,183 +1333,283 @@ class CoreGeneticOptimizer:
             'anomaly_zscore_threshold': individual['anomaly_zscore_threshold'],
             'module_retirement_threshold': individual['module_retirement_threshold']
         }
-        # Apply modified snapshot
-        original_snapshot = self._snapshot_config()
         self._apply_snapshot(modified)
-        # Simulate performance
-        status = self.core.get_system_status()
-        modules_health = asyncio.run(self.core.registry.health_check_all())
-        health_scores = [1.0 if s['status'] == 'healthy' else 0.5 if s['status'] == 'degraded' else 0.0 for s in modules_health.values()]
-        avg_health = np.mean(health_scores) if health_scores else 0.5
-        uptime = status.get('uptime_seconds', 0)
-        uptime_score = min(1.0, uptime / 86400)
-        open_circuits = sum(1 for m in self.core.registry.modules.values() if m.circuit_breaker_state == 'open')
-        circuit_score = max(0, 1.0 - open_circuits / max(1, len(self.core.registry.modules) * 0.5))
-        anomaly_report = asyncio.run(self.core._anomaly_detector.get_anomaly_report())
-        anomaly_count = len(anomaly_report.get('anomalies', []))
-        anomaly_score = max(0, 1.0 - anomaly_count / 20)
-        # Restore original snapshot
-        self._apply_snapshot(original_snapshot)
-        return {
-            'health_score': avg_health,
-            'uptime_score': uptime_score,
-            'circuit_score': circuit_score,
-            'anomaly_score': anomaly_score
-        }
 
-    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
-        tournament = random.sample(range(len(population)), self.tournament_size)
-        best_idx = max(tournament, key=lambda i: fitness_scores[i])
-        return population[best_idx]
+        try:
+            # Simulate performance
+            status = self.core.get_system_status()
+            modules_health = asyncio.run(self.core.registry.health_check_all())
+            health_scores = [1.0 if s['status'] == 'healthy' else 0.5 if s['status'] == 'degraded' else 0.0 for s in modules_health.values()]
+            avg_health = np.mean(health_scores) if health_scores else 0.5
+            uptime = status.get('uptime_seconds', 0)
+            uptime_score = min(1.0, uptime / 86400)
+            open_circuits = sum(1 for m in self.core.registry.modules.values() if m.circuit_breaker_state == 'open')
+            circuit_score = max(0, 1.0 - open_circuits / max(1, len(self.core.registry.modules) * 0.5))
+            anomaly_report = asyncio.run(self.core._anomaly_detector.get_anomaly_report())
+            anomaly_count = len(anomaly_report.get('anomalies', []))
+            anomaly_score = max(0, 1.0 - anomaly_count / 20)
 
-    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
-        child = {}
-        for key in parent1:
-            if random.random() < 0.5:
-                child[key] = parent1[key]
+            objectives = {
+                'health_score': avg_health,
+                'uptime_score': uptime_score,
+                'circuit_score': circuit_score,
+                'anomaly_score': anomaly_score
+            }
+        finally:
+            # Restore original
+            self._apply_snapshot(original_snapshot)
+
+        self._eval_cache[key] = objectives
+        return objectives
+
+    # ----------------------------------------------------------------------
+    # NSGA‑II components
+    # ----------------------------------------------------------------------
+    def _fast_non_dominated_sort(self, population: List[Dict], objectives: Dict[Tuple, Dict[str, float]]) -> List[List[Dict]]:
+        """Returns a list of fronts (each front is a list of individuals)."""
+        fronts = []
+        domination_count = {ind_key: 0 for ind_key in objectives}
+        dominated_solutions = {ind_key: [] for ind_key in objectives}
+
+        for p_key, p_obj in objectives.items():
+            for q_key, q_obj in objectives.items():
+                if p_key == q_key:
+                    continue
+                # p dominates q if p is better or equal in all objectives and strictly better in at least one
+                p_better = all(p_obj[k] >= q_obj[k] for k in p_obj)
+                p_strict = any(p_obj[k] > q_obj[k] for k in p_obj)
+                if p_better and p_strict:
+                    dominated_solutions[p_key].append(q_key)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[p_key] += 1
+
+            if domination_count[p_key] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p_key)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p_key in fronts[i]:
+                for q_key in dominated_solutions[p_key]:
+                    domination_count[q_key] -= 1
+                    if domination_count[q_key] == 0:
+                        next_front.append(q_key)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+
+        # Convert keys back to individuals
+        key_to_ind = {tuple(sorted(ind.items())): ind for ind in population}
+        return [[key_to_ind[key] for key in front] for front in fronts]
+
+    def _crowding_distance(self, front: List[Dict], objectives: Dict[Tuple, Dict[str, float]]) -> Dict[Tuple, float]:
+        """Assign crowding distance to each individual in a front."""
+        if not front:
+            return {}
+        distances = {tuple(sorted(ind.items())): 0.0 for ind in front}
+        obj_keys = list(next(iter(objectives.values())).keys())
+        for obj in obj_keys:
+            sorted_front = sorted(front, key=lambda ind: objectives[tuple(sorted(ind.items()))][obj])
+            distances[tuple(sorted(sorted_front[0].items()))] = float('inf')
+            distances[tuple(sorted(sorted_front[-1].items()))] = float('inf')
+            obj_min = objectives[tuple(sorted(sorted_front[0].items()))][obj]
+            obj_max = objectives[tuple(sorted(sorted_front[-1].items()))][obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                key = tuple(sorted(sorted_front[i].items()))
+                prev_key = tuple(sorted(sorted_front[i-1].items()))
+                next_key = tuple(sorted(sorted_front[i+1].items()))
+                distances[key] += (objectives[next_key][obj] - objectives[prev_key][obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[Dict]], crowding: Dict[Tuple, float]) -> Dict:
+        ind1 = random.choice(population)
+        ind2 = random.choice(population)
+        rank1 = self._get_rank(ind1, fronts)
+        rank2 = self._get_rank(ind2, fronts)
+        if rank1 < rank2:
+            return ind1
+        elif rank2 < rank1:
+            return ind2
+        else:
+            key1 = tuple(sorted(ind1.items()))
+            key2 = tuple(sorted(ind2.items()))
+            if crowding.get(key1, 0) > crowding.get(key2, 0):
+                return ind1
             else:
-                child[key] = parent2[key]
-            if random.random() < 0.3:
-                child[key] = (parent1[key] + parent2[key]) / 2
-        child['circuit_breaker_threshold'] = int(child['circuit_breaker_threshold'])
-        child['health_check_interval_seconds'] = int(child['health_check_interval_seconds'])
-        child['predictive_health_retrain_interval'] = int(child['predictive_health_retrain_interval'])
-        return child
+                return ind2
 
-    def _mutate(self, individual: Dict) -> Dict:
+    def _get_rank(self, individual: Dict, fronts: List[List[Dict]]) -> int:
+        for i, front in enumerate(fronts):
+            if individual in front:
+                return i
+        return len(fronts)  # should not happen
+
+    def _sbx_crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
+        """Simulated Binary Crossover for continuous variables."""
+        child1, child2 = {}, {}
+        for key in self.param_bounds:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                val1 = 0.5 * ((1 + beta) * parent1[key] + (1 - beta) * parent2[key])
+                val2 = 0.5 * ((1 - beta) * parent1[key] + (1 + beta) * parent2[key])
+                low, high = self.param_bounds[key]
+                val1 = max(low, min(high, val1))
+                val2 = max(low, min(high, val2))
+                child1[key] = val1
+                child2[key] = val2
+            else:
+                child1[key] = parent1[key]
+                child2[key] = parent2[key]
+        # Cast integer fields
+        child1['circuit_breaker_threshold'] = int(child1['circuit_breaker_threshold'])
+        child1['health_check_interval_seconds'] = int(child1['health_check_interval_seconds'])
+        child1['predictive_health_retrain_interval'] = int(child1['predictive_health_retrain_interval'])
+        child2['circuit_breaker_threshold'] = int(child2['circuit_breaker_threshold'])
+        child2['health_check_interval_seconds'] = int(child2['health_check_interval_seconds'])
+        child2['predictive_health_retrain_interval'] = int(child2['predictive_health_retrain_interval'])
+        return child1, child2
+
+    def _polynomial_mutation(self, individual: Dict) -> Dict:
+        """Polynomial mutation for continuous variables."""
         mutated = individual.copy()
         for key, (low, high) in self.param_bounds.items():
             if random.random() < self.mutation_rate:
-                delta = random.uniform(-(high-low)*0.1, (high-low)*0.1)
-                mutated[key] = max(low, min(high, mutated[key] + delta))
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutated[key] = mutated[key] + delta * (high - low)
+                mutated[key] = max(low, min(high, mutated[key]))
         mutated['circuit_breaker_threshold'] = int(mutated['circuit_breaker_threshold'])
         mutated['health_check_interval_seconds'] = int(mutated['health_check_interval_seconds'])
         mutated['predictive_health_retrain_interval'] = int(mutated['predictive_health_retrain_interval'])
         return mutated
 
-    # ---------- Pareto front methods (NEW) ----------
-    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
-        """Return non‑dominated points."""
-        if not points:
-            return []
-        objective_keys = ['health_score', 'uptime_score', 'circuit_score', 'anomaly_score']
-        pareto = []
-        for i, p_i in enumerate(points):
-            dominated = False
-            for j, p_j in enumerate(points):
-                if i == j:
-                    continue
-                a_vec = [getattr(p_i, k) for k in objective_keys]
-                b_vec = [getattr(p_j, k) for k in objective_keys]
-                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
-                    dominated = True
-                    break
-            if not dominated:
-                pareto.append(p_i)
-        return pareto
+    # ----------------------------------------------------------------------
+    # Dynamic objective weighting
+    # ----------------------------------------------------------------------
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        """Adjust weights based on current system state."""
+        weights = self.core.config.mopd.objective_weights.copy()
+        # Example: if anomalies are high, increase anomaly weight
+        anomaly_report = asyncio.run(self.core._anomaly_detector.get_anomaly_report())
+        anomaly_count = len(anomaly_report.get('anomalies', []))
+        if anomaly_count > 5:
+            weights['anomaly_score'] = min(0.5, weights['anomaly_score'] * 1.5)
+        # If circuit breakers are open, increase circuit weight
+        open_circuits = sum(1 for m in self.core.registry.modules.values() if m.circuit_breaker_state == 'open')
+        if open_circuits > 0:
+            weights['circuit_score'] = min(0.5, weights['circuit_score'] * 1.2)
+        # Normalize
+        total = sum(weights.values())
+        return {k: v / total for k, v in weights.items()}
 
-    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with MOPD weights."""
-        if not pareto_front:
-            return None
-        weights = self.core.config.mopd.objective_weights
-        objective_keys = list(weights.keys())
-
-        # Normalise objectives across Pareto front
-        max_vals = {}
-        min_vals = {}
-        for key in objective_keys:
-            vals = [getattr(p, key) for p in pareto_front]
-            max_vals[key] = max(vals)
-            min_vals[key] = min(vals)
-        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
-
-        best = None
-        best_score = -float('inf')
-        for point in pareto_front:
-            score = 0.0
-            for key in objective_keys:
-                val = getattr(point, key)
-                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                weight = weights.get(key, 0.0)
-                score += weight * norm
-            point.scalarised_score = score
-            if score > best_score:
-                best_score = score
-                best = point
-        return best
-
-    # ---------- Main evolve (enhanced with MOPD) ----------
+    # ----------------------------------------------------------------------
+    # Main evolve (NSGA‑II)
+    # ----------------------------------------------------------------------
     async def evolve(self, generations: Optional[int] = None) -> Dict:
         async with self.lock:
             if generations is None:
                 generations = self.generations
+
             population = self._initialize_population()
+            objectives = {}
+            for ind in population:
+                key = tuple(sorted(ind.items()))
+                objectives[key] = self._evaluate_individual(ind)
 
             if self.core.config.mopd.enabled:
                 self.pareto_front = []
 
             for gen in range(generations):
-                # Evaluate objectives for all individuals
-                individuals_with_objs = []
-                for ind in population:
-                    objs = self._evaluate_individual(ind)
-                    individuals_with_objs.append((ind, objs))
-
-                # If MOPD enabled, update Pareto front
-                if self.core.config.mopd.enabled:
-                    points = []
-                    for ind, objs in individuals_with_objs:
-                        point = MOPDPoint(
-                            individual=ind,
-                            health_score=objs['health_score'],
-                            uptime_score=objs['uptime_score'],
-                            circuit_score=objs['circuit_score'],
-                            anomaly_score=objs['anomaly_score']
-                        )
-                        points.append(point)
-                    self.pareto_front = self._filter_pareto(self.pareto_front + points)
-
-                    # Compute scalarised scores for selection
-                    weights = self.core.config.mopd.objective_weights
-                    fitness_scores = []
-                    for point in points:
-                        score = (weights.get('health_score', 0.4) * point.health_score +
-                                 weights.get('uptime_score', 0.3) * point.uptime_score +
-                                 weights.get('circuit_score', 0.2) * point.circuit_score +
-                                 weights.get('anomaly_score', 0.1) * point.anomaly_score)
-                        point.scalarised_score = score
-                        fitness_scores.append(score)
-                else:
-                    # Legacy: single fitness (we use health_score as scalar)
-                    fitness_scores = [objs['health_score'] for _, objs in individuals_with_objs]
-
-                # Selection and reproduction
-                new_population = []
-                best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                new_population.append(population[best_idx])
-                while len(new_population) < self.population_size:
+                # Create offspring using tournament selection, SBX, and polynomial mutation
+                offspring = []
+                while len(offspring) < self.population_size:
+                    # Need fronts and crowding for tournament; we compute on current population
+                    pop_objectives = {k: objectives[k] for k in objectives if k in [tuple(sorted(i.items())) for i in population]}
+                    fronts = self._fast_non_dominated_sort(population, pop_objectives)
+                    crowding = {}
+                    for front in fronts:
+                        front_crowding = self._crowding_distance(front, pop_objectives)
+                        crowding.update(front_crowding)
+                    parent1 = self._tournament_selection(population, fronts, crowding)
+                    parent2 = self._tournament_selection(population, fronts, crowding)
                     if random.random() < self.crossover_rate:
-                        parent1 = self._select(population, fitness_scores)
-                        parent2 = self._select(population, fitness_scores)
-                        child = self._crossover(parent1, parent2)
-                        child = self._mutate(child)
-                        new_population.append(child)
+                        child1, child2 = self._sbx_crossover(parent1, parent2)
+                        child1 = self._polynomial_mutation(child1)
+                        child2 = self._polynomial_mutation(child2)
+                        offspring.extend([child1, child2])
                     else:
-                        parent = self._select(population, fitness_scores)
-                        new_population.append(parent.copy())
+                        offspring.append(self._polynomial_mutation(parent1.copy()))
+                offspring = offspring[:self.population_size]
+
+                # Evaluate offspring
+                for ind in offspring:
+                    key = tuple(sorted(ind.items()))
+                    if key not in objectives:
+                        objectives[key] = self._evaluate_individual(ind)
+
+                # Combine parent and offspring
+                combined = population + offspring
+                # Remove duplicates
+                unique_keys = {}
+                for ind in combined:
+                    key = tuple(sorted(ind.items()))
+                    unique_keys[key] = ind
+                combined = list(unique_keys.values())
+
+                # Non‑dominated sorting on combined
+                combined_objectives = {tuple(sorted(ind.items())): objectives[tuple(sorted(ind.items()))] for ind in combined}
+                fronts = self._fast_non_dominated_sort(combined, combined_objectives)
+
+                # Select next population
+                new_population = []
+                for front in fronts:
+                    if len(new_population) + len(front) <= self.population_size:
+                        new_population.extend(front)
+                    else:
+                        crowding = self._crowding_distance(front, combined_objectives)
+                        sorted_front = sorted(front, key=lambda ind: crowding.get(tuple(sorted(ind.items())), 0), reverse=True)
+                        remaining = self.population_size - len(new_population)
+                        new_population.extend(sorted_front[:remaining])
+                        break
+
                 population = new_population
 
-                gen_best_fitness = max(fitness_scores)
-                logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
+                # Update Pareto front (first front of population)
+                pop_objectives = {tuple(sorted(ind.items())): objectives[tuple(sorted(ind.items()))] for ind in population}
+                fronts_pop = self._fast_non_dominated_sort(population, pop_objectives)
+                if fronts_pop:
+                    pareto_individuals = fronts_pop[0]
+                    self.pareto_front = []
+                    for ind in pareto_individuals:
+                        obj = pop_objectives[tuple(sorted(ind.items()))]
+                        self.pareto_front.append(MOPDPoint(
+                            individual=ind,
+                            health_score=obj['health_score'],
+                            uptime_score=obj['uptime_score'],
+                            circuit_score=obj['circuit_score'],
+                            anomaly_score=obj['anomaly_score']
+                        ))
+                logger.debug(f"Generation {gen+1}/{generations}: population={len(population)}, Pareto front={len(self.pareto_front)}")
 
-            # After evolution, if MOPD enabled and we have a Pareto front, select best
+            # After evolution, select best individual using dynamic weights
+            weights = self._compute_dynamic_weights()
             if self.core.config.mopd.enabled and self.pareto_front:
-                best_point = self._select_best_from_pareto(self.pareto_front)
+                best_point = self._select_best_from_pareto(self.pareto_front, weights)
                 if best_point:
                     self.best_individual = best_point.individual
                     self.best_fitness = best_point.scalarised_score
-                    # Apply best individual permanently
+                    # Apply best individual
                     original_snapshot = self._snapshot_config()
                     modified = {
                         'health_check_interval_seconds': best_point.individual['health_check_interval_seconds'],
@@ -1506,20 +1621,33 @@ class CoreGeneticOptimizer:
                     self._apply_snapshot(modified)
                     logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
             else:
-                # Legacy: keep best fitness and individual
-                if fitness_scores:
-                    best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                    self.best_fitness = fitness_scores[best_idx]
-                    self.best_individual = population[best_idx]
-                    self._apply_snapshot(self._snapshot_config())  # Apply the best
-                    logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
+                # Legacy fallback: pick best by weighted sum from population
+                pop_objectives = {tuple(sorted(ind.items())): objectives[tuple(sorted(ind.items()))] for ind in population}
+                best_ind = max(population, key=lambda ind: sum(weights[k] * pop_objectives[tuple(sorted(ind.items()))][k] for k in weights))
+                best_obj = pop_objectives[tuple(sorted(best_ind.items()))]
+                self.best_individual = best_ind
+                self.best_fitness = sum(weights[k] * best_obj[k] for k in weights)
+                # Apply best individual
+                original_snapshot = self._snapshot_config()
+                modified = {
+                    'health_check_interval_seconds': best_ind['health_check_interval_seconds'],
+                    'circuit_breaker_threshold': best_ind['circuit_breaker_threshold'],
+                    'predictive_health_retrain_interval': best_ind['predictive_health_retrain_interval'],
+                    'anomaly_zscore_threshold': best_ind['anomaly_zscore_threshold'],
+                    'module_retirement_threshold': best_ind['module_retirement_threshold']
+                }
+                self._apply_snapshot(modified)
+                logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
 
+            # Record history
             self.evolution_history.append({
                 'timestamp': datetime.utcnow(),
                 'best_fitness': self.best_fitness,
-                'pareto_front_size': len(self.pareto_front) if self.core.config.mopd.enabled else 0
+                'pareto_front_size': len(self.pareto_front) if self.core.config.mopd.enabled else 0,
+                'dynamic_weights': weights,
+                'generation_count': generations
             })
-            # Save best individual and Pareto front to global state
+            # Save state
             self.core.storage.save_global_state('best_individual', json.dumps(self.best_individual))
             self.core.storage.save_global_state('best_fitness', str(self.best_fitness))
             if self.core.config.mopd.enabled:
@@ -1527,23 +1655,57 @@ class CoreGeneticOptimizer:
             return {
                 'best_fitness': self.best_fitness,
                 'best_individual': self.best_individual,
-                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.core.config.mopd.enabled else None
+                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.core.config.mopd.enabled else None,
+                'dynamic_weights': weights
             }
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint], weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
+        if not pareto_front:
+            return None
+        if weights is None:
+            weights = self.core.config.mopd.objective_weights
+        objective_keys = list(weights.keys())
+
+        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in objective_keys:
+                val = getattr(point, key)
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                score += weights.get(key, 0.0) * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
 
     def get_status(self) -> Dict:
         return {
             'best_fitness': self.best_fitness,
             'best_individual': self.best_individual,
             'history': self.evolution_history[-10:],
-            'pareto_front_size': len(self.pareto_front) if self.core.config.mopd.enabled else 0
+            'pareto_front_size': len(self.pareto_front) if self.core.config.mopd.enabled else 0,
+            'pareto_front': [p.to_dict() for p in self.pareto_front],
+            'cache_size': len(self._eval_cache)
         }
 
+    def get_system_signature(self) -> str:
+        """Return a compact signature for change detection."""
+        summary = self.core.get_system_status()
+        # Use key metrics
+        sig = f"{summary.get('uptime_seconds', 0):.0f}|{len(summary.get('modules', {}))}|{summary.get('mopd_enabled', False)}"
+        return sig
+
 # ============================================================================
-# Module Registry (Enhanced with persistence)
+# Module Registry (Full implementation)
 # ============================================================================
 
 class ModuleRegistry:
-    # ... (same as before, unchanged) ...
     def __init__(self, storage: Storage, circuit_breaker_threshold: int = 5):
         self.storage = storage
         self.modules: Dict[str, ModuleEntry] = {}
@@ -1566,46 +1728,319 @@ class ModuleRegistry:
                 self.module_paths[entry.name] = entry.module_path
         logger.info(f"Module Registry initialized, loaded {len(self.modules)} modules from DB")
 
-    # ... rest of ModuleRegistry methods unchanged ...
-    # (For brevity, we assume the rest of ModuleRegistry is unchanged)
+    async def register(self, name: str, module: Any, dependencies: List[str] = None,
+                       health_check: Optional[Callable] = None,
+                       init_timeout: float = 30.0, shutdown_timeout: float = 10.0) -> ModuleEntry:
+        async with self._lock:
+            if name in self.modules:
+                # Update existing entry
+                entry = self.modules[name]
+                entry.module = module
+                entry.health_check = health_check
+                entry.dependencies = dependencies or []
+                entry.phase = LifecyclePhase.REGISTERED
+                entry.health_status = "unknown"
+                entry.error_message = None
+                entry.loaded_at = datetime.utcnow()
+                self.storage.save_module(entry)
+                return entry
+            entry = ModuleEntry(
+                name=name,
+                module=module,
+                dependencies=dependencies or [],
+                health_check=health_check,
+                init_timeout=init_timeout,
+                shutdown_timeout=shutdown_timeout,
+                loaded_at=datetime.utcnow()
+            )
+            self.modules[name] = entry
+            self.storage.save_module(entry)
+            logger.info("Module registered", name=name)
+            return entry
+
+    async def unregister(self, name: str) -> bool:
+        async with self._lock:
+            if name in self.modules:
+                entry = self.modules.pop(name)
+                self.storage.delete_module(name)
+                self.loaded_modules.discard(name)
+                logger.info("Module unregistered", name=name)
+                return True
+            return False
+
+    async def initialize_all(self) -> Dict[str, bool]:
+        async with self._init_lock:
+            if self._initialized:
+                return {name: True for name in self.modules}
+            # Topological sort based on dependencies
+            sorted_names = self._topological_sort()
+            results = {}
+            for name in sorted_names:
+                entry = self.modules[name]
+                entry.phase = LifecyclePhase.INITIALIZING
+                entry.init_started = datetime.utcnow()
+                try:
+                    if hasattr(entry.module, 'initialize') and callable(entry.module.initialize):
+                        await asyncio.wait_for(entry.module.initialize(), timeout=entry.init_timeout)
+                    entry.phase = LifecyclePhase.INITIALIZED
+                    entry.init_completed = datetime.utcnow()
+                    entry.health_status = "healthy"
+                    results[name] = True
+                except Exception as e:
+                    entry.phase = LifecyclePhase.ERROR
+                    entry.error_message = str(e)
+                    entry.health_status = "error"
+                    results[name] = False
+                    logger.error("Module initialization failed", name=name, error=str(e))
+                self.storage.save_module(entry)
+            self._initialized = True
+            return results
+
+    async def shutdown_all(self) -> Dict[str, bool]:
+        results = {}
+        for name in reversed(self._topological_sort()):
+            entry = self.modules[name]
+            entry.phase = LifecyclePhase.STOPPING
+            try:
+                if hasattr(entry.module, 'shutdown') and callable(entry.module.shutdown):
+                    await asyncio.wait_for(entry.module.shutdown(), timeout=entry.shutdown_timeout)
+                entry.phase = LifecyclePhase.STOPPED
+                results[name] = True
+            except Exception as e:
+                entry.phase = LifecyclePhase.ERROR
+                entry.error_message = str(e)
+                results[name] = False
+                logger.error("Module shutdown failed", name=name, error=str(e))
+            self.storage.save_module(entry)
+        self._initialized = False
+        return results
+
+    async def health_check_all(self) -> Dict[str, Dict]:
+        results = {}
+        async with self._lock:
+            for name, entry in self.modules.items():
+                status = await self._health_check_module(entry)
+                results[name] = status
+        return results
+
+    async def _health_check_module(self, entry: ModuleEntry) -> Dict:
+        status = {
+            'status': 'unknown',
+            'circuit_breaker': entry.circuit_breaker_state,
+            'last_failure': entry.last_failure.isoformat() if entry.last_failure else None,
+            'failure_count': entry.failure_count,
+            'health_trend': entry.health_trend,
+            'predicted_health': entry.predicted_health
+        }
+        if entry.health_check:
+            try:
+                healthy = await entry.health_check()
+                status['status'] = 'healthy' if healthy else 'unhealthy'
+            except Exception as e:
+                status['status'] = 'error'
+                status['error'] = str(e)
+        elif entry.health_status:
+            status['status'] = entry.health_status
+        return status
+
+    async def update_predictive_health(self, module_name: str, metrics: Dict[str, float]):
+        entry = self.modules.get(module_name)
+        if entry:
+            prediction = await self.health_forecaster.predict_health(metrics)
+            entry.predicted_health = prediction['predicted_health']
+            entry.failure_probability = prediction['failure_probability']
+            entry.health_trend = prediction['trend']
+            self.storage.save_module(entry)
+
+    async def load_module(self, name: str, module_path: str) -> bool:
+        if name in self.modules:
+            return False
+        try:
+            spec = importlib.util.spec_from_file_location(name, module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            # Assume module has a class with the same name as the module file
+            class_name = name.split('.')[-1].capitalize()
+            if hasattr(module, class_name):
+                instance = getattr(module, class_name)()
+                await self.register(name, instance, module_path=module_path)
+                self.module_paths[name] = module_path
+                return True
+            else:
+                logger.error("Module does not contain expected class", name=name, class_name=class_name)
+                return False
+        except Exception as e:
+            logger.error("Failed to load module", name=name, error=str(e))
+            return False
+
+    async def unload_module(self, name: str) -> bool:
+        if name not in self.modules:
+            return False
+        entry = self.modules[name]
+        if entry.phase in (LifecyclePhase.RUNNING, LifecyclePhase.INITIALIZED):
+            await self.shutdown_all()
+        return await self.unregister(name)
+
+    def _topological_sort(self) -> List[str]:
+        # Simple DFS-based topological sort
+        visited = set()
+        result = []
+        def dfs(name):
+            if name in visited:
+                return
+            visited.add(name)
+            entry = self.modules.get(name)
+            if entry:
+                for dep in entry.dependencies:
+                    if dep in self.modules:
+                        dfs(dep)
+            result.append(name)
+        for name in self.modules:
+            dfs(name)
+        return result
+
+    def get_registry_stats(self) -> Dict[str, Any]:
+        return {
+            'total_modules': len(self.modules),
+            'loaded_modules': len(self.loaded_modules),
+            'phases': {name: entry.phase.value for name, entry in self.modules.items()},
+            'health_statuses': {name: entry.health_status for name, entry in self.modules.items()},
+            'circuit_breaker_states': {name: entry.circuit_breaker_state for name, entry in self.modules.items()}
+        }
+
+    async def get_dependency_graph(self) -> Dict[str, List[str]]:
+        return {name: entry.dependencies for name, entry in self.modules.items()}
 
 # ============================================================================
-# Task Manager
+# Module Marketplace (Full implementation)
 # ============================================================================
 
-class TaskManager:
-    # ... (same as before) ...
-    def __init__(self):
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.shutdown_event = asyncio.Event()
+class ModuleMarketplace:
+    def __init__(self, core: 'EnhancedBioInspiredCore', storage: Storage, auto_replace: bool = False):
+        self.core = core
+        self.storage = storage
+        self.auto_replace = auto_replace
+        self.module_scores: Dict[str, float] = {}
+        self.competition_interval = 300  # seconds
+        self._load_scores()
+
+    def _load_scores(self):
+        self.module_scores = self.storage.load_marketplace_scores()
+
+    async def run_competition(self):
+        # Simple scoring based on health and performance
+        health_results = await self.core.registry.health_check_all()
+        for name, status in health_results.items():
+            health_score = 1.0 if status['status'] == 'healthy' else 0.5 if status['status'] == 'degraded' else 0.0
+            self.module_scores[name] = health_score
+            self.storage.save_marketplace_score(name, health_score)
+        # Possibly replace low-scoring modules if auto_replace is enabled
+        if self.auto_replace:
+            await self._auto_replace_low_scoring()
+
+    async def _auto_replace_low_scoring(self):
+        # Placeholder: actual replacement logic would require module discovery
+        pass
+
+    def get_marketplace_stats(self) -> Dict[str, Any]:
+        return {
+            'scores': self.module_scores,
+            'auto_replace': self.auto_replace,
+            'competition_interval': self.competition_interval
+        }
+
+# ============================================================================
+# Event Bus (Full implementation)
+# ============================================================================
+
+@dataclass
+class CoreEvent:
+    event_type: str
+    source: str
+    payload: Dict[str, Any]
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    correlation_id: Optional[str] = None
+    priority: int = 0
+
+class CoreEventBus:
+    def __init__(self, max_workers: int = 4):
+        self.subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self.event_queue: asyncio.Queue = asyncio.Queue()
+        self.workers: List[asyncio.Task] = []
+        self.running = False
+        self.max_workers = max_workers
+        self.event_stats = {'published': 0, 'processed': 0}
         self._lock = asyncio.Lock()
 
-    def start_task(self, name: str, coro_func, *args, **kwargs):
-        async def wrapper():
-            backoff = 1
-            max_backoff = 300
-            while not self.shutdown_event.is_set():
-                try:
-                    await coro_func(*args, **kwargs)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-        task = asyncio.create_task(wrapper(), name=name)
-        async with self._lock:
-            self.tasks[name] = task
-        return task
+    async def start(self):
+        if self.running:
+            return
+        self.running = True
+        for _ in range(self.max_workers):
+            task = asyncio.create_task(self._worker())
+            self.workers.append(task)
 
-    async def stop_all(self):
-        self.shutdown_event.set()
+    async def stop(self):
+        self.running = False
+        await self.event_queue.join()
+        for worker in self.workers:
+            worker.cancel()
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        self.workers.clear()
+
+    def subscribe(self, event_type: str, callback: Callable):
+        self.subscribers[event_type].append(callback)
+
+    def unsubscribe(self, event_type: str, callback: Callable):
+        if event_type in self.subscribers:
+            self.subscribers[event_type] = [cb for cb in self.subscribers[event_type] if cb != callback]
+
+    async def publish(self, event: CoreEvent):
+        await self.event_queue.put(event)
         async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
+            self.event_stats['published'] += 1
+
+    async def _worker(self):
+        while self.running:
+            try:
+                event = await self.event_queue.get()
+                callbacks = self.subscribers.get(event.event_type, [])
+                for cb in callbacks:
+                    try:
+                        await cb(event)
+                    except Exception as e:
+                        logger.error("Event handler error", event_type=event.event_type, error=str(e))
+                async with self._lock:
+                    self.event_stats['processed'] += 1
+                self.event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Event worker error", error=str(e))
+
+    def get_event_stats(self) -> Dict[str, Any]:
+        return dict(self.event_stats)
+
+    async def shutdown(self):
+        await self.stop()
+
+# ============================================================================
+# Decentralized Module Base Class
+# ============================================================================
+
+class DecentralizedModule(ABC):
+    def __init__(self, name: str):
+        self.name = name
+        self.event_subscriptions: List[str] = []
+
+    @abstractmethod
+    async def local_decision(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Make a local decision based on context."""
+        pass
+
+    async def on_event(self, event: CoreEvent):
+        """Handle subscribed events."""
+        pass
 
 # ============================================================================
 # Task Input Validation
@@ -1625,45 +2060,12 @@ if PYDANTIC_AVAILABLE:
             return v or f"task_{uuid.uuid4().hex[:8]}"
 
 # ============================================================================
-# Decentralized Module Base Class
-# ============================================================================
-
-class DecentralizedModule(ABC):
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Module Marketplace (unchanged)
-# ============================================================================
-
-class ModuleMarketplace:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
-# Event Bus
-# ============================================================================
-
-@dataclass
-class CoreEvent:
-    event_type: str
-    source: str
-    payload: Dict[str, Any]
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    correlation_id: Optional[str] = None
-    priority: int = 0
-
-class CoreEventBus:
-    # ... (same as before) ...
-    pass
-
-# ============================================================================
 # Enhanced Bio-Inspired Core (Main Class)
 # ============================================================================
 
 class EnhancedBioInspiredCore:
     """
-    Enhanced Bio-Inspired Core v9.1.0 with MOPD support.
+    Enhanced Bio-Inspired Core v9.1.0 with MOPD support and NSGA‑II optimizer.
     """
 
     def __init__(self,
@@ -1714,7 +2116,7 @@ class EnhancedBioInspiredCore:
         # Performance anomaly detector
         self._anomaly_detector = PerformanceAnomalyDetector()
 
-        # Genetic optimizer
+        # Genetic optimizer (now NSGA‑II)
         self._genetic_optimizer = CoreGeneticOptimizer(self)
 
         # Module marketplace
@@ -1749,7 +2151,7 @@ class EnhancedBioInspiredCore:
         # Start tasks
         self._start_tasks()
 
-        logger.info("Enhanced Bio-Inspired Core v9.1.0 created with MOPD")
+        logger.info("Enhanced Bio-Inspired Core v9.1.0 created with MOPD and NSGA‑II")
 
     def _setup_metrics(self):
         self.metrics = {
@@ -1774,6 +2176,7 @@ class EnhancedBioInspiredCore:
         self._task_manager.start_task("anomaly_detection", self._anomaly_detection_loop)
         self._task_manager.start_task("competition", self._competition_loop)
         self._task_manager.start_task("genetic_optimization", self._genetic_optimization_loop)
+        self._task_manager.start_task("change_detection", self._change_detection_loop)
         self._task_manager.start_task("ml_training", self._ml_training_loop)
         self._task_manager.start_task("strategy_update", self._strategy_update_loop)
         self._task_manager.start_task("persistence_save", self._persistence_save_loop)
@@ -2013,9 +2416,10 @@ class EnhancedBioInspiredCore:
                 if len(self.registry.modules) >= 5:
                     logger.info("Starting genetic optimization cycle...")
                     result = await self._genetic_optimizer.evolve(generations=10)
-                    # Telemetry for MOPD (if available)
                     if self.config.mopd.enabled:
-                        logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
+                        logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}, "
+                                    f"Pareto front size: {len(result.get('pareto_front', []))}, "
+                                    f"Dynamic weights: {result.get('dynamic_weights', {})}")
                     else:
                         logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}")
                 await asyncio.sleep(86400)
@@ -2024,6 +2428,24 @@ class EnhancedBioInspiredCore:
             except Exception as e:
                 logger.error("Genetic optimization loop error", error=str(e))
                 await asyncio.sleep(3600)
+
+    async def _change_detection_loop(self):
+        """Monitor system state for significant changes and trigger early evolution."""
+        while self._lifecycle_phase == LifecyclePhase.RUNNING:
+            try:
+                if self._genetic_optimizer:
+                    current_signature = self._genetic_optimizer.get_system_signature()
+                    if (self._genetic_optimizer._last_summary_signature is not None and
+                        current_signature != self._genetic_optimizer._last_summary_signature):
+                        logger.info("System state changed significantly; triggering early evolution.")
+                        await self._genetic_optimizer.evolve(generations=min(5, 10))
+                    self._genetic_optimizer._last_summary_signature = current_signature
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Change detection error", error=str(e))
+                await asyncio.sleep(60)
 
     async def _ml_training_loop(self):
         while self._lifecycle_phase == LifecyclePhase.RUNNING:
@@ -2081,7 +2503,6 @@ class EnhancedBioInspiredCore:
     # ============================================================================
 
     async def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        # ... (same as before) ...
         if self._lifecycle_phase != LifecyclePhase.RUNNING:
             return {'success': False, 'reason': f'System not running (phase: {self._lifecycle_phase.value})'}
 
@@ -2205,17 +2626,15 @@ class EnhancedBioInspiredCore:
             return False, f"Update failed: {str(e)}"
 
     # ============================================================================
-    # MOPD Public Methods (NEW)
+    # MOPD Public Methods
     # ============================================================================
 
     def get_mopd_pareto_front(self) -> List[MOPDPoint]:
-        """Return the current Pareto front from the genetic optimizer."""
         if not self.config.mopd.enabled or not self._genetic_optimizer:
             return []
         return self._genetic_optimizer.pareto_front.copy()
 
     def get_mopd_summary(self) -> Dict[str, Any]:
-        """Return a summary of MOPD‑related metrics."""
         if not self.config.mopd.enabled or not self._genetic_optimizer:
             return {"enabled": False}
         return {
