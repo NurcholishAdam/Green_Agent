@@ -7,11 +7,12 @@
 # MOPD enhancements:
 # - MOPDConfig sub‑configuration for objective weights and grid resolution.
 # - MOPDPoint dataclass to represent a configuration with objectives.
-# - Pareto front generation in the ThresholdGeneticOptimizer.
+# - Pareto front generation in the ThresholdGeneticOptimizer (now NSGA‑II).
 # - Selection of best configuration via scalarisation.
 # - Persistence of Pareto front.
 # - Telemetry tracks MOPD generations and Pareto front sizes.
 # - Full backward compatibility.
+# - Change detection to trigger early re‑optimization.
 # =============================================================================
 
 import asyncio
@@ -22,6 +23,7 @@ import os
 import hashlib
 import math
 import random
+import sqlite3
 from typing import Dict, Any, List, Optional, Tuple, Set, Protocol, Callable, Union
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -635,10 +637,14 @@ class MLDemandPredictor:
             return 0.0
 
 # ============================================================================
-# Threshold Genetic Optimizer (Enhanced with MOPD)
+# Threshold Genetic Optimizer (Enhanced with NSGA‑II)
 # ============================================================================
 
 class ThresholdGeneticOptimizer:
+    """
+    Enhanced genetic optimizer using NSGA‑II for multi‑objective Pareto optimization.
+    Supports dynamic objective weighting, evaluation caching, and diversity preservation.
+    """
     def __init__(self, token_manager: 'EcoATPTokenManager', config: EcoATPConfig):
         self.token_manager = token_manager
         self.config = config
@@ -658,10 +664,17 @@ class ThresholdGeneticOptimizer:
             'rate_limit_multiplier_high': (0.3, 0.7),
             'rate_limit_multiplier_low': (1.2, 2.0)
         }
-        # MOPD: Pareto front storage
+        # Pareto front storage (list of MOPDPoint)
         self.pareto_front: List[MOPDPoint] = []
+        # Evaluation cache: key = tuple of individual values, value = objectives dict
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+        # Previous system summary for change detection (used by token manager)
+        self._last_summary_signature: Optional[str] = None
         self._load_state()
 
+    # ----------------------------------------------------------------------
+    # State persistence
+    # ----------------------------------------------------------------------
     def _load_state(self):
         if os.path.exists(self.config.genetic_state_path):
             try:
@@ -691,6 +704,9 @@ class ThresholdGeneticOptimizer:
         except Exception as e:
             logger.warning(f"Failed to save genetic state: {e}")
 
+    # ----------------------------------------------------------------------
+    # Population initialization
+    # ----------------------------------------------------------------------
     def _initialize_individual(self) -> Dict:
         ind = {}
         for key, (low, high) in self.param_bounds.items():
@@ -700,24 +716,44 @@ class ThresholdGeneticOptimizer:
     def _initialize_population(self) -> List[Dict]:
         return [self._initialize_individual() for _ in range(self.population_size)]
 
-    # ---------- Multi‑objective evaluation (NEW) ----------
+    # ----------------------------------------------------------------------
+    # Objective evaluation (with caching and without permanent mutation)
+    # ----------------------------------------------------------------------
     def _evaluate_individual(self, individual: Dict) -> Dict[str, float]:
-        """Evaluate an individual on multiple objectives."""
+        """
+        Evaluate the three objectives for a given individual.
+        The evaluation temporarily applies the individual's parameters to the token manager,
+        obtains the system summary, and then restores the original parameters.
+        Results are cached for efficiency.
+        """
+        # Use a tuple of sorted items as cache key (stable representation)
+        key = tuple(sorted(individual.items()))
+        if key in self._eval_cache:
+            return self._eval_cache[key]
+
+        # Temporarily apply parameters
         self._apply_individual(individual)
-        summary = self.token_manager.get_system_summary_sync()
-        utilization = summary.get('system_efficiency', 0.5)
-        total_generated = summary.get('total_generated', 1)
-        total_consumed = summary.get('total_consumed', 1)
-        inflation = (total_generated - total_consumed) / max(total_consumed, 1)
-        emergency_mode = 1 if summary.get('emergency_mode', False) else 0
-        self._restore_original_parameters()
-        return {
-            'efficiency': utilization,
-            'inflation': 1.0 - abs(inflation),  # lower inflation is better
-            'emergency': 1.0 - emergency_mode   # lower emergency is better
-        }
+        try:
+            summary = self.token_manager.get_system_summary_sync()
+            # Compute objectives from summary
+            utilization = summary.get('system_efficiency', 0.5)
+            total_generated = summary.get('total_generated', 1)
+            total_consumed = summary.get('total_consumed', 1)
+            inflation = (total_generated - total_consumed) / max(total_consumed, 1)
+            emergency_mode = 1 if summary.get('emergency_mode', False) else 0
+
+            objectives = {
+                'efficiency': utilization,
+                'inflation': 1.0 - abs(inflation),   # lower inflation is better
+                'emergency': 1.0 - emergency_mode   # lower emergency is better
+            }
+            self._eval_cache[key] = objectives
+            return objectives
+        finally:
+            self._restore_original_parameters()
 
     def _apply_individual(self, individual: Dict):
+        """Save original params and set new ones."""
         self._original_params = {
             'hoarding_threshold': self.token_manager.config.hoarding_threshold,
             'tax_rate': self.token_manager.config.tax_rate,
@@ -739,65 +775,307 @@ class ThresholdGeneticOptimizer:
             self.token_manager.config.rate_limit_multiplier_high = self._original_params['rate_limit_multiplier_high']
             self.token_manager.config.rate_limit_multiplier_low = self._original_params['rate_limit_multiplier_low']
 
-    def _select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
-        tournament = random.sample(range(len(population)), self.tournament_size)
-        best_idx = max(tournament, key=lambda i: fitness_scores[i])
-        return population[best_idx]
+    # ----------------------------------------------------------------------
+    # NSGA‑II core methods
+    # ----------------------------------------------------------------------
+    def _fast_non_dominated_sort(self, population: List[Dict], objectives: Dict[Tuple, Dict[str, float]]) -> List[List[Dict]]:
+        """
+        Perform fast non‑dominated sorting.
+        Returns a list of fronts (each front is a list of individuals).
+        """
+        fronts = []
+        domination_count = {ind_key: 0 for ind_key in objectives}
+        dominated_solutions = {ind_key: [] for ind_key in objectives}
 
-    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
-        child = {}
-        for key in parent1:
-            if random.random() < 0.5:
-                child[key] = parent1[key]
+        for p_key, p_obj in objectives.items():
+            for q_key, q_obj in objectives.items():
+                if p_key == q_key:
+                    continue
+                # p dominates q if p is better or equal in all objectives and strictly better in at least one
+                p_better = all(p_obj[k] >= q_obj[k] for k in p_obj)
+                p_strict = any(p_obj[k] > q_obj[k] for k in p_obj)
+                if p_better and p_strict:
+                    dominated_solutions[p_key].append(q_key)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[p_key] += 1
+
+            if domination_count[p_key] == 0:
+                # p is in first front
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p_key)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p_key in fronts[i]:
+                for q_key in dominated_solutions[p_key]:
+                    domination_count[q_key] -= 1
+                    if domination_count[q_key] == 0:
+                        next_front.append(q_key)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+
+        # Convert front keys back to individuals
+        # We need a mapping from key to individual
+        key_to_ind = {tuple(sorted(ind.items())): ind for ind in population}
+        fronts = [[key_to_ind[key] for key in front] for front in fronts]
+        return fronts
+
+    def _crowding_distance(self, front: List[Dict], objectives: Dict[Tuple, Dict[str, float]]) -> Dict[Tuple, float]:
+        """
+        Assign crowding distance to each individual in a front.
+        Returns a dict mapping individual key to crowding distance.
+        """
+        if not front:
+            return {}
+        distances = {tuple(sorted(ind.items())): 0.0 for ind in front}
+        obj_keys = list(next(iter(objectives.values())).keys())  # e.g., ['efficiency', 'inflation', 'emergency']
+        for obj in obj_keys:
+            # Sort front by this objective
+            sorted_front = sorted(front, key=lambda ind: objectives[tuple(sorted(ind.items()))][obj])
+            # Set boundary points to large distance
+            distances[tuple(sorted(sorted_front[0].items()))] = float('inf')
+            distances[tuple(sorted(sorted_front[-1].items()))] = float('inf')
+            obj_min = objectives[tuple(sorted(sorted_front[0].items()))][obj]
+            obj_max = objectives[tuple(sorted(sorted_front[-1].items()))][obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front)-1):
+                key = tuple(sorted(sorted_front[i].items()))
+                prev_key = tuple(sorted(sorted_front[i-1].items()))
+                next_key = tuple(sorted(sorted_front[i+1].items()))
+                distances[key] += (objectives[next_key][obj] - objectives[prev_key][obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[Dict]], crowding: Dict[Tuple, float]) -> Dict:
+        """Select an individual using binary tournament based on rank and crowding distance."""
+        # Randomly select two individuals
+        ind1 = random.choice(population)
+        ind2 = random.choice(population)
+        rank1 = self._get_rank(ind1, fronts)
+        rank2 = self._get_rank(ind2, fronts)
+        if rank1 < rank2:
+            return ind1
+        elif rank2 < rank1:
+            return ind2
+        else:
+            # Same front, compare crowding distance
+            key1 = tuple(sorted(ind1.items()))
+            key2 = tuple(sorted(ind2.items()))
+            if crowding.get(key1, 0) > crowding.get(key2, 0):
+                return ind1
             else:
-                child[key] = parent2[key]
-            if random.random() < 0.3:
-                child[key] = (parent1[key] + parent2[key]) / 2
-        return child
+                return ind2
+
+    def _get_rank(self, individual: Dict, fronts: List[List[Dict]]) -> int:
+        for i, front in enumerate(fronts):
+            if individual in front:
+                return i
+        return len(fronts)  # should not happen
+
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
+        """Simulated binary crossover (SBX) for continuous variables."""
+        child1, child2 = {}, {}
+        for key in self.param_bounds:
+            if random.random() < 0.5:
+                # SBX
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))  # distribution index = 20
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                val1 = 0.5 * ((1 + beta) * parent1[key] + (1 - beta) * parent2[key])
+                val2 = 0.5 * ((1 - beta) * parent1[key] + (1 + beta) * parent2[key])
+                # Clip to bounds
+                low, high = self.param_bounds[key]
+                val1 = max(low, min(high, val1))
+                val2 = max(low, min(high, val2))
+                child1[key] = val1
+                child2[key] = val2
+            else:
+                child1[key] = parent1[key]
+                child2[key] = parent2[key]
+        return child1, child2
 
     def _mutate(self, individual: Dict) -> Dict:
+        """Polynomial mutation."""
         mutated = individual.copy()
         for key, (low, high) in self.param_bounds.items():
             if random.random() < self.mutation_rate:
-                delta = random.uniform(-(high-low)*0.1, (high-low)*0.1)
-                mutated[key] = max(low, min(high, mutated[key] + delta))
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutated[key] = mutated[key] + delta * (high - low)
+                mutated[key] = max(low, min(high, mutated[key]))
         return mutated
 
-    # ---------- Pareto front methods (NEW) ----------
-    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
-        """Return non‑dominated points."""
-        if not points:
-            return []
-        objective_keys = ['efficiency', 'inflation', 'emergency']
-        pareto = []
-        for i, p_i in enumerate(points):
-            dominated = False
-            for j, p_j in enumerate(points):
-                if i == j:
-                    continue
-                a_vec = [getattr(p_i, k) for k in objective_keys]
-                b_vec = [getattr(p_j, k) for k in objective_keys]
-                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
-                    dominated = True
-                    break
-            if not dominated:
-                pareto.append(p_i)
-        return pareto
+    # ----------------------------------------------------------------------
+    # Dynamic objective weighting
+    # ----------------------------------------------------------------------
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        """
+        Adjust objective weights based on current system state.
+        - If emergency_mode is active, increase weight of 'emergency'.
+        - If inflation is high (i.e., total_generated >> total_consumed), increase weight of 'inflation'.
+        - Otherwise, default weights from config.
+        """
+        summary = self.token_manager.get_system_summary_sync()
+        weights = self.config.mopd.objective_weights.copy()
+        if summary.get('emergency_mode', False):
+            # Shift weight towards emergency
+            weights['emergency'] = min(0.6, weights['emergency'] * 1.5)
+            # Normalize
+            total = sum(weights.values())
+            weights = {k: v / total for k, v in weights.items()}
+        total_gen = summary.get('total_generated', 1)
+        total_con = summary.get('total_consumed', 1)
+        inflation = (total_gen - total_con) / max(total_con, 1)
+        if inflation > 0.2:  # high inflation
+            weights['inflation'] = min(0.6, weights['inflation'] * 1.5)
+            total = sum(weights.values())
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
 
-    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with MOPD weights."""
+    # ----------------------------------------------------------------------
+    # Main evolution loop (NSGA‑II)
+    # ----------------------------------------------------------------------
+    async def evolve(self, generations: Optional[int] = None) -> Dict:
+        async with self.lock:
+            if generations is None:
+                generations = self.generations
+
+            # Initialize population
+            population = self._initialize_population()
+            # Evaluate all individuals and store objectives
+            objectives = {}
+            for ind in population:
+                key = tuple(sorted(ind.items()))
+                objectives[key] = self._evaluate_individual(ind)
+
+            # NSGA‑II main loop
+            for gen in range(generations):
+                # Create offspring population
+                offspring = []
+                while len(offspring) < self.population_size:
+                    parent1 = self._tournament_selection(population, fronts=None, crowding={})  # simplified
+                    parent2 = self._tournament_selection(population, fronts=None, crowding={})
+                    if random.random() < self.crossover_rate:
+                        child1, child2 = self._crossover(parent1, parent2)
+                        child1 = self._mutate(child1)
+                        child2 = self._mutate(child2)
+                        offspring.extend([child1, child2])
+                    else:
+                        offspring.append(self._mutate(parent1.copy()))
+                # Trim offspring to population size
+                offspring = offspring[:self.population_size]
+
+                # Evaluate offspring
+                for ind in offspring:
+                    key = tuple(sorted(ind.items()))
+                    if key not in objectives:
+                        objectives[key] = self._evaluate_individual(ind)
+
+                # Combine parent and offspring
+                combined = population + offspring
+                # Remove duplicates (by key)
+                unique_keys = {}
+                for ind in combined:
+                    key = tuple(sorted(ind.items()))
+                    unique_keys[key] = ind
+                combined = list(unique_keys.values())
+
+                # Non‑dominated sorting on combined
+                combined_objectives = {tuple(sorted(ind.items())): objectives[tuple(sorted(ind.items()))] for ind in combined}
+                fronts = self._fast_non_dominated_sort(combined, combined_objectives)
+
+                # Select next population
+                new_population = []
+                for front in fronts:
+                    if len(new_population) + len(front) <= self.population_size:
+                        new_population.extend(front)
+                    else:
+                        # Need to fill remaining slots using crowding distance
+                        crowding = self._crowding_distance(front, combined_objectives)
+                        # Sort front by crowding distance descending
+                        sorted_front = sorted(front, key=lambda ind: crowding.get(tuple(sorted(ind.items())), 0), reverse=True)
+                        remaining = self.population_size - len(new_population)
+                        new_population.extend(sorted_front[:remaining])
+                        break
+
+                population = new_population
+
+                # Update Pareto front (non‑dominated set of current population)
+                pop_objectives = {tuple(sorted(ind.items())): objectives[tuple(sorted(ind.items()))] for ind in population}
+                fronts_pop = self._fast_non_dominated_sort(population, pop_objectives)
+                if fronts_pop:
+                    pareto_individuals = fronts_pop[0]  # first front
+                    self.pareto_front = []
+                    for ind in pareto_individuals:
+                        obj = pop_objectives[tuple(sorted(ind.items()))]
+                        self.pareto_front.append(MOPDPoint(
+                            individual=ind,
+                            efficiency=obj['efficiency'],
+                            inflation=obj['inflation'],
+                            emergency=obj['emergency']
+                        ))
+                # Log generation info
+                logger.debug(f"Generation {gen+1}/{generations}: population size={len(population)}, pareto front size={len(self.pareto_front)}")
+
+            # After evolution, select best individual using scalarisation with dynamic weights
+            weights = self._compute_dynamic_weights()
+            if self.pareto_front:
+                # Use scalarisation on Pareto front
+                best_point = self._select_best_from_pareto(self.pareto_front, weights)
+                if best_point:
+                    self.best_individual = best_point.individual
+                    self.best_fitness = best_point.scalarised_score
+                    self._apply_individual(best_point.individual)  # apply best params to system
+                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
+            else:
+                # Fallback: pick individual with highest scalarised fitness from population
+                pop_objectives = {tuple(sorted(ind.items())): objectives[tuple(sorted(ind.items()))] for ind in population}
+                best_ind = max(population, key=lambda ind: sum(weights[k] * pop_objectives[tuple(sorted(ind.items()))][k] for k in weights))
+                best_obj = pop_objectives[tuple(sorted(best_ind.items()))]
+                self.best_individual = best_ind
+                self.best_fitness = sum(weights[k] * best_obj[k] for k in weights)
+                self._apply_individual(best_ind)
+                logger.info(f"Applied best individual with scalarised fitness {self.best_fitness:.4f}")
+
+            # Record evolution history
+            self.evolution_history.append({
+                'timestamp': datetime.utcnow(),
+                'best_fitness': self.best_fitness,
+                'pareto_front_size': len(self.pareto_front),
+                'dynamic_weights': weights,
+                'generation_count': generations
+            })
+            self._save_state()
+
+            return {
+                'best_fitness': self.best_fitness,
+                'best_individual': self.best_individual,
+                'pareto_front': [p.to_dict() for p in self.pareto_front],
+                'dynamic_weights': weights
+            }
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint], weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
+        """
+        Select best point from Pareto front using scalarisation with given weights.
+        If weights not provided, use config weights.
+        """
         if not pareto_front:
             return None
-        weights = self.token_manager.config.mopd.objective_weights
+        if weights is None:
+            weights = self.config.mopd.objective_weights
         objective_keys = list(weights.keys())
 
         # Normalise objectives across Pareto front
-        max_vals = {}
-        min_vals = {}
-        for key in objective_keys:
-            vals = [getattr(p, key) for p in pareto_front]
-            max_vals[key] = max(vals)
-            min_vals[key] = min(vals)
+        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
         ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
 
         best = None
@@ -807,111 +1085,31 @@ class ThresholdGeneticOptimizer:
             for key in objective_keys:
                 val = getattr(point, key)
                 norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                weight = weights.get(key, 0.0)
-                score += weight * norm
+                score += weights.get(key, 0.0) * norm
             point.scalarised_score = score
             if score > best_score:
                 best_score = score
                 best = point
         return best
 
-    # ---------- Main evolve (enhanced with MOPD) ----------
-    async def evolve(self, generations: Optional[int] = None) -> Dict:
-        async with self.lock:
-            if generations is None:
-                generations = self.generations
-            population = self._initialize_population()
-
-            if self.token_manager.config.mopd.enabled:
-                self.pareto_front = []
-
-            for gen in range(generations):
-                # Evaluate objectives for all individuals
-                individuals_with_objs = []
-                for ind in population:
-                    objs = self._evaluate_individual(ind)
-                    individuals_with_objs.append((ind, objs))
-
-                # If MOPD enabled, update Pareto front
-                if self.token_manager.config.mopd.enabled:
-                    points = []
-                    for ind, objs in individuals_with_objs:
-                        point = MOPDPoint(
-                            individual=ind,
-                            efficiency=objs['efficiency'],
-                            inflation=objs['inflation'],
-                            emergency=objs['emergency']
-                        )
-                        points.append(point)
-                    self.pareto_front = self._filter_pareto(self.pareto_front + points)
-
-                    # Compute scalarised scores for selection
-                    weights = self.token_manager.config.mopd.objective_weights
-                    fitness_scores = []
-                    for point in points:
-                        score = (weights.get('efficiency', 0.4) * point.efficiency +
-                                 weights.get('inflation', 0.3) * point.inflation +
-                                 weights.get('emergency', 0.3) * point.emergency)
-                        point.scalarised_score = score
-                        fitness_scores.append(score)
-                else:
-                    # Legacy: single fitness (efficiency)
-                    fitness_scores = [objs['efficiency'] for _, objs in individuals_with_objs]
-
-                # Selection and reproduction
-                new_population = []
-                best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                new_population.append(population[best_idx])
-                while len(new_population) < self.population_size:
-                    if random.random() < self.crossover_rate:
-                        parent1 = self._select(population, fitness_scores)
-                        parent2 = self._select(population, fitness_scores)
-                        child = self._crossover(parent1, parent2)
-                        child = self._mutate(child)
-                        new_population.append(child)
-                    else:
-                        parent = self._select(population, fitness_scores)
-                        new_population.append(parent.copy())
-                population = new_population
-
-                gen_best_fitness = max(fitness_scores)
-                logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
-
-            # After evolution, if MOPD enabled and we have a Pareto front, select best
-            if self.token_manager.config.mopd.enabled and self.pareto_front:
-                best_point = self._select_best_from_pareto(self.pareto_front)
-                if best_point:
-                    self.best_individual = best_point.individual
-                    self.best_fitness = best_point.scalarised_score
-                    self._apply_individual(best_point.individual)
-                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
-            else:
-                # Legacy: keep best fitness and individual
-                if fitness_scores:
-                    best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                    self.best_fitness = fitness_scores[best_idx]
-                    self.best_individual = population[best_idx]
-                    self._apply_individual(self.best_individual)
-                    logger.info(f"Applied best individual with fitness {self.best_fitness:.4f}")
-
-            self.evolution_history.append({
-                'timestamp': datetime.utcnow(),
-                'best_fitness': self.best_fitness,
-                'pareto_front_size': len(self.pareto_front) if self.token_manager.config.mopd.enabled else 0
-            })
-            self._save_state()
-            return {
-                'best_fitness': self.best_fitness,
-                'best_individual': self.best_individual,
-                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.token_manager.config.mopd.enabled else None
-            }
+    # ----------------------------------------------------------------------
+    # Helper for change detection
+    # ----------------------------------------------------------------------
+    def get_system_signature(self) -> str:
+        """Return a compact signature of current system state for change detection."""
+        summary = self.token_manager.get_system_summary_sync()
+        # Use key metrics that influence optimization
+        sig = f"{summary.get('total_balance', 0):.1f}|{summary.get('system_efficiency', 0):.2f}|{summary.get('emergency_mode', False)}|{summary.get('substrate_reserves', 0):.1f}"
+        return sig
 
     def get_status(self) -> Dict:
         return {
             'best_fitness': self.best_fitness,
             'best_individual': self.best_individual,
             'history': self.evolution_history[-10:],
-            'pareto_front_size': len(self.pareto_front) if self.token_manager.config.mopd.enabled else 0
+            'pareto_front_size': len(self.pareto_front),
+            'pareto_front': [p.to_dict() for p in self.pareto_front],
+            'cache_size': len(self._eval_cache)
         }
 
 # ============================================================================
@@ -1916,7 +2114,7 @@ class EcoATPTokenManager:
         if self.persistence:
             asyncio.create_task(self._load_state())
 
-        logger.info("Enhanced Eco-ATP Token Manager v10.1.0 initialized with MOPD")
+        logger.info("Enhanced Eco-ATP Token Manager v10.1.0 initialized with MOPD and NSGA‑II")
 
     # ---------- Energy cost per token (fixed method) ----------
     async def energy_cost_per_token(
@@ -1957,6 +2155,7 @@ class EcoATPTokenManager:
         self.task_manager.start_task("market_matching", self._market_matching_loop)
         if self.genetic_optimizer:
             self.task_manager.start_task("evolution", self._evolution_loop)
+            self.task_manager.start_task("change_detection", self._change_detection_loop)
         self.task_manager.start_task("ml_training", self._ml_training_loop)
         self.task_manager.start_task("token_cleanup", self._token_cleanup_loop)
         self.task_manager.start_task("persistence_save", self._persistence_save_loop)
@@ -2453,10 +2652,11 @@ class EcoATPTokenManager:
                 if self.genetic_optimizer:
                     logger.info("Starting genetic evolution cycle...")
                     result = await self.genetic_optimizer.evolve(generations=self.config.genetic_generations)
-                    # Telemetry for MOPD (if Prometheus available)
+                    # Log MOPD metrics
                     if self.config.mopd.enabled:
-                        # We could add counters, but we'll log for now
-                        logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
+                        logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}, "
+                                    f"Pareto front size: {len(result.get('pareto_front', []))}, "
+                                    f"Dynamic weights: {result.get('dynamic_weights', {})}")
                     else:
                         logger.info(f"Evolution complete: best fitness {result['best_fitness']:.4f}")
                 await asyncio.sleep(self.config.genetic_evolution_interval_seconds)
@@ -2464,6 +2664,25 @@ class EcoATPTokenManager:
                 break
             except Exception as e:
                 logger.error(f"Evolution error: {e}")
+                await asyncio.sleep(60)
+
+    async def _change_detection_loop(self):
+        """Monitor system state for significant changes and trigger early evolution."""
+        while True:
+            try:
+                if self.genetic_optimizer:
+                    current_signature = self.genetic_optimizer.get_system_signature()
+                    if (self.genetic_optimizer._last_summary_signature is not None and
+                        current_signature != self.genetic_optimizer._last_summary_signature):
+                        # Significant change detected – trigger evolution sooner
+                        logger.info("System state changed significantly; triggering evolution early.")
+                        await self.genetic_optimizer.evolve(generations=min(5, self.config.genetic_generations))
+                    self.genetic_optimizer._last_summary_signature = current_signature
+                await asyncio.sleep(60)  # check every minute
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Change detection error: {e}")
                 await asyncio.sleep(60)
 
     async def _ml_training_loop(self):
