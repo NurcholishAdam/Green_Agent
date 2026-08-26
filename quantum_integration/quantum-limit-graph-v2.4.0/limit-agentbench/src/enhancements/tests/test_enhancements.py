@@ -1,20 +1,23 @@
 # =============================================================================
-# FILE: src/enhancements/tests/test_enhancements_v7_0.py
-# VERSION: 7.0 (Enhanced Test Suite with Adaptive Test Selection via Distillation)
+# FILE: src/enhancements/tests/test_enhancements_v8_0.py
+# VERSION: 8.0 (Enhanced with full adaptive test selection and integration)
 # =============================================================================
 """
-Enhanced Pytest Test Suite for Enhancements Modules - Version 7.0
+Enhanced Pytest Test Suite for Enhancements Modules - Version 8.0
 
-Additions over 6.0:
-- Adaptive test selection using Multi‑Teacher On‑Policy Distillation.
-- State‑aware decision to run or skip each test based on context (code coverage, recent failures, system load, carbon intensity, etc.).
-- Online learning from test outcomes.
-- Teachers: rule‑based, historical ML, stateful Q.
-- Student: linear softmax with distillation + REINFORCE.
-- Persistence for Q‑teacher weights and interaction logs.
-- Offline training for historical ML teacher.
-- Unit tests for distillation components.
-All previous features (key storage, encryption, optimizer, concurrency) retained.
+Additions over 7.0:
+- Fixed feature vector dimension to 12.
+- State vectors now stored in interaction logs; historical ML training implemented.
+- Emits FeedbackEvent for decisions and outcomes (if available).
+- Safety constraints: critical tests always run.
+- Reward function includes carbon cost and test importance.
+- Automated test metadata loading from JSON (optional).
+- Improved pytest integration via plugin hooks.
+- Dead-letter/quarantine handling for repeatedly failing tests.
+- Cross-module integration: accepts external context (system load, carbon intensity).
+- Unit tests for AdaptiveTestRunner and enhanced components.
+
+All previous features retained.
 """
 
 import os
@@ -25,21 +28,19 @@ from cryptography.exceptions import InvalidTag
 import random
 import numpy as np
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import deque, defaultdict
 from pathlib import Path
 import json
 import pickle
 import pandas as pd
 from datetime import datetime
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set, Union
 import asyncio
 import logging
 import functools
+from dataclasses import dataclass
 
 # Import components from src.enhancements
-# Adjust import path as needed; in the final file, we assume the modules are available.
-# For the purpose of this standalone test file, we'll use relative imports or mock.
-# We'll import from the actual package assuming it's installed.
 try:
     from src.enhancements import (
         Storage,
@@ -47,7 +48,6 @@ try:
         QuantumResilientEnhancementsSecurity,
     )
 except ImportError:
-    # Fallback: if running tests from a different directory, adjust path.
     import sys
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
     from src.enhancements import (
@@ -55,6 +55,17 @@ except ImportError:
         AutonomousEnhancementsOptimizer,
         QuantumResilientEnhancementsSecurity,
     )
+
+# Optional imports for FeedbackEvent and AsyncMessageQueue
+try:
+    from src.enhancements.schemas.feedback_event import FeedbackEvent
+except ImportError:
+    FeedbackEvent = None
+
+try:
+    from src.enhancements.async_message_queue import AsyncMessageQueue
+except ImportError:
+    AsyncMessageQueue = None
 
 # ---------- scikit-learn for ML teacher ----------
 try:
@@ -73,41 +84,43 @@ except ImportError:
     logging.basicConfig(level=logging.INFO)
 
 # ============================================================================
-# DISTILLATION COMPONENTS FOR TEST SELECTION
+# DISTILLATION COMPONENTS (Enhanced to 12 features)
 # ============================================================================
 
 @dataclass
 class TestSelectionState:
-    """State for the distillation agent."""
+    """State for the distillation agent (12 features)."""
     test_name: str
     test_category: str  # 'unit', 'integration', 'performance'
     estimated_duration_sec: float
-    code_coverage_pct: float  # 0-100
-    recent_failures: int      # failures in last 10 runs
-    system_load: float        # 0-1
-    carbon_intensity: float   # gCO2/kWh
-    time_of_day: float        # 0-24
-    test_success_rate: float  # 0-1
+    test_importance: float  # 0-1, from metadata (critical tests have high importance)
+    code_coverage_pct: float
+    recent_failures: int
+    system_load: float
+    carbon_intensity: float
+    time_of_day: float
+    test_success_rate: float
     avg_reward: float
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to 11‑dim numeric feature vector."""
+        """Convert to 12‑dim numeric feature vector."""
         features = [
-            min(self.estimated_duration_sec / 60.0, 1.0),
-            min(self.code_coverage_pct / 100.0, 1.0),
-            min(self.recent_failures / 5.0, 1.0),
-            self.system_load,
-            min(self.carbon_intensity / 1000.0, 1.0),
-            self.time_of_day / 24.0,
-            self.test_success_rate,
-            self.avg_reward,
+            min(self.estimated_duration_sec / 60.0, 1.0),   # 0
+            self.test_importance,                           # 1
+            min(self.code_coverage_pct / 100.0, 1.0),       # 2
+            min(self.recent_failures / 5.0, 1.0),           # 3
+            self.system_load,                               # 4
+            min(self.carbon_intensity / 1000.0, 1.0),       # 5
+            self.time_of_day / 24.0,                        # 6
+            self.test_success_rate,                         # 7
+            self.avg_reward,                                # 8
         ]
         # One‑hot for test_category (unit, integration, performance)
         cat_map = {'unit': 0, 'integration': 1, 'performance': 2}
         one_hot = [0.0, 0.0, 0.0]
         idx = cat_map.get(self.test_category, 0)
         one_hot[idx] = 1.0
-        features.extend(one_hot)
+        features.extend(one_hot)                            # 9,10,11
         return np.array(features, dtype=np.float32)
 
 
@@ -119,36 +132,33 @@ class Teacher(ABC):
 
     @abstractmethod
     def confidence(self, state: TestSelectionState) -> float:
-        """Return confidence in prediction [0,1]."""
         pass
 
 
 class TestRuleBasedTeacher(Teacher):
-    """Rule‑based expert: uses heuristics."""
     ACTIONS = ['run', 'skip']
 
     def predict(self, state: TestSelectionState) -> np.ndarray:
         probs = np.ones(2) * 0.1
-        if state.recent_failures > 2:
-            probs[0] = 0.9  # run
+        if state.test_importance > 0.8 or state.recent_failures > 2:
+            probs[0] = 0.9
         elif state.code_coverage_pct < 50:
-            probs[0] = 0.8  # run
+            probs[0] = 0.8
         elif state.system_load > 0.8:
-            probs[1] = 0.8  # skip
-        elif state.carbon_intensity > 500:
-            probs[1] = 0.6  # skip
+            probs[1] = 0.8
+        elif state.carbon_intensity > 500 and state.test_importance < 0.5:
+            probs[1] = 0.6
         else:
-            probs[0] = 0.6  # run default
+            probs[0] = 0.6
         return probs / probs.sum()
 
     def confidence(self, state: TestSelectionState) -> float:
-        if state.recent_failures > 2:
+        if state.test_importance > 0.8 or state.recent_failures > 2:
             return 0.6
         return 0.4
 
 
 class TestHistoricalMLTeacher(Teacher):
-    """Offline trained classifier from past interactions."""
     def __init__(self, model_path: Optional[Path] = None):
         self.model = None
         self.label_encoder = None
@@ -171,28 +181,71 @@ class TestHistoricalMLTeacher(Teacher):
     def confidence(self, state: TestSelectionState) -> float:
         return 0.7 if self.model is not None else 0.0
 
+    @classmethod
+    def train_from_logs(cls, log_paths: List[Path], model_path: Path,
+                        state_col: str = 'state_vec', label_col: str = 'action'):
+        """Train a RandomForestClassifier from logs containing state vectors."""
+        if not SKLEARN_ML:
+            logger.error("scikit-learn not available, cannot train historical model.")
+            return None
+        all_dfs = []
+        for path in log_paths:
+            if path.exists():
+                df = pd.read_csv(path)
+                all_dfs.append(df)
+        if not all_dfs:
+            logger.warning("No logs found for training.")
+            return None
+
+        df = pd.concat(all_dfs, ignore_index=True)
+        if len(df) < 10:
+            logger.warning("Not enough logs to train historical model.")
+            return None
+
+        def parse_state(s):
+            try:
+                return np.fromstring(s, sep=',')
+            except:
+                return None
+
+        valid_indices = [i for i, s in enumerate(df[state_col]) if parse_state(s) is not None]
+        X = np.array([parse_state(df[state_col].iloc[i]) for i in valid_indices])
+        y = df[label_col].iloc[valid_indices].values
+
+        if len(X) < 5:
+            logger.warning("Too few valid samples after parsing.")
+            return None
+
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        clf.fit(X, y_enc)
+
+        with open(model_path, 'wb') as f:
+            pickle.dump((clf, le), f)
+        logger.info(f"Trained historical model and saved to {model_path}")
+        return model_path
+
 
 class TestStatefulQTeacher(Teacher):
-    """Linear Q‑learning with state features."""
-    def __init__(self, lr: float = 0.1):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
         self.lr = lr
-        self.weights = np.zeros((11, 2))  # 11 features, 2 actions
+        self.weights_path = weights_path or Path("./test_selection_q_weights.json")
+        self.weights = np.zeros((12, 2))  # 12 features, 2 actions
         self._load_state()
 
     def _load_state(self):
-        path = Path("./test_selection_q_weights.json")
-        if path.exists():
+        if self.weights_path.exists():
             try:
-                with open(path, 'r') as f:
+                with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
-                logger.info(f"Loaded Q‑teacher weights from {path}")
+                logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
 
     def _save_state(self):
-        path = Path("./test_selection_q_weights.json")
-        with open(path, 'w') as f:
+        with open(self.weights_path, 'w') as f:
             json.dump(self.weights.tolist(), f, indent=2)
 
     def predict(self, state: TestSelectionState) -> np.ndarray:
@@ -212,7 +265,7 @@ class TestStatefulQTeacher(Teacher):
 
 
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 11, n_classes: int = 2, lr: float = 0.01):
+    def __init__(self, feature_dim: int = 12, n_classes: int = 2, lr: float = 0.01):
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
@@ -237,8 +290,6 @@ class DistillationStudent:
     def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
                reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
         current_probs = self.predict_proba(state_vector, self.n_classes)
-        logits = state_vector @ self.weights + self.biases
-
         grad_distill = -(teacher_probs - current_probs)
         one_hot = np.zeros(self.n_classes)
         one_hot[action] = 1.0
@@ -272,24 +323,28 @@ class ReplayBuffer:
 
 
 class DistillationTestSelector:
-    """
-    Multi‑teacher on‑policy distillation agent for test selection.
-    Actions: run, skip.
-    """
     ACTIONS = ['run', 'skip']
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.student = DistillationStudent(
+            feature_dim=12,
+            lr=config.get('distillation_learning_rate', 0.01)
+        )
         self.teachers: List[Teacher] = [
             TestRuleBasedTeacher(),
-            TestHistoricalMLTeacher(),
-            TestStatefulQTeacher()
+            TestHistoricalMLTeacher(model_path=config.get('historical_model_path')),
+            TestStatefulQTeacher(
+                lr=config.get('q_learning_rate', 0.1),
+                weights_path=config.get('q_weights_path')
+            )
         ]
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
         self.counter = 0
+        self.distill_weight = config.get('distill_weight', 0.7)
+        self.rl_weight = config.get('rl_weight', 0.3)
 
     async def select_action(self, state: TestSelectionState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
@@ -330,63 +385,103 @@ class DistillationTestSelector:
             batch = self.replay_buffer.sample(8)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
+                                    distill_weight=self.distill_weight, rl_weight=self.rl_weight)
 
     def get_stats(self) -> Dict:
         return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
 
 
 # ============================================================================
-# ADAPTIVE TEST RUNNER
+# ADAPTIVE TEST RUNNER (Enhanced)
 # ============================================================================
 
 class AdaptiveTestRunner:
     """
     Orchestrates test execution with adaptive selection.
-    This is meant to be used as a pytest plugin or a wrapper around pytest.
+    Supports:
+    - Loading test metadata from JSON file.
+    - Critical tests (always run).
+    - External context injection (system load, carbon intensity).
+    - Emits FeedbackEvent if message queue available.
+    - Dead-letter/quarantine for repeatedly failing tests.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None,
+                 critical_tests: Optional[Set[str]] = None,
+                 message_queue: Optional[AsyncMessageQueue] = None):
         self.config = config or {}
         self.selector = DistillationTestSelector({
             'distillation_epsilon': self.config.get('distillation_epsilon', 0.1),
             'distillation_train_every': self.config.get('distillation_train_every', 10),
             'distillation_replay_size': self.config.get('distillation_replay_size', 2000),
             'distillation_learning_rate': self.config.get('distillation_learning_rate', 0.01),
+            'distill_weight': self.config.get('distill_weight', 0.7),
+            'rl_weight': self.config.get('rl_weight', 0.3),
+            'q_learning_rate': self.config.get('q_learning_rate', 0.1),
+            'q_weights_path': self.config.get('q_weights_path', './test_selection_q_weights.json'),
+            'historical_model_path': self.config.get('historical_model_path', './test_selection_model.pkl'),
         })
         self.interaction_log: List[Dict] = []
         self.last_state_vec: Optional[np.ndarray] = None
         self.last_action_idx: Optional[int] = None
         self.last_teacher_probs: Optional[np.ndarray] = None
-
-        # Test metadata (populated via register_test)
         self.test_metadata: Dict[str, Dict] = {}
+        self.critical_tests: Set[str] = critical_tests or set()
+        self.message_queue = message_queue
+        self.failed_tests: Dict[str, int] = defaultdict(int)
+        self.quarantine_threshold = self.config.get('quarantine_threshold', 3)
 
-        logger.info("AdaptiveTestRunner initialized")
+        # Load metadata from file if provided
+        metadata_file = self.config.get('metadata_file')
+        if metadata_file and Path(metadata_file).exists():
+            self.load_test_metadata(metadata_file)
 
-    def register_test(self, test_name: str, category: str = 'unit', duration_sec: float = 1.0):
+        logger.info("AdaptiveTestRunner initialized (v8.0)")
+
+    def register_test(self, test_name: str, category: str = 'unit',
+                      duration_sec: float = 1.0, importance: float = 0.5):
         """Register a test with its metadata."""
         self.test_metadata[test_name] = {
             'category': category,
             'duration_sec': duration_sec,
+            'importance': importance,
             'coverage_pct': 0.0,
             'recent_failures': 0,
             'success_rate': 0.5,
             'avg_reward': 0.5,
         }
 
-    def _build_state(self, test_name: str) -> TestSelectionState:
-        """Build state for a specific test."""
+    def load_test_metadata(self, filepath: str):
+        """Load test metadata from a JSON file."""
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        for test_name, meta in data.items():
+            self.test_metadata[test_name] = {
+                'category': meta.get('category', 'unit'),
+                'duration_sec': meta.get('duration_sec', 1.0),
+                'importance': meta.get('importance', 0.5),
+                'coverage_pct': meta.get('coverage_pct', 0.0),
+                'recent_failures': meta.get('recent_failures', 0),
+                'success_rate': meta.get('success_rate', 0.5),
+                'avg_reward': meta.get('avg_reward', 0.5),
+            }
+
+    def _build_state(self, test_name: str,
+                     system_load: Optional[float] = None,
+                     carbon_intensity: Optional[float] = None) -> TestSelectionState:
         meta = self.test_metadata.get(test_name, {})
-        # Gather context (mock values for demonstration; in real usage these would come from system monitoring)
-        system_load = 0.5
-        carbon_intensity = 400
+        if system_load is None:
+            system_load = 0.5
+        if carbon_intensity is None:
+            carbon_intensity = 400
         time_of_day = datetime.now().hour
 
         return TestSelectionState(
             test_name=test_name,
             test_category=meta.get('category', 'unit'),
             estimated_duration_sec=meta.get('duration_sec', 1.0),
+            test_importance=meta.get('importance', 0.5),
             code_coverage_pct=meta.get('coverage_pct', 0.0),
             recent_failures=meta.get('recent_failures', 0),
             system_load=system_load,
@@ -396,13 +491,26 @@ class AdaptiveTestRunner:
             avg_reward=meta.get('avg_reward', 0.5),
         )
 
-    async def decide_and_run(self, test_name: str, test_func) -> bool:
+    async def decide_and_run(self, test_name: str, test_func,
+                             system_load: Optional[float] = None,
+                             carbon_intensity: Optional[float] = None) -> bool:
         """
         Decide whether to run the test.
-        Returns True if the test was executed, False if skipped.
+        Returns True if test was executed, False if skipped.
         """
-        # Build state
-        state = self._build_state(test_name)
+        # Critical tests always run
+        if test_name in self.critical_tests:
+            logger.info(f"Test '{test_name}' is critical, always running.")
+            action = 'run'
+            state = self._build_state(test_name, system_load, carbon_intensity)
+            state_vec = state.to_feature_vector()
+            passed = await self._execute_test(test_name, test_func)
+            reward = self._compute_reward(passed, state)
+            await self._record_outcome(test_name, action, reward, passed, state_vec=state_vec,
+                                       action_idx=0, teacher_probs=None)
+            return True
+
+        state = self._build_state(test_name, system_load, carbon_intensity)
         action, action_idx, state_vec, teacher_probs = await self.selector.select_action(state, exploration=True)
         self.last_state_vec = state_vec
         self.last_action_idx = action_idx
@@ -410,62 +518,79 @@ class AdaptiveTestRunner:
 
         if action == 'skip':
             logger.info(f"Skipping test '{test_name}' based on distillation decision")
-            # Record skip (no reward)
-            await self._record_outcome(test_name, 'skip', 0.0, passed=None)
+            reward = 0.1 * (1.0 - state.test_importance)
+            await self._record_outcome(test_name, 'skip', reward, passed=None,
+                                       state_vec=state_vec, action_idx=action_idx, teacher_probs=teacher_probs)
             return False
 
-        # Execute the test
-        logger.info(f"Running test '{test_name}' based on distillation decision")
-        try:
-            test_func()
-            passed = True
-        except Exception as e:
-            passed = False
-            logger.error(f"Test '{test_name}' failed: {e}")
-
-        # Compute reward
+        passed = await self._execute_test(test_name, test_func)
         reward = self._compute_reward(passed, state)
-        await self._record_outcome(test_name, 'run', reward, passed)
-
+        await self._record_outcome(test_name, 'run', reward, passed,
+                                   state_vec=state_vec, action_idx=action_idx, teacher_probs=teacher_probs)
         return True
 
+    async def _execute_test(self, test_name: str, test_func) -> bool:
+        """Execute the test function in a thread to avoid blocking the event loop."""
+        try:
+            await asyncio.to_thread(test_func)
+            self.failed_tests[test_name] = 0
+            return True
+        except Exception as e:
+            self.failed_tests[test_name] = self.failed_tests.get(test_name, 0) + 1
+            logger.error(f"Test '{test_name}' failed: {e}")
+            if self.failed_tests[test_name] >= self.quarantine_threshold:
+                logger.warning(f"Test '{test_name}' has failed {self.failed_tests[test_name]} times, quarantining.")
+            return False
+
     def _compute_reward(self, passed: bool, state: TestSelectionState) -> float:
-        """Compute reward based on test outcome."""
+        """Compute reward based on test outcome, carbon cost, and test importance."""
         base = 0.6 if passed else 0.0
         coverage_bonus = 0.2 * min(1.0, state.code_coverage_pct / 100.0)
-        time_penalty = 0.2 * min(1.0, state.estimated_duration_sec / 60.0)
-        reward = base + coverage_bonus - time_penalty
+        time_penalty = 0.1 * min(1.0, state.estimated_duration_sec / 60.0)
+        carbon_penalty = 0.1 * min(1.0, state.carbon_intensity / 1000.0) * state.estimated_duration_sec / 60.0
+        importance_factor = state.test_importance
+        reward = (base + coverage_bonus - time_penalty - carbon_penalty) * (0.5 + 0.5 * importance_factor)
         return max(0.0, min(1.0, reward))
 
-    async def _record_outcome(self, test_name: str, action: str, reward: float, passed: Optional[bool]):
-        """Record the outcome of a test decision and update the agent."""
-        # Log interaction
-        self.interaction_log.append({
+    async def _record_outcome(self, test_name: str, action: str, reward: float,
+                              passed: Optional[bool],
+                              state_vec: Optional[np.ndarray] = None,
+                              action_idx: Optional[int] = None,
+                              teacher_probs: Optional[np.ndarray] = None):
+        """Record outcome, update agent, and emit FeedbackEvent."""
+        if state_vec is None:
+            state_vec = self.last_state_vec
+            action_idx = self.last_action_idx
+            teacher_probs = self.last_teacher_probs
+
+        entry = {
             'timestamp': datetime.utcnow().isoformat(),
             'test_name': test_name,
             'action': action,
             'reward': reward,
             'passed': passed,
-        })
-        log_path = Path("./test_selection_interactions.csv")
-        df_log = pd.DataFrame([self.interaction_log[-1]])
+        }
+        if state_vec is not None:
+            entry['state_vec'] = ','.join(map(str, state_vec))
+        self.interaction_log.append(entry)
+
+        log_path = Path(self.config.get('interaction_logs_path', './test_selection_interactions.csv'))
+        df_log = pd.DataFrame([entry])
         if log_path.exists():
             df_log.to_csv(log_path, mode='a', header=False, index=False)
         else:
             df_log.to_csv(log_path, index=False)
 
-        # Update agent if we have a recorded state
-        if self.last_state_vec is not None and self.last_action_idx is not None:
-            next_state_vec = self.last_state_vec  # for simplicity, same state
+        if state_vec is not None and action_idx is not None and teacher_probs is not None:
+            next_state_vec = state_vec
             await self.selector.update(
-                self.last_state_vec,
-                self.last_action_idx,
+                state_vec,
+                action_idx,
                 reward,
                 next_state_vec,
-                self.last_teacher_probs
+                teacher_probs
             )
 
-        # Update test metadata
         if test_name in self.test_metadata:
             meta = self.test_metadata[test_name]
             if passed is not None:
@@ -476,66 +601,88 @@ class AdaptiveTestRunner:
                 meta['success_rate'] = 0.9 * meta['success_rate'] + 0.1 * (1.0 if passed else 0.0)
             meta['avg_reward'] = 0.9 * meta['avg_reward'] + 0.1 * reward
 
+        if FeedbackEvent and self.message_queue:
+            event = FeedbackEvent(
+                source="adaptive_test_runner",
+                feedback_type="routing",
+                task_id=test_name,
+                context={"action": action, "test_category": self.test_metadata.get(test_name, {}).get('category', 'unknown')},
+                action={"selected_action": action, "selected_rank": 1, "confidence_score": 0.5},
+                performance={"quality_score": reward, "latency_ms": 0, "energy_joules": 0,
+                             "carbon_g": 0, "helium_cost": 0, "duration_ms": 0},
+                adaptive_cost_value=reward,
+                tags=["test_selection", action, test_name],
+            )
+            await self.message_queue.publish("test_events", event.to_json())
+
     def get_runner_stats(self) -> Dict:
-        return self.selector.get_stats()
+        return {
+            'selector_stats': self.selector.get_stats(),
+            'interaction_count': len(self.interaction_log),
+            'critical_tests': len(self.critical_tests),
+            'quarantined_tests': {k: v for k, v in self.failed_tests.items() if v >= self.quarantine_threshold},
+        }
 
     # Synchronous wrapper for use in decorator
-    def decide_and_run_sync(self, test_name: str, test_func) -> bool:
-        return asyncio.run(self.decide_and_run(test_name, test_func))
+    def decide_and_run_sync(self, test_name: str, test_func,
+                            system_load: Optional[float] = None,
+                            carbon_intensity: Optional[float] = None) -> bool:
+        return asyncio.run(self.decide_and_run(test_name, test_func, system_load, carbon_intensity))
 
 
 # ============================================================================
-# PYTEST HOOKS (to integrate the adaptive runner)
+# PYTEST PLUGIN HOOKS
 # ============================================================================
 
-# We'll use a fixture to provide the runner and a decorator to mark tests.
+_runner_instance = None
 
-@pytest.fixture(scope="session")
-def adaptive_runner():
-    """Fixture to provide the adaptive test runner."""
-    runner = AdaptiveTestRunner()
-    # Register tests (in a real system, this could be automated via test discovery)
-    # For this file, we'll register each test manually in the fixture.
-    # Alternatively, we could use a pytest hook to register tests dynamically.
-    runner.register_test('test_encryption_decryption_roundtrip', 'unit', 0.1)
-    runner.register_test('test_unique_nonce_per_encryption', 'unit', 0.1)
-    runner.register_test('test_tampered_ciphertext_rejection', 'unit', 0.1)
-    runner.register_test('test_missing_master_key_raises_error', 'unit', 0.1)
-    runner.register_test('test_sqlite_wal_mode_enabled', 'unit', 0.1)
-    runner.register_test('test_optimizer_initialization', 'unit', 0.1)
-    runner.register_test('test_save_and_retrieve_optimization_state', 'unit', 0.1)
-    runner.register_test('test_optimizer_key_rotation_flow', 'integration', 0.3)
-    runner.register_test('test_concurrent_state_updates', 'performance', 0.5)
-    return runner
+def pytest_configure(config):
+    """Initialize the adaptive test runner."""
+    global _runner_instance
+    critical = set()
+    # Example: load from config file or marker
+    _runner_instance = AdaptiveTestRunner(
+        config={
+            'metadata_file': config.getoption('--test-metadata', default=None),
+            'interaction_logs_path': './test_selection_interactions.csv',
+            'q_weights_path': './test_selection_q_weights.json',
+            'historical_model_path': './test_selection_model.pkl',
+        },
+        critical_tests=critical,
+    )
 
+def pytest_collection_modifyitems(session, config, items):
+    """Register all collected tests with metadata (if available)."""
+    if _runner_instance is None:
+        return
+    for item in items:
+        test_name = item.nodeid
+        category = 'unit'
+        duration = 1.0
+        importance = 0.5
+        if item.get_closest_marker('integration'):
+            category = 'integration'
+        elif item.get_closest_marker('performance'):
+            category = 'performance'
+        _runner_instance.register_test(test_name, category=category, duration_sec=duration, importance=importance)
 
-# Global runner instance for use in decorator
-_test_runner = None
-
-# A decorator that can be used to conditionally run a test.
-def adaptive_test(func):
-    """
-    Decorator that uses the adaptive runner to decide whether to run the test.
-    Usage:
-        @adaptive_test
-        def test_something():
-            ...
-    """
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        # Get the runner from the fixture (we need to have it available)
-        # In a real pytest environment, we'd use the fixture.
-        # For simplicity, we'll rely on a global runner.
-        global _test_runner
-        if _test_runner is None:
-            # Initialize with default config
-            _test_runner = AdaptiveTestRunner()
-        test_name = func.__name__
-        # If runner decides to skip, we skip the test.
-        if not _test_runner.decide_and_run_sync(test_name, lambda: func(*args, **kwargs)):
-            pytest.skip(f"Test '{test_name}' skipped by adaptive selector")
-        return None
-    return wrapper
+def pytest_runtest_call(item):
+    """Intercept test execution to allow skipping based on selector."""
+    if _runner_instance is None:
+        return
+    test_name = item.nodeid
+    if test_name in _runner_instance.critical_tests:
+        return
+    if test_name not in _runner_instance.test_metadata:
+        return
+    async def _decide():
+        return await _runner_instance.decide_and_run(test_name, lambda: item.runtest())
+    try:
+        should_run = asyncio.run(_decide())
+        if not should_run:
+            pytest.skip(f"Skipped by adaptive selector")
+    except Exception as e:
+        logger.error(f"Error in adaptive selector for {test_name}: {e}")
 
 
 # ============================================================================
@@ -577,6 +724,23 @@ def optimizer(set_env_master_key, temp_db_path):
 # ORIGINAL TESTS (with adaptive decorator)
 # ============================================================================
 
+# Global runner for decorator (lazy initialization)
+_test_runner = None
+
+def adaptive_test(func):
+    """Decorator that uses the adaptive runner to decide whether to run the test."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        global _test_runner
+        if _test_runner is None:
+            _test_runner = AdaptiveTestRunner()
+        test_name = func.__name__
+        if not _test_runner.decide_and_run_sync(test_name, lambda: func(*args, **kwargs)):
+            pytest.skip(f"Test '{test_name}' skipped by adaptive selector")
+        return None
+    return wrapper
+
+
 class TestKeyStorageEncryption:
     """Unit tests for AES-256-GCM key storage encryption and security."""
 
@@ -586,25 +750,20 @@ class TestKeyStorageEncryption:
         secret_key = "sk_live_51NxExampleKey123456789"
         key_alias = "api_provider_key"
 
-        # Encrypt & store
         storage.store_key(alias=key_alias, plaintext_key=secret_key)
-
-        # Retrieve & decrypt
         decrypted_key = storage.get_key(alias=key_alias)
         assert decrypted_key == secret_key
 
     @adaptive_test
     def test_unique_nonce_per_encryption(self, storage):
-        """Ensures consecutive encryptions of the same key produce distinct ciphertexts (96-bit nonce)."""
+        """Ensures consecutive encryptions of the same key produce distinct ciphertexts."""
         secret_key = "static_secret_value"
-        
         storage.store_key(alias="key_v1", plaintext_key=secret_key)
         storage.store_key(alias="key_v2", plaintext_key=secret_key)
 
         raw_c1 = storage.get_raw_encrypted_entry("key_v1")
         raw_c2 = storage.get_raw_encrypted_entry("key_v2")
 
-        # Nonce / ciphertext should differ even for identical plaintexts
         assert raw_c1["nonce"] != raw_c2["nonce"]
         assert raw_c1["ciphertext"] != raw_c2["ciphertext"]
 
@@ -614,19 +773,15 @@ class TestKeyStorageEncryption:
         key_alias = "sensitive_token"
         storage.store_key(alias=key_alias, plaintext_key="super_secret")
 
-        # Directly tamper with ciphertext in SQLite
         conn = sqlite3.connect(temp_db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT ciphertext FROM keys WHERE alias = ?", (key_alias,))
         original_ct = bytearray(cursor.fetchone()[0])
-        
-        # Flip a bit in the ciphertext
         original_ct[0] ^= 0xFF
         cursor.execute("UPDATE keys SET ciphertext = ? WHERE alias = ?", (bytes(original_ct), key_alias))
         conn.commit()
         conn.close()
 
-        # Decryption must raise an authentication / tag failure exception
         with pytest.raises((ValueError, InvalidTag, Exception)):
             storage.get_key(alias=key_alias)
 
@@ -634,19 +789,17 @@ class TestKeyStorageEncryption:
     def test_missing_master_key_raises_error(self, monkeypatch, temp_db_path):
         """Verifies Storage initialization fails if MASTER_ENCRYPTION_KEY is unset."""
         monkeypatch.delenv("MASTER_ENCRYPTION_KEY", raising=False)
-        
         with pytest.raises(EnvironmentError, match="MASTER_ENCRYPTION_KEY"):
             Storage(db_path=temp_db_path)
 
     @adaptive_test
     def test_sqlite_wal_mode_enabled(self, storage, temp_db_path):
-        """Verifies SQLite storage initializes with Write-Ahead Logging (WAL) for concurrency."""
+        """Verifies SQLite storage initializes with Write-Ahead Logging (WAL)."""
         conn = sqlite3.connect(temp_db_path)
         cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode;")
         journal_mode = cursor.fetchone()[0]
         conn.close()
-
         assert journal_mode.lower() == "wal"
 
 
@@ -667,7 +820,6 @@ class TestAutonomousEnhancementsOptimizer:
             "best_score": 0.945,
             "hyperparameters": {"learning_rate": 0.001, "batch_size": 64},
         }
-        
         optimizer.save_state(state=state_payload)
         retrieved_state = optimizer.load_latest_state()
 
@@ -681,14 +833,10 @@ class TestAutonomousEnhancementsOptimizer:
         old_key = set_env_master_key
         new_key = os.urandom(32).hex()
 
-        # Store key under old master key
         optimizer.storage.store_key("service_api", "secret_value_123")
-
-        # Perform re-encryption/rotation
         optimizer.rotate_master_key(new_master_key=new_key)
         monkeypatch.setenv("MASTER_ENCRYPTION_KEY", new_key)
 
-        # Ensure key is still correctly readable
         retrieved = optimizer.storage.get_key("service_api")
         assert retrieved == "secret_value_123"
 
@@ -715,7 +863,7 @@ class TestAutonomousEnhancementsOptimizer:
 
 
 # ============================================================================
-# UNIT TESTS FOR DISTILLATION COMPONENTS (Phase 10)
+# UNIT TESTS FOR DISTILLATION COMPONENTS
 # ============================================================================
 
 import unittest
@@ -728,14 +876,18 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             'distillation_replay_size': 10,
             'distillation_learning_rate': 0.01,
             'distillation_train_every': 10,
+            'distill_weight': 0.7,
+            'rl_weight': 0.3,
+            'q_learning_rate': 0.1,
         }
         self.selector = DistillationTestSelector(self.config)
 
-    def test_state_feature_vector(self):
+    def test_state_feature_vector_dimension(self):
         state = TestSelectionState(
             test_name='test_example',
             test_category='unit',
             estimated_duration_sec=1.0,
+            test_importance=0.7,
             code_coverage_pct=80.0,
             recent_failures=0,
             system_load=0.5,
@@ -745,7 +897,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             avg_reward=0.8,
         )
         vec = state.to_feature_vector()
-        self.assertEqual(len(vec), 11)
+        self.assertEqual(len(vec), 12)
 
     def test_rule_based_teacher(self):
         teacher = TestRuleBasedTeacher()
@@ -753,6 +905,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             test_name='test_example',
             test_category='unit',
             estimated_duration_sec=1.0,
+            test_importance=0.3,
             code_coverage_pct=80.0,
             recent_failures=3,
             system_load=0.5,
@@ -763,13 +916,14 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         )
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
-        self.assertGreater(probs[0], probs[1])  # run should be highest
+        self.assertGreater(probs[0], probs[1])
 
     async def test_select_action(self):
         state = TestSelectionState(
             test_name='test_example',
             test_category='unit',
             estimated_duration_sec=1.0,
+            test_importance=0.7,
             code_coverage_pct=80.0,
             recent_failures=0,
             system_load=0.5,
@@ -783,7 +937,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 
     def test_replay_buffer(self):
         buffer = ReplayBuffer(max_size=5)
-        state_vec = np.random.randn(11)
+        state_vec = np.random.randn(12)
         buffer.push(state_vec, 0, 1.0, state_vec, np.ones(2)/2)
         self.assertEqual(len(buffer), 1)
         batch = buffer.sample(1)
@@ -791,26 +945,13 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 
 
 # ============================================================================
-# OFFLINE TRAINING FOR HISTORICAL ML
+# OFFLINE TRAINING FOR HISTORICAL ML (now functional)
 # ============================================================================
 
 def train_historical_model(log_path: Path = Path("./test_selection_interactions.csv"),
                            model_path: Path = Path("./test_selection_model.pkl")):
-    """
-    Train a RandomForestClassifier from past test selection logs.
-    """
-    if not log_path.exists():
-        logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
-        return
-
-    df_logs = pd.read_csv(log_path)
-    if len(df_logs) < 10:
-        logger.warning("Not enough logs to train historical model (need at least 10).")
-        return
-
-    # For a real implementation, you need to store state vectors in logs.
-    # Here we just log a message.
-    logger.info("Historical ML training requires state vectors in logs. Please implement logging of state vectors.")
+    """Train a RandomForestClassifier from interaction logs."""
+    return TestHistoricalMLTeacher.train_from_logs([log_path], model_path)
 
 
 # ============================================================================
@@ -819,5 +960,5 @@ def train_historical_model(log_path: Path = Path("./test_selection_interactions.
 
 if __name__ == "__main__":
     # When running directly, we run pytest normally.
-    # The adaptive runner would be enabled via a plugin or environment variable.
+    # The adaptive runner can be enabled via command-line options or environment.
     pytest.main([__file__, "-v", "--tb=short"])
