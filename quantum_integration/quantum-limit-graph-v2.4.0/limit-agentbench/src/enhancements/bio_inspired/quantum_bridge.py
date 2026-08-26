@@ -15,6 +15,8 @@ import os
 import time
 from enum import Enum
 import uuid
+import asyncio
+import random
 
 # ============================================================================
 # Optional dependencies
@@ -947,6 +949,402 @@ class QuantumBridge:
         self.clear_cache()
         logger.info("Set custom transform for field %s: %s", field, transform_name)
 
+
+# ============================================================================
+# [ENHANCEMENT] Multi‑Objective Optimizer for QuantumBridge Configuration
+# ============================================================================
+@dataclass
+class MOPDPoint:
+    """Represents a configuration with its objective vector."""
+    config: QuantumBridgeConfig
+    objectives: Dict[str, float]  # e.g., {'success_rate': 0.8, 'energy_cost': 0.3, ...}
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'config': self.config.dict() if PYDANTIC_AVAILABLE else asdict(self.config),
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        config_data = data['config']
+        if PYDANTIC_AVAILABLE:
+            config = QuantumBridgeConfig(**config_data)
+        else:
+            config = QuantumBridgeConfig(**config_data)
+        return cls(config=config, objectives=data['objectives'], scalarised_score=data.get('scalarised_score', 0.0))
+
+
+class QuantumBridgeOptimizer:
+    """
+    Multi‑objective optimizer that tunes the QuantumBridge configuration (scaling factors,
+    quadratic scaling, etc.) using NSGA‑II. The objectives are provided by a user‑supplied
+    evaluation function that runs the bridge with a given configuration and returns a dict
+    of objectives (all to be maximized).
+
+    Usage:
+        optimizer = QuantumBridgeOptimizer(bridge, evaluate_func, population_size=20, generations=10)
+        best_config, best_objectives = await optimizer.evolve()
+        bridge.update_config(best_config.dict())  # apply best configuration
+    """
+
+    def __init__(self,
+                 bridge: QuantumBridge,
+                 evaluate_func: Callable[[QuantumBridgeConfig], Dict[str, float]],
+                 population_size: int = 20,
+                 generations: int = 10,
+                 mutation_rate: float = 0.2,
+                 crossover_rate: float = 0.8,
+                 tournament_size: int = 3,
+                 objective_weights: Optional[Dict[str, float]] = None,
+                 config_bounds: Optional[Dict[str, Tuple[float, float]]] = None):
+        """
+        Args:
+            bridge: The QuantumBridge instance (used to fetch scaling keys).
+            evaluate_func: Async or sync function that takes a QuantumBridgeConfig and returns
+                           a dictionary of objective values (higher is better for all).
+            population_size: Size of the population.
+            generations: Number of generations to evolve.
+            mutation_rate: Probability of mutation per gene.
+            crossover_rate: Probability of crossover.
+            tournament_size: Tournament selection size.
+            objective_weights: Optional weights for scalarisation to select final best.
+                               If None, equal weights are used.
+            config_bounds: Optional bounds for scaling factors. If None, defaults are used.
+        """
+        self.bridge = bridge
+        self.evaluate_func = evaluate_func
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {}
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDPoint] = []
+        self._lock = asyncio.Lock()
+
+        # Determine which parameters to optimize: scaling factors and quadratic_scaling
+        self.scaling_keys = list(bridge.config.scaling.keys())
+        self.param_names = self.scaling_keys + ['quadratic_scaling']
+        self.param_bounds = {}
+        # Default bounds
+        for key in self.scaling_keys:
+            self.param_bounds[key] = (0.1, 100.0)  # wide range
+        self.param_bounds['quadratic_scaling'] = (0.0, 10.0)
+        if config_bounds:
+            self.param_bounds.update(config_bounds)
+
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _config_from_vector(self, vector: Dict[str, float]) -> QuantumBridgeConfig:
+        """Create a new configuration with the given parameter values."""
+        new_config = self.bridge.config.copy(deep=True) if PYDANTIC_AVAILABLE else copy.deepcopy(self.bridge.config)
+        # Update scaling
+        new_scaling = new_config.scaling.copy()
+        for key in self.scaling_keys:
+            new_scaling[key] = vector[key]
+        new_config.scaling = new_scaling
+        # Update quadratic_scaling
+        new_config.quadratic_scaling = vector['quadratic_scaling']
+        # Clear cache in the new config (or we can rely on bridge's update later)
+        new_config.enable_caching = False  # avoid cache side effects during evaluation
+        return new_config
+
+    def _vector_to_tuple(self, vector: Dict[str, float]) -> Tuple[float, ...]:
+        return tuple(vector[name] for name in self.param_names)
+
+    def _random_individual(self) -> Dict[str, float]:
+        ind = {}
+        for name in self.param_names:
+            low, high = self.param_bounds[name]
+            ind[name] = random.uniform(low, high)
+        return ind
+
+    def _crossover(self, parent1: Dict[str, float], parent2: Dict[str, float]) -> Dict[str, float]:
+        child = {}
+        for name in self.param_names:
+            if random.random() < 0.5:
+                child[name] = parent1[name]
+            else:
+                child[name] = parent2[name]
+            # SBX-like blending
+            if random.random() < 0.3:
+                low, high = self.param_bounds[name]
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                val = 0.5 * ((1 + beta) * parent1[name] + (1 - beta) * parent2[name])
+                child[name] = max(low, min(high, val))
+        return child
+
+    def _mutate(self, individual: Dict[str, float]) -> Dict[str, float]:
+        mutant = individual.copy()
+        for name in self.param_names:
+            if random.random() < self.mutation_rate:
+                low, high = self.param_bounds[name]
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[name] = individual[name] + delta * (high - low)
+                mutant[name] = max(low, min(high, mutant[name]))
+        return mutant
+
+    async def _evaluate(self, vector: Dict[str, float]) -> Dict[str, float]:
+        """Evaluate a single configuration, using cache if possible."""
+        key = self._vector_to_tuple(vector)
+        if key in self._eval_cache:
+            return self._eval_cache[key]
+        config = self._config_from_vector(vector)
+        # Call the evaluate function (could be sync or async)
+        if asyncio.iscoroutinefunction(self.evaluate_func):
+            objectives = await self.evaluate_func(config)
+        else:
+            objectives = self.evaluate_func(config)
+        # Ensure all objectives are numeric and positive (higher is better)
+        obj = {k: float(v) for k, v in objectives.items()}
+        self._eval_cache[key] = obj
+        return obj
+
+    def _fast_non_dominated_sort(self, population: List[Dict[str, float]],
+                                 objectives: Dict[Tuple[float, ...], Dict[str, float]]) -> List[List[Dict[str, float]]]:
+        """Non‑dominated sorting (maximization)."""
+        fronts = []
+        domination_count = {key: 0 for key in objectives}
+        dominated_solutions = {key: [] for key in objectives}
+
+        keys = list(objectives.keys())
+        for i, p_key in enumerate(keys):
+            p_obj = objectives[p_key]
+            for j, q_key in enumerate(keys):
+                if i == j:
+                    continue
+                q_obj = objectives[q_key]
+                # p dominates q if all objectives of p >= q and at least one > q
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[p_key].append(q_key)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[p_key] += 1
+
+            if domination_count[p_key] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p_key)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p_key in fronts[i]:
+                for q_key in dominated_solutions[p_key]:
+                    domination_count[q_key] -= 1
+                    if domination_count[q_key] == 0:
+                        next_front.append(q_key)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+
+        # Convert keys back to individuals
+        key_to_ind = {self._vector_to_tuple(ind): ind for ind in population}
+        return [[key_to_ind[key] for key in front] for front in fronts]
+
+    def _crowding_distance(self, front: List[Dict[str, float]],
+                           objectives: Dict[Tuple[float, ...], Dict[str, float]]) -> Dict[Tuple[float, ...], float]:
+        if not front:
+            return {}
+        distances = {self._vector_to_tuple(ind): 0.0 for ind in front}
+        obj_keys = list(next(iter(objectives.values())).keys())
+        for obj in obj_keys:
+            sorted_front = sorted(front, key=lambda ind: objectives[self._vector_to_tuple(ind)][obj])
+            distances[self._vector_to_tuple(sorted_front[0])] = float('inf')
+            distances[self._vector_to_tuple(sorted_front[-1])] = float('inf')
+            obj_min = objectives[self._vector_to_tuple(sorted_front[0])][obj]
+            obj_max = objectives[self._vector_to_tuple(sorted_front[-1])][obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                key = self._vector_to_tuple(sorted_front[i])
+                prev_key = self._vector_to_tuple(sorted_front[i-1])
+                next_key = self._vector_to_tuple(sorted_front[i+1])
+                distances[key] += (objectives[next_key][obj] - objectives[prev_key][obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict[str, float]],
+                              fronts: List[List[Dict[str, float]]],
+                              crowding: Dict[Tuple[float, ...], float]) -> Dict[str, float]:
+        ind1 = random.choice(population)
+        ind2 = random.choice(population)
+        rank1 = self._get_rank(ind1, fronts)
+        rank2 = self._get_rank(ind2, fronts)
+        if rank1 < rank2:
+            return ind1
+        elif rank2 < rank1:
+            return ind2
+        else:
+            key1 = self._vector_to_tuple(ind1)
+            key2 = self._vector_to_tuple(ind2)
+            if crowding.get(key1, 0) > crowding.get(key2, 0):
+                return ind1
+            else:
+                return ind2
+
+    def _get_rank(self, individual: Dict[str, float], fronts: List[List[Dict[str, float]]]) -> int:
+        for i, front in enumerate(fronts):
+            if individual in front:
+                return i
+        return len(fronts)
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint],
+                                 weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
+        if not pareto_front:
+            return None
+        if weights is None:
+            obj_keys = list(pareto_front[0].objectives.keys())
+            weights = {k: 1.0 / len(obj_keys) for k in obj_keys}
+        else:
+            obj_keys = list(weights.keys())
+
+        max_vals = {k: max(p.objectives[k] for p in pareto_front) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto_front) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in obj_keys:
+                val = point.objectives[key]
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                score += weights.get(key, 0.0) * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
+
+    async def evolve(self, generations: Optional[int] = None) -> Tuple[QuantumBridgeConfig, Dict[str, float]]:
+        """
+        Run NSGA‑II to find the best configuration.
+        Returns the best configuration and its objective values.
+        """
+        async with self._lock:
+            if generations is None:
+                generations = self.generations
+
+            population = [self._random_individual() for _ in range(self.population_size)]
+            objectives = {}
+            for ind in population:
+                key = self._vector_to_tuple(ind)
+                objectives[key] = await self._evaluate(ind)
+
+            self.pareto_front = []
+
+            for gen in range(generations):
+                # Create offspring
+                offspring = []
+                pop_objectives = {k: objectives[k] for k in objectives if k in [self._vector_to_tuple(i) for i in population]}
+                fronts = self._fast_non_dominated_sort(population, pop_objectives)
+                crowding = {}
+                for front in fronts:
+                    front_crowding = self._crowding_distance(front, pop_objectives)
+                    crowding.update(front_crowding)
+
+                while len(offspring) < self.population_size:
+                    parent1 = self._tournament_selection(population, fronts, crowding)
+                    parent2 = self._tournament_selection(population, fronts, crowding)
+                    if random.random() < self.crossover_rate:
+                        child = self._crossover(parent1, parent2)
+                        child = self._mutate(child)
+                        offspring.append(child)
+                    else:
+                        offspring.append(self._mutate(parent1.copy()))
+                offspring = offspring[:self.population_size]
+
+                # Evaluate offspring
+                for ind in offspring:
+                    key = self._vector_to_tuple(ind)
+                    if key not in objectives:
+                        objectives[key] = await self._evaluate(ind)
+
+                # Combine and non‑dominated sort
+                combined = population + offspring
+                unique_keys = {}
+                for ind in combined:
+                    unique_keys[self._vector_to_tuple(ind)] = ind
+                combined = list(unique_keys.values())
+
+                combined_objectives = {self._vector_to_tuple(ind): objectives[self._vector_to_tuple(ind)] for ind in combined}
+                fronts = self._fast_non_dominated_sort(combined, combined_objectives)
+
+                # Environmental selection
+                new_population = []
+                for front in fronts:
+                    if len(new_population) + len(front) <= self.population_size:
+                        new_population.extend(front)
+                    else:
+                        crowding = self._crowding_distance(front, combined_objectives)
+                        sorted_front = sorted(front, key=lambda ind: crowding.get(self._vector_to_tuple(ind), 0), reverse=True)
+                        remaining = self.population_size - len(new_population)
+                        new_population.extend(sorted_front[:remaining])
+                        break
+                population = new_population
+
+                # Update Pareto front (first front)
+                pop_objectives = {self._vector_to_tuple(ind): objectives[self._vector_to_tuple(ind)] for ind in population}
+                fronts_pop = self._fast_non_dominated_sort(population, pop_objectives)
+                if fronts_pop:
+                    pareto_individuals = fronts_pop[0]
+                    self.pareto_front = []
+                    for ind in pareto_individuals:
+                        objs = pop_objectives[self._vector_to_tuple(ind)]
+                        config = self._config_from_vector(ind)
+                        self.pareto_front.append(MOPDPoint(config=config, objectives=objs))
+                logger.debug(f"Generation {gen+1}/{generations}: Pareto front size={len(self.pareto_front)}")
+
+            # Select best using scalarisation
+            if self.objective_weights:
+                weights = self.objective_weights
+            else:
+                # Use equal weights among all objectives
+                all_keys = set()
+                for p in self.pareto_front:
+                    all_keys.update(p.objectives.keys())
+                weights = {k: 1.0 / len(all_keys) for k in all_keys}
+
+            best_point = self._select_best_from_pareto(self.pareto_front, weights)
+            if best_point:
+                self.best_individual = best_point.config
+                self.best_fitness = best_point.scalarised_score
+                self.evolution_history.append({
+                    'timestamp': datetime.now(timezone.utc),
+                    'best_fitness': self.best_fitness,
+                    'pareto_front_size': len(self.pareto_front)
+                })
+                return best_point.config, best_point.objectives
+            else:
+                # Fallback: choose individual with max average objective from population
+                # (should rarely happen)
+                best_ind = max(population, key=lambda ind: np.mean(list(objectives[self._vector_to_tuple(ind)].values())))
+                return self._config_from_vector(best_ind), objectives[self._vector_to_tuple(best_ind)]
+
+    def get_pareto_front(self) -> List[MOPDPoint]:
+        return self.pareto_front.copy()
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            'best_fitness': self.best_fitness,
+            'evolution_history': self.evolution_history[-10:],
+            'pareto_front_size': len(self.pareto_front)
+        }
+
+
 # ============================================================================
 # Example usage and tests
 # ============================================================================
@@ -1043,12 +1441,33 @@ if __name__ == "__main__":
     health = bridge.health_check()
     print("Health check:", health)
 
-    # Async example (not actually async here, but demonstrates)
-    # import asyncio
-    # async def test_async():
-    #     params_async = await bridge.get_qubo_parameters_async()
-    #     print("Async params:", params_async)
-    # asyncio.run(test_async())
+    # ---------------------------------------------------------------------
+    # Demonstrate QuantumBridgeOptimizer (optional, requires a solver evaluator)
+    # ---------------------------------------------------------------------
+    # Define a mock evaluation function: it takes a config and returns objectives
+    # For demonstration, we'll just generate random objectives based on config hash.
+    def mock_evaluate(config: QuantumBridgeConfig) -> Dict[str, float]:
+        h = int(hashlib.md5(config.config_hash().encode()).hexdigest(), 16)
+        return {
+            'success_rate': (h % 100) / 100.0,
+            'energy_cost': 1.0 - ((h // 100) % 100) / 100.0,  # lower is better, so invert
+            'stability': ((h // 10000) % 100) / 100.0
+        }
+
+    # Create optimizer (async example)
+    async def run_optimizer():
+        optimizer = QuantumBridgeOptimizer(
+            bridge=bridge,
+            evaluate_func=mock_evaluate,
+            population_size=10,
+            generations=3
+        )
+        best_config, best_obj = await optimizer.evolve()
+        print("Best config found:", best_config)
+        print("Best objectives:", best_obj)
+
+    # Uncomment to run the optimizer
+    # asyncio.run(run_optimizer())
 
     # Cleanup
     if os.path.exists('./cache.json'):
