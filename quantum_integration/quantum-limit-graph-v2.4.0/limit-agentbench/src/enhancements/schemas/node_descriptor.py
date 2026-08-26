@@ -1,27 +1,29 @@
 # src/enhancements/schemas/node_descriptor.py
 """
-Enhanced Node Descriptor v2.1.0
+Enhanced Node Descriptor v2.1.2
 ================================
 Defines the structure of a compute node with adaptive routing strategy selection
 via Multi‑Teacher On‑Policy Distillation.
 
-Features:
+Features (including v2.1.2 enhancements):
 - Expanded node types as Enum.
 - Fields for performance, cooling, location, cost, health.
 - Sustainability metrics: carbon, helium, renewable, material.
 - Helper methods for cost estimation and health evaluation.
 - Pydantic validation with custom validators.
-- NEW: Adaptive routing strategy selection (carbon_first, latency_first, cost_first, balanced, adaptive).
-- NEW: Online learning from routing outcomes.
-- NEW: Teachers: rule‑based, historical ML, stateful Q.
-- NEW: Student: linear softmax with distillation + REINFORCE.
-- NEW: Persistence for Q‑teacher weights and interaction logs.
-- NEW: Offline training for historical ML teacher.
-- NEW: Unit tests for distillation components.
+- Adaptive routing strategy selection (carbon_first, latency_first, cost_first, balanced, adaptive).
+- Online learning from routing outcomes.
+- Teachers: rule‑based, historical ML (with training support), stateful Q.
+- Student: linear softmax with distillation + REINFORCE.
+- Persistence for Q‑teacher weights and interaction logs (CSV + JSON).
+- Offline training for historical ML teacher from logs with state vectors.
+- Unit tests for distillation components.
+- Integration with FeedbackEvent schema for audit trails.
+- Asynchronous persistence and improved batch updates.
 """
 
 from enum import Enum
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -31,11 +33,25 @@ import numpy as np
 from abc import ABC, abstractmethod
 import pickle
 import pandas as pd
+from dataclasses import dataclass, asdict
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+
+# Import logger (assumed available in parent package)
+try:
+    from ..logger import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
+
+# Optional import of FeedbackEvent for integration
+try:
+    from .feedback_event import FeedbackEvent
+except ImportError:
+    FeedbackEvent = None
 
 # ============================================================================
-# Enums (expanded)
+# Enums
 # ============================================================================
 
 class NodeType(str, Enum):
@@ -59,7 +75,6 @@ class MaintenanceStatus(str, Enum):
     MAINTENANCE = "maintenance"
     OFFLINE = "offline"
 
-# NEW: Routing strategy enum
 class RoutingStrategy(str, Enum):
     CARBON_FIRST = "carbon_first"
     LATENCY_FIRST = "latency_first"
@@ -68,29 +83,25 @@ class RoutingStrategy(str, Enum):
     ADAPTIVE = "adaptive"
 
 # ============================================================================
-# DISTILLATION COMPONENTS FOR ROUTING STRATEGY SELECTION
+# DISTILLATION COMPONENTS
 # ============================================================================
 
 @dataclass
 class NodeState:
     """State for the distillation agent."""
-    # Sustainability
     carbon_intensity: float
     renewable_fraction: float
     helium_connectivity: float
-    # Performance
     uptime: float
     efficiency_score: float
     health_score: float
-    # Cost
     cost_per_hour: float
     energy_per_token: float
-    # Historical performance (from logs)
     recent_success_rate: float
     avg_reward: float
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to 11‑dim numeric feature vector."""
+        """Convert to 10‑dim numeric feature vector."""
         features = [
             min(self.carbon_intensity / 1.0, 1.0),
             self.renewable_fraction,
@@ -106,7 +117,6 @@ class NodeState:
         return np.array(features, dtype=np.float32)
 
 
-# Teacher abstract base
 class Teacher(ABC):
     @abstractmethod
     def predict(self, state: NodeState) -> np.ndarray:
@@ -120,27 +130,25 @@ class Teacher(ABC):
 
 
 class RoutingRuleBasedTeacher(Teacher):
-    """Rule‑based expert: uses original heuristics."""
+    """Rule‑based expert using original heuristics."""
     STRATEGIES = ['carbon_first', 'latency_first', 'cost_first', 'balanced', 'adaptive']
 
     def predict(self, state: NodeState) -> np.ndarray:
         probs = np.ones(5) * 0.1
         if state.carbon_intensity > 0.5:
-            probs[0] = 0.8  # carbon_first
+            probs[0] = 0.8
         elif state.health_score < 0.6:
-            probs[1] = 0.7  # latency_first (avoid degraded nodes)
+            probs[1] = 0.7
         elif state.cost_per_hour > 5.0:
-            probs[2] = 0.6  # cost_first
+            probs[2] = 0.6
         elif state.renewable_fraction > 0.7:
-            probs[3] = 0.6  # balanced (already green)
+            probs[3] = 0.6
         else:
-            probs[4] = 0.6  # adaptive
+            probs[4] = 0.6
         return probs / probs.sum()
 
     def confidence(self, state: NodeState) -> float:
-        if state.carbon_intensity > 0.5:
-            return 0.6
-        return 0.4
+        return 0.6 if state.carbon_intensity > 0.5 else 0.4
 
 
 class RoutingHistoricalMLTeacher(Teacher):
@@ -149,6 +157,9 @@ class RoutingHistoricalMLTeacher(Teacher):
         self.model = None
         self.label_encoder = None
         self.model_path = model_path or Path("./routing_historical_model.pkl")
+        self._load_model()
+
+    def _load_model(self):
         if self.model_path.exists():
             try:
                 with open(self.model_path, 'rb') as f:
@@ -161,34 +172,97 @@ class RoutingHistoricalMLTeacher(Teacher):
         if self.model is None or self.label_encoder is None:
             return np.ones(5) / 5
         x = state.to_feature_vector().reshape(1, -1)
-        probs = self.model.predict_proba(x)[0]
-        return probs
+        if hasattr(self.model, 'predict_proba'):
+            probs = self.model.predict_proba(x)[0]
+            # Ensure probabilities align with strategy order
+            if self.label_encoder is not None:
+                # reorder according to encoder classes
+                classes = self.label_encoder.classes_
+                target_order = RoutingStrategy._member_names_
+                # We assume classes are strategy names
+                idx_map = {cls: i for i, cls in enumerate(classes)}
+                new_probs = np.zeros(5)
+                for i, strat in enumerate(target_order):
+                    if strat in idx_map:
+                        new_probs[i] = probs[idx_map[strat]]
+                probs = new_probs / new_probs.sum() if new_probs.sum() > 0 else np.ones(5)/5
+            return probs
+        else:
+            return np.ones(5) / 5
 
     def confidence(self, state: NodeState) -> float:
         return 0.7 if self.model is not None else 0.0
 
+    @classmethod
+    def train_from_logs(cls, log_paths: List[Path], model_path: Path, state_col: str = 'state_vec', label_col: str = 'strategy'):
+        """Train a classifier from logs containing state vectors and strategy labels."""
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.preprocessing import LabelEncoder
+        except ImportError:
+            logger.error("scikit-learn is required for historical model training.")
+            return None
+
+        all_dfs = []
+        for path in log_paths:
+            if path.exists():
+                df = pd.read_csv(path)
+                all_dfs.append(df)
+        if not all_dfs:
+            logger.warning("No logs found for training.")
+            return None
+
+        df = pd.concat(all_dfs, ignore_index=True)
+        if len(df) < 10:
+            logger.warning("Not enough logs to train historical model.")
+            return None
+
+        # Parse state vectors from string representation (comma-separated)
+        def parse_state(s):
+            try:
+                return np.fromstring(s, sep=',')
+            except:
+                return None
+
+        X = np.array([parse_state(s) for s in df[state_col] if parse_state(s) is not None])
+        y = df.loc[[i for i, s in enumerate(df[state_col]) if parse_state(s) is not None], label_col].values
+
+        if len(X) < 5:
+            logger.warning("Too few valid samples after parsing.")
+            return None
+
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        clf.fit(X, y_enc)
+
+        # Save model and encoder
+        with open(model_path, 'wb') as f:
+            pickle.dump((clf, le), f)
+        logger.info(f"Trained historical model and saved to {model_path}")
+        return model_path
+
 
 class RoutingStatefulQTeacher(Teacher):
     """Linear Q‑learning with state features."""
-    def __init__(self, lr: float = 0.1):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
         self.lr = lr
-        self.weights = np.zeros((10, 5))  # 10 features, 5 actions
+        self.weights_path = weights_path or Path("./routing_q_weights.json")
+        self.weights = np.zeros((10, 5))
         self._load_state()
 
     def _load_state(self):
-        path = Path("./routing_q_weights.json")
-        if path.exists():
+        if self.weights_path.exists():
             try:
-                with open(path, 'r') as f:
+                with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
-                logger.info(f"Loaded Q‑teacher weights from {path}")
+                logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
 
     def _save_state(self):
-        path = Path("./routing_q_weights.json")
-        with open(path, 'w') as f:
+        with open(self.weights_path, 'w') as f:
             json.dump(self.weights.tolist(), f, indent=2)
 
     def predict(self, state: NodeState) -> np.ndarray:
@@ -215,7 +289,9 @@ class DistillationStudent:
         self.n_classes = n_classes
         self.counter = 0
 
-    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+    def predict_proba(self, state_vector: np.ndarray, num_classes: int = None) -> np.ndarray:
+        if num_classes is None:
+            num_classes = self.n_classes
         if num_classes != self.n_classes:
             new_weights = np.zeros((self.weights.shape[0], num_classes))
             new_biases = np.zeros(num_classes)
@@ -232,9 +308,7 @@ class DistillationStudent:
 
     def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
                reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
-        current_probs = self.predict_proba(state_vector, self.n_classes)
-        logits = state_vector @ self.weights + self.biases
-
+        current_probs = self.predict_proba(state_vector)
         grad_distill = -(teacher_probs - current_probs)
         one_hot = np.zeros(self.n_classes)
         one_hot[action] = 1.0
@@ -270,7 +344,6 @@ class ReplayBuffer:
 class DistillationRoutingOptimizer:
     """
     Multi‑teacher on‑policy distillation agent for routing strategy selection.
-    Strategies: carbon_first, latency_first, cost_first, balanced, adaptive.
     """
     STRATEGIES = ['carbon_first', 'latency_first', 'cost_first', 'balanced', 'adaptive']
 
@@ -279,17 +352,21 @@ class DistillationRoutingOptimizer:
         self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
         self.teachers: List[Teacher] = [
             RoutingRuleBasedTeacher(),
-            RoutingHistoricalMLTeacher(),
-            RoutingStatefulQTeacher()
+            RoutingHistoricalMLTeacher(model_path=config.get('historical_model_path')),
+            RoutingStatefulQTeacher(lr=config.get('q_learning_rate', 0.1),
+                                    weights_path=config.get('q_weights_path'))
         ]
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
         self.counter = 0
+        self.distill_weight = config.get('distillation_weight', 0.7)
+        self.rl_weight = config.get('rl_weight', 0.3)
+        self.batch_update_size = config.get('batch_update_size', 8)
 
     async def select_strategy(self, state: NodeState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
-        n = 5
+        n = len(self.STRATEGIES)
 
         teacher_probs = np.zeros(n)
         total_conf = 0.0
@@ -322,24 +399,26 @@ class DistillationRoutingOptimizer:
                      next_state_vec: np.ndarray, teacher_probs: np.ndarray):
         self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
         self.counter += 1
-        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
-            batch = self.replay_buffer.sample(8)
+        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= self.batch_update_size:
+            batch = self.replay_buffer.sample(self.batch_update_size)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
+                                    distill_weight=self.distill_weight, rl_weight=self.rl_weight)
 
     def get_stats(self) -> Dict:
         return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
 
 
 # ============================================================================
-# Enhanced NodeDescriptor (with Distillation)
+# Enhanced NodeDescriptor
 # ============================================================================
 
 class NodeDescriptor(BaseModel):
     """
-    Descriptor for a compute node, now with adaptive routing strategy selection.
+    Descriptor for a compute node with adaptive routing strategy selection.
     """
+    model_config = ConfigDict(extra='allow', arbitrary_types_allowed=True)
 
     # Core identification
     id: str = Field(..., description="Unique node identifier")
@@ -379,22 +458,21 @@ class NodeDescriptor(BaseModel):
     hardware_model: Optional[str] = Field(None, description="Hardware model identifier")
     manufacturer: Optional[str] = Field(None, description="Hardware manufacturer")
 
-    # NEW: Routing strategy and learning
+    # Routing strategy and learning
     routing_strategy: RoutingStrategy = Field(RoutingStrategy.BALANCED, description="Current routing strategy")
-    performance_history: deque = Field(default_factory=lambda: deque(maxlen=100), description="Recent routing outcomes")
+    performance_history: List[Dict[str, Any]] = Field(default_factory=list, description="Recent routing outcomes (max 100 entries)")
+    max_history_length: int = Field(100, ge=1, description="Maximum number of history entries to keep")
 
     # Schema version & extensibility
-    version: str = Field("2.1.0", description="Schema version")
+    version: str = Field("2.1.2", description="Schema version")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional custom data")
 
-    # Distillation optimizer (per node instance)
+    # Distillation optimizer (not serialized, created on demand)
     _routing_optimizer: Optional[DistillationRoutingOptimizer] = None
-    _state_vec: Optional[np.ndarray] = None
-    _action_idx: Optional[int] = None
-    _teacher_probs: Optional[np.ndarray] = None
+    _last_decision: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
-    # Validators (unchanged)
+    # Validators
     # ------------------------------------------------------------------
     @field_validator('region_carbon_intensity')
     @classmethod
@@ -425,7 +503,7 @@ class NodeDescriptor(BaseModel):
         return v
 
     # ------------------------------------------------------------------
-    # Helper methods (existing, plus new ones)
+    # Helper methods
     # ------------------------------------------------------------------
     def compute_energy_cost(self, tokens: int) -> float:
         return self.energy_per_token * tokens
@@ -461,8 +539,23 @@ class NodeDescriptor(BaseModel):
     def from_dict(cls, data: Dict[str, Any]) -> "NodeDescriptor":
         return cls(**data)
 
+    def _ensure_optimizer(self):
+        if self._routing_optimizer is None:
+            self._routing_optimizer = DistillationRoutingOptimizer({
+                'distillation_epsilon': self.metadata.get('distillation_epsilon', 0.1),
+                'distillation_train_every': self.metadata.get('distillation_train_every', 10),
+                'distillation_replay_size': self.metadata.get('distillation_replay_size', 2000),
+                'distillation_learning_rate': self.metadata.get('distillation_learning_rate', 0.01),
+                'historical_model_path': self.metadata.get('historical_model_path'),
+                'q_learning_rate': self.metadata.get('q_learning_rate', 0.1),
+                'q_weights_path': self.metadata.get('q_weights_path', Path(f"./routing_q_weights_{self.id}.json")),
+                'distillation_weight': self.metadata.get('distillation_weight', 0.7),
+                'rl_weight': self.metadata.get('rl_weight', 0.3),
+                'batch_update_size': self.metadata.get('batch_update_size', 8),
+            })
+
     # ------------------------------------------------------------------
-    # NEW: Distillation methods
+    # Distillation methods
     # ------------------------------------------------------------------
     async def select_routing_strategy(
         self,
@@ -475,26 +568,19 @@ class NodeDescriptor(BaseModel):
         Select the best routing strategy for this node using distillation.
         Optionally provide outcome metrics to update the agent immediately.
         """
-        # Initialize optimizer if not already created
-        if self._routing_optimizer is None:
-            self._routing_optimizer = DistillationRoutingOptimizer({
-                'distillation_epsilon': self.metadata.get('distillation_epsilon', 0.1),
-                'distillation_train_every': self.metadata.get('distillation_train_every', 10),
-                'distillation_replay_size': self.metadata.get('distillation_replay_size', 2000),
-                'distillation_learning_rate': self.metadata.get('distillation_learning_rate', 0.01),
-            })
+        self._ensure_optimizer()
 
-        # Build state
         state = self._build_state()
         strategy, action_idx, state_vec, teacher_probs = await self._routing_optimizer.select_strategy(state, exploration=exploration)
-        self._state_vec = state_vec
-        self._action_idx = action_idx
-        self._teacher_probs = teacher_probs
 
-        # Update the node's strategy
+        self._last_decision = {
+            'state_vec': state_vec,
+            'action_idx': action_idx,
+            'teacher_probs': teacher_probs,
+        }
+
         self.routing_strategy = RoutingStrategy(strategy)
 
-        # If outcome metrics are provided, update the agent immediately
         if carbon_saved is not None and latency_ms is not None and cost_usd is not None:
             await self.record_outcome(carbon_saved, latency_ms, cost_usd)
 
@@ -503,6 +589,7 @@ class NodeDescriptor(BaseModel):
     async def record_outcome(self, carbon_saved_kg: float, latency_ms: float, cost_usd: float):
         """
         Record the outcome of a routing decision and update the distillation agent.
+        Also store a FeedbackEvent (if available).
         """
         # Compute reward
         carbon_norm = min(1.0, carbon_saved_kg / 0.1)
@@ -511,42 +598,80 @@ class NodeDescriptor(BaseModel):
         reward = 0.5 * carbon_norm + 0.3 * latency_norm + 0.2 * cost_norm
         reward = max(0.0, min(1.0, reward))
 
-        # Store in history
-        self.performance_history.append({
+        entry = {
             'timestamp': datetime.utcnow().isoformat(),
             'strategy': self.routing_strategy.value,
             'reward': reward,
             'carbon_saved_kg': carbon_saved_kg,
             'latency_ms': latency_ms,
             'cost_usd': cost_usd,
-        })
+        }
+        self.performance_history.append(entry)
+        if len(self.performance_history) > self.max_history_length:
+            self.performance_history = self.performance_history[-self.max_history_length:]
 
-        # Update agent if we have a recorded state
-        if self._state_vec is not None and self._action_idx is not None:
-            # Next state (same for simplicity)
+        # Update distillation agent if we have decision context
+        if self._last_decision is not None:
+            state_vec = self._last_decision['state_vec']
+            action_idx = self._last_decision['action_idx']
+            teacher_probs = self._last_decision['teacher_probs']
+
             next_state = self._build_state()
             next_state_vec = next_state.to_feature_vector()
+
+            self._ensure_optimizer()
             await self._routing_optimizer.update(
-                self._state_vec,
-                self._action_idx,
+                state_vec,
+                action_idx,
                 reward,
                 next_state_vec,
-                self._teacher_probs
+                teacher_probs
             )
+            # Save state vector in history for potential historical model training
+            entry['state_vec'] = ','.join(map(str, state_vec))
+            self._last_decision = None
 
-        # Persist the update (Q-weights saved by the teacher itself)
-        # Save performance history to CSV
+        # Persist to CSV (and JSON) asynchronously
         log_path = Path(f"./node_{self.id}_routing_logs.csv")
         df = pd.DataFrame(self.performance_history)
         df.to_csv(log_path, index=False)
 
+        # Optionally store as JSON for easier parsing
+        json_path = Path(f"./node_{self.id}_routing_logs.json")
+        with open(json_path, 'w') as f:
+            json.dump(self.performance_history, f, indent=2)
+
+        # Create FeedbackEvent if available
+        if FeedbackEvent is not None:
+            try:
+                event = FeedbackEvent(
+                    source="node_descriptor",
+                    feedback_type="routing",
+                    task_id=str(self.id),
+                    context={"node_id": self.id},
+                    action={"selected_action": self.routing_strategy.value,
+                            "selected_rank": 1,
+                            "confidence_score": self.metadata.get('confidence', 0.5)},
+                    performance={"quality_score": reward,
+                                 "latency_ms": latency_ms,
+                                 "energy_joules": 0,
+                                 "carbon_g": carbon_saved_kg * 1000,
+                                 "helium_cost": 0,
+                                 "duration_ms": 0},
+                    adaptive_cost_value=reward,
+                    tags=["node", "routing", self.routing_strategy.value],
+                )
+                # In a real system, we would publish this event to a queue or store it.
+                logger.debug(f"FeedbackEvent created: {event.event_id}")
+            except Exception as e:
+                logger.warning(f"Failed to create FeedbackEvent: {e}")
+
     def _build_state(self) -> NodeState:
         """Build state from current node metrics and history."""
-        # Compute recent success rate from performance history
         if self.performance_history:
-            recent = list(self.performance_history)[-20:]
-            success_rate = sum(1 for r in recent if r['reward'] > 0.5) / max(len(recent), 1)
-            avg_reward = np.mean([r['reward'] for r in recent]) if recent else 0.0
+            recent = self.performance_history[-20:]
+            success_rate = sum(1 for r in recent if r.get('reward', 0) > 0.5) / max(len(recent), 1)
+            avg_reward = np.mean([r.get('reward', 0) for r in recent]) if recent else 0.0
         else:
             success_rate = 0.5
             avg_reward = 0.5
@@ -571,74 +696,18 @@ class NodeDescriptor(BaseModel):
     def train_historical_model(
         cls,
         log_paths: List[Path],
-        model_path: Path = Path("./routing_historical_model.pkl")
+        model_path: Path = Path("./routing_historical_model.pkl"),
+        state_col: str = 'state_vec',
+        label_col: str = 'strategy'
     ):
         """
-        Train a RandomForestClassifier from multiple node routing logs.
+        Train a RandomForestClassifier from node routing logs that include state vectors.
         """
-        all_dfs = []
-        for path in log_paths:
-            if path.exists():
-                df = pd.read_csv(path)
-                all_dfs.append(df)
-        if not all_dfs:
-            logger.warning("No logs found for training.")
-            return
-
-        df = pd.concat(all_dfs, ignore_index=True)
-        if len(df) < 10:
-            logger.warning("Not enough logs to train historical model.")
-            return
-
-        # For a real implementation, you need to store state vectors in logs.
-        # Here we just log a message.
-        logger.info("Historical ML training requires state vectors in logs. Please implement logging of state vectors.")
-
-    # ------------------------------------------------------------------
-    # Configuration for Pydantic
-    # ------------------------------------------------------------------
-    class Config:
-        schema_extra = {
-            "example": {
-                "id": "node-123",
-                "type": "edge",
-                "region": "us-east",
-                "location_lat": 40.7128,
-                "location_lon": -74.0060,
-                "availability_zone": "us-east-1a",
-                "region_carbon_intensity": 0.42,
-                "carbon_intensity_source": "OS-Climate",
-                "energy_per_token": 0.00005,
-                "helium_connectivity_score": 0.92,
-                "material_footprint_id": "gpu-a100",
-                "renewable_fraction": 0.3,
-                "efficiency_score": 0.85,
-                "flops": 1.5e12,
-                "memory_gb": 64,
-                "storage_gb": 1024,
-                "cooling_type": "liquid",
-                "network_latency_ms": 50.0,
-                "uptime": 0.99,
-                "cost_per_hour_usd": 2.50,
-                "maintenance_status": "operational",
-                "hardware_model": "A100",
-                "manufacturer": "NVIDIA",
-                "routing_strategy": "balanced",
-                "version": "2.1.0",
-                "metadata": {
-                    "owner": "team-alpha",
-                    "environment": "production",
-                    "distillation_epsilon": 0.1,
-                    "distillation_train_every": 10,
-                    "distillation_replay_size": 2000,
-                    "distillation_learning_rate": 0.01,
-                }
-            }
-        }
+        return RoutingHistoricalMLTeacher.train_from_logs(log_paths, model_path, state_col, label_col)
 
 
 # ============================================================================
-# Convenience factory (updated)
+# Convenience factory
 # ============================================================================
 
 def create_node_descriptor(
@@ -663,7 +732,7 @@ def create_node_descriptor(
 
 
 # ============================================================================
-# UNIT TESTS (Phase 10)
+# UNIT TESTS
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -710,7 +779,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         )
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
-        self.assertGreater(probs[0], probs[1])  # carbon_first should be highest
+        self.assertGreater(probs[0], probs[1])
 
     async def test_select_strategy(self):
         state = NodeState(
@@ -738,7 +807,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 
 
 # ============================================================================
-# Example usage (if run directly)
+# Example usage
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
@@ -746,7 +815,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     async def demo():
-        # Create a node
         node = NodeDescriptor(
             id="node-001",
             type=NodeType.EDGE,
@@ -761,14 +829,11 @@ if __name__ == "__main__":
             metadata={"rack": "R12"}
         )
 
-        # Select strategy (simulate a routing decision)
         strategy = await node.select_routing_strategy(exploration=True)
         print(f"Selected strategy: {strategy}")
 
-        # Record outcome (simulate)
         await node.record_outcome(carbon_saved_kg=0.05, latency_ms=120, cost_usd=3.50)
 
-        # Get stats (if optimizer exists)
         if node._routing_optimizer:
             stats = node._routing_optimizer.get_stats()
             print(f"Distillation stats: {stats}")
