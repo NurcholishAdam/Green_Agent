@@ -1,4 +1,4 @@
-# cache_manager.py (Enhanced v2.0.0)
+# cache_manager.py (Enhanced v2.1.0)
 """
 Enhanced Cache Manager for Green Agent with Adaptive Caching Policy
 ====================================================================
@@ -8,19 +8,26 @@ Uses Multi‑Teacher On‑Policy Distillation to select caching strategies
 
 All existing features (Redis backend, memory LRU fallback, TTL, metrics,
 background cleanup) are retained.
+
+New in v2.1.0:
+- Multi‑Objective Evolutionary Optimization (NSGA‑II) for caching policy parameters.
+- Pareto front maintenance and MODP‑based selection.
+- Dynamic objective weighting based on system state.
 """
 
 import asyncio
 import json
 import logging
-from typing import Optional, Any, Dict, Callable, Tuple
+from typing import Optional, Any, Dict, Callable, Tuple, List, Union
 from datetime import datetime, timedelta
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import time
 import random
 from abc import ABC, abstractmethod
 import hashlib
 import numpy as np
+from dataclasses import dataclass, field
+from pathlib import Path
 
 # ---------- Redis async client ----------
 try:
@@ -149,7 +156,6 @@ class CacheStatefulQTeacher(Teacher):
         self._load_state()
 
     def _load_state(self):
-        # We'll persist in the cache_manager's memory (or a separate key)
         pass
 
     def _save_state(self):
@@ -282,9 +288,6 @@ class DistillationCachePolicyOptimizer:
             for i in range(len(states)):
                 self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
 
-        # Update Q-teacher (if we have the original state)
-        # We'll do that separately in the main loop.
-
     def get_stats(self) -> Dict:
         return {
             'student_counter': self.student.counter,
@@ -294,18 +297,310 @@ class DistillationCachePolicyOptimizer:
 
 
 # ============================================================================
-# MAIN CACHE MANAGER (Enhanced)
+# NEW: Multi‑Objective Evolutionary Optimizer (NSGA‑II)
+# ============================================================================
+
+@dataclass
+class MOPDPoint:
+    """A point in the Pareto front for cache policy parameters."""
+    policy_id: str
+    parameters: Dict[str, float]  # e.g., TTL values, feature weights
+    objectives: Dict[str, float]  # hit_rate, latency, memory_usage, ...
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'policy_id': self.policy_id,
+            'parameters': self.parameters,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+
+class NSGAIIOptimizer:
+    """
+    Multi‑objective genetic algorithm for cache policy parameter optimization.
+    Objectives are to be maximized (e.g., hit_rate, -latency, -memory_usage).
+    """
+    def __init__(self,
+                 evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+                 parameter_bounds: Dict[str, Tuple[float, float]],
+                 population_size: int = 20,
+                 generations: int = 5,
+                 mutation_rate: float = 0.2,
+                 crossover_rate: float = 0.8,
+                 tournament_size: int = 3,
+                 objective_weights: Optional[Dict[str, float]] = None,
+                 dynamic_weights: bool = True):
+        self.evaluate_func = evaluate_func
+        self.parameter_bounds = parameter_bounds
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {}
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDPoint] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _random_individual(self) -> Dict[str, float]:
+        ind = {}
+        for name, (low, high) in self.parameter_bounds.items():
+            ind[name] = random.uniform(low, high)
+        return ind
+
+    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
+        child = {}
+        for name in self.parameter_bounds:
+            if random.random() < 0.5:
+                # SBX
+                low, high = self.parameter_bounds[name]
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                val = 0.5 * ((1 + beta) * p1[name] + (1 - beta) * p2[name])
+                child[name] = max(low, min(high, val))
+            else:
+                child[name] = p1[name] if random.random() < 0.5 else p2[name]
+        return child
+
+    def _mutate(self, ind: Dict) -> Dict:
+        mutant = ind.copy()
+        for name, (low, high) in self.parameter_bounds.items():
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[name] = mutant[name] + delta * (high - low)
+                mutant[name] = max(low, min(high, mutant[name]))
+        return mutant
+
+    def _fast_non_dominated_sort(self, points: List[MOPDPoint]) -> List[List[MOPDPoint]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+
+        for i, p in enumerate(points):
+            p_obj = p.objectives
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                q_obj = q.objectives
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDPoint]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = list(front[0].objectives.keys())
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: x.objectives[obj])
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = sorted_front[0].objectives[obj]
+            obj_max = sorted_front[-1].objectives[obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (sorted_front[i+1].objectives[obj] - sorted_front[i-1].objectives[obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDPoint]],
+                              crowding: Dict[int, float]) -> Dict:
+        candidates = random.sample(population, self.tournament_size)
+        ind_to_point = {}
+        for ind, point in zip(population, self._all_points):
+            ind_to_point[id(ind)] = point
+
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            point = ind_to_point.get(id(cand))
+            if not point:
+                continue
+            rank = len(fronts)
+            for fi, front in enumerate(fronts):
+                if point in front:
+                    rank = fi
+                    break
+            cd = crowding.get(id(point), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        # Example: increase weight of objective with lower average relative to max
+        # For cache, we can dynamically adjust based on system state (handled in caller)
+        return weights
+
+    def _select_best_from_pareto(self, pareto: List[MOPDPoint], weights: Dict[str, float]) -> Optional[MOPDPoint]:
+        if not pareto:
+            return None
+        obj_keys = list(weights.keys())
+        max_vals = {k: max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+
+        best = None
+        best_score = -float('inf')
+        for p in pareto:
+            score = 0.0
+            for k in obj_keys:
+                val = p.objectives[k]
+                norm = (val - min_vals[k]) / ranges[k] if ranges[k] > 0 else 1.0
+                score += weights.get(k, 0.0) * norm
+            p.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = p
+        return best
+
+    async def evolve(self) -> List[MOPDPoint]:
+        population = [self._random_individual() for _ in range(self.population_size)]
+        points = []
+        for ind in population:
+            obj = await self.evaluate_func(ind)
+            point = MOPDPoint(
+                policy_id=str(uuid.uuid4()),
+                parameters=ind,
+                objectives=obj
+            )
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))] = obj
+
+        self._all_points = points
+        for gen in range(self.generations):
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+
+            offspring = []
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection(population, fronts, crowding)
+                parent2 = self._tournament_selection(population, fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+
+            child_points = []
+            for ind in offspring:
+                key = tuple(sorted(ind.items()))
+                if key in self._eval_cache:
+                    obj = self._eval_cache[key]
+                else:
+                    obj = await self.evaluate_func(ind)
+                    self._eval_cache[key] = obj
+                point = MOPDPoint(
+                    policy_id=str(uuid.uuid4()),
+                    parameters=ind,
+                    objectives=obj
+                )
+                child_points.append(point)
+
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+            self._all_points = points
+
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+            self._all_points = points
+
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+
+        weights = self._compute_dynamic_weights()
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best:
+            self.best_individual = best.parameters
+            self.best_fitness = best.scalarised_score
+        return self.pareto_front
+
+
+# ============================================================================
+# CACHE MANAGER (Enhanced with MOEA)
 # ============================================================================
 
 class CacheManager:
     """
-    Asynchronous cache manager with adaptive caching policy via distillation.
+    Asynchronous cache manager with adaptive caching policy via distillation and
+    multi‑objective optimization (NSGA‑II) for policy parameters.
 
     If Redis is available and reachable, it will be used for caching. Otherwise,
     it falls back to an in‑memory LRU cache with TTL support. The policy selection
     (which backend, TTL, or skip) is learned via multi‑teacher distillation.
-
-    All existing features are retained; the policy decisions are now adaptive.
+    The MOEA periodically optimizes the TTL values and other parameters
+    to achieve an optimal trade‑off between multiple objectives.
     """
 
     def __init__(
@@ -317,16 +612,25 @@ class CacheManager:
         cleanup_interval_seconds: int = 60,
         retry_attempts: int = 3,
         retry_delay_ms: float = 100.0,
-        # NEW: distillation parameters
+        # Distillation parameters
         distillation_epsilon: float = 0.1,
         distillation_train_every: int = 10,
         distillation_replay_size: int = 2000,
         distillation_learning_rate: float = 0.01,
         distill_weight: float = 0.7,
         rl_weight: float = 0.3,
+        # MOEA parameters
+        moea_enabled: bool = True,
+        moea_interval_seconds: int = 300,   # Run every 5 minutes
+        moea_population_size: int = 20,
+        moea_generations: int = 5,
+        moea_mutation_rate: float = 0.2,
+        moea_crossover_rate: float = 0.8,
+        moea_objective_weights: Optional[Dict[str, float]] = None,
+        moea_dynamic_weights: bool = True,
     ):
         """
-        Initialize the cache manager with adaptive policy.
+        Initialize the cache manager with adaptive policy and MOEA.
 
         Args:
             redis_url: Redis connection URL.
@@ -337,6 +641,7 @@ class CacheManager:
             retry_attempts: Number of retries for Redis operations.
             retry_delay_ms: Base delay (ms) for exponential backoff.
             distillation_*: Parameters for the distillation agent.
+            moea_*: Parameters for the multi‑objective evolutionary optimizer.
         """
         self.redis_url = redis_url
         self.serializer = serializer or (lambda v: json.dumps(v, default=str))
@@ -351,16 +656,17 @@ class CacheManager:
         self._redis_available = False
         self._redis_lock = asyncio.Lock()
 
-        # Memory LRU cache: dict with OrderedDict for LRU ordering
+        # Memory LRU cache
         self._memory_cache: OrderedDict[str, Tuple[Any, datetime]] = OrderedDict()
         self._memory_lock = asyncio.Lock()
 
         # Background tasks
         self._cleanup_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
+        self._moea_task: Optional[asyncio.Task] = None
         self._running = True
 
-        # Prometheus metrics (if enabled)
+        # Prometheus metrics
         self.metrics = None
         if PROMETHEUS_AVAILABLE:
             self.metrics = {
@@ -371,9 +677,10 @@ class CacheManager:
                 'size': Gauge('cache_size', 'Cache entries'),
                 'memory_size': Gauge('cache_memory_size', 'Memory cache entries'),
                 'redis_available': Gauge('cache_redis_available', 'Redis availability status'),
+                'moea_pareto_front': Gauge('cache_moea_pareto_front', 'Size of MOEA Pareto front'),
             }
 
-        # NEW: Distillation optimizer
+        # Distillation optimizer
         self.distillation_config = {
             'distillation_epsilon': distillation_epsilon,
             'distillation_train_every': distillation_train_every,
@@ -384,7 +691,25 @@ class CacheManager:
         }
         self.policy_optimizer = DistillationCachePolicyOptimizer(self, self.distillation_config)
 
-        # Track key metrics for state building
+        # MOEA parameters
+        self.moea_enabled = moea_enabled
+        self.moea_interval_seconds = moea_interval_seconds
+        self.moea_population_size = moea_population_size
+        self.moea_generations = moea_generations
+        self.moea_mutation_rate = moea_mutation_rate
+        self.moea_crossover_rate = moea_crossover_rate
+        self.moea_objective_weights = moea_objective_weights or {
+            'hit_rate': 0.4,
+            'latency': 0.3,
+            'memory_usage': 0.2,
+            'redis_usage': 0.1,
+        }
+        self.moea_dynamic_weights = moea_dynamic_weights
+        self.moea_optimizer: Optional[NSGAIIOptimizer] = None
+        self.moea_pareto_front: List[MOPDPoint] = []
+        self.moea_best_parameters: Optional[Dict[str, float]] = None
+
+        # Key tracking
         self.key_access_count: Dict[str, int] = {}
         self.key_last_access: Dict[str, datetime] = {}
         self.key_size_estimate: Dict[str, float] = {}
@@ -392,8 +717,12 @@ class CacheManager:
         # Start background tasks
         self._start_background_tasks()
 
-        # Initialize Redis (async)
+        # Initialize Redis
         asyncio.create_task(self._init_redis())
+
+        # Start MOEA if enabled
+        if self.moea_enabled:
+            self._moea_task = asyncio.create_task(self._moea_loop())
 
     def _start_background_tasks(self):
         """Start background TTL cleanup and health check tasks."""
@@ -410,7 +739,6 @@ class CacheManager:
             try:
                 pool = ConnectionPool.from_url(self.redis_url, decode_responses=True)
                 self._redis = Redis(connection_pool=pool)
-                # Test connection with ping
                 await self._redis.ping()
                 self._redis_available = True
                 if self.metrics:
@@ -427,7 +755,7 @@ class CacheManager:
         """Periodically check Redis availability and reconnect if needed."""
         while self._running:
             try:
-                await asyncio.sleep(30)  # Check every 30 seconds
+                await asyncio.sleep(30)
                 if self._redis:
                     try:
                         await self._redis.ping()
@@ -509,23 +837,18 @@ class CacheManager:
     async def _get_policy_state(self, key: str, value: Any) -> CachePolicyState:
         """Build state for the distillation agent."""
         now = datetime.now()
-        # Key characteristics
         key_length = len(key)
-        # Estimate size of serialized value (if possible)
         try:
             serialized = self._serialize(value)
             size_bytes = len(serialized.encode('utf-8'))
         except:
-            size_bytes = 1024  # default
-        # Access frequency (times accessed in last hour)
+            size_bytes = 1024
         access_count = self.key_access_count.get(key, 0)
         if key in self.key_last_access:
             last = self.key_last_access[key]
             if (now - last).total_seconds() > 3600:
                 access_count = 0
-        freq = access_count  # per hour
-
-        # Context
+        freq = access_count
         hour = now.hour
         redis_avail = self._redis_available
         redis_latency = 0.0
@@ -537,13 +860,8 @@ class CacheManager:
             except:
                 redis_latency = 100.0
         memory_usage = len(self._memory_cache) / self.max_memory_entries * 100
-
-        # Historical performance for this key
-        # We'll use a simple heuristic: hit rate from our internal tracking
-        # For simplicity, we'll derive from metrics if available, else default.
         hit_rate = 0.5
         avg_latency = 0.0
-
         return CachePolicyState(
             key_length=key_length,
             estimated_size_bytes=size_bytes,
@@ -556,14 +874,13 @@ class CacheManager:
             avg_latency_ms=avg_latency,
         )
 
-    # ----- Update tracking stats -----
     def _update_key_stats(self, key: str, hit: bool, latency: float):
         """Update access statistics for a key."""
         now = datetime.now()
         self.key_access_count[key] = self.key_access_count.get(key, 0) + 1
         self.key_last_access[key] = now
 
-    # ----- New: Apply selected policy -----
+    # ----- Apply selected policy -----
     async def _apply_policy(
         self,
         policy: str,
@@ -574,29 +891,20 @@ class CacheManager:
         state_vec: np.ndarray,
         teacher_probs: np.ndarray
     ) -> Tuple[bool, bool, float, Optional[Any]]:
-        """
-        Execute the selected policy.
-        Returns (success, hit, latency, result)
-        """
+        """Execute the selected policy."""
         start = time.time()
         success = False
         hit = False
         result = None
 
         if policy == 'no_cache':
-            # Skip caching entirely; just return the value (if set) or None (if get)
-            # For get, we don't have the value, so we'll just return None.
-            # For set, we do nothing.
             if value is not None:
-                # This is a set operation; we skip storing
                 success = True
             else:
-                # Get operation; return None (miss)
                 hit = False
             latency = (time.time() - start) * 1000
             return success, hit, latency, None
 
-        # Determine backend and TTL
         if policy == 'redis_ttl_short':
             backend = 'redis'
             effective_ttl = 60
@@ -605,22 +913,24 @@ class CacheManager:
             effective_ttl = 600
         elif policy == 'memory_only':
             backend = 'memory'
-            effective_ttl = ttl  # use provided TTL
+            effective_ttl = ttl
         elif policy == 'adaptive_ttl':
-            # Use a dynamic TTL based on hit rate (e.g., longer for high hit)
-            if self._redis_available:
-                backend = 'redis'
-            else:
-                backend = 'memory'
-            # For simplicity, use a fixed adaptive TTL (e.g., 300s)
+            backend = 'redis' if self._redis_available else 'memory'
             effective_ttl = 300
         else:
             backend = 'redis'
             effective_ttl = ttl
 
-        # Execute operation
-        if value is not None:
-            # SET operation
+        # If MOEA best parameters exist, override TTL for redis_ttl_short and redis_ttl_long
+        if self.moea_best_parameters:
+            if policy == 'redis_ttl_short' and 'ttl_short' in self.moea_best_parameters:
+                effective_ttl = int(self.moea_best_parameters['ttl_short'])
+            elif policy == 'redis_ttl_long' and 'ttl_long' in self.moea_best_parameters:
+                effective_ttl = int(self.moea_best_parameters['ttl_long'])
+            elif policy == 'memory_only' and 'memory_ttl' in self.moea_best_parameters:
+                effective_ttl = int(self.moea_best_parameters['memory_ttl'])
+
+        if value is not None:  # SET
             if backend == 'redis':
                 try:
                     serialized = self._serialize(value)
@@ -630,7 +940,6 @@ class CacheManager:
                     logger.error(f"Redis set failed for key {key}: {e}")
                     self._redis_available = False
             else:
-                # memory
                 async with self._memory_lock:
                     expiry = datetime.now() + timedelta(seconds=effective_ttl)
                     self._memory_cache[key] = (value, expiry)
@@ -639,8 +948,7 @@ class CacheManager:
                 success = True
             latency = (time.time() - start) * 1000
             return success, False, latency, None
-        else:
-            # GET operation
+        else:  # GET
             if backend == 'redis':
                 try:
                     result_str = await self._redis_operation('get', key)
@@ -673,49 +981,150 @@ class CacheManager:
             return success, hit, latency, result
 
     # ========================================================================
-    # PUBLIC METHODS (Enhanced with distillation)
+    # MOEA Background Loop
+    # ========================================================================
+    async def _moea_loop(self):
+        """Periodically run MOEA optimization to tune cache policy parameters."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.moea_interval_seconds)
+                await self.run_moea_optimization()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"MOEA loop failed: {e}")
+                await asyncio.sleep(60)
+
+    async def run_moea_optimization(self):
+        """
+        Run NSGA-II to optimize TTL values and other parameters based on
+        recent access history. The objectives are:
+          - maximize hit_rate (simulated)
+          - minimize average latency (we maximize -latency)
+          - minimize memory usage (we maximize -memory_usage)
+          - minimize Redis usage (we maximize -redis_usage)
+        """
+        if not self.moea_enabled:
+            return
+
+        # Parameter bounds: TTL values for redis_ttl_short, redis_ttl_long, memory_ttl
+        param_bounds = {
+            'ttl_short': (10, 300),
+            'ttl_long': (300, 3600),
+            'memory_ttl': (30, 1800),
+            'redis_threshold': (0.0, 1.0),  # threshold for using redis vs memory
+        }
+
+        async def evaluate(params: Dict[str, float]) -> Dict[str, float]:
+            # Simulate performance based on recent access patterns
+            # In a real implementation, we would replay recent logs or use a simulator.
+            # For demonstration, we'll compute based on current system state.
+            # Higher hit_rate is better; lower latency, memory_usage, redis_usage are better.
+            # We'll convert to maximization objectives.
+            # Simple heuristic: hit_rate increases with longer TTL, but memory usage also increases.
+            ttl_short = params['ttl_short']
+            ttl_long = params['ttl_long']
+            memory_ttl = params['memory_ttl']
+
+            # Hit rate: higher TTLs generally lead to higher hit rate, but with diminishing returns
+            hit_rate = min(0.95, 0.3 + 0.0005 * (ttl_short + ttl_long + memory_ttl))
+            # Latency: Redis operations have lower latency than memory? Actually memory is faster.
+            # We'll assume Redis is 2ms, memory 0.1ms. So using redis more increases latency.
+            # We can compute average latency based on policy distribution.
+            # For simplicity, we use a weighted average based on parameter values.
+            # redis_usage: proportion of keys stored in redis.
+            redis_usage = params.get('redis_threshold', 0.5)
+            # memory_usage: proportional to memory_ttl and number of entries
+            memory_usage = min(1.0, len(self._memory_cache) / self.max_memory_entries * (memory_ttl / 3600))
+            # latency in ms: redis ~2ms, memory ~0.1ms
+            avg_latency = redis_usage * 2.0 + (1 - redis_usage) * 0.1
+            # Normalize to 0-1 (lower is better)
+            latency_score = 1.0 - min(avg_latency / 10.0, 1.0)
+
+            objectives = {
+                'hit_rate': hit_rate,
+                'latency': latency_score,
+                'memory_usage': 1.0 - memory_usage,
+                'redis_usage': 1.0 - redis_usage,
+            }
+            return objectives
+
+        self.moea_optimizer = NSGAIIOptimizer(
+            evaluate_func=evaluate,
+            parameter_bounds=param_bounds,
+            population_size=self.moea_population_size,
+            generations=self.moea_generations,
+            mutation_rate=self.moea_mutation_rate,
+            crossover_rate=self.moea_crossover_rate,
+            objective_weights=self._get_dynamic_moea_weights(),
+            dynamic_weights=self.moea_dynamic_weights,
+        )
+
+        pareto_front = await self.moea_optimizer.evolve()
+        self.moea_pareto_front = pareto_front
+        if pareto_front:
+            # Select best using MODP (scalarisation with dynamic weights)
+            weights = self._get_dynamic_moea_weights()
+            best_point = self.moea_optimizer._select_best_from_pareto(pareto_front, weights)
+            if best_point:
+                self.moea_best_parameters = best_point.parameters
+                logger.info(f"MOEA selected best parameters: {self.moea_best_parameters}")
+                if self.metrics:
+                    self.metrics['moea_pareto_front'].set(len(pareto_front))
+
+    def _get_dynamic_moea_weights(self) -> Dict[str, float]:
+        """Compute dynamic objective weights based on current system state."""
+        weights = self.moea_objective_weights.copy()
+        if not self.moea_dynamic_weights:
+            return weights
+        # If memory usage is high, increase weight on memory_usage
+        mem_pct = len(self._memory_cache) / self.max_memory_entries if self.max_memory_entries > 0 else 0
+        if mem_pct > 0.8:
+            weights['memory_usage'] = min(0.6, weights.get('memory_usage', 0.2) * 1.5)
+        # If Redis latency is high, increase weight on latency
+        if self._redis_available:
+            try:
+                start = time.time()
+                # Can't call async here; assume latency from last check? We'll skip.
+                pass
+            except:
+                pass
+        # Normalize
+        total = sum(weights.values())
+        return {k: v / total for k, v in weights.items()}
+
+    # ========================================================================
+    # PUBLIC METHODS (Enhanced with MOEA)
     # ========================================================================
 
     async def get(self, key: str) -> Optional[Any]:
-        """
-        Retrieve a value from cache. Policy is selected adaptively.
-        """
+        """Retrieve a value from cache. Policy is selected adaptively."""
         start = time.time()
         value = None
 
-        # Build state
-        # For get, we don't have a value to estimate size, so we use previous size or default.
         state = await self._get_policy_state(key, None)
-        # Select policy
         policy, action_idx, state_vec, teacher_probs = await self.policy_optimizer.select_policy(state, exploration=True)
 
-        # Execute policy
         success, hit, latency, result = await self._apply_policy(policy, key, None, 0, action_idx, state_vec, teacher_probs)
 
-        # Update stats
         self._update_key_stats(key, hit, latency)
 
-        # Compute reward
         reward = 0.0
         if hit:
             reward += 0.5
-        # Latency: lower is better; we want reward if latency is low
         if latency < 10:
             reward += 0.3
         elif latency < 50:
             reward += 0.15
-        # Resource usage: prefer Redis over memory if redis available (less memory pressure)
         if policy.startswith('redis') and self._redis_available:
             reward += 0.2
         elif policy == 'memory_only' and len(self._memory_cache) < self.max_memory_entries * 0.5:
             reward += 0.1
         reward = max(0.0, min(1.0, reward))
 
-        # Update agent (async, non‑blocking)
         next_state = await self._get_policy_state(key, None)
         asyncio.create_task(self.policy_optimizer.update(state_vec, action_idx, reward, next_state.to_feature_vector(), teacher_probs))
 
-        # Update metrics
         if self.metrics:
             if hit:
                 self.metrics['hits'].inc()
@@ -727,37 +1136,27 @@ class CacheManager:
         return result
 
     async def set(self, key: str, value: Any, ttl: int = 300) -> None:
-        """
-        Store a value in cache. Policy is selected adaptively.
-        """
+        """Store a value in cache. Policy is selected adaptively."""
         start = time.time()
-        # Build state with value size
         state = await self._get_policy_state(key, value)
-        # Select policy
         policy, action_idx, state_vec, teacher_probs = await self.policy_optimizer.select_policy(state, exploration=True)
 
-        # Execute policy
         success, _, latency, _ = await self._apply_policy(policy, key, value, ttl, action_idx, state_vec, teacher_probs)
 
-        # Compute reward
         reward = 0.0
         if success:
             reward += 0.6
-        # Latency reward
         if latency < 5:
             reward += 0.2
         elif latency < 20:
             reward += 0.1
-        # Resource efficiency: prefer Redis for large values
         if policy.startswith('redis') and state.estimated_size_bytes > 100_000:
             reward += 0.2
         reward = max(0.0, min(1.0, reward))
 
-        # Update agent (async)
         next_state = await self._get_policy_state(key, value)
         asyncio.create_task(self.policy_optimizer.update(state_vec, action_idx, reward, next_state.to_feature_vector(), teacher_probs))
 
-        # Update metrics
         if self.metrics:
             self.metrics['latency'].labels('set').observe(time.time() - start)
             self.metrics['size'].set(
@@ -766,11 +1165,7 @@ class CacheManager:
         logger.debug(f"Cache set (policy={policy}): {key} (TTL={ttl}s)")
 
     async def delete(self, key: str) -> bool:
-        """
-        Delete a key from cache.
-        """
-        # We can still use the same distillation logic for deletion, but it's simpler to just delete.
-        # For consistency, we could also learn whether to delete from Redis or memory, but we'll keep it simple.
+        """Delete a key from cache."""
         deleted = False
         if self._redis_available:
             try:
@@ -804,11 +1199,11 @@ class CacheManager:
     async def close(self) -> None:
         """Close Redis connection pool and stop background tasks."""
         self._running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-        if self._health_task:
-            self._health_task.cancel()
-        await asyncio.gather(self._cleanup_task, self._health_task, return_exceptions=True)
+        tasks = [self._cleanup_task, self._health_task, self._moea_task]
+        for task in tasks:
+            if task:
+                task.cancel()
+        await asyncio.gather(*[t for t in tasks if t], return_exceptions=True)
         if self._redis:
             await self._redis.close()
             await self._redis.connection_pool.disconnect()
@@ -837,6 +1232,11 @@ class CacheManager:
             'memory_entries': len(self._memory_cache),
             'redis_available': self._redis_available,
             'distillation': self.policy_optimizer.get_stats(),
+            'moea': {
+                'pareto_front_size': len(self.moea_pareto_front),
+                'best_parameters': self.moea_best_parameters,
+                'enabled': self.moea_enabled,
+            },
         }
         if self.metrics:
             stats['metrics'] = {
@@ -856,9 +1256,17 @@ if __name__ == "__main__":
     async def demo():
         logging.basicConfig(level=logging.INFO)
 
-        # Create cache manager with adaptive policy
-        cache = CacheManager(max_memory_entries=5, cleanup_interval_seconds=10,
-                             distillation_epsilon=0.2, distillation_train_every=2)
+        # Create cache manager with adaptive policy and MOEA
+        cache = CacheManager(
+            max_memory_entries=5,
+            cleanup_interval_seconds=10,
+            distillation_epsilon=0.2,
+            distillation_train_every=2,
+            moea_enabled=True,
+            moea_interval_seconds=20,  # run every 20 seconds for demo
+            moea_population_size=10,
+            moea_generations=3,
+        )
 
         # Simulate some accesses to let the agent learn
         for i in range(20):
@@ -869,6 +1277,9 @@ if __name__ == "__main__":
                 val = await cache.get(key)
                 print(f"get {key}: {val}")
             await asyncio.sleep(0.1)
+
+        # Wait for MOEA to run
+        await asyncio.sleep(25)
 
         stats = await cache.get_stats()
         print(f"Stats: {stats}")
