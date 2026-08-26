@@ -1,25 +1,29 @@
 # src/enhancements/cost_function/sustainability_cost.py
 """
-Enhanced Sustainability Cost Function v2.2.0
+Enhanced Sustainability Cost Function v2.3.0
 =============================================
 Multi‑objective sustainability cost function with Multi‑Teacher On‑Policy Distillation
-for adaptive weight selection.
+for adaptive weight selection, plus an optional Multi‑Objective Evolutionary Optimizer (MOEA)
+to globally tune the six weights. The MOEA (NSGA‑II) maintains a Pareto front of
+non‑dominated weight vectors, and MODP (scalarization with dynamic weights) selects
+the best compromise based on current system state.
 
-ENHANCEMENTS OVER v2.1.0:
-- Replaced static weight adjustments with a multi‑teacher distillation agent.
-- Agent selects among 5 strategies (standard, carbon_focus, energy_focus, helium_focus, adaptive).
-- Learns from the effectiveness of past decisions via reward (cost reduction vs baseline).
-- State includes carbon intensity, node health, workload, anomaly severity, historical cost trend.
-- New configuration parameters for distillation (epsilon, train_every, replay_size, learning_rate).
+ENHANCEMENTS OVER v2.2.0:
+- Added NSGA‑II optimizer to evolve continuous weight vectors (sum to 1).
+- Pareto front storage and MODP‑based selection.
+- Dynamic MOEA objective weights based on real‑time system metrics.
+- Background task for periodic MOEA refinement.
+- New configuration parameters for MOEA.
 """
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional, Union, List
+from typing import Dict, Any, Optional, Union, List, Tuple
 from datetime import datetime, timedelta
 from collections import OrderedDict, deque
 import numpy as np
 import random
+import copy
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -93,13 +97,33 @@ if PYDANTIC_AVAILABLE:
         integrate_anomaly_detection: bool = Field(False)
         integrate_predictive_maintenance: bool = Field(False)
 
-        # NEW: Distillation parameters
+        # Distillation parameters
         distillation_epsilon: float = Field(0.1, ge=0, le=1)
         distillation_train_every: int = Field(10, ge=1)
         distillation_replay_size: int = Field(2000, ge=10)
         distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
         distill_weight: float = Field(0.7, ge=0, le=1)
         rl_weight: float = Field(0.3, ge=0, le=1)
+
+        # NEW: MOEA parameters
+        moea_enabled: bool = Field(True)
+        moea_interval_seconds: int = Field(300, ge=60)  # run every 5 minutes
+        moea_population_size: int = Field(30, ge=10)
+        moea_generations: int = Field(10, ge=2)
+        moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
+        moea_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
+        moea_tournament_size: int = Field(3, ge=2)
+        moea_objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'energy': 0.2,
+                'carbon': 0.3,
+                'helium': 0.15,
+                'material': 0.15,
+                'latency': 0.1,
+                'accuracy': 0.1,
+            }
+        )
+        moea_dynamic_weights: bool = Field(True)
 
         @validator('energy_weight', 'carbon_weight', 'helium_weight', 'material_weight', 'latency_weight', 'accuracy_weight')
         def weights_sum_one(cls, v, values):
@@ -145,6 +169,23 @@ else:
         "distillation_learning_rate": 0.01,
         "distill_weight": 0.7,
         "rl_weight": 0.3,
+        # MOEA defaults
+        "moea_enabled": True,
+        "moea_interval_seconds": 300,
+        "moea_population_size": 30,
+        "moea_generations": 10,
+        "moea_mutation_rate": 0.2,
+        "moea_crossover_rate": 0.8,
+        "moea_tournament_size": 3,
+        "moea_objective_weights": {
+            'energy': 0.2,
+            'carbon': 0.3,
+            'helium': 0.15,
+            'material': 0.15,
+            'latency': 0.1,
+            'accuracy': 0.1,
+        },
+        "moea_dynamic_weights": True,
     }
 
 
@@ -400,23 +441,326 @@ class DistillationCostOptimizer:
 
 
 # ============================================================================
-# MAIN COST FUNCTION (Enhanced)
+# NEW: Multi‑Objective Evolutionary Optimizer (NSGA‑II)
+# ============================================================================
+
+@dataclass
+class MOPDPoint:
+    """Point in the Pareto front for weight vectors."""
+    policy_id: str
+    parameters: Dict[str, float]  # weight vector (keys: energy, carbon, helium, material, latency, accuracy)
+    objectives: Dict[str, float]  # benefits (1 - normalized cost) for each component
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'policy_id': self.policy_id,
+            'parameters': self.parameters,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+
+class NSGAIIOptimizer:
+    """
+    Generic NSGA-II for continuous parameter optimization with multiple objectives.
+    Assumes all objectives are to be maximized.
+    """
+    def __init__(self,
+                 evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+                 parameter_bounds: Dict[str, Tuple[float, float]],
+                 population_size: int = 30,
+                 generations: int = 10,
+                 mutation_rate: float = 0.2,
+                 crossover_rate: float = 0.8,
+                 tournament_size: int = 3,
+                 objective_weights: Optional[Dict[str, float]] = None,
+                 dynamic_weights: bool = True):
+        self.evaluate_func = evaluate_func
+        self.parameter_bounds = parameter_bounds
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {}
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDPoint] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+        self._all_points: List[MOPDPoint] = []
+
+    def _random_individual(self) -> Dict[str, float]:
+        ind = {}
+        for name, (low, high) in self.parameter_bounds.items():
+            ind[name] = random.uniform(low, high)
+        # Normalize weights to sum to 1
+        total = sum(ind.values())
+        if total > 0:
+            ind = {k: v / total for k, v in ind.items()}
+        return ind
+
+    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
+        child = {}
+        for name in self.parameter_bounds:
+            if random.random() < 0.5:
+                # SBX
+                low, high = self.parameter_bounds[name]
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                val = 0.5 * ((1 + beta) * p1[name] + (1 - beta) * p2[name])
+                child[name] = max(low, min(high, val))
+            else:
+                child[name] = p1[name] if random.random() < 0.5 else p2[name]
+        # Normalize
+        total = sum(child.values())
+        if total > 0:
+            child = {k: v / total for k, v in child.items()}
+        return child
+
+    def _mutate(self, ind: Dict) -> Dict:
+        mutant = ind.copy()
+        for name, (low, high) in self.parameter_bounds.items():
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[name] = mutant[name] + delta * (high - low)
+                mutant[name] = max(low, min(high, mutant[name]))
+        total = sum(mutant.values())
+        if total > 0:
+            mutant = {k: v / total for k, v in mutant.items()}
+        return mutant
+
+    def _fast_non_dominated_sort(self, points: List[MOPDPoint]) -> List[List[MOPDPoint]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+
+        for i, p in enumerate(points):
+            p_obj = p.objectives
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                q_obj = q.objectives
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDPoint]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = list(front[0].objectives.keys())
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: x.objectives[obj])
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = sorted_front[0].objectives[obj]
+            obj_max = sorted_front[-1].objectives[obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (sorted_front[i+1].objectives[obj] - sorted_front[i-1].objectives[obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDPoint]],
+                              crowding: Dict[int, float]) -> Dict:
+        candidates = random.sample(population, self.tournament_size)
+        ind_to_point = {}
+        for ind, point in zip(population, self._all_points):
+            ind_to_point[id(ind)] = point
+
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            point = ind_to_point.get(id(cand))
+            if not point:
+                continue
+            rank = len(fronts)
+            for fi, front in enumerate(fronts):
+                if point in front:
+                    rank = fi
+                    break
+            cd = crowding.get(id(point), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        # For example, increase weight of objective with lower average relative to max
+        obj_keys = list(weights.keys())
+        if not obj_keys:
+            return weights
+        avg = {k: np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        max_val = {k: np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        for k in obj_keys:
+            if max_val[k] > 0 and avg[k] < 0.5 * max_val[k]:
+                weights[k] = min(0.6, weights.get(k, 0.0) * 1.5)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def _select_best_from_pareto(self, pareto: List[MOPDPoint], weights: Dict[str, float]) -> Optional[MOPDPoint]:
+        if not pareto:
+            return None
+        obj_keys = list(weights.keys())
+        max_vals = {k: max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+
+        best = None
+        best_score = -float('inf')
+        for p in pareto:
+            score = 0.0
+            for k in obj_keys:
+                val = p.objectives[k]
+                norm = (val - min_vals[k]) / ranges[k] if ranges[k] > 0 else 1.0
+                score += weights.get(k, 0.0) * norm
+            p.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = p
+        return best
+
+    async def evolve(self) -> List[MOPDPoint]:
+        population = [self._random_individual() for _ in range(self.population_size)]
+        points = []
+        for ind in population:
+            obj = await self.evaluate_func(ind)
+            point = MOPDPoint(
+                policy_id=str(uuid.uuid4()),
+                parameters=ind,
+                objectives=obj
+            )
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))] = obj
+
+        self._all_points = points
+        for gen in range(self.generations):
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+
+            offspring = []
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection(population, fronts, crowding)
+                parent2 = self._tournament_selection(population, fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+
+            child_points = []
+            for ind in offspring:
+                key = tuple(sorted(ind.items()))
+                if key in self._eval_cache:
+                    obj = self._eval_cache[key]
+                else:
+                    obj = await self.evaluate_func(ind)
+                    self._eval_cache[key] = obj
+                point = MOPDPoint(
+                    policy_id=str(uuid.uuid4()),
+                    parameters=ind,
+                    objectives=obj
+                )
+                child_points.append(point)
+
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+            self._all_points = points
+
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+            self._all_points = points
+
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+
+        weights = self._compute_dynamic_weights()
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best:
+            self.best_individual = best.parameters
+            self.best_fitness = best.scalarised_score
+        return self.pareto_front
+
+
+# ============================================================================
+# MAIN COST FUNCTION (Enhanced with MOEA)
 # ============================================================================
 
 class SustainabilityCostFunction:
     """
     Enhanced multi‑objective sustainability cost function with adaptive weight selection
-    via multi‑teacher distillation.
-
-    Computes a weighted sum of six normalized cost components (each in [0,1]):
-        - Energy: joules per token * tokens, normalized by max energy.
-        - Carbon: energy * carbon intensity, normalized by max carbon.
-        - Helium: inverse of connectivity score, adjusted by scarcity, normalized by max.
-        - Material: composite of embodied carbon and rare earth, normalized.
-        - Latency: latency target normalized by baseline and max.
-        - Accuracy: 1 - accuracy score, normalized by max.
-
-    The weight selection is learned by the distillation agent.
+    via multi‑teacher distillation and optional MOEA refinement.
     """
 
     def __init__(
@@ -485,6 +829,7 @@ class SustainabilityCostFunction:
                 'total': Histogram('cost_total', 'Total sustainability cost'),
                 'weights': Gauge('cost_weights', 'Current weights', ['component']),
                 'anomaly_triggered': Counter('cost_anomaly_triggered', 'Anomaly triggered weight adjustments'),
+                'moea_pareto_front': Gauge('cost_moea_pareto_front', 'MOEA Pareto front size'),
             }
         else:
             self.metrics = None
@@ -508,7 +853,22 @@ class SustainabilityCostFunction:
         self._last_total_cost: Optional[float] = None
         self._cost_history = deque(maxlen=50)
 
-        logger.info("SustainabilityCostFunction v2.2.0 initialized with config: %s", self.config)
+        # NEW: MOEA attributes
+        self.moea_enabled = self._get_config('moea_enabled', True)
+        self.moea_interval_seconds = self._get_config('moea_interval_seconds', 300)
+        self.moea_optimizer: Optional[NSGAIIOptimizer] = None
+        self.moea_pareto_front: List[MOPDPoint] = []
+        self.moea_best_weights: Optional[Dict[str, float]] = None
+        self._moea_task: Optional[asyncio.Task] = None
+        self._last_node_desc: Optional[NodeDescriptor] = None
+        self._last_workload: Optional[WorkloadDescriptor] = None
+        self._last_expert_profile: Optional[ExpertProfile] = None
+
+        logger.info("SustainabilityCostFunction v2.3.0 initialized with config: %s", self.config)
+
+        # Start MOEA background task if enabled
+        if self.moea_enabled:
+            self._moea_task = asyncio.create_task(self._moea_loop())
 
     def _get_config(self, key: str, default: Any = None) -> Any:
         """Safely get a config value, supporting both dict and Pydantic."""
@@ -585,6 +945,11 @@ class SustainabilityCostFunction:
         Compute the sustainability cost for a given node and workload.
         Uses distillation to select the weight strategy.
         """
+        # Store last inputs for MOEA evaluation
+        self._last_node_desc = node_desc
+        self._last_workload = workload
+        self._last_expert_profile = expert_profile
+
         # --- Energy cost ---
         # Apply predictive maintenance efficiency factor if enabled
         if self._get_config('integrate_predictive_maintenance', False) and self.predictive_maintenance:
@@ -658,7 +1023,6 @@ class SustainabilityCostFunction:
                 self.metrics['weights'].labels(component=k).set(v)
 
         # --- Compute reward and update distillation agent ---
-        # Baseline cost using base weights
         baseline_weights = self._base_weights
         baseline_total = (
             baseline_weights['energy'] * energy_cost +
@@ -674,15 +1038,11 @@ class SustainabilityCostFunction:
             reward = 0.0
         reward = max(0.0, min(1.0, reward))
 
-        # Store cost history for state building
         self._cost_history.append(total)
         self._last_total_cost = total
 
-        # Build state for update (next state could be same, but we'll use current state)
         state = self._build_optimization_state(node_desc, workload, expert_profile)
-        next_state = state  # in this simple version, we treat next state as same
-
-        # Update agent asynchronously
+        next_state = state
         asyncio.create_task(self.policy_optimizer.update(
             state.to_feature_vector(),
             self._last_action_idx,
@@ -705,24 +1065,15 @@ class SustainabilityCostFunction:
         expert_profile: Optional[ExpertProfile] = None,
     ) -> CostOptimizationState:
         """Build state for the distillation agent."""
-        # Carbon intensity
         carbon_intensity = self._get_carbon_intensity_sync(node_desc.region)
-
-        # Node health (from predictive maintenance if enabled)
         node_health = 1.0
         if self._get_config('integrate_predictive_maintenance', False) and self.predictive_maintenance:
             try:
-                # We'll use a synchronous method or a cached value
-                # For simplicity, we assume a method get_efficiency_factor is async; we'll use a default.
                 node_health = 0.8  # placeholder
             except Exception:
                 pass
-
-        # Workload characteristics
         tokens = workload.tokens
         latency = workload.latency_target
-
-        # Anomaly severity
         anomaly_severity = 0.0
         if self._get_config('integrate_anomaly_detection', False) and self.anomaly_detector:
             try:
@@ -730,8 +1081,6 @@ class SustainabilityCostFunction:
                     anomaly_severity = await self.anomaly_detector.get_latest_severity()
             except Exception:
                 pass
-
-        # Historical cost trend
         if len(self._cost_history) >= 5:
             recent = list(self._cost_history)[-5:]
             trend = (recent[-1] - recent[0]) / (len(recent) - 1) if len(recent) > 1 else 0.0
@@ -740,14 +1089,10 @@ class SustainabilityCostFunction:
         else:
             avg_cost_trend = 0.0
             cost_variance = 0.0
-
-        # Current weights (we use base weights for state, or we could use current)
         weight_carbon = self._base_weights['carbon']
         weight_energy = self._base_weights['energy']
         weight_helium = self._base_weights['helium']
-
         hour = datetime.now().hour
-
         return CostOptimizationState(
             carbon_intensity=carbon_intensity,
             node_health=node_health,
@@ -763,14 +1108,11 @@ class SustainabilityCostFunction:
         )
 
     def _get_carbon_intensity_sync(self, region: str) -> float:
-        """Synchronous version of _get_carbon_intensity (for state building)."""
-        # Use cache if available
         now = datetime.now()
         if region in self._carbon_cache:
             value, timestamp = self._carbon_cache[region]
             if (now - timestamp).total_seconds() < self._carbon_cache_ttl:
                 return value
-        # Otherwise return baseline
         return self._get_config('carbon_intensity_baseline_kg_per_kwh', 0.4)
 
     # ---------- Modified _get_weights ----------
@@ -780,25 +1122,13 @@ class SustainabilityCostFunction:
         workload: WorkloadDescriptor,
         anomaly_detected: bool = False,
     ) -> Dict[str, float]:
-        """
-        Return current weights.
-        Uses distillation agent to select a strategy, then applies it.
-        Stores the selected action for reward update.
-        """
-        # Build state
         state = self._build_optimization_state(node_desc, workload, None)
-
-        # Select strategy via distillation
         strategy, action_idx, state_vec, teacher_probs = await self.policy_optimizer.select_strategy(state, exploration=True)
-
-        # Store for update
         self._last_action_idx = action_idx
         self._last_teacher_probs = teacher_probs
-
-        # Apply strategy
         weights = self._base_weights.copy()
         if strategy == 'standard':
-            pass  # use base weights
+            pass
         elif strategy == 'carbon_focus':
             weights['carbon'] *= 1.2
         elif strategy == 'energy_focus':
@@ -825,19 +1155,14 @@ class SustainabilityCostFunction:
                             weights[comp] = adaptive_weights[ad_key]
                 except Exception as e:
                     logger.warning(f"Adaptive weight update failed: {e}")
-
-        # Normalize weights to sum to 1
         total = sum(weights.values())
         if total > 0:
             weights = {k: v / total for k, v in weights.items()}
-
-        # Store current weights for metrics
         self._current_weights = weights
         return weights
 
     # ---------- Helper methods (unchanged) ----------
     async def _get_carbon_intensity(self, region: str) -> float:
-        """Fetch carbon intensity with LRU caching."""
         now = datetime.now()
         if region in self._carbon_cache:
             value, timestamp = self._carbon_cache[region]
@@ -877,26 +1202,21 @@ class SustainabilityCostFunction:
 
     # ---------- Integration callbacks (unchanged) ----------
     async def on_anomaly_detected(self, anomaly_severity: float):
-        """Callback from anomaly detection module."""
         if not self._get_config('integrate_anomaly_detection', False):
             return
         self._last_anomaly_time = datetime.now()
-        # The distillation agent will handle weight adjustments; we don't need to do anything.
         logger.info(f"Anomaly detected with severity {anomaly_severity}, will be reflected in next strategy selection.")
 
     async def update_from_predictive_maintenance(self, node_id: str, efficiency_factor: float):
-        """Update cost based on predictive maintenance feedback."""
         if not self._get_config('integrate_predictive_maintenance', False):
             return
         logger.debug(f"Predictive maintenance update for node {node_id}: factor={efficiency_factor}")
 
     # ---------- Utility methods ----------
     async def get_weights(self) -> Dict[str, float]:
-        """Return current weights."""
         return self._current_weights.copy()
 
     async def set_weights(self, new_weights: Dict[str, float]) -> None:
-        """Manually set base weights (overrides config)."""
         total = sum(new_weights.values())
         if total == 0:
             raise ValueError("Weights sum cannot be zero")
@@ -904,12 +1224,10 @@ class SustainabilityCostFunction:
         logger.info(f"Base weights set manually: {self._base_weights}")
 
     async def reset_weights(self) -> None:
-        """Reset weights to initial config values."""
         self._base_weights = self._get_initial_weights()
         logger.info("Weights reset to initial configuration")
 
     async def reset_carbon_cache(self) -> None:
-        """Clear the carbon intensity cache."""
         self._carbon_cache.clear()
         logger.info("Carbon cache cleared")
 
@@ -919,10 +1237,6 @@ class SustainabilityCostFunction:
         workload: WorkloadDescriptor,
         expert_profile: Optional[ExpertProfile] = None,
     ) -> Dict[str, Any]:
-        """
-        Return a breakdown of cost components (for dashboard/explanation).
-        """
-        # Compute raw values (similar to compute but without distillation)
         energy_used = node_desc.energy_per_token * workload.tokens
         energy_cost = self._normalize_energy(energy_used)
         carbon_intensity = await self._get_carbon_intensity(node_desc.region)
@@ -962,12 +1276,165 @@ class SustainabilityCostFunction:
         }
 
     async def close(self):
-        """Clean up resources."""
+        if self._moea_task:
+            self._moea_task.cancel()
+            await asyncio.gather(self._moea_task, return_exceptions=True)
         pass
 
     # ---------- Distillation stats ----------
     async def get_distillation_stats(self) -> Dict:
         return self.policy_optimizer.get_stats()
+
+    # ============================================================================
+    # NEW: MOEA Integration Methods
+    # ============================================================================
+    async def _moea_loop(self):
+        """Periodically run MOEA to refine weights."""
+        while True:
+            try:
+                await asyncio.sleep(self.moea_interval_seconds)
+                await self.run_moea_optimization()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"MOEA loop failed: {e}")
+                await asyncio.sleep(60)
+
+    async def run_moea_optimization(self):
+        """Run NSGA-II to evolve weight vectors based on the latest scenario."""
+        if not self.moea_enabled:
+            logger.info("MOEA is disabled.")
+            return
+
+        if not self._last_node_desc or not self._last_workload:
+            logger.warning("No scenario available for MOEA; skipping.")
+            return
+
+        # Define parameter bounds: each weight in [0.01, 0.99]
+        param_bounds = {
+            'energy': (0.01, 0.99),
+            'carbon': (0.01, 0.99),
+            'helium': (0.01, 0.99),
+            'material': (0.01, 0.99),
+            'latency': (0.01, 0.99),
+            'accuracy': (0.01, 0.99),
+        }
+
+        async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
+            """Compute objectives (benefits) for a weight vector using the last scenario."""
+            # Temporarily set weights
+            old_weights = self._current_weights.copy()
+            self._current_weights = weights
+
+            # Compute cost components using the last scenario
+            node_desc = self._last_node_desc
+            workload = self._last_workload
+            expert_profile = self._last_expert_profile
+
+            # Reuse the compute logic but without weight selection (to avoid recursion)
+            # We'll manually compute each component using the same methods as compute.
+            energy_used = node_desc.energy_per_token * workload.tokens
+            energy_cost = self._normalize_energy(energy_used)
+            carbon_intensity = await self._get_carbon_intensity(node_desc.region)
+            carbon_kg = energy_used * carbon_intensity
+            carbon_cost = self._normalize_carbon(carbon_kg)
+            helium_scarcity = await self._get_helium_scarcity(node_desc)
+            helium_base = (1 - node_desc.helium_connectivity_score) * 0.5
+            if helium_scarcity > self._get_config('helium_scarcity_threshold', 0.7):
+                helium_base *= (1 + helium_scarcity)
+            helium_cost = self._normalize_helium(helium_base)
+            material_composite = await self._get_material_composite(node_desc)
+            material_cost = self._normalize_material(material_composite)
+            latency_cost = self._normalize_latency(workload.latency_target)
+            if expert_profile:
+                acc = expert_profile.accuracy_score
+            else:
+                acc = self._get_config('accuracy_baseline', 0.9)
+            accuracy_cost = self._normalize_accuracy(acc)
+
+            # Restore weights
+            self._current_weights = old_weights
+
+            # Convert costs to benefits (higher is better)
+            return {
+                'energy': 1.0 - energy_cost,
+                'carbon': 1.0 - carbon_cost,
+                'helium': 1.0 - helium_cost,
+                'material': 1.0 - material_cost,
+                'latency': 1.0 - latency_cost,
+                'accuracy': 1.0 - accuracy_cost,
+            }
+
+        # Create NSGA-II optimizer
+        self.moea_optimizer = NSGAIIOptimizer(
+            evaluate_func=evaluate,
+            parameter_bounds=param_bounds,
+            population_size=self._get_config('moea_population_size', 30),
+            generations=self._get_config('moea_generations', 10),
+            mutation_rate=self._get_config('moea_mutation_rate', 0.2),
+            crossover_rate=self._get_config('moea_crossover_rate', 0.8),
+            tournament_size=self._get_config('moea_tournament_size', 3),
+            objective_weights=self._get_dynamic_moea_weights(),
+            dynamic_weights=self._get_config('moea_dynamic_weights', True),
+        )
+
+        pareto = await self.moea_optimizer.evolve()
+        self.moea_pareto_front = pareto
+
+        # Select best using MODP (scalarization with current dynamic weights)
+        if pareto:
+            weights = self._get_dynamic_moea_weights()
+            best_point = self.moea_optimizer._select_best_from_pareto(pareto, weights)
+            if best_point:
+                self.moea_best_weights = best_point.parameters
+                # Update base weights (or current weights) with the best found
+                self._base_weights = best_point.parameters
+                logger.info(f"MOEA selected best weights: {self._base_weights}")
+                if self.metrics:
+                    self.metrics['moea_pareto_front'].set(len(pareto))
+
+    def _get_dynamic_moea_weights(self) -> Dict[str, float]:
+        """Compute dynamic objective weights for MODP selection."""
+        weights = self._get_config('moea_objective_weights', {
+            'energy': 0.2,
+            'carbon': 0.3,
+            'helium': 0.15,
+            'material': 0.15,
+            'latency': 0.1,
+            'accuracy': 0.1,
+        }).copy()
+
+        # Adjust based on current system state
+        if self._carbon_cache:
+            # Example: if carbon intensity is high, increase carbon weight
+            try:
+                latest_carbon = max(
+                    value for value, ts in self._carbon_cache.values()
+                    if (datetime.now() - ts).total_seconds() < self._carbon_cache_ttl
+                )
+                if latest_carbon > 0.8:
+                    weights['carbon'] = min(0.6, weights.get('carbon', 0.3) * 1.5)
+            except ValueError:
+                pass
+
+        # Normalize
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    async def get_pareto_front(self) -> List[Dict]:
+        """Return the current Pareto front as a list of dictionaries."""
+        return [p.to_dict() for p in self.moea_pareto_front]
+
+    async def apply_moea_weights(self, weights: Dict[str, float]):
+        """Manually apply a weight vector (e.g., from Pareto front selection)."""
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        self._base_weights = weights
+        self._current_weights = weights
+        logger.info(f"Applied MOEA weights: {weights}")
 
 
 # ============================================================================
@@ -1044,9 +1511,17 @@ if __name__ == "__main__":
         expert = MockExpertProfile()
         cost = await cost_func.compute(node_desc, workload, expert)
         print(f"Total cost: {cost}")
+
+        # Trigger MOEA optimization manually
+        await cost_func.run_moea_optimization()
+        pareto = await cost_func.get_pareto_front()
+        print(f"Pareto front size: {len(pareto)}")
+        if pareto:
+            print("Best weights:", cost_func.moea_best_weights)
+
         breakdown = await cost_func.get_cost_breakdown(node_desc, workload, expert)
         print("Cost breakdown:", breakdown)
-        stats = await cost_func.get_distillation_stats()
-        print("Distillation stats:", stats)
+
+        await cost_func.close()
 
     asyncio.run(main())
