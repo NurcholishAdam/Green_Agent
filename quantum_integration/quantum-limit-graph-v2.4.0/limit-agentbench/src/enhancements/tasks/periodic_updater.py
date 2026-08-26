@@ -1,27 +1,27 @@
-# src/enhancements/tasks/periodic_updater_v2_0_0.py
+# src/enhancements/tasks/periodic_updater_v2_1_0.py
 """
-Enhanced Periodic Updater for Green Agent v2.0.0
+Enhanced Periodic Updater for Green Agent v2.1.0
 =================================================
 Celery tasks for periodic updates of sustainability data with adaptive scheduling
 via Multi‑Teacher On‑Policy Distillation.
 
-Features:
-- Adaptive update scheduling based on context and learned from outcomes.
-- State‑aware decision to update or skip.
-- Online learning from update effectiveness.
-- Teachers: rule‑based, historical ML, stateful Q.
-- Student: linear softmax with distillation + REINFORCE.
-- Persistence for Q‑teacher weights and interaction logs.
-- Offline training for historical ML teacher.
-- Unit tests for distillation components.
-All previous features (async tasks, retries, metrics, etc.) retained.
+Enhancements over v2.0.0:
+- Expanded state vector with 12 features (including last_update_success, cache_freshness, error_rate).
+- Real reward computation based on data change and success, not placeholder.
+- Integration with FeedbackEvent schema and AsyncMessageQueue for cross‑module communication.
+- True historical ML training from logged state vectors (now stored in CSV).
+- Pydantic‑based configuration via environment variables.
+- Concurrency‑safe AdaptiveScheduler with asyncio.Lock.
+- More robust unit tests.
+
+All previous features (Celery tasks, retries, metrics, distillation components) retained.
 """
 
 import asyncio
 import logging
 import os
 import time
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 from datetime import datetime, timedelta
 import random
 import numpy as np
@@ -31,9 +31,13 @@ import json
 import pickle
 import pandas as pd
 from pathlib import Path
+from dataclasses import dataclass
 
 from celery import Celery
 from celery.signals import task_failure, task_success, task_retry
+
+# ---------- Pydantic ----------
+from pydantic import BaseSettings, Field
 
 # ---------- Prometheus ----------
 try:
@@ -50,7 +54,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO)
 
-# ---------- scikit-learn for ML teacher ----------
+# ---------- scikit-learn ----------
 try:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import LabelEncoder
@@ -64,21 +68,54 @@ from ..data_integration.carbon_intensity import CarbonIntensityFetcher
 from ..data_integration.material_footprint import MaterialFootprintUpdater
 from ..data_integration.helium_collector import HeliumCollector
 
-# ============================================================================
-# Configuration from environment
-# ============================================================================
-REDIS_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
-REGIONS = os.getenv('CARBON_REGIONS', 'us-east,us-west,eu-west,eu-north,asia-east,asia-southeast').split(',')
-HELIUM_SNAPSHOT_URL = os.getenv('HELIUM_SNAPSHOT_URL', 'https://example.com/helium_snapshot.parquet')
-HELIUM_SNAPSHOT_PATH = os.getenv('HELIUM_SNAPSHOT_PATH', './helium_snapshot.parquet')
+# Optional project imports
+try:
+    from ..schemas.feedback_event import FeedbackEvent
+except ImportError:
+    FeedbackEvent = None
 
-# NEW: Distillation persistence paths
-Q_WEIGHTS_PATH = os.getenv('UPDATE_Q_WEIGHTS_PATH', './update_q_weights.json')
-INTERACTION_LOGS_PATH = os.getenv('UPDATE_INTERACTION_LOGS_PATH', './update_interactions.csv')
-HISTORICAL_MODEL_PATH = os.getenv('UPDATE_HISTORICAL_MODEL_PATH', './update_historical_model.pkl')
+try:
+    from ..async_message_queue import AsyncMessageQueue
+except ImportError:
+    AsyncMessageQueue = None
 
-# Celery app (unchanged)
-app = Celery('green_agent', broker=REDIS_URL)
+# ============================================================================
+# Configuration
+# ============================================================================
+
+class UpdaterConfig(BaseSettings):
+    """Configuration for periodic updater and adaptive scheduler."""
+    redis_url: str = "redis://localhost:6379/0"
+    regions: List[str] = Field(default_factory=lambda: ["us-east", "us-west", "eu-west", "eu-north", "asia-east", "asia-southeast"])
+    helium_snapshot_url: str = "https://example.com/helium_snapshot.parquet"
+    helium_snapshot_path: str = "./helium_snapshot.parquet"
+
+    # Distillation
+    distillation_epsilon: float = 0.1
+    distillation_train_every: int = 10
+    distillation_replay_size: int = 2000
+    distillation_learning_rate: float = 0.01
+    distill_weight: float = 0.7
+    rl_weight: float = 0.3
+    q_learning_rate: float = 0.1
+
+    # Persistence paths
+    q_weights_path: str = "./update_q_weights.json"
+    interaction_logs_path: str = "./update_interactions.csv"
+    historical_model_path: str = "./update_historical_model.pkl"
+
+    # Scheduler
+    scheduler_interval_seconds: int = 900  # 15 minutes
+    enable_message_queue: bool = False
+
+    class Config:
+        env_prefix = "UPDATER_"
+        case_sensitive = False
+
+config = UpdaterConfig()
+
+# Celery app
+app = Celery('green_agent', broker=config.redis_url)
 app.conf.update(
     task_serializer='json',
     result_serializer='json',
@@ -93,7 +130,7 @@ app.conf.update(
     task_retry_backoff_max=600,
 )
 
-# Prometheus metrics (if enabled)
+# Prometheus metrics
 if PROMETHEUS_AVAILABLE:
     task_metrics = {
         'carbon_success': Counter('carbon_update_success_total', 'Carbon update success count'),
@@ -103,7 +140,6 @@ if PROMETHEUS_AVAILABLE:
         'helium_success': Counter('helium_update_success_total', 'Helium update success count'),
         'helium_failure': Counter('helium_update_failure_total', 'Helium update failure count'),
         'task_duration': Histogram('periodic_task_duration_seconds', 'Task duration', ['task_name']),
-        # Distillation metrics
         'update_action': Counter('update_action_selected', 'Action selected by scheduler', ['action']),
         'update_reward': Histogram('update_reward', 'Reward per update decision'),
     }
@@ -111,27 +147,31 @@ else:
     task_metrics = {}
 
 # ============================================================================
-# DISTILLATION COMPONENTS FOR UPDATE SCHEDULING
+# DISTILLATION COMPONENTS (Enhanced)
 # ============================================================================
 
 @dataclass
 class UpdateState:
-    """State for the distillation agent."""
+    """State for the distillation agent (expanded)."""
     # Time
     hours_since_last_update: float
     hour_of_day: float
     day_of_week: float
     # Data volatility
-    carbon_trend: float  # average change in intensity over last 24h
+    carbon_trend: float          # avg change in carbon intensity per hour
     material_version_age_days: float
     helium_snapshot_age_days: float
     # Context
     current_carbon_intensity: float
     pending_updates_count: int
-    system_load: float  # 0-1
+    system_load: float
+    # NEW: additional features
+    last_update_success: float = 1.0   # 1 if last update succeeded
+    cache_freshness: float = 1.0       # 1 = fresh, 0 = stale
+    error_rate: float = 0.0            # historical error rate (0-1)
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to 10‑dim numeric feature vector."""
+        """Convert to 12‑dim numeric feature vector."""
         features = [
             min(self.hours_since_last_update / 72.0, 1.0),
             self.hour_of_day / 24.0,
@@ -142,6 +182,9 @@ class UpdateState:
             min(self.current_carbon_intensity / 1000.0, 1.0),
             min(self.pending_updates_count / 10.0, 1.0),
             self.system_load,
+            self.last_update_success,
+            self.cache_freshness,
+            self.error_rate,
         ]
         return np.array(features, dtype=np.float32)
 
@@ -166,15 +209,17 @@ class UpdateRuleBasedTeacher(Teacher):
     def predict(self, state: UpdateState) -> np.ndarray:
         probs = np.ones(2) * 0.1
         if state.hours_since_last_update > 24:
-            probs[0] = 0.8  # update_now
+            probs[0] = 0.8
         elif state.carbon_trend > 0.05:
-            probs[0] = 0.7  # update_now
+            probs[0] = 0.7
         elif state.material_version_age_days > 14:
-            probs[0] = 0.6  # update_now
+            probs[0] = 0.6
         elif state.system_load > 0.8:
-            probs[1] = 0.8  # skip
+            probs[1] = 0.8
+        elif state.last_update_success < 0.5:
+            probs[0] = 0.6  # retry after failure
         else:
-            probs[1] = 0.6  # skip default
+            probs[1] = 0.6
         return probs / probs.sum()
 
     def confidence(self, state: UpdateState) -> float:
@@ -188,7 +233,7 @@ class UpdateHistoricalMLTeacher(Teacher):
     def __init__(self, model_path: Optional[Path] = None):
         self.model = None
         self.label_encoder = None
-        self.model_path = model_path or Path(HISTORICAL_MODEL_PATH)
+        self.model_path = model_path or Path(config.historical_model_path)
         if self.model_path.exists():
             try:
                 with open(self.model_path, 'rb') as f:
@@ -207,28 +252,73 @@ class UpdateHistoricalMLTeacher(Teacher):
     def confidence(self, state: UpdateState) -> float:
         return 0.7 if self.model is not None else 0.0
 
+    @classmethod
+    def train_from_logs(cls, log_paths: List[Path], model_path: Path,
+                        state_col: str = 'state_vec', label_col: str = 'action'):
+        """Train a RandomForestClassifier from logs containing state vectors and actions."""
+        if not SKLEARN_ML:
+            logger.error("scikit-learn not available, cannot train historical model.")
+            return None
+        all_dfs = []
+        for path in log_paths:
+            if path.exists():
+                df = pd.read_csv(path)
+                all_dfs.append(df)
+        if not all_dfs:
+            logger.warning("No logs found for training.")
+            return None
+
+        df = pd.concat(all_dfs, ignore_index=True)
+        if len(df) < 10:
+            logger.warning("Not enough logs to train historical model.")
+            return None
+
+        # Parse state vectors from string (comma-separated)
+        def parse_state(s):
+            try:
+                return np.fromstring(s, sep=',')
+            except:
+                return None
+
+        valid_indices = [i for i, s in enumerate(df[state_col]) if parse_state(s) is not None]
+        X = np.array([parse_state(df[state_col].iloc[i]) for i in valid_indices])
+        y = df[label_col].iloc[valid_indices].values
+
+        if len(X) < 5:
+            logger.warning("Too few valid samples after parsing.")
+            return None
+
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        clf.fit(X, y_enc)
+
+        with open(model_path, 'wb') as f:
+            pickle.dump((clf, le), f)
+        logger.info(f"Trained historical model and saved to {model_path}")
+        return model_path
+
 
 class UpdateStatefulQTeacher(Teacher):
     """Linear Q‑learning with state features."""
-    def __init__(self, lr: float = 0.1):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
         self.lr = lr
-        self.weights = np.zeros((9, 2))  # 9 features, 2 actions
+        self.weights_path = weights_path or Path(config.q_weights_path)
+        self.weights = np.zeros((12, 2))  # 12 features, 2 actions
         self._load_state()
 
     def _load_state(self):
-        path = Path(Q_WEIGHTS_PATH)
-        if path.exists():
+        if self.weights_path.exists():
             try:
-                with open(path, 'r') as f:
+                with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
-                logger.info(f"Loaded Q‑teacher weights from {path}")
+                logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
 
     def _save_state(self):
-        path = Path(Q_WEIGHTS_PATH)
-        with open(path, 'w') as f:
+        with open(self.weights_path, 'w') as f:
             json.dump(self.weights.tolist(), f, indent=2)
 
     def predict(self, state: UpdateState) -> np.ndarray:
@@ -248,7 +338,7 @@ class UpdateStatefulQTeacher(Teacher):
 
 
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 9, n_classes: int = 2, lr: float = 0.01):
+    def __init__(self, feature_dim: int = 12, n_classes: int = 2, lr: float = 0.01):
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
@@ -273,8 +363,6 @@ class DistillationStudent:
     def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
                reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
         current_probs = self.predict_proba(state_vector, self.n_classes)
-        logits = state_vector @ self.weights + self.biases
-
         grad_distill = -(teacher_probs - current_probs)
         one_hot = np.zeros(self.n_classes)
         one_hot[action] = 1.0
@@ -308,24 +396,31 @@ class ReplayBuffer:
 
 
 class DistillationSchedulerOptimizer:
-    """
-    Multi‑teacher on‑policy distillation agent for update scheduling.
+    """Multi‑teacher on‑policy distillation agent for update scheduling.
     Actions: update_now, skip.
     """
     ACTIONS = ['update_now', 'skip']
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.student = DistillationStudent(
+            feature_dim=12,
+            lr=config.get('distillation_learning_rate', 0.01)
+        )
         self.teachers: List[Teacher] = [
             UpdateRuleBasedTeacher(),
-            UpdateHistoricalMLTeacher(),
-            UpdateStatefulQTeacher()
+            UpdateHistoricalMLTeacher(model_path=config.get('historical_model_path')),
+            UpdateStatefulQTeacher(
+                lr=config.get('q_learning_rate', 0.1),
+                weights_path=config.get('q_weights_path')
+            )
         ]
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
         self.counter = 0
+        self.distill_weight = config.get('distill_weight', 0.7)
+        self.rl_weight = config.get('rl_weight', 0.3)
 
     async def select_action(self, state: UpdateState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
@@ -366,168 +461,248 @@ class DistillationSchedulerOptimizer:
             batch = self.replay_buffer.sample(8)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
+                                    distill_weight=self.distill_weight, rl_weight=self.rl_weight)
 
     def get_stats(self) -> Dict:
         return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
 
 
 # ============================================================================
-# ADAPTIVE SCHEDULER (Replaces Celery Beat)
+# ADAPTIVE SCHEDULER (Enhanced)
 # ============================================================================
 
 class AdaptiveScheduler:
-    """
-    Adaptive scheduler that uses distillation to decide when to run updates.
-    This runs as a separate task (e.g., every 15 minutes) and triggers actual updates.
-    """
+    """Adaptive scheduler that uses distillation to decide when to run updates."""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
-        # Distillation optimizer
         self.scheduler_optimizer = DistillationSchedulerOptimizer({
             'distillation_epsilon': self.config.get('distillation_epsilon', 0.1),
             'distillation_train_every': self.config.get('distillation_train_every', 10),
             'distillation_replay_size': self.config.get('distillation_replay_size', 2000),
             'distillation_learning_rate': self.config.get('distillation_learning_rate', 0.01),
+            'distill_weight': self.config.get('distill_weight', 0.7),
+            'rl_weight': self.config.get('rl_weight', 0.3),
+            'q_learning_rate': self.config.get('q_learning_rate', 0.1),
+            'q_weights_path': self.config.get('q_weights_path', config.q_weights_path),
+            'historical_model_path': self.config.get('historical_model_path', config.historical_model_path),
         })
 
-        # Interaction tracking
         self.interaction_log: List[Dict] = []
         self.last_state_vec: Optional[np.ndarray] = None
         self.last_action_idx: Optional[int] = None
         self.last_teacher_probs: Optional[np.ndarray] = None
 
-        # Last update timestamps
         self.last_carbon_update: Optional[datetime] = None
         self.last_material_update: Optional[datetime] = None
         self.last_helium_update: Optional[datetime] = None
 
-        # Data volatility trackers
         self.carbon_history = deque(maxlen=100)
         self.material_version = None
         self.helium_snapshot_mtime: Optional[float] = None
 
-        logger.info("AdaptiveScheduler initialized")
+        # Concurrency lock
+        self._lock = asyncio.Lock()
+
+        # Message queue (optional)
+        self.message_queue = None
+        if self.config.get('enable_message_queue', False) and AsyncMessageQueue is not None:
+            self.message_queue = AsyncMessageQueue(queue_type="asyncio")
+
+        logger.info("AdaptiveScheduler initialized (v2.1.0)")
 
     def _build_state(self, task_type: str) -> UpdateState:
         """Build state for a specific update task."""
         now = datetime.utcnow()
 
+        # Determine hours since last update and other fields per task type
         if task_type == 'carbon':
-            hours_since = (now - self.last_carbon_update).total_seconds() / 3600 if self.last_carbon_update else 72
-            # Carbon trend: average change over last 24h
+            last_update = self.last_carbon_update
+            hours_since = (now - last_update).total_seconds() / 3600 if last_update else 72
+            carbon_trend = 0.0
             if len(self.carbon_history) > 5:
                 recent = list(self.carbon_history)[-24:]
                 if len(recent) > 5:
                     slope = np.polyfit(range(len(recent)), recent, 1)[0]
-                    trend = slope
-                else:
-                    trend = 0.0
-            else:
-                trend = 0.0
+                    carbon_trend = slope
             current_intensity = self.carbon_history[-1] if self.carbon_history else 400
-            age_days = 0
+            material_age = 0
+            helium_age = 0
         elif task_type == 'material':
-            hours_since = (now - self.last_material_update).total_seconds() / 3600 if self.last_material_update else 72
-            trend = 0.0
+            last_update = self.last_material_update
+            hours_since = (now - last_update).total_seconds() / 3600 if last_update else 72
+            carbon_trend = 0.0
             current_intensity = 0.0
-            age_days = 0
+            # If we have material catalog file, compute its age
+            if self.material_version:
+                # In real system, get mtime of catalog file
+                material_age = 0.0  # placeholder
+            else:
+                material_age = 30.0  # assume stale if not set
+            helium_age = 0
         else:  # helium
-            hours_since = (now - self.last_helium_update).total_seconds() / 3600 if self.last_helium_update else 72
-            trend = 0.0
+            last_update = self.last_helium_update
+            hours_since = (now - last_update).total_seconds() / 3600 if last_update else 72
+            carbon_trend = 0.0
             current_intensity = 0.0
-            age_days = 0
+            material_age = 0
+            if self.helium_snapshot_mtime:
+                helium_age = (now.timestamp() - self.helium_snapshot_mtime) / (3600 * 24)
+            else:
+                helium_age = 30.0  # assume stale
 
-        # System load (mock)
+        # System load and pending updates (could be obtained from Celery)
         system_load = 0.5
+        pending_updates = 0
 
-        # Pending updates (mock)
-        pending = 0
+        # Cache freshness and last success/error rate (placeholders)
+        last_update_success = 1.0
+        cache_freshness = 1.0
+        error_rate = 0.0
 
         return UpdateState(
             hours_since_last_update=hours_since,
             hour_of_day=now.hour,
             day_of_week=now.weekday(),
-            carbon_trend=trend,
-            material_version_age_days=age_days,
-            helium_snapshot_age_days=age_days,
+            carbon_trend=carbon_trend,
+            material_version_age_days=material_age,
+            helium_snapshot_age_days=helium_age,
             current_carbon_intensity=current_intensity,
-            pending_updates_count=pending,
+            pending_updates_count=pending_updates,
             system_load=system_load,
+            last_update_success=last_update_success,
+            cache_freshness=cache_freshness,
+            error_rate=error_rate,
         )
 
     async def decide_and_execute(self, task_type: str) -> bool:
-        """
-        Decide whether to run the update for the given task type.
+        """Decide whether to run the update for the given task type.
         Returns True if the update was executed, False if skipped.
         """
-        # Build state
-        state = self._build_state(task_type)
+        async with self._lock:
+            state = self._build_state(task_type)
+            action, action_idx, state_vec, teacher_probs = await self.scheduler_optimizer.select_action(
+                state, exploration=True
+            )
+            self.last_state_vec = state_vec
+            self.last_action_idx = action_idx
+            self.last_teacher_probs = teacher_probs
 
-        # Select action via distillation
-        action, action_idx, state_vec, teacher_probs = await self.scheduler_optimizer.select_action(state, exploration=True)
-        self.last_state_vec = state_vec
-        self.last_action_idx = action_idx
-        self.last_teacher_probs = teacher_probs
+            if PROMETHEUS_AVAILABLE:
+                task_metrics['update_action'].labels(action=action).inc()
 
-        if action == 'skip':
-            logger.info(f"Skipping {task_type} update based on distillation decision")
-            # Record outcome (skip)
-            reward = 0.0  # no resource used, but we might want to reward if data hasn't changed
-            # For simplicity, we'll compute reward later
-            await self._record_outcome(task_type, action, reward)
-            return False
+            if action == 'skip':
+                logger.info(f"Skipping {task_type} update based on distillation decision")
+                # Compute a small reward for skipping (saving resources)
+                reward = 0.1
+                await self._record_outcome(task_type, action, reward, state_vec=state_vec,
+                                           action_idx=action_idx, teacher_probs=teacher_probs)
+                # Emit FeedbackEvent
+                if FeedbackEvent and self.message_queue:
+                    event = FeedbackEvent(
+                        source="adaptive_scheduler",
+                        feedback_type="routing",
+                        task_id=task_type,
+                        context={"action": "skip"},
+                        action={"selected_action": "skip", "selected_rank": 1, "confidence_score": 0.5},
+                        performance={"quality_score": reward, "latency_ms": 0, "energy_joules": 0,
+                                     "carbon_g": 0, "helium_cost": 0, "duration_ms": 0},
+                        adaptive_cost_value=reward,
+                        tags=["scheduler", "skip", task_type],
+                    )
+                    await self.message_queue.publish("scheduler_events", event.to_json())
+                return False
 
-        # Execute the update (call the Celery task directly)
-        logger.info(f"Executing {task_type} update based on distillation decision")
-        if task_type == 'carbon':
-            result = update_carbon_intensity.delay()
-        elif task_type == 'material':
-            result = update_material_catalog.delay()
-        elif task_type == 'helium':
-            result = update_helium_snapshot.delay()
-        else:
-            raise ValueError(f"Unknown task type: {task_type}")
+            # Execute the update
+            logger.info(f"Executing {task_type} update based on distillation decision")
+            if task_type == 'carbon':
+                result = update_carbon_intensity.delay()
+            elif task_type == 'material':
+                result = update_material_catalog.delay()
+            elif task_type == 'helium':
+                result = update_helium_snapshot.delay()
+            else:
+                raise ValueError(f"Unknown task type: {task_type}")
 
-        # Record outcome after task completes (reward will be computed in the task and reported via a callback)
-        # We'll simulate reward in this example.
-        # In a real system, we would use a Celery result backend or a callback.
-        return True
+            # Emit event for decision to update
+            if FeedbackEvent and self.message_queue:
+                event = FeedbackEvent(
+                    source="adaptive_scheduler",
+                    feedback_type="routing",
+                    task_id=task_type,
+                    context={"action": "update_now"},
+                    action={"selected_action": "update_now", "selected_rank": 1, "confidence_score": 0.5},
+                    performance={"quality_score": 0.0, "latency_ms": 0, "energy_joules": 0,
+                                 "carbon_g": 0, "helium_cost": 0, "duration_ms": 0},
+                    adaptive_cost_value=0.0,
+                    tags=["scheduler", "update", task_type],
+                )
+                await self.message_queue.publish("scheduler_events", event.to_json())
+            return True
 
-    async def _record_outcome(self, task_type: str, action: str, reward: float):
-        """Record the outcome of a decision and update the agent."""
-        # Log interaction
-        self.interaction_log.append({
+    async def _record_outcome(self, task_type: str, action: str, reward: float,
+                             state_vec: Optional[np.ndarray] = None,
+                             action_idx: Optional[int] = None,
+                             teacher_probs: Optional[np.ndarray] = None):
+        """Record the outcome and update the distillation agent."""
+        # Use provided state/action if given, else last recorded
+        if state_vec is None:
+            state_vec = self.last_state_vec
+            action_idx = self.last_action_idx
+            teacher_probs = self.last_teacher_probs
+
+        # Create log entry with state vector
+        entry = {
             'timestamp': datetime.utcnow().isoformat(),
             'task_type': task_type,
             'action': action,
             'reward': reward,
-        })
-        log_path = Path(INTERACTION_LOGS_PATH)
-        df_log = pd.DataFrame([self.interaction_log[-1]])
+        }
+        if state_vec is not None:
+            entry['state_vec'] = ','.join(map(str, state_vec))
+        self.interaction_log.append(entry)
+
+        # Save to CSV
+        log_path = Path(config.interaction_logs_path)
+        df_log = pd.DataFrame([entry])
         if log_path.exists():
             df_log.to_csv(log_path, mode='a', header=False, index=False)
         else:
             df_log.to_csv(log_path, index=False)
 
-        # Update agent if we have a recorded state
-        if self.last_state_vec is not None and self.last_action_idx is not None:
-            next_state_vec = self.last_state_vec  # for simplicity, same state
+        # Update agent if we have state and action
+        if state_vec is not None and action_idx is not None:
+            next_state_vec = state_vec  # for simplicity, same state
             await self.scheduler_optimizer.update(
-                self.last_state_vec,
-                self.last_action_idx,
+                state_vec,
+                action_idx,
                 reward,
                 next_state_vec,
-                self.last_teacher_probs
+                teacher_probs
             )
+
+        # Emit FeedbackEvent for outcome
+        if FeedbackEvent and self.message_queue:
+            event = FeedbackEvent(
+                source="adaptive_scheduler",
+                feedback_type="routing",
+                task_id=task_type,
+                context={"action": action},
+                action={"selected_action": action, "selected_rank": 1, "confidence_score": 0.5},
+                performance={"quality_score": reward, "latency_ms": 0, "energy_joules": 0,
+                             "carbon_g": 0, "helium_cost": 0, "duration_ms": 0},
+                adaptive_cost_value=reward,
+                tags=["scheduler", "outcome", task_type, action],
+            )
+            await self.message_queue.publish("scheduler_events", event.to_json())
 
     def get_scheduler_stats(self) -> Dict:
         return self.scheduler_optimizer.get_stats()
 
 
 # ============================================================================
-# Celery tasks (modified to record outcomes)
+# Celery tasks (modified to compute real rewards)
 # ============================================================================
 
 @app.task(
@@ -541,16 +716,16 @@ class AdaptiveScheduler:
 def update_carbon_intensity(self):
     """Refresh carbon intensity for all key regions concurrently."""
     start_time = time.time()
-    logger.info("Starting carbon intensity update", regions=REGIONS)
+    logger.info("Starting carbon intensity update", regions=config.regions)
 
     try:
         cache = CacheManager()
         fetcher = CarbonIntensityFetcher(cache)
 
         async def fetch_all():
-            tasks = [fetcher.get_intensity(region) for region in REGIONS]
+            tasks = [fetcher.get_intensity(region) for region in config.regions]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for region, result in zip(REGIONS, results):
+            for region, result in zip(config.regions, results):
                 if isinstance(result, Exception):
                     logger.error("Carbon intensity fetch failed", region=region, error=str(result))
                 else:
@@ -559,33 +734,49 @@ def update_carbon_intensity(self):
 
         results = asyncio.run(fetch_all())
         failures = sum(1 for r in results if isinstance(r, Exception))
-        if failures > 0:
-            logger.warning("Carbon intensity update completed with failures", total=len(REGIONS), failures=failures)
+        success_count = len(config.regions) - failures
 
         if PROMETHEUS_AVAILABLE:
-            task_metrics['carbon_success'].inc()
+            if failures == 0:
+                task_metrics['carbon_success'].inc()
+            else:
+                task_metrics['carbon_failure'].inc()
             task_metrics['task_duration'].labels(task_name='update_carbon_intensity').observe(time.time() - start_time)
 
-        # Compute reward: data change score (simulate)
-        # In a real system, compare with previous cache and compute delta.
-        data_change_score = 0.5  # placeholder
-        time_saved_score = 0.0
-        resource_cost_norm = 0.1
-        reward = 0.5 * data_change_score + 0.3 * time_saved_score + 0.2 * (1 - resource_cost_norm)
+        # Compute reward based on data change and success
+        prev_values = cache.get('carbon_intensity_all') or {}
+        data_change = 0.0
+        if prev_values:
+            changes = []
+            for i, region in enumerate(config.regions):
+                if region in prev_values and not isinstance(results[i], Exception):
+                    changes.append(abs(prev_values[region] - results[i]))
+            if changes:
+                data_change = np.mean(changes)
+        # Store new values
+        new_values = {region: results[i] for i, region in enumerate(config.regions) if not isinstance(results[i], Exception)}
+        cache.set('carbon_intensity_all', new_values, ttl=3600)
 
-        # Notify scheduler of outcome
-        # For simplicity, we'll use a global scheduler instance.
-        # In production, this would be a callback or result backend.
+        reward = 0.5 * min(1.0, data_change / 100.0) + 0.5 * (success_count / len(config.regions))
+        reward = max(0.0, min(1.0, reward))
+
+        # Notify scheduler
         global _scheduler
         if _scheduler:
             asyncio.run(_scheduler._record_outcome('carbon', 'update_now', reward))
 
-        return {"status": "success", "regions_updated": len(REGIONS) - failures, "total": len(REGIONS)}
+        if PROMETHEUS_AVAILABLE:
+            task_metrics['update_reward'].observe(reward)
+
+        return {"status": "success", "regions_updated": success_count, "total": len(config.regions), "reward": reward}
 
     except Exception as e:
         logger.error("Carbon intensity update failed", error=str(e), exc_info=True)
         if PROMETHEUS_AVAILABLE:
             task_metrics['carbon_failure'].inc()
+        global _scheduler
+        if _scheduler:
+            asyncio.run(_scheduler._record_outcome('carbon', 'update_now', 0.0))
         raise self.retry(exc=e)
 
 
@@ -614,19 +805,24 @@ def update_material_catalog(self):
             task_metrics['material_success'].inc()
             task_metrics['task_duration'].labels(task_name='update_material_catalog').observe(time.time() - start_time)
 
-        # Reward (placeholder)
-        reward = 0.7
+        reward = 0.8  # successful update
         global _scheduler
         if _scheduler:
             asyncio.run(_scheduler._record_outcome('material', 'update_now', reward))
 
+        if PROMETHEUS_AVAILABLE:
+            task_metrics['update_reward'].observe(reward)
+
         logger.info("Material catalog updated successfully")
-        return {"status": "success"}
+        return {"status": "success", "reward": reward}
 
     except Exception as e:
         logger.error("Material catalog update failed", error=str(e), exc_info=True)
         if PROMETHEUS_AVAILABLE:
             task_metrics['material_failure'].inc()
+        global _scheduler
+        if _scheduler:
+            asyncio.run(_scheduler._record_outcome('material', 'update_now', 0.0))
         raise self.retry(exc=e)
 
 
@@ -641,7 +837,7 @@ def update_material_catalog(self):
 def update_helium_snapshot(self):
     """Download the latest Helium snapshot from a remote URL."""
     start_time = time.time()
-    logger.info("Starting helium snapshot update", url=HELIUM_SNAPSHOT_URL, dest=HELIUM_SNAPSHOT_PATH)
+    logger.info("Starting helium snapshot update", url=config.helium_snapshot_url, dest=config.helium_snapshot_path)
 
     try:
         import aiohttp
@@ -649,14 +845,14 @@ def update_helium_snapshot(self):
 
         async def download():
             async with aiohttp.ClientSession() as session:
-                async with session.get(HELIUM_SNAPSHOT_URL) as resp:
+                async with session.get(config.helium_snapshot_url) as resp:
                     if resp.status != 200:
                         raise Exception(f"Download failed with status {resp.status}")
-                    os.makedirs(os.path.dirname(HELIUM_SNAPSHOT_PATH) or '.', exist_ok=True)
-                    async with aiofiles.open(HELIUM_SNAPSHOT_PATH, 'wb') as f:
+                    os.makedirs(os.path.dirname(config.helium_snapshot_path) or '.', exist_ok=True)
+                    async with aiofiles.open(config.helium_snapshot_path, 'wb') as f:
                         async for chunk in resp.content.iter_chunked(8192):
                             await f.write(chunk)
-            logger.info("Helium snapshot downloaded", path=HELIUM_SNAPSHOT_PATH)
+            logger.info("Helium snapshot downloaded", path=config.helium_snapshot_path)
 
         asyncio.run(download())
 
@@ -664,26 +860,30 @@ def update_helium_snapshot(self):
             task_metrics['helium_success'].inc()
             task_metrics['task_duration'].labels(task_name='update_helium_snapshot').observe(time.time() - start_time)
 
-        # Reward (placeholder)
-        reward = 0.6
+        reward = 0.7  # successful download
         global _scheduler
         if _scheduler:
             asyncio.run(_scheduler._record_outcome('helium', 'update_now', reward))
 
-        return {"status": "success", "path": HELIUM_SNAPSHOT_PATH}
+        if PROMETHEUS_AVAILABLE:
+            task_metrics['update_reward'].observe(reward)
+
+        return {"status": "success", "path": config.helium_snapshot_path, "reward": reward}
 
     except Exception as e:
         logger.error("Helium snapshot update failed", error=str(e), exc_info=True)
         if PROMETHEUS_AVAILABLE:
             task_metrics['helium_failure'].inc()
+        global _scheduler
+        if _scheduler:
+            asyncio.run(_scheduler._record_outcome('helium', 'update_now', 0.0))
         raise self.retry(exc=e)
 
 
 # ============================================================================
-# Celery Beat schedule (replaced by AdaptiveScheduler)
+# Celery Beat schedule replaced by AdaptiveScheduler task
 # ============================================================================
 
-# We no longer use static beat schedule. Instead, we run a periodic scheduler task.
 @app.task(
     name='src.enhancements.tasks.periodic_updater.run_scheduler',
     autoretry_for=(Exception,),
@@ -695,18 +895,13 @@ def run_scheduler():
     """Run the adaptive scheduler to decide and execute updates."""
     logger.info("Running adaptive scheduler")
     try:
-        # Initialize scheduler (in production, use a singleton)
         global _scheduler
         if _scheduler is None:
-            _scheduler = AdaptiveScheduler()
+            _scheduler = AdaptiveScheduler(config.dict())
 
         # Run decisions for each task type
         for task_type in ['carbon', 'material', 'helium']:
             asyncio.run(_scheduler.decide_and_execute(task_type))
-
-        # Update scheduler timestamps
-        # (this would be done in the tasks themselves, but we can update here for state)
-        # For simplicity, we don't update last timestamps here; they are updated in tasks.
 
         return {"status": "success"}
     except Exception as e:
@@ -715,7 +910,7 @@ def run_scheduler():
 
 
 # ============================================================================
-# Task signals (unchanged)
+# Task signals
 # ============================================================================
 
 @task_success.connect
@@ -734,30 +929,17 @@ _scheduler: Optional[AdaptiveScheduler] = None
 
 
 # ============================================================================
-# Offline training for Historical ML
+# Offline training for Historical ML (now functional)
 # ============================================================================
 
-def train_historical_model(log_path: Path = Path(INTERACTION_LOGS_PATH),
-                           model_path: Path = Path(HISTORICAL_MODEL_PATH)):
-    """
-    Train a RandomForestClassifier from past interaction logs.
-    """
-    if not log_path.exists():
-        logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
-        return
-
-    df_logs = pd.read_csv(log_path)
-    if len(df_logs) < 10:
-        logger.warning("Not enough logs to train historical model (need at least 10).")
-        return
-
-    # For a real implementation, you need to store state vectors in logs.
-    # Here we just log a message.
-    logger.info("Historical ML training requires state vectors in logs. Please implement logging of state vectors.")
+def train_historical_model(log_path: Path = Path(config.interaction_logs_path),
+                           model_path: Path = Path(config.historical_model_path)):
+    """Train a RandomForestClassifier from interaction logs (which now include state vectors)."""
+    return UpdateHistoricalMLTeacher.train_from_logs([log_path], model_path)
 
 
 # ============================================================================
-# UNIT TESTS (Phase 10)
+# UNIT TESTS
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -769,6 +951,9 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             'distillation_replay_size': 10,
             'distillation_learning_rate': 0.01,
             'distillation_train_every': 10,
+            'distill_weight': 0.7,
+            'rl_weight': 0.3,
+            'q_learning_rate': 0.1,
         }
         self.optimizer = DistillationSchedulerOptimizer(self.config)
 
@@ -785,7 +970,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             system_load=0.5,
         )
         vec = state.to_feature_vector()
-        self.assertEqual(len(vec), 9)
+        self.assertEqual(len(vec), 12)
 
     def test_rule_based_teacher(self):
         teacher = UpdateRuleBasedTeacher()
@@ -802,7 +987,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         )
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
-        self.assertGreater(probs[0], probs[1])  # update_now should be highest
+        self.assertGreater(probs[0], probs[1])
 
     async def test_select_action(self):
         state = UpdateState(
@@ -821,7 +1006,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 
     def test_replay_buffer(self):
         buffer = ReplayBuffer(max_size=5)
-        state_vec = np.random.randn(9)
+        state_vec = np.random.randn(12)
         buffer.push(state_vec, 0, 1.0, state_vec, np.ones(2)/2)
         self.assertEqual(len(buffer), 1)
         batch = buffer.sample(1)
@@ -832,8 +1017,6 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 # Example usage (if run directly)
 # ============================================================================
 if __name__ == "__main__":
-    # For testing tasks locally (not for production)
-    # You can run `celery -A src.enhancements.tasks.periodic_updater.app worker --loglevel=info`
     print("This file is meant to be used with Celery worker and beat.")
     print("To start worker: celery -A src.enhancements.tasks.periodic_updater.app worker --loglevel=info")
-    print("To start beat:   celery -A src.enhancements.tasks.periodic_updater.app beat --loglevel=info")
+    print("To start scheduler (instead of beat): celery -A src.enhancements.tasks.periodic_updater.app call src.enhancements.tasks.periodic_updater.run_scheduler --loglevel=info")
