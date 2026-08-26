@@ -13,6 +13,7 @@
 # - Async file I/O with aiofiles
 # - Removal of stub components (DeFi, Carbon, Chaos, etc.)
 # - Improved error handling with tenacity retries
+# - Multi‑Objective Pareto Decision (MOPD) with NSGA‑II
 # =============================================================================
 
 import asyncio
@@ -276,6 +277,26 @@ if PYDANTIC_AVAILABLE:
         rate_limit_max_requests: int = 100
         rate_limit_window: int = 60
 
+    # [ENHANCEMENT] MOPD Configuration
+    class MOPDConfig(BaseModel):
+        enabled: bool = Field(True, description="Enable multi‑objective optimization")
+        objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                'energy_output': 0.4,
+                'pigment_health': 0.3,
+                'longterm_efficiency': 0.2,
+                'resource_usage': 0.1,
+            },
+            description="Weights for scalarising Pareto front (must sum to 1)"
+        )
+        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused)")
+
+        @validator('objective_weights')
+        def check_weights(cls, v):
+            if abs(sum(v.values()) - 1.0) > 1e-6:
+                raise ValueError("objective_weights must sum to 1")
+            return v
+
     class HarvesterConfig(BaseModel):
         harvester_id: str = Field("primary", description="Unique harvester identifier")
         latitude: float = Field(0.0, ge=-90, le=90, description="Latitude for circadian model")
@@ -294,6 +315,7 @@ if PYDANTIC_AVAILABLE:
         websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
         persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
         security: SecurityConfig = Field(default_factory=SecurityConfig)
+        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
 
         class Config:
             env_prefix = "HARVESTER_"
@@ -424,6 +446,17 @@ else:
         rate_limit_window: int = 60
 
     @dataclass
+    class MOPDConfig:
+        enabled: bool = True
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            'energy_output': 0.4,
+            'pigment_health': 0.3,
+            'longterm_efficiency': 0.2,
+            'resource_usage': 0.1,
+        })
+        grid_resolution: int = 5
+
+    @dataclass
     class HarvesterConfig:
         harvester_id: str = "primary"
         latitude: float = 0.0
@@ -441,6 +474,7 @@ else:
         websocket: WebSocketConfig = field(default_factory=WebSocketConfig)
         persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
         security: SecurityConfig = field(default_factory=SecurityConfig)
+        mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
 # =============================================================================
 # [ENHANCEMENT] Interface Definitions (Dependency Inversion)
@@ -490,7 +524,7 @@ class ISwarmCoordinator(Protocol):
     async def stop(self): ...
 
 # =============================================================================
-# Enums and Data Classes (unchanged)
+# Enums and Data Classes
 # =============================================================================
 class PigmentState(Enum):
     ACTIVE = "active"
@@ -1040,8 +1074,24 @@ class RLController(IRLController):
         # Tasks are managed centrally; no need to cancel here.
 
 # =============================================================================
-# [ENHANCEMENT] Genetic Optimizer (unchanged but uses config.genetic)
+# [ENHANCEMENT] Multi‑Objective Genetic Optimizer (NSGA‑II)
 # =============================================================================
+@dataclass
+class MOPDPoint:
+    individual: Dict[str, Any]
+    energy_output: float
+    pigment_health: float
+    longterm_efficiency: float
+    resource_usage: float
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
+        return cls(**data)
+
 class HarvesterGeneticOptimizer:
     def __init__(self, harvester: 'EnhancedPhotosyntheticHarvester', config: HarvesterConfig):
         self.harvester = harvester
@@ -1061,8 +1111,14 @@ class HarvesterGeneticOptimizer:
             'repair_rates': (0.005, 0.05)
         }
         self.recent_data = deque(maxlen=config.genetic.simulation_cycles * 2)
-        logger.info("HarvesterGeneticOptimizer initialized")
+        # MOPD attributes
+        self.pareto_front: List[MOPDPoint] = []
+        self._eval_cache: Dict[Tuple[Any, ...], Dict[str, float]] = {}
+        logger.info("HarvesterGeneticOptimizer initialized (NSGA-II)")
 
+    # ----------------------------------------------------------------------
+    # Initialization
+    # ----------------------------------------------------------------------
     def _initialize_individual(self) -> Dict:
         ind = {'conversion_factors': {}, 'sensitivity_multipliers': {}, 'repair_rates': {}}
         for p in self.harvester.pigments.pigments.keys():
@@ -1074,107 +1130,392 @@ class HarvesterGeneticOptimizer:
     def _initialize_population(self) -> List[Dict]:
         return [self._initialize_individual() for _ in range(self.population_size)]
 
-    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
-        child = {'conversion_factors': {}, 'sensitivity_multipliers': {}, 'repair_rates': {}}
-        pigments = self.harvester.pigments.pigments.keys()
-        for p in pigments:
-            if random.random() < 0.5:
-                child['conversion_factors'][p] = p1['conversion_factors'][p]
-                child['sensitivity_multipliers'][p] = p1['sensitivity_multipliers'][p]
-                child['repair_rates'][p] = p1['repair_rates'][p]
-            else:
-                child['conversion_factors'][p] = p2['conversion_factors'][p]
-                child['sensitivity_multipliers'][p] = p2['sensitivity_multipliers'][p]
-                child['repair_rates'][p] = p2['repair_rates'][p]
-            if random.random() < 0.3:
-                child['conversion_factors'][p] = (p1['conversion_factors'][p] + p2['conversion_factors'][p]) / 2
-                child['sensitivity_multipliers'][p] = (p1['sensitivity_multipliers'][p] + p2['sensitivity_multipliers'][p]) / 2
-                child['repair_rates'][p] = (p1['repair_rates'][p] + p2['repair_rates'][p]) / 2
-        return child
+    # ----------------------------------------------------------------------
+    # Cache key
+    # ----------------------------------------------------------------------
+    def _individual_to_cache_key(self, individual: Dict) -> Tuple[Any, ...]:
+        conv = tuple(sorted(individual['conversion_factors'].items()))
+        sens = tuple(sorted(individual['sensitivity_multipliers'].items()))
+        rep = tuple(sorted(individual['repair_rates'].items()))
+        return (conv, sens, rep)
 
-    def _mutate(self, individual: Dict) -> Dict:
-        mutated = {'conversion_factors': {}, 'sensitivity_multipliers': {}, 'repair_rates': {}}
-        pigments = self.harvester.pigments.pigments.keys()
-        for p in pigments:
-            mutated['conversion_factors'][p] = individual['conversion_factors'][p]
-            mutated['sensitivity_multipliers'][p] = individual['sensitivity_multipliers'][p]
-            mutated['repair_rates'][p] = individual['repair_rates'][p]
-            if random.random() < self.mutation_rate:
-                delta = random.uniform(-0.01, 0.01)
-                mutated['conversion_factors'][p] = max(0.001, min(0.1, mutated['conversion_factors'][p] + delta))
-            if random.random() < self.mutation_rate:
-                delta = random.uniform(-0.1, 0.1)
-                mutated['sensitivity_multipliers'][p] = max(0.5, min(2.0, mutated['sensitivity_multipliers'][p] + delta))
-            if random.random() < self.mutation_rate:
-                delta = random.uniform(-0.002, 0.002)
-                mutated['repair_rates'][p] = max(0.005, min(0.05, mutated['repair_rates'][p] + delta))
-        return mutated
+    # ----------------------------------------------------------------------
+    # Multi-objective evaluation
+    # ----------------------------------------------------------------------
+    async def _evaluate_individual_mo(self, individual: Dict) -> Dict[str, float]:
+        key = self._individual_to_cache_key(individual)
+        if key in self._eval_cache:
+            return self._eval_cache[key]
 
-    def _tournament_select(self, population: List[Dict], fitness_scores: List[float]) -> Dict:
-        tournament = random.sample(range(len(population)), self.tournament_size)
-        best_idx = max(tournament, key=lambda i: fitness_scores[i])
-        return population[best_idx]
-
-    async def _evaluate_individual_simulation(self, individual: Dict) -> float:
         if not self.recent_data:
-            return 0.0
-        total_score = 0.0
-        cycles = 0
-        for env_data in self.recent_data:
-            excitations = []
-            for pigment_name, pigment in self.harvester.pigments.pigments.items():
-                target_key = pigment['target']
-                raw = env_data.get(target_key, 0.0)
-                sensitivity = pigment['base_sensitivity'] * individual['sensitivity_multipliers'][pigment_name]
-                conversion = individual['conversion_factors'][pigment_name]
-                excitation = raw * sensitivity
-                excitation = np.clip(excitation, 0, 1.0)
-                excitations.append(excitation * conversion)
-            total_excitation = sum(excitations)
-            efficiency = 0.85 * (1 - 0.01 * total_excitation)
-            health = 1.0
-            for pigment_name in self.harvester.pigments.pigments:
-                repair = individual['repair_rates'][pigment_name]
-                health *= (0.9 + repair * 10)
-            health = min(1.0, health)
-            cycle_score = total_excitation * efficiency * health
-            total_score += cycle_score
-            cycles += 1
-        avg_score = total_score / cycles if cycles > 0 else 0.0
-        return avg_score
+            objectives = {
+                'energy_output': 0.0,
+                'pigment_health': 1.0,
+                'longterm_efficiency': 0.0,
+                'resource_usage': 0.0
+            }
+        else:
+            total_energy = 0.0
+            total_damage = 0.0
+            total_efficiency = 0.0
+            total_repair_cost = 0.0
+            cycles = 0
+            for env_data in self.recent_data:
+                total_excitation = 0.0
+                for pigment_name, pigment in self.harvester.pigments.pigments.items():
+                    target_key = pigment['target']
+                    raw = env_data.get(target_key, 0.0)
+                    sensitivity = pigment['base_sensitivity'] * individual['sensitivity_multipliers'][pigment_name]
+                    conversion = individual['conversion_factors'][pigment_name]
+                    excitation = raw * sensitivity
+                    excitation = np.clip(excitation, 0, 1.0)
+                    converted = excitation * conversion
+                    total_excitation += converted
 
+                efficiency = 0.85 * (1 - 0.01 * total_excitation)
+                damage = 0.001 * total_excitation
+                repair_cost = sum(individual['repair_rates'].values()) * 0.01
+                health = 1.0 - damage + repair_cost * 0.5
+                health = np.clip(health, 0.0, 1.0)
+
+                total_energy += total_excitation * efficiency * health
+                total_damage += damage
+                total_efficiency += efficiency
+                total_repair_cost += repair_cost
+                cycles += 1
+
+            avg_energy = total_energy / cycles if cycles > 0 else 0.0
+            avg_damage = total_damage / cycles if cycles > 0 else 0.0
+            avg_efficiency = total_efficiency / cycles if cycles > 0 else 0.0
+            avg_repair_cost = total_repair_cost / cycles if cycles > 0 else 0.0
+
+            objectives = {
+                'energy_output': avg_energy,
+                'pigment_health': 1.0 - avg_damage,
+                'longterm_efficiency': avg_efficiency,
+                'resource_usage': 1.0 - avg_repair_cost
+            }
+
+        self._eval_cache[key] = objectives
+        return objectives
+
+    # ----------------------------------------------------------------------
+    # NSGA-II core methods
+    # ----------------------------------------------------------------------
+    def _fast_non_dominated_sort(self, population: List[Dict], objectives: Dict[Tuple[Any, ...], Dict[str, float]]) -> List[List[Dict]]:
+        fronts = []
+        domination_count = {k: 0 for k in objectives}
+        dominated_solutions = {k: [] for k in objectives}
+
+        for p_key, p_obj in objectives.items():
+            for q_key, q_obj in objectives.items():
+                if p_key == q_key:
+                    continue
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[p_key].append(q_key)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[p_key] += 1
+
+            if domination_count[p_key] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p_key)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p_key in fronts[i]:
+                for q_key in dominated_solutions[p_key]:
+                    domination_count[q_key] -= 1
+                    if domination_count[q_key] == 0:
+                        next_front.append(q_key)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+
+        key_to_ind = {self._individual_to_cache_key(ind): ind for ind in population}
+        return [[key_to_ind[key] for key in front] for front in fronts]
+
+    def _crowding_distance(self, front: List[Dict], objectives: Dict[Tuple[Any, ...], Dict[str, float]]) -> Dict[Tuple[Any, ...], float]:
+        if not front:
+            return {}
+        distances = {self._individual_to_cache_key(ind): 0.0 for ind in front}
+        obj_keys = list(next(iter(objectives.values())).keys())
+        for obj in obj_keys:
+            sorted_front = sorted(front, key=lambda ind: objectives[self._individual_to_cache_key(ind)][obj])
+            distances[self._individual_to_cache_key(sorted_front[0])] = float('inf')
+            distances[self._individual_to_cache_key(sorted_front[-1])] = float('inf')
+            obj_min = objectives[self._individual_to_cache_key(sorted_front[0])][obj]
+            obj_max = objectives[self._individual_to_cache_key(sorted_front[-1])][obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                key = self._individual_to_cache_key(sorted_front[i])
+                prev_key = self._individual_to_cache_key(sorted_front[i-1])
+                next_key = self._individual_to_cache_key(sorted_front[i+1])
+                distances[key] += (objectives[next_key][obj] - objectives[prev_key][obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[Dict]], crowding: Dict[Tuple[Any, ...], float]) -> Dict:
+        ind1 = random.choice(population)
+        ind2 = random.choice(population)
+        rank1 = self._get_rank(ind1, fronts)
+        rank2 = self._get_rank(ind2, fronts)
+        if rank1 < rank2:
+            return ind1
+        elif rank2 < rank1:
+            return ind2
+        else:
+            key1 = self._individual_to_cache_key(ind1)
+            key2 = self._individual_to_cache_key(ind2)
+            if crowding.get(key1, 0) > crowding.get(key2, 0):
+                return ind1
+            else:
+                return ind2
+
+    def _get_rank(self, individual: Dict, fronts: List[List[Dict]]) -> int:
+        for i, front in enumerate(fronts):
+            if individual in front:
+                return i
+        return len(fronts)
+
+    def _sbx_crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
+        child1, child2 = {}, {}
+        # conversion_factors
+        child1['conversion_factors'] = {}
+        child2['conversion_factors'] = {}
+        for p in parent1['conversion_factors']:
+            if random.random() < 0.5:
+                low, high = self.param_bounds['conversion_factors']
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                val1 = 0.5 * ((1 + beta) * parent1['conversion_factors'][p] + (1 - beta) * parent2['conversion_factors'][p])
+                val2 = 0.5 * ((1 - beta) * parent1['conversion_factors'][p] + (1 + beta) * parent2['conversion_factors'][p])
+                child1['conversion_factors'][p] = max(low, min(high, val1))
+                child2['conversion_factors'][p] = max(low, min(high, val2))
+            else:
+                child1['conversion_factors'][p] = parent1['conversion_factors'][p]
+                child2['conversion_factors'][p] = parent2['conversion_factors'][p]
+
+        for group, bounds in [('sensitivity_multipliers', self.param_bounds['sensitivity_multipliers']),
+                              ('repair_rates', self.param_bounds['repair_rates'])]:
+            child1[group] = {}
+            child2[group] = {}
+            for p in parent1[group]:
+                if random.random() < 0.5:
+                    low, high = bounds
+                    u = random.random()
+                    if u <= 0.5:
+                        beta = (2 * u) ** (1 / (20 + 1))
+                    else:
+                        beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                    val1 = 0.5 * ((1 + beta) * parent1[group][p] + (1 - beta) * parent2[group][p])
+                    val2 = 0.5 * ((1 - beta) * parent1[group][p] + (1 + beta) * parent2[group][p])
+                    child1[group][p] = max(low, min(high, val1))
+                    child2[group][p] = max(low, min(high, val2))
+                else:
+                    child1[group][p] = parent1[group][p]
+                    child2[group][p] = parent2[group][p]
+
+        return child1, child2
+
+    def _polynomial_mutation(self, individual: Dict) -> Dict:
+        mutant = {}
+        for group, bounds in [('conversion_factors', self.param_bounds['conversion_factors']),
+                              ('sensitivity_multipliers', self.param_bounds['sensitivity_multipliers']),
+                              ('repair_rates', self.param_bounds['repair_rates'])]:
+            mutant[group] = {}
+            for p, val in individual[group].items():
+                if random.random() < self.mutation_rate:
+                    low, high = bounds
+                    u = random.random()
+                    if u < 0.5:
+                        delta = (2 * u) ** (1 / (20 + 1)) - 1
+                    else:
+                        delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                    new_val = val + delta * (high - low)
+                    mutant[group][p] = max(low, min(high, new_val))
+                else:
+                    mutant[group][p] = val
+        return mutant
+
+    # ----------------------------------------------------------------------
+    # Dynamic objective weighting
+    # ----------------------------------------------------------------------
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.config.mopd.objective_weights.copy()
+        # Example: if pigment health is low, increase its weight
+        health_summary = self.harvester.pigments.get_health_summary()
+        avg_health = np.mean([h.get('efficiency', 1.0) for h in health_summary.values()]) if health_summary else 1.0
+        if avg_health < 0.5:
+            weights['pigment_health'] = min(0.6, weights['pigment_health'] * 1.5)
+        # Normalize
+        total = sum(weights.values())
+        return {k: v / total for k, v in weights.items()}
+
+    # ----------------------------------------------------------------------
+    # Main evolve (NSGA-II)
+    # ----------------------------------------------------------------------
     async def evolve(self, generations: Optional[int] = None) -> Dict:
         async with self._lock:
             if generations is None:
                 generations = self.generations
+
             population = self._initialize_population()
-            best_fitness = -float('inf')
-            best_ind = None
+            objectives = {}
+            # Evaluate initial population in parallel
+            eval_tasks = [self._evaluate_individual_mo(ind) for ind in population]
+            eval_results = await asyncio.gather(*eval_tasks)
+            for ind, objs in zip(population, eval_results):
+                objectives[self._individual_to_cache_key(ind)] = objs
+
+            self.pareto_front = []
+
             for gen in range(generations):
-                fitness_scores = await asyncio.gather(*[
-                    self._evaluate_individual_simulation(ind) for ind in population
-                ])
-                gen_best_idx = max(range(len(population)), key=lambda i: fitness_scores[i])
-                gen_best_fitness = fitness_scores[gen_best_idx]
-                if gen_best_fitness > best_fitness:
-                    best_fitness = gen_best_fitness
-                    best_ind = population[gen_best_idx].copy()
+                # Create offspring
+                offspring = []
+                pop_objectives = {k: objectives[k] for k in objectives if k in [self._individual_to_cache_key(i) for i in population]}
+                fronts = self._fast_non_dominated_sort(population, pop_objectives)
+                crowding = {}
+                for front in fronts:
+                    front_crowding = self._crowding_distance(front, pop_objectives)
+                    crowding.update(front_crowding)
+
+                while len(offspring) < self.population_size:
+                    parent1 = self._tournament_selection(population, fronts, crowding)
+                    parent2 = self._tournament_selection(population, fronts, crowding)
+                    if random.random() < self.crossover_rate:
+                        child1, child2 = self._sbx_crossover(parent1, parent2)
+                        child1 = self._polynomial_mutation(child1)
+                        child2 = self._polynomial_mutation(child2)
+                        offspring.extend([child1, child2])
+                    else:
+                        offspring.append(self._polynomial_mutation(parent1.copy()))
+                offspring = offspring[:self.population_size]
+
+                # Evaluate offspring in parallel
+                eval_tasks = [self._evaluate_individual_mo(ind) for ind in offspring]
+                eval_results = await asyncio.gather(*eval_tasks)
+                for ind, objs in zip(offspring, eval_results):
+                    objectives[self._individual_to_cache_key(ind)] = objs
+
+                # Combine parent and offspring
+                combined = population + offspring
+                unique_keys = {}
+                for ind in combined:
+                    unique_keys[self._individual_to_cache_key(ind)] = ind
+                combined = list(unique_keys.values())
+
+                combined_objectives = {self._individual_to_cache_key(ind): objectives[self._individual_to_cache_key(ind)] for ind in combined}
+                fronts = self._fast_non_dominated_sort(combined, combined_objectives)
+
+                # Environmental selection
                 new_population = []
-                for _ in range(self.population_size):
-                    parent1 = self._tournament_select(population, fitness_scores)
-                    parent2 = self._tournament_select(population, fitness_scores)
-                    child = self._crossover(parent1, parent2)
-                    child = self._mutate(child)
-                    new_population.append(child)
+                for front in fronts:
+                    if len(new_population) + len(front) <= self.population_size:
+                        new_population.extend(front)
+                    else:
+                        crowding = self._crowding_distance(front, combined_objectives)
+                        sorted_front = sorted(front, key=lambda ind: crowding.get(self._individual_to_cache_key(ind), 0), reverse=True)
+                        remaining = self.population_size - len(new_population)
+                        new_population.extend(sorted_front[:remaining])
+                        break
                 population = new_population
-                logger.debug(f"Gen {gen+1}: best fitness = {gen_best_fitness:.4f}")
-            if best_fitness > self.best_fitness:
-                self.best_fitness = best_fitness
+
+                # Update Pareto front (first front)
+                pop_objectives = {self._individual_to_cache_key(ind): objectives[self._individual_to_cache_key(ind)] for ind in population}
+                fronts_pop = self._fast_non_dominated_sort(population, pop_objectives)
+                if fronts_pop:
+                    pareto_individuals = fronts_pop[0]
+                    self.pareto_front = []
+                    for ind in pareto_individuals:
+                        objs = pop_objectives[self._individual_to_cache_key(ind)]
+                        self.pareto_front.append(MOPDPoint(
+                            individual=ind,
+                            energy_output=objs['energy_output'],
+                            pigment_health=objs['pigment_health'],
+                            longterm_efficiency=objs['longterm_efficiency'],
+                            resource_usage=objs['resource_usage']
+                        ))
+                logger.debug(f"Generation {gen+1}/{generations}: Pareto front size={len(self.pareto_front)}")
+
+            # Select final best using dynamic weights
+            weights = self._compute_dynamic_weights()
+            if self.config.mopd.enabled and self.pareto_front:
+                best_point = self._select_best_from_pareto(self.pareto_front, weights)
+                if best_point:
+                    self.best_individual = best_point.individual
+                    self.best_fitness = best_point.scalarised_score
+                    await self._apply_individual(best_point.individual)
+                    logger.info(f"Applied best MOPD individual with scalarised score {self.best_fitness:.4f}")
+            else:
+                # Fallback: weighted sum from population
+                pop_objectives = {self._individual_to_cache_key(ind): objectives[self._individual_to_cache_key(ind)] for ind in population}
+                best_ind = max(population, key=lambda ind: sum(weights[k] * pop_objectives[self._individual_to_cache_key(ind)][k] for k in weights))
+                best_obj = pop_objectives[self._individual_to_cache_key(best_ind)]
                 self.best_individual = best_ind
+                self.best_fitness = sum(weights[k] * best_obj[k] for k in weights)
                 await self._apply_individual(best_ind)
-                logger.info(f"Applied best individual with fitness {best_fitness:.4f}")
-            self.evolution_history.append({'timestamp': datetime.now(timezone.utc), 'best_fitness': best_fitness})
-            return {'best_fitness': best_fitness, 'best_individual': best_ind}
+                logger.info(f"Applied best individual with scalarised fitness {self.best_fitness:.4f}")
+
+            self.evolution_history.append({
+                'timestamp': datetime.now(timezone.utc),
+                'best_fitness': self.best_fitness,
+                'pareto_front_size': len(self.pareto_front) if self.config.mopd.enabled else 0,
+                'dynamic_weights': weights,
+                'generation_count': generations
+            })
+            # Persist best and Pareto front via harvester's persistence if available
+            if self.harvester.config.persistence.enabled:
+                state = {
+                    'best_individual': self.best_individual,
+                    'best_fitness': self.best_fitness,
+                    'pareto_front': [p.to_dict() for p in self.pareto_front] if self.config.mopd.enabled else []
+                }
+                await self.harvester.persistence.save_global_state('genetic_optimizer', state)
+            return {
+                'best_fitness': self.best_fitness,
+                'best_individual': self.best_individual,
+                'pareto_front': [p.to_dict() for p in self.pareto_front] if self.config.mopd.enabled else None,
+                'dynamic_weights': weights
+            }
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint], weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
+        if not pareto_front:
+            return None
+        if weights is None:
+            weights = self.config.mopd.objective_weights
+        obj_keys = list(weights.keys())
+
+        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in obj_keys}
+        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in obj_keys:
+                val = getattr(point, key)
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                score += weights.get(key, 0.0) * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            'best_fitness': self.best_fitness,
+            'best_individual': self.best_individual,
+            'evolution_history': self.evolution_history[-10:],
+            'pareto_front_size': len(self.pareto_front) if self.config.mopd.enabled else 0,
+            'cache_size': len(self._eval_cache)
+        }
 
     async def _apply_individual(self, individual: Dict):
         async with self.harvester._state_lock:
@@ -1183,10 +1524,6 @@ class HarvesterGeneticOptimizer:
                 pigments[p]['energy_conversion_factor'] = individual['conversion_factors'][p]
                 pigments[p]['sensitivity'] = individual['sensitivity_multipliers'][p] * pigments[p]['base_sensitivity']
                 self.harvester.pigments.pigment_health[p].recovery_rate = individual['repair_rates'][p]
-
-    def get_status(self) -> Dict:
-        return {'best_fitness': self.best_fitness, 'best_individual': self.best_individual,
-                'history': self.evolution_history[-10:]}
 
 # =============================================================================
 # [ENHANCEMENT] ChildHarvesterCompetition (implements ICompetition)
@@ -1573,6 +1910,16 @@ class PersistentHarvesterState(IPersistence):
         elif isinstance(self.backend, RedisBackend):
             await self.backend.delete_old_checkpoints(self.harvester_id, retention_days)
 
+    async def save_global_state(self, key: str, data: Any) -> bool:
+        full_key = f"{self.harvester_id}:{key}"
+        async with self._lock:
+            return await self.backend.save(full_key, data)
+
+    async def load_global_state(self, key: str) -> Optional[Any]:
+        full_key = f"{self.harvester_id}:{key}"
+        async with self._lock:
+            return await self.backend.load(full_key)
+
 # =============================================================================
 # [ENHANCEMENT] WebSocket Server (with TLS and rate limiting)
 # =============================================================================
@@ -1917,7 +2264,7 @@ class EnhancedPhotosyntheticHarvester:
             self._task_manager.start_task("websocket_server", self.websocket_server.start)
             self._task_manager.start_task("websocket_broadcast", self.websocket_server.broadcast_loop)
 
-        # Genetic optimizer (no interface needed, internal)
+        # Genetic optimizer (now multi-objective)
         self.genetic_optimizer = HarvesterGeneticOptimizer(self, self.config)
 
         # Child harvesters
@@ -1963,6 +2310,7 @@ class EnhancedPhotosyntheticHarvester:
             'pigment_damage': Gauge('harvester_pigment_damage', 'Damage per pigment', ['pigment']),
             'children_count': Gauge('harvester_children_count', 'Number of children'),
             'genetic_fitness': Gauge('harvester_genetic_fitness', 'Best genetic fitness'),
+            'pareto_front_size': Gauge('harvester_pareto_front_size', 'Pareto front size'),
         }
         start_http_server(8000)  # default port, configurable
 
@@ -1985,7 +2333,15 @@ class EnhancedPhotosyntheticHarvester:
                 if self.harvest_cycles > 50:
                     logger.info("Starting genetic evolution...")
                     result = await self.genetic_optimizer.evolve(generations=self.config.genetic.generations)
-                    logger.info("Evolution complete", fitness=result['best_fitness'])
+                    if self.config.mopd.enabled:
+                        logger.info("Evolution complete", 
+                                    best_fitness=result['best_fitness'],
+                                    pareto_front_size=len(result.get('pareto_front', [])),
+                                    dynamic_weights=result.get('dynamic_weights', {}))
+                    else:
+                        logger.info("Evolution complete", best_fitness=result['best_fitness'])
+                    if self.config.enable_prometheus:
+                        self.metrics['pareto_front_size'].set(len(result.get('pareto_front', [])))
                 await asyncio.sleep(self.config.genetic.evolution_interval)
             except asyncio.CancelledError:
                 break
@@ -2190,6 +2546,8 @@ class EnhancedPhotosyntheticHarvester:
                     self.metrics['pigment_damage'].labels(pigment=pigment).set(h.damage_accumulation)
                 self.metrics['children_count'].set(len(self.child_harvesters))
                 self.metrics['genetic_fitness'].set(self.genetic_optimizer.best_fitness)
+                if self.config.mopd.enabled:
+                    self.metrics['pareto_front_size'].set(len(self.genetic_optimizer.pareto_front))
 
             result = {
                 'harvester_id': self.harvester_id,
@@ -2240,7 +2598,9 @@ class EnhancedPhotosyntheticHarvester:
                 'competition': self.competition_engine.get_stats() if self.competition_engine else {},
                 'children_count': len(self.child_harvesters),
                 'account_balance': self._get_balance(),
-                'health_status': self.health_monitor.get_status()
+                'health_status': self.health_monitor.get_status(),
+                'mopd_enabled': self.config.mopd.enabled,
+                'pareto_front_size': len(self.genetic_optimizer.pareto_front) if self.config.mopd.enabled else 0
             }
             if self.swarm_coordinator:
                 stats['swarm'] = await self.swarm_coordinator.get_shared_predictions()
