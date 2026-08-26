@@ -2,11 +2,12 @@
 """
 Cold Start Optimizer for Green Agent MoE System v3.4.0
 Eliminates expert warmup latency through pre-initialization and transfer learning.
-ENHANCED WITH: Multi‑Teacher On‑Policy Distillation for adaptive strategy selection.
+ENHANCED WITH: Multi‑Teacher On‑Policy Distillation and Multi‑Objective Evolutionary Optimization (NSGA‑II).
 
 Features:
 - Adaptive strategy selection (preload, transfer, progressive, hybrid, federated)
   using Multi‑Teacher On‑Policy Distillation.
+- Continuous strategy weight refinement via NSGA‑II with Pareto front and MODP selection.
 - State‑aware decisions based on expert type, urgency, carbon/helium budgets,
   latency, and historical performance.
 - Online learning from warmup outcomes.
@@ -42,6 +43,8 @@ import aiofiles
 import random
 from abc import ABC, abstractmethod
 from pathlib import Path
+import uuid
+import copy
 
 # Pydantic for configuration
 from pydantic import BaseModel, Field, field_validator, ConfigDict, ValidationError
@@ -132,13 +135,32 @@ class ColdStartConfig(BaseSettings):
     telemetry_export_interval: int = Field(60, ge=1)
     prometheus_port: Optional[int] = Field(None, ge=1024)
 
-    # NEW: Distillation parameters
+    # Distillation parameters
     distillation_epsilon: float = Field(0.1, ge=0, le=1)
     distillation_train_every: int = Field(10, ge=1)
     distillation_replay_size: int = Field(2000, ge=10)
     distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
     distill_weight: float = Field(0.7, ge=0, le=1)
     rl_weight: float = Field(0.3, ge=0, le=1)
+
+    # MOEA parameters
+    moea_enabled: bool = Field(True, description="Enable MOEA global weight optimization")
+    moea_interval_seconds: int = Field(300, ge=60, description="MOEA run interval")
+    moea_population_size: int = Field(20, ge=5)
+    moea_generations: int = Field(10, ge=1)
+    moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
+    moea_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
+    moea_tournament_size: int = Field(3, ge=2)
+    moea_objective_weights: Optional[Dict[str, float]] = Field(
+        default_factory=lambda: {
+            'latency': 0.4,
+            'carbon': 0.3,
+            'cache_hit': 0.2,
+            'sustainability': 0.1,
+        }
+    )
+    moea_dynamic_weights: bool = Field(True)
+    moea_pareto_path: str = Field("./cold_start_moea_pareto.json")
 
     # Persistence paths for distillation
     q_weights_path: str = Field("./cold_start_q_weights.json")
@@ -1377,34 +1399,28 @@ class WarmupStrategy:
 @dataclass
 class ColdStartState:
     """State for the distillation agent."""
-    # Expert characteristics
-    expert_type: str  # energy, data, iot, quantum, general
-    urgency: str  # critical, high, normal, low
+    expert_type: str
+    urgency: str
     carbon_budget: float
     helium_budget: float
     max_latency_ms: float
-    # Environment
     carbon_intensity: float
-    cache_utilization: float  # 0-1
+    cache_utilization: float
     recent_hit_rate: float
-    # Historical performance (from logs)
-    strategy_success_rates: Dict[str, float]  # preload, transfer, progressive, hybrid, federated
+    strategy_success_rates: Dict[str, float]
     avg_warmup_time_ms: float
     avg_sustainability_score: float
 
     def to_feature_vector(self) -> np.ndarray:
         """Convert to 14‑dim numeric feature vector."""
-        # One‑hot for expert type (4 types + general)
         type_map = {'energy': 0, 'data': 1, 'iot': 2, 'quantum': 3, 'general': 4}
         type_onehot = [0.0] * 5
         type_onehot[type_map.get(self.expert_type, 4)] = 1.0
 
-        # Urgency one‑hot (4 levels)
         urgency_map = {'critical': 0, 'high': 1, 'normal': 2, 'low': 3}
         urgency_onehot = [0.0] * 4
         urgency_onehot[urgency_map.get(self.urgency, 2)] = 1.0
 
-        # Strategy success rates (5 strategies)
         success_preload = self.strategy_success_rates.get('preload', 0.5)
         success_transfer = self.strategy_success_rates.get('transfer', 0.5)
         success_progressive = self.strategy_success_rates.get('progressive', 0.5)
@@ -1430,36 +1446,31 @@ class ColdStartState:
         return np.array(features, dtype=np.float32)
 
 
-# Teacher abstract base
 class Teacher(ABC):
     @abstractmethod
     def predict(self, state: ColdStartState) -> np.ndarray:
-        """Return probability vector over 5 strategies."""
         pass
 
     @abstractmethod
     def confidence(self, state: ColdStartState) -> float:
-        """Return confidence in prediction [0,1]."""
         pass
 
 
 class StrategyRuleBasedTeacher(Teacher):
-    """Rule‑based expert: uses original heuristics."""
     STRATEGIES = ['preload', 'transfer', 'progressive', 'hybrid', 'federated']
 
     def predict(self, state: ColdStartState) -> np.ndarray:
         probs = np.ones(5) * 0.1
-        # Preload if cache hit is likely (we don't have a direct flag; we'll use recent_hit_rate)
         if state.recent_hit_rate > 0.8:
-            probs[0] = 0.8  # preload
+            probs[0] = 0.8
         elif state.expert_type == 'quantum' and state.max_latency_ms < 100:
-            probs[3] = 0.7  # hybrid
+            probs[3] = 0.7
         elif state.carbon_intensity > 500:
-            probs[4] = 0.6  # federated (sharing reduces carbon)
+            probs[4] = 0.6
         elif state.urgency == 'critical':
-            probs[1] = 0.7  # transfer (faster than progressive)
+            probs[1] = 0.7
         else:
-            probs[2] = 0.6  # progressive default
+            probs[2] = 0.6
         return probs / probs.sum()
 
     def confidence(self, state: ColdStartState) -> float:
@@ -1469,7 +1480,6 @@ class StrategyRuleBasedTeacher(Teacher):
 
 
 class StrategyHistoricalMLTeacher(Teacher):
-    """Offline trained classifier from past interactions."""
     def __init__(self, model_path: Optional[str] = None):
         self.model = None
         self.label_encoder = None
@@ -1494,10 +1504,9 @@ class StrategyHistoricalMLTeacher(Teacher):
 
 
 class StrategyStatefulQTeacher(Teacher):
-    """Linear Q‑learning with state features."""
     def __init__(self, lr: float = 0.1):
         self.lr = lr
-        self.weights = np.zeros((14, 5))  # 14 features, 5 actions
+        self.weights = np.zeros((14, 5))
         self._load_state()
 
     def _load_state(self):
@@ -1658,12 +1667,305 @@ class DistillationStrategyOptimizer:
 
 
 # ============================================================================
+# NEW: Multi‑Objective Strategy Weight Optimizer (NSGA‑II)
+# ============================================================================
+@dataclass
+class MOPDStrategyWeights:
+    """A weight vector for the five warmup strategies, with its objective values."""
+    vector_id: str
+    weights: Dict[str, float]  # keys: preload, transfer, progressive, hybrid, federated (sum to 1)
+    objectives: Dict[str, float]  # achieved values (higher is better)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'vector_id': self.vector_id,
+            'weights': self.weights,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDStrategyWeights':
+        return cls(**data)
+
+
+class NSGAIIStrategyOptimizer:
+    """
+    Multi‑objective genetic algorithm for evolving continuous strategy weights.
+    Decision variables: weights for the five warmup strategies (sum to 1).
+    Objectives (maximized): minimize latency, minimize carbon, maximize cache hit rate, maximize sustainability.
+    The evaluation function is provided by the ColdStartOptimizer, which simulates or replays historical outcomes.
+    """
+
+    def __init__(
+        self,
+        evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+        population_size: int = 20,
+        generations: int = 10,
+        mutation_rate: float = 0.2,
+        crossover_rate: float = 0.8,
+        tournament_size: int = 3,
+        objective_weights: Optional[Dict[str, float]] = None,
+        dynamic_weights: bool = True,
+    ):
+        self.evaluate_func = evaluate_func
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {
+            'latency': 0.4,
+            'carbon': 0.3,
+            'cache_hit': 0.2,
+            'sustainability': 0.1,
+        }
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDStrategyWeights] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _random_individual(self) -> Dict[str, float]:
+        keys = ['preload', 'transfer', 'progressive', 'hybrid', 'federated']
+        w = {k: random.random() for k in keys}
+        total = sum(w.values())
+        if total > 0:
+            w = {k: v / total for k, v in w.items()}
+        return w
+
+    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
+        child = {}
+        for key in p1:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                child[key] = max(0.0, min(1.0, 0.5 * ((1 + beta) * p1[key] + (1 - beta) * p2[key])))
+            else:
+                child[key] = p1[key] if random.random() < 0.5 else p2[key]
+        total = sum(child.values())
+        if total > 0:
+            child = {k: v / total for k, v in child.items()}
+        return child
+
+    def _mutate(self, ind: Dict) -> Dict:
+        mutant = ind.copy()
+        for key in mutant:
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[key] = mutant[key] + delta
+                mutant[key] = max(0.0, min(1.0, mutant[key]))
+        total = sum(mutant.values())
+        if total > 0:
+            mutant = {k: v / total for k, v in mutant.items()}
+        return mutant
+
+    def _fast_non_dominated_sort(self, points: List[MOPDStrategyWeights]) -> List[List[MOPDStrategyWeights]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+        for i, p in enumerate(points):
+            p_obj = p.objectives
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                q_obj = q.objectives
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDStrategyWeights]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = list(front[0].objectives.keys())
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: x.objectives[obj])
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = sorted_front[0].objectives[obj]
+            obj_max = sorted_front[-1].objectives[obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (sorted_front[i+1].objectives[obj] - sorted_front[i-1].objectives[obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDStrategyWeights]],
+                              crowding: Dict[int, float]) -> Dict:
+        candidates = random.sample(population, self.tournament_size)
+        ind_to_point = {}
+        for ind, point in zip(population, self._all_points):
+            ind_to_point[id(ind)] = point
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            point = ind_to_point.get(id(cand))
+            if not point:
+                continue
+            rank = len(fronts)
+            for fi, front in enumerate(fronts):
+                if point in front:
+                    rank = fi
+                    break
+            cd = crowding.get(id(point), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        obj_keys = list(weights.keys())
+        avg = {k: np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        max_val = {k: np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        for k in obj_keys:
+            if max_val[k] > 0 and avg[k] < 0.5 * max_val[k]:
+                weights[k] = min(0.6, weights.get(k, 0.0) * 1.5)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def _select_best_from_pareto(self, pareto: List[MOPDStrategyWeights], weights: Dict[str, float]) -> Optional[MOPDStrategyWeights]:
+        if not pareto:
+            return None
+        obj_keys = list(weights.keys())
+        max_vals = {k: max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+        best = None
+        best_score = -float('inf')
+        for p in pareto:
+            score = 0.0
+            for k in obj_keys:
+                val = p.objectives[k]
+                norm = (val - min_vals[k]) / ranges[k] if ranges[k] > 0 else 1.0
+                score += weights.get(k, 0.0) * norm
+            p.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = p
+        return best
+
+    async def evolve(self) -> List[MOPDStrategyWeights]:
+        population = [self._random_individual() for _ in range(self.population_size)]
+        points = []
+        eval_tasks = [self.evaluate_func(ind) for ind in population]
+        eval_results = await asyncio.gather(*eval_tasks)
+        for ind, obj in zip(population, eval_results):
+            point = MOPDStrategyWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))] = obj
+        self._all_points = points
+        for gen in range(self.generations):
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+            offspring = []
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection(population, fronts, crowding)
+                parent2 = self._tournament_selection(population, fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+            child_tasks = [self.evaluate_func(ind) for ind in offspring]
+            child_results = await asyncio.gather(*child_tasks)
+            child_points = []
+            for ind, obj in zip(offspring, child_results):
+                point = MOPDStrategyWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+                child_points.append(point)
+                self._eval_cache[tuple(sorted(ind.items()))] = obj
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+        weights = self._compute_dynamic_weights()
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best:
+            self.best_individual = best.weights
+            self.best_fitness = best.scalarised_score
+        return self.pareto_front
+
+
+# ============================================================================
 # Enhanced Cold Start Optimizer (Main Class)
 # ============================================================================
 
 class ColdStartOptimizer:
     """
-    Enhanced Cold Start Optimizer v3.4.0 with adaptive strategy selection via distillation.
+    Enhanced Cold Start Optimizer v3.4.0 with adaptive strategy selection via distillation
+    and multi‑objective evolutionary optimization (NSGA‑II) for global weight refinement.
     """
 
     def __init__(self, config: Optional[ColdStartConfig] = None, **kwargs):
@@ -1711,6 +2013,16 @@ class ColdStartOptimizer:
             'distillation_replay_size': config.distillation_replay_size,
             'distillation_learning_rate': config.distillation_learning_rate,
         })
+
+        # MOEA globals
+        self.moea_enabled = config.moea_enabled
+        self.moea_optimizer: Optional[NSGAIIStrategyOptimizer] = None
+        self.global_best_weights: Optional[Dict[str, float]] = None
+        self.pareto_front: List[MOPDStrategyWeights] = []
+        self._moea_task: Optional[asyncio.Task] = None
+
+        if self.moea_enabled:
+            self._moea_task = asyncio.create_task(self._moea_loop())
 
         # Expert checkpoint cache (LRU)
         self.checkpoint_cache: OrderedDict[str, ExpertCheckpoint] = OrderedDict()
@@ -1799,9 +2111,6 @@ class ColdStartOptimizer:
                 # Preload high-probability experts
                 for expert_id, probability in list(predictions.items()):
                     if probability > self.preload_threshold:
-                        async with self._cache_lock:
-                            if expert_id not in self.checkpoint_cache:
-                                pass  # will preload without lock
                         if expert_id not in self.checkpoint_cache:
                             await self.preload_expert(expert_id)
 
@@ -1888,7 +2197,86 @@ class ColdStartOptimizer:
         }
 
     # ============================================================================
-    # Core Initialization Methods (Enhanced with Distillation)
+    # MOEA Background Loop and Update
+    # ============================================================================
+    async def _moea_loop(self):
+        interval = self.config.moea_interval_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.run_moea_update()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"MOEA loop error: {e}")
+                await asyncio.sleep(60)
+
+    async def run_moea_update(self) -> List[MOPDStrategyWeights]:
+        """
+        Run NSGA‑II to evolve a Pareto front of strategy weights.
+        Uses historical warmup outcomes to estimate objectives.
+        """
+        if not self.moea_enabled or len(self.warmup_history) < 20:
+            return []
+
+        async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
+            # Compute objectives from recent warmup history.
+            strategy_metrics = {s: [] for s in self.strategy_optimizer.STRATEGIES}
+            for event in self.warmup_history[-200:]:
+                method = event.get('method', 'unknown')
+                if method in strategy_metrics:
+                    latency = event.get('load_time_ms', event.get('total_time_ms', 500))
+                    carbon = event.get('carbon_footprint_kg', 0.1)
+                    sustainability = event.get('sustainability_score', 0.5)
+                    hit = 1.0 if method in ('checkpoint', 'transfer_learning') else 0.0
+                    strategy_metrics[method].append({
+                        'latency': latency,
+                        'carbon': carbon,
+                        'sustainability': sustainability,
+                        'hit': hit,
+                    })
+            objectives = {}
+            for metric in ['latency', 'carbon', 'sustainability', 'hit']:
+                weighted_values = []
+                for strategy, weight in weights.items():
+                    if strategy in strategy_metrics and strategy_metrics[strategy]:
+                        avg_val = np.mean([m[metric] for m in strategy_metrics[strategy]])
+                        weighted_values.append(weight * avg_val)
+                    else:
+                        weighted_values.append(weight * 0.5)
+                objectives[metric] = sum(weighted_values)
+
+            max_lat = 1000.0
+            max_carbon = 1.0
+            return {
+                'latency': 1.0 - min(1.0, objectives['latency'] / max_lat),
+                'carbon': 1.0 - min(1.0, objectives['carbon'] / max_carbon),
+                'cache_hit': objectives['hit'],
+                'sustainability': objectives['sustainability'],
+            }
+
+        self.moea_optimizer = NSGAIIStrategyOptimizer(
+            evaluate_func=evaluate,
+            population_size=self.config.moea_population_size,
+            generations=self.config.moea_generations,
+            mutation_rate=self.config.moea_mutation_rate,
+            crossover_rate=self.config.moea_crossover_rate,
+            tournament_size=self.config.moea_tournament_size,
+            objective_weights=self.config.moea_objective_weights,
+            dynamic_weights=self.config.moea_dynamic_weights,
+        )
+        pareto = await self.moea_optimizer.evolve()
+        self.pareto_front = pareto
+        if pareto:
+            weights = self.moea_optimizer._compute_dynamic_weights()
+            best = self.moea_optimizer._select_best_from_pareto(pareto, weights)
+            if best:
+                self.global_best_weights = best.weights
+                logger.info(f"MOEA selected best weights: {best.weights}")
+        return pareto
+
+    # ============================================================================
+    # Core Initialization Methods (Enhanced with Distillation + MOEA)
     # ============================================================================
 
     async def initialize_expert(
@@ -1913,7 +2301,7 @@ class ColdStartOptimizer:
         elif carbon_intensity is None:
             carbon_intensity = 400
 
-        # ---- Distillation: build state and select strategy ----
+        # Build state for distillation
         state = self._build_state(
             expert_type, urgency, carbon_budget, helium_budget, max_latency_ms,
             carbon_intensity
@@ -1924,6 +2312,18 @@ class ColdStartOptimizer:
         self.last_teacher_probs = teacher_probs
 
         logger.info(f"Selected strategy: {strategy} for {expert_id}")
+
+        # Blend with MOEA global weights if available
+        if self.global_best_weights is not None:
+            one_hot = np.zeros(5)
+            one_hot[action_idx] = 1.0
+            moea_probs = np.array([self.global_best_weights[s] for s in self.strategy_optimizer.STRATEGIES])
+            moea_probs = moea_probs / moea_probs.sum()
+            blended = 0.7 * moea_probs + 0.3 * one_hot
+            blended = blended / blended.sum()
+            action_idx = np.argmax(blended)
+            strategy = self.strategy_optimizer.STRATEGIES[action_idx]
+            logger.info(f"Blended strategy after MOEA: {strategy}")
 
         # Check cache first (cache hit may override strategy)
         async with self._cache_lock:
@@ -1936,8 +2336,7 @@ class ColdStartOptimizer:
                 checkpoint.sustainability_score = self._calculate_checkpoint_sustainability(checkpoint)
                 result = await self._load_from_checkpoint(checkpoint, max_latency_ms)
                 # Reward for cache hit
-                reward = 0.8 + 0.1 * checkpoint.sustainability_score  # high reward
-                # Update agent
+                reward = 0.8 + 0.1 * checkpoint.sustainability_score
                 await self._update_agent(state_vec, action_idx, reward, state)
                 return result
 
@@ -1997,21 +2396,16 @@ class ColdStartOptimizer:
         carbon_intensity: float
     ) -> ColdStartState:
         """Build state for the distillation agent."""
-        # Cache utilization and hit rate
         async with self._cache_lock:
             cache_util = len(self.checkpoint_cache) / self.cache_size
         hit_rate = self._calculate_hit_rate()
 
-        # Strategy success rates from warmup history
         success_rates = {'preload': 0.5, 'transfer': 0.5, 'progressive': 0.5, 'hybrid': 0.5, 'federated': 0.5}
         for event in self.warmup_history[-100:]:
             method = event.get('method', 'unknown')
             if method in success_rates:
-                # If the event indicates a successful initialization, we increment success
-                # For simplicity, we'll assume all events are successes.
                 success_rates[method] = min(1.0, success_rates.get(method, 0.5) + 0.01)
 
-        # Average warmup time and sustainability
         if self.warmup_history:
             times = [h.get('load_time_ms', h.get('total_time_ms', 0)) for h in self.warmup_history[-50:]]
             avg_time = np.mean(times) if times else 500.0
@@ -2044,8 +2438,7 @@ class ColdStartOptimizer:
         # Sustainability score from result
         sustainability = result.get('sustainability_score', 0.5)
 
-        # Cache hit bonus (if the expert was already cached, result would indicate that)
-        # In our flow, if cache hit, we returned early with a high reward. For non-cache, we give a small bonus if the strategy succeeded.
+        # Success bonus
         success_bonus = 0.2 if result.get('initialized', False) else 0.0
 
         # Carbon intensity bonus: lower carbon is better
@@ -2056,7 +2449,7 @@ class ColdStartOptimizer:
 
     # ---------- Update agent ----------
     async def _update_agent(self, state_vec: np.ndarray, action_idx: int, reward: float, state: ColdStartState):
-        next_state_vec = state.to_feature_vector()  # next state (same for simplicity)
+        next_state_vec = state.to_feature_vector()
         await self.strategy_optimizer.update(
             state_vec,
             action_idx,
@@ -2124,10 +2517,8 @@ class ColdStartOptimizer:
         target_type: str,
         max_latency_ms: float
     ) -> Dict[str, Any]:
-        # Find similar expert
         similar = self._find_similar_expert(target_id, target_type)
         if not similar or similar not in self.checkpoint_cache:
-            # Fallback to progressive
             return await self._progressive_initialize(
                 target_id, target_type, 0.1, 0.1, max_latency_ms, 'progressive'
             )
@@ -2192,7 +2583,6 @@ class ColdStartOptimizer:
         expert_type: str,
         max_latency_ms: float
     ) -> Dict[str, Any]:
-        # Create checkpoint and add to cache
         checkpoint = await self._create_checkpoint(expert_id, {'type': expert_type})
         async with self._cache_lock:
             self._add_to_cache(expert_id, checkpoint)
@@ -2398,7 +2788,6 @@ class ColdStartOptimizer:
     def _add_to_cache(self, expert_id: str, checkpoint: ExpertCheckpoint):
         if len(self.checkpoint_cache) >= self.cache_size:
             if self.enable_intelligent_eviction and self.eviction_manager:
-                # Eviction handled in background loop
                 oldest_id, _ = self.checkpoint_cache.popitem(last=False)
                 logger.info(f"Evicted {oldest_id} from cache (LRU)")
                 if self.telemetry:
@@ -2498,9 +2887,13 @@ class ColdStartOptimizer:
         if self.enable_intelligent_eviction and self.eviction_manager:
             stats['eviction'] = self.eviction_manager.get_eviction_stats()
 
-        # Distillation stats
         stats['distillation'] = self.strategy_optimizer.get_stats()
-
+        if self.moea_enabled:
+            stats['moea'] = {
+                'pareto_front_size': len(self.pareto_front),
+                'best_weights': self.global_best_weights,
+                'enabled': True,
+            }
         return stats
 
     def _calculate_hit_rate(self) -> float:
@@ -2590,6 +2983,9 @@ class ColdStartOptimizer:
                 await self._preloader_task
             except asyncio.CancelledError:
                 pass
+        if self._moea_task:
+            self._moea_task.cancel()
+            await asyncio.gather(self._moea_task, return_exceptions=True)
         if self.enable_persistence:
             await self.save_state()
         if self.federated_manager:
@@ -2665,7 +3061,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         )
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
-        self.assertGreater(probs[0], probs[1])  # preload should be highest due to high hit rate
+        self.assertGreater(probs[0], probs[1])
 
     async def test_select_strategy(self):
         state = ColdStartState(
@@ -2710,7 +3106,6 @@ def train_historical_model(log_path: Path = Path(ColdStartConfig().interaction_l
         logger.warning("Not enough logs to train historical model (need at least 10).")
         return
 
-    # Prepare features (state vectors) and labels (strategies)
     X_list = []
     y_list = []
     for _, row in df_logs.iterrows():
@@ -2721,15 +3116,12 @@ def train_historical_model(log_path: Path = Path(ColdStartConfig().interaction_l
     X = np.array(X_list)
     y = np.array(y_list)
 
-    # Encode labels
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
 
-    # Train RandomForest
     model = RandomForestClassifier(n_estimators=100, random_state=42)
     model.fit(X, y_encoded)
 
-    # Save model
     with open(model_path, 'wb') as f:
         pickle.dump((model, le), f)
     logger.info(f"Historical ML model trained and saved to {model_path}")
@@ -2745,7 +3137,6 @@ if __name__ == "__main__":
     async def main():
         config = ColdStartConfig()
         optimizer = ColdStartOptimizer(config)
-        # Test initialization
         result = await optimizer.initialize_expert(
             expert_id="test_expert",
             expert_type="energy",
