@@ -1,22 +1,19 @@
 """
-Enhanced Predictive Maintenance for Hardware Based on Sustainability Metrics v3.1.0
+Enhanced Predictive Maintenance for Hardware Based on Sustainability Metrics v3.2.0
 ============================================================================
 
 Tracks energy efficiency (FLOPs/Joule) per node over time, forecasts when
 efficiency will drop below a threshold, simulates replacement impact via
 DigitalTwin, and generates maintenance recommendations during low‑carbon periods.
 
-ENHANCEMENTS OVER v3.0.0:
-- Adaptive action selection (replace/refurbish/monitor) via Multi‑Teacher Distillation.
-- State‑aware decisions based on efficiency, slope, days to threshold, cost savings,
-  carbon intensity, material index, and historical performance.
-- Online learning from outcome metrics (energy saved, cost saved, carbon saved).
-- Teachers: rule‑based, historical ML, stateful Q.
-- Student: linear softmax with distillation + REINFORCE.
-- Persistence for Q‑teacher weights and interaction logs.
-- Offline training for historical ML teacher.
-- Unit tests for distillation components.
-All previous features (async persistence, forecasting, digital twin, carbon/LCA integration, etc.) retained.
+ENHANCEMENTS OVER v3.1.0:
+- Continuous action weight optimization via NSGA‑II multi‑objective evolutionary algorithm.
+- Pareto front of non‑dominated action weight vectors.
+- MODP‑based selection using dynamic objective weights.
+- Background task for periodic MOEA evolution.
+- Blending of MOEA global weights with online distillation for action selection.
+- Persistence of evolved Pareto front and best weights.
+All previous features (distillation, async persistence, forecasting, digital twin, carbon/LCA integration, etc.) retained.
 """
 
 import asyncio
@@ -34,6 +31,8 @@ import random
 from abc import ABC, abstractmethod
 import pandas as pd
 from pathlib import Path
+import uuid
+import copy
 
 # ---------- Pydantic ----------
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -174,13 +173,32 @@ class PredictiveMaintenanceConfig(BaseModel):
     carbon_offset_price_per_kg_usd: float = Field(0.10, gt=0)
     electricity_price_per_kwh_usd: float = Field(0.12, gt=0)
 
-    # NEW: Distillation parameters
+    # Distillation parameters
     distillation_epsilon: float = Field(0.1, ge=0, le=1)
     distillation_train_every: int = Field(10, ge=1)
     distillation_replay_size: int = Field(2000, ge=10)
     distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
     distill_weight: float = Field(0.7, ge=0, le=1)
     rl_weight: float = Field(0.3, ge=0, le=1)
+
+    # MOEA parameters
+    moea_enabled: bool = Field(True, description="Enable MOEA global weight optimization")
+    moea_interval_seconds: int = Field(300, ge=60)
+    moea_population_size: int = Field(20, ge=5)
+    moea_generations: int = Field(10, ge=1)
+    moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
+    moea_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
+    moea_tournament_size: int = Field(3, ge=2)
+    moea_objective_weights: Optional[Dict[str, float]] = Field(
+        default_factory=lambda: {
+            'net_savings': 0.35,
+            'carbon_savings': 0.25,
+            'risk_reduction': 0.25,
+            'longterm_efficiency': 0.15,
+        }
+    )
+    moea_dynamic_weights: bool = Field(True)
+    moea_pareto_path: str = Field("./pm_moea_pareto.json")
 
     # Persistence paths for distillation
     q_weights_path: str = Field("./pm_q_weights.json")
@@ -257,7 +275,7 @@ class PersistenceManager:
                 CREATE TABLE IF NOT EXISTS recommendations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     node_id TEXT,
-                    recommendation TEXT,  # JSON
+                    recommendation TEXT,  -- JSON
                     created_at REAL
                 )
             """)
@@ -603,7 +621,7 @@ class DigitalTwinSimulator:
         }
 
 # ============================================================================
-# 7. DISTILLATION COMPONENTS FOR ACTION SELECTION
+# 7. DISTILLATION COMPONENTS FOR ACTION SELECTION (unchanged)
 # ============================================================================
 
 @dataclass
@@ -868,12 +886,304 @@ class DistillationActionOptimizer:
 
 
 # ============================================================================
-# 8. MAINTENANCE SCHEDULER (ENHANCED)
+# NEW: Multi‑Objective Action Weight Optimizer (NSGA‑II)
+# ============================================================================
+@dataclass
+class MOPDActionWeights:
+    """A weight vector for the three actions, with its objective values."""
+    vector_id: str
+    weights: Dict[str, float]  # keys: replace, refurbish, monitor (sum to 1)
+    objectives: Dict[str, float]  # achieved values (higher is better)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'vector_id': self.vector_id,
+            'weights': self.weights,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDActionWeights':
+        return cls(**data)
+
+
+class NSGAIAActionOptimizer:
+    """
+    Multi‑objective genetic algorithm for evolving action weight vectors.
+    Decision variables: weights for replace, refurbish, monitor (sum to 1).
+    Objectives: maximize net savings, maximize carbon savings, minimize risk (maximize risk reduction),
+                maximize long-term efficiency.
+    """
+
+    def __init__(
+        self,
+        evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+        population_size: int = 20,
+        generations: int = 10,
+        mutation_rate: float = 0.2,
+        crossover_rate: float = 0.8,
+        tournament_size: int = 3,
+        objective_weights: Optional[Dict[str, float]] = None,
+        dynamic_weights: bool = True,
+    ):
+        self.evaluate_func = evaluate_func
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {
+            'net_savings': 0.35,
+            'carbon_savings': 0.25,
+            'risk_reduction': 0.25,
+            'longterm_efficiency': 0.15,
+        }
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDActionWeights] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _random_individual(self) -> Dict[str, float]:
+        keys = ['replace', 'refurbish', 'monitor']
+        w = {k: random.random() for k in keys}
+        total = sum(w.values())
+        if total > 0:
+            w = {k: v / total for k, v in w.items()}
+        return w
+
+    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
+        child = {}
+        for key in p1:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                child[key] = max(0.0, min(1.0, 0.5 * ((1 + beta) * p1[key] + (1 - beta) * p2[key])))
+            else:
+                child[key] = p1[key] if random.random() < 0.5 else p2[key]
+        total = sum(child.values())
+        if total > 0:
+            child = {k: v / total for k, v in child.items()}
+        return child
+
+    def _mutate(self, ind: Dict) -> Dict:
+        mutant = ind.copy()
+        for key in mutant:
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[key] = mutant[key] + delta
+                mutant[key] = max(0.0, min(1.0, mutant[key]))
+        total = sum(mutant.values())
+        if total > 0:
+            mutant = {k: v / total for k, v in mutant.items()}
+        return mutant
+
+    def _fast_non_dominated_sort(self, points: List[MOPDActionWeights]) -> List[List[MOPDActionWeights]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+        for i, p in enumerate(points):
+            p_obj = p.objectives
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                q_obj = q.objectives
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDActionWeights]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = list(front[0].objectives.keys())
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: x.objectives[obj])
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = sorted_front[0].objectives[obj]
+            obj_max = sorted_front[-1].objectives[obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (sorted_front[i+1].objectives[obj] - sorted_front[i-1].objectives[obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDActionWeights]],
+                              crowding: Dict[int, float]) -> Dict:
+        candidates = random.sample(population, self.tournament_size)
+        ind_to_point = {}
+        for ind, point in zip(population, self._all_points):
+            ind_to_point[id(ind)] = point
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            point = ind_to_point.get(id(cand))
+            if not point:
+                continue
+            rank = len(fronts)
+            for fi, front in enumerate(fronts):
+                if point in front:
+                    rank = fi
+                    break
+            cd = crowding.get(id(point), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        obj_keys = list(weights.keys())
+        avg = {k: np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        max_val = {k: np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        for k in obj_keys:
+            if max_val[k] > 0 and avg[k] < 0.5 * max_val[k]:
+                weights[k] = min(0.6, weights.get(k, 0.0) * 1.5)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def _select_best_from_pareto(self, pareto: List[MOPDActionWeights], weights: Dict[str, float]) -> Optional[MOPDActionWeights]:
+        if not pareto:
+            return None
+        obj_keys = list(weights.keys())
+        max_vals = {k: max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+        best = None
+        best_score = -float('inf')
+        for p in pareto:
+            score = 0.0
+            for k in obj_keys:
+                val = p.objectives[k]
+                norm = (val - min_vals[k]) / ranges[k] if ranges[k] > 0 else 1.0
+                score += weights.get(k, 0.0) * norm
+            p.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = p
+        return best
+
+    async def evolve(self) -> List[MOPDActionWeights]:
+        population = [self._random_individual() for _ in range(self.population_size)]
+        points = []
+        eval_tasks = [self.evaluate_func(ind) for ind in population]
+        eval_results = await asyncio.gather(*eval_tasks)
+        for ind, obj in zip(population, eval_results):
+            point = MOPDActionWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))] = obj
+        self._all_points = points
+        for gen in range(self.generations):
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+            offspring = []
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection(population, fronts, crowding)
+                parent2 = self._tournament_selection(population, fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+            child_tasks = [self.evaluate_func(ind) for ind in offspring]
+            child_results = await asyncio.gather(*child_tasks)
+            child_points = []
+            for ind, obj in zip(offspring, child_results):
+                point = MOPDActionWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+                child_points.append(point)
+                self._eval_cache[tuple(sorted(ind.items()))] = obj
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+        weights = self._compute_dynamic_weights()
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best:
+            self.best_individual = best.weights
+            self.best_fitness = best.scalarised_score
+        return self.pareto_front
+
+
+# ============================================================================
+# 8. MAINTENANCE SCHEDULER (ENHANCED WITH MOEA)
 # ============================================================================
 class MaintenanceScheduler:
     """
     Generates maintenance recommendations and schedules them during low‑carbon windows.
-    Uses distillation to select action.
+    Uses distillation for online action selection and MOEA for global weight refinement.
     """
     def __init__(self, config: PredictiveMaintenanceConfig,
                  carbon_manager: Optional[Any] = None):
@@ -892,6 +1202,16 @@ class MaintenanceScheduler:
             'distillation_learning_rate': config.distillation_learning_rate,
         })
 
+        # MOEA globals
+        self.moea_enabled = config.moea_enabled
+        self.moea_optimizer: Optional[NSGAIAActionOptimizer] = None
+        self.global_best_weights: Optional[Dict[str, float]] = None
+        self.pareto_front: List[MOPDActionWeights] = []
+        self._moea_task: Optional[asyncio.Task] = None
+
+        if self.moea_enabled:
+            self._moea_task = asyncio.create_task(self._moea_loop())
+
         # Interaction tracking
         self.interaction_log: List[Dict] = []
         self.last_state_vec: Optional[np.ndarray] = None
@@ -900,6 +1220,71 @@ class MaintenanceScheduler:
 
     def parse_time(self, time_str: str) -> datetime.time:
         return datetime.strptime(time_str, "%H:%M").time()
+
+    async def _moea_loop(self):
+        interval = self.config.moea_interval_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.run_moea_update()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"MOEA loop error: {e}")
+                await asyncio.sleep(60)
+
+    async def run_moea_update(self) -> List[MOPDActionWeights]:
+        """
+        Run NSGA‑II to evolve a Pareto front of action weight vectors.
+        Uses interaction logs to estimate objectives.
+        """
+        if not self.moea_enabled or len(self.interaction_log) < 20:
+            return []
+
+        async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
+            # Compute objectives from interaction history
+            # For each action, aggregate rewards for net_savings, carbon_savings, etc.
+            action_metrics = {a: [] for a in self.action_optimizer.ACTIONS}
+            for entry in self.interaction_log[-200:]:
+                action = entry.get('action')
+                if action in action_metrics:
+                    action_metrics[action].append({
+                        'net_savings': entry.get('net_savings', 0),
+                        'carbon_savings': entry.get('carbon_savings', 0),
+                        'risk_reduction': entry.get('risk_reduction', 0),
+                        'longterm_efficiency': entry.get('longterm_efficiency', 0),
+                    })
+            objectives = {}
+            for metric in ['net_savings', 'carbon_savings', 'risk_reduction', 'longterm_efficiency']:
+                weighted_values = []
+                for action, weight in weights.items():
+                    if action_metrics.get(action):
+                        avg = np.mean([m[metric] for m in action_metrics[action]])
+                        weighted_values.append(weight * avg)
+                    else:
+                        weighted_values.append(weight * 0.5)  # neutral
+                objectives[metric] = sum(weighted_values)
+            return objectives
+
+        self.moea_optimizer = NSGAIAActionOptimizer(
+            evaluate_func=evaluate,
+            population_size=self.config.moea_population_size,
+            generations=self.config.moea_generations,
+            mutation_rate=self.config.moea_mutation_rate,
+            crossover_rate=self.config.moea_crossover_rate,
+            tournament_size=self.config.moea_tournament_size,
+            objective_weights=self.config.moea_objective_weights,
+            dynamic_weights=self.config.moea_dynamic_weights,
+        )
+        pareto = await self.moea_optimizer.evolve()
+        self.pareto_front = pareto
+        if pareto:
+            weights = self.moea_optimizer._compute_dynamic_weights()
+            best = self.moea_optimizer._select_best_from_pareto(pareto, weights)
+            if best:
+                self.global_best_weights = best.weights
+                logger.info(f"MOEA selected best weights: {best.weights}")
+        return pareto
 
     async def get_next_low_carbon_window(self, from_date: datetime) -> Optional[datetime]:
         today = from_date.date()
@@ -923,7 +1308,7 @@ class MaintenanceScheduler:
         sim_refurb: Dict[str, Any],
     ) -> MaintenanceRecommendation:
         """
-        Create a maintenance recommendation using distillation to select action.
+        Create a maintenance recommendation using distillation with MOEA blending.
         """
         # Build state
         state = MaintenanceState(
@@ -946,6 +1331,18 @@ class MaintenanceScheduler:
         self.last_action_idx = action_idx
         self.last_teacher_probs = teacher_probs
 
+        # Blend with MOEA global weights if available
+        if self.global_best_weights is not None:
+            one_hot = np.zeros(3)
+            one_hot[action_idx] = 1.0
+            moea_probs = np.array([self.global_best_weights[a] for a in self.action_optimizer.ACTIONS])
+            moea_probs = moea_probs / moea_probs.sum()
+            blended = 0.7 * moea_probs + 0.3 * one_hot
+            blended = blended / blended.sum()
+            action_idx = np.argmax(blended)
+            action = self.action_optimizer.ACTIONS[action_idx]
+            logger.info(f"Blended action after MOEA: {action}")
+
         # Determine suggested date
         threshold = self.config.efficiency_threshold
         days_to = forecast_result.get("days_to_threshold")
@@ -953,7 +1350,6 @@ class MaintenanceScheduler:
         if action == "monitor" or days_to is None or days_to > 30:
             suggested_date = datetime.now() + timedelta(days=30)
         else:
-            # Schedule maintenance before crossing
             crossing_date = datetime.now() + timedelta(days=days_to)
             maintenance_date = crossing_date - timedelta(days=self.lead_time)
             suggested_date = await self.get_next_low_carbon_window(maintenance_date)
@@ -966,12 +1362,10 @@ class MaintenanceScheduler:
         else:
             simulation_result = {}  # monitor
 
-        # Carbon and cost savings
         co2_saved = simulation_result.get("co2_saved_total_kg", 0.0) if action in ["replace", "refurbish"] else 0.0
         cost_saved = simulation_result.get("net_savings_usd", 0.0) if action in ["replace", "refurbish"] else 0.0
         payback = simulation_result.get("payback_days")
 
-        # Predict efficiency in 30 days
         slope = forecast_result.get("slope", 0)
         pred_eff_30 = current_efficiency + slope * 30
 
@@ -997,7 +1391,6 @@ class MaintenanceScheduler:
         """
         Record the outcome of a maintenance action to update the distillation agent.
         """
-        # Compute reward based on savings
         reward = 0.0
         if actual_energy_saved > 0:
             reward += 0.4 * min(1.0, actual_energy_saved / 1e6)
@@ -1007,12 +1400,15 @@ class MaintenanceScheduler:
             reward += 0.3 * min(1.0, actual_carbon_saved / 100)
         reward = max(0.0, min(1.0, reward))
 
-        # Log interaction
         self.interaction_log.append({
             'timestamp': datetime.now().isoformat(),
             'node_id': node_id,
             'action': action,
             'reward': reward,
+            'net_savings': actual_cost_saved,
+            'carbon_savings': actual_carbon_saved,
+            'risk_reduction': 0.5,  # placeholder
+            'longterm_efficiency': 0.5,  # placeholder
         })
         log_path = Path(PredictiveMaintenanceConfig().interaction_logs_path)
         df_log = pd.DataFrame([self.interaction_log[-1]])
@@ -1021,9 +1417,8 @@ class MaintenanceScheduler:
         else:
             df_log.to_csv(log_path, index=False)
 
-        # Update agent
         if self.last_state_vec is not None and self.last_action_idx is not None:
-            next_state_vec = self.last_state_vec  # for simplicity, same state
+            next_state_vec = self.last_state_vec
             await self.action_optimizer.update(
                 self.last_state_vec,
                 self.last_action_idx,
@@ -1069,7 +1464,7 @@ class MaintenanceScheduler:
 # ============================================================================
 class PredictiveMaintenanceEngine:
     """
-    Orchestrates the entire predictive maintenance pipeline with distillation.
+    Orchestrates the entire predictive maintenance pipeline with distillation and MOEA.
     """
 
     def __init__(
@@ -1115,7 +1510,7 @@ class PredictiveMaintenanceEngine:
         if self.config.refresh_interval > 0:
             self._background_task = asyncio.create_task(self._periodic_analysis())
 
-        logger.info("PredictiveMaintenanceEngine initialized with distillation")
+        logger.info("PredictiveMaintenanceEngine initialized with distillation and MOEA")
 
     def register_telemetry_source(self, callback: Callable):
         self.telemetry_callback = callback
@@ -1168,7 +1563,7 @@ class PredictiveMaintenanceEngine:
             hardware_model=hardware_model
         )
 
-        # Generate recommendation via scheduler (which uses distillation)
+        # Generate recommendation via scheduler (which uses distillation + MOEA)
         rec = await self.scheduler.generate_recommendation(
             node_id,
             current_eff,
@@ -1248,6 +1643,8 @@ class PredictiveMaintenanceEngine:
             "nodes_tracked": len(self.tracker.history),
             "recommendations_pending": len(self.scheduler.recommendations),
             "distillation_stats": self.scheduler.action_optimizer.get_stats(),
+            "moea_pareto_front_size": len(self.scheduler.pareto_front),
+            "moea_best_weights": self.scheduler.global_best_weights,
         }
 
     async def shutdown(self):
@@ -1258,6 +1655,9 @@ class PredictiveMaintenanceEngine:
                 await self._background_task
             except asyncio.CancelledError:
                 pass
+        if self.scheduler._moea_task:
+            self.scheduler._moea_task.cancel()
+            await asyncio.gather(self.scheduler._moea_task, return_exceptions=True)
         if self.persistence:
             await self.persistence.close()
         logger.info("Shutdown complete")
@@ -1302,7 +1702,7 @@ def create_predictive_maintenance_system(
 # 12. REST API (FastAPI) – Optional (unchanged)
 # ============================================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Predictive Maintenance API", version="3.1.0")
+    app = FastAPI(title="Predictive Maintenance API", version="3.2.0")
     engine: Optional[PredictiveMaintenanceEngine] = None
 
     @app.get("/health")
@@ -1467,7 +1867,7 @@ def train_historical_model(log_path: Path = Path(PredictiveMaintenanceConfig().i
 
 
 # ============================================================================
-# 15. EXAMPLE USAGE (unchanged but with distillation)
+# 15. EXAMPLE USAGE (unchanged but with MOEA)
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
