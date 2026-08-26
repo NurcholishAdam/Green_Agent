@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Zero Trust Security Architecture for Green Agent v4.1.0
+Zero Trust Security Architecture for Green Agent v4.2.0
 Implements complete zero‑trust security model for expert routing and execution.
 ENHANCED WITH:
 - Adaptive authentication level selection via Multi‑Teacher On‑Policy Distillation.
@@ -11,6 +11,9 @@ ENHANCED WITH:
 - Persistence for Q‑teacher weights and interaction logs.
 - Offline training for historical ML teacher.
 - Unit tests for distillation components.
+- Integration with FeedbackEvent schema and AsyncMessageQueue for cross‑module learning.
+- Expanded state vector with additional security context features.
+- Public API for other modules to query security context.
 All previous features (carbon/helium tracking, predictive analytics, ledger, rate limiting, etc.) retained.
 """
 
@@ -74,6 +77,17 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
+# ---------- Project internal imports ----------
+try:
+    from ..schemas.feedback_event import FeedbackEvent
+except ImportError:
+    FeedbackEvent = None
+
+try:
+    from ..async_message_queue import AsyncMessageQueue
+except ImportError:
+    AsyncMessageQueue = None
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -94,6 +108,7 @@ class ZeroTrustConfig(BaseSettings):
     enable_adaptive_ratelimit: bool = True
     enable_persistence: bool = True
     enable_telemetry: bool = True
+    enable_message_queue: bool = False
 
     # Carbon manager settings
     carbon_api_region: str = "us-east"
@@ -138,7 +153,7 @@ class ZeroTrustConfig(BaseSettings):
         'critical': 0.1
     })
 
-    # NEW: Distillation parameters
+    # Distillation parameters
     distillation_epsilon: float = Field(0.1, ge=0, le=1)
     distillation_train_every: int = Field(10, ge=1)
     distillation_replay_size: int = Field(2000, ge=10)
@@ -180,7 +195,7 @@ class ZeroTrustConfig(BaseSettings):
         return v
 
 # ============================================================================
-# Circuit Breaker with Half‑Open State (Async‑safe)
+# Circuit Breaker (unchanged)
 # ============================================================================
 
 class CircuitBreakerState(Enum):
@@ -200,7 +215,6 @@ class CircuitBreaker:
         self._lock = asyncio.Lock()
 
     async def call(self, func: Callable, *args, **kwargs) -> Any:
-        """Execute the given async function with circuit breaker protection."""
         async with self._lock:
             if self.state == CircuitBreakerState.OPEN:
                 if self.last_failure_time:
@@ -245,14 +259,12 @@ class CircuitBreaker:
             self.state = CircuitBreakerState.CLOSED
             self.failure_count = 0
             self.last_failure_time = None
-            logger.info(f"Circuit breaker {self.name} manually reset")
 
 # ============================================================================
-# Retry Helper (using tenacity if available)
+# Retry Helper (unchanged)
 # ============================================================================
 
 def is_retryable_exception(e: Exception) -> bool:
-    """Check if an exception is retryable."""
     return isinstance(e, (IOError, TimeoutError, ConnectionError, aiohttp.ClientError))
 
 if TENACITY_AVAILABLE:
@@ -280,12 +292,10 @@ else:
         return wrapper
 
 # ============================================================================
-# Telemetry Collector (Prometheus)
+# Telemetry Collector (unchanged)
 # ============================================================================
 
 class ZeroTrustTelemetry:
-    """Collects telemetry for the zero trust architecture."""
-
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
@@ -342,7 +352,6 @@ class ZeroTrustTelemetry:
     async def export(self) -> str:
         if PROMETHEUS_AVAILABLE and self.config.prometheus_port:
             return generate_latest().decode('utf-8')
-        # Fallback text format
         output = []
         for key, value in self.metrics['counters'].items():
             output.append(f"# TYPE {key} counter\n{key} {value}")
@@ -359,12 +368,10 @@ class ZeroTrustTelemetry:
         self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
-# Persistence Manager (Pickle + zlib + async I/O, versioned)
+# Persistence Manager (unchanged)
 # ============================================================================
 
 class ZeroTrustPersistenceManager:
-    """Saves and loads the zero trust architecture state using pickle + compression with versioning."""
-
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.path = config.persistence_path
@@ -374,27 +381,22 @@ class ZeroTrustPersistenceManager:
             recovery_timeout=config.circuit_breaker_recovery_timeout,
             name="persistence"
         )
-        self._version = "4.1.0"
+        self._version = "4.2.0"
         logger.info(f"ZeroTrustPersistenceManager initialized (path={self.path})")
 
     async def _upgrade_state(self, state: Dict) -> Dict:
-        """Upgrade state to current version if needed."""
         version = state.get('version', '1.0.0')
         if version == self._version:
             return state
         logger.info(f"Upgrading state from version {version} to {self._version}")
-        # Add new fields with defaults as needed.
         if 'key_rotation_counter' not in state:
             state['key_rotation_counter'] = 0
-        # Q-weights will be saved separately
         state['version'] = self._version
         return state
 
     async def save_state(self, zta: 'ZeroTrustArchitecture') -> bool:
-        """Save the zero trust state to disk."""
         async with self._lock:
             try:
-                # Prepare state: convert non-serialisable objects to serialisable forms.
                 state = {
                     'version': self._version,
                     'identities': zta.identities,
@@ -421,7 +423,6 @@ class ZeroTrustPersistenceManager:
                     'key_rotation_counter': zta._key_rotation_counter,
                     'revoked_identities': list(zta._revoked_identities),
                 }
-                # Serialise using pickle (handles bytes, RSA keys, etc.)
                 pickled = pickle.dumps(state)
                 compressed = zlib.compress(pickled)
                 if aiofiles:
@@ -437,7 +438,6 @@ class ZeroTrustPersistenceManager:
                 return False
 
     async def load_state(self, zta: 'ZeroTrustArchitecture') -> bool:
-        """Load the zero trust state from disk."""
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
@@ -453,7 +453,6 @@ class ZeroTrustPersistenceManager:
                 state = pickle.loads(pickled)
                 state = await self._upgrade_state(state)
 
-                # Restore state
                 zta.identities = state.get('identities', {})
                 zta.role_assignments = state.get('role_assignments', {})
                 zta.access_policies = state.get('access_policies', {})
@@ -499,12 +498,10 @@ class ZeroTrustPersistenceManager:
             return False
 
 # ============================================================================
-# Carbon Intensity Manager (Enhanced with locks and telemetry)
+# Carbon Intensity Manager (unchanged)
 # ============================================================================
 
 class CarbonIntensityManager:
-    """Real-time carbon intensity integration with improved price forecasting."""
-
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
@@ -525,8 +522,6 @@ class CarbonIntensityManager:
             recovery_timeout=config.circuit_breaker_recovery_timeout,
             name="carbon_api"
         )
-
-        # Regional profiles for fallback
         self.region_profiles = {
             'us-east': {'timezone': -5, 'renewable_pct': 30, 'base_intensity': 420},
             'us-west': {'timezone': -8, 'renewable_pct': 45, 'base_intensity': 350},
@@ -539,7 +534,6 @@ class CarbonIntensityManager:
             'africa': {'timezone': 2, 'renewable_pct': 25, 'base_intensity': 450},
             'middle-east': {'timezone': 3, 'renewable_pct': 15, 'base_intensity': 550}
         }
-
         logger.info("Carbon Intensity Manager initialized with improved forecasting")
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -548,7 +542,6 @@ class CarbonIntensityManager:
         return self._session
 
     async def update_carbon_intensity(self, region: Optional[str] = None) -> Dict:
-        """Fetch real-time carbon intensity with retry and circuit breaker."""
         async def _do_fetch():
             session = await self._get_session()
             url = f"{self.endpoint}/latest?zone={self.region}"
@@ -595,7 +588,6 @@ class CarbonIntensityManager:
         return {'intensity': self.carbon_intensity, 'region': self.region, 'is_fallback': True}
 
     def _update_carbon_price(self, intensity: float):
-        """Update carbon price with exponential smoothing."""
         base_price = 50.0
         intensity_factor = (intensity - 300) / 500
         self.carbon_price_usd_per_ton = max(10.0, base_price * (1.0 + intensity_factor))
@@ -619,7 +611,6 @@ class CarbonIntensityManager:
             return self.carbon_price_usd_per_ton
 
     async def forecast_carbon_prices(self, hours: int = 24) -> Dict[str, Any]:
-        """Forecast carbon prices using exponential smoothing."""
         if len(self.price_history) < 10:
             return {'status': 'insufficient_data'}
 
@@ -627,13 +618,11 @@ class CarbonIntensityManager:
         if len(prices) < 5:
             return {'status': 'insufficient_data'}
 
-        # Simple exponential smoothing
         alpha = 0.3
         smoothed = prices[0]
         for v in prices[1:]:
             smoothed = alpha * v + (1 - alpha) * smoothed
 
-        # Project forward
         predictions = [smoothed] * hours
         return {
             'status': 'success',
@@ -668,12 +657,10 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Helium Security Tracker (Enhanced with locks)
+# Helium Security Tracker (unchanged)
 # ============================================================================
 
 class HeliumSecurityTracker:
-    """Helium tracking for security operations with improved price forecasting."""
-
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.helium_budget_l = config.helium_budget_l
@@ -735,7 +722,6 @@ class HeliumSecurityTracker:
         if len(prices) < 5:
             return {'status': 'insufficient_data'}
 
-        # Exponential smoothing
         alpha = 0.3
         smoothed = prices[0]
         for v in prices[1:]:
@@ -767,12 +753,10 @@ class HeliumSecurityTracker:
         return saved
 
 # ============================================================================
-# Predictive Security Analyzer (Enhanced with locks and persistence)
+# Predictive Security Analyzer (unchanged)
 # ============================================================================
 
 class PredictiveSecurityAnalyzer:
-    """Predictive analytics for security operations with online learning using SGDRegressor."""
-
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.history_window = config.predictive_history_window
@@ -805,7 +789,6 @@ class PredictiveSecurityAnalyzer:
             logger.warning("SGDRegressor not available; using fallback moving average")
 
     def _serialize_model(self) -> Dict:
-        """Serialize model weights for persistence."""
         if not self._ml_available or self.model is None:
             return {}
         return {
@@ -814,7 +797,6 @@ class PredictiveSecurityAnalyzer:
         }
 
     def _deserialize_model(self, weights: Dict):
-        """Deserialize model weights from persistence."""
         if not self._ml_available or self.model is None or not weights:
             return
         if 'coef_' in weights:
@@ -889,7 +871,6 @@ class PredictiveSecurityAnalyzer:
             self.is_trained = True
             self.model_version += 1
             self.samples_since_last_train = 0
-        # Compute R2 for diagnostics
         X_scaled = self.scaler.transform(X)
         pred = self.model.predict(X_scaled)
         r2 = r2_score(y, pred) if len(y) > 5 else 0.0
@@ -980,12 +961,10 @@ class PredictiveSecurityAnalyzer:
         self._executor.shutdown(wait=True)
 
 # ============================================================================
-# Immutable Security Ledger (Enhanced)
+# Immutable Security Ledger (unchanged)
 # ============================================================================
 
 class ImmutableSecurityLedger:
-    """Immutable ledger for security audit trail."""
-
     def __init__(self):
         self.chain = []
         self.current_hash = "0" * 64
@@ -1052,12 +1031,10 @@ class ImmutableSecurityLedger:
         }
 
 # ============================================================================
-# Adaptive Rate Limiter (Enhanced with sliding window)
+# Adaptive Rate Limiter (unchanged)
 # ============================================================================
 
 class AdaptiveRateLimiter:
-    """Adaptive rate limiting based on threat level with sliding window."""
-
     def __init__(self, config: ZeroTrustConfig):
         self.config = config
         self.rate_limits: Dict[str, Dict] = {}
@@ -1101,7 +1078,6 @@ class AdaptiveRateLimiter:
             if key not in self.rate_limits:
                 self.rate_limits[key] = {'count': 0, 'window_start': now}
             info = self.rate_limits[key]
-            # Sliding window: reset if window has passed
             if (now - info['window_start']).total_seconds() > 60:
                 info['count'] = 0
                 info['window_start'] = now
@@ -1159,20 +1135,25 @@ class SecurityContext:
         return grant in self.authorization_grants
 
 # ============================================================================
-# DISTILLATION COMPONENTS FOR AUTHENTICATION LEVEL SELECTION
+# DISTILLATION COMPONENTS (Enhanced with more features)
 # ============================================================================
 
 @dataclass
 class AuthState:
-    """State for the distillation agent."""
+    """State for the distillation agent, now with more features."""
     carbon_intensity: float
     carbon_price: float
     helium_price: float
     threat_level: float
-    request_sensitivity: float  # 0-1, based on security level
-    # Historical performance (from logs)
+    request_sensitivity: float  # 0-1
+    # Historical performance
     recent_success_rate: float
     avg_sustainability_score: float
+    # NEW: additional context features
+    request_origin_trusted: float = 0.0  # 1 if trusted origin
+    identity_violation_count: float = 0.0  # normalized
+    current_load: float = 0.0  # 0-1 (request volume relative to limit)
+    time_since_key_rotation: float = 0.0  # in hours, normalized
 
     def to_feature_vector(self) -> np.ndarray:
         features = [
@@ -1183,6 +1164,10 @@ class AuthState:
             self.request_sensitivity,
             self.recent_success_rate,
             self.avg_sustainability_score,
+            self.request_origin_trusted,
+            min(self.identity_violation_count / 10.0, 1.0),
+            self.current_load,
+            min(self.time_since_key_rotation / 24.0, 1.0),
         ]
         return np.array(features, dtype=np.float32)
 
@@ -1190,17 +1175,14 @@ class AuthState:
 class Teacher(ABC):
     @abstractmethod
     def predict(self, state: AuthState) -> np.ndarray:
-        """Return probability vector over 3 auth levels."""
         pass
 
     @abstractmethod
     def confidence(self, state: AuthState) -> float:
-        """Return confidence in prediction [0,1]."""
         pass
 
 
 class AuthRuleBasedTeacher(Teacher):
-    """Rule‑based expert: uses original heuristics."""
     LEVELS = ['light', 'standard', 'enhanced']
 
     def predict(self, state: AuthState) -> np.ndarray:
@@ -1211,18 +1193,19 @@ class AuthRuleBasedTeacher(Teacher):
             probs[2] = 0.8  # enhanced
         elif state.carbon_price > 50 and state.helium_price > 1.0:
             probs[1] = 0.6  # standard
+        elif state.identity_violation_count > 2.0:
+            probs[2] = 0.7  # enhanced due to violations
         else:
             probs[1] = 0.6  # standard default
         return probs / probs.sum()
 
     def confidence(self, state: AuthState) -> float:
-        if state.carbon_intensity > 500:
+        if state.carbon_intensity > 500 or state.identity_violation_count > 2.0:
             return 0.6
         return 0.4
 
 
 class AuthHistoricalMLTeacher(Teacher):
-    """Offline trained classifier from past interactions."""
     def __init__(self, model_path: Optional[Path] = None):
         self.model = None
         self.label_encoder = None
@@ -1247,26 +1230,24 @@ class AuthHistoricalMLTeacher(Teacher):
 
 
 class AuthStatefulQTeacher(Teacher):
-    """Linear Q‑learning with state features."""
-    def __init__(self, lr: float = 0.1):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
         self.lr = lr
-        self.weights = np.zeros((7, 3))  # 7 features, 3 actions
+        self.weights_path = weights_path or Path(ZeroTrustConfig().q_weights_path)
+        self.weights = np.zeros((11, 3))  # 11 features, 3 actions
         self._load_state()
 
     def _load_state(self):
-        path = Path(ZeroTrustConfig().q_weights_path)
-        if path.exists():
+        if self.weights_path.exists():
             try:
-                with open(path, 'r') as f:
+                with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
-                logger.info(f"Loaded Q‑teacher weights from {path}")
+                logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
 
     def _save_state(self):
-        path = Path(ZeroTrustConfig().q_weights_path)
-        with open(path, 'w') as f:
+        with open(self.weights_path, 'w') as f:
             json.dump(self.weights.tolist(), f, indent=2)
 
     def predict(self, state: AuthState) -> np.ndarray:
@@ -1286,7 +1267,7 @@ class AuthStatefulQTeacher(Teacher):
 
 
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 7, n_classes: int = 3, lr: float = 0.01):
+    def __init__(self, feature_dim: int = 11, n_classes: int = 3, lr: float = 0.01):
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
@@ -1311,8 +1292,6 @@ class DistillationStudent:
     def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
                reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
         current_probs = self.predict_proba(state_vector, self.n_classes)
-        logits = state_vector @ self.weights + self.biases
-
         grad_distill = -(teacher_probs - current_probs)
         one_hot = np.zeros(self.n_classes)
         one_hot[action] = 1.0
@@ -1346,24 +1325,28 @@ class ReplayBuffer:
 
 
 class DistillationAuthOptimizer:
-    """
-    Multi‑teacher on‑policy distillation agent for authentication level selection.
-    Levels: light, standard, enhanced.
-    """
     LEVELS = ['light', 'standard', 'enhanced']
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.student = DistillationStudent(
+            feature_dim=11,
+            lr=config.get('distillation_learning_rate', 0.01)
+        )
         self.teachers: List[Teacher] = [
             AuthRuleBasedTeacher(),
-            AuthHistoricalMLTeacher(),
-            AuthStatefulQTeacher()
+            AuthHistoricalMLTeacher(model_path=config.get('historical_model_path')),
+            AuthStatefulQTeacher(
+                lr=config.get('q_learning_rate', 0.1),
+                weights_path=config.get('q_weights_path')
+            )
         ]
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
         self.counter = 0
+        self.distill_weight = config.get('distill_weight', 0.7)
+        self.rl_weight = config.get('rl_weight', 0.3)
 
     async def select_auth_level(self, state: AuthState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
@@ -1404,37 +1387,40 @@ class DistillationAuthOptimizer:
             batch = self.replay_buffer.sample(8)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
+                                    distill_weight=self.distill_weight, rl_weight=self.rl_weight)
 
     def get_stats(self) -> Dict:
         return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
 
 
 # ============================================================================
-# Carbon-Aware Authenticator (Enhanced with Distillation)
+# Carbon-Aware Authenticator (Enhanced with FeedbackEvent and MessageQueue)
 # ============================================================================
 
 class CarbonAwareAuthenticator:
-    def __init__(self, carbon_manager: Optional[CarbonIntensityManager] = None):
+    def __init__(self, carbon_manager: Optional[CarbonIntensityManager] = None,
+                 message_queue: Optional[AsyncMessageQueue] = None):
         self.carbon_manager = carbon_manager
         self.auth_history = deque(maxlen=1000)
         self._lock = asyncio.Lock()
-
-        # NEW: Distillation optimizer
+        self.message_queue = message_queue
         self.auth_optimizer = DistillationAuthOptimizer({
             'distillation_epsilon': ZeroTrustConfig().distillation_epsilon,
             'distillation_train_every': ZeroTrustConfig().distillation_train_every,
             'distillation_replay_size': ZeroTrustConfig().distillation_replay_size,
             'distillation_learning_rate': ZeroTrustConfig().distillation_learning_rate,
+            'distill_weight': ZeroTrustConfig().distill_weight,
+            'rl_weight': ZeroTrustConfig().rl_weight,
+            'historical_model_path': ZeroTrustConfig().historical_model_path,
+            'q_weights_path': ZeroTrustConfig().q_weights_path,
         })
-
-        # Interaction tracking
         self.interaction_log: List[Dict] = []
         self.last_state_vec: Optional[np.ndarray] = None
         self.last_action_idx: Optional[int] = None
         self.last_teacher_probs: Optional[np.ndarray] = None
 
-        logger.info("Carbon-Aware Authenticator initialized with distillation")
+        logger.info("Carbon-Aware Authenticator initialized with distillation, FeedbackEvent, and optional message queue")
 
     async def authenticate_with_carbon_awareness(
         self,
@@ -1445,8 +1431,8 @@ class CarbonAwareAuthenticator:
         helium_price: Optional[float] = None,
         threat_level: float = 0.3,
         request_sensitivity: float = 0.5,
+        extra_state: Optional[Dict] = None,
     ) -> Dict:
-        # Get current prices if not provided
         if carbon_intensity is None and self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
             carbon_price = await self.carbon_manager.get_current_carbon_price()
@@ -1456,7 +1442,7 @@ class CarbonAwareAuthenticator:
 
         helium_price = helium_price or 0.5
 
-        # ---- Distillation: select auth level ----
+        # Build state with extra features if provided
         state = AuthState(
             carbon_intensity=carbon_intensity,
             carbon_price=carbon_price,
@@ -1465,8 +1451,14 @@ class CarbonAwareAuthenticator:
             request_sensitivity=request_sensitivity,
             recent_success_rate=self._get_recent_success_rate(),
             avg_sustainability_score=self._get_avg_sustainability(),
+            request_origin_trusted=extra_state.get('request_origin_trusted', 0.0) if extra_state else 0.0,
+            identity_violation_count=extra_state.get('identity_violation_count', 0.0) if extra_state else 0.0,
+            current_load=extra_state.get('current_load', 0.0) if extra_state else 0.0,
+            time_since_key_rotation=extra_state.get('time_since_key_rotation', 0.0) if extra_state else 0.0,
         )
-        auth_level, action_idx, state_vec, teacher_probs = await self.auth_optimizer.select_auth_level(state, exploration=True)
+        auth_level, action_idx, state_vec, teacher_probs = await self.auth_optimizer.select_auth_level(
+            state, exploration=True
+        )
         self.last_state_vec = state_vec
         self.last_action_idx = action_idx
         self.last_teacher_probs = teacher_probs
@@ -1482,13 +1474,12 @@ class CarbonAwareAuthenticator:
             session_duration = 3600
             sustainability_score = 0.6
             carbon_impact = 'medium'
-        else:  # enhanced
+        else:
             auth_factors = 3
             session_duration = 1800
             sustainability_score = 0.4
             carbon_impact = 'high'
 
-        # Record in history
         async with self._lock:
             self.auth_history.append({
                 'timestamp': datetime.utcnow().isoformat(),
@@ -1499,6 +1490,30 @@ class CarbonAwareAuthenticator:
                 'threat_level': threat_level,
                 'sustainability_score': sustainability_score
             })
+
+        # Emit FeedbackEvent (if available and message queue configured)
+        if FeedbackEvent is not None and self.message_queue is not None:
+            try:
+                event = FeedbackEvent(
+                    source="carbon_aware_authenticator",
+                    feedback_type="routing",  # or "security", but using existing types
+                    task_id=extra_state.get('task_id', 'unknown') if extra_state else 'unknown',
+                    context={"auth_level": auth_level},
+                    action={"selected_action": auth_level,
+                            "selected_rank": 1,
+                            "confidence_score": 0.5},
+                    performance={"quality_score": 0.7,
+                                 "latency_ms": 0,
+                                 "energy_joules": 0,
+                                 "carbon_g": carbon_intensity,
+                                 "helium_cost": helium_price,
+                                 "duration_ms": 0},
+                    adaptive_cost_value=sustainability_score,
+                    tags=["security", "authentication", auth_level],
+                )
+                await self.message_queue.publish("security_events", event.to_json())
+            except Exception as e:
+                logger.warning(f"Failed to publish FeedbackEvent: {e}")
 
         return {
             'authenticated': True,
@@ -1513,10 +1528,6 @@ class CarbonAwareAuthenticator:
         }
 
     async def record_outcome(self, success: bool, carbon_saved_kg: float, sustainability_score: float, latency_ms: float = 0.0):
-        """
-        Record the outcome of an authentication to update the distillation agent.
-        """
-        # Compute reward
         if success:
             reward = 0.6
             reward += 0.2 * min(1.0, carbon_saved_kg / 0.1)
@@ -1525,7 +1536,6 @@ class CarbonAwareAuthenticator:
             reward = 0.0
         reward = max(0.0, min(1.0, reward))
 
-        # Log interaction
         self.interaction_log.append({
             'timestamp': datetime.utcnow().isoformat(),
             'success': success,
@@ -1540,9 +1550,8 @@ class CarbonAwareAuthenticator:
         else:
             df_log.to_csv(log_path, index=False)
 
-        # Update agent
         if self.last_state_vec is not None and self.last_action_idx is not None:
-            next_state_vec = self.last_state_vec  # for simplicity, same state
+            next_state_vec = self.last_state_vec
             await self.auth_optimizer.update(
                 self.last_state_vec,
                 self.last_action_idx,
@@ -1578,12 +1587,13 @@ class CarbonAwareAuthenticator:
             'distillation_stats': self.auth_optimizer.get_stats(),
         }
 
+
 # ============================================================================
-# SecuritySustainability Dashboard (Enhanced with active monitor)
+# SecuritySustainability Dashboard (unchanged except optional queue)
 # ============================================================================
 
 class SecuritySustainabilityDashboard:
-    def __init__(self):
+    def __init__(self, message_queue: Optional[AsyncMessageQueue] = None):
         self.history = []
         self.alert_thresholds = {
             'carbon_intensity': 500,
@@ -1594,14 +1604,12 @@ class SecuritySustainabilityDashboard:
         self._lock = asyncio.Lock()
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self.message_queue = message_queue
         logger.info("Security Sustainability Dashboard initialized")
 
     async def _monitor_loop(self):
-        """Periodically check thresholds and log alerts."""
         while self._running:
             try:
-                # In a real implementation, you would gather metrics and check alerts.
-                # For now, just sleep.
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
@@ -1670,6 +1678,13 @@ class SecuritySustainabilityDashboard:
             if len(self.history) > 1000:
                 self.history = self.history[-1000:]
 
+        # Optionally publish dashboard status
+        if self.message_queue:
+            try:
+                await self.message_queue.publish("sustainability_dashboard", status)
+            except Exception:
+                pass
+
         return status
 
     def generate_sustainability_report(self, status: Dict) -> Dict:
@@ -1717,15 +1732,12 @@ class SecuritySustainabilityDashboard:
                 pass
         logger.info("SecuritySustainabilityDashboard shut down")
 
+
 # ============================================================================
-# Enhanced Zero Trust Architecture (Main Class)
+# Enhanced Zero Trust Architecture (Main Class with new integration points)
 # ============================================================================
 
 class ZeroTrustArchitecture:
-    """
-    Enhanced Zero Trust Security Architecture v4.1.0 with adaptive authentication.
-    """
-
     def __init__(self, config: Optional[ZeroTrustConfig] = None, **kwargs):
         if config is None:
             config = ZeroTrustConfig(**{
@@ -1734,7 +1746,6 @@ class ZeroTrustArchitecture:
             })
         self.config = config
 
-        # Feature flags
         self.enable_carbon_intensity = config.enable_carbon_intensity
         self.enable_helium_tracking = config.enable_helium_tracking
         self.enable_predictive = config.enable_predictive
@@ -1744,27 +1755,30 @@ class ZeroTrustArchitecture:
         self.enable_adaptive_ratelimit = config.enable_adaptive_ratelimit
         self.enable_persistence = config.enable_persistence
         self.enable_telemetry = config.enable_telemetry
+        self.enable_message_queue = config.enable_message_queue
 
-        # Concurrency locks
         self._identity_lock = asyncio.Lock()
         self._session_lock = asyncio.Lock()
         self._audit_lock = asyncio.Lock()
         self._rate_limit_lock = asyncio.Lock()
 
-        # New modules with config
         self.carbon_manager = CarbonIntensityManager(config) if self.enable_carbon_intensity else None
         self.helium_tracker = HeliumSecurityTracker(config) if self.enable_helium_tracking else None
         self.predictive_analyzer = PredictiveSecurityAnalyzer(config) if self.enable_predictive else None
-        self.sustainability_dashboard = SecuritySustainabilityDashboard() if self.enable_sustainability_dashboard else None
-        self.carbon_authenticator = CarbonAwareAuthenticator(self.carbon_manager) if self.enable_carbon_auth else None
         self.ledger = ImmutableSecurityLedger() if self.enable_immutable_ledger else None
         self.rate_limiter = AdaptiveRateLimiter(config) if self.enable_adaptive_ratelimit else None
-
-        # Persistence and telemetry
-        self.persistence = ZeroTrustPersistenceManager(config) if self.enable_persistence else None
         self.telemetry = ZeroTrustTelemetry(config) if self.enable_telemetry else None
 
-        # Core security components
+        # Message queue (if enabled)
+        self.message_queue = None
+        if self.enable_message_queue and AsyncMessageQueue is not None:
+            self.message_queue = AsyncMessageQueue(queue_type="asyncio", max_queue_size=10000)
+
+        self.sustainability_dashboard = SecuritySustainabilityDashboard(self.message_queue) if self.enable_sustainability_dashboard else None
+        self.carbon_authenticator = CarbonAwareAuthenticator(self.carbon_manager, self.message_queue) if self.enable_carbon_auth else None
+
+        self.persistence = ZeroTrustPersistenceManager(config) if self.enable_persistence else None
+
         self.identities: Dict[str, Dict[str, Any]] = {}
         self.identity_keys: Dict[str, rsa.RSAPrivateKey] = {}
         self.access_policies: Dict[str, List[Dict]] = {}
@@ -1777,29 +1791,22 @@ class ZeroTrustArchitecture:
         self.fernet = Fernet(self.master_key)
         self.rate_limits: Dict[str, Dict] = {}
 
-        # Key rotation and revocation
         self._key_rotation_counter = 0
         self._revoked_identities: Set[str] = set()
 
-        # Sustainability tracking
         self.sustainability_score = 0.0
         self.total_carbon_savings_kg = 0.0
 
-        # Background tasks (store for cancellation)
         self._background_tasks: List[asyncio.Task] = []
 
-        # Initialize security infrastructure
         self._initialize_security()
-
-        # Start background tasks
         self._start_background_tasks()
 
-        # Load state if persistence enabled
         if self.enable_persistence and self.persistence:
             self._load_state_task = asyncio.create_task(self._load_state())
             self._background_tasks.append(self._load_state_task)
 
-        logger.info("Enhanced Zero Trust Architecture v4.1.0 initialized with distillation")
+        logger.info("Enhanced Zero Trust Architecture v4.2.0 initialized with distillation, FeedbackEvent, and message queue")
 
     def _start_background_tasks(self):
         if self.enable_carbon_intensity:
@@ -1836,6 +1843,7 @@ class ZeroTrustArchitecture:
                     'rate_limiter': self.rate_limiter is not None,
                     'persistence': self.persistence is not None,
                     'telemetry': True,
+                    'message_queue': self.message_queue is not None,
                 },
                 'active_sessions': active_sessions,
                 'audit_events': len(self.audit_log),
@@ -1882,7 +1890,6 @@ class ZeroTrustArchitecture:
                         })
                     await self.predictive_analyzer.train_prediction_model()
 
-                    # Update rate limiter with threat level
                     if self.rate_limiter:
                         risk_score = await self._calculate_risk_score()
                         self.rate_limiter.update_threat_level(risk_score)
@@ -1967,10 +1974,23 @@ class ZeroTrustArchitecture:
         risk = (violations * 0.6 + auth_failures * 0.4) / max(len(recent), 1)
         return min(1.0, risk)
 
-    # ============================================================================
-    # Enhanced Authentication with Distillation
-    # ============================================================================
+    # New method: provide security context to other modules
+    def get_security_context_for_routing(self) -> Dict:
+        """Return a snapshot of security/sustainability context for external consumers."""
+        context = {
+            'carbon_intensity': self.carbon_manager.carbon_intensity if self.carbon_manager else 400,
+            'carbon_price': self.carbon_manager.carbon_price_usd_per_ton if self.carbon_manager else 50,
+            'helium_price': self.helium_tracker.helium_price_usd_per_l if self.helium_tracker else 0.5,
+            'threat_level': asyncio.run(self._calculate_risk_score()) if self.predictive_analyzer else 0.3,
+            'rate_limit_multiplier': self.rate_limiter.get_current_threat_multiplier() if self.rate_limiter else 1.0,
+            'active_sessions': len(self.active_sessions),
+            'sustainability_score': self.sustainability_score,
+        }
+        return context
 
+    # ============================================================================
+    # Enhanced Authentication
+    # ============================================================================
     async def authenticate_request(
         self,
         request: Dict[str, Any],
@@ -1978,44 +1998,45 @@ class ZeroTrustArchitecture:
     ) -> SecurityContext:
         request_id = self._generate_request_id()
 
-        # Get carbon intensity and price
         carbon_intensity = 400
         carbon_price = 50.0
         if self.carbon_manager:
             carbon_intensity = await self.carbon_manager.get_current_intensity()
             carbon_price = await self.carbon_manager.get_current_carbon_price()
 
-        # Get helium price
         helium_price = 0.5
         if self.helium_tracker:
             helium_price = await self.helium_tracker.get_current_helium_price()
 
-        # Get threat level and request sensitivity
         threat_level = 0.3
         if self.predictive_analyzer:
             risk_pred = await self.predictive_analyzer.predict_security_risk({})
             threat_level = risk_pred.get('predicted_risk', 0.3)
-        request_sensitivity = self._determine_security_level(request).value / 4.0  # normalize to 0-1
+        request_sensitivity = self._determine_security_level(request).value / 4.0
 
-        # ---- Distillation: select auth level ----
+        # Additional state for distillation
+        extra_state = {
+            'request_origin_trusted': 1.0 if request.get('origin') in self.identities.get(credentials.get('identity'), {}).get('trusted_origins', []) else 0.0,
+            'identity_violation_count': self._count_violations(credentials.get('identity', '')),
+            'current_load': len(self.audit_log) / 1000.0,  # rough load indicator
+            'time_since_key_rotation': (datetime.utcnow() - datetime.fromtimestamp(self._key_rotation_counter)).total_seconds() / 3600.0 if self._key_rotation_counter else 0.0,
+            'task_id': request.get('task_id', 'unknown'),
+        }
+
         auth_level = 'standard'
         if self.enable_carbon_auth and self.carbon_authenticator:
             auth_result = await self.carbon_authenticator.authenticate_with_carbon_awareness(
                 request, credentials, carbon_intensity, carbon_price, helium_price,
-                threat_level, request_sensitivity
+                threat_level, request_sensitivity, extra_state
             )
             auth_level = auth_result.get('auth_level', 'standard')
-        else:
-            auth_level = 'standard'
 
-        # Step 1: Validate credentials
         if not await self._validate_credentials(credentials):
             await self._log_security_event(
                 'authentication_failure',
                 request_id,
                 {'reason': 'invalid_credentials'}
             )
-            # Record outcome (failure)
             if self.carbon_authenticator:
                 await self.carbon_authenticator.record_outcome(
                     success=False,
@@ -2024,7 +2045,6 @@ class ZeroTrustArchitecture:
                 )
             raise SecurityException("Invalid credentials")
 
-        # Step 2: Verify identity
         identity = await self._verify_identity(credentials)
         if not identity:
             await self._log_security_event(
@@ -2040,7 +2060,6 @@ class ZeroTrustArchitecture:
                 )
             raise SecurityException("Identity verification failed")
 
-        # Step 3: Risk assessment with price adjustment
         risk_score = await self._assess_risk(request, identity)
         if carbon_price > 100:
             risk_score = min(1.0, risk_score * 1.2)
@@ -2055,7 +2074,6 @@ class ZeroTrustArchitecture:
                     )
                 raise SecurityException("Step-up authentication failed")
 
-        # Step 4: Create security context
         context = SecurityContext(
             request_id=request_id,
             source_identity=identity['id'],
@@ -2068,13 +2086,11 @@ class ZeroTrustArchitecture:
             sustainability_score=0.7
         )
 
-        # Track helium usage
         if self.helium_tracker:
             await self.helium_tracker.record_helium_usage(
                 'authentication', 0.01, 'auth_flow', threat_level
             )
 
-        # Update predictive analyzer
         if self.predictive_analyzer:
             self.predictive_analyzer.update_history({
                 'threat_level': risk_score,
@@ -2085,7 +2101,6 @@ class ZeroTrustArchitecture:
             })
             await self.predictive_analyzer.train_prediction_model()
 
-        # Add to immutable ledger
         if self.ledger:
             self.ledger.add_block({
                 'type': 'authentication_success',
@@ -2103,14 +2118,12 @@ class ZeroTrustArchitecture:
             {'identity': identity['id'], 'risk_score': risk_score, 'auth_level': auth_level}
         )
 
-        # Telemetry
         if self.telemetry:
             self.telemetry.increment('zt_authentications_total')
             self.telemetry.gauge('zt_risk_score', risk_score)
 
-        # ---- Record outcome (success) ----
         if self.carbon_authenticator:
-            carbon_saved = 0.0  # could be computed from auth level selection
+            carbon_saved = 0.0
             await self.carbon_authenticator.record_outcome(
                 success=True,
                 carbon_saved_kg=carbon_saved,
@@ -2120,9 +2133,8 @@ class ZeroTrustArchitecture:
         return context
 
     # ============================================================================
-    # Enhanced Authorization with Adaptive Rate Limiting
+    # Enhanced Authorization (unchanged)
     # ============================================================================
-
     async def authorize_action(
         self,
         context: SecurityContext,
@@ -2130,13 +2142,11 @@ class ZeroTrustArchitecture:
         resource: str,
         expert_type: Optional[str] = None
     ) -> bool:
-        # Get current threat level
         threat_level = 0.3
         if self.predictive_analyzer:
             risk_prediction = await self.predictive_analyzer.predict_security_risk({})
             threat_level = risk_prediction.get('predicted_risk', 0.3)
 
-        # Check adaptive rate limit
         if self.rate_limiter:
             if not await self.rate_limiter.check_rate_limit(context.source_identity, action, threat_level):
                 await self._log_security_event(
@@ -2148,7 +2158,6 @@ class ZeroTrustArchitecture:
                     self.telemetry.increment('zt_rate_limit_throttles')
                 return False
 
-        # Verify context
         if not await self._validate_context(context):
             await self._log_security_event(
                 'invalid_context',
@@ -2165,7 +2174,6 @@ class ZeroTrustArchitecture:
             )
             return False
 
-        # Check grants
         required_grant = f"{action}:{resource}"
         if expert_type:
             required_grant = f"{required_grant}:{expert_type}"
@@ -2178,7 +2186,6 @@ class ZeroTrustArchitecture:
             )
             return False
 
-        # Verify security level
         if not self._verify_security_level(context.security_level, resource):
             await self._log_security_event(
                 'security_level_mismatch',
@@ -2187,13 +2194,11 @@ class ZeroTrustArchitecture:
             )
             return False
 
-        # Track helium usage for authorization
         if self.helium_tracker:
             await self.helium_tracker.record_helium_usage(
                 'authorization', 0.005, 'authz_flow', threat_level
             )
 
-        # Add to immutable ledger
         if self.ledger:
             self.ledger.add_block({
                 'type': 'authorization_success',
@@ -2209,16 +2214,14 @@ class ZeroTrustArchitecture:
             {'action': action, 'resource': resource}
         )
 
-        # Telemetry
         if self.telemetry:
             self.telemetry.increment('zt_authorizations_total')
 
         return True
 
     # ============================================================================
-    # Authentication Helpers (Enhanced with real stubs)
+    # Authentication Helpers (unchanged)
     # ============================================================================
-
     async def _validate_credentials(self, credentials: Dict) -> bool:
         required_fields = ['identity', 'authentication_method']
         if not all(field in credentials for field in required_fields):
@@ -2245,13 +2248,9 @@ class ZeroTrustArchitecture:
             return False
 
     async def _validate_certificate(self, certificate: str) -> bool:
-        # Real implementation: verify X.509 certificate chain.
-        # For demo, just check non‑empty.
         return bool(certificate)
 
     async def _validate_api_key(self, api_key: str) -> bool:
-        # Real implementation: compare stored hash.
-        # For demo, accept any non‑empty key.
         return bool(api_key)
 
     async def _validate_mfa(self, credentials: Dict) -> bool:
@@ -2326,8 +2325,6 @@ class ZeroTrustArchitecture:
         return min(risk_score, 1.0)
 
     async def _perform_step_up_auth(self, identity: Dict) -> bool:
-        # Real implementation: trigger TOTP, SMS, or biometrics.
-        # For demo, always succeed.
         return True
 
     def _determine_security_level(self, request: Dict) -> SecurityLevel:
@@ -2393,8 +2390,6 @@ class ZeroTrustArchitecture:
         return level_hierarchy[context_level] >= level_hierarchy[required_level]
 
     def _verify_totp(self, totp: str) -> bool:
-        # Real implementation: verify TOTP against shared secret.
-        # For demo, accept any 6‑digit.
         return len(totp) == 6 and totp.isdigit()
 
     def _count_recent_requests(self, identity_id: str) -> int:
@@ -2422,9 +2417,8 @@ class ZeroTrustArchitecture:
         return jwt.encode(payload, self.session_key, algorithm='HS256')
 
     # ============================================================================
-    # Secure Communication (Preserved)
+    # Secure Communication (unchanged)
     # ============================================================================
-
     async def secure_expert_communication(
         self,
         source_context: SecurityContext,
@@ -2450,7 +2444,6 @@ class ZeroTrustArchitecture:
             'session_id': source_context.session_id
         }
 
-        # Add to immutable ledger
         if self.ledger:
             self.ledger.add_block({
                 'type': 'secure_communication',
@@ -2486,13 +2479,6 @@ class ZeroTrustArchitecture:
                 return False, None
 
             decrypted_message = await self._decrypt_message(secure_message['payload'])
-
-            # Verify with ledger
-            if self.ledger:
-                latest_block = self.ledger.get_latest_blocks(1)
-                if latest_block and latest_block[0]['data'].get('type') == 'secure_communication':
-                    # Verify integrity with latest block
-                    pass
 
             return True, decrypted_message
 
@@ -2544,13 +2530,10 @@ class ZeroTrustArchitecture:
         return True
 
     # ============================================================================
-    # Key Management (Enhanced)
+    # Key Management (unchanged)
     # ============================================================================
-
     async def rotate_keys(self):
-        """Rotate master keys and invalidate old sessions."""
         logger.info("Rotating master keys")
-        # Generate new keys
         self.root_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=4096
@@ -2559,15 +2542,12 @@ class ZeroTrustArchitecture:
         self.master_key = Fernet.generate_key()
         self.fernet = Fernet(self.master_key)
         self._key_rotation_counter += 1
-        # Invalidate all sessions
         async with self._session_lock:
             self.active_sessions.clear()
         logger.info("Master keys rotated, all sessions invalidated")
 
     async def revoke_identity(self, identity_id: str):
-        """Revoke an identity and invalidate its sessions."""
         self._revoked_identities.add(identity_id)
-        # Remove active sessions
         async with self._session_lock:
             for sid, sess in list(self.active_sessions.items()):
                 if sess['identity_id'] == identity_id:
@@ -2575,9 +2555,8 @@ class ZeroTrustArchitecture:
         logger.info(f"Identity {identity_id} revoked")
 
     # ============================================================================
-    # Security Event Logging (Enhanced)
+    # Security Event Logging (unchanged)
     # ============================================================================
-
     async def _log_security_event(self, event_type: str, request_id: str, details: Dict):
         event = {
             'event_type': event_type,
@@ -2590,7 +2569,6 @@ class ZeroTrustArchitecture:
             if len(self.audit_log) > 10000:
                 self.audit_log = self.audit_log[-10000:]
 
-        # Add to immutable ledger
         if self.ledger:
             self.ledger.add_block({
                 'type': 'security_event',
@@ -2606,9 +2584,8 @@ class ZeroTrustArchitecture:
         logger.warning(f"SECURITY ALERT: {event['event_type']} - {event['details']}")
 
     # ============================================================================
-    # Statistics and Reporting (Enhanced)
+    # Statistics and Reporting (unchanged)
     # ============================================================================
-
     def get_security_posture(self) -> Dict[str, Any]:
         posture = {
             'active_sessions': len(self.active_sessions),
@@ -2624,7 +2601,6 @@ class ZeroTrustArchitecture:
             'last_security_audit': datetime.utcnow().isoformat()
         }
 
-        # Add sustainability metrics
         if self.carbon_manager:
             posture['carbon_intensity'] = asyncio.run(self.carbon_manager.get_current_intensity())
             posture['carbon_price'] = asyncio.run(self.carbon_manager.get_current_carbon_price())
@@ -2647,7 +2623,6 @@ class ZeroTrustArchitecture:
         if self.sustainability_dashboard:
             posture['sustainability_score'] = self.sustainability_score
 
-        # Add distillation stats
         if self.carbon_authenticator:
             posture['distillation_stats'] = self.carbon_authenticator.auth_optimizer.get_stats()
 
@@ -2708,8 +2683,7 @@ class ZeroTrustArchitecture:
             return json.dumps(self.audit_log[-1000:], default=str)
 
     async def shutdown(self):
-        logger.info("Shutting down Zero Trust Architecture v4.1.0")
-        # Cancel background tasks
+        logger.info("Shutting down Zero Trust Architecture v4.2.0")
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
@@ -2722,7 +2696,10 @@ class ZeroTrustArchitecture:
             await self.predictive_analyzer.close()
         if self.sustainability_dashboard:
             await self.sustainability_dashboard.shutdown()
+        if self.message_queue:
+            await self.message_queue.close()
         logger.info("Shutdown complete")
+
 
 # ============================================================================
 # Singleton Accessor
@@ -2739,8 +2716,9 @@ async def get_zero_trust_architecture() -> ZeroTrustArchitecture:
 class SecurityException(Exception):
     pass
 
+
 # ============================================================================
-# UNIT TESTS (Phase 10)
+# UNIT TESTS (Phase 10) - updated for new feature dimension
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -2752,6 +2730,8 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             'distillation_replay_size': 10,
             'distillation_learning_rate': 0.01,
             'distillation_train_every': 10,
+            'distill_weight': 0.7,
+            'rl_weight': 0.3,
         }
         self.optimizer = DistillationAuthOptimizer(self.config)
 
@@ -2766,7 +2746,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             avg_sustainability_score=0.6,
         )
         vec = state.to_feature_vector()
-        self.assertEqual(len(vec), 7)
+        self.assertEqual(len(vec), 11)
 
     def test_rule_based_teacher(self):
         teacher = AuthRuleBasedTeacher()
@@ -2781,7 +2761,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         )
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
-        self.assertGreater(probs[0], probs[1])  # light should be highest
+        self.assertGreater(probs[0], probs[1])
 
     async def test_select_auth_level(self):
         state = AuthState(
@@ -2798,7 +2778,7 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 
     def test_replay_buffer(self):
         buffer = ReplayBuffer(max_size=5)
-        state_vec = np.random.randn(7)
+        state_vec = np.random.randn(11)
         buffer.push(state_vec, 0, 1.0, state_vec, np.ones(3)/3)
         self.assertEqual(len(buffer), 1)
         batch = buffer.sample(1)
@@ -2806,13 +2786,10 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
 
 
 # ============================================================================
-# OFFLINE TRAINING FOR HISTORICAL ML
+# OFFLINE TRAINING FOR HISTORICAL ML (unchanged)
 # ============================================================================
 def train_historical_model(log_path: Path = Path(ZeroTrustConfig().interaction_logs_path),
                            model_path: Path = Path(ZeroTrustConfig().historical_model_path)):
-    """
-    Train a RandomForestClassifier from past interaction logs.
-    """
     if not log_path.exists():
         logger.warning(f"Interaction logs not found at {log_path}. No model trained.")
         return
@@ -2844,7 +2821,7 @@ def train_historical_model(log_path: Path = Path(ZeroTrustConfig().interaction_l
 
 
 # ============================================================================
-# Example Usage
+# Example Usage (unchanged)
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
