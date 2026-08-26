@@ -1,5 +1,5 @@
 """
-TimeTickEngine v3.3 – Enhanced simulation driver with MOPD support.
+TimeTickEngine v3.4 – Enhanced simulation driver with evolutionary MOPD support.
 
 Supports:
 - CSV data loading with validation and configurable date column.
@@ -10,9 +10,10 @@ Supports:
 - Graceful stop via stop() method.
 - Async context manager.
 - **Multi‑policy simulation** for Pareto front generation.
-- **MOPD (Multi‑Objective Pareto Decision)** with configurable weights.
+- **Evolutionary optimization** of policies using NSGA‑II.
+- **Dynamic objective weighting** based on system state.
 - **Persistence of Pareto fronts** in checkpoints.
-- **Telemetry** for MOPD generations and Pareto front sizes.
+- **Parallel policy evaluation** for speed.
 """
 
 import asyncio
@@ -27,6 +28,8 @@ import glob
 from pathlib import Path
 import math
 import hashlib
+import random
+import copy
 
 import pandas as pd
 import numpy as np
@@ -65,6 +68,12 @@ if PYDANTIC_AVAILABLE:
             description="Weights for scalarising Pareto front (must sum to 1)"
         )
         grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
+        population_size: int = Field(20, ge=4)
+        generations: int = Field(5, ge=1)
+        mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
+        crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
+        tournament_size: int = Field(3, ge=2)
+        dynamic_weights: bool = Field(True, description="Enable dynamic weighting based on system state")
 
         @validator('objective_weights')
         def check_weights(cls, v):
@@ -129,6 +138,12 @@ else:
             'helium_saved': 0.2,
         })
         grid_resolution: int = 5
+        population_size: int = 20
+        generations: int = 5
+        mutation_rate: float = 0.2
+        crossover_rate: float = 0.8
+        tournament_size: int = 3
+        dynamic_weights: bool = True
 
     @dataclass
     class TimeTickConfig:
@@ -160,6 +175,7 @@ class HarvesterProtocol(Protocol):
     def set_mode(self, mode: Any) -> None: ...
     async def get_harvesting_stats(self) -> Dict[str, Any]: ...
     def restore_state(self, state: Dict[str, Any]) -> None: ...
+    def set_parameters(self, params: Dict[str, Any]) -> None: ...  # optional, for fine-tuning
 
 class TranslatorProtocol(Protocol):
     """Protocol for translating CSV rows to harvester input."""
@@ -186,7 +202,7 @@ class SimulationState:
     current_policy_id: Optional[str] = None  # if multi‑policy, which one is active
 
 # ============================================================================
-# MOPD Data Classes (NEW)
+# MOPD Data Classes
 # ============================================================================
 @dataclass
 class MOPDPoint:
@@ -194,7 +210,8 @@ class MOPDPoint:
     policy_id: str
     # Decision variables (can be extended)
     harvester_mode: str
-    # Objectives (to be minimised/maximised)
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    # Objectives (to be maximised)
     total_harvested: float
     avg_efficiency: float
     carbon_saved: float
@@ -203,7 +220,8 @@ class MOPDPoint:
     scalarised_score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
@@ -211,9 +229,10 @@ class MOPDPoint:
 
 @dataclass
 class Policy:
-    """A policy defines a simulation scenario with a harvester mode."""
+    """A policy defines a simulation scenario with a harvester mode and tunable parameters."""
     policy_id: str
     harvester_mode: str
+    parameters: Dict[str, Any] = field(default_factory=dict)  # additional parameters to set on harvester
 
 # ============================================================================
 # Metrics Collector (extensible with capped storage)
@@ -331,11 +350,11 @@ class LiveDataFeed:
         self._running = False
 
 # ============================================================================
-# Enhanced TimeTickEngine (with MOPD)
+# Enhanced TimeTickEngine (with Evolutionary MOPD)
 # ============================================================================
 class TimeTickEngine:
     """
-    Enhanced simulation driver with MOPD support for multi‑policy evaluation.
+    Enhanced simulation driver with evolutionary MOPD support.
     """
 
     def __init__(self,
@@ -379,6 +398,7 @@ class TimeTickEngine:
         # MOPD state
         self._mopd_results: Dict[str, Dict[str, Any]] = {}  # policy_id -> metrics summary
         self._pareto_front: List[MOPDPoint] = []
+        self._policy_cache: Dict[Tuple[str, frozenset], MOPDPoint] = {}  # for caching evaluations
 
         # Ensure checkpoint directory exists
         if self.config.enable_checkpointing:
@@ -610,100 +630,114 @@ class TimeTickEngine:
             return None
 
     # ============================================================================
-    # MOPD Multi‑Policy Simulation (NEW)
+    # Enhanced MOPD: Policy Evaluation and Evolutionary Optimization
     # ============================================================================
+    async def evaluate_policy(self, policy: Policy) -> MOPDPoint:
+        """
+        Run a full simulation for a given policy and return the resulting MOPDPoint.
+        The harvester's mode and additional parameters are set temporarily.
+        """
+        # Cache check
+        params_key = (policy.harvester_mode, frozenset(policy.parameters.items()))
+        if params_key in self._policy_cache:
+            return self._policy_cache[params_key]
+
+        # Save original state
+        original_mode = getattr(self.harvester, 'mode', None)
+        original_params = {}
+        if hasattr(self.harvester, 'get_parameters'):
+            try:
+                original_params = self.harvester.get_parameters()
+            except:
+                pass
+
+        try:
+            # Apply policy
+            if hasattr(self.harvester, 'set_mode'):
+                self.harvester.set_mode(policy.harvester_mode)
+            if policy.parameters and hasattr(self.harvester, 'set_parameters'):
+                self.harvester.set_parameters(policy.parameters)
+
+            # Reset metrics for this policy
+            self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
+
+            # Run simulation from start
+            await self.run_simulation(start_index=0)
+
+            # Extract objectives
+            summary = self.metrics.get_summary()
+            # For demonstration, carbon_saved and helium_saved are derived from custom metrics if available
+            carbon_saved = summary.get('avg_carbon_impact', 0.0)
+            helium_saved = summary.get('avg_helium_usage', 0.0)
+
+            point = MOPDPoint(
+                policy_id=policy.policy_id,
+                harvester_mode=policy.harvester_mode,
+                parameters=policy.parameters,
+                total_harvested=summary['total_harvested'],
+                avg_efficiency=summary['avg_efficiency'],
+                carbon_saved=carbon_saved,
+                helium_saved=helium_saved,
+            )
+            self._policy_cache[params_key] = point
+            return point
+
+        except Exception as e:
+            logger.error("Policy %s evaluation failed: %s", policy.policy_id, e)
+            raise
+        finally:
+            # Restore original state
+            if hasattr(self.harvester, 'set_mode') and original_mode is not None:
+                self.harvester.set_mode(original_mode)
+            if original_params and hasattr(self.harvester, 'set_parameters'):
+                self.harvester.set_parameters(original_params)
+
     async def run_multi_policy_simulation(
         self,
         policies: List[Policy],
         post_policy_callback: Optional[Callable[[Policy, Dict[str, Any]], Awaitable[None]]] = None
     ) -> List[MOPDPoint]:
         """
-        Run a simulation for each policy, collect objectives, and generate the Pareto front.
-        The harvester's mode is set for each policy, and the simulation runs from start to end.
-
-        Args:
-            policies: List of Policy objects (each with a harvester_mode).
-            post_policy_callback: Optional callback after each policy completes.
-
-        Returns:
-            List of MOPDPoint objects representing the Pareto front.
+        Run simulations for a list of policies sequentially (or in parallel if possible)
+        and return the Pareto front.
+        This method is kept for backward compatibility.
         """
         if not self.config.mopd.enabled:
-            logger.warning("MOPD is disabled; multi‑policy simulation will not generate Pareto front.")
+            logger.warning("MOPD is disabled; no Pareto front will be generated.")
             return []
 
         if self.config.data_source == 'csv' and self.daily_df is None:
             raise RuntimeError("Data not loaded. Call load_data() first.")
 
-        # Store original harvester mode to restore later
-        original_mode = getattr(self.harvester, 'mode', None)
-
         self._mopd_results = {}
         self._pareto_front = []
 
-        logger.info("Starting multi‑policy simulation with %d policies.", len(policies))
-
-        for policy in policies:
-            logger.info("Running policy: %s (mode: %s)", policy.policy_id, policy.harvester_mode)
-
-            # Set harvester mode
-            if hasattr(self.harvester, 'set_mode'):
-                self.harvester.set_mode(policy.harvester_mode)
-
-            # Reset metrics for this policy
-            self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
-
-            # Run simulation (from start, no checkpoint resuming)
-            try:
-                await self.run_simulation(start_index=0)
-            except Exception as e:
-                logger.error("Policy %s failed: %s", policy.policy_id, e)
+        logger.info("Evaluating %d policies...", len(policies))
+        points = []
+        # Parallel evaluation (if possible)
+        eval_tasks = [self.evaluate_policy(p) for p in policies]
+        results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+        for p, res in zip(policies, results):
+            if isinstance(res, Exception):
+                logger.error("Policy %s failed: %s", p.policy_id, res)
                 continue
+            points.append(res)
 
-            # Extract objectives from metrics
-            summary = self.metrics.get_summary()
-            # Compute carbon savings and helium savings (example: based on custom metrics)
-            carbon_saved = summary.get('avg_carbon_impact', 0.0)  # placeholder
-            helium_saved = summary.get('avg_helium_usage', 0.0)   # placeholder
-
-            # Build MOPDPoint
-            point = MOPDPoint(
-                policy_id=policy.policy_id,
-                harvester_mode=policy.harvester_mode,
-                total_harvested=summary['total_harvested'],
-                avg_efficiency=summary['avg_efficiency'],
-                carbon_saved=carbon_saved,
-                helium_saved=helium_saved,
-            )
-            self._mopd_results[policy.policy_id] = {
-                'metrics': summary,
+        # Update results map for compatibility
+        for point in points:
+            self._mopd_results[point.policy_id] = {
+                'metrics': self.metrics.get_summary(),  # placeholder
                 'point': point,
             }
 
-            if post_policy_callback:
-                try:
-                    if asyncio.iscoroutinefunction(post_policy_callback):
-                        await post_policy_callback(policy, summary)
-                    else:
-                        post_policy_callback(policy, summary)
-                except Exception as e:
-                    logger.error("Post‑policy callback failed: %s", e)
+        # Generate Pareto front
+        self._pareto_front = self._filter_pareto(points)
+        best_plan = self._select_best_from_pareto(self._pareto_front)
+        if best_plan:
+            logger.info("Best policy: %s with scalarised score %.3f",
+                        best_plan.policy_id, best_plan.scalarised_score)
 
-        # Generate Pareto front from all points
-        points = [data['point'] for data in self._mopd_results.values()]
-        if points:
-            self._pareto_front = self._filter_pareto(points)
-            # Select best plan using MOPD weights
-            best_plan = self._select_best_from_pareto(self._pareto_front)
-            if best_plan:
-                logger.info("Best policy: %s with scalarised score %.3f",
-                            best_plan.policy_id, best_plan.scalarised_score)
-
-        # Restore harvester mode
-        if hasattr(self.harvester, 'set_mode') and original_mode is not None:
-            self.harvester.set_mode(original_mode)
-
-        # Save checkpoint with Pareto front
+        # Save checkpoint
         if self.config.enable_checkpointing:
             await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
 
@@ -714,6 +748,48 @@ class TimeTickEngine:
 
         return self._pareto_front
 
+    # ---------- New: Evolutionary Optimization ----------
+    async def run_evolution(self, policy_space: Dict[str, Any] = None):
+        """
+        Evolve policies using NSGA-II over the specified parameter space.
+
+        Args:
+            policy_space: Dictionary describing the parameter space for policies.
+                          Keys are parameter names (e.g., 'harvester_mode', 'conversion_factor',
+                          'repair_rate'). Values are either a list of discrete choices or a tuple
+                          (low, high) for continuous parameters.
+
+        Returns:
+            The Pareto front of evolved policies as a list of MOPDPoint.
+        """
+        if not self.config.mopd.enabled:
+            logger.warning("MOPD is disabled; cannot run evolution.")
+            return []
+
+        if self.config.data_source == 'csv' and self.daily_df is None:
+            raise RuntimeError("Data not loaded. Call load_data() first.")
+
+        # Create an optimizer instance
+        optimizer = NSGAIIOptimizer(
+            engine=self,
+            policy_space=policy_space,
+            population_size=self.config.mopd.population_size,
+            generations=self.config.mopd.generations,
+            mutation_rate=self.config.mopd.mutation_rate,
+            crossover_rate=self.config.mopd.crossover_rate,
+            tournament_size=self.config.mopd.tournament_size,
+            dynamic_weights=self.config.mopd.dynamic_weights,
+            objective_weights=self.config.mopd.objective_weights,
+        )
+        pareto = await optimizer.evolve()
+        self._pareto_front = pareto
+
+        # Save checkpoint
+        if self.config.enable_checkpointing:
+            await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
+
+        return pareto
+
     # ---------- MOPD Helper Methods ----------
     def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
         """Return non‑dominated points."""
@@ -722,7 +798,6 @@ class TimeTickEngine:
 
         pareto = []
         objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
-        # For all objectives, higher is better.
         for i, p_i in enumerate(points):
             dominated = False
             for j, p_j in enumerate(points):
@@ -745,7 +820,6 @@ class TimeTickEngine:
         weights = self.config.mopd.objective_weights
         objective_keys = list(weights.keys())
 
-        # Normalise objectives across Pareto front
         max_vals = {}
         min_vals = {}
         for key in objective_keys:
@@ -760,7 +834,6 @@ class TimeTickEngine:
             score = 0.0
             for key in objective_keys:
                 val = getattr(point, key)
-                # Higher is better, so normalise as (val - min) / range
                 norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
                 weight = weights.get(key, 0.0)
                 score += weight * norm
@@ -791,7 +864,6 @@ class TimeTickEngine:
         metrics_summary = self.metrics.get_summary()
         metrics_data = self.metrics.to_dict()
 
-        # Serialise Pareto front if provided
         pareto_front_dict = None
         if pareto_front is not None:
             pareto_front_dict = [p.to_dict() for p in pareto_front]
@@ -809,7 +881,7 @@ class TimeTickEngine:
             data_hash=self._data_hash,
             timestamp=datetime.now().isoformat(),
             pareto_front=pareto_front_dict,
-            current_policy_id=None  # Not needed for single policy
+            current_policy_id=None
         )
 
         filename = f"simulation_{self.harvester.__class__.__name__}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
@@ -863,7 +935,6 @@ class TimeTickEngine:
                 except Exception as e:
                     logger.warning("Failed to restore harvester state: %s", e)
 
-            # Restore Pareto front if present
             if state.pareto_front:
                 self._pareto_front = [MOPDPoint.from_dict(p) for p in state.pareto_front]
                 logger.info("Restored Pareto front with %d points.", len(self._pareto_front))
@@ -876,7 +947,7 @@ class TimeTickEngine:
             return False
 
     # ============================================================================
-    # Public API – MOPD Query Methods (NEW)
+    # Public API – MOPD Query Methods
     # ============================================================================
     def get_pareto_front(self) -> List[MOPDPoint]:
         """Return the current Pareto front (if any)."""
@@ -916,6 +987,348 @@ class TimeTickEngine:
 
 
 # ============================================================================
+# New: NSGA-II Optimizer for Policy Space
+# ============================================================================
+class NSGAIIOptimizer:
+    """
+    Multi‑objective optimizer using NSGA‑II to evolve policies for the TimeTickEngine.
+    """
+    def __init__(self,
+                 engine: TimeTickEngine,
+                 policy_space: Optional[Dict[str, Any]] = None,
+                 population_size: int = 20,
+                 generations: int = 5,
+                 mutation_rate: float = 0.2,
+                 crossover_rate: float = 0.8,
+                 tournament_size: int = 3,
+                 dynamic_weights: bool = True,
+                 objective_weights: Optional[Dict[str, float]] = None):
+        self.engine = engine
+        self.policy_space = policy_space if policy_space else self._default_policy_space()
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.dynamic_weights = dynamic_weights
+        self.objective_weights = objective_weights or engine.config.mopd.objective_weights
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDPoint] = []
+        self._eval_cache: Dict[Tuple, MOPDPoint] = {}
+
+        # Determine parameter names and types
+        self.param_names = list(self.policy_space.keys())
+        self.discrete_params = {k: v for k, v in self.policy_space.items() if isinstance(v, (list, tuple)) and not isinstance(v[0], (int, float))}
+        self.continuous_params = {k: v for k, v in self.policy_space.items() if isinstance(v, (list, tuple)) and isinstance(v[0], (int, float)) and len(v) == 2}
+
+        # Convert discrete lists of floats/ints to list
+        for k, v in self.policy_space.items():
+            if isinstance(v, list) and not isinstance(v[0], (list, tuple)):
+                self.discrete_params[k] = v
+            elif isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
+                self.continuous_params[k] = v
+
+    def _default_policy_space(self) -> Dict[str, Any]:
+        # Default: mode choices and a few continuous parameters
+        return {
+            'harvester_mode': ['standard', 'aggressive', 'conservative'],
+            'conversion_factor': (0.5, 1.5),
+            'repair_rate': (0.001, 0.02),
+            'sensitivity_multiplier': (0.5, 2.0),
+        }
+
+    def _random_individual(self) -> Dict[str, Any]:
+        ind = {}
+        for name in self.param_names:
+            if name in self.discrete_params:
+                ind[name] = random.choice(self.discrete_params[name])
+            elif name in self.continuous_params:
+                low, high = self.continuous_params[name]
+                ind[name] = random.uniform(low, high)
+        return ind
+
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
+        child = {}
+        for name in self.param_names:
+            if name in self.discrete_params:
+                child[name] = random.choice([parent1[name], parent2[name]])
+            else:
+                low, high = self.continuous_params[name]
+                # SBX
+                if random.random() < 0.5:
+                    u = random.random()
+                    if u <= 0.5:
+                        beta = (2 * u) ** (1 / (20 + 1))
+                    else:
+                        beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                    val = 0.5 * ((1 + beta) * parent1[name] + (1 - beta) * parent2[name])
+                    child[name] = max(low, min(high, val))
+                else:
+                    child[name] = parent1[name] if random.random() < 0.5 else parent2[name]
+        return child
+
+    def _mutate(self, individual: Dict) -> Dict:
+        mutant = copy.deepcopy(individual)
+        for name in self.param_names:
+            if random.random() < self.mutation_rate:
+                if name in self.discrete_params:
+                    mutant[name] = random.choice(self.discrete_params[name])
+                else:
+                    low, high = self.continuous_params[name]
+                    u = random.random()
+                    if u < 0.5:
+                        delta = (2 * u) ** (1 / (20 + 1)) - 1
+                    else:
+                        delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                    mutant[name] = individual[name] + delta * (high - low)
+                    mutant[name] = max(low, min(high, mutant[name]))
+        return mutant
+
+    def _individual_to_policy(self, ind: Dict) -> Policy:
+        policy_id = "evolved_" + hashlib.md5(str(ind).encode()).hexdigest()[:8]
+        mode = ind.get('harvester_mode', 'standard')
+        params = {k: v for k, v in ind.items() if k != 'harvester_mode'}
+        return Policy(policy_id=policy_id, harvester_mode=mode, parameters=params)
+
+    async def _evaluate_individual(self, ind: Dict) -> MOPDPoint:
+        # Cache
+        key = tuple(sorted(ind.items()))
+        if key in self._eval_cache:
+            return self._eval_cache[key]
+        policy = self._individual_to_policy(ind)
+        point = await self.engine.evaluate_policy(policy)
+        self._eval_cache[key] = point
+        return point
+
+    def _fast_non_dominated_sort(self, points: List[MOPDPoint]) -> List[List[MOPDPoint]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+        objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
+
+        for i, p in enumerate(points):
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                p_obj = [getattr(p, k) for k in objective_keys]
+                q_obj = [getattr(q, k) for k in objective_keys]
+                if all(p >= q for p, q in zip(p_obj, q_obj)) and any(p > q for p, q in zip(p_obj, q_obj)):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q >= p for p, q in zip(p_obj, q_obj)) and any(q > p for p, q in zip(p_obj, q_obj)):
+                    domination_count[id(p)] += 1
+
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDPoint]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: getattr(x, obj))
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = getattr(sorted_front[0], obj)
+            obj_max = getattr(sorted_front[-1], obj)
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (getattr(sorted_front[i+1], obj) - getattr(sorted_front[i-1], obj)) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDPoint]], crowding: Dict[int, float]) -> Dict:
+        # Select based on rank and crowding distance
+        # We need mapping from individual dict to point
+        # Build mapping id(point) -> individual dict
+        point_to_ind = {}
+        for ind, point in self._eval_cache.items():
+            point_to_ind[id(point)] = ind
+
+        # Randomly choose two individuals
+        candidates = random.sample(population, self.tournament_size)
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            # Find rank
+            rank = None
+            for fi, front in enumerate(fronts):
+                # front contains MOPDPoint objects; need to find corresponding individual
+                for p in front:
+                    if point_to_ind.get(id(p)) == cand:
+                        rank = fi
+                        break
+                if rank is not None:
+                    break
+            if rank is None:
+                rank = len(fronts)
+            # Get crowding distance
+            cd = crowding.get(id(self._eval_cache.get(tuple(sorted(cand.items())))), 0) if tuple(sorted(cand.items())) in self._eval_cache else 0
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        """Adjust weights based on current system state."""
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights:
+            return weights
+        # Example: if total harvested is low compared to potential, increase weight on total_harvested
+        if self.pareto_front:
+            avg_harvest = np.mean([p.total_harvested for p in self.pareto_front])
+            max_harvest = max([p.total_harvested for p in self.pareto_front])
+            if max_harvest > 0 and avg_harvest < 0.5 * max_harvest:
+                weights['total_harvested'] = min(0.5, weights.get('total_harvested', 0.3) * 1.5)
+                # Normalize
+                total = sum(weights.values())
+                weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    async def evolve(self) -> List[MOPDPoint]:
+        """Run NSGA-II optimization."""
+        population = [self._random_individual() for _ in range(self.population_size)]
+        # Evaluate initial population
+        points = []
+        for ind in population:
+            p = await self._evaluate_individual(ind)
+            points.append(p)
+
+        # Map point to individual for later
+        point_to_ind = {id(p): ind for ind, p in zip(population, points)}
+
+        for gen in range(self.generations):
+            # Create offspring
+            offspring = []
+            # Update population list of individuals (we need mapping)
+            # We'll keep a list of (individual, point)
+            pairs = list(zip(population, points))
+            # Fast non-dominated sort of current points
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection([p[0] for p in pairs], fronts, crowding)
+                parent2 = self._tournament_selection([p[0] for p in pairs], fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+
+            # Evaluate offspring
+            child_points = []
+            for ind in offspring:
+                p = await self._evaluate_individual(ind)
+                child_points.append(p)
+
+            # Combine parent and offspring
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            # Remove duplicates based on individual dict
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+
+            # Non-dominated sorting on combined points
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        # Find corresponding individual
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    # Fill remaining with crowding distance
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+
+            # Update Pareto front (first front)
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: population={len(population)}, Pareto front size={len(self.pareto_front)}")
+
+        # After generations, compute dynamic weights and select best
+        weights = self._compute_dynamic_weights()
+        # Use MODP scalarisation on Pareto front
+        best_point = self._select_best_from_pareto(self.pareto_front, weights)
+        if best_point:
+            # Find corresponding individual and set as best
+            for ind, p in zip(population, points):
+                if p is best_point:
+                    self.best_individual = ind
+                    self.best_fitness = best_point.scalarised_score
+                    break
+        return self.pareto_front
+
+    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint], weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
+        if not pareto_front:
+            return None
+        if weights is None:
+            weights = self.objective_weights
+        objective_keys = list(weights.keys())
+        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
+
+        best = None
+        best_score = -float('inf')
+        for point in pareto_front:
+            score = 0.0
+            for key in objective_keys:
+                val = getattr(point, key)
+                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
+                score += weights.get(key, 0.0) * norm
+            point.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = point
+        return best
+
+
+# ============================================================================
 # Example usage
 # ============================================================================
 if __name__ == "__main__":
@@ -923,22 +1336,29 @@ if __name__ == "__main__":
     class MockHarvester:
         def __init__(self):
             self.mode = "standard"
+            self.parameters = {}
 
         async def harvest_cycle(self, env_data):
-            # Simulate different harvest based on mode
+            # Simulate different harvest based on mode and parameters
+            base = env_data.get('helium_supply', 0.5) * 10
+            factor = 1.0
             if self.mode == "aggressive":
-                multiplier = 1.5
+                factor = 1.5
             elif self.mode == "conservative":
-                multiplier = 0.8
-            else:
-                multiplier = 1.0
+                factor = 0.8
+            if 'conversion_factor' in self.parameters:
+                factor *= self.parameters['conversion_factor']
+            if 'sensitivity_multiplier' in self.parameters:
+                factor *= self.parameters['sensitivity_multiplier']
+            repair_rate = self.parameters.get('repair_rate', 0.01)
+            efficiency = 0.85 * factor * (1 - repair_rate * 10)
             return {
-                'eco_atp_generated': env_data.get('helium_supply', 0.5) * multiplier * 10,
+                'eco_atp_generated': base * factor,
                 'account_balance': 1000,
-                'efficiency': 0.85 * multiplier,
+                'efficiency': efficiency,
                 'mode': self.mode,
-                'carbon_impact': 0.1 * multiplier,
-                'helium_usage': env_data.get('helium_demand', 0.5) * multiplier
+                'carbon_impact': 0.1 * factor,
+                'helium_usage': env_data.get('helium_demand', 0.5) * factor
             }
 
         async def get_harvesting_stats(self):
@@ -949,6 +1369,12 @@ if __name__ == "__main__":
 
         def set_mode(self, mode):
             self.mode = mode
+
+        def set_parameters(self, params):
+            self.parameters = params
+
+        def get_parameters(self):
+            return self.parameters
 
     # Mock translator
     class MockTranslator:
@@ -970,19 +1396,20 @@ if __name__ == "__main__":
         'csv_path': 'helium_data.csv',
         'value_columns': ['helium_supply', 'helium_demand'],
         'interpolation_method': 'linear',
-        'tick_interval_seconds': 0.05,
-        'enable_checkpointing': True,
-        'checkpoint_interval': 50,
+        'tick_interval_seconds': 0.01,
+        'enable_checkpointing': False,
         'metrics_enabled': True,
-        'max_checkpoints': 3,
         'mopd': {
             'enabled': True,
+            'population_size': 8,
+            'generations': 3,
             'objective_weights': {
                 'total_harvested': 0.3,
                 'avg_efficiency': 0.3,
                 'carbon_saved': 0.2,
                 'helium_saved': 0.2,
-            }
+            },
+            'dynamic_weights': True
         }
     }
 
@@ -994,19 +1421,17 @@ if __name__ == "__main__":
         try:
             await engine.load_data()
 
-            # Run single policy simulation (original)
-            # await engine.run_simulation()
-
-            # Run multi‑policy simulation with MOPD
-            policies = [
-                Policy(policy_id="standard", harvester_mode="standard"),
-                Policy(policy_id="aggressive", harvester_mode="aggressive"),
-                Policy(policy_id="conservative", harvester_mode="conservative"),
-            ]
-            pareto_front = await engine.run_multi_policy_simulation(policies)
-            print("Pareto front size:", len(pareto_front))
-            for p in pareto_front:
-                print(f"Policy {p.policy_id}: total_harvested={p.total_harvested:.2f}, avg_efficiency={p.avg_efficiency:.2f}, carbon_saved={p.carbon_saved:.2f}, helium_saved={p.helium_saved:.2f}, scalarised={p.scalarised_score:.3f}")
+            # Run evolutionary optimization
+            policy_space = {
+                'harvester_mode': ['standard', 'aggressive', 'conservative'],
+                'conversion_factor': (0.5, 1.5),
+                'repair_rate': (0.001, 0.02),
+                'sensitivity_multiplier': (0.5, 2.0),
+            }
+            pareto = await engine.run_evolution(policy_space)
+            print("Evolved Pareto front size:", len(pareto))
+            for p in pareto[:5]:
+                print(f"Policy {p.policy_id}: mode={p.harvester_mode}, harvested={p.total_harvested:.2f}, eff={p.avg_efficiency:.2f}")
 
         finally:
             await engine.shutdown()
