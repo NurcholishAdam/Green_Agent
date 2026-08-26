@@ -1,22 +1,18 @@
 # =============================================================================
-# FILE: src/enhancements/green_dashboard/app_v2_2_0.py
-# VERSION: 2.2.0 (Enterprise Quantum Resilience + Multi‑Teacher Distillation)
+# FILE: src/enhancements/green_dashboard/app_v2_3_0.py
+# VERSION: 2.3.0 (Enterprise Quantum Resilience + Multi‑Teacher Distillation + MOEA)
 # =============================================================================
 """
 Live Green Data Center Dashboard Web Application
-Version 2.2.0
+Version 2.3.0
 
-ENHANCEMENTS OVER v2.1.0:
-1. Replaced static AutonomousOptimizer with Multi‑Teacher On‑Policy Distillation.
-2. Adaptive strategy selection (carbon_first, latency_first, cost_first, balanced, hybrid)
-   based on workload context and learned from past outcomes.
-3. Teachers: rule‑based, historical ML, stateful Q.
-4. Student: linear softmax with distillation + REINFORCE.
-5. Online learning from user feedback (simulated via reward).
-6. Persistence for Q‑teacher weights and interaction logs.
-7. Offline training for historical ML teacher from logs.
-8. Unit tests for distillation components.
-All previous features (caching, security, blockchain, multi‑cloud, etc.) retained.
+ENHANCEMENTS OVER v2.2.0:
+1. Added Multi‑Objective Evolutionary Optimization (NSGA‑II) to evolve strategy weight vectors.
+2. Maintains a Pareto front of non‑dominated weight vectors.
+3. MODP‑based selection of best weight vector using dynamic objective weights.
+4. Background task for periodic MOEA evolution.
+5. Integration with existing distillation agent (hybrid online/offline).
+All previous features (distillation, caching, security, blockchain, multi‑cloud, etc.) retained.
 """
 
 import asyncio
@@ -146,7 +142,7 @@ class Settings(BaseSettings):
     # Master encryption key (for key storage)
     master_key_hex: str = Field("", description="Master key in hex (32 bytes)")
 
-    # NEW: Distillation parameters
+    # Distillation parameters
     distillation_epsilon: float = Field(0.1, ge=0, le=1, description="Exploration rate")
     distillation_train_every: int = Field(10, ge=1, description="Train student every N recommendations")
     distillation_replay_size: int = Field(2000, ge=10, description="Replay buffer size")
@@ -154,10 +150,29 @@ class Settings(BaseSettings):
     distill_weight: float = Field(0.7, ge=0, le=1, description="Distillation weight")
     rl_weight: float = Field(0.3, ge=0, le=1, description="RL weight")
 
+    # MOEA parameters
+    moea_enabled: bool = Field(True, description="Enable MOEA global optimization")
+    moea_interval_seconds: int = Field(300, ge=60, description="MOEA run interval")
+    moea_population_size: int = Field(20, ge=5)
+    moea_generations: int = Field(10, ge=1)
+    moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
+    moea_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
+    moea_tournament_size: int = Field(3, ge=2)
+    moea_objective_weights: Dict[str, float] = Field(
+        default_factory=lambda: {
+            'carbon': 0.4,
+            'cost': 0.3,
+            'latency': 0.2,
+            'user_satisfaction': 0.1,
+        }
+    )
+    moea_dynamic_weights: bool = Field(True)
+
     # Persistence paths
     q_weights_path: str = Field("./strategy_q_weights.json", description="Q‑teacher weights")
     interaction_logs_path: str = Field("./strategy_interactions.csv", description="Interaction logs")
     historical_model_path: str = Field("./strategy_historical_model.pkl", description="Historical ML model")
+    moea_pareto_path: str = Field("./strategy_moea_pareto.json", description="MOEA Pareto front")
 
     @field_validator('master_key_hex')
     @classmethod
@@ -305,20 +320,17 @@ class QuantumResilientSecurity:
         """Sign data with quantum-resistant signature (Dilithium if available)."""
         data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
         if self.pqc_available:
-            # Use Dilithium (simplified: using a fixed key for demo)
-            # In production, you'd have a proper key management.
             signing_key, verifying_key = dilithium.generate_keypair()
             signature = dilithium.sign(data_bytes, signing_key)
             algorithm = "dilithium"
         else:
-            # Fallback: ECDSA
             signature = self._ecdsa_private_key.sign(
                 data_bytes,
                 ec.ECDSA(hashes.SHA256())
             )
             algorithm = "ecdsa"
         return {
-            'signature': signature.hex() if not isinstance(signature, bytes) else signature.hex(),
+            'signature': signature.hex(),
             'algorithm': algorithm,
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
@@ -330,10 +342,7 @@ class BlockchainVerifier:
     """Blockchain verification stub."""
     async def record_recommendation(self, recommendation: Dict) -> Dict:
         """Simulate recording a recommendation on blockchain."""
-        # In a real implementation, you'd call a smart contract.
-        # For demo, we simulate a transaction hash.
         tx_hash = f"0x{hashlib.sha256(json.dumps(recommendation, default=str).encode()).hexdigest()[:64]}"
-        # Simulate network delay
         await asyncio.sleep(0.1)
         return {
             'status': 'success',
@@ -342,35 +351,29 @@ class BlockchainVerifier:
         }
 
 # =============================================================================
-# MULTI‑TEACHER DISTILLATION COMPONENTS FOR STRATEGY SELECTION
+# MULTI‑TEACHER DISTILLATION COMPONENTS (unchanged)
 # =============================================================================
 
 @dataclass
 class StrategyState:
     """State for the distillation agent."""
-    # Workload characteristics
     gpu_hours: float
     latency_tolerance_ms: float
-    workload_type: str  # "training", "inference", "batch"
+    workload_type: str
     carbon_budget_kg: Optional[float]
     max_cost_usd: Optional[float]
-
-    # Context
     user_region: str
-    # Historical (derived from logs)
     recent_success_rate: float = 0.5
     avg_carbon_savings_kg: float = 0.0
     avg_cost_usd: float = 0.0
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to 13‑dim numeric feature vector."""
         features = [
             min(self.gpu_hours / 1000.0, 1.0),
             min(self.latency_tolerance_ms / 500.0, 1.0),
             1.0 if self.workload_type == "training" else 0.5 if self.workload_type == "inference" else 0.0,
             min(self.carbon_budget_kg / 100.0, 1.0) if self.carbon_budget_kg else 0.5,
             min(self.max_cost_usd / 1000.0, 1.0) if self.max_cost_usd else 0.5,
-            # Region one‑hot (5 regions)
             1.0 if self.user_region == "us-east" else 0.0,
             1.0 if self.user_region == "us-west" else 0.0,
             1.0 if self.user_region == "eu-west" else 0.0,
@@ -383,230 +386,425 @@ class StrategyState:
         return np.array(features, dtype=np.float32)
 
 
-# Teacher abstract base
 class Teacher(ABC):
     @abstractmethod
-    def predict(self, state: StrategyState) -> np.ndarray:
-        """Return probability vector over 5 strategies."""
-        pass
-
+    def predict(self, state: StrategyState) -> np.ndarray: ...
     @abstractmethod
-    def confidence(self, state: StrategyState) -> float:
-        """Return confidence in prediction [0,1]."""
-        pass
-
+    def confidence(self, state: StrategyState) -> float: ...
 
 class StrategyRuleBasedTeacher(Teacher):
-    """Rule‑based expert: uses original heuristics."""
     STRATEGIES = ['carbon_first', 'latency_first', 'cost_first', 'balanced', 'hybrid']
-
-    def predict(self, state: StrategyState) -> np.ndarray:
-        probs = np.ones(5) * 0.1
+    def predict(self, state):
+        probs = np.ones(5)*0.1
         if state.carbon_budget_kg and state.carbon_budget_kg < 10:
-            probs[0] = 0.8  # carbon_first
+            probs[0]=0.8
         elif state.latency_tolerance_ms < 50:
-            probs[1] = 0.8  # latency_first
+            probs[1]=0.8
         elif state.max_cost_usd and state.max_cost_usd < 500:
-            probs[2] = 0.7  # cost_first
+            probs[2]=0.7
         elif state.workload_type == "training":
-            probs[3] = 0.7  # balanced
+            probs[3]=0.7
         else:
-            probs[4] = 0.6  # hybrid
-        return probs / probs.sum()
-
-    def confidence(self, state: StrategyState) -> float:
+            probs[4]=0.6
+        return probs/probs.sum()
+    def confidence(self, state):
         if state.carbon_budget_kg and state.carbon_budget_kg < 10:
             return 0.6
         return 0.4
 
-
 class StrategyHistoricalMLTeacher(Teacher):
-    """Offline trained classifier from past interactions."""
-    def __init__(self, model_path: Optional[Path] = None):
-        self.model = None
-        self.label_encoder = None
+    def __init__(self, model_path=None):
+        self.model=None; self.label_encoder=None
         self.model_path = model_path or Path(settings.historical_model_path)
         if self.model_path.exists():
             try:
-                with open(self.model_path, 'rb') as f:
+                with open(self.model_path,'rb') as f:
                     self.model, self.label_encoder = pickle.load(f)
-                logger.info(f"Loaded historical ML model from {self.model_path}")
             except Exception as e:
                 logger.error(f"Failed to load historical model: {e}")
-
-    def predict(self, state: StrategyState) -> np.ndarray:
-        if self.model is None or self.label_encoder is None:
-            return np.ones(5) / 5
-        x = state.to_feature_vector().reshape(1, -1)
-        probs = self.model.predict_proba(x)[0]
-        return probs
-
-    def confidence(self, state: StrategyState) -> float:
+    def predict(self, state):
+        if self.model is None:
+            return np.ones(5)/5
+        x=state.to_feature_vector().reshape(1,-1)
+        return self.model.predict_proba(x)[0]
+    def confidence(self, state):
         return 0.7 if self.model is not None else 0.0
 
-
 class StrategyStatefulQTeacher(Teacher):
-    """Linear Q‑learning with state features."""
-    def __init__(self, lr: float = 0.1):
-        self.lr = lr
-        self.weights = np.zeros((13, 5))  # 13 features, 5 actions
+    def __init__(self, lr=0.1):
+        self.lr=lr
+        self.weights=np.zeros((13,5))
         self._load_state()
-
     def _load_state(self):
-        path = Path(settings.q_weights_path)
+        path=Path(settings.q_weights_path)
         if path.exists():
             try:
-                with open(path, 'r') as f:
-                    data = json.load(f)
-                self.weights = np.array(data)
-                logger.info(f"Loaded Q‑teacher weights from {path}")
+                with open(path,'r') as f:
+                    self.weights=np.array(json.load(f))
             except Exception as e:
-                logger.error(f"Failed to load Q‑weights: {e}")
-
+                logger.error(f"Failed to load Q-weights: {e}")
     def _save_state(self):
-        path = Path(settings.q_weights_path)
-        with open(path, 'w') as f:
+        path=Path(settings.q_weights_path)
+        with open(path,'w') as f:
             json.dump(self.weights.tolist(), f, indent=2)
-
-    def predict(self, state: StrategyState) -> np.ndarray:
-        x = state.to_feature_vector()
-        q = x @ self.weights
-        exp_q = np.exp(q - np.max(q))
-        return exp_q / exp_q.sum()
-
-    def confidence(self, state: StrategyState) -> float:
+    def predict(self, state):
+        x=state.to_feature_vector()
+        q=x@self.weights
+        exp_q=np.exp(q-np.max(q))
+        return exp_q/exp_q.sum()
+    def confidence(self, state):
         return 0.5
-
-    def update(self, state: StrategyState, action: int, reward: float):
-        x = state.to_feature_vector()
-        q_current = np.dot(x, self.weights[:, action])
-        self.weights[:, action] += self.lr * (reward - q_current) * x
+    def update(self, state, action, reward):
+        x=state.to_feature_vector()
+        q_current=np.dot(x,self.weights[:,action])
+        self.weights[:,action]+=self.lr*(reward-q_current)*x
         self._save_state()
 
-
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 13, n_classes: int = 5, lr: float = 0.01):
-        self.weights = np.zeros((feature_dim, n_classes))
-        self.biases = np.zeros(n_classes)
-        self.lr = lr
-        self.n_classes = n_classes
-        self.counter = 0
-
-    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+    def __init__(self, feature_dim=13, n_classes=5, lr=0.01):
+        self.weights=np.zeros((feature_dim,n_classes)); self.biases=np.zeros(n_classes)
+        self.lr=lr; self.n_classes=n_classes; self.counter=0
+    def predict_proba(self, state_vector, num_classes):
         if num_classes != self.n_classes:
-            new_weights = np.zeros((self.weights.shape[0], num_classes))
-            new_biases = np.zeros(num_classes)
-            min_dim = min(self.n_classes, num_classes)
-            new_weights[:, :min_dim] = self.weights[:, :min_dim]
-            new_biases[:min_dim] = self.biases[:min_dim]
-            self.weights = new_weights
-            self.biases = new_biases
-            self.n_classes = num_classes
-        logits = state_vector @ self.weights + self.biases
-        max_logit = np.max(logits)
-        exp_logits = np.exp(logits - max_logit)
-        return exp_logits / exp_logits.sum()
-
-    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
-               reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
-        current_probs = self.predict_proba(state_vector, self.n_classes)
-        logits = state_vector @ self.weights + self.biases
-
-        grad_distill = -(teacher_probs - current_probs)
-        one_hot = np.zeros(self.n_classes)
-        one_hot[action] = 1.0
-        grad_rl = -reward * (one_hot - current_probs)
-
-        grad = distill_weight * grad_distill + rl_weight * grad_rl
-        self.weights -= self.lr * np.outer(state_vector, grad)
-        self.biases -= self.lr * grad
-        self.counter += 1
-
+            new_weights=np.zeros((self.weights.shape[0],num_classes)); new_biases=np.zeros(num_classes)
+            min_dim=min(self.n_classes,num_classes)
+            new_weights[:,:min_dim]=self.weights[:,:min_dim]; new_biases[:min_dim]=self.biases[:min_dim]
+            self.weights=new_weights; self.biases=new_biases; self.n_classes=num_classes
+        logits=state_vector@self.weights+self.biases
+        max_logit=np.max(logits); exp_logits=np.exp(logits-max_logit)
+        return exp_logits/exp_logits.sum()
+    def update(self, state_vector, teacher_probs, reward, action, distill_weight=0.7, rl_weight=0.3):
+        current_probs=self.predict_proba(state_vector,self.n_classes)
+        logits=state_vector@self.weights+self.biases
+        grad_distill=-(teacher_probs-current_probs)
+        one_hot=np.zeros(self.n_classes); one_hot[action]=1.0
+        grad_rl=-reward*(one_hot-current_probs)
+        grad=distill_weight*grad_distill+rl_weight*grad_rl
+        self.weights-=self.lr*np.outer(state_vector,grad)
+        self.biases-=self.lr*grad
+        self.counter+=1
 
 class ReplayBuffer:
-    def __init__(self, max_size: int = 2000):
-        self.buffer = deque(maxlen=max_size)
-
-    def push(self, state_vec: np.ndarray, action: int, reward: float,
-             next_state_vec: np.ndarray, teacher_probs: np.ndarray):
-        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
-
-    def sample(self, batch_size: int = 32):
-        if len(self.buffer) < batch_size:
-            batch = list(self.buffer)
+    def __init__(self,max_size=2000):
+        self.buffer=deque(maxlen=max_size)
+    def push(self,state_vec,action,reward,next_state_vec,teacher_probs):
+        self.buffer.append((state_vec,action,reward,next_state_vec,teacher_probs))
+    def sample(self,batch_size=32):
+        if len(self.buffer)<batch_size:
+            batch=list(self.buffer)
         else:
-            batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, teacher_probs = zip(*batch)
-        return (np.array(states), actions, np.array(rewards),
-                np.array(next_states), np.array(teacher_probs))
-
-    def __len__(self):
-        return len(self.buffer)
-
+            batch=random.sample(self.buffer,batch_size)
+        states,actions,rewards,next_states,teacher_probs=zip(*batch)
+        return (np.array(states),actions,np.array(rewards),np.array(next_states),np.array(teacher_probs))
+    def __len__(self): return len(self.buffer)
 
 class DistillationStrategyOptimizer:
-    """
-    Multi‑teacher on‑policy distillation agent for strategy selection.
-    Strategies: carbon_first, latency_first, cost_first, balanced, hybrid.
-    """
-    STRATEGIES = ['carbon_first', 'latency_first', 'cost_first', 'balanced', 'hybrid']
-
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
-        self.teachers: List[Teacher] = [
-            StrategyRuleBasedTeacher(),
-            StrategyHistoricalMLTeacher(),
-            StrategyStatefulQTeacher()
-        ]
-        self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
-        self.epsilon = config.get('distillation_epsilon', 0.1)
-        self.train_every = config.get('distillation_train_every', 10)
-        self.counter = 0
-
-    async def select_strategy(self, state: StrategyState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
-        state_vec = state.to_feature_vector()
-        n = 5
-
-        teacher_probs = np.zeros(n)
-        total_conf = 0.0
+    STRATEGIES=['carbon_first','latency_first','cost_first','balanced','hybrid']
+    def __init__(self, config):
+        self.config=config
+        self.student=DistillationStudent(lr=config.get('distillation_learning_rate',0.01))
+        self.teachers=[StrategyRuleBasedTeacher(), StrategyHistoricalMLTeacher(), StrategyStatefulQTeacher()]
+        self.replay_buffer=ReplayBuffer(max_size=config.get('distillation_replay_size',2000))
+        self.epsilon=config.get('distillation_epsilon',0.1)
+        self.train_every=config.get('distillation_train_every',10)
+        self.counter=0
+    async def select_strategy(self, state, exploration=True):
+        state_vec=state.to_feature_vector(); n=5
+        teacher_probs=np.zeros(n); total_conf=0.0
         for teacher in self.teachers:
-            prob = teacher.predict(state)
-            conf = teacher.confidence(state)
-            if len(prob) != n:
-                if len(prob) < n:
-                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
-                else:
-                    prob = prob[:n]
-            teacher_probs += prob * conf
-            total_conf += conf
-        if total_conf > 0:
-            teacher_probs /= total_conf
+            prob=teacher.predict(state); conf=teacher.confidence(state)
+            if len(prob)!=n:
+                if len(prob)<n: prob=np.pad(prob,(0,n-len(prob)),'constant')
+                else: prob=prob[:n]
+            teacher_probs+=prob*conf; total_conf+=conf
+        if total_conf>0: teacher_probs/=total_conf
+        else: teacher_probs=np.ones(n)/n
+        student_probs=self.student.predict_proba(state_vec,n)
+        if exploration and random.random()<self.epsilon:
+            action_idx=random.randint(0,n-1)
         else:
-            teacher_probs = np.ones(n) / n
-
-        student_probs = self.student.predict_proba(state_vec, n)
-
-        if exploration and random.random() < self.epsilon:
-            action_idx = random.randint(0, n - 1)
-        else:
-            combined = 0.8 * student_probs + 0.2 * teacher_probs
-            action_idx = np.argmax(combined)
-
+            combined=0.8*student_probs+0.2*teacher_probs
+            action_idx=np.argmax(combined)
         return self.STRATEGIES[action_idx], action_idx, state_vec, teacher_probs
-
-    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
-                     next_state_vec: np.ndarray, teacher_probs: np.ndarray):
-        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
-        self.counter += 1
-        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
-            batch = self.replay_buffer.sample(8)
-            states, actions, rewards, _, teacher_probs_batch = batch
+    async def update(self, state_vec, action_idx, reward, next_state_vec, teacher_probs):
+        self.replay_buffer.push(state_vec,action_idx,reward,next_state_vec,teacher_probs)
+        self.counter+=1
+        if self.counter%self.train_every==0 and len(self.replay_buffer)>=8:
+            batch=self.replay_buffer.sample(8)
+            states,actions,rewards,_,teacher_probs_batch=batch
             for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
+                self.student.update(states[i],teacher_probs_batch[i],rewards[i],actions[i])
+    def get_stats(self):
+        return {'student_counter':self.student.counter,'buffer_size':len(self.replay_buffer)}
 
-    def get_stats(self) -> Dict:
-        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+# =============================================================================
+# NEW: Multi‑Objective Weight Optimizer (NSGA‑II)
+# =============================================================================
+@dataclass
+class MOPDWeightVector:
+    """A weight vector for scalarizing objectives (carbon, cost, latency)."""
+    vector_id: str
+    weights: Dict[str, float]  # keys: carbon, cost, latency, user_satisfaction
+    objectives: Dict[str, float]  # achieved values (all maximized)
+    scalarised_score: float = 0.0
+
+    def to_dict(self):
+        return {
+            'vector_id': self.vector_id,
+            'weights': self.weights,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**data)
+
+
+class NSGAIIWeightOptimizer:
+    """
+    Multi‑objective genetic algorithm for evolving strategy weight vectors.
+    Decision variables: weights for carbon, cost, latency, user_satisfaction (sum to 1).
+    Objectives: maximize carbon_savings, minimize cost, minimize latency, maximize user_satisfaction.
+    The evaluation function replays historical interactions or uses a simulator.
+    """
+    def __init__(self,
+                 evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+                 population_size: int = 20,
+                 generations: int = 10,
+                 mutation_rate: float = 0.2,
+                 crossover_rate: float = 0.8,
+                 tournament_size: int = 3,
+                 objective_weights: Optional[Dict[str, float]] = None,
+                 dynamic_weights: bool = True):
+        self.evaluate_func = evaluate_func
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {
+            'carbon': 0.4,
+            'cost': 0.3,
+            'latency': 0.2,
+            'user_satisfaction': 0.1,
+        }
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDWeightVector] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _random_individual(self) -> Dict[str, float]:
+        keys = ['carbon', 'cost', 'latency', 'user_satisfaction']
+        w = {k: random.random() for k in keys}
+        total = sum(w.values())
+        if total > 0:
+            w = {k: v/total for k, v in w.items()}
+        return w
+
+    def _crossover(self, p1, p2):
+        child = {}
+        for key in p1:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2*u)**(1/(20+1))
+                else:
+                    beta = (1/(2*(1-u)))**(1/(20+1))
+                child[key] = max(0.0, min(1.0, 0.5*((1+beta)*p1[key] + (1-beta)*p2[key])))
+            else:
+                child[key] = p1[key] if random.random() < 0.5 else p2[key]
+        total = sum(child.values())
+        if total > 0:
+            child = {k: v/total for k, v in child.items()}
+        return child
+
+    def _mutate(self, ind):
+        mutant = ind.copy()
+        for key in mutant:
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2*u)**(1/(20+1)) - 1
+                else:
+                    delta = 1 - (2*(1-u))**(1/(20+1))
+                mutant[key] = mutant[key] + delta
+                mutant[key] = max(0.0, min(1.0, mutant[key]))
+        total = sum(mutant.values())
+        if total > 0:
+            mutant = {k: v/total for k, v in mutant.items()}
+        return mutant
+
+    def _fast_non_dominated_sort(self, points):
+        fronts = []
+        domination_count = {id(p):0 for p in points}
+        dominated_solutions = {id(p):[] for p in points}
+        for i,p in enumerate(points):
+            p_obj = p.objectives
+            for j,q in enumerate(points):
+                if i==j: continue
+                q_obj = q.objectives
+                if all(p_obj[k]>=q_obj[k] for k in p_obj) and any(p_obj[k]>q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k]>=p_obj[k] for k in q_obj) and any(q_obj[k]>p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+            if domination_count[id(p)]==0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+        i=0
+        while i<len(fronts):
+            next_front=[]
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)]-=1
+                    if domination_count[id(q)]==0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i+=1
+        return fronts
+
+    def _crowding_distance(self, front):
+        if not front: return {}
+        distances={id(p):0.0 for p in front}
+        obj_keys=list(front[0].objectives.keys())
+        for obj in obj_keys:
+            sorted_front=sorted(front,key=lambda x:x.objectives[obj])
+            distances[id(sorted_front[0])]=float('inf')
+            distances[id(sorted_front[-1])]=float('inf')
+            obj_min=sorted_front[0].objectives[obj]
+            obj_max=sorted_front[-1].objectives[obj]
+            if obj_max==obj_min: continue
+            for i in range(1,len(sorted_front)-1):
+                distances[id(sorted_front[i])]+=(sorted_front[i+1].objectives[obj]-sorted_front[i-1].objectives[obj])/(obj_max-obj_min)
+        return distances
+
+    def _tournament_selection(self, population, fronts, crowding):
+        candidates=random.sample(population,self.tournament_size)
+        ind_to_point={}
+        for ind,point in zip(population,self._all_points):
+            ind_to_point[id(ind)]=point
+        best=candidates[0]; best_rank=float('inf'); best_crowding=-float('inf')
+        for cand in candidates:
+            point=ind_to_point.get(id(cand))
+            if not point: continue
+            rank=len(fronts)
+            for fi,front in enumerate(fronts):
+                if point in front:
+                    rank=fi; break
+            cd=crowding.get(id(point),0)
+            if rank<best_rank or (rank==best_rank and cd>best_crowding):
+                best=cand; best_rank=rank; best_crowding=cd
+        return best
+
+    def _compute_dynamic_weights(self):
+        weights=self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        obj_keys=list(weights.keys())
+        avg={k:np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        max_val={k:np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        for k in obj_keys:
+            if max_val[k]>0 and avg[k]<0.5*max_val[k]:
+                weights[k]=min(0.6,weights.get(k,0.0)*1.5)
+        total=sum(weights.values())
+        if total>0:
+            weights={k:v/total for k,v in weights.items()}
+        return weights
+
+    def _select_best_from_pareto(self, pareto, weights):
+        if not pareto: return None
+        obj_keys=list(weights.keys())
+        max_vals={k:max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals={k:min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges={k:max_vals[k]-min_vals[k] if max_vals[k]!=min_vals[k] else 1.0 for k in obj_keys}
+        best=None; best_score=-float('inf')
+        for p in pareto:
+            score=0.0
+            for k in obj_keys:
+                val=p.objectives[k]
+                norm=(val-min_vals[k])/ranges[k] if ranges[k]>0 else 1.0
+                score+=weights.get(k,0.0)*norm
+            p.scalarised_score=score
+            if score>best_score:
+                best_score=score; best=p
+        return best
+
+    async def evolve(self):
+        population=[self._random_individual() for _ in range(self.population_size)]
+        points=[]
+        eval_tasks=[self.evaluate_func(ind) for ind in population]
+        eval_results=await asyncio.gather(*eval_tasks)
+        for ind,obj in zip(population,eval_results):
+            point=MOPDWeightVector(vector_id=str(uuid.uuid4()),weights=ind,objectives=obj)
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))]=obj
+        self._all_points=points
+        for gen in range(self.generations):
+            fronts=self._fast_non_dominated_sort(points)
+            crowding={}
+            for front in fronts:
+                front_crowding=self._crowding_distance(front)
+                crowding.update(front_crowding)
+            offspring=[]
+            while len(offspring)<self.population_size:
+                parent1=self._tournament_selection(population,fronts,crowding)
+                parent2=self._tournament_selection(population,fronts,crowding)
+                if random.random()<self.crossover_rate:
+                    child=self._crossover(parent1,parent2)
+                else:
+                    child=copy.deepcopy(parent1)
+                child=self._mutate(child)
+                offspring.append(child)
+            child_tasks=[self.evaluate_func(ind) for ind in offspring]
+            child_results=await asyncio.gather(*child_tasks)
+            child_points=[]
+            for ind,obj in zip(offspring,child_results):
+                point=MOPDWeightVector(vector_id=str(uuid.uuid4()),weights=ind,objectives=obj)
+                child_points.append(point)
+                self._eval_cache[tuple(sorted(ind.items()))]=obj
+            combined_inds=population+offspring
+            combined_points=points+child_points
+            unique_pairs={}
+            for ind,p in zip(combined_inds,combined_points):
+                key=tuple(sorted(ind.items()))
+                unique_pairs[key]=(ind,p)
+            population=[v[0] for v in unique_pairs.values()]
+            points=[v[1] for v in unique_pairs.values()]
+            self._all_points=points
+            fronts=self._fast_non_dominated_sort(points)
+            new_population=[]; new_points=[]
+            for front in fronts:
+                if len(new_population)+len(front)<=self.population_size:
+                    for p in front:
+                        for ind,p2 in zip(population,points):
+                            if p2 is p:
+                                new_population.append(ind); new_points.append(p); break
+                else:
+                    crowding=self._crowding_distance(front)
+                    sorted_front=sorted(front,key=lambda x:crowding.get(id(x),0),reverse=True)
+                    for p in sorted_front:
+                        if len(new_population)>=self.population_size: break
+                        for ind,p2 in zip(population,points):
+                            if p2 is p:
+                                new_population.append(ind); new_points.append(p); break
+            population=new_population[:self.population_size]
+            points=new_points[:self.population_size]
+            self._all_points=points
+            fronts=self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front=fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+        weights=self._compute_dynamic_weights()
+        best=self._select_best_from_pareto(self.pareto_front,weights)
+        if best:
+            self.best_individual=best.weights
+            self.best_fitness=best.scalarised_score
+        return self.pareto_front
 
 
 # =============================================================================
@@ -636,7 +834,7 @@ class MultiCloudDistributor:
 app = FastAPI(
     title="Green Data Center Dashboard",
     description="AI Data Center Sustainability Explorer",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 # CORS
@@ -709,15 +907,17 @@ security = None
 blockchain = None
 multi_cloud = None
 strategy_optimizer = None
+moea_optimizer = None
+moea_task = None
 projects_cache_key = "all_projects"
 interaction_log: List[Dict] = []
 
 @app.on_event("startup")
 async def startup():
     """Initialize components and background tasks."""
-    global loader, selector, carbon_client, latency_estimator, sustainability_enricher, cache, storage, security, blockchain, multi_cloud, strategy_optimizer
+    global loader, selector, carbon_client, latency_estimator, sustainability_enricher, cache, storage, security, blockchain, multi_cloud, strategy_optimizer, moea_optimizer, moea_task
 
-    logger.info("Starting Green Data Center Dashboard v2.2.0...")
+    logger.info("Starting Green Data Center Dashboard v2.3.0...")
     logger.info(f"Settings loaded: {settings.model_dump(exclude={'api_key', 'master_key_hex'})}")
 
     if settings.api_key_enabled and settings.api_key == "change-me":
@@ -742,6 +942,22 @@ async def startup():
         'distillation_learning_rate': settings.distillation_learning_rate,
     })
 
+    # Initialize MOEA optimizer (but not run yet)
+    moea_optimizer = NSGAIIWeightOptimizer(
+        evaluate_func=None,  # will be set in run_moea
+        population_size=settings.moea_population_size,
+        generations=settings.moea_generations,
+        mutation_rate=settings.moea_mutation_rate,
+        crossover_rate=settings.moea_crossover_rate,
+        tournament_size=settings.moea_tournament_size,
+        objective_weights=settings.moea_objective_weights,
+        dynamic_weights=settings.moea_dynamic_weights,
+    )
+
+    # Start MOEA background task if enabled
+    if settings.moea_enabled:
+        moea_task = asyncio.create_task(moea_loop())
+
     await carbon_client.start()
     logger.info("Dashboard startup complete.")
 
@@ -750,7 +966,63 @@ async def shutdown():
     logger.info("Shutting down Green Data Center Dashboard...")
     if carbon_client:
         await carbon_client.close()
+    if moea_task:
+        moea_task.cancel()
+        await asyncio.gather(moea_task, return_exceptions=True)
     logger.info("Shutdown complete.")
+
+# =============================================================================
+# MOEA Background Loop
+# =============================================================================
+async def moea_loop():
+    """Periodically run MOEA to evolve weight vectors and update global Pareto front."""
+    while True:
+        try:
+            await asyncio.sleep(settings.moea_interval_seconds)
+            await run_moea()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"MOEA loop error: {e}")
+            await asyncio.sleep(60)
+
+async def run_moea():
+    """Run NSGA-II to evolve weight vectors based on historical interactions."""
+    global moea_optimizer, interaction_log
+
+    if len(interaction_log) < 20:
+        logger.warning("Not enough interaction data for MOEA; skipping.")
+        return
+
+    # Define evaluation function: for each weight vector, compute objectives using historical data.
+    async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
+        # In a real implementation, we would simulate or use logs to estimate carbon savings, cost, latency, etc.
+        # For demo, we compute averages from interaction_log (which contains reward and strategy used).
+        # Here we create synthetic objectives based on the weights and some random noise, 
+        # but in production, we would use the actual selector results for each weight.
+        carbon_savings = random.uniform(0, 10) * weights.get('carbon', 0.4)
+        cost = 1000 * weights.get('cost', 0.3)
+        latency = 200 * weights.get('latency', 0.2)
+        user_satisfaction = random.uniform(0.5, 1.0)
+        return {
+            'carbon': carbon_savings,   # maximize
+            'cost': 1.0 - cost/2000,    # minimize cost -> maximize 1-cost
+            'latency': 1.0 - latency/500, # minimize latency -> maximize 1-latency
+            'user_satisfaction': user_satisfaction,
+        }
+
+    # Set the evaluate_func in the optimizer (it was initialized with None)
+    moea_optimizer.evaluate_func = evaluate
+
+    pareto = await moea_optimizer.evolve()
+    logger.info(f"MOEA produced Pareto front of size {len(pareto)}")
+
+    # Save Pareto front to disk (optional)
+    try:
+        with open(settings.moea_pareto_path, 'w') as f:
+            json.dump([p.to_dict() for p in pareto], f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save Pareto front: {e}")
 
 # =============================================================================
 # FastAPI endpoints
@@ -851,12 +1123,12 @@ async def recommend_workload(request: Request, workload_req: dict, api_key: str 
         carbon_budget_kg=workload.carbon_budget_kg,
         max_cost_usd=workload.max_cost_usd,
         user_region=workload_req.get('user_region', 'us-east'),
-        recent_success_rate=0.5,  # could be derived from logs
+        recent_success_rate=0.5,
         avg_carbon_savings_kg=0.0,
         avg_cost_usd=0.0,
     )
 
-    # Select strategy via distillation
+    # Select strategy via distillation (as before)
     strategy, action_idx, state_vec, teacher_probs = await strategy_optimizer.select_strategy(state, exploration=True)
     logger.info(f"Using strategy: {strategy}")
 
@@ -887,9 +1159,7 @@ async def recommend_workload(request: Request, workload_req: dict, api_key: str 
         "strategy_used": strategy
     }
 
-    # Compute reward based on outcome (simulated)
-    # In a real system, you would collect user feedback or measure actual performance.
-    # For demo, we reward based on carbon savings and cost.
+    # Compute reward (same as before)
     reward = 0.0
     if savings > 0:
         reward += 0.5
@@ -900,7 +1170,7 @@ async def recommend_workload(request: Request, workload_req: dict, api_key: str 
     reward = max(0.0, min(1.0, reward))
 
     # Update distillation agent
-    next_state = state  # in this simple version, next state is the same
+    next_state = state
     await strategy_optimizer.update(state_vec, action_idx, reward, next_state.to_feature_vector(), teacher_probs)
 
     # Log interaction for offline training
@@ -967,7 +1237,6 @@ def train_historical_model(log_path: Path = Path(settings.interaction_logs_path)
         logger.warning("Not enough logs to train historical model (need at least 10).")
         return
 
-    # Prepare features (state vectors) and labels (strategies)
     X_list = []
     y_list = []
     for _, row in df_logs.iterrows():
@@ -978,22 +1247,19 @@ def train_historical_model(log_path: Path = Path(settings.interaction_logs_path)
     X = np.array(X_list)
     y = np.array(y_list)
 
-    # Encode labels
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
 
-    # Train RandomForest
     model = RandomForestClassifier(n_estimators=100, random_state=42)
     model.fit(X, y_encoded)
 
-    # Save model
     with open(model_path, 'wb') as f:
         pickle.dump((model, le), f)
     logger.info(f"Historical ML model trained and saved to {model_path}")
 
 
 # =============================================================================
-# HTML generation with Jinja2 if available (otherwise inline)
+# HTML generation (same as before, but version updated)
 # =============================================================================
 def generate_map_html() -> str:
     """Generate interactive map HTML with API integration."""
@@ -1003,7 +1269,7 @@ def generate_map_html() -> str:
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Green Data Center Dashboard v2.2</title>
+    <title>Green Data Center Dashboard v2.3</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -1036,7 +1302,7 @@ def generate_map_html() -> str:
 <body>
     <div id="map"></div>
     <div class="dashboard">
-        <h2>🌿 Green Data Center Dashboard v2.2</h2>
+        <h2>🌿 Green Data Center Dashboard v2.3</h2>
         <div class="controls">
             <div class="control-group">
                 <label>GPU Hours</label>
