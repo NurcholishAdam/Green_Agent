@@ -7,6 +7,8 @@ Provides:
 - A stub implementation for testing (with configurable daily/seasonal patterns).
 - A real implementation that queries ElectricityMap (or other providers) with caching,
   error handling, fallback, and region support.
+- A CarbonIntensityFetcher adapter that exposes async methods compatible with
+  FlexGen/MODP modules (get_current_intensity, forecast_carbon_prices).
 
 Usage:
     Set environment variable CARBON_API_MODE=stub|real.
@@ -18,6 +20,7 @@ import time
 import random
 import json
 import logging
+import asyncio
 from typing import List, Tuple, Optional, Dict, Any
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -27,6 +30,16 @@ try:
 except ImportError:
     requests = None
     logging.warning("requests not installed; RealCarbonAPI will not work.")
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+    import math
+    def sin(x):
+        return math.sin(x)
+    np = None
 
 
 # ----------------------------------------------------------------------
@@ -77,18 +90,21 @@ class CarbonAPIStub(CarbonAPI):
         self.seasonal_amp = seasonal_amplitude
         self.noise_std = noise_std
         self._start_time = start_time or time.time()
+        self._rng = random.Random(42)  # deterministic for testing if needed
 
     def _simulate(self, timestamp: float) -> float:
         """Compute intensity at a given timestamp."""
         # Hours since start
         hours = (timestamp - self._start_time) / 3600.0
-        # Daily cycle (12‑hour period; adjust as needed)
-        daily = self.daily_amp * 0.5 * (1 + np.sin(2 * np.pi * hours / 24))
-        # Seasonal cycle (365 days)
-        days = hours / 24.0
-        seasonal = self.seasonal_amp * 0.5 * (1 + np.sin(2 * np.pi * days / 365))
-        # Noise
-        noise = random.gauss(0, self.noise_std)
+        # Daily cycle (24-hour period)
+        if NUMPY_AVAILABLE:
+            daily = self.daily_amp * 0.5 * (1 + np.sin(2 * np.pi * hours / 24))
+            seasonal = self.seasonal_amp * 0.5 * (1 + np.sin(2 * np.pi * hours / (365 * 24)))
+            noise = self._rng.gauss(0, self.noise_std)
+        else:
+            daily = self.daily_amp * 0.5 * (1 + sin(2 * 3.14159 * hours / 24))
+            seasonal = self.seasonal_amp * 0.5 * (1 + sin(2 * 3.14159 * hours / (365 * 24)))
+            noise = self._rng.gauss(0, self.noise_std)
         return max(50.0, self.base + daily + seasonal + noise)
 
     def get_current(self) -> float:
@@ -178,8 +194,6 @@ class RealCarbonAPI(CarbonAPI):
 
     def get_forecast(self, minutes: int = 60) -> List[Tuple[float, float]]:
         """Get forecast for the next `minutes` (max 24h)."""
-        # ElectricityMap forecast returns data for the next 24h in 5‑min intervals.
-        # We'll fetch the full forecast and filter to the requested horizon.
         endpoint = f"carbon-intensity/forecast"
         params = {"zone": self.region}
         data = self._api_call(endpoint, params)
@@ -220,6 +234,60 @@ def get_carbon_api(mode: Optional[str] = None, **kwargs) -> CarbonAPI:
 
 
 # ----------------------------------------------------------------------
+# CarbonIntensityFetcher adapter for FlexGen / MODP
+# ----------------------------------------------------------------------
+
+class CarbonIntensityFetcher:
+    """
+    Asynchronous wrapper around CarbonAPI that provides the interface expected
+    by FlexGen and MODP modules:
+
+    - `async get_current_intensity()` -> float
+    - `async forecast_carbon_prices(hours)` -> dict with 'status' and 'predictions'
+    """
+    def __init__(self, api: Optional[CarbonAPI] = None, mode: Optional[str] = None, **kwargs):
+        self.api = api or get_carbon_api(mode, **kwargs)
+
+    async def get_current_intensity(self) -> float:
+        """Return current carbon intensity asynchronously."""
+        # Run blocking call in a thread to avoid blocking the event loop
+        return await asyncio.to_thread(self.api.get_current)
+
+    async def forecast_carbon_prices(self, hours: int = 24) -> Dict[str, Any]:
+        """
+        Return a forecast in the format expected by FlexGen MODP:
+        {
+            'status': 'success',
+            'predictions': [float, ...],   # hourly average intensity for next `hours`
+            'timestamps': [float, ...],    # optional Unix timestamps
+            'region': str,                 # optional
+        }
+        """
+        minutes = hours * 60
+        # Fetch forecast with underlying API (blocking)
+        forecast = await asyncio.to_thread(self.api.get_forecast, minutes)
+
+        if not forecast:
+            return {"status": "insufficient_data", "predictions": []}
+
+        # Convert list of (timestamp, intensity) to hourly averages
+        hourly = {}
+        for ts, intensity in forecast:
+            hour_bucket = int(ts // 3600) * 3600
+            hourly.setdefault(hour_bucket, []).append(intensity)
+
+        timestamps = sorted(hourly.keys())
+        predictions = [sum(hourly[ts]) / len(hourly[ts]) for ts in timestamps]
+
+        return {
+            "status": "success",
+            "predictions": predictions,
+            "timestamps": timestamps,
+            "region": getattr(self.api, 'region', 'unknown'),
+        }
+
+
+# ----------------------------------------------------------------------
 # Example usage (when run as script)
 # ----------------------------------------------------------------------
 
@@ -233,6 +301,19 @@ if __name__ == "__main__":
     print("Forecast (stub) first 5 entries:")
     for ts, intensity in api.get_forecast(30)[:5]:
         print(f"  {datetime.fromtimestamp(ts)}: {intensity:.1f}")
+
+    # Demonstrate async fetcher for FlexGen
+    fetcher = CarbonIntensityFetcher(api)
+
+    async def async_demo():
+        current = await fetcher.get_current_intensity()
+        forecast = await fetcher.forecast_carbon_prices(hours=6)
+        print(f"\nAsync current intensity: {current:.1f}")
+        print(f"Async forecast status: {forecast['status']}, points: {len(forecast.get('predictions', []))}")
+        if forecast['predictions']:
+            print(f"First 3 hourly predictions: {[round(p,1) for p in forecast['predictions'][:3]]}")
+
+    asyncio.run(async_demo())
 
     # If you have a real API key, uncomment to test:
     # api_real = get_carbon_api(mode="real", region="DE")
