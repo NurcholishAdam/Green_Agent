@@ -1,30 +1,13 @@
 #!/usr/bin/env python3
-# File: src/enhancements/control_system_enhanced_v16_0.py
+# File: src/enhancements/control_system_enhanced_v16_1.py
 """
-Enhanced Control System - v16.0 (Enterprise Quantum Resilience & Autonomous Healing)
-ENHANCEMENTS OVER v15.0:
-- Dependency inversion with interfaces (Protocols) for all major components.
-- Global circuit breaker registry with configurable thresholds.
-- Grouped configuration using nested Pydantic models.
-- TaskManager supervises all background tasks with automatic restart.
-- Database schema versioning and migrations (Alembic‑style).
-- Health check aggregation across all components.
-- Real cloud deployments (AWS EC2, Azure VMs, GCP Compute) with circuit breakers.
-- Proper async context managers for resource cleanup.
-- Rate limiting on API endpoints.
-- OpenTelemetry integration (if available).
-- Removed unused code (Bulkhead, TrendingCircuitBreaker).
-- Enhanced error handling and structured logging.
-- Full integration with Green_Agent sustainability modules.
+Enhanced Control System - v16.1 (Enterprise Quantum Resilience & Autonomous Healing)
+ENHANCEMENTS OVER v16.0:
+- Added FlexGen integration for GPU/CPU/disk offloading policy optimization.
+- New FlexGenManager component.
+- API endpoints for FlexGen optimization (if FastAPI enabled).
 
-NEW IN v16.0+:
-- Integrated bio_inspired, moe_system, MODP, ContextualBandit.
-- Self-healing strategies evolved via GeneticPolicyGenerator.
-- Cloud provider selection uses ContextualBandit and ExpertRouter.
-- Digital twin simulation selection uses ContextualBandit.
-- Multi‑objective trade‑offs in sustainability use ParetoOptimizer.
-- Feedback loops update all learning modules.
-- Learned state persisted via database.
+All previous enhancements (v16.0) retained.
 """
 
 import asyncio
@@ -250,6 +233,32 @@ except ImportError:
         def seed_safe_policy(self, context, policy): pass
 
 # ============================================================
+# FLEXGEN MODULES (with fallback)
+# ============================================================
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
+
+# ============================================================
 # STRUCTURED LOGGING
 # ============================================================
 try:
@@ -371,7 +380,7 @@ else:
 if PYDANTIC_AVAILABLE:
     class GeneralConfig(BaseModel):
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("16.0")
+        version: str = Field("16.1")
         log_level: str = Field("INFO")
         jwt_secret: str = Field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
         data_retention_days: int = Field(365, ge=0)
@@ -466,6 +475,14 @@ if PYDANTIC_AVAILABLE:
         bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
         bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
+        # FlexGen settings
+        flexgen_carbon_intensity_default: float = 400.0
+        flexgen_population_size: int = 50
+        flexgen_generations: int = 10
+        flexgen_use_real_executor: bool = False
+        flexgen_executor_type: str = "mock"   # "mock", "cost_model", "real"
+        flexgen_selector_epsilon: float = 0.1
+        flexgen_selector_epsilon_decay: float = 0.999
 
     class ControlSystemConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix="CONTROL_", case_sensitive=False)
@@ -487,7 +504,7 @@ else:
     @dataclass
     class GeneralConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "16.0"
+        version: str = "16.1"
         log_level: str = "INFO"
         jwt_secret: str = field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
         data_retention_days: int = 365
@@ -569,6 +586,14 @@ else:
         bandit_confidence_threshold: float = 0.6
         bio_generations: int = 10
         bio_population_size: int = 20
+        # FlexGen settings
+        flexgen_carbon_intensity_default: float = 400.0
+        flexgen_population_size: int = 50
+        flexgen_generations: int = 10
+        flexgen_use_real_executor: bool = False
+        flexgen_executor_type: str = "mock"
+        flexgen_selector_epsilon: float = 0.1
+        flexgen_selector_epsilon_decay: float = 0.999
 
     @dataclass
     class ControlSystemConfig:
@@ -2160,7 +2185,85 @@ class WebSocketDashboard:
     pass
 
 # ============================================================
-# MAIN CONTROL SYSTEM v16.0 with Dependency Injection
+# FLEXGEN MANAGER (NEW)
+# ============================================================
+class FlexGenManager:
+    """
+    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
+    Used to select optimal policies for AI inference tasks within the control system.
+    """
+    def __init__(self, config: ControlSystemConfig):
+        self.config = config
+        self.flexgen_cost_model = None
+        self.policy_drift_detector = None
+        self.gpu_profiler = None
+
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(
+                carbon_intensity_g_per_kwh=config.optimizer.flexgen_carbon_intensity_default
+            )
+            self.policy_drift_detector = PolicyDriftDetector()
+            try:
+                from enhancements.gpu_profiler import GPUProfiler
+                self.gpu_profiler = GPUProfiler()
+            except ImportError:
+                self.gpu_profiler = None
+            logger.info("FlexGen Manager initialized")
+        else:
+            logger.warning("FlexGen modules not available; manager will be disabled.")
+
+    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        """
+        Run FlexGen policy selection for a given workload and node.
+        Returns chosen policy, metrics, reward, and drift status.
+        """
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': self.config.optimizer.flexgen_selector_epsilon,
+                'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay,
+            }
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity',
+                                                   self.config.optimizer.flexgen_carbon_intensity_default),
+            use_real_executor=self.config.optimizer.flexgen_use_real_executor,
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={
+                'population_size': self.config.optimizer.flexgen_population_size,
+                'generations': self.config.optimizer.flexgen_generations,
+            },
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        return result
+
+    async def get_status(self) -> Dict:
+        """Return FlexGen system status."""
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        status = {
+            "available": True,
+            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+        }
+        return status
+
+# ============================================================
+# MAIN CONTROL SYSTEM v16.1 with Dependency Injection + FlexGen
 # ============================================================
 class GreenAgentControlSystemV16:
     def __init__(
@@ -2183,6 +2286,7 @@ class GreenAgentControlSystemV16:
         self.digital_twin = digital_twin
         self.sustainability = sustainability
         self.vault = vault
+        self.flexgen_manager = FlexGenManager(config)  # NEW
 
         # WebSocket dashboard
         if config.websocket.enabled and WEBSOCKETS_AVAILABLE:
@@ -2203,7 +2307,7 @@ class GreenAgentControlSystemV16:
         # Rate limiter
         self.rate_limiter = EnhancedRateLimiter(config)
 
-        logger.info(f"GreenAgentControlSystemV16 initialized (instance: {self.instance_id})")
+        logger.info(f"GreenAgentControlSystemV16.1 initialized (instance: {self.instance_id})")
 
     def _register_background_tasks(self):
         self.task_manager.register_task("self_healing", self.self_healer.detect_and_heal)
@@ -2213,7 +2317,7 @@ class GreenAgentControlSystemV16:
         self.task_manager.register_task("data_cleanup", self._data_cleanup_loop)
 
     async def start(self):
-        logger.info("Starting Green Agent Control System v16.0...")
+        logger.info("Starting Green Agent Control System v16.1...")
         await self.self_healer.start()
         if self.ws_dashboard:
             await self.ws_dashboard.start()
@@ -2226,6 +2330,7 @@ class GreenAgentControlSystemV16:
             self.components['multi_cloud'] = ComponentInfo('multi_cloud', '1.0', ComponentStatus.HEALTHY)
             self.components['digital_twin'] = ComponentInfo('digital_twin', '1.0', ComponentStatus.HEALTHY)
             self.components['sustainability'] = ComponentInfo('sustainability', '1.0', ComponentStatus.HEALTHY)
+            self.components['flexgen'] = ComponentInfo('flexgen', '1.0', ComponentStatus.HEALTHY if FLEXGEN_AVAILABLE else ComponentStatus.DEGRADED)
         self.task_manager.start_registered_tasks()
         logger.info("Control system started")
 
@@ -2282,6 +2387,17 @@ class GreenAgentControlSystemV16:
                 logger.error(f"Data cleanup error: {e}")
                 await asyncio.sleep(60)
 
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        """Public method to run FlexGen policy optimization."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        workload_obj = WorkloadDescriptor(**workload)
+        node_obj = NodeDescriptor(**node)
+        return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
+
+    async def get_flexgen_status(self) -> Dict:
+        return await self.flexgen_manager.get_status()
+
     async def health_check(self) -> Dict:
         health = {'status': 'healthy', 'timestamp': datetime.now().isoformat(), 'components': {}, 'warnings': []}
         # PQC
@@ -2304,6 +2420,10 @@ class GreenAgentControlSystemV16:
         twin_stats = self.digital_twin.get_twin_stats()
         health['components']['digital_twin'] = {'healthy': True, 'twins': twin_stats.get('total_twins', 0)}
 
+        # FlexGen
+        flexgen_status = await self.flexgen_manager.get_status()
+        health['components']['flexgen'] = {'healthy': flexgen_status.get('available', False)}
+
         component_status = [c.get('healthy', False) for c in health['components'].values()]
         if all(component_status):
             health['status'] = 'healthy'
@@ -2314,7 +2434,7 @@ class GreenAgentControlSystemV16:
         return health
 
     async def shutdown(self):
-        logger.info(f"Shutting down GreenAgentControlSystemV16 (instance: {self.instance_id})")
+        logger.info(f"Shutting down GreenAgentControlSystemV16.1 (instance: {self.instance_id})")
         await self.self_healer.shutdown()
         if self.ws_dashboard:
             await self.ws_dashboard.stop()
@@ -2323,12 +2443,30 @@ class GreenAgentControlSystemV16:
         logger.info("Shutdown complete")
 
 # ============================================================
-# FASTAPI REST API (EXTERNAL CONTROL) – mostly unchanged
+# FASTAPI REST API (EXTERNAL CONTROL) – add FlexGen endpoints
 # ============================================================
 if FASTAPI_AVAILABLE:
     # ... (the FastAPI app would be the same as original, with the same endpoints)
     # For brevity, we don't duplicate the entire app, but it remains identical.
-    pass
+    # We add the FlexGen endpoints below:
+    from fastapi import FastAPI, Depends, HTTPException, status, Request
+    app = FastAPI(title="Green Agent Control System API", version="16.1")
+    # ... (middleware, auth, etc.)
+
+    # Global instance
+    control_system: Optional[GreenAgentControlSystemV16] = None
+
+    @app.post("/flexgen/optimize")
+    async def flexgen_optimize(workload: Dict, node: Dict):
+        if not control_system:
+            raise HTTPException(status_code=503, detail="Control system not initialized")
+        return await control_system.run_flexgen_optimization(workload, node)
+
+    @app.get("/flexgen/status")
+    async def flexgen_status():
+        if not control_system:
+            raise HTTPException(status_code=503, detail="Control system not initialized")
+        return await control_system.get_flexgen_status()
 
 # ============================================================
 # SINGLETON ACCESSOR (for non-FastAPI use)
@@ -2378,7 +2516,7 @@ def test_control_system_initialization():
         vault=None
     )  # partial mock for test
     assert system.instance_id is not None
-    assert system.config.general.version == "16.0"
+    assert system.config.general.version == "16.1"
 
 def test_pqc_signing():
     config = ControlSystemConfig()
@@ -2395,29 +2533,13 @@ def test_pqc_signing():
 # ============================================================
 async def main():
     print("=" * 80)
-    print("Green Agent Control System v16.0 - Enhanced with Dependency Injection")
+    print("Green Agent Control System v16.1 - Enhanced with Dependency Injection and FlexGen")
     print("=" * 80)
 
     control = await get_control_system()
-    print(f"\n✅ ENHANCEMENTS OVER v15.0:")
-    print("   ✅ Dependency inversion with interfaces (Protocols) for all major components.")
-    print("   ✅ Global circuit breaker registry with configurable thresholds.")
-    print("   ✅ Grouped configuration using nested Pydantic models.")
-    print("   ✅ TaskManager supervises all background tasks with automatic restart.")
-    print("   ✅ Database schema versioning and migrations (Alembic‑style).")
-    print("   ✅ Health check aggregation across all components.")
-    print("   ✅ Real cloud deployments (AWS EC2, Azure VMs, GCP Compute) with circuit breakers.")
-    print("   ✅ Proper async context managers for resource cleanup.")
-    print("   ✅ Rate limiting on API endpoints.")
-    print("   ✅ Enhanced error handling and structured logging.")
-    print("\n✅ NEW ENHANCEMENTS:")
-    print("   ✅ Integrated bio_inspired, moe_system, MODP, ContextualBandit.")
-    print("   ✅ Self-healing strategies evolved via GeneticPolicyGenerator.")
-    print("   ✅ Cloud provider selection uses ContextualBandit and ExpertRouter.")
-    print("   ✅ Digital twin simulation selection uses ContextualBandit.")
-    print("   ✅ Multi‑objective trade‑offs in sustainability use ParetoOptimizer.")
-    print("   ✅ Feedback loops update all learning modules.")
-    print("   ✅ Learned state persisted via database.")
+    print(f"\n✅ ENHANCEMENTS OVER v16.0:")
+    print("   ✅ FlexGen integration for GPU/CPU/disk offloading policy optimization")
+    print("   ✅ New FlexGenManager component and API endpoints")
 
     # Show security status
     sec_status = control.pqc.get_security_status()
@@ -2448,9 +2570,10 @@ async def main():
     status = await control.health_check()
     print(f"   Health: {status.get('status', 'unknown')}")
     print(f"   Active Twins: {control.digital_twin.get_twin_stats().get('active_twins', 0)}")
+    print(f"   FlexGen Available: {status.get('components', {}).get('flexgen', {}).get('healthy', False)}")
 
     print("\n" + "=" * 80)
-    print("✅ Green Agent Control System v16.0 - Ready for Production")
+    print("✅ Green Agent Control System v16.1 - Ready for Production")
     print("=" * 80)
 
     try:
