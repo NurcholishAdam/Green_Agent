@@ -26,6 +26,7 @@ NEW IN v17.0.0+ (ENHANCED WITH bio_inspired, moe_system, MODP):
 - Feedback loop for continuous online learning.
 - Periodic strategy evolution in background tasks.
 - New API endpoints for optimization and feedback.
+- FlexGen integration for GPU/CPU/disk offloading policy optimization (new).
 """
 
 import asyncio
@@ -233,6 +234,30 @@ except ImportError:
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
 
+# FlexGen modules (with fallback)
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
+
 # -----------------------------------------------------------------------------
 # Configuration & Logging
 # -----------------------------------------------------------------------------
@@ -393,6 +418,14 @@ if PYDANTIC_AVAILABLE:
         bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
         bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
+        # FlexGen settings
+        flexgen_carbon_intensity_default: float = 400.0
+        flexgen_population_size: int = 50
+        flexgen_generations: int = 10
+        flexgen_use_real_executor: bool = False
+        flexgen_executor_type: str = "mock"   # "mock", "cost_model", "real"
+        flexgen_selector_epsilon: float = 0.1
+        flexgen_selector_epsilon_decay: float = 0.999
 
     class VerificationConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix='VERIFICATION_', case_sensitive=False)
@@ -442,6 +475,14 @@ else:
         bandit_confidence_threshold: float = 0.6
         bio_generations: int = 10
         bio_population_size: int = 20
+        # FlexGen settings
+        flexgen_carbon_intensity_default: float = 400.0
+        flexgen_population_size: int = 50
+        flexgen_generations: int = 10
+        flexgen_use_real_executor: bool = False
+        flexgen_executor_type: str = "mock"
+        flexgen_selector_epsilon: float = 0.1
+        flexgen_selector_epsilon_decay: float = 0.999
 
     @dataclass
     class DatabaseConfig:
@@ -753,8 +794,6 @@ class ICloudDistributor(Protocol):
 # -----------------------------------------------------------------------------
 # IMPLEMENTATIONS (Simplified for brevity; in real code they would be full classes)
 # -----------------------------------------------------------------------------
-# (We'll provide stubs with comments indicating they are updated to implement interfaces)
-
 class AsyncDatabaseManager(IVerificationStorage):
     # ... full implementation with schema versioning (migration added)
     def __init__(self, config: VerificationConfig):
@@ -775,7 +814,6 @@ class AsyncDatabaseManager(IVerificationStorage):
             self._initialized = True
 
     async def _apply_migrations(self, conn):
-        # Create schema_version table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY,
@@ -788,7 +826,6 @@ class AsyncDatabaseManager(IVerificationStorage):
         current_ver = row[0] if row else 0
 
         if current_ver < 1:
-            # Create all tables (as before)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS verifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -864,11 +901,9 @@ class AsyncDatabaseManager(IVerificationStorage):
             current_ver = 1
 
         if current_ver < 2:
-            # Example migration: add index
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_verifications_batch_id ON verifications(batch_id)")
             await conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))")
             await conn.commit()
-        # ... additional migrations as needed
 
     # ... all other methods (save_verification, etc.) remain the same
 
@@ -932,15 +967,6 @@ class AutonomousVerificationOptimizer:
 
         # State for learning
         self.recent_rewards = deque(maxlen=100)
-        self._load_state()
-
-    async def _load_state(self):
-        """Load bandit and MODP state from storage (if persistent)."""
-        # In production, we'd query optimization_history or a dedicated state table.
-        pass
-
-    async def _save_state(self):
-        pass
 
     async def select_strategy(self, context: Dict) -> Dict:
         """
@@ -960,7 +986,6 @@ class AutonomousVerificationOptimizer:
             strategy = self._fallback_strategy(context)
 
         # Compute MODP utility (to be used as reward after execution)
-        # We'll compute it from the current context (e.g., carbon intensity, gas price, latency)
         objectives = {
             "carbon": context.get("carbon_intensity", 400) / 1000,
             "gas": context.get("gas_price_gwei", 50) / 200,
@@ -976,9 +1001,6 @@ class AutonomousVerificationOptimizer:
             'utility': utility,
             'timestamp': datetime.now().isoformat()
         }
-
-        # Store in optimization_history (if we have storage)
-        # self.storage.save_optimization(strategy['name'], result)
 
         AUTONOMOUS_OPTIMIZATIONS.labels(strategy=strategy['name'], status='selected').inc()
         return result
@@ -1009,7 +1031,6 @@ class AutonomousVerificationOptimizer:
             return []
         # Use a fitness function based on recent rewards
         def fitness(policy):
-            # In practice, evaluate policy on historical data.
             return np.mean(self.recent_rewards) if self.recent_rewards else 0.5
 
         new_strategies = self.bio.evolve(
@@ -1025,10 +1046,86 @@ class AutonomousVerificationOptimizer:
 
     def get_optimization_stats(self) -> Dict:
         return {
-            'total_optimizations': 0,  # would fetch from storage
+            'total_optimizations': 0,
             'strategies': [s['name'] for s in self.action_space],
             'recent_rewards': list(self.recent_rewards),
         }
+
+# -----------------------------------------------------------------------------
+# FLEXGEN MANAGER (NEW)
+# -----------------------------------------------------------------------------
+class FlexGenManager:
+    """
+    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
+    Used to select optimal policies for AI model inference tasks (e.g., purity prediction).
+    """
+    def __init__(self, config: VerificationConfig):
+        self.config = config
+        self.flexgen_cost_model = None
+        self.policy_drift_detector = None
+        self.gpu_profiler = None
+
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(
+                carbon_intensity_g_per_kwh=config.optimizer.flexgen_carbon_intensity_default
+            )
+            self.policy_drift_detector = PolicyDriftDetector()
+            try:
+                from enhancements.gpu_profiler import GPUProfiler
+                self.gpu_profiler = GPUProfiler()
+            except ImportError:
+                self.gpu_profiler = None
+            logger.info("FlexGen Manager initialized")
+        else:
+            logger.warning("FlexGen modules not available; manager will be disabled.")
+
+    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        """
+        Run FlexGen policy selection for a given workload and node.
+        Returns chosen policy, metrics, reward, and drift status.
+        """
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': self.config.optimizer.flexgen_selector_epsilon,
+                'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay,
+            }
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity', self.config.optimizer.flexgen_carbon_intensity_default),
+            use_real_executor=self.config.optimizer.flexgen_use_real_executor,
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={
+                'population_size': self.config.optimizer.flexgen_population_size,
+                'generations': self.config.optimizer.flexgen_generations,
+            },
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        return result
+
+    async def get_status(self) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        status = {
+            "available": True,
+            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+        }
+        return status
 
 # -----------------------------------------------------------------------------
 # ENHANCED VERIFICATION MANAGER v17.0.0 with Dependency Injection
@@ -1054,6 +1151,7 @@ class EnhancedVerificationManagerV17:
         # Other components
         self.quantum_security = QuantumResilientVerificationSecurity(storage)
         self.autonomous_optimizer = AutonomousVerificationOptimizer(config, storage)  # Enhanced!
+        self.flexgen_manager = FlexGenManager(config)  # NEW
         self.monitor = RealTimeVerificationMonitor(config)
         self.dashboard = VerificationAnalyticsDashboard()
         self.health_scorer = VerificationHealthScorer()
@@ -1085,6 +1183,7 @@ class EnhancedVerificationManagerV17:
         logger.info("  ✅ Database migrations and schema versioning.")
         logger.info("  ✅ Grouped configuration.")
         logger.info("  ✅ Enhanced AutonomousVerificationOptimizer with ContextualBandit, MODP, MoE, and Bio‑inspired evolution.")
+        logger.info("  ✅ FlexGen Manager for GPU/CPU/disk offloading policy optimization.")
 
     def _register_background_tasks(self):
         self.task_manager.register_task("health_check", self._health_check_loop)
@@ -1096,7 +1195,6 @@ class EnhancedVerificationManagerV17:
         self.task_manager.register_task("blockchain_integrity", self._blockchain_integrity_loop)
         self.task_manager.register_task("auto_optimize", self._auto_optimize_loop)
         self.task_manager.register_task("cloud_sync", self._cloud_sync_loop)
-        # New task: evolve strategies periodically
         self.task_manager.register_task("evolve_strategies", self._evolve_strategies_loop)
 
     async def start(self):
@@ -1107,7 +1205,6 @@ class EnhancedVerificationManagerV17:
         self.task_manager.start_registered_tasks()
         logger.info(f"Verification manager started with {len(self.task_manager.tasks)} background tasks")
 
-    # Background loop implementations (use the same as before, but now managed by TaskManager)
     async def _health_check_loop(self):
         while not self.task_manager.shutdown_event.is_set():
             try:
@@ -1127,19 +1224,16 @@ class EnhancedVerificationManagerV17:
                 await asyncio.sleep(3600)
 
     async def _auto_optimize_loop(self):
-        """Background task to periodically re-optimize strategy selection (if needed)."""
         while not self.task_manager.shutdown_event.is_set():
             try:
-                # This could trigger re-evaluation of current strategies
                 await asyncio.sleep(600)
             except Exception as e:
                 logger.error(f"Auto optimize error: {e}")
                 await asyncio.sleep(60)
 
     async def _evolve_strategies_loop(self):
-        """Periodically trigger bio‑inspired evolution of verification strategies."""
         while not self.task_manager.shutdown_event.is_set():
-            await asyncio.sleep(3600)  # every hour
+            await asyncio.sleep(3600)
             try:
                 if ENHANCEMENTS_AVAILABLE and self.autonomous_optimizer.bio:
                     new_strategies = await self.autonomous_optimizer.evolve_strategies()
@@ -1188,15 +1282,22 @@ class EnhancedVerificationManagerV17:
 
     # New methods for optimization
     async def select_verification_strategy(self, context: Dict) -> Dict:
-        """Public API to get the best verification strategy for a given context."""
         return await self.autonomous_optimizer.select_strategy(context)
 
     async def update_verification_feedback(self, context: Dict, strategy: Dict, reward: float):
-        """Public API to provide feedback on a verification outcome."""
         await self.autonomous_optimizer.update_feedback(context, strategy, reward)
 
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        workload_obj = WorkloadDescriptor(**workload)
+        node_obj = NodeDescriptor(**node)
+        return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
+
+    async def get_flexgen_status(self) -> Dict:
+        return await self.flexgen_manager.get_status()
+
     async def health_check(self) -> Dict:
-        # Aggregated health check using injected dependencies
         health_score = 100
         # ... (similar to v16)
         return {
@@ -1229,14 +1330,11 @@ if FASTAPI_AVAILABLE:
 
     manager: Optional[EnhancedVerificationManagerV17] = None
 
-    # Dependency for rate limiting (using the manager's rate limiter)
     async def rate_limit(request: Request):
-        # Use IP or API key
         client = request.client.host
         if not await manager.rate_limiter.acquire():
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    # JWT auth
     security = HTTPBearer()
     async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
@@ -1269,7 +1367,6 @@ if FASTAPI_AVAILABLE:
         result = await manager.register_batch(source, volume_liters, purity, certification_level, carbon_aware, urgency)
         return result
 
-    # New endpoints for optimization
     @app.post("/verification/optimize")
     async def optimize_strategy(context: Dict, user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
         if not manager:
@@ -1291,13 +1388,24 @@ if FASTAPI_AVAILABLE:
         new_strategies = await manager.autonomous_optimizer.evolve_strategies()
         return {"new_strategies": new_strategies}
 
-    # ... other endpoints
+    # NEW FlexGen endpoints
+    @app.post("/flexgen/optimize")
+    async def flexgen_optimize(workload: Dict, node: Dict,
+                               user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
+        if not manager:
+            raise HTTPException(status_code=503, detail="Manager not initialized")
+        return await manager.run_flexgen_optimization(workload, node)
+
+    @app.get("/flexgen/status")
+    async def flexgen_status(user: Dict = Depends(verify_token)):
+        if not manager:
+            raise HTTPException(status_code=503, detail="Manager not initialized")
+        return await manager.get_flexgen_status()
 
     @app.on_event("startup")
     async def startup():
         global manager
         config = VerificationConfig()
-        # Instantiate dependencies
         storage = AsyncDatabaseManager(config)
         zk = ZKProofSystem(config)
         blockchain = BlockchainVerificationIntegrity(config, storage)
@@ -1329,10 +1437,9 @@ async def main():
     print("=" * 80)
     print("Enhanced Blockchain Helium Verification v17.0.0 - Enterprise Quantum Resilience")
     print("WITH DEPENDENCY INJECTION, TASK MANAGER, GLOBAL CIRCUIT BREAKER")
-    print("AND INTEGRATED bio_inspired, moe_system, MODP")
+    print("AND INTEGRATED bio_inspired, moe_system, MODP, FlexGen")
     print("=" * 80)
 
-    # Bootstrap
     config = VerificationConfig()
     storage = AsyncDatabaseManager(config)
     zk = ZKProofSystem(config)
@@ -1390,6 +1497,35 @@ async def main():
     # Demo: provide feedback
     await manager.update_verification_feedback(context, opt_result['strategy'], 0.85)
     print("   Feedback recorded.")
+
+    # Demo: FlexGen optimization (mock workload/node)
+    workload = {
+        "task_id": "demo_workload",
+        "task_type": "inference",
+        "tokens": 512,
+        "latency_target": 200.0,
+        "urgency": "medium",
+        "priority": "balanced",
+        "bio_mode": "none",
+        "metadata": {"carbon_intensity": 400}
+    }
+    node = {
+        "id": "demo_node",
+        "type": "cloud",
+        "region": "us-east",
+        "region_carbon_intensity": 0.42,
+        "energy_per_token": 0.00005,
+        "helium_connectivity_score": 0.9,
+        "uptime": 0.99,
+        "maintenance_status": "operational",
+        "efficiency_score": 0.85,
+        "metadata": {"gpu_memory_gb": 16, "cpu_memory_gb": 64, "disk_bandwidth_gbps": 2}
+    }
+    flexgen_result = await manager.run_flexgen_optimization(workload, node)
+    print(f"\n🚀 FlexGen Optimization Result:")
+    print(f"   Chosen Policy: {flexgen_result.get('chosen_policy', {})}")
+    print(f"   Reward: {flexgen_result.get('reward', 0.0):.3f}")
+    print(f"   Pareto Count: {flexgen_result.get('pareto_count', 0)}")
 
     health = await manager.health_check()
     print(f"\n🏥 Health: {health['health_score']:.1f} - {'healthy' if health['healthy'] else 'degraded'}")
