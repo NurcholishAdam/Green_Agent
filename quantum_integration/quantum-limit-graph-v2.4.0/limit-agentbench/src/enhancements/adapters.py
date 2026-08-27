@@ -3,7 +3,8 @@
 LoRA adapter support for experts to enable dynamic specialization.
 Each expert can have multiple adapter weights for different energy modes.
 Enhanced version with full hook-based injection, memory optimization,
-and serialization support.
+serialization support, and integration with bio_inspired, moe_system, MODP,
+and FlexGen.
 
 Features:
 - Supports Linear, Conv1d, Conv2d, Conv3d, Embedding, MultiheadAttention
@@ -25,6 +26,13 @@ ENHANCEMENTS INTEGRATED (v2.0):
 - MoE‑based context‑aware mode selection (ExpertRouter)
 - MODP‑based multi‑objective mode evaluation (ParetoOptimizer)
 - Unified adaptive forward pass that selects the best mode automatically
+
+ENHANCEMENTS INTEGRATED (v3.0):
+- FlexGen‑aware mode selection using cost model and GPU profiler.
+- Carbon‑intensity‑based adapter scaling.
+- Adapter modes can be evaluated as FlexGen policies.
+- Methods to generate FlexGenPolicy from adapter configuration.
+- Full compatibility with Green Agent's FlexGenController and MODPPlanner.
 """
 
 import torch
@@ -78,8 +86,28 @@ except ImportError:
         def select(self, context): return "balanced"
     class ParetoOptimizer:
         def __init__(self): pass
-        def evaluate(self, objectives, weights): 
+        def evaluate(self, objectives, weights):
             return sum(objectives.get(k,0) * weights.get(k,1) for k in objectives)
+
+# FlexGen modules (optional)
+try:
+    from .gpu_optimization.flexgen_policy import FlexGenPolicy
+    from .gpu_optimization.flexgen_cost_model import FlexGenCostModel, CostEstimate
+    from .gpu_optimization.gpu_profiler import GPUProfiler
+    from .modp.flexgen_modp_planner import FlexGenMODPPlanner
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    # Dummy placeholders
+    class FlexGenPolicy:
+        pass
+    class FlexGenCostModel:
+        def estimate(self, *args, **kwargs): return None
+    class GPUProfiler:
+        def get_gpu_metrics(self): return {}
+    class FlexGenMODPPlanner:
+        def __init__(self, *args, **kwargs): pass
+        async def plan(self, *args, **kwargs): return ("run_now", 0, None)
 
 # ============================================================================
 # LoRA Adapter Layer
@@ -109,7 +137,7 @@ class LoRAAdapter(nn.Module):
         """
         super().__init__()
         self.rank = rank
-        self._scale = scale  # scalar, not a parameter by default
+        self._scale = scale
         self.device = device
         self.dtype = dtype
 
@@ -257,6 +285,7 @@ class AdapterManager:
     - MoE‑based context‑aware mode selection via ExpertRouter.
     - MODP‑based multi‑objective mode evaluation via ParetoOptimizer.
     - Unified forward with adaptive mode selection.
+    - FlexGen‑aware mode selection using cost model and GPU profiler.
     """
     _local = threading.local()
 
@@ -277,6 +306,11 @@ class AdapterManager:
         modp_optimizer: Optional[ParetoOptimizer] = None,
         modp_weights: Optional[Dict[str, float]] = None,
         context_encoder: Optional[Callable] = None,
+        # FlexGen integration
+        enable_flexgen: bool = True,
+        flexgen_cost_model: Optional[FlexGenCostModel] = None,
+        gpu_profiler: Optional[GPUProfiler] = None,
+        modp_planner: Optional[FlexGenMODPPlanner] = None,
     ):
         """
         Args:
@@ -295,6 +329,10 @@ class AdapterManager:
             modp_optimizer: Optional pre‑configured ParetoOptimizer.
             modp_weights: Weights for MODP objectives (energy, carbon, latency, accuracy, etc.).
             context_encoder: Function that encodes input (or task) into a context dict for MoE.
+            enable_flexgen: Whether to enable FlexGen integration.
+            flexgen_cost_model: Optional FlexGenCostModel for policy evaluation.
+            gpu_profiler: Optional GPUProfiler for real GPU metrics.
+            modp_planner: Optional FlexGenMODPPlanner for temporal scheduling.
         """
         self.expert = expert
         self.default_rank = default_rank
@@ -339,6 +377,12 @@ class AdapterManager:
             'accuracy': 0.30,
         }
         self.context_encoder = context_encoder or (lambda x: {})
+
+        # ---- FlexGen module initialization ----
+        self.enable_flexgen = enable_flexgen and FLEXGEN_AVAILABLE
+        self.flexgen_cost_model = flexgen_cost_model or (FlexGenCostModel() if FLEXGEN_AVAILABLE else None)
+        self.gpu_profiler = gpu_profiler or (GPUProfiler() if FLEXGEN_AVAILABLE else None)
+        self.modp_planner = modp_planner if modp_planner else (FlexGenMODPPlanner() if FLEXGEN_AVAILABLE else None)
 
         # Internal state for bio evolution
         self._evolution_population = []
@@ -481,7 +525,7 @@ class AdapterManager:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
-            'version': 2,  # version bump for enhanced modules
+            'version': 3,  # version bump for FlexGen integration
             'default_rank': self.default_rank,
             'mode_scales': {mode: scale.item() for mode, scale in self.scale_params.items()},
             'per_layer_config': self.per_layer_config,
@@ -723,3 +767,96 @@ class AdapterManager:
             'carbon': (base_energy + scale * delta_energy) * carbon_intensity,
             'latency': base_latency - scale * delta_latency,
         }
+
+    # --------------------- FlexGen Integration ---------------------
+    def get_flexgen_policy_for_mode(self, mode: str) -> FlexGenPolicy:
+        """
+        Map an adapter mode to a FlexGenPolicy. This allows adapter modes to be
+        evaluated as offloading/quantization policies.
+        """
+        scale = self.mode_scales.get(mode, 0.5)
+        # Heuristic mapping:
+        # - eco: aggressive offloading, low quantization
+        # - balanced: medium offloading, medium quantization
+        # - performance: no offloading, high precision
+        if mode == 'eco':
+            return FlexGenPolicy(
+                gpu_batch_size=2,
+                block_size=32,
+                weight_device="cpu",
+                activation_device="cpu",
+                kv_cache_device="cpu",
+                weight_bits=4,
+                kv_cache_bits=4,
+                cpu_attention=True,
+                overlap_io_compute=True,
+            )
+        elif mode == 'balanced':
+            return FlexGenPolicy(
+                gpu_batch_size=4,
+                block_size=32,
+                weight_device="cpu",
+                activation_device="gpu",
+                kv_cache_device="gpu",
+                weight_bits=8,
+                kv_cache_bits=8,
+                cpu_attention=False,
+                overlap_io_compute=True,
+            )
+        elif mode == 'performance':
+            return FlexGenPolicy(
+                gpu_batch_size=8,
+                block_size=16,
+                weight_device="gpu",
+                activation_device="gpu",
+                kv_cache_device="gpu",
+                weight_bits=16,
+                kv_cache_bits=16,
+                cpu_attention=False,
+                overlap_io_compute=True,
+            )
+        else:
+            return FlexGenPolicy()
+
+    def evaluate_mode_with_flexgen(self, mode: str, node, workload) -> Dict[str, float]:
+        """
+        Use FlexGenCostModel to estimate metrics for a given adapter mode,
+        treating it as a FlexGen policy. Returns metrics dict.
+        """
+        if not self.enable_flexgen or self.flexgen_cost_model is None:
+            return self.get_mode_metrics(mode)
+        policy = self.get_flexgen_policy_for_mode(mode)
+        est = self.flexgen_cost_model.estimate(policy, node, workload)
+        return {
+            'latency_ms': est.total_latency_ms,
+            'energy_joules': est.total_energy_joules,
+            'carbon_g': est.total_carbon_g,
+            'gpu_memory_gb': est.peak_gpu_memory_gb,
+            'quality_score': est.quality_score,
+        }
+
+    async def select_mode_flexgen(self, node, workload, carbon_intensity: float) -> str:
+        """
+        Select the best adapter mode by evaluating each mode as a FlexGen policy
+        and using MODP to choose the optimal trade-off.
+        """
+        if not self.enable_flexgen:
+            return self._current_mode or list(self.mode_scales.keys())[0]
+        best_utility = -float('inf')
+        best_mode = None
+        for mode in self.mode_scales.keys():
+            metrics = self.evaluate_mode_with_flexgen(mode, node, workload)
+            objectives = {
+                'accuracy': metrics['quality_score'],
+                'energy': metrics['energy_joules'],
+                'carbon': metrics['carbon_g'],
+                'latency': metrics['latency_ms'],
+            }
+            utility = self.modp.evaluate(objectives, self.modp_weights) if self.modp else 0.0
+            if utility > best_utility:
+                best_utility = utility
+                best_mode = mode
+        if best_mode is None:
+            best_mode = list(self.mode_scales.keys())[0]
+        logger.info(f"FlexGen selected mode '{best_mode}' with utility {best_utility:.4f}")
+        return best_mode
