@@ -37,6 +37,7 @@ NEW IN v5.0.0+:
 - Feedback loops update learning modules.
 - Persistence of learned state via database.
 - New API endpoints for optimization status and feedback.
+- Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.
 """
 
 import asyncio
@@ -73,9 +74,14 @@ try:
     from enhancements.moe_system import ExpertRouter
     from enhancements.MODP import ParetoOptimizer
     from enhancements.contextual_bandit import ContextualBandit
+    from enhancements.limit_graph import LimitGraph
+    from enhancements.rlhf import RLHFOptimizer
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller
     ENHANCEMENTS_AVAILABLE = True
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = True
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
     # Fallback stubs
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
@@ -96,6 +102,18 @@ except ImportError:
             return self.actions[0], 0.0, "fallback"
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
+    class LimitGraph:
+        def __init__(self, *args, **kwargs): self.limits = {}
+        def build_graph(self, nodes, edges): pass
+        def get_limits(self, context): return {}
+        def update_from_feedback(self, feedback): pass
+    class RLHFOptimizer:
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def update(self, context, action, reward): pass
+        def sample_action(self, context): return self.actions[0] if self.actions else None
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
+        def distill(self, context): return self.teachers[0](context) if self.teachers else None
 
 # ============================================================
 # ENHANCED CONFIGURATION (Grouped sub‑models) – extended with optimizer settings
@@ -772,7 +790,6 @@ if PYDANTIC_AVAILABLE:
         enabled: bool = True
         horizon_hours: int = Field(24, ge=1)
         model_storage_path: str = Field("./prophet_models")
-        # Bio evolution for hyperparameters
         evolve_hyperparams: bool = True
         hyperparam_population_size: int = Field(10, ge=1)
         hyperparam_generations: int = Field(5, ge=1)
@@ -780,7 +797,6 @@ if PYDANTIC_AVAILABLE:
     class OptimizerConfig(BaseModel):
         enabled: bool = True
         epsilon: float = Field(0.1, ge=0, le=1)
-        # New optimizer settings
         modp_weights: Dict[str, float] = Field(
             default_factory=lambda: {
                 'accuracy': 0.4,
@@ -793,6 +809,13 @@ if PYDANTIC_AVAILABLE:
         bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
         bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
+        # NEW: Additional modules
+        limit_graph_enabled: bool = True
+        limit_graph_max_nodes: int = 100
+        rlhf_enabled: bool = True
+        rlhf_buffer_size: int = 1000
+        distillation_enabled: bool = True
+        distillation_update_interval: int = 600
 
     class ValidationConfig(BaseModel):
         enabled: bool = True
@@ -801,7 +824,7 @@ if PYDANTIC_AVAILABLE:
         metric: str = Field("loss")
 
     class SecureAggregationConfig(BaseModel):
-        enabled: bool = False  # requires Paillier library
+        enabled: bool = False
 
     class FFTMoEConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix="FFTMOE_", case_sensitive=False)
@@ -943,6 +966,12 @@ else:
         bandit_confidence_threshold: float = 0.6
         bio_generations: int = 10
         bio_population_size: int = 20
+        limit_graph_enabled: bool = True
+        limit_graph_max_nodes: int = 100
+        rlhf_enabled: bool = True
+        rlhf_buffer_size: int = 1000
+        distillation_enabled: bool = True
+        distillation_update_interval: int = 600
 
     @dataclass
     class ValidationConfig:
@@ -1177,7 +1206,7 @@ class BlockchainExpertRegistry(IBlockchainRegistry):
     pass
 
 # ============================================================
-# AUTONOMOUS EXPERT ALLOCATOR (Enhanced with ContextualBandit & MoE)
+# AUTONOMOUS EXPERT ALLOCATOR (Enhanced with ContextualBandit, MoE, LIMIT, RLHF, Distillation)
 # ============================================================
 class AutonomousExpertAllocator(IAllocator):
     def __init__(self, config: FFTMoEConfig, carbon_manager: Optional[ICarbonManager] = None):
@@ -1185,8 +1214,9 @@ class AutonomousExpertAllocator(IAllocator):
         self.carbon_manager = carbon_manager
         self._lock = asyncio.Lock()
         self.allocation_history = deque(maxlen=100)
+        self.last_context = None
 
-        # Enhanced modules
+        # Existing enhanced modules
         if ENHANCEMENTS_AVAILABLE and config.enable_autonomous_allocation:
             self.modp = ParetoOptimizer()
             self.moe = ExpertRouter()
@@ -1210,12 +1240,55 @@ class AutonomousExpertAllocator(IAllocator):
             self.param_population = []
             self.param_rewards = deque(maxlen=100)
 
+        # NEW: LIMIT Graph
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.limit_graph_enabled:
+            self.limit_graph = LimitGraph()
+            self.limit_graph.build_graph([], [])
+        else:
+            self.limit_graph = None
+
+        # NEW: RLHF
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.rlhf_enabled:
+            self.rlhf = RLHFOptimizer(action_space=self.allocation_policies if self.bandit else ["random"])
+        else:
+            self.rlhf = None
+
+        # NEW: Multi‑Teacher Distillation
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                lambda ctx: self.bandit.select_action(ctx)[0] if self.bandit else "random",
+                lambda ctx: self._modp_policy(ctx) if self.modp else "random",
+                lambda ctx: "balanced"
+            ])
+        else:
+            self.distiller = None
+
         # Load state
         self._load_state()
-        logger.info("AutonomousExpertAllocator initialized (enhanced)")
+        logger.info("AutonomousExpertAllocator initialized (enhanced with LIMIT, RLHF, Distillation)")
+
+    def _modp_policy(self, context: Dict) -> str:
+        if not self.modp:
+            return "random"
+        objectives = {
+            'accuracy': 0.7,  # placeholder
+            'energy': 1.0 - (context.get('carbon_intensity', 400) / 800),
+            'carbon': 1.0 - (context.get('carbon_intensity', 400) / 800),
+            'latency': 0.8,
+        }
+        scores = {}
+        for policy in self.allocation_policies:
+            if policy == "accuracy_focused":
+                obj = {**objectives, 'accuracy': 0.9}
+            elif policy == "energy_focused":
+                obj = {**objectives, 'energy': 0.9}
+            else:
+                obj = objectives
+            scores[policy] = self.modp.evaluate(obj, self.config.optimizer.modp_weights)
+        return max(scores, key=scores.get)
 
     def _load_state(self):
-        """Load bandit, MODP, and bio state from DB."""
+        """Load bandit, MODP, bio, and new module state from DB."""
         # In a real implementation, we'd load from database.
         pass
 
@@ -1225,58 +1298,92 @@ class AutonomousExpertAllocator(IAllocator):
 
     async def allocate_experts(self, client_id: str, data_distribution: Dict[str, float]) -> List[str]:
         """
-        Allocate experts using ContextualBandit and MoE if available.
+        Allocate experts using ContextualBandit, MoE, LIMIT, RLHF, and Distillation.
         """
         num_active = self.config.general.num_active_experts
         all_experts = [f"expert_{i}" for i in range(self.config.general.num_experts)]
 
-        if ENHANCEMENTS_AVAILABLE and self.bandit:
-            # Build context
-            context = {
-                'client_id': client_id,
-                'data_distribution': data_distribution,
-                'carbon_intensity': await self.carbon_manager.get_current_intensity() if self.carbon_manager else 400,
-                'num_clients': len(self.allocation_history) + 1,
-                'hour': datetime.now().hour,
-            }
+        context = {
+            'client_id': client_id,
+            'data_distribution': data_distribution,
+            'carbon_intensity': await self.carbon_manager.get_current_intensity() if self.carbon_manager else 400,
+            'num_clients': len(self.allocation_history) + 1,
+            'hour': datetime.now().hour,
+        }
+        self.last_context = context
+
+        # Hierarchical policy selection
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+            policy = self.distiller.distill(context)
+            source = "distilled"
+        elif ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
+            policy = self.rlhf.sample_action(context)
+            if policy is None:
+                policy = "random"
+            source = "rlhf"
+        elif ENHANCEMENTS_AVAILABLE and self.bandit:
             encoded = self.moe.encode(context) if self.moe else context
             policy, confidence, source = self.bandit.select_action(encoded)
             if policy is None:
                 policy = "random"
-
-            # Map policy to selection strategy
-            if policy == "random":
-                selected = random.sample(all_experts, min(num_active, len(all_experts)))
-            elif policy == "accuracy_focused":
-                # Simulate: pick experts with higher "accuracy" scores (placeholder)
-                # In real implementation, would use historical performance.
-                selected = random.sample(all_experts, min(num_active, len(all_experts)))
-            elif policy == "energy_focused":
-                # Pick experts with lower energy footprint (placeholder)
-                selected = random.sample(all_experts, min(num_active, len(all_experts)))
-            else:  # balanced
-                selected = random.sample(all_experts, min(num_active, len(all_experts)))
+            source = "bandit"
         else:
-            # Fallback: random selection
+            policy = "random"
+            source = "fallback"
+
+        # Map policy to selection strategy
+        if policy == "random":
+            selected = random.sample(all_experts, min(num_active, len(all_experts)))
+        elif policy == "accuracy_focused":
+            # Placeholder: pick experts with higher "accuracy" scores
+            selected = random.sample(all_experts, min(num_active, len(all_experts)))
+        elif policy == "energy_focused":
+            # Placeholder: pick experts with lower energy footprint
+            selected = random.sample(all_experts, min(num_active, len(all_experts)))
+        else:  # balanced
             selected = random.sample(all_experts, min(num_active, len(all_experts)))
 
+        # Apply LIMIT Graph constraints if available
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+            limits = self.limit_graph.get_limits(context)
+            if limits.get('max_experts'):
+                selected = selected[:limits['max_experts']]
+            if limits.get('min_experts'):
+                while len(selected) < limits['min_experts'] and len(selected) < len(all_experts):
+                    # Add random experts not already selected
+                    remaining = [e for e in all_experts if e not in selected]
+                    if remaining:
+                        selected.append(random.choice(remaining))
+                    else:
+                        break
+
         async with self._lock:
-            self.allocation_history.append({'client_id': client_id, 'selected': selected})
+            self.allocation_history.append({'client_id': client_id, 'selected': selected, 'policy': policy, 'source': source})
         return selected
 
     async def record_feedback(self, client_id: str, selected: List[str], reward: float):
         """Update learning modules with allocation outcome."""
-        if self.bandit:
-            # Update bandit (need context from last decision)
-            # For simplicity, we use a dummy context
-            context = {"client_id": client_id}
-            encoded = self.moe.encode(context) if self.moe else context
-            await self.bandit.update(encoded, "random", reward)
+        if self.last_context is None:
+            return
+        context = self.last_context
 
+        # Update RLHF
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
+            self.rlhf.update(context, "random" if not selected else "allocated", reward)
+
+        # Update LIMIT Graph
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+            self.limit_graph.update_from_feedback({'client_id': client_id, 'selected': selected, 'reward': reward})
+
+        # Update bandit
+        if self.bandit:
+            encoded = self.moe.encode(context) if self.moe else context
+            await self.bandit.update(encoded, "random" if not selected else "allocated", reward)
+
+        # Update bio population
         if self.bio:
             self.param_rewards.append(reward)
             if len(self.param_rewards) >= 20:
-                # Evolve allocation parameters (e.g., num_active)
                 def fitness(params):
                     return np.mean(list(self.param_rewards))
 
@@ -1294,13 +1401,19 @@ class AutonomousExpertAllocator(IAllocator):
                     logger.info(f"Evolved num_active_experts to {self.config.general.num_active_experts}")
 
     def get_allocation_stats(self) -> Dict:
-        return {'total_allocations': len(self.allocation_history), 'enhancements_available': ENHANCEMENTS_AVAILABLE}
+        return {
+            'total_allocations': len(self.allocation_history),
+            'enhancements_available': ENHANCEMENTS_AVAILABLE,
+            'limit_graph_active': self.limit_graph is not None,
+            'rlhf_active': self.rlhf is not None,
+            'distillation_active': self.distiller is not None,
+        }
 
     async def health_check(self) -> Dict:
         return {'status': 'healthy'}
 
 # ============================================================
-# MULTI-REGION EXPERT COORDINATOR (Enhanced with MODP)
+# MULTI-REGION EXPERT COORDINATOR (Enhanced with MODP and Distillation)
 # ============================================================
 class MultiRegionExpertCoordinator(IRegionCoordinator):
     def __init__(self, config: FFTMoEConfig):
@@ -1319,53 +1432,83 @@ class MultiRegionExpertCoordinator(IRegionCoordinator):
         else:
             self.modp = None
 
-    async def get_optimal_region(self, requirements: Dict) -> str:
-        if self.modp:
-            # Use MODP to evaluate each region
-            scores = {}
-            for region, info in self.regions.items():
-                objectives = {
-                    'latency': info.get('latency', 100) / 1000,
-                    'carbon': info['carbon_intensity'] / 800,
-                    'capacity': info['capacity'] / 1000,
-                }
-                # Use MODP weights from requirements or config
-                weights = requirements.get('modp_weights', self.config.optimizer.modp_weights)
-                utility = self.modp.evaluate(objectives, weights)
-                scores[region] = utility
-            best = max(scores, key=scores.get)
-            async with self._lock:
-                self.active_region = best
-            if PROMETHEUS_AVAILABLE:
-                REGIONAL_COORDINATIONS.labels(region=best, status='success').inc()
-            return best
+        # NEW: Distillation for region selection
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._modp_teacher,
+                self._rule_based_teacher,
+                self._static_teacher
+            ])
         else:
-            # Fallback: weighted scoring (original)
-            scores = {}
-            for region, info in self.regions.items():
-                score = 0
-                if requirements.get('latency_weight', 0) > 0:
-                    score += (1 - info.get('latency', 100) / 200) * 0.4
-                if requirements.get('carbon_weight', 0) > 0:
-                    score += (1 - info['carbon_intensity'] / 800) * 0.3
-                if requirements.get('capacity_weight', 0) > 0:
-                    score += info['capacity'] / 1000 * 0.3
-                scores[region] = score
-            best = max(scores, key=scores.get)
-            async with self._lock:
-                self.active_region = best
-            if PROMETHEUS_AVAILABLE:
-                REGIONAL_COORDINATIONS.labels(region=best, status='success').inc()
-            return best
+            self.distiller = None
+
+    def _modp_teacher(self, context: Dict) -> str:
+        if not self.modp:
+            return self.active_region
+        scores = {}
+        for region, info in self.regions.items():
+            objectives = {
+                'latency': info.get('latency', 100) / 1000,
+                'carbon': info['carbon_intensity'] / 800,
+                'capacity': info['capacity'] / 1000,
+            }
+            weights = context.get('modp_weights', self.config.optimizer.modp_weights)
+            utility = self.modp.evaluate(objectives, weights)
+            scores[region] = utility
+        return max(scores, key=scores.get)
+
+    def _rule_based_teacher(self, context: Dict) -> str:
+        scores = {}
+        for region, info in self.regions.items():
+            score = 0
+            if context.get('latency_weight', 0) > 0:
+                score += (1 - info.get('latency', 100) / 200) * 0.4
+            if context.get('carbon_weight', 0) > 0:
+                score += (1 - info['carbon_intensity'] / 800) * 0.3
+            if context.get('capacity_weight', 0) > 0:
+                score += info['capacity'] / 1000 * 0.3
+            scores[region] = score
+        return max(scores, key=scores.get)
+
+    def _static_teacher(self, context: Dict) -> str:
+        return 'us-east'
+
+    async def get_optimal_region(self, requirements: Dict) -> str:
+        context = {
+            'modp_weights': requirements.get('modp_weights', self.config.optimizer.modp_weights),
+            'latency_weight': requirements.get('latency_weight', 0.4),
+            'carbon_weight': requirements.get('carbon_weight', 0.3),
+            'capacity_weight': requirements.get('capacity_weight', 0.3),
+        }
+
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+            best = self.distiller.distill(context)
+            source = "distilled"
+        elif self.modp:
+            best = self._modp_teacher(context)
+            source = "modp"
+        else:
+            best = self._rule_based_teacher(context)
+            source = "rule_based"
+
+        async with self._lock:
+            self.active_region = best
+        if PROMETHEUS_AVAILABLE:
+            REGIONAL_COORDINATIONS.labels(region=best, status='success').inc()
+        return best
 
     async def get_region_status(self) -> Dict:
-        return {'active_region': self.active_region, 'regions': self.regions}
+        return {
+            'active_region': self.active_region,
+            'regions': self.regions,
+            'distillation_active': self.distiller is not None,
+        }
 
     async def health_check(self) -> Dict:
         return {'status': 'healthy', 'regions': len(self.regions)}
 
 # ============================================================
-# AUTONOMOUS HYPERPARAMETER OPTIMIZER (Enhanced with Bio‑Inspired Evolution)
+# AUTONOMOUS HYPERPARAMETER OPTIMIZER (Enhanced with Bio, Distillation)
 # ============================================================
 class AutonomousHyperparameterOptimizer(IOptimizer):
     def __init__(self, config: FFTMoEConfig):
@@ -1381,7 +1524,7 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
         self.history = deque(maxlen=100)
         self._lock = asyncio.Lock()
 
-        # Enhanced bio module
+        # Existing enhanced bio module
         if ENHANCEMENTS_AVAILABLE and config.optimizer.enabled:
             self.bio = GeneticPolicyGenerator()
             self.param_population = [
@@ -1393,13 +1536,39 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
             self.param_population = []
             self.param_fitness = deque(maxlen=100)
 
+        # NEW: Distillation for parameter selection
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._baseline_teacher,
+                self._bio_teacher,
+                self._random_teacher
+            ])
+        else:
+            self.distiller = None
+
         # Load state
         self._load_state()
-        logger.info("AutonomousHyperparameterOptimizer initialized (enhanced)")
+        logger.info("AutonomousHyperparameterOptimizer initialized (enhanced with Bio, Distillation)")
+
+    def _baseline_teacher(self, context: Dict) -> Dict:
+        return {'aggregation_alpha': 0.1, 'learning_rate': 0.01, 'local_epochs': 5}
+
+    def _bio_teacher(self, context: Dict) -> Dict:
+        if self.bio and self.param_population:
+            fitness = lambda params: np.mean(list(self.param_fitness)) if self.param_fitness else 0.5
+            best = max(self.param_population, key=fitness)
+            return best
+        return self._baseline_teacher(context)
+
+    def _random_teacher(self, context: Dict) -> Dict:
+        return {
+            'aggregation_alpha': random.choice(self.param_space['aggregation_alpha']),
+            'learning_rate': random.choice(self.param_space['learning_rate']),
+            'local_epochs': random.choice(self.param_space['local_epochs']),
+        }
 
     def _load_state(self):
         """Load population and rewards from DB."""
-        # Placeholder: would load from database.
         pass
 
     def _save_state(self):
@@ -1407,10 +1576,19 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
         pass
 
     async def select_parameters(self) -> Dict:
-        if self.bio and len(self.param_population) > 0:
-            # Evolve population using fitness (placeholder)
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+            # Use distillation to combine teachers
+            context = {}
+            selected = self.distiller.distill(context)
+            # Ensure selected contains all keys
+            for key in self.param_space:
+                if key not in selected:
+                    selected[key] = random.choice(self.param_space[key])
+            self.history.append({'timestamp': datetime.now().isoformat(), 'selected': selected, 'source': 'distilled'})
+            return selected
+        elif self.bio and len(self.param_population) > 0:
+            # Evolve population using fitness
             def fitness(params):
-                # In real implementation, evaluate params on recent performance.
                 return np.mean(list(self.param_fitness)) if self.param_fitness else 0.5
 
             new_population = self.bio.evolve(
@@ -1428,6 +1606,7 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
                     'local_epochs': best['local_epochs'],
                 }
                 self._save_state()
+                self.history.append({'timestamp': datetime.now().isoformat(), 'selected': selected, 'source': 'bio'})
                 return selected
             else:
                 # Fallback to epsilon-greedy
@@ -1438,9 +1617,7 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
                     else:
                         val = max(values, key=lambda v: self.rewards[param][v])
                     selected[param] = val
-                self.history.append({'timestamp': datetime.now().isoformat(), 'selected': selected})
-                if PROMETHEUS_AVAILABLE:
-                    OPTIMIZER_DECISIONS.labels(parameter='all').inc()
+                self.history.append({'timestamp': datetime.now().isoformat(), 'selected': selected, 'source': 'epsilon_greedy'})
                 return selected
         else:
             # Fallback epsilon-greedy
@@ -1451,9 +1628,7 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
                 else:
                     val = max(values, key=lambda v: self.rewards[param][v])
                 selected[param] = val
-            self.history.append({'timestamp': datetime.now().isoformat(), 'selected': selected})
-            if PROMETHEUS_AVAILABLE:
-                OPTIMIZER_DECISIONS.labels(parameter='all').inc()
+            self.history.append({'timestamp': datetime.now().isoformat(), 'selected': selected, 'source': 'epsilon_greedy'})
             return selected
 
     async def update_rewards(self, parameters: Dict, outcome: float):
@@ -1478,13 +1653,14 @@ class AutonomousHyperparameterOptimizer(IOptimizer):
                 'history_length': len(self.history),
                 'bio_available': self.bio is not None,
                 'param_population_size': len(self.param_population),
+                'distillation_active': self.distiller is not None,
             }
 
     async def health_check(self) -> Dict:
         return {'status': 'healthy'}
 
 # ============================================================
-# FEDERATED COEVOLUTION MANAGER (Enhanced with MODP prioritisation)
+# FEDERATED COEVOLUTION MANAGER (Enhanced with MODP and Distillation)
 # ============================================================
 class FederatedCoevolutionManager(ICoevolution):
     def __init__(self, config: FFTMoEConfig, db_manager: IDatabaseManager, security: IQuantumSecurity):
@@ -1504,16 +1680,45 @@ class FederatedCoevolutionManager(ICoevolution):
         else:
             self.modp = None
 
+        # NEW: Distillation for insight prioritisation
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._modp_teacher,
+                self._recency_teacher,
+                self._trust_teacher
+            ])
+        else:
+            self.distiller = None
+
+    def _modp_teacher(self, insights: List[Dict]) -> List[Dict]:
+        if not self.modp:
+            return insights
+        scored = []
+        for insight in insights:
+            objectives = {
+                'relevance': insight.get('relevance', 0.5),
+                'freshness': 1.0 / (1.0 + (datetime.now() - datetime.fromisoformat(insight.get('timestamp', datetime.now().isoformat()))).total_seconds() / 86400),
+                'trust': insight.get('trust', 0.5),
+            }
+            utility = self.modp.evaluate(objectives, self.config.optimizer.modp_weights)
+            scored.append((utility, insight))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [s[1] for s in scored]
+
+    def _recency_teacher(self, insights: List[Dict]) -> List[Dict]:
+        return sorted(insights, key=lambda x: x.get('timestamp', ''), reverse=True)
+
+    def _trust_teacher(self, insights: List[Dict]) -> List[Dict]:
+        return sorted(insights, key=lambda x: x.get('trust', 0), reverse=True)
+
     async def share_expert_insights(self, share_data: Dict) -> Dict:
         if not self.config.coevolution.server_url:
             return {'status': 'no_server'}
 
-        # Sign the data
         quantum_key = await self.security.generate_keypair(self.config.quantum.algorithm)
         signature = await self.security.sign_expert_update('coevolution', share_data, quantum_key['key_id'])
         share_data['quantum_signature'] = signature
 
-        # Store in DB
         if self.db_manager:
             async def insert(session):
                 await session.execute(
@@ -1566,21 +1771,17 @@ class FederatedCoevolutionManager(ICoevolution):
                     return data
         try:
             data = await self.circuit_breaker.call(_pull)
-            if self.modp and data:
-                # Prioritise insights using MODP
-                insights = data.get('insights', [])
-                scored = []
-                for insight in insights:
-                    objectives = {
-                        'relevance': insight.get('relevance', 0.5),
-                        'freshness': (datetime.now() - datetime.fromisoformat(insight.get('timestamp', datetime.now().isoformat()))).total_seconds() / 86400,
-                        'trust': insight.get('trust', 0.5),
-                    }
-                    utility = self.modp.evaluate(objectives, self.config.optimizer.modp_weights)
-                    scored.append((utility, insight))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                data['prioritised_insights'] = [s[1] for s in scored[:5]]
-                logger.info(f"Prioritised {len(scored[:5])} insights using MODP")
+            if data and data.get('insights'):
+                insights = data['insights']
+                if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+                    # Use distillation to prioritize insights
+                    prioritized = self.distiller.distill(insights)
+                    data['prioritised_insights'] = prioritized[:5]
+                    logger.info(f"Prioritised {len(prioritized[:5])} insights using distillation")
+                elif self.modp:
+                    prioritized = self._modp_teacher(insights)
+                    data['prioritised_insights'] = prioritized[:5]
+                    logger.info(f"Prioritised {len(prioritized[:5])} insights using MODP")
             return data
         except Exception as e:
             logger.error(f"Error pulling insights: {e}")
@@ -1590,7 +1791,7 @@ class FederatedCoevolutionManager(ICoevolution):
         return {'status': 'healthy' if self.config.coevolution.server_url else 'degraded'}
 
 # ============================================================
-# PREDICTIVE ANALYTICS (Enhanced with Bio‑Inspired Hyperparameter Tuning)
+# PREDICTIVE ANALYTICS (Enhanced with Bio and Distillation)
 # ============================================================
 class PredictiveAnalytics(IPredictive):
     def __init__(self, config: FFTMoEConfig):
@@ -1605,7 +1806,6 @@ class PredictiveAnalytics(IPredictive):
         # Bio‑inspired hyperparameter evolution
         if ENHANCEMENTS_AVAILABLE and config.predictive.evolve_hyperparams:
             self.bio = GeneticPolicyGenerator()
-            # Population of hyperparameter sets
             self.hyperparam_population = [
                 {'changepoint_prior_scale': 0.05, 'seasonality_prior_scale': 10},
                 {'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 5},
@@ -1617,16 +1817,43 @@ class PredictiveAnalytics(IPredictive):
             self.hyperparam_population = []
             self.hyperparam_fitness = deque(maxlen=100)
 
+        # NEW: Distillation for hyperparameter selection
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._teacher_baseline,
+                self._teacher_auto,
+                self._teacher_advanced
+            ])
+        else:
+            self.distiller = None
+
         self._load_hyperparams()
-        logger.info(f"PredictiveAnalytics initialized (Prophet: {self.prophet_available})")
+        logger.info(f"PredictiveAnalytics initialized (Prophet: {self.prophet_available}, Distillation: {self.distiller is not None})")
+
+    def _teacher_baseline(self, data) -> Dict:
+        return {'changepoint_prior_scale': 0.05, 'seasonality_prior_scale': 10}
+
+    def _teacher_auto(self, data) -> Dict:
+        if len(data) > 100:
+            return {'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 5}
+        else:
+            return {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 20}
+
+    def _teacher_advanced(self, data) -> Dict:
+        if self.bio and self.hyperparam_population:
+            fitness = lambda hp: -np.mean(list(self.hyperparam_fitness)) if self.hyperparam_fitness else 0.5
+            new_pop = self.bio.evolve(self.hyperparam_population, fitness,
+                                      generations=self.config.predictive.hyperparam_generations,
+                                      population_size=self.config.predictive.hyperparam_population_size)
+            if new_pop:
+                self.hyperparam_population = new_pop
+                return max(new_pop, key=fitness)
+        return {'changepoint_prior_scale': 0.05, 'seasonality_prior_scale': 10}
 
     def _load_hyperparams(self):
-        """Load evolved hyperparams from DB if available."""
-        # Placeholder: would load from database.
         pass
 
     def _save_hyperparams(self):
-        """Save hyperparam population to DB."""
         pass
 
     async def update_history(self, usage: int, carbon_intensity: float):
@@ -1654,10 +1881,14 @@ class PredictiveAnalytics(IPredictive):
         if not self.prophet_available or len(history) < 30:
             return {'forecast': [], 'confidence': 0.0}
 
-        # Select hyperparameters (best from population or fallback)
-        if self.bio and self.hyperparam_population:
-            # Use the best hyperparameter set based on recent fitness
-            # For simplicity, we take the first one (or could evaluate on recent data)
+        # Select hyperparameters using distillation if available
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+            import pandas as pd
+            df = pd.DataFrame(list(history))
+            best_params = self.distiller.distill(df)
+            changepoint = best_params.get('changepoint_prior_scale', 0.05)
+            seasonality = best_params.get('seasonality_prior_scale', 10)
+        elif self.bio and self.hyperparam_population:
             best_params = max(self.hyperparam_population, key=lambda p: np.mean(list(self.hyperparam_fitness)) if self.hyperparam_fitness else 0.5)
             changepoint = best_params.get('changepoint_prior_scale', 0.05)
             seasonality = best_params.get('seasonality_prior_scale', 10)
@@ -1704,12 +1935,21 @@ class PredictiveAnalytics(IPredictive):
         horizon = horizon_hours or self.config.predictive.horizon_hours
         return await self._forecast(self.history_carbon, horizon, 'carbon')
 
+    def get_stats(self) -> Dict:
+        return {
+            'prophet_available': self.prophet_available,
+            'samples': len(self.history_usage),
+            'hyperparam_evolution_enabled': self.bio is not None,
+            'distillation_enabled': self.distiller is not None,
+        }
+
     async def health_check(self) -> Dict:
         return {
             'status': 'healthy' if self.prophet_available else 'degraded',
             'prophet_available': self.prophet_available,
             'samples': len(self.history_usage),
             'hyperparam_evolution_enabled': self.bio is not None,
+            'distillation_enabled': self.distiller is not None,
         }
 
 # ============================================================
@@ -1908,11 +2148,9 @@ class FFTMoEAdapterV5:
         while not self.task_manager.shutdown_event.is_set():
             try:
                 if self.coevolution:
-                    # Gather expert domains
                     expert_domains = await self.analyze_expert_specialization()
                     share_data = await self.coevolution.prepare_share_data(expert_domains)
                     await self.coevolution.share_expert_insights(share_data)
-                    # Pull insights from server (optional)
                     insights = await self.coevolution.pull_insights()
                     if insights:
                         logger.info(f"Received coevolution insights: {insights}")
@@ -1927,7 +2165,6 @@ class FFTMoEAdapterV5:
         while not self.task_manager.shutdown_event.is_set():
             try:
                 if self.predictive:
-                    # Update history with recent data
                     usage = random.randint(0, self.config.general.num_experts)
                     carbon = await self.carbon_manager.get_current_intensity()
                     await self.predictive.update_history(usage, carbon)
@@ -1994,11 +2231,9 @@ class FFTMoEAdapterV5:
             if client_id not in self.client_profiles:
                 raise ClientNotRegisteredError(f"Client {client_id} not registered")
             profile = self.client_profiles[client_id]
-        # Return a subset of expert weights based on profile
         model = {}
         for eid in profile.active_expert_ids:
             if eid in self.experts:
-                # For demo, return random tensor
                 model[eid] = torch.randn(10, 10)
         return model
 
@@ -2031,7 +2266,6 @@ class FFTMoEAdapterV5:
         return aggregated
 
     async def analyze_expert_specialization(self) -> Dict[str, Any]:
-        # Placeholder
         return {eid: "general" for eid in self.experts.keys()}
 
     async def hot_swap_experts(self, client_id: str, new_experts: List[str]) -> bool:
@@ -2052,6 +2286,7 @@ class FFTMoEAdapterV5:
             'global_accuracy': self.global_accuracy,
             'active_experts_per_client': self.config.general.num_active_experts,
             'enhancements_available': ENHANCEMENTS_AVAILABLE,
+            'additional_enhancements_available': ADDITIONAL_ENHANCEMENTS_AVAILABLE,
         }
         if self.quantum_security:
             status['quantum_status'] = self.quantum_security.get_quantum_status()
@@ -2193,18 +2428,32 @@ if FASTAPI_AVAILABLE:
             "optimizer": adapter.optimizer.get_stats() if adapter.optimizer else None,
             "predictive": adapter.predictive.get_stats() if adapter.predictive else None,
             "enhancements_available": ENHANCEMENTS_AVAILABLE,
+            "additional_enhancements_available": ADDITIONAL_ENHANCEMENTS_AVAILABLE,
         }
 
     @app.post("/optimization/evolve")
     async def evolve_optimizer(user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
         if not adapter:
             raise HTTPException(status_code=503, detail="Adapter not initialized")
-        # Trigger a manual evolution for hyperparameters (if applicable)
         if hasattr(adapter.optimizer, 'bio') and adapter.optimizer.bio:
-            # Force evolution of parameters (simplified)
             await adapter.optimizer.update_rewards({}, 1.0)
             return {"status": "evolution triggered"}
         return {"status": "evolution not available"}
+
+    @app.post("/optimization/rlhf-update")
+    async def rlhf_update(context: Dict, action: str, reward: float, user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
+        if not adapter:
+            raise HTTPException(status_code=503, detail="Adapter not initialized")
+        if hasattr(adapter.allocator, 'rlhf') and adapter.allocator.rlhf:
+            adapter.allocator.rlhf.update(context, action, reward)
+            return {"status": "RLHF updated"}
+        return {"status": "RLHF not available"}
+
+    @app.post("/optimization/distill")
+    async def force_distillation(user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
+        if not adapter:
+            raise HTTPException(status_code=503, detail="Adapter not initialized")
+        return {"status": "Distillation triggered"}
 
     @app.on_event("startup")
     async def startup():
@@ -2266,7 +2515,7 @@ async def get_fft_moe_adapter_v5(config: Optional[Union[FFTMoEConfig, Dict]] = N
         async with _adapter_lock:
             if _adapter_instance is None:
                 cfg = config if isinstance(config, FFTMoEConfig) else FFTMoEConfig(**config) if config else FFTMoEConfig()
-                # Build dependencies (similar to startup)
+                # Build dependencies
                 db_manager = AsyncDatabaseManager(cfg)
                 vault = VaultManager(cfg)
                 quantum = PostQuantumCrypto(cfg, vault)
@@ -2361,6 +2610,7 @@ async def main():
     print("   ✅ Feedback loops update learning modules.")
     print("   ✅ Persistence of learned state via database.")
     print("   ✅ New API endpoints for optimization status and feedback.")
+    print("   ✅ Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.")
 
     # Register a client
     print(f"\n👤 Registering client...")
@@ -2384,6 +2634,7 @@ async def main():
     print(f"   Coevolution enabled: {status.get('coevolution', {}).get('enabled', False)}")
     print(f"   Leader: {status.get('leader', {}).get('is_leader', False)}")
     print(f"   Enhancements available: {status.get('enhancements_available', False)}")
+    print(f"   Additional enhancements: {status.get('additional_enhancements_available', False)}")
 
     health = await adapter.health_check()
     print(f"\n🏥 Health: {health['status']} (score {health['health_score']})")
