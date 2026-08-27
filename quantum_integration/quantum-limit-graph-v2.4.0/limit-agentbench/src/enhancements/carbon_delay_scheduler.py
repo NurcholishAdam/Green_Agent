@@ -1,7 +1,8 @@
 """
 carbon_delay_scheduler.py
 
-Enhanced carbon‑intensity‑aware delay queue with MODP, bio‑inspired tuning, and MoE integration.
+Enhanced carbon‑intensity‑aware delay queue with MODP, bio‑inspired tuning, MoE integration,
+and FlexGen policy selection.
 
 Features:
 - Multi‑objective decision (carbon, latency, energy, cost) using MODP framework.
@@ -10,6 +11,7 @@ Features:
 - Probabilistic forecast handling with confidence intervals.
 - Persistent queue across restarts.
 - Comprehensive logging and reward feedback loop.
+- FlexGen integration: select optimal offloading policy for AI tasks based on carbon intensity.
 """
 
 import heapq
@@ -24,42 +26,47 @@ from enum import Enum
 # ----------------------------------------------------------------------
 # 1. Imports from other enhancement modules (assumed present)
 # ----------------------------------------------------------------------
-# Uncomment these when the modules are available:
-# from enhancements.bio_inspired import GeneticOptimizer
-# from enhancements.MODP import ParetoOptimizer
-# from enhancements.moe_system import ExpertRouter
-
-# If not available, we use stubs that behave as simple placeholders.
-class MODPStub:
-    """Stub for MODP – implements a simple weighted sum decision."""
-    def decide(self, objectives: Dict[str, float], weights: Dict[str, float]) -> float:
-        return sum(objectives[k] * weights.get(k, 0.0) for k in objectives)
-
-class BioStub:
-    """Stub for bio_inspired – does nothing but logs."""
-    def adapt(self, context: Dict[str, Any], reward: float):
-        pass
-
-class MoEStub:
-    """Stub for MoE – always returns 'normal' delayability."""
-    def classify(self, task: Dict[str, Any]) -> str:
-        return "normal"
-
-# Try to import real modules, fallback to stubs
+# Enhanced modules (with fallback stubs)
 try:
     from enhancements.bio_inspired import GeneticOptimizer
 except ImportError:
-    GeneticOptimizer = BioStub
+    class GeneticOptimizer:
+        def adapt(self, context, reward):
+            return None
 
 try:
     from enhancements.MODP import ParetoOptimizer
 except ImportError:
-    ParetoOptimizer = MODPStub
+    class ParetoOptimizer:
+        def decide(self, objectives, weights):
+            return sum(objectives[k] * weights.get(k, 0.0) for k in objectives)
 
 try:
     from enhancements.moe_system import ExpertRouter
 except ImportError:
-    ExpertRouter = MoEStub
+    class ExpertRouter:
+        def classify(self, task):
+            return "normal"
+
+# FlexGen modules (with fallback)
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel, CostEstimate
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    class FlexGenCostModel:
+        def estimate(self, policy, node, workload):
+            return None
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
 
 
 # ----------------------------------------------------------------------
@@ -80,7 +87,8 @@ class DelayedTask:
 
 class CarbonDelayScheduler:
     """
-    Enhanced scheduler with MODP, bio‑inspired adaptation, and MoE integration.
+    Enhanced scheduler with MODP, bio‑inspired adaptation, MoE integration,
+    and FlexGen policy selection.
     """
     def __init__(
         self,
@@ -92,6 +100,7 @@ class CarbonDelayScheduler:
         bio_optimizer: Optional[Any] = None,
         moe_router: Optional[Any] = None,
         forecast_confidence_threshold: float = 0.7,
+        flexgen_manager: Optional[Any] = None,
     ):
         """
         Args:
@@ -103,6 +112,7 @@ class CarbonDelayScheduler:
             bio_optimizer: Instance of bio_inspired optimizer (optional).
             moe_router: Instance of MoE router (optional).
             forecast_confidence_threshold: Only use forecast points with confidence > this.
+            flexgen_manager: Optional FlexGen manager for policy selection.
         """
         self.carbon_api = carbon_api
         self.max_delay = max_delay_seconds
@@ -114,19 +124,48 @@ class CarbonDelayScheduler:
         self.logger = logging.getLogger(__name__)
 
         # Multi‑objective decision
-        self.modp = modp_weights if modp_weights else ParetoOptimizer()
-        self.modp_weights = modp_weights or {
-            "carbon": 0.4,
-            "latency": 0.3,
-            "energy": 0.2,
-            "cost": 0.1
-        }
+        if modp_weights is None:
+            self.modp_weights = {
+                "carbon": 0.4,
+                "latency": 0.3,
+                "energy": 0.2,
+                "cost": 0.1
+            }
+        else:
+            self.modp_weights = modp_weights
+
+        # MODP instance
+        try:
+            # If real ParetoOptimizer available, use it; otherwise fallback to stub logic
+            if 'ParetoOptimizer' in globals() and hasattr(ParetoOptimizer, 'decide'):
+                self.modp = ParetoOptimizer()
+            else:
+                # Create a stub that works like the original stub
+                class _MODP:
+                    def __init__(self, weights):
+                        self.weights = weights
+                    def decide(self, objectives, weights=None):
+                        w = weights or self.weights
+                        return sum(objectives[k] * w.get(k, 0.0) for k in objectives)
+                self.modp = _MODP(self.modp_weights)
+        except Exception:
+            class _MODP:
+                def __init__(self, weights):
+                    self.weights = weights
+                def decide(self, objectives, weights=None):
+                    w = weights or self.weights
+                    return sum(objectives[k] * w.get(k, 0.0) for k in objectives)
+            self.modp = _MODP(self.modp_weights)
 
         # Bio‑inspired adaptation
         self.bio = bio_optimizer if bio_optimizer else GeneticOptimizer()
 
         # MoE router
         self.moe = moe_router if moe_router else ExpertRouter()
+
+        # FlexGen manager
+        self.flexgen_manager = flexgen_manager
+        self._flexgen_available = FLEXGEN_AVAILABLE and flexgen_manager is not None
 
         # Priority queue: heap of (scheduled_time, DelayedTask)
         self.queue: List[Tuple[float, DelayedTask]] = []
@@ -140,6 +179,7 @@ class CarbonDelayScheduler:
             "total_forwarded": 0,
             "total_released": 0,
             "total_rewards": 0.0,
+            "total_flexgen_policies_selected": 0,
         }
 
     # --------------------- Persistence ---------------------
@@ -280,11 +320,42 @@ class CarbonDelayScheduler:
         else:
             return Delayability.LOW
 
+    # --------------------- FlexGen Policy Selection ---------------------
+    def select_flexgen_policy(self, task: Dict[str, Any], node: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Select an optimal FlexGen policy for an AI inference task.
+        Uses the FlexGenManager (if available) to run policy optimization.
+        Returns a dict with chosen policy and metrics.
+        """
+        if not self._flexgen_available:
+            return {"error": "FlexGen manager not available"}
+
+        # Prepare workload and node descriptors
+        try:
+            workload = WorkloadDescriptor(**task.get("workload", {}))
+            node_desc = NodeDescriptor(**node) if node else NodeDescriptor(
+                id="default_node",
+                type="cloud",
+                region="us-east",
+                region_carbon_intensity=0.42,
+                energy_per_token=0.00005,
+                uptime=0.99,
+                maintenance_status="operational"
+            )
+            # Use flexgen manager to optimize policy
+            result = self.flexgen_manager.optimize_policy(workload, node_desc)
+            self.metrics["total_flexgen_policies_selected"] += 1
+            return result
+        except Exception as e:
+            self.logger.error(f"FlexGen policy selection failed: {e}")
+            return {"error": str(e)}
+
     # --------------------- Main Public API ---------------------
     def submit(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Decide whether to delay the task, based on MODP, MoE, and bio‑adapted thresholds.
-        Returns dict with status, delay_until, and reason.
+        Decide whether to delay the task, based on MODP, MoE, bio‑adapted thresholds,
+        and possibly FlexGen policy evaluation.
+        Returns dict with status, delay_until, reason, and optional FlexGen policy.
         """
         # 1. Determine delayability via MoE
         delayability = self._get_delayability(task)
@@ -297,8 +368,15 @@ class CarbonDelayScheduler:
 
         # 3. If current intensity is already low, forward immediately
         if current_intensity <= self.threshold:
+            # Optionally select FlexGen policy for the forwarded task
+            flexgen_policy = None
+            if self._flexgen_available and task.get("type") == "inference":
+                flexgen_policy = self.select_flexgen_policy(task)
             self.metrics["total_forwarded"] += 1
-            return {"status": "forward", "task": task, "delay_until": None, "reason": "Already low carbon"}
+            result = {"status": "forward", "task": task, "delay_until": None, "reason": "Already low carbon"}
+            if flexgen_policy:
+                result["flexgen_policy"] = flexgen_policy
+            return result
 
         # 4. Get forecast
         forecast_minutes = self.max_delay // 60 + 2  # extra buffer
@@ -311,13 +389,19 @@ class CarbonDelayScheduler:
         should_delay, scheduled_time, reason = self._evaluate_delay(task, current_intensity, forecast)
 
         if not should_delay:
+            # Forward, but optionally include FlexGen policy
+            flexgen_policy = None
+            if self._flexgen_available and task.get("type") == "inference":
+                flexgen_policy = self.select_flexgen_policy(task)
             self.metrics["total_forwarded"] += 1
-            return {"status": "forward", "task": task, "delay_until": None, "reason": reason}
+            result = {"status": "forward", "task": task, "delay_until": None, "reason": reason}
+            if flexgen_policy:
+                result["flexgen_policy"] = flexgen_policy
+            return result
 
         # 6. For delayable tasks, also check if the delay is acceptable given the delayability category
         if delayability == Delayability.MEDIUM and (scheduled_time - time.time()) > self.max_delay * 0.5:
             # For medium, we limit delay to half the max
-            # Alternatively, we could recompute with a stricter constraint
             self.metrics["total_forwarded"] += 1
             return {"status": "forward", "task": task, "delay_until": None,
                     "reason": f"Delay too long for medium priority ({scheduled_time - time.time():.0f}s)"}
@@ -352,9 +436,12 @@ class CarbonDelayScheduler:
             _, delayed_task = heapq.heappop(self.queue)
             released.append(delayed_task.task)
             self.metrics["total_released"] += 1
-            # Record reward feedback (to be called later by the main loop)
-            # We'll store the delayed_task for later reward callback.
-            # For now, we just return the task.
+            # Optionally select FlexGen policy upon release
+            if self._flexgen_available and delayed_task.task.get("type") == "inference":
+                policy = self.select_flexgen_policy(delayed_task.task)
+                # In a real system, the policy would be attached to the task or returned separately.
+                # For simplicity, we log it.
+                self.logger.info(f"FlexGen policy selected for released task: {policy}")
 
         if released:
             self._save_queue()
@@ -399,9 +486,9 @@ if __name__ == "__main__":
 
     # Simulate tasks
     tasks = [
-        {"priority": "normal", "latency_sensitivity": 0.5, "idle_power_watts": 10},
+        {"priority": "normal", "latency_sensitivity": 0.5, "idle_power_watts": 10, "type": "inference"},
         {"priority": "high", "latency_sensitivity": 0.9},
-        {"priority": "normal", "latency_sensitivity": 0.3, "idle_power_watts": 5},
+        {"priority": "normal", "latency_sensitivity": 0.3, "idle_power_watts": 5, "type": "inference"},
     ]
 
     for task in tasks:
