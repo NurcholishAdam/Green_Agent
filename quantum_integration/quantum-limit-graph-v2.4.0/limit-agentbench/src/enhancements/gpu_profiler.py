@@ -7,7 +7,7 @@ Enhanced real‑time hardware metrics collector with:
 - Multi‑GPU support.
 - Persistent SQLite history.
 - Streaming callbacks.
-- Direct integration with MODP, bio_inspired, and moe_system.
+- Direct integration with MODP, bio_inspired, moe_system, LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.
 """
 
 import time
@@ -43,7 +43,7 @@ try:
     from enhancements.bio_inspired import FitnessEvaluator
 except ImportError:
     class FitnessEvaluator:
-        def evaluate(self, metrics):
+        def evaluate(self, metrics, policy=None):
             return 0.0
 
 try:
@@ -54,6 +54,30 @@ except ImportError:
             return [metrics.get("gpu_utilization_pct", 0),
                     metrics.get("cpu_utilization_pct", 0),
                     metrics.get("gpu_memory_used_mb", 0) / 1000]
+
+try:
+    from enhancements.limit_graph import LimitGraph
+except ImportError:
+    class LimitGraph:
+        def __init__(self, *args, **kwargs): pass
+        def build_graph(self, nodes, edges): pass
+        def get_limits(self, context): return {}
+        def update_from_feedback(self, feedback): pass
+
+try:
+    from enhancements.rlhf import RLHFOptimizer
+except ImportError:
+    class RLHFOptimizer:
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def update(self, context, action, reward): pass
+        def sample_action(self, context): return self.actions[0] if self.actions else None
+
+try:
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller
+except ImportError:
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
+        def distill(self, context): return self.teachers[0](context) if self.teachers else None
 
 # ----------------------------------------------------------------------
 # Enhanced GPUProfiler
@@ -68,6 +92,11 @@ class ProfilerConfig:
     max_history_days: int = 7
     enable_callbacks: bool = True
     callback_cooldown: float = 0.1  # minimum time between callbacks
+    # New: enable additional modules
+    enable_limit_graph: bool = True
+    enable_rlhf: bool = True
+    enable_distillation: bool = True
+
 
 class GPUProfiler:
     """
@@ -77,7 +106,7 @@ class GPUProfiler:
     - Network I/O.
     - Persistent history (SQLite).
     - Streaming callbacks.
-    - Integration with MODP, bio_inspired, and moe_system.
+    - Integration with MODP, bio_inspired, moe_system, LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.
     """
 
     def __init__(
@@ -86,6 +115,9 @@ class GPUProfiler:
         modp_weights: Optional[Dict[str, float]] = None,
         bio_evaluator: Optional[Any] = None,
         moe_encoder: Optional[Any] = None,
+        limit_graph: Optional[Any] = None,
+        rlhf_optimizer: Optional[Any] = None,
+        distiller: Optional[Any] = None,
     ):
         self.config = config or ProfilerConfig()
         self.modp_weights = modp_weights or {
@@ -96,6 +128,24 @@ class GPUProfiler:
         }
         self.bio = bio_evaluator if bio_evaluator else FitnessEvaluator()
         self.moe = moe_encoder if moe_encoder else ContextEncoder()
+
+        # New modules
+        if self.config.enable_limit_graph:
+            self.limit_graph = limit_graph if limit_graph else LimitGraph()
+        else:
+            self.limit_graph = None
+
+        if self.config.enable_rlhf:
+            # Action space can be profiles (e.g., power profiles)
+            self.rlhf = rlhf_optimizer if rlhf_optimizer else RLHFOptimizer(action_space=["balanced", "performance", "power_save"])
+        else:
+            self.rlhf = None
+
+        if self.config.enable_distillation:
+            # Teachers: simple policy functions based on metrics
+            self.distiller = distiller if distiller else self._create_default_distiller()
+        else:
+            self.distiller = None
 
         # Internal state
         self._running = False
@@ -115,6 +165,20 @@ class GPUProfiler:
         self._conn = None
         if self.config.enable_history:
             self._init_history()
+
+    def _create_default_distiller(self):
+        """Create a default distiller with simple teachers."""
+        def teacher_performance(ctx):
+            return "performance" if ctx.get("gpu_utilization_pct", 0) > 0.7 else "balanced"
+
+        def teacher_power(ctx):
+            return "power_save" if ctx.get("gpu_power_watts", 0) > 300 else "balanced"
+
+        def teacher_carbon(ctx):
+            # Placeholder: assume high carbon if energy high
+            return "power_save" if ctx.get("energy_gpu_joules", 0) > 1000 else "performance"
+
+        return MultiTeacherDistiller([teacher_performance, teacher_power, teacher_carbon])
 
     # --------------------- History (SQLite) ---------------------
     def _init_history(self):
@@ -211,7 +275,6 @@ class GPUProfiler:
             try:
                 device_count = pynvml.nvmlDeviceGetCount()
                 metrics["gpu_count"] = device_count
-                # We'll aggregate across all GPUs for simplicity, but can add per‑GPU if needed.
                 total_used = 0
                 total_free = 0
                 total_power = 0.0
@@ -235,8 +298,6 @@ class GPUProfiler:
                 metrics["gpu_utilization_pct"] = max_util
                 metrics["gpu_power_watts"] = total_power
                 metrics["gpu_temp_c"] = avg_temp
-                # Per‑process memory (optional)
-                # Could be added using nvmlDeviceGetComputeRunningProcesses
             except Exception as e:
                 logging.warning(f"NVML snapshot error: {e}")
         else:
@@ -278,7 +339,6 @@ class GPUProfiler:
             gpu_energy = metrics["gpu_power_watts"] * elapsed
             self._energy_cumulative_gpu_joules += gpu_energy
         # CPU energy: estimate from TDP or use psutil's sensors if available
-        # For simplicity, use a rough estimate (CPU power ~ 0.5 * TDP * util)
         cpu_tdp = 65  # placeholder, could be detected
         cpu_power = cpu_tdp * metrics["cpu_utilization_pct"]
         cpu_energy = cpu_power * elapsed
@@ -307,7 +367,6 @@ class GPUProfiler:
 
     def _compute_carbon_efficiency(self, metrics: Dict[str, Any]) -> float:
         """Compute carbon efficiency (tokens per kg CO2)."""
-        # Requires carbon intensity from external source; we'll use a placeholder.
         carbon_intensity = 200.0  # gCO2/kWh
         total_energy = metrics.get("energy_gpu_joules", 0) / 3600 / 1000  # kWh
         carbon_kg = total_energy * carbon_intensity / 1000
@@ -346,10 +405,8 @@ class GPUProfiler:
             metrics = self._snapshot()
             with self._lock:
                 self._latest_metrics = metrics
-            # Store history
             if self.config.enable_history:
                 self._store_metrics(metrics)
-            # Trigger callbacks
             if self.config.enable_callbacks:
                 self._trigger_callbacks(metrics)
             time.sleep(self.config.sample_interval)
@@ -366,19 +423,16 @@ class GPUProfiler:
         """Return a scalar utility using MODP weights."""
         if metrics is None:
             metrics = self.get_current_metrics()
-        # MODP evaluates multiple objectives
         objectives = {
             "energy_efficiency": metrics.get("energy_efficiency", 0),
             "carbon_efficiency": metrics.get("carbon_efficiency", 0),
             "memory_efficiency": metrics.get("memory_efficiency", 0),
             "throughput": metrics.get("throughput", 0),
         }
-        # Use the MODP module (or fallback weighted sum)
         return ParetoOptimizer().evaluate(objectives, self.modp_weights)
 
     def get_bio_fitness(self, policy: Dict[str, Any]) -> float:
         """Return a fitness score for a given policy using bio_inspired evaluator."""
-        # The bio evaluator could use current metrics to judge policy quality.
         metrics = self.get_current_metrics()
         return self.bio.evaluate(metrics, policy)
 
@@ -386,6 +440,42 @@ class GPUProfiler:
         """Return a context vector for the MoE router."""
         metrics = self.get_current_metrics()
         return self.moe.encode(metrics)
+
+    # --------------------- New Integration Methods (LIMIT, RLHF, Distillation) ---------------------
+    def get_policy_from_distillation(self, context: Optional[Dict] = None) -> str:
+        """Use distillation to select a policy based on current context."""
+        if not self.distiller:
+            return "balanced"
+        if context is None:
+            context = self.get_current_metrics()
+        return self.distiller.distill(context)
+
+    def get_policy_from_rlhf(self, context: Optional[Dict] = None) -> str:
+        """Sample a policy from RLHF optimizer."""
+        if not self.rlhf:
+            return "balanced"
+        if context is None:
+            context = self.get_current_metrics()
+        return self.rlhf.sample_action(context)
+
+    def get_limits(self, context: Optional[Dict] = None) -> Dict:
+        """Return limits from the LIMIT Graph."""
+        if not self.limit_graph:
+            return {}
+        if context is None:
+            context = self.get_current_metrics()
+        return self.limit_graph.get_limits(context)
+
+    def update_feedback(self, context: Dict, action: str, reward: float):
+        """Update RLHF and LIMIT Graph with feedback."""
+        if self.rlhf:
+            self.rlhf.update(context, action, reward)
+        if self.limit_graph:
+            self.limit_graph.update_from_feedback({
+                'context': context,
+                'action': action,
+                'reward': reward,
+            })
 
     # --------------------- Utility ---------------------
     def get_history(self, start_time: float = 0, end_time: float = None) -> List[Dict]:
@@ -449,6 +539,11 @@ if __name__ == "__main__":
     # Get context for MoE
     context = profiler.get_moe_context()
     print(f"MoE context: {context}")
+
+    # Use distillation and RLHF to select policy
+    policy_dist = profiler.get_policy_from_distillation()
+    policy_rlhf = profiler.get_policy_from_rlhf()
+    print(f"Distilled policy: {policy_dist}, RLHF policy: {policy_rlhf}")
 
     # Retrieve history
     history = profiler.get_history(start_time=time.time()-10)
