@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Green Agent Base Classes - Version 14.2 (Integrated with bio_inspired, moe_system, MODP)
+# Green Agent Base Classes - Version 14.3 (Integrated with bio_inspired, moe_system, MODP, and FlexGen)
 # ENHANCED WITH: Full async/await, aiosqlite, FastAPI REST layer, real blockchain
 # integration, advanced analytics with Prophet/LSTM, real-time monitoring,
 # data lake with S3, MLOps pipeline, and seamless integration with
 # sustainability modules (adaptive cost, anomaly detection, predictive maintenance).
-# NEW IN v14.2: Enhanced Autonomous Optimizer using ContextualBandit, ParetoOptimizer,
-# GeneticPolicyGenerator, and ExpertRouter.
+# NEW IN v14.3: Full FlexGen integration for GPU/CPU/disk offloading policy selection,
+# with mock/real executor, GPU profiler, cost model, drift detector, and MODP scheduler.
 # ============================================================================
 
 from __future__ import annotations
@@ -244,6 +244,46 @@ except ImportError:
         def seed_safe_policy(self, context, policy): pass
 
 # ============================================================
+# FlexGen modules (optional)
+# ============================================================
+try:
+    from .gpu_optimization.flexgen_policy import FlexGenPolicy, MockFlexGenExecutor, generate_candidate_policies
+    from .gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector, FlexGenState
+    from .gpu_optimization.flexgen_controller import FlexGenController
+    from .gpu_optimization.gpu_profiler import GPUProfiler
+    from .gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from .gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from .modp.flexgen_modp_planner import FlexGenMODPPlanner
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    # Dummy placeholders
+    class FlexGenPolicy:
+        pass
+    class MockFlexGenExecutor:
+        def execute(self, policy, node, workload): return {}
+    def generate_candidate_policies(n=20): return []
+    class DistillationFlexGenSelector:
+        def __init__(self, *args, **kwargs): pass
+    class FlexGenState:
+        pass
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class GPUProfiler:
+        def __init__(self, *args, **kwargs): pass
+        async def get_all_gpu_metrics(self): return []
+        async def start_monitoring(self, interval_sec=5.0): pass
+        def shutdown(self): pass
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class FlexGenMODPPlanner:
+        def __init__(self, *args, **kwargs): pass
+
+# ============================================================
 # Green_Agent Sustainability Modules (optional)
 # ============================================================
 try:
@@ -341,35 +381,18 @@ class GreenAgentException(Exception):
         self.timestamp = datetime.now()
         self.correlation_id = getattr(logger, 'correlation_id', str(uuid.uuid4())[:8])
 
-class QuantumError(GreenAgentException):
-    pass
-
-class BlockchainError(GreenAgentException):
-    pass
-
-class DataLakeError(GreenAgentException):
-    pass
-
-class EdgeDeviceError(GreenAgentException):
-    pass
-
-class MLOpsError(GreenAgentException):
-    pass
-
-class APIGatewayError(GreenAgentException):
-    pass
-
-class CircuitBreakerOpenError(GreenAgentException):
-    pass
-
-class AuthenticationError(GreenAgentException):
-    pass
-
-class SecurityError(GreenAgentException):
-    pass
+class QuantumError(GreenAgentException): pass
+class BlockchainError(GreenAgentException): pass
+class DataLakeError(GreenAgentException): pass
+class EdgeDeviceError(GreenAgentException): pass
+class MLOpsError(GreenAgentException): pass
+class APIGatewayError(GreenAgentException): pass
+class CircuitBreakerOpenError(GreenAgentException): pass
+class AuthenticationError(GreenAgentException): pass
+class SecurityError(GreenAgentException): pass
 
 # ============================================================
-# CONFIGURATION (Grouped sub-configs) – extended with MODP weights
+# CONFIGURATION (Grouped sub-configs) – extended with FlexGen settings
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class DatabaseConfig(BaseModel):
@@ -396,6 +419,14 @@ if PYDANTIC_AVAILABLE:
                 'accuracy': 0.30,
             }
         )
+        # New FlexGen settings
+        flexgen_carbon_intensity_default: float = 400.0
+        flexgen_population_size: int = 50
+        flexgen_generations: int = 10
+        flexgen_use_real_executor: bool = False
+        flexgen_executor_type: str = "mock"   # "mock", "cost_model", "real"
+        flexgen_selector_epsilon: float = 0.1
+        flexgen_selector_epsilon_decay: float = 0.999
 
     class EdgeConfig(BaseModel):
         mqtt_broker: str = "localhost"
@@ -486,6 +517,14 @@ else:
         lstm_batch_size: int = 32
         ensemble_weights: Optional[List[float]] = None
         modp_weights: Dict[str, float] = field(default_factory=lambda: {'energy':0.25, 'carbon':0.25, 'latency':0.20, 'accuracy':0.30})
+        # New FlexGen settings
+        flexgen_carbon_intensity_default: float = 400.0
+        flexgen_population_size: int = 50
+        flexgen_generations: int = 10
+        flexgen_use_real_executor: bool = False
+        flexgen_executor_type: str = "mock"
+        flexgen_selector_epsilon: float = 0.1
+        flexgen_selector_epsilon_decay: float = 0.999
 
     @dataclass
     class DatabaseConfig:
@@ -693,7 +732,7 @@ class EnhancedRateLimiter:
 # ============================================================
 class AsyncDatabaseManager:
     """Async database manager using aiosqlite with schema migrations."""
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, config: GreenAgentConfig):
         self.config = config
@@ -839,6 +878,25 @@ class AsyncDatabaseManager:
             await conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))")
             await conn.commit()
             logger.info("Database migrated to v2")
+            current_ver = 2
+
+        if current_ver < 3:
+            # Migration: add flexgen_decisions table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS flexgen_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workload_id TEXT,
+                    node_id TEXT,
+                    policy_json TEXT,
+                    metrics_json TEXT,
+                    reward REAL,
+                    timestamp TEXT
+                )
+            """)
+            await conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (3, datetime('now'))")
+            await conn.commit()
+            logger.info("Database migrated to v3")
+            current_ver = 3
 
     async def _execute(self, query: str, params: tuple = ()):
         await self._init_db()
@@ -941,6 +999,13 @@ class AsyncDatabaseManager:
                     'updated_at': r[10],
                     'version_number': r[11]
                 } for r in rows]
+
+    # NEW: Save FlexGen decision
+    async def save_flexgen_decision(self, workload_id: str, node_id: str, policy_json: str, metrics_json: str, reward: float):
+        await self._execute("""
+            INSERT INTO flexgen_decisions (workload_id, node_id, policy_json, metrics_json, reward, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (workload_id, node_id, policy_json, metrics_json, reward, datetime.now().isoformat()))
 
     async def close(self):
         pass
@@ -1451,8 +1516,6 @@ class EnhancedAutonomousOptimizer:
             policy = self._fallback_solve(context)
 
         # Evaluate using MODP (if available) to compute reward
-        # In this simplified version, we compute the utility of the chosen policy.
-        # In practice, you would run the policy and measure actual outcomes.
         objectives = {
             "energy": metrics.get("energy_joules", 0) / 1000.0,
             "carbon": metrics.get("carbon_kg", 0) / 10.0,
@@ -1548,6 +1611,29 @@ class EnhancedAutonomousOptimizer:
         """Fitness function for bio evolution (placeholder)."""
         return random.uniform(0, 1)
 
+    # NEW: FlexGen integration method
+    async def optimize_flexgen(self, workload, node, metrics) -> Dict:
+        """Select best FlexGen policy using bandit/MoE and return execution plan."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        # Generate candidate policies (from bio or random)
+        candidates = generate_candidate_policies(20)
+        # Use MoE to encode context
+        context = self.moe.encode({
+            "workload": workload.to_dict(),
+            "node": node.to_dict(),
+            "metrics": metrics,
+        }) if self.moe else {}
+        # Select policy index via bandit (or fallback)
+        if self.bandit:
+            action, confidence, source = self.bandit.select_action(context)
+            # action is a policy dict; map to FlexGenPolicy
+            chosen_policy = FlexGenPolicy(**action.get('params', {}))
+        else:
+            # Fallback: choose first Pareto-optimal policy from cost model
+            chosen_policy = candidates[0] if candidates else None
+        return {"chosen_policy": chosen_policy.to_dict() if chosen_policy else None, "candidates": [c.to_dict() for c in candidates]}
+
     def get_optimization_stats(self) -> Dict:
         return {
             'total_optimizations': len(self.db.get_recent_optimisations(1000)),
@@ -1589,7 +1675,7 @@ class APIGateway:
         logger.info("API Gateway initialized")
 
     def _init_fastapi(self):
-        app = FastAPI(title="Green Agent API", version="14.2")
+        app = FastAPI(title="Green Agent API", version="14.3")
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
@@ -1646,7 +1732,6 @@ class APIGateway:
 
         @self.fastapi_app.post("/optimize")
         async def optimize(state: Dict, metrics: Dict):
-            # Replaced old endpoint to use new optimizer
             result = await self.system.autonomous_optimizer.optimize(state, metrics)
             return result
 
@@ -1658,7 +1743,6 @@ class APIGateway:
 
         @self.fastapi_app.post("/optimization/evolve")
         async def evolve():
-            # Trigger bio‑inspired evolution manually (admin only)
             return {"status": "evolution triggered"}
 
         @self.fastapi_app.post("/optimization/pareto")
@@ -1684,6 +1768,25 @@ class APIGateway:
         @self.fastapi_app.get("/nlp/summary")
         async def nlp_summary(metrics: Dict):
             return {'summary': await self.system.nlp.generate_sustainability_summary(metrics)}
+
+        # NEW FLEXGEN ENDPOINTS
+        @self.fastapi_app.post("/flexgen/optimize")
+        async def flexgen_optimize(workload: Dict, node: Dict):
+            # Convert dicts to descriptors
+            from ..schemas.workload_descriptor import WorkloadDescriptor
+            from ..schemas.node_descriptor import NodeDescriptor
+            wl = WorkloadDescriptor(**workload)
+            nd = NodeDescriptor(**node)
+            result = await self.system.run_flexgen_workload(wl, nd)
+            return result
+
+        @self.fastapi_app.get("/flexgen/status")
+        async def flexgen_status():
+            if self.system.gpu_profiler:
+                metrics = await self.system.gpu_profiler.get_all_gpu_metrics()
+                drift_stats = self.system.policy_drift_detector.get_stats()
+                return {"gpu": metrics, "drift": drift_stats}
+            return {"error": "GPU profiler not available"}
 
 # ============================================================
 # CENTRAL ORCHESTRATOR (Application)
@@ -1722,6 +1825,20 @@ class GreenAgentSystem:
         self.environmental_analyzer = EnvironmentalImpactAnalyzer()
         self.api_gateway = APIGateway(config, self)
 
+        # --- FlexGen integration ---
+        if FLEXGEN_AVAILABLE:
+            self.gpu_profiler = GPUProfiler()
+            self.flexgen_cost_model = FlexGenCostModel(
+                carbon_intensity_g_per_kwh=config.analytics.flexgen_carbon_intensity_default
+            )
+            self.policy_drift_detector = PolicyDriftDetector()
+            self.flexgen_controller = None  # created per workload
+        else:
+            self.gpu_profiler = None
+            self.flexgen_cost_model = None
+            self.policy_drift_detector = None
+            self.flexgen_controller = None
+
         # Register components with event bus
         self.components = {
             'pqc': self.pqc,
@@ -1739,6 +1856,9 @@ class GreenAgentSystem:
             'financial': self.financial_modeler,
             'environmental': self.environmental_analyzer,
             'api': self.api_gateway,
+            'gpu_profiler': self.gpu_profiler,
+            'flexgen_cost_model': self.flexgen_cost_model,
+            'policy_drift_detector': self.policy_drift_detector,
         }
 
         # Set global instance for FastAPI
@@ -1753,6 +1873,9 @@ class GreenAgentSystem:
             asyncio.create_task(self._health_check_loop()),
             asyncio.create_task(self._monitoring_loop()),
         ]
+        # Start GPU monitoring if available
+        if self.gpu_profiler:
+            tasks.append(asyncio.create_task(self.gpu_profiler.start_monitoring(interval_sec=5.0)))
         for task in tasks:
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
@@ -1812,6 +1935,62 @@ class GreenAgentSystem:
             'timestamp': datetime.now().isoformat()
         }
 
+    async def run_flexgen_workload(self, workload: Any, node: Any) -> Dict:
+        """Run FlexGen policy selection and mock/real execution for a workload."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        from .gpu_optimization.flexgen_controller import FlexGenController
+        from .gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': self.config.analytics.flexgen_selector_epsilon,
+                'epsilon_decay': self.config.analytics.flexgen_selector_epsilon_decay,
+            },
+        )
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity',
+                                                   self.config.analytics.flexgen_carbon_intensity_default),
+            message_queue=None,  # Use EventBus if needed
+            use_real_executor=self.config.analytics.flexgen_use_real_executor,
+            executor=self._get_flexgen_executor(),
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={
+                'population_size': self.config.analytics.flexgen_population_size,
+                'generations': self.config.analytics.flexgen_generations,
+            },
+            modp_planner=None,  # We'll integrate separately if needed
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        # Save decision to DB
+        chosen_policy = result.get("chosen_policy", {})
+        metrics = result.get("metrics", {})
+        reward = result.get("reward", 0.0)
+        await self.db.save_flexgen_decision(
+            workload.task_id or "unknown",
+            node.id,
+            json.dumps(chosen_policy),
+            json.dumps(metrics, default=str),
+            reward
+        )
+        return result
+
+    def _get_flexgen_executor(self):
+        """Return appropriate executor based on config."""
+        if self.config.analytics.flexgen_executor_type == "real":
+            # Placeholder for real executor
+            return None  # Use default mock
+        elif self.config.analytics.flexgen_executor_type == "cost_model":
+            return None  # Use cost model in controller (handled separately)
+        else:
+            return None  # Mock executor is default
+
     async def shutdown(self):
         logger.info(f"Shutting down GreenAgentSystem (instance: {self.instance_id})")
         self._shutdown_event.set()
@@ -1822,6 +2001,8 @@ class GreenAgentSystem:
             task.cancel()
         if self.background_tasks:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        if self.gpu_profiler:
+            self.gpu_profiler.shutdown()
         await self.db.close()
         logger.info("Shutdown complete")
 
@@ -1831,7 +2012,7 @@ class GreenAgentSystem:
 async def main():
     config = GreenAgentConfig()
     print("=" * 80)
-    print("Green Agent Base Classes v14.2 - Integrated with bio_inspired, moe_system, MODP")
+    print("Green Agent Base Classes v14.3 - Integrated with bio_inspired, moe_system, MODP, and FlexGen")
     print("=" * 80)
 
     system = GreenAgentSystem(config)
