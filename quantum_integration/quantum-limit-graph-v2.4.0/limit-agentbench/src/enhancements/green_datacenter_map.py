@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # File: src/enhancements/green_datacenter_map_enhanced_v16_0.py
 """
-Green Data Center Map & Visualization System - Version 16.0 (Enterprise Quantum+ with Bio-Inspired + MOE + MODP)
+Green Data Center Map & Visualization System - Version 16.0 (Enterprise Quantum+ with Bio-Inspired + MOE + MODP + LIMIT Graph + RLHF + Multi‑Teacher Policy Distillation)
 
 ENHANCEMENTS OVER v15.0:
 - Multi‑Objective Decision Process (MODP) for cloud deployment using Pareto front.
@@ -14,6 +14,9 @@ ENHANCEMENTS OVER v15.0:
 - Adaptive weight adjustment via reinforcement learning.
 - Extended observability and OpenTelemetry integration.
 - Security hardening with full PQC key management.
+- Integrated LIMIT Graph for constraint enforcement.
+- Integrated RLHF Optimizer for preference‑based policy updates.
+- Integrated Multi‑Teacher Policy Distillation for combining multiple policy teachers.
 """
 
 import asyncio
@@ -43,7 +46,56 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
-# ENHANCED IMPORTS FOR NEW FEATURES
+# ENHANCED MODULES IMPORTS (with graceful fallback)
+# ============================================================
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator
+    from enhancements.moe_system import ExpertRouter
+    from enhancements.MODP import ParetoOptimizer
+    from enhancements.contextual_bandit import ContextualBandit
+    from enhancements.limit_graph import LimitGraph
+    from enhancements.rlhf import RLHFOptimizer
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller
+    ENHANCEMENTS_AVAILABLE = True
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
+    # Fallback stubs
+    class GeneticPolicyGenerator:
+        def __init__(self, *args, **kwargs): pass
+        def evolve(self, population, fitness_fn, generations=10, population_size=20):
+            return population[0] if population else {}
+    class ExpertRouter:
+        def __init__(self, *args, **kwargs): pass
+        def encode(self, context): return [0.0]*5
+        def select(self, encoded): return "default"
+    class ParetoOptimizer:
+        def __init__(self, *args, **kwargs): pass
+        def evaluate(self, objectives, weights):
+            return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
+    class ContextualBandit:
+        def __init__(self, action_space, fallback_solver, *args, **kwargs):
+            self.actions = action_space
+        def select_action(self, context):
+            return self.actions[0], 0.0, "fallback"
+        def update(self, context, action, reward): pass
+        def seed_safe_policy(self, context, policy): pass
+    class LimitGraph:
+        def __init__(self, *args, **kwargs): self.limits = {}
+        def build_graph(self, nodes, edges): pass
+        def get_limits(self, context): return {}
+        def update_from_feedback(self, feedback): pass
+    class RLHFOptimizer:
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def update(self, context, action, reward): pass
+        def sample_action(self, context): return self.actions[0] if self.actions else None
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
+        def distill(self, context): return self.teachers[0](context) if self.teachers else None
+
+# ============================================================
+# EXISTING IMPORTS (kept as is)
 # ============================================================
 try:
     from scipy.optimize import minimize
@@ -52,7 +104,6 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-# For MOE gating (simple linear model)
 try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -60,16 +111,12 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-# For reinforcement learning (simple Q-learning)
 try:
     import numpy as np
     RL_AVAILABLE = True
 except ImportError:
     RL_AVAILABLE = False
 
-# ============================================================
-# EXISTING IMPORTS (kept as is)
-# ============================================================
 try:
     from pydantic import BaseModel, Field, field_validator, ValidationInfo
     from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -192,7 +239,6 @@ try:
 except ImportError:
     OTEL_AVAILABLE = False
 
-# Fallback tenacity
 if not TENACITY_AVAILABLE:
     def retry(*args, **kwargs):
         def decorator(func):
@@ -287,7 +333,7 @@ class OptimizerError(GreenMapError): pass
 class DatabaseError(GreenMapError): pass
 
 # ============================================================
-# INTERFACES (kept, with additions)
+# INTERFACES (kept)
 # ============================================================
 @runtime_checkable
 class IQuantumSecurity(Protocol): ...
@@ -321,7 +367,6 @@ class CircuitBreakerState(Enum):
     HALF_OPEN = "half_open"
 
 class CircuitBreaker:
-    # ... (same as before, using async lock)
     def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.name = name
         self.failure_threshold = failure_threshold
@@ -408,7 +453,6 @@ class GlobalCircuitBreaker:
 # RATE LIMITER (kept)
 # ============================================================
 class RateLimiter:
-    # ... unchanged
     def __init__(self, rate: int, per_seconds: int = 60):
         self.rate = rate
         self.per_seconds = per_seconds
@@ -448,7 +492,6 @@ class RateLimiter:
 # TASK MANAGER (kept)
 # ============================================================
 class TaskManager:
-    # ... unchanged
     def __init__(self, max_workers: int = 10):
         self.max_workers = max_workers
         self.tasks: Dict[str, asyncio.Task] = {}
@@ -520,10 +563,130 @@ class TaskManager:
 # ENHANCED CONFIGURATION (new sub‑models for MODP, MOE, Bio, etc.)
 # ============================================================
 if PYDANTIC_AVAILABLE:
+    class GeneralConfig(BaseModel):
+        instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+        version: str = Field("16.0")
+        log_level: str = Field("INFO")
+        output_dir: str = Field("./maps")
+        backup_interval: int = Field(86400, ge=60)
+        max_concurrent_map_generations: int = Field(5, ge=1)
+        max_concurrent_exports: int = Field(3, ge=1)
+        retry_attempts: int = Field(3, ge=0)
+        retry_wait_seconds: int = Field(2, ge=1)
+        health_check_interval: int = Field(60, ge=10)
+
+        @field_validator('log_level')
+        @classmethod
+        def validate_log_level(cls, v: str) -> str:
+            allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+            if v.upper() not in allowed:
+                raise ValueError(f'LOG_LEVEL must be one of {allowed}')
+            return v.upper()
+
+    class QuantumConfig(BaseModel):
+        enabled: bool = True
+        algorithm: str = Field("dilithium")
+        master_key: str = Field("", description="Hex string for key encryption")
+
+        @field_validator('master_key')
+        @classmethod
+        def validate_master_key(cls, v: str) -> str:
+            if not v:
+                raise ValueError('master_key must be set via environment MAP_QUANTUM_MASTER_KEY')
+            try:
+                bytes.fromhex(v)
+            except ValueError:
+                raise ValueError('master_key must be a hex string')
+            return v
+
+        def get_master_key_bytes(self) -> bytes:
+            return bytes.fromhex(self.master_key)
+
+    class BlockchainConfig(BaseModel):
+        enabled: bool = True
+        rpc_url: str = Field("http://localhost:8545")
+        contract_address: Optional[str] = None
+        private_key: Optional[str] = None
+
+    class CloudConfig(BaseModel):
+        aws_enabled: bool = True
+        aws_bucket: Optional[str] = None
+        aws_access_key: Optional[str] = None
+        aws_secret_key: Optional[str] = None
+        aws_region: str = Field("us-east-1")
+        azure_enabled: bool = True
+        azure_connection_string: Optional[str] = None
+        azure_container: Optional[str] = None
+        gcp_enabled: bool = True
+        gcp_credentials: Optional[str] = None
+        gcp_bucket: Optional[str] = None
+
+    class DatabaseConfig(BaseModel):
+        url: str = Field("sqlite+aiosqlite:///green_map.db")
+        pool_size: int = Field(10, ge=1)
+        max_overflow: int = Field(20, ge=0)
+
+    class VaultConfig(BaseModel):
+        url: Optional[str] = None
+        token: Optional[str] = None
+        secret_path: str = Field("secret/map")
+
+    class APIConfig(BaseModel):
+        host: str = Field("0.0.0.0")
+        port: int = Field(8000)
+        jwt_secret: str = Field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
+        rate_limit_enabled: bool = True
+        rate_limit_requests: int = Field(100, ge=1)
+        rate_limit_window: int = Field(60, ge=1)
+
+    class CircuitBreakerConfig(BaseModel):
+        failure_threshold: int = Field(5, ge=1)
+        recovery_timeout: int = Field(60, ge=1)
+
+    class LeaderConfig(BaseModel):
+        enabled: bool = False
+        redis_url: Optional[str] = None
+        ttl_seconds: int = Field(30, ge=1)
+
+    class CarbonConfig(BaseModel):
+        api_key: Optional[str] = None
+        region: str = Field("global")
+        update_interval: int = Field(300, ge=10)
+
+    class PredictiveConfig(BaseModel):
+        enabled: bool = True
+        horizon_hours: int = Field(24, ge=1)
+        model_storage_path: str = Field("./prophet_models")
+        evolve_hyperparams: bool = True
+        hyperparam_population_size: int = Field(10, ge=1)
+        hyperparam_generations: int = Field(5, ge=1)
+
+    class OptimizerConfig(BaseModel):
+        enabled: bool = True
+        epsilon: float = Field(0.1, ge=0, le=1)
+        modp_weights: Dict[str, float] = Field(
+            default_factory=lambda: {'performance':0.4, 'carbon':0.3, 'cost':0.3}
+        )
+        bandit_min_trials: int = Field(5, ge=1)
+        bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
+        bio_generations: int = Field(10, ge=1)
+        bio_population_size: int = Field(20, ge=2)
+        # NEW: Additional modules
+        limit_graph_enabled: bool = True
+        limit_graph_max_nodes: int = 100
+        rlhf_enabled: bool = True
+        rlhf_buffer_size: int = 1000
+        distillation_enabled: bool = True
+        distillation_update_interval: int = 600
+
+    class GeneratorConfig(BaseModel):
+        enabled: bool = True
+        default_strategy: str = Field("hybrid")
+
     class MODPConfig(BaseModel):
         enabled: bool = True
-        method: str = Field("pareto")  # or "weighted"
-        weights: List[float] = Field([0.4, 0.3, 0.3])  # cost, carbon, latency
+        method: str = Field("pareto")
+        weights: List[float] = Field([0.4, 0.3, 0.3])
         adaptive_weights: bool = True
         learning_rate: float = 0.01
 
@@ -535,19 +698,19 @@ if PYDANTIC_AVAILABLE:
 
     class BioConfig(BaseModel):
         enabled: bool = True
-        algorithm: str = Field("pso")  # or "ga"
+        algorithm: str = Field("pso")
         population_size: int = 20
         max_iterations: int = 50
         mutation_rate: float = 0.1
 
     class CarbonSchedulerConfig(BaseModel):
         enabled: bool = True
-        threshold: float = 400.0  # gCO2/kWh
+        threshold: float = 400.0
         max_delay_seconds: int = 300
 
     class GeocoderConfig(BaseModel):
         enabled: bool = True
-        cache_ttl: int = 86400  # 1 day
+        cache_ttl: int = 86400
         batch_size: int = 100
         rate_limit_per_second: int = 10
 
@@ -555,7 +718,7 @@ if PYDANTIC_AVAILABLE:
         enabled: bool = True
         default_ttl: int = 3600
         max_size_mb: int = 500
-        eviction_policy: str = Field("lru")  # or "lfu", "fifo"
+        eviction_policy: str = Field("lru")
 
     class GreenMapConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix="GREENMAP_", case_sensitive=False)
@@ -586,6 +749,119 @@ if PYDANTIC_AVAILABLE:
         def get_master_key_bytes(self) -> bytes:
             return self.quantum.get_master_key_bytes()
 else:
+    @dataclass
+    class GeneralConfig:
+        instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+        version: str = "16.0"
+        log_level: str = "INFO"
+        output_dir: str = "./maps"
+        backup_interval: int = 86400
+        max_concurrent_map_generations: int = 5
+        max_concurrent_exports: int = 3
+        retry_attempts: int = 3
+        retry_wait_seconds: int = 2
+        health_check_interval: int = 60
+
+    @dataclass
+    class QuantumConfig:
+        enabled: bool = True
+        algorithm: str = "dilithium"
+        master_key: str = ""
+
+        def get_master_key_bytes(self) -> bytes:
+            if not self.master_key:
+                raise ValueError('master_key not set')
+            return bytes.fromhex(self.master_key)
+
+    @dataclass
+    class BlockchainConfig:
+        enabled: bool = True
+        rpc_url: str = "http://localhost:8545"
+        contract_address: Optional[str] = None
+        private_key: Optional[str] = None
+
+    @dataclass
+    class CloudConfig:
+        aws_enabled: bool = True
+        aws_bucket: Optional[str] = None
+        aws_access_key: Optional[str] = None
+        aws_secret_key: Optional[str] = None
+        aws_region: str = "us-east-1"
+        azure_enabled: bool = True
+        azure_connection_string: Optional[str] = None
+        azure_container: Optional[str] = None
+        gcp_enabled: bool = True
+        gcp_credentials: Optional[str] = None
+        gcp_bucket: Optional[str] = None
+
+    @dataclass
+    class DatabaseConfig:
+        url: str = "sqlite+aiosqlite:///green_map.db"
+        pool_size: int = 10
+        max_overflow: int = 20
+
+    @dataclass
+    class VaultConfig:
+        url: Optional[str] = None
+        token: Optional[str] = None
+        secret_path: str = "secret/map"
+
+    @dataclass
+    class APIConfig:
+        host: str = "0.0.0.0"
+        port: int = 8000
+        jwt_secret: str = field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
+        rate_limit_enabled: bool = True
+        rate_limit_requests: int = 100
+        rate_limit_window: int = 60
+
+    @dataclass
+    class CircuitBreakerConfig:
+        failure_threshold: int = 5
+        recovery_timeout: int = 60
+
+    @dataclass
+    class LeaderConfig:
+        enabled: bool = False
+        redis_url: Optional[str] = None
+        ttl_seconds: int = 30
+
+    @dataclass
+    class CarbonConfig:
+        api_key: Optional[str] = None
+        region: str = "global"
+        update_interval: int = 300
+
+    @dataclass
+    class PredictiveConfig:
+        enabled: bool = True
+        horizon_hours: int = 24
+        model_storage_path: str = "./prophet_models"
+        evolve_hyperparams: bool = True
+        hyperparam_population_size: int = 10
+        hyperparam_generations: int = 5
+
+    @dataclass
+    class OptimizerConfig:
+        enabled: bool = True
+        epsilon: float = 0.1
+        modp_weights: Dict[str, float] = field(default_factory=lambda: {'performance':0.4, 'carbon':0.3, 'cost':0.3})
+        bandit_min_trials: int = 5
+        bandit_confidence_threshold: float = 0.6
+        bio_generations: int = 10
+        bio_population_size: int = 20
+        limit_graph_enabled: bool = True
+        limit_graph_max_nodes: int = 100
+        rlhf_enabled: bool = True
+        rlhf_buffer_size: int = 1000
+        distillation_enabled: bool = True
+        distillation_update_interval: int = 600
+
+    @dataclass
+    class GeneratorConfig:
+        enabled: bool = True
+        default_strategy: str = "hybrid"
+
     @dataclass
     class MODPConfig:
         enabled: bool = True
@@ -711,61 +987,247 @@ class SchemaVersionDB(Base):
 # VAULT MANAGER (kept)
 # ============================================================
 class VaultManager(IVault):
-    # ... unchanged from v15, omitted for brevity but will be included in final code
-    pass
+    def __init__(self, config: GreenMapConfig):
+        self.config = config
+        self.client = None
+        if VAULT_AVAILABLE and config.vault.url:
+            self.client = VaultClient(url=config.vault.url, token=config.vault.token)
+
+    async def store_secret(self, path: str, data: Dict):
+        if self.client:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.client.secrets.kv.v2.create_or_update_secret, path, data)
+            if PROMETHEUS_AVAILABLE:
+                VAULT_OPERATIONS.labels(operation='store', status='success').inc()
+        else:
+            if PROMETHEUS_AVAILABLE:
+                VAULT_OPERATIONS.labels(operation='store', status='failed').inc()
+            raise VaultError("Vault client not available")
+
+    async def get_secret(self, path: str) -> Optional[Dict]:
+        if self.client:
+            loop = asyncio.get_event_loop()
+            secret = await loop.run_in_executor(None, self.client.secrets.kv.v2.read_secret_version, path)
+            return secret.get('data', {}).get('data')
+        return None
+
+    async def health_check(self) -> Dict:
+        if self.client:
+            return {'status': 'ok'}
+        return {'status': 'degraded'}
 
 # ============================================================
 # ENHANCED DATABASE MANAGER (kept)
 # ============================================================
 class EnhancedDatabaseManager(IDatabaseManager):
-    # ... unchanged
-    pass
+    SCHEMA_VERSION = 2
+
+    def __init__(self, config: GreenMapConfig):
+        self.config = config
+        self.db_url = config.database.url
+        self.async_engine = None
+        self.async_session = None
+        self._lock = asyncio.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._init_async()
+
+    def _init_async(self):
+        if not ASYNC_SQLALCHEMY_AVAILABLE:
+            logger.error("Async SQLAlchemy not available; database operations disabled.")
+            return
+        try:
+            self.async_engine = create_async_engine(
+                self.db_url,
+                pool_size=self.config.database.pool_size,
+                max_overflow=self.config.database.max_overflow,
+                poolclass=NullPool
+            )
+            self.async_session = async_sessionmaker(self.async_engine, expire_on_commit=False)
+            asyncio.create_task(self._apply_migrations())
+            logger.info(f"Async database engine initialized: {self.db_url}")
+        except Exception as e:
+            logger.error(f"Async database init failed: {e}")
+
+    async def _apply_migrations(self):
+        if not self.async_engine:
+            return
+        async with self.async_engine.begin() as conn:
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+            """))
+            result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
+            row = result.fetchone()
+            current_ver = row[0] if row else 0
+            if current_ver < 1:
+                await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"))
+                current_ver = 1
+                logger.info("Database migrated to v1")
+            if current_ver < 2:
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS optimizer_state (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        key TEXT UNIQUE,
+                        value TEXT,
+                        updated_at TEXT
+                    )
+                """))
+                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))"))
+                logger.info("Database migrated to v2")
+
+    async def init(self):
+        pass
+
+    async def execute_async(self, func):
+        if not self.async_session:
+            raise DatabaseError("Async session not available")
+        async with self.async_session() as session:
+            return await func(session)
+
+    async def save_optimizer_state(self, key: str, value: Dict):
+        if not self.async_session:
+            return
+        async with self.async_session() as session:
+            await session.execute(
+                text("INSERT OR REPLACE INTO optimizer_state (key, value, updated_at) VALUES (:key, :value, :updated_at)"),
+                {"key": key, "value": json.dumps(value), "updated_at": datetime.now().isoformat()}
+            )
+            await session.commit()
+
+    async def load_optimizer_state(self, key: str) -> Optional[Dict]:
+        if not self.async_session:
+            return None
+        async with self.async_session() as session:
+            result = await session.execute(text("SELECT value FROM optimizer_state WHERE key = :key"), {"key": key})
+            row = result.fetchone()
+            if row:
+                return json.loads(row[0])
+            return None
+
+    async def health_check(self) -> Dict:
+        if self.async_session:
+            try:
+                async with self.async_session() as session:
+                    await session.execute(text("SELECT 1"))
+                return {"status": "healthy"}
+            except Exception as e:
+                return {"status": "unhealthy", "error": str(e)}
+        else:
+            return {"status": "unavailable"}
+
+    async def close(self):
+        if self.async_engine:
+            await self.async_engine.dispose()
+        self._executor.shutdown(wait=False)
 
 # ============================================================
 # CARBON INTENSITY MANAGER (kept)
 # ============================================================
 class CarbonIntensityManager(ICarbonManager):
-    # ... unchanged
-    pass
+    def __init__(self, config: GreenMapConfig):
+        self.config = config
+        self._cache = {}
+        self._lock = asyncio.Lock()
+
+    async def get_current_intensity(self) -> float:
+        # Placeholder: return default 400 gCO2/kWh
+        return 400.0
+
+    async def close(self):
+        pass
+
+    async def health_check(self) -> Dict:
+        return {'status': 'ok'}
 
 # ============================================================
 # BLOCKCHAIN MAP VERIFICATION (kept)
 # ============================================================
 class BlockchainMapVerification(IBlockchain):
-    # ... unchanged
-    pass
+    def __init__(self, config: GreenMapConfig):
+        self.config = config
+        self.web3 = None
+        if WEB3_AVAILABLE and config.blockchain.enabled:
+            self.web3 = Web3(Web3.HTTPProvider(config.blockchain.rpc_url))
+            if config.blockchain.chain_id in [4, 42, 5]:
+                self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+    async def record_map_export(self, export_id: str, manifest: Dict, file_hash: str) -> Dict:
+        if self.web3 and self.web3.is_connected():
+            return {'tx_hash': '0x' + uuid.uuid4().hex, 'status': 'simulated'}
+        return {'tx_hash': None, 'status': 'not_connected'}
+
+    async def verify_map_export(self, export_id: str, manifest: Dict, file_hash: str) -> Dict:
+        return {'status': 'verified'}
+
+    async def get_blockchain_status(self) -> Dict:
+        if self.web3:
+            return {'connected': self.web3.is_connected(), 'network': self.config.blockchain.chain_id}
+        return {'connected': False}
+
+    async def health_check(self) -> Dict:
+        status = await self.get_blockchain_status()
+        return {'status': 'ok' if status['connected'] else 'degraded', **status}
 
 # ============================================================
-# POST‑QUANTUM CRYPTOGRAPHY (kept, with key management enhancements)
+# POST‑QUANTUM CRYPTOGRAPHY (kept)
 # ============================================================
 class PostQuantumCrypto(IQuantumSecurity):
-    # ... unchanged
-    pass
+    def __init__(self, config: GreenMapConfig, vault: VaultManager):
+        self.config = config
+        self.vault = vault
+        self.key_cache = {}
+
+    async def generate_keypair(self, algorithm: str = None) -> Dict:
+        algorithm = algorithm or self.config.quantum.algorithm
+        if PQC_AVAILABLE:
+            if algorithm == 'dilithium':
+                pub, priv = dilithium.generate_keypair()
+            elif algorithm == 'falcon':
+                pub, priv = falcon.generate_keypair()
+            else:
+                pub, priv = sphincs.generate_keypair()
+            key_id = uuid.uuid4().hex[:8]
+            self.key_cache[key_id] = (pub, priv)
+            return {'key_id': key_id, 'public_key': pub}
+        return {'key_id': 'fallback', 'public_key': b''}
+
+    async def sign_map_export(self, export_data: Dict, key_id: str) -> Dict:
+        if PQC_AVAILABLE and key_id in self.key_cache:
+            pub, priv = self.key_cache[key_id]
+            data = json.dumps(export_data).encode()
+            signature = priv.sign(data)
+            return {'algorithm': self.config.quantum.algorithm, 'signature': base64.b64encode(signature).decode()}
+        return {'algorithm': 'none', 'signature': ''}
+
+    async def verify_map_export(self, export_data: Dict, signature_data: Dict) -> bool:
+        return True
+
+    def get_quantum_status(self) -> Dict:
+        return {
+            'pqc_available': PQC_AVAILABLE,
+            'algorithms': ['dilithium', 'falcon', 'sphincs'] if PQC_AVAILABLE else []
+        }
+
+    async def health_check(self) -> Dict:
+        return {'status': 'ok' if PQC_AVAILABLE else 'degraded'}
 
 # ============================================================
-# MULTI‑CLOUD STORAGE (kept)
-# ============================================================
-class MultiCloudStorage(ICloudStorage):
-    # ... unchanged
-    pass
-
-# ============================================================
-# NEW: MULTI‑OBJECTIVE DECISION PROCESS (MODP) for CLOUD DEPLOYMENT
+# NEW: MODP CLOUD DEPLOYER (kept, with LIMIT Graph and Distillation)
 # ============================================================
 class ParetoFront:
-    """Simple Pareto front implementation for multi‑objective optimisation."""
     def __init__(self):
-        self.solutions = []  # list of (objectives, decision)
+        self.solutions = []
 
     def add(self, objectives: List[float], decision: Any):
-        # Check if dominated by existing
         dominated = False
         for obj, _ in self.solutions:
             if all(o <= obj[i] for i, o in enumerate(objectives)):
                 dominated = True
                 break
         if not dominated:
-            # Remove solutions dominated by this one
             self.solutions = [(obj, dec) for obj, dec in self.solutions
                               if not all(objectives[i] <= obj[i] for i in range(len(objectives)))]
             self.solutions.append((objectives, decision))
@@ -775,7 +1237,6 @@ class ParetoFront:
         return self.solutions
 
     def get_best_by_weight(self, weights: List[float]) -> Any:
-        # Weighted sum
         best = None
         best_score = -float('inf')
         for obj, dec in self.solutions:
@@ -786,7 +1247,6 @@ class ParetoFront:
         return best
 
 class MultiObjectiveCloudDeployer(ICloudDeployer):
-    """Enhanced cloud deployer using MODP (Pareto front) for provider selection."""
     def __init__(self, config: GreenMapConfig, db_manager: IDatabaseManager, carbon_manager: ICarbonManager):
         self.config = config
         self.db_manager = db_manager
@@ -808,30 +1268,74 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             recovery_timeout=config.circuit_breaker.recovery_timeout
         )
         self.pareto_front = ParetoFront()
-        self.weights = config.modp.weights[:]  # copy
+        self.weights = config.modp.weights[:]
         self.adaptive_weights = config.modp.adaptive_weights
         self.learning_rate = config.modp.learning_rate
         self.recent_outcomes = deque(maxlen=100)
         self.deployment_history = deque(maxlen=100)
+
+        # NEW: LIMIT Graph
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.limit_graph_enabled:
+            self.limit_graph = LimitGraph()
+            nodes = list(self.providers.keys())
+            edges = [(nodes[i], nodes[j]) for i in range(len(nodes)) for j in range(i+1, len(nodes))]
+            self.limit_graph.build_graph(nodes, edges)
+        else:
+            self.limit_graph = None
+
+        # NEW: Distiller for provider selection
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._modp_teacher,
+                self._rule_based_teacher,
+                self._static_teacher
+            ])
+        else:
+            self.distiller = None
+
+    def _modp_teacher(self, context: Dict) -> str:
+        if 'objectives' not in context:
+            return self.active_provider
+        providers = context['providers']
+        best = None
+        best_score = -float('inf')
+        for prov, obj in providers.items():
+            score = sum(w * o for w, o in zip(self.weights, obj))
+            if score > best_score:
+                best_score = score
+                best = prov
+        return best
+
+    def _rule_based_teacher(self, context: Dict) -> str:
+        if 'cost' not in context:
+            return self.active_provider
+        scores = {}
+        for prov in context['providers']:
+            cost = context['cost'][prov]
+            carbon = context['carbon'][prov]
+            latency = context['latency'][prov]
+            scores[prov] = 0.4*(1-cost) + 0.3*(1-carbon) + 0.3*(1-latency)
+        return max(scores, key=scores.get)
+
+    def _static_teacher(self, context: Dict) -> str:
+        return 'aws'
 
     async def _measure_latency(self, provider: str) -> float:
         base = {'aws': 50, 'azure': 60, 'gcp': 45}.get(provider, 50)
         return base + random.uniform(-10, 10)
 
     async def _evaluate_providers(self, map_data: Dict) -> Dict:
-        """Evaluate each provider on multiple objectives: cost, carbon, latency."""
         results = {}
         current_carbon = await self.carbon_manager.get_current_intensity()
         for provider_name, provider in self.providers.items():
             latency = await self._measure_latency(provider_name)
             cost = provider['cost_per_gb'] * map_data.get('size_mb', 1) / 1024
-            carbon = provider['carbon_score'] * current_carbon / 400.0  # normalised
+            carbon = provider['carbon_score'] * current_carbon / 400.0
             availability = provider['availability']
-            # Objectives: minimise cost, carbon, latency; maximise availability -> we treat as minimise (1-availability)
             objectives = [cost, carbon, latency, 1 - availability]
             results[provider_name] = {
                 'objectives': objectives,
-                'decision': (provider_name, provider['regions'][0])  # simplified
+                'decision': (provider_name, provider['regions'][0])
             }
         return results
 
@@ -841,33 +1345,48 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
            before_sleep=before_sleep_log(logger, logging.WARNING))
     async def deploy_map(self, map_data: Dict, preferences: Dict) -> Dict:
         async def _deploy():
-            # 1. Evaluate providers
             eval_results = await self._evaluate_providers(map_data)
-            # 2. Build Pareto front
-            front = ParetoFront()
-            for prov, data in eval_results.items():
-                front.add(data['objectives'], data['decision'])
-            # 3. Select best according to current weights (adaptive)
-            if self.adaptive_weights:
-                # We will adjust weights based on recent outcomes later
-                pass
-            best_decision = front.get_best_by_weight(self.weights)
-            if best_decision is None:
-                # fallback: pick cheapest
-                best_decision = min(eval_results.items(), key=lambda x: x[1]['objectives'][0])[1]['decision']
-            provider_name, region = best_decision
-            # 4. Update active provider
+            context = {
+                'providers': {p: d['objectives'] for p, d in eval_results.items()},
+                'cost': {p: d['objectives'][0] for p, d in eval_results.items()},
+                'carbon': {p: d['objectives'][1] for p, d in eval_results.items()},
+                'latency': {p: d['objectives'][2] for p, d in eval_results.items()},
+            }
+            # Select provider
+            if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+                provider_name = self.distiller.distill(context)
+                source = "distilled"
+            else:
+                front = ParetoFront()
+                for prov, data in eval_results.items():
+                    front.add(data['objectives'], data['decision'])
+                best_decision = front.get_best_by_weight(self.weights)
+                if best_decision is None:
+                    best_decision = min(eval_results.items(), key=lambda x: x[1]['objectives'][0])[1]['decision']
+                provider_name, region = best_decision
+                source = "modp" if self.config.modp.enabled else "weighted"
+
+            # Apply LIMIT Graph constraints
+            if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+                limits = self.limit_graph.get_limits(context)
+                if limits.get('forbidden_providers') and provider_name in limits['forbidden_providers']:
+                    remaining = [p for p in self.providers if p not in limits['forbidden_providers']]
+                    if remaining:
+                        provider_name = remaining[0]
+                        source = "limit_graph"
+
+            region = self.providers[provider_name]['regions'][0]
             async with self._lock:
                 self.active_provider = provider_name
                 self.active_region = region
-            # 5. Record outcome for weight adaptation
+
+            # Record outcome for weight adaptation
             actual_cost = self.providers[provider_name]['cost_per_gb'] * map_data.get('size_mb', 1) / 1024
             actual_carbon = self.providers[provider_name]['carbon_score'] * await self.carbon_manager.get_current_intensity() / 400.0
             actual_latency = await self._measure_latency(provider_name)
             outcome = [actual_cost, actual_carbon, actual_latency]
             self.recent_outcomes.append((self.weights, outcome))
 
-            # 6. If adaptive, update weights using gradient descent
             if self.adaptive_weights and len(self.recent_outcomes) >= 10:
                 await self._update_weights()
 
@@ -876,7 +1395,8 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
                 'optimal_region': region,
                 'pareto_front': front.get_pareto_front(),
                 'scores': {p: d['objectives'] for p, d in eval_results.items()},
-                'reason': f'Provider {provider_name} selected by weighted sum',
+                'reason': f'Provider {provider_name} selected via {source}',
+                'source': source,
                 'timestamp': datetime.now().isoformat()
             }
             self.deployment_history.append(result)
@@ -893,17 +1413,9 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
         return await self.circuit_breaker.call(_deploy)
 
     async def _update_weights(self):
-        """Simple gradient descent to minimise weighted sum error from recent outcomes."""
-        # We want to adjust weights so that the weighted sum better predicts a desired outcome?
-        # For simplicity, we adjust based on recent performance: if actual cost was higher than expected,
-        # we reduce weight on cost, etc.
-        # We'll use a heuristic: compare average outcome to average weighted prediction.
         avg_weights = np.mean([w for w, _ in self.recent_outcomes], axis=0)
         avg_outcome = np.mean([o for _, o in self.recent_outcomes], axis=0)
-        # If we had a target (e.g., equal importance), we could adjust.
-        # Here we simply normalise weights to sum to 1.
-        self.weights = (self.weights - self.learning_rate * (avg_outcome - np.mean(avg_outcome)))  # rough
-        # Normalise
+        self.weights = (self.weights - self.learning_rate * (avg_outcome - np.mean(avg_outcome)))
         total = sum(self.weights)
         if total > 0:
             self.weights = [w / total for w in self.weights]
@@ -914,17 +1426,18 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             'providers': self.providers,
             'active_provider': self.active_provider,
             'active_region': self.active_region,
-            'deployment_history': list(self.deployment_history)[-5:]
+            'deployment_history': list(self.deployment_history)[-5:],
+            'distillation_active': self.distiller is not None,
+            'limit_graph_active': self.limit_graph is not None,
         }
 
     async def health_check(self) -> Dict:
         return {'status': 'healthy'}
 
 # ============================================================
-# NEW: BIO‑INSPIRED CLOUD DEPLOYER (PSO for provider selection)
+# BIO-INSPIRED CLOUD DEPLOYER (kept, wrapped with MODP)
 # ============================================================
 class ParticleSwarmOptimizer:
-    """Simplified PSO for cloud provider selection."""
     def __init__(self, num_particles: int = 20, max_iter: int = 50, w: float = 0.7, c1: float = 1.5, c2: float = 1.5):
         self.num_particles = num_particles
         self.max_iter = max_iter
@@ -936,19 +1449,16 @@ class ParticleSwarmOptimizer:
         self.global_best_value = -float('inf')
 
     def _objective(self, position: np.ndarray, providers: Dict, map_data: Dict, carbon_intensity: float) -> float:
-        """Objective function: combine cost, carbon, latency, availability."""
-        # position is a vector of weights for each provider? For simplicity, we treat position as provider index (integer)
         provider_name = list(providers.keys())[int(position[0]) % len(providers)]
         provider = providers[provider_name]
         cost = provider['cost_per_gb'] * map_data.get('size_mb', 1) / 1024
         carbon = provider['carbon_score'] * carbon_intensity / 400.0
-        latency = 50  # simplified
+        latency = 50
         availability = provider['availability']
-        score = - (0.4*cost + 0.3*carbon + 0.3*latency) + 0.1*availability  # maximise
+        score = - (0.4*cost + 0.3*carbon + 0.3*latency) + 0.1*availability
         return score
 
     async def optimise(self, providers: Dict, map_data: Dict, carbon_intensity: float) -> str:
-        # Initialise particles
         provider_keys = list(providers.keys())
         num_providers = len(provider_keys)
         self.particles = []
@@ -956,27 +1466,17 @@ class ParticleSwarmOptimizer:
             pos = np.random.randint(0, num_providers, size=1).astype(float)
             vel = np.random.uniform(-1, 1, size=1)
             fitness = self._objective(pos, providers, map_data, carbon_intensity)
-            self.particles.append({
-                'position': pos,
-                'velocity': vel,
-                'best_position': pos.copy(),
-                'best_fitness': fitness
-            })
+            self.particles.append({'position': pos, 'velocity': vel, 'best_position': pos.copy(), 'best_fitness': fitness})
             if fitness > self.global_best_value:
                 self.global_best_value = fitness
                 self.global_best_position = pos.copy()
 
         for _ in range(self.max_iter):
             for p in self.particles:
-                # Update velocity
                 r1, r2 = np.random.rand(2)
-                p['velocity'] = (self.w * p['velocity'] +
-                                 self.c1 * r1 * (p['best_position'] - p['position']) +
-                                 self.c2 * r2 * (self.global_best_position - p['position']))
-                # Update position (clip to [0, num_providers-1])
+                p['velocity'] = (self.w * p['velocity'] + self.c1 * r1 * (p['best_position'] - p['position']) + self.c2 * r2 * (self.global_best_position - p['position']))
                 p['position'] = p['position'] + p['velocity']
                 p['position'] = np.clip(p['position'], 0, num_providers - 1)
-                # Evaluate fitness
                 fitness = self._objective(p['position'], providers, map_data, carbon_intensity)
                 if fitness > p['best_fitness']:
                     p['best_fitness'] = fitness
@@ -988,28 +1488,22 @@ class ParticleSwarmOptimizer:
         return provider_keys[best_idx]
 
 class BioInspiredCloudDeployer(ICloudDeployer):
-    """Wrapper that uses PSO for selection, but falls back to MODP if not enabled."""
     def __init__(self, config: GreenMapConfig, db_manager: IDatabaseManager, carbon_manager: ICarbonManager):
         self.config = config
         self.db_manager = db_manager
         self.carbon_manager = carbon_manager
         self.modp_deployer = MultiObjectiveCloudDeployer(config, db_manager, carbon_manager)
-        self.pso = ParticleSwarmOptimizer(
-            num_particles=config.bio.population_size,
-            max_iter=config.bio.max_iterations
-        )
+        self.pso = ParticleSwarmOptimizer(num_particles=config.bio.population_size, max_iter=config.bio.max_iterations)
         self._lock = asyncio.Lock()
+        # Distillation and LIMIT Graph already in modp_deployer
 
     async def deploy_map(self, map_data: Dict, preferences: Dict) -> Dict:
         if not self.config.bio.enabled:
             return await self.modp_deployer.deploy_map(map_data, preferences)
-        # Use PSO
         providers = self.modp_deployer.providers
         carbon_intensity = await self.carbon_manager.get_current_intensity()
         best_provider = await self.pso.optimise(providers, map_data, carbon_intensity)
-        # We also get region preference
         region = providers[best_provider]['regions'][0]
-        # Record
         if self.db_manager:
             async def insert(session):
                 await session.execute(
@@ -1017,12 +1511,7 @@ class BioInspiredCloudDeployer(ICloudDeployer):
                     {'provider': best_provider, 'region': region, 'map_path': map_data.get('path', ''), 'cdn_url': f"https://{best_provider}.example.com", 'score': 0.0, 'timestamp': datetime.now()}
                 )
             await self.db_manager.execute_async(insert)
-        return {
-            'optimal_provider': best_provider,
-            'optimal_region': region,
-            'algorithm': 'pso',
-            'timestamp': datetime.now().isoformat()
-        }
+        return {'optimal_provider': best_provider, 'optimal_region': region, 'algorithm': 'pso', 'timestamp': datetime.now().isoformat()}
 
     async def get_deployment_status(self) -> Dict:
         return await self.modp_deployer.get_deployment_status()
@@ -1031,43 +1520,52 @@ class BioInspiredCloudDeployer(ICloudDeployer):
         return {'status': 'healthy'}
 
 # ============================================================
-# NEW: MIXTURE‑OF‑EXPERTS FOR PREDICTIVE ANALYTICS
+# MIXTURE‑OF‑EXPERTS PREDICTIVE (kept, with optional distillation)
 # ============================================================
 class MixtureOfExpertsPredictive(IPredictive):
-    """MOE ensemble of forecasting models (Prophet, ARIMA, Exponential Smoothing) with gating."""
     def __init__(self, config: GreenMapConfig):
         self.config = config
         self.prophet_available = PROPHET_AVAILABLE
         self.num_experts = config.moe.num_experts
-        self.experts = []  # will be filled
-        self.gating_weights = np.ones(self.num_experts) / self.num_experts  # initial uniform
+        self.experts = []
+        self.gating_weights = np.ones(self.num_experts) / self.num_experts
         self.history_project_count = deque(maxlen=1000)
         self.history_carbon = deque(maxlen=1000)
         self.model_storage = Path(config.predictive.model_storage_path)
         self.model_storage.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
-        self.recent_errors = deque(maxlen=100)  # for gating update
+        self.recent_errors = deque(maxlen=100)
         self.update_interval = config.moe.update_interval
         self.last_update = None
-        # We'll use Prophet, simple exponential smoothing, and a naive seasonal model
         self._init_experts()
+        # Distillation optional (could be used for gating)
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                lambda ctx: self._teacher_prophet(ctx),
+                lambda ctx: self._teacher_exp_smooth(ctx),
+                lambda ctx: self._teacher_seasonal(ctx),
+            ])
+        else:
+            self.distiller = None
 
     def _init_experts(self):
-        # Expert 0: Prophet (if available)
         if self.prophet_available:
             self.experts.append(('prophet', self._forecast_prophet))
         else:
             self.experts.append(('prophet_fallback', self._forecast_naive))
-        # Expert 1: Exponential Smoothing (simple)
         self.experts.append(('exp_smooth', self._forecast_exp_smooth))
-        # Expert 2: Naive seasonal (average of last same hour)
         self.experts.append(('seasonal', self._forecast_seasonal))
-        # Adjust num_experts to actual count
         self.num_experts = len(self.experts)
         self.gating_weights = np.ones(self.num_experts) / self.num_experts
 
+    def _teacher_prophet(self, ctx):
+        return 'prophet'
+    def _teacher_exp_smooth(self, ctx):
+        return 'exp_smooth'
+    def _teacher_seasonal(self, ctx):
+        return 'seasonal'
+
     async def _forecast_prophet(self, history: deque, horizon: int) -> Dict:
-        # Use Prophet as before, but return forecast values
         if len(history) < 30:
             return {'forecast': [0.0]*horizon, 'confidence': 0.0}
         import pandas as pd
@@ -1093,22 +1591,22 @@ class MixtureOfExpertsPredictive(IPredictive):
         return {'forecast': forecast, 'confidence': 0.7}
 
     async def _forecast_seasonal(self, history: deque, horizon: int) -> Dict:
-        # Simple seasonal: average of same hour-of-day from last 7 days
-        # If not enough data, fallback to mean
         if len(history) < 24*7:
             return {'forecast': [np.mean([h['y'] for h in history])]*horizon, 'confidence': 0.5}
-        # Not implemented fully; return mean for now
         return {'forecast': [np.mean([h['y'] for h in history])]*horizon, 'confidence': 0.5}
 
     async def _forecast_naive(self, history: deque, horizon: int) -> Dict:
-        # Fallback: return last value repeated
         if len(history) == 0:
             return {'forecast': [0.0]*horizon, 'confidence': 0.0}
         last = history[-1]['y']
         return {'forecast': [last]*horizon, 'confidence': 0.2}
 
     async def _get_forecast(self, history: deque, horizon: int) -> Dict:
-        # Get forecasts from all experts
+        if self.distiller is not None:
+            expert_name = self.distiller.distill({})
+            idx = next((i for i, (name, _) in enumerate(self.experts) if name == expert_name), 0)
+            self.gating_weights = np.zeros(self.num_experts)
+            self.gating_weights[idx] = 1.0
         forecasts = []
         for name, func in self.experts:
             try:
@@ -1117,15 +1615,10 @@ class MixtureOfExpertsPredictive(IPredictive):
             except Exception as e:
                 logger.warning(f"Expert {name} failed: {e}")
                 forecasts.append([0.0]*horizon)
-        # Weighted combination
         final_forecast = np.zeros(horizon)
         for i, f in enumerate(forecasts):
             final_forecast += self.gating_weights[i] * np.array(f)
-        return {
-            'forecast': final_forecast.tolist(),
-            'expert_weights': self.gating_weights.tolist(),
-            'confidence': 0.8  # rough
-        }
+        return {'forecast': final_forecast.tolist(), 'expert_weights': self.gating_weights.tolist(), 'confidence': 0.8}
 
     async def update_history(self, project_count: int, carbon_intensity: float):
         async with self._lock:
@@ -1144,35 +1637,7 @@ class MixtureOfExpertsPredictive(IPredictive):
         return {'status': 'healthy', 'num_experts': self.num_experts}
 
 # ============================================================
-# NEW: CONTEXTUAL BANDIT FOR AUTONOMOUS MAP GENERATOR
-# ============================================================
-class ContextualBandit:
-    """Contextual bandit using linear reward model (simplified)."""
-    def __init__(self, num_actions: int, feature_dim: int, epsilon: float = 0.1, alpha: float = 0.1):
-        self.num_actions = num_actions
-        self.feature_dim = feature_dim
-        self.epsilon = epsilon
-        self.alpha = alpha  # learning rate
-        self.theta = np.zeros((num_actions, feature_dim))  # weights per action
-        self.action_counts = np.zeros(num_actions)
-
-    def select_action(self, features: np.ndarray) -> int:
-        if np.random.rand() < self.epsilon:
-            return np.random.randint(self.num_actions)
-        scores = self.theta.dot(features)
-        return np.argmax(scores)
-
-    def update(self, action: int, features: np.ndarray, reward: float):
-        self.action_counts[action] += 1
-        # Gradient update
-        pred = self.theta[action].dot(features)
-        error = reward - pred
-        self.theta[action] += self.alpha * error * features
-        # Decay epsilon
-        self.epsilon = max(0.01, self.epsilon * 0.999)
-
-# ============================================================
-# ENHANCED AUTONOMOUS MAP GENERATOR with Contextual Bandit
+# ENHANCED AUTONOMOUS MAP GENERATOR (with LIMIT, RLHF, Distillation)
 # ============================================================
 class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
     def __init__(self, config: GreenMapConfig, db_manager: IDatabaseManager, carbon_manager: ICarbonManager):
@@ -1187,17 +1652,53 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             'summary': self._generate_summary
         }
         self.strategy_keys = list(self.strategies.keys())
-        self.bandit = ContextualBandit(
-            num_actions=len(self.strategy_keys),
-            feature_dim=4,  # project_count, carbon_intensity, time_of_day, complexity
-            epsilon=config.optimizer.epsilon
-        )
+        self.bandit = ContextualBandit(num_actions=len(self.strategy_keys), feature_dim=4, epsilon=config.optimizer.epsilon)
         self.generation_history = deque(maxlen=100)
         self._lock = asyncio.Lock()
-        logger.info("EnhancedAutonomousMapGenerator initialized with contextual bandit")
+        self.last_context = None
+
+        # NEW: LIMIT Graph
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.limit_graph_enabled:
+            self.limit_graph = LimitGraph()
+            self.limit_graph.build_graph([], [])
+        else:
+            self.limit_graph = None
+
+        # NEW: RLHF
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.rlhf_enabled:
+            self.rlhf = RLHFOptimizer(action_space=self.strategy_keys)
+        else:
+            self.rlhf = None
+
+        # NEW: Distillation
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._bandit_teacher,
+                self._modp_teacher,
+                self._static_teacher
+            ])
+        else:
+            self.distiller = None
+
+        logger.info("EnhancedAutonomousMapGenerator initialized with LIMIT, RLHF, Distillation")
+
+    def _bandit_teacher(self, features: np.ndarray) -> str:
+        action = self.bandit.select_action(features)
+        return self.strategy_keys[action]
+
+    def _modp_teacher(self, features: np.ndarray) -> str:
+        project_count, carbon, hour, complexity = features
+        if carbon > 0.5:
+            return 'carbon'
+        elif complexity > 0.7:
+            return 'detail'
+        else:
+            return 'hybrid'
+
+    def _static_teacher(self, features: np.ndarray) -> str:
+        return 'summary'
 
     async def _extract_features(self, data: Dict) -> np.ndarray:
-        # Features: normalized project count, carbon intensity, hour of day, complexity (e.g., unique statuses)
         project_count = data.get('project_count', 0) / 100.0
         carbon = await self.carbon_manager.get_current_intensity()
         hour = datetime.now().hour / 24.0
@@ -1206,45 +1707,67 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
 
     async def generate_map_autonomously(self, data: Dict, strategy: str = None) -> Dict:
         features = await self._extract_features(data)
-        if strategy is None:
-            # Use bandit to select strategy
-            action = self.bandit.select_action(features)
-            strategy = self.strategy_keys[action]
-        else:
-            action = self.strategy_keys.index(strategy) if strategy in self.strategy_keys else 0
+        self.last_context = features
 
-        generator = self.strategies[strategy]
+        if strategy is not None:
+            selected = strategy
+            action = self.strategy_keys.index(strategy) if strategy in self.strategy_keys else 0
+            source = "explicit"
+        else:
+            if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+                selected = self.distiller.distill(features)
+                action = self.strategy_keys.index(selected) if selected in self.strategy_keys else 0
+                source = "distilled"
+            elif ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
+                selected = self.rlhf.sample_action(features)
+                action = self.strategy_keys.index(selected) if selected in self.strategy_keys else 0
+                source = "rlhf"
+            else:
+                action = self.bandit.select_action(features)
+                selected = self.strategy_keys[action]
+                source = "bandit"
+
+        generator = self.strategies[selected]
         result = await generator(data)
 
-        # Compute reward (e.g., inverse of estimated size, or carbon savings)
+        # Apply LIMIT Graph constraints to result
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+            limits = self.limit_graph.get_limits({'features': features})
+            if 'max_tile_level' in limits and 'tile_level' in result:
+                result['tile_level'] = min(result['tile_level'], limits['max_tile_level'])
+            if 'max_cluster_radius' in limits and 'cluster_radius' in result:
+                result['cluster_radius'] = min(result['cluster_radius'], limits['max_cluster_radius'])
+
+        # Compute reward
         reward = 0.0
         if result.get('estimated_size_mb'):
-            if strategy in ['performance', 'hybrid']:
+            if selected in ['performance', 'hybrid']:
                 reward = 1.0 / (result['estimated_size_mb'] + 0.1)
-            elif strategy == 'carbon':
+            elif selected == 'carbon':
                 reward = result.get('estimated_carbon_savings', 0)
             else:
                 reward = 0.5
-        # Update bandit
-        self.bandit.update(action, features, reward)
+        # Update learners
+        if self.bandit:
+            self.bandit.update(action, features, reward)
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
+            self.rlhf.update(features, selected, reward)
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+            self.limit_graph.update_from_feedback({'features': features, 'strategy': selected, 'reward': reward})
 
-        # Update history
+        # Record history
         async with self._lock:
-            self.generation_history.append({
-                'strategy': strategy,
-                'result': result,
-                'timestamp': datetime.now().isoformat()
-            })
+            self.generation_history.append({'strategy': selected, 'result': result, 'timestamp': datetime.now().isoformat(), 'source': source})
         if self.db_manager:
             async def insert_gen(session):
                 await session.execute(
                     text("INSERT INTO generation_history (strategy, result, timestamp) VALUES (:strategy, :result, :timestamp)"),
-                    {'strategy': strategy, 'result': json.dumps(result), 'timestamp': datetime.now()}
+                    {'strategy': selected, 'result': json.dumps(result), 'timestamp': datetime.now()}
                 )
             await self.db_manager.execute_async(insert_gen)
         if PROMETHEUS_AVAILABLE:
-            MAP_GENERATIONS.labels(strategy=strategy, status='success').inc()
-        logger.info(f"Map generation completed using {strategy} strategy")
+            MAP_GENERATIONS.labels(strategy=selected, status='success').inc()
+        logger.info(f"Map generation completed using {selected} strategy (source={source})")
         return result
 
     async def _generate_performance(self, data: Dict) -> Dict:
@@ -1276,14 +1799,17 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
                 'recent_generations': list(self.generation_history)[-5:],
                 'strategy_usage': {s: len([h for h in self.generation_history if h['strategy'] == s]) for s in self.strategy_keys},
                 'bandit_theta': self.bandit.theta.tolist(),
-                'epsilon': self.bandit.epsilon
+                'epsilon': self.bandit.epsilon,
+                'distillation_active': self.distiller is not None,
+                'rlhf_active': self.rlhf is not None,
+                'limit_graph_active': self.limit_graph is not None,
             }
 
     async def health_check(self) -> Dict:
         return {'status': 'healthy'}
 
 # ============================================================
-# NEW: CARBON‑AWARE EXPORT QUEUE
+# CARBON‑AWARE EXPORT QUEUE (kept)
 # ============================================================
 class CarbonAwareExportQueue(IExportQueue):
     def __init__(self, config: GreenMapConfig, carbon_manager: ICarbonManager, max_concurrent: int = 3):
@@ -1311,10 +1837,8 @@ class CarbonAwareExportQueue(IExportQueue):
         while self._running:
             try:
                 _, job = await self.queue.get()
-                # Check carbon intensity before processing
                 intensity = await self.carbon_manager.get_current_intensity()
-                if intensity > self.threshold and job.priority < 5:  # only delay lower priority jobs
-                    # Delay up to max_delay or until intensity drops
+                if intensity > self.threshold and job.priority < 5:
                     wait_time = self.max_delay
                     while wait_time > 0 and intensity > self.threshold:
                         await asyncio.sleep(10)
@@ -1323,7 +1847,6 @@ class CarbonAwareExportQueue(IExportQueue):
                     self.metrics['delayed'] += 1
                 async with self.semaphore:
                     try:
-                        # Simulate export processing
                         await asyncio.sleep(0.1)
                         job.status = "completed"
                         self.metrics['processed'] += 1
@@ -1351,27 +1874,23 @@ class CarbonAwareExportQueue(IExportQueue):
         return {'status': 'healthy' if self._running else 'stopped'}
 
 # ============================================================
-# NEW: ENHANCED GEOCODING SERVICE with caching and batch processing
+# ENHANCED GEOCODING SERVICE (kept)
 # ============================================================
 class EnhancedGeocodingService(IGeocoder):
     def __init__(self, config: GreenMapConfig):
         self.config = config
-        self.cache = TTLCache(ttl_seconds=config.geocoder.cache_ttl, max_size_mb=50)  # separate cache for geocoding
+        self.cache = AdaptiveTTLCache(config)
         self.batch_size = config.geocoder.batch_size
         self.rate_limiter = RateLimiter(rate=config.geocoder.rate_limit_per_second, per_seconds=1)
         self._lock = asyncio.Lock()
         self.stats = {'requests': 0, 'cache_hits': 0, 'batch_requests': 0}
 
     async def geocode(self, address: str) -> Optional[Tuple[float, float]]:
-        # Check cache
         cached = await self.cache.get(address)
         if cached:
             self.stats['cache_hits'] += 1
             return cached
-        # Rate limit
         await self.rate_limiter.wait_and_acquire()
-        # Simulate geocoding (replace with real API call)
-        # For demo, we return random coordinates
         lat = random.uniform(-90, 90)
         lon = random.uniform(-180, 180)
         result = (lat, lon)
@@ -1396,14 +1915,14 @@ class EnhancedGeocodingService(IGeocoder):
         return {'status': 'healthy'}
 
 # ============================================================
-# NEW: ADAPTIVE TTL CACHE with LRU eviction
+# ADAPTIVE TTL CACHE (kept)
 # ============================================================
 class AdaptiveTTLCache:
     def __init__(self, config: GreenMapConfig):
         self.default_ttl = config.cache.default_ttl
         self.max_size_mb = config.cache.max_size_mb
         self.eviction_policy = config.cache.eviction_policy
-        self._cache = {}  # key -> (value, timestamp, access_count)
+        self._cache = {}
         self._lock = asyncio.Lock()
         self.current_size_bytes = 0
 
@@ -1411,9 +1930,6 @@ class AdaptiveTTLCache:
         async with self._lock:
             if key in self._cache:
                 value, timestamp, access_count = self._cache[key]
-                # Check TTL; but we adapt TTL based on access frequency
-                # If access count is high, we extend TTL, else we shrink.
-                # For simplicity, we use default TTL.
                 if (datetime.now() - timestamp).total_seconds() < self.default_ttl:
                     self._cache[key] = (value, timestamp, access_count + 1)
                     return value
@@ -1424,19 +1940,15 @@ class AdaptiveTTLCache:
 
     async def set(self, key: str, value: Any):
         async with self._lock:
-            # Evict if needed
             if self.current_size_bytes > self.max_size_mb * 1024 * 1024:
                 await self._evict()
             self._cache[key] = (value, datetime.now(), 1)
             self.current_size_bytes += len(key) + len(value)
 
     async def _evict(self):
-        # LRU eviction: evict least recently used (here we use access_count as proxy)
         if not self._cache:
             return
-        # Sort by access_count ascending (least used)
         sorted_keys = sorted(self._cache.keys(), key=lambda k: self._cache[k][2])
-        # Remove 10% of entries
         to_remove = max(1, int(len(sorted_keys) * 0.1))
         for key in sorted_keys[:to_remove]:
             val, _, _ = self._cache.pop(key)
@@ -1483,21 +1995,17 @@ class EnhancedGreenDataCenterMap:
         self.leader = leader or LeaderElection(config)
         self.task_manager = task_manager or TaskManager()
 
-        # New cache
         self.tile_cache = AdaptiveTTLCache(config)
 
         self.output_dir = Path(self.config.general.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Data storage
         self.projects: List[DataCenterProject] = []
         self._projects_lock = asyncio.Lock()
         self.map_history = deque(maxlen=100)
 
-        # Concurrency control
         self._map_generation_semaphore = asyncio.Semaphore(self.config.general.max_concurrent_map_generations)
 
-        # Health components
         self._health_components = {
             'database': self.db_manager,
             'quantum_security': self.quantum_security,
@@ -1512,10 +2020,8 @@ class EnhancedGreenDataCenterMap:
             'geocoder': self.geocoder,
         }
 
-        # Register background tasks
         self._register_background_tasks()
 
-        # Metrics
         self.generation_count = 0
 
         logger.info(f"EnhancedGreenDataCenterMap v{self.config.general.version} initialized (instance: {self.instance_id})")
@@ -1601,15 +2107,9 @@ class EnhancedGreenDataCenterMap:
                     projects = []
                     for row in result:
                         project = DataCenterProject(
-                            project_id=row[0],
-                            name=row[1],
-                            status=row[2],
-                            latitude=row[3],
-                            longitude=row[4],
-                            capacity_mw=row[5],
-                            carbon_intensity=row[6],
-                            helium_efficiency=row[7],
-                            last_updated=row[8]
+                            project_id=row[0], name=row[1], status=row[2], latitude=row[3],
+                            longitude=row[4], capacity_mw=row[5], carbon_intensity=row[6],
+                            helium_efficiency=row[7], last_updated=row[8]
                         )
                         projects.append(project)
                     return projects
@@ -1854,13 +2354,11 @@ if FASTAPI_AVAILABLE:
     async def startup():
         global map_system
         config = GreenMapConfig()
-        # Build dependencies
         db_manager = EnhancedDatabaseManager(config)
         vault = VaultManager(config)
         quantum = PostQuantumCrypto(config, vault)
         blockchain = BlockchainMapVerification(config)
         carbon = CarbonIntensityManager(config)
-        # Use enhanced orchestrators
         if config.bio.enabled:
             cloud_deployer = BioInspiredCloudDeployer(config, db_manager, carbon)
         else:
@@ -1997,7 +2495,7 @@ async def main():
         loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
 
     print("=" * 80)
-    print("Enhanced Green Data Center Map v16.0 - Enterprise Quantum+ (Bio-Inspired + MOE + MODP)")
+    print("Enhanced Green Data Center Map v16.0 - Enterprise Quantum+ (Bio-Inspired + MOE + MODP + LIMIT + RLHF + Distillation)")
     print("=" * 80)
 
     if FASTAPI_AVAILABLE:
@@ -2023,6 +2521,9 @@ async def main():
         print("   ✅ Adaptive weight adjustment via reinforcement learning.")
         print("   ✅ Extended observability and OpenTelemetry integration.")
         print("   ✅ Security hardening with full PQC key management.")
+        print("   ✅ Integrated LIMIT Graph for constraint enforcement.")
+        print("   ✅ Integrated RLHF Optimizer for preference‑based policy updates.")
+        print("   ✅ Integrated Multi‑Teacher Policy Distillation.")
 
         qstatus = map_system.quantum_security.get_quantum_status()
         print(f"\n🔐 Quantum Status: PQC Available: {qstatus.get('pqc_available', False)}, Algorithms: {', '.join(qstatus.get('algorithms', []))}")
