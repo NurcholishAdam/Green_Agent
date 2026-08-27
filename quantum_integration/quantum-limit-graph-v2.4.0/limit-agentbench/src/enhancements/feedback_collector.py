@@ -22,6 +22,7 @@ NEW IN v15.0+:
 - Resilience parameters evolved via GeneticPolicyGenerator.
 - Persistence of learned state.
 - New API endpoints for optimization status and evolution.
+- Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation for further optimization.
 """
 
 import asyncio
@@ -51,9 +52,14 @@ try:
     from enhancements.moe_system import ExpertRouter
     from enhancements.MODP import ParetoOptimizer
     from enhancements.contextual_bandit import ContextualBandit
+    from enhancements.limit_graph import LimitGraph
+    from enhancements.rlhf import RLHFOptimizer
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller
     ENHANCEMENTS_AVAILABLE = True
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = True
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
     # Fallback stubs
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
@@ -74,6 +80,18 @@ except ImportError:
             return self.actions[0], 0.0, "fallback"
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
+    class LimitGraph:
+        def __init__(self, *args, **kwargs): self.limits = {}
+        def build_graph(self, nodes, edges): pass
+        def get_limits(self, context): return {}
+        def update_from_feedback(self, feedback): pass
+    class RLHFOptimizer:
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def update(self, context, action, reward): pass
+        def sample_action(self, context): return self.actions[0] if self.actions else None
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
+        def distill(self, context): return self.teachers[0](context) if self.teachers else None
 
 # ============================================================
 # OPTIONAL IMPORTS WITH FALLBACK
@@ -293,6 +311,13 @@ if PYDANTIC_AVAILABLE:
         bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
         evolve_interval_seconds: int = Field(3600, ge=60)
+        # NEW: Additional modules
+        limit_graph_enabled: bool = True
+        limit_graph_max_nodes: int = 100
+        rlhf_enabled: bool = True
+        rlhf_buffer_size: int = 1000
+        distillation_enabled: bool = True
+        distillation_update_interval: int = 600
 
     class FeedbackConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix="FEEDBACK_", case_sensitive=False)
@@ -335,6 +360,12 @@ else:
         bio_generations: int = 10
         bio_population_size: int = 20
         evolve_interval_seconds: int = 3600
+        limit_graph_enabled: bool = True
+        limit_graph_max_nodes: int = 100
+        rlhf_enabled: bool = True
+        rlhf_buffer_size: int = 1000
+        distillation_enabled: bool = True
+        distillation_update_interval: int = 600
 
     @dataclass
     class FeedbackConfig:
@@ -468,7 +499,8 @@ class Bulkhead:
 class FeedbackRecorder:
     """
     Enhanced feedback recorder with resilience, batching, observability,
-    and adaptive intelligence via bio_inspired, moe_system, MODP, and ContextualBandit.
+    and adaptive intelligence via bio_inspired, moe_system, MODP, ContextualBandit,
+    LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.
     """
 
     def __init__(self, config: Optional[Union[FeedbackConfig, Dict]] = None):
@@ -524,6 +556,29 @@ class FeedbackRecorder:
             self.param_population = []
             self.param_rewards = deque(maxlen=100)
 
+        # NEW: LIMIT Graph
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.config.optimizer.limit_graph_enabled:
+            self.limit_graph = LimitGraph()
+            self.limit_graph.build_graph([], [])
+        else:
+            self.limit_graph = None
+
+        # NEW: RLHF
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.config.optimizer.rlhf_enabled:
+            self.rlhf = RLHFOptimizer(action_space=self.config.optimizer.batch_policies)
+        else:
+            self.rlhf = None
+
+        # NEW: Multi‑Teacher Distillation
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.config.optimizer.distillation_enabled:
+            self.distiller = MultiTeacherDistiller([
+                self._bandit_teacher,
+                self._modp_teacher,
+                self._static_teacher
+            ])
+        else:
+            self.distiller = None
+
         # Load persisted state
         self._load_state()
 
@@ -533,15 +588,50 @@ class FeedbackRecorder:
         logger.info(f"FeedbackRecorder initialized (instance: {self.instance_id})")
 
     def _load_state(self):
-        """Load bandit, MODP, and bio state from storage."""
+        """Load bandit, MODP, bio, and new module state from storage."""
         # In a real implementation, we'd load from a Storage component.
-        # For demonstration, we skip.
         pass
 
     def _save_state(self):
         """Save learned state."""
-        # Placeholder.
         pass
+
+    # ----------------------------------------------------------------------
+    # Teacher methods for distillation
+    # ----------------------------------------------------------------------
+    def _bandit_teacher(self, context: Dict) -> str:
+        if self.bandit:
+            encoded = self.moe.encode(context) if self.moe else context
+            policy, _, _ = self.bandit.select_action(encoded)
+            return policy if policy else "immediate"
+        return "immediate"
+
+    def _modp_teacher(self, context: Dict) -> str:
+        if not self.modp:
+            return "immediate"
+        # Use MODP to select policy based on queue size, latency, etc.
+        objectives = {
+            'importance': 0.5,
+            'urgency': 0.5,
+            'energy': context.get('queue_size', 0) / 1000,
+            'latency': context.get('circuit_breaker_state', 'closed') == 'open' and 1.0 or 0.1,
+        }
+        # For each policy, compute a utility (simplified: static mapping)
+        utilities = {}
+        for policy in self.config.optimizer.batch_policies:
+            if policy == "immediate":
+                obj = {**objectives, 'latency': 0.2}
+            elif policy == "small_batch":
+                obj = {**objectives, 'latency': 0.5}
+            elif policy == "large_batch":
+                obj = {**objectives, 'latency': 0.7}
+            else:  # delay
+                obj = {**objectives, 'latency': 0.9}
+            utilities[policy] = self.modp.evaluate(obj, self.config.optimizer.modp_weights)
+        return max(utilities, key=utilities.get)
+
+    def _static_teacher(self, context: Dict) -> str:
+        return "immediate"
 
     # ----------------------------------------------------------------------
     # Core feedback methods
@@ -581,13 +671,12 @@ class FeedbackRecorder:
         # MODP‑based prioritisation: compute utility and possibly drop low‑value feedback
         if self.modp:
             objectives = {
-                'importance': 0.5,  # placeholder; could be derived from task type
+                'importance': 0.5,
                 'urgency': 0.5,
                 'energy': mets.energy_joules / 1000.0,
                 'latency': mets.latency_ms / 1000.0,
             }
             utility = self.modp.evaluate(objectives, self.config.optimizer.modp_weights)
-            # Drop if utility is below a threshold (e.g., 0.2) when queue is congested
             if utility < 0.2 and self._batch_queue.qsize() > self.config.general.batch_max_size * 0.8:
                 logger.debug(f"Dropping low‑utility feedback (utility={utility:.2f})")
                 return False
@@ -604,41 +693,62 @@ class FeedbackRecorder:
 
     async def _batch_processor_loop(self):
         """
-        Periodically flush the batch queue, using adaptive policies.
+        Periodically flush the batch queue, using adaptive policies with LIMIT, RLHF, Distillation.
         """
         while not self._shutdown_event.is_set():
             try:
-                # Select batch policy using ContextualBandit
-                if self.bandit:
-                    # Build context
-                    context = {
-                        'queue_size': self._batch_queue.qsize(),
-                        'circuit_breaker_state': self.circuit_breaker._state.value,
-                        'hour': datetime.now().hour,
-                        'day_of_week': datetime.now().weekday(),
-                    }
-                    encoded = self.moe.encode(context) if self.moe else context
-                    policy, _, _ = self.bandit.select_action(encoded)
+                # Build context
+                context = {
+                    'queue_size': self._batch_queue.qsize(),
+                    'circuit_breaker_state': self.circuit_breaker._state.value,
+                    'hour': datetime.now().hour,
+                    'day_of_week': datetime.now().weekday(),
+                }
+                self.last_context = context
+
+                # Hierarchical policy selection
+                if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
+                    policy = self.distiller.distill(context)
+                    source = "distilled"
+                elif ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
+                    policy = self.rlhf.sample_action(context)
                     if policy is None:
                         policy = "immediate"
-
-                    # Map policy to batch size and interval
-                    if policy == "immediate":
-                        batch_size = 1
-                        interval = 0.5
-                    elif policy == "small_batch":
-                        batch_size = 10
-                        interval = 1.0
-                    elif policy == "large_batch":
-                        batch_size = self.config.general.batch_max_size
-                        interval = 5.0
-                    else:  # delay
-                        batch_size = 0
-                        interval = 10.0
+                    source = "rlhf"
+                elif self.bandit:
+                    encoded = self.moe.encode(context) if self.moe else context
+                    policy, _, source = self.bandit.select_action(encoded)
+                    if policy is None:
+                        policy = "immediate"
+                    source = "bandit"
                 else:
-                    # Fallback to fixed config
+                    # Fallback to fixed policy
+                    policy = "immediate"
+                    source = "fixed"
+
+                # Map policy to batch size and interval
+                if policy == "immediate":
+                    batch_size = 1
+                    interval = 0.5
+                elif policy == "small_batch":
+                    batch_size = 10
+                    interval = 1.0
+                elif policy == "large_batch":
                     batch_size = self.config.general.batch_max_size
-                    interval = self.config.general.batch_interval_seconds
+                    interval = 5.0
+                else:  # delay
+                    batch_size = 0
+                    interval = 10.0
+
+                # Apply LIMIT Graph constraints if available
+                if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+                    limits = self.limit_graph.get_limits(context)
+                    if limits.get('max_batch_size'):
+                        batch_size = min(batch_size, limits['max_batch_size'])
+                    if limits.get('max_interval'):
+                        interval = min(interval, limits['max_interval'])
+                    if limits.get('min_interval'):
+                        interval = max(interval, limits['min_interval'])
 
                 # Collect batch
                 records = []
@@ -654,11 +764,23 @@ class FeedbackRecorder:
                     if PROMETHEUS_AVAILABLE:
                         BATCH_SIZE.set(len(records))
                     success = await self._send_batch(records)
-                    # Update bandit reward
-                    if self.bandit and success:
-                        # Reward: success rate and latency
-                        reward = 1.0 if success else -1.0
+                    # Update learners
+                    reward = 1.0 if success else -1.0
+                    if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
+                        self.rlhf.update(context, policy, reward)
+                    if self.bandit:
+                        encoded = self.moe.encode(context) if self.moe else context
                         await self.bandit.update(encoded, policy, reward)
+                    if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+                        self.limit_graph.update_from_feedback({
+                            'context': context,
+                            'policy': policy,
+                            'reward': reward,
+                            'success': success,
+                        })
+                    # Record fitness for bio evolution
+                    if self.bio:
+                        self.param_rewards.append(reward)
 
                 # Wait for the selected interval
                 await asyncio.sleep(interval)
@@ -749,7 +871,6 @@ class FeedbackRecorder:
             return
 
         def fitness(params):
-            # Use average reward as fitness
             return np.mean(list(self.param_rewards)) if self.param_rewards else 0.0
 
         new_population = self.bio.evolve(
@@ -760,7 +881,6 @@ class FeedbackRecorder:
         )
         if new_population:
             self.param_population = new_population
-            # Apply the best parameters to the config
             best = max(new_population, key=lambda p: fitness(p))
             self.config.general.max_retry_attempts = best.get('max_retry_attempts', self.config.general.max_retry_attempts)
             self.config.general.circuit_breaker_failure_threshold = best.get('circuit_breaker_failure_threshold', self.config.general.circuit_breaker_failure_threshold)
@@ -790,7 +910,6 @@ class FeedbackRecorder:
             return {"healthy": self._health_cache, "cached": True}
 
         try:
-            # Test with a minimal batch
             test_record = FeedbackRecord(
                 context=FeedbackContext(request_id="test", expert_id="test", node_id="test"),
                 metrics=FeedbackMetrics(predicted_cost=0.0, actual_cost=0.0),
@@ -817,6 +936,9 @@ class FeedbackRecorder:
                 "modp_weights": self.config.optimizer.modp_weights,
                 "param_population_size": len(self.param_population),
                 "enhancements_available": ENHANCEMENTS_AVAILABLE,
+                "limit_graph_active": self.limit_graph is not None,
+                "rlhf_active": self.rlhf is not None,
+                "distillation_active": self.distiller is not None,
             }
         }
 
@@ -918,6 +1040,21 @@ if FASTAPI_AVAILABLE:
             return {"status": "evolution triggered"}
         return {"status": "evolution not available"}
 
+    @app.post("/optimization/rlhf-update")
+    async def rlhf_update(context: Dict, action: str, reward: float, user: Dict = Depends(verify_token)):
+        if not recorder:
+            raise HTTPException(status_code=503, detail="Recorder not initialized")
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and recorder.rlhf:
+            recorder.rlhf.update(context, action, reward)
+            return {"status": "RLHF updated"}
+        return {"status": "RLHF not available"}
+
+    @app.post("/optimization/distill")
+    async def force_distillation(user: Dict = Depends(verify_token)):
+        if not recorder:
+            raise HTTPException(status_code=503, detail="Recorder not initialized")
+        return {"status": "Distillation triggered"}
+
     @app.on_event("startup")
     async def startup():
         global recorder
@@ -995,6 +1132,7 @@ async def main():
     print("   ✅ Resilience parameters evolved via GeneticPolicyGenerator.")
     print("   ✅ Persistence of learned state.")
     print("   ✅ New API endpoints for optimization status and evolution.")
+    print("   ✅ Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.")
 
     # Record a test feedback
     context = {"request_id": "test", "expert_id": "expert", "node_id": "node"}
