@@ -1,4 +1,3 @@
-# explainable_ui.py
 """
 Enhanced Explainable Green Decisions – Enterprise UI (v4.0.0+)
 =============================================================================
@@ -57,7 +56,7 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 try:
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
-    from sqlalchemy import Column, String, Float, DateTime, Integer, Boolean, JSON, Text, Index, func, select, update
+    from sqlalchemy import Column, String, Float, DateTime, Integer, Boolean, JSON, Text, Index, func, select, update, text
     from sqlalchemy.pool import NullPool
     from sqlalchemy.exc import SQLAlchemyError
     ASYNC_SQLALCHEMY_AVAILABLE = True
@@ -94,7 +93,7 @@ import plotly.io as pio
 from jinja2 import Template, Environment, FileSystemLoader, TemplateNotFound
 
 # ---------- Prometheus ----------
-from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 
 # ---------- Structlog ----------
 import structlog
@@ -196,6 +195,16 @@ except ImportError:
         def __init__(self, *args, **kwargs): pass
         def evaluate(self, objectives, weights):
             return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
+
+# Stub for message queue and feedback event
+class AsyncMessageQueue:
+    async def publish(self, topic: str, message: str):
+        pass
+
+class FeedbackEvent:
+    @staticmethod
+    def create_with_context(**kwargs):
+        return type('FeedbackEvent', (), {'to_json': lambda self: json.dumps(kwargs)})()
 
 # =============================================================================
 # 1. CONFIGURATION (Pydantic, always used) – extended with MODP weights
@@ -376,6 +385,7 @@ class DatabaseManager:
         self.sync_engine = None
         self.sync_sessionmaker = None
         self._lock = asyncio.Lock()
+        self._initialized = False
 
         if ASYNC_SQLALCHEMY_AVAILABLE:
             self.async_engine = create_async_engine(
@@ -383,16 +393,19 @@ class DatabaseManager:
                 poolclass=NullPool,  # SQLite doesn't support pooling well
             )
             self.async_sessionmaker = async_sessionmaker(self.async_engine, expire_on_commit=False)
-            # Create tables (async)
-            asyncio.create_task(self._init_db_async())
         elif SQLALCHEMY_SYNC_AVAILABLE:
             self.sync_engine = create_engine(f"sqlite:///{config.db_path}", poolclass=NullPool)
             self.sync_sessionmaker = sessionmaker(bind=self.sync_engine)
             Base.metadata.create_all(self.sync_engine)
 
-    async def _init_db_async(self):
-        async with self.async_engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    async def initialize(self):
+        """Create tables if not already created (async engine)."""
+        if self._initialized:
+            return
+        if ASYNC_SQLALCHEMY_AVAILABLE:
+            async with self.async_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        self._initialized = True
 
     async def get_async_session(self) -> AsyncSession:
         if self.async_sessionmaker:
@@ -496,7 +509,7 @@ class ExplanationGenerator:
             # Population of template variants (each is a dict of parameters)
             self.template_population = [{"template": self.template, "style": "default"}]
             self.template_fitness = deque(maxlen=100)
-            self._load_state()
+            # We'll load state asynchronously; call initialize() later
         else:
             self.modp = None
             self.moe = None
@@ -504,22 +517,22 @@ class ExplanationGenerator:
             self.template_population = []
             self.template_fitness = deque(maxlen=100)
 
-    def _load_state(self):
-        """Load evolved template population from DB."""
-        if self.db:
-            state = asyncio.run(self.db.load_optimizer_state("explanation_templates"))
+    async def initialize(self):
+        """Load evolved template population from DB asynchronously."""
+        if ENHANCEMENTS_AVAILABLE and self.db:
+            state = await self.db.load_optimizer_state("explanation_templates")
             if state:
                 self.template_population = state.get("population", [{"template": self.template, "style": "default"}])
                 self.template_fitness = deque(state.get("fitness", []), maxlen=100)
 
-    def _save_state(self):
+    async def _save_state(self):
         """Persist template population and fitness to DB."""
         if self.db:
             state = {
                 "population": self.template_population,
                 "fitness": list(self.template_fitness),
             }
-            asyncio.create_task(self.db.save_optimizer_state("explanation_templates", state))
+            await self.db.save_optimizer_state("explanation_templates", state)
 
     def _default_template(self) -> str:
         return (
@@ -563,19 +576,26 @@ class ExplanationGenerator:
         chosen_utility = None
         alt_utilities = {}
         if self.modp:
+            # Normalization factors to avoid division by zero
+            max_energy = max([a[1].energy_per_inference_full for a in alternatives] + [request.energy_joules] + [1e-8])
+            max_co2 = max([a[1].energy_per_inference_full * self.config.energy_to_co2_factor for a in alternatives] + [request.co2_kg] + [1e-8])
+            max_latency = max([a[1].energy_per_inference_full * 1e-6 * 0.5 for a in alternatives] + [request.latency_ms] + [1e-8])
             chosen_objectives = {
                 "accuracy": request.accuracy,
-                "energy": 1.0 - (request.energy_joules / (max([a[1].energy_per_inference_full for a in alternatives] + [request.energy_joules]) + 1e-8)),
-                "carbon": 1.0 - (request.co2_kg / (max([a[1].energy_per_inference_full for a in alternatives] + [request.energy_joules]) + 1e-8)),
-                "latency": 1.0 - (request.latency_ms / 1000.0),
+                "energy": 1.0 - (request.energy_joules / max_energy),
+                "carbon": 1.0 - (request.co2_kg / max_co2),
+                "latency": 1.0 - (request.latency_ms / max_latency),
             }
             chosen_utility = self.modp.evaluate(chosen_objectives, self.config.modp_weights)
             for eid, prof in alternatives:
+                alt_energy = prof.energy_per_inference_full
+                alt_co2 = alt_energy * self.config.energy_to_co2_factor
+                alt_latency = alt_energy * 1e-6 * 0.5
                 alt_obj = {
                     "accuracy": prof.accuracy_full,
-                    "energy": 1.0 - (prof.energy_per_inference_full / (max([a[1].energy_per_inference_full for a in alternatives] + [request.energy_joules]) + 1e-8)),
-                    "carbon": 1.0 - ((prof.energy_per_inference_full * self.config.energy_to_co2_factor) / (max([a[1].energy_per_inference_full for a in alternatives] + [request.energy_joules]) + 1e-8)),
-                    "latency": 1.0 - ((prof.energy_per_inference_full * 1e-6 * 0.5) / 1000.0),
+                    "energy": 1.0 - (alt_energy / max_energy),
+                    "carbon": 1.0 - (alt_co2 / max_co2),
+                    "latency": 1.0 - (alt_latency / max_latency),
                 }
                 alt_utilities[eid] = self.modp.evaluate(alt_obj, self.config.modp_weights)
 
@@ -655,7 +675,13 @@ class ExplanationGenerator:
     ) -> str:
         """
         Generate explanation synchronously using the template engine.
+        NOTE: This method should only be called outside an async context.
+        If inside async, use `await generate_async` directly.
         """
+        # This is a convenience wrapper; in async context use generate_async.
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            raise RuntimeError("generate() is synchronous; use generate_async() within async context.")
         return asyncio.run(self.generate_async(request, chosen_expert, alternatives, user_context))
 
     def _fallback_generate(self, data: Dict) -> str:
@@ -699,7 +725,7 @@ class ExplanationGenerator:
             best = max(new_population, key=lambda v: fitness(v))
             self.template = best.get("template", self.template)
             self.template_name = best.get("style", "default")
-            self._save_state()
+            await self._save_state()
             logger.info("Templates evolved; new population size: %d", len(new_population))
 
     async def record_feedback(self, rating: int, template_used: str):
@@ -836,6 +862,12 @@ class DashboardEngine:
         if not stats:
             stats = ExpertStatsDB(expert_id=expert_id)
             session.add(stats)
+            # Initialize fields
+            stats.total_requests = 0
+            stats.avg_latency_ms = 0.0
+            stats.avg_energy_joules = 0.0
+            stats.avg_accuracy = 0.0
+            stats.total_co2_kg = 0.0
         stats.total_requests += 1
         stats.avg_latency_ms = (stats.avg_latency_ms * (stats.total_requests - 1) + req.latency_ms) / stats.total_requests
         stats.avg_energy_joules = (stats.avg_energy_joules * (stats.total_requests - 1) + req.energy_joules) / stats.total_requests
@@ -845,20 +877,30 @@ class DashboardEngine:
         session.commit()
 
     async def _update_expert_stats_async(self, expert_id, req):
-        """Async version of updating expert stats."""
+        """Async version of updating expert stats with atomic update."""
         async with self.db_manager.async_sessionmaker() as session:
-            stmt = select(ExpertStatsDB).where(ExpertStatsDB.expert_id == expert_id)
+            # Try to update existing row with atomic operations
+            stmt = update(ExpertStatsDB).where(ExpertStatsDB.expert_id == expert_id).values(
+                total_requests=ExpertStatsDB.total_requests + 1,
+                avg_latency_ms=((ExpertStatsDB.avg_latency_ms * ExpertStatsDB.total_requests) + req.latency_ms) / (ExpertStatsDB.total_requests + 1),
+                avg_energy_joules=((ExpertStatsDB.avg_energy_joules * ExpertStatsDB.total_requests) + req.energy_joules) / (ExpertStatsDB.total_requests + 1),
+                avg_accuracy=((ExpertStatsDB.avg_accuracy * ExpertStatsDB.total_requests) + req.accuracy) / (ExpertStatsDB.total_requests + 1),
+                total_co2_kg=ExpertStatsDB.total_co2_kg + req.co2_kg,
+                last_updated=datetime.now()
+            )
             result = await session.execute(stmt)
-            stats = result.scalar_one_or_none()
-            if not stats:
-                stats = ExpertStatsDB(expert_id=expert_id)
+            if result.rowcount == 0:
+                # No existing row; insert new
+                stats = ExpertStatsDB(
+                    expert_id=expert_id,
+                    total_requests=1,
+                    avg_latency_ms=req.latency_ms,
+                    avg_energy_joules=req.energy_joules,
+                    avg_accuracy=req.accuracy,
+                    total_co2_kg=req.co2_kg,
+                    last_updated=datetime.now()
+                )
                 session.add(stats)
-            stats.total_requests += 1
-            stats.avg_latency_ms = (stats.avg_latency_ms * (stats.total_requests - 1) + req.latency_ms) / stats.total_requests
-            stats.avg_energy_joules = (stats.avg_energy_joules * (stats.total_requests - 1) + req.energy_joules) / stats.total_requests
-            stats.avg_accuracy = (stats.avg_accuracy * (stats.total_requests - 1) + req.accuracy) / stats.total_requests
-            stats.total_co2_kg += req.co2_kg
-            stats.last_updated = datetime.now()
             await session.commit()
 
     # ----- Caching -----
@@ -955,8 +997,36 @@ class DashboardEngine:
         session = self.db_manager.sync_sessionmaker()
         db_entry = session.query(RequestLogDB).filter_by(request_id=request_id).first()
         if db_entry:
-            # Use a new event loop or run in thread
-            return asyncio.run(self._from_db_entry_async(db_entry))
+            # Convert synchronously without asyncio
+            alt_list = json.loads(db_entry.alternative_experts)
+            alternatives = []
+            for alt in alt_list:
+                prof = SustainabilityAwareExpertProfile(
+                    expert_id=alt['expert_id'],
+                    energy_per_inference_full=alt['energy'],
+                    accuracy_full=alt['accuracy'],
+                    compressed_flag=alt['compressed']
+                )
+                alternatives.append((alt['expert_id'], prof))
+            return RequestLog(
+                request_id=db_entry.request_id,
+                timestamp=db_entry.timestamp,
+                query=db_entry.query,
+                chosen_expert_id=db_entry.chosen_expert_id,
+                chosen_expert_profile=SustainabilityAwareExpertProfile(db_entry.chosen_expert_id),
+                alternative_experts=alternatives,
+                latency_ms=db_entry.latency_ms,
+                energy_joules=db_entry.energy_joules,
+                co2_kg=db_entry.co2_kg,
+                accuracy=db_entry.accuracy,
+                carbon_intensity=db_entry.carbon_intensity,
+                helium_scarcity=db_entry.helium_scarcity,
+                material_index=db_entry.material_index,
+                sustainability_score=db_entry.sustainability_score,
+                explanation=db_entry.explanation,
+                feedback_rating=db_entry.feedback_rating,
+                feedback_comment=db_entry.feedback_comment,
+            )
         return None
 
     async def get_expert_details(self, expert_id: str) -> Dict[str, Any]:
@@ -1069,10 +1139,9 @@ class DashboardEngine:
             while True:
                 try:
                     data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
-                    # If client sends "pong", continue; else handle message
                     if data.strip() == "pong":
                         continue
-                    # Handle other messages (e.g., client requests)
+                    # Handle other messages (e.g., client requests) here if needed
                 except asyncio.TimeoutError:
                     # Send ping and wait for pong
                     await websocket.send_text(json.dumps({"type": "ping"}))
@@ -1084,7 +1153,8 @@ class DashboardEngine:
                         raise WebSocketDisconnect
         except WebSocketDisconnect:
             async with self._ws_lock:
-                self._ws_connections.remove(websocket)
+                if websocket in self._ws_connections:
+                    self._ws_connections.remove(websocket)
 
     # ----- Pagination (database-backed) -----
     async def get_recent_requests(self, page: int = 1, page_size: int = 20, filter_expert: Optional[str] = None, user_id: Optional[str] = None) -> Dict:
@@ -1209,21 +1279,28 @@ class WhatIfSimulator:
         chosen_utility = None
         alternative_utility = None
         if self.modp:
+            max_energy = max(alt_energy, req.energy_joules, 1e-8)
+            max_co2 = max(alt_co2, req.co2_kg, 1e-8)
+            max_latency = max(alt_latency, req.latency_ms, 1e-8)
             chosen_obj = {
                 "accuracy": req.accuracy,
-                "energy": 1.0 - (req.energy_joules / max(alt_energy, req.energy_joules, 1e-8)),
-                "carbon": 1.0 - (req.co2_kg / max(alt_co2, req.co2_kg, 1e-8)),
-                "latency": 1.0 - (req.latency_ms / max(alt_latency, req.latency_ms, 1e-8)),
+                "energy": 1.0 - (req.energy_joules / max_energy),
+                "carbon": 1.0 - (req.co2_kg / max_co2),
+                "latency": 1.0 - (req.latency_ms / max_latency),
             }
             chosen_utility = self.modp.evaluate(chosen_obj, self.config.modp_weights)
 
             alt_obj = {
                 "accuracy": alt_accuracy,
-                "energy": 1.0 - (alt_energy / max(alt_energy, req.energy_joules, 1e-8)),
-                "carbon": 1.0 - (alt_co2 / max(alt_co2, req.co2_kg, 1e-8)),
-                "latency": 1.0 - (alt_latency / max(alt_latency, req.latency_ms, 1e-8)),
+                "energy": 1.0 - (alt_energy / max_energy),
+                "carbon": 1.0 - (alt_co2 / max_co2),
+                "latency": 1.0 - (alt_latency / max_latency),
             }
             alternative_utility = self.modp.evaluate(alt_obj, self.config.modp_weights)
+
+        # For material index and helium, we could optionally call LCA client; here we use request values
+        expected_material_index = req.material_index
+        expected_helium_scarcity = req.helium_scarcity
 
         return WhatIfResult(
             scenario_id=str(uuid.uuid4()),
@@ -1233,8 +1310,8 @@ class WhatIfSimulator:
             expected_latency_ms=alt_latency,
             expected_accuracy=alt_accuracy,
             expected_carbon_intensity=req.carbon_intensity,
-            expected_helium_scarcity=req.helium_scarcity,
-            expected_material_index=req.material_index,
+            expected_helium_scarcity=expected_helium_scarcity,
+            expected_material_index=expected_material_index,
             difference_energy=diff_energy,
             difference_co2=diff_co2,
             difference_latency=diff_latency,
@@ -1319,7 +1396,7 @@ class AuthManager:
             user = await self.get_user(username)
             if not user:
                 raise HTTPException(status_code=401, detail="User not found")
-            new_token = self.auth.create_token(username, user.role)
+            new_token = self.create_token(username, user.role)
             return {"access_token": new_token, "token_type": "bearer"}
         except jwt.PyJWTError:
             raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -1334,12 +1411,15 @@ class APIGatewayExtension:
     """
     def __init__(self, dashboard: DashboardEngine, generator: ExplanationGenerator,
                  what_if: WhatIfSimulator, auth: AuthManager,
-                 message_queue: Optional[AsyncMessageQueue] = None):
+                 message_queue: Optional[AsyncMessageQueue] = None,
+                 carbon_manager=None, lca_client=None):
         self.dashboard = dashboard
         self.generator = generator
         self.what_if = what_if
         self.auth = auth
         self.message_queue = message_queue
+        self.carbon_manager = carbon_manager
+        self.lca_client = lca_client
         self.app = None
         self.limiter = None
         if SLOWAPI_AVAILABLE:
@@ -1354,10 +1434,9 @@ class APIGatewayExtension:
             app.add_exception_handler(429, _rate_limit_exceeded_handler)
 
         # WebSocket endpoint
-        if FASTAPI_AVAILABLE and WEBSOCKETS_AVAILABLE:
-            @app.websocket("/ws/explain")
-            async def websocket_endpoint(websocket: WebSocket):
-                await self.dashboard.register_websocket(websocket)
+        @app.websocket("/ws/explain")
+        async def websocket_endpoint(websocket: WebSocket):
+            await self.dashboard.register_websocket(websocket)
 
         # Authentication endpoints
         @app.post("/api/explain/login")
@@ -1424,16 +1503,16 @@ class APIGatewayExtension:
             try:
                 if ASYNC_SQLALCHEMY_AVAILABLE:
                     async with self.dashboard.db_manager.async_sessionmaker() as session:
-                        await session.execute("SELECT 1")
+                        await session.execute(text("SELECT 1"))
                 else:
                     session = self.dashboard.db_manager.sync_sessionmaker()
-                    session.execute("SELECT 1")
+                    session.execute(text("SELECT 1"))
             except Exception as e:
                 db_ok = False
                 logger.error(f"Health check: DB error {e}")
             # Check carbon manager
             carbon_ok = True
-            if hasattr(self, 'carbon_manager') and self.carbon_manager:
+            if self.carbon_manager:
                 try:
                     if hasattr(self.carbon_manager, 'get_current_intensity'):
                         await self.carbon_manager.get_current_intensity()
@@ -1441,7 +1520,7 @@ class APIGatewayExtension:
                     carbon_ok = False
             # Check LCA client
             lca_ok = True
-            if hasattr(self, 'lca_client') and self.lca_client:
+            if self.lca_client:
                 try:
                     if hasattr(self.lca_client, 'get_material_index'):
                         await self.lca_client.get_material_index("test")
@@ -1648,6 +1727,8 @@ def create_explainable_ui(
 ) -> Dict[str, Any]:
     """
     Factory to create all components and return them for integration.
+    NOTE: Callers should await db_manager.initialize() and generator.initialize()
+    after creating the components, unless using async context.
     """
     if config is None:
         config = ExplainableUIConfig()
@@ -1661,7 +1742,8 @@ def create_explainable_ui(
                                modp=generator.modp if ENHANCEMENTS_AVAILABLE else None)
     auth = AuthManager(config, db_manager)
 
-    api_extension = APIGatewayExtension(dashboard, generator, what_if, auth, message_queue)
+    api_extension = APIGatewayExtension(dashboard, generator, what_if, auth, message_queue,
+                                        carbon_manager=carbon_manager, lca_client=lca_client)
 
     return {
         "dashboard": dashboard,
@@ -1679,6 +1761,10 @@ async def test_explainable_ui():
     """Example test stub."""
     config = ExplainableUIConfig(db_path=":memory:")
     components = create_explainable_ui(config)
+    db_manager = components["db_manager"]
+    await db_manager.initialize()
+    await components["explanation_generator"].initialize()
+
     dashboard = components["dashboard"]
     # Log a mock request
     prof = SustainabilityAwareExpertProfile("expert_A")
@@ -1708,6 +1794,10 @@ if __name__ == "__main__":
 
     async def main():
         components = create_explainable_ui()
+        db_manager = components["db_manager"]
+        await db_manager.initialize()
+        await components["explanation_generator"].initialize()
+
         dash = components["dashboard"]
         gen = components["explanation_generator"]
         what_if = components["what_if"]
