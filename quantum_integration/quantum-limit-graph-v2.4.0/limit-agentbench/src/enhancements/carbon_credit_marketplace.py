@@ -27,6 +27,7 @@ NEW IN v5.0.0+:
 - Context‑aware routing.
 - Feedback loop for continuous learning.
 - New API endpoints for optimization.
+- FlexGen integration for GPU/CPU/disk offloading policy optimization (new).
 """
 
 import asyncio
@@ -212,6 +213,30 @@ except ImportError:
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
 
+# FlexGen modules (with fallback)
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
+
 # =============================================================================
 # CONFIGURATION (Grouped sub‑models)
 # =============================================================================
@@ -281,6 +306,15 @@ class OptimizerConfig(BaseModel):
     bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
     bio_generations: int = Field(10, ge=1)
     bio_population_size: int = Field(20, ge=2)
+
+    # FlexGen settings
+    flexgen_carbon_intensity_default: float = 400.0
+    flexgen_population_size: int = 50
+    flexgen_generations: int = 10
+    flexgen_use_real_executor: bool = False
+    flexgen_executor_type: str = "mock"   # "mock", "cost_model", "real"
+    flexgen_selector_epsilon: float = 0.1
+    flexgen_selector_epsilon_decay: float = 0.999
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CARBON_", case_sensitive=False)
@@ -1456,6 +1490,84 @@ class AutonomousOptimizer:
         }
 
 # =============================================================================
+# FLEXGEN MANAGER (NEW)
+# =============================================================================
+class FlexGenManager:
+    """
+    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
+    Used to select optimal policies for AI model inference tasks (e.g., price prediction).
+    """
+    def __init__(self, config: Settings):
+        self.config = config
+        self.flexgen_cost_model = None
+        self.policy_drift_detector = None
+        self.gpu_profiler = None
+
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(
+                carbon_intensity_g_per_kwh=config.optimizer.flexgen_carbon_intensity_default
+            )
+            self.policy_drift_detector = PolicyDriftDetector()
+            try:
+                from enhancements.gpu_profiler import GPUProfiler
+                self.gpu_profiler = GPUProfiler()
+            except ImportError:
+                self.gpu_profiler = None
+            logger.info("FlexGen Manager initialized")
+        else:
+            logger.warning("FlexGen modules not available; manager will be disabled.")
+
+    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        """
+        Run FlexGen policy selection for a given workload and node.
+        Returns chosen policy, metrics, reward, and drift status.
+        """
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': self.config.optimizer.flexgen_selector_epsilon,
+                'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay,
+            }
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity',
+                                                   self.config.optimizer.flexgen_carbon_intensity_default),
+            use_real_executor=self.config.optimizer.flexgen_use_real_executor,
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={
+                'population_size': self.config.optimizer.flexgen_population_size,
+                'generations': self.config.optimizer.flexgen_generations,
+            },
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        return result
+
+    async def get_status(self) -> Dict:
+        """Return FlexGen system status."""
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        status = {
+            "available": True,
+            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+        }
+        return status
+
+# =============================================================================
 # DATABASE MODELS (SQLAlchemy)
 # =============================================================================
 Base = declarative_base()
@@ -1584,6 +1696,7 @@ class CarbonCreditMarketplace:
 
         # Internal components
         self.optimizer = AutonomousOptimizer(config, self)
+        self.flexgen_manager = FlexGenManager(config)  # NEW
         self.ws_manager = WebSocketManager()
         self.webhook = WebhookNotifier(config)
 
@@ -1604,7 +1717,7 @@ class CarbonCreditMarketplace:
         # Data retention
         self.retention_days = config.general.data_retention_days
 
-        logger.info("CarbonCreditMarketplace v5.0.0 initialized")
+        logger.info("CarbonCreditMarketplace v5.0.0 initialized with FlexGen")
 
     def _register_background_tasks(self):
         self.task_manager.register_task("auto_offset", self._auto_offset_loop)
@@ -2118,6 +2231,17 @@ class CarbonCreditMarketplace:
                         logger.error(f"Reconciliation failed for tx {tx.tx_id}: {e}")
         await asyncio.sleep(0.1)
 
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        """Public method to run FlexGen policy optimization."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        workload_obj = WorkloadDescriptor(**workload)
+        node_obj = NodeDescriptor(**node)
+        return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
+
+    async def get_flexgen_status(self) -> Dict:
+        return await self.flexgen_manager.get_status()
+
     async def health_check(self) -> Dict:
         components = {}
         try:
@@ -2151,6 +2275,11 @@ class CarbonCreditMarketplace:
             components["optimizer"] = {"status": "ok", "strategies": len(self.optimizer.action_space)}
         else:
             components["optimizer"] = {"status": "fallback"}
+        # FlexGen health
+        if FLEXGEN_AVAILABLE:
+            components["flexgen"] = await self.flexgen_manager.get_status()
+        else:
+            components["flexgen"] = {"available": False}
         overall_ok = all(v.get("status") == "ok" for v in components.values() if v.get("status") != "not configured")
         return {
             "status": "ok" if overall_ok else "degraded",
@@ -2416,6 +2545,23 @@ async def optimization_stats(user: Dict = Depends(get_current_user), _: None = D
     if not marketplace:
         raise HTTPException(status_code=503, detail="Service not initialized")
     return marketplace.optimizer.get_optimization_stats()
+
+# =============================================================================
+# NEW FLEXGEN ENDPOINTS
+# =============================================================================
+@app.post("/flexgen/optimize")
+async def flexgen_optimize(workload: Dict, node: Dict,
+                           user: Dict = Depends(get_current_user),
+                           _: None = Depends(rate_limit)):
+    if not marketplace:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    return await marketplace.run_flexgen_optimization(workload, node)
+
+@app.get("/flexgen/status")
+async def flexgen_status(user: Dict = Depends(get_current_user)):
+    if not marketplace:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    return await marketplace.get_flexgen_status()
 
 # ---------- Startup & Shutdown ----------
 @app.on_event("startup")
