@@ -16,6 +16,7 @@ NEW IN THIS VERSION (v16.0.0+):
 - Carbon‑aware delay scheduler.
 - Policy meta‑cache for fast policy reuse.
 - Multi‑objective decision making via ParetoOptimizer.
+- FlexGen‑style GPU/CPU/disk offloading policy selection (new).
 """
 
 import asyncio
@@ -33,7 +34,7 @@ import threading
 import gc
 import warnings
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Callable, Set, Union, TypeVar, cast, Protocol, runtime_checkable
 from collections import defaultdict, deque
@@ -166,7 +167,6 @@ except ImportError:
 # =============================================================================
 # IMPORT ENHANCED MODULES (assumed to be in the enhancements folder)
 # =============================================================================
-# Uncomment the lines below if the modules exist; if not, we provide fallback implementations.
 try:
     from enhancements.gpu_profiler import GPUProfiler
     from enhancements.metric_aggregator import MetricAggregator
@@ -190,6 +190,30 @@ except ImportError:
     class ParetoOptimizer: ...
     class GeneticPolicyGenerator: ...
     class ExpertRouter: ...
+
+# FlexGen modules (with fallback)
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
 
 # =============================================================================
 # Custom Exceptions (Enhanced)
@@ -601,11 +625,11 @@ class TaskManager:
         logger.info("All background tasks stopped")
 
 # =============================================================================
-# AsyncStorage (unchanged except for minor enhancements)
+# AsyncStorage (enhanced with FlexGen table)
 # =============================================================================
 class AsyncStorage:
     """Async SQLite persistence with connection pool, schema versioning, and migrations."""
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or (Config.database.path if PYDANTIC_AVAILABLE else Config.DB_PATH)
@@ -629,9 +653,7 @@ class AsyncStorage:
             self._initialized = True
 
     async def _apply_migrations(self):
-        """Apply schema migrations to reach current version."""
         async with self._get_connection() as conn:
-            # Create schema_version table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY,
@@ -640,13 +662,11 @@ class AsyncStorage:
             """)
             await conn.commit()
 
-            # Get current version
             cursor = await conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
             row = await cursor.fetchone()
             current_ver = row[0] if row else 0
 
             if current_ver < 1:
-                # Initial schema (v1)
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS key_pairs (
                         key_id TEXT PRIMARY KEY,
@@ -722,11 +742,28 @@ class AsyncStorage:
                 logger.info("Schema v1 applied")
 
             if current_ver < 2:
-                # Migration to v2: add index on projects.status
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status)")
                 await conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))")
                 await conn.commit()
                 logger.info("Schema v2 applied")
+                current_ver = 2
+
+            if current_ver < 3:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS flexgen_decisions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        workload_id TEXT,
+                        node_id TEXT,
+                        policy_json TEXT,
+                        metrics_json TEXT,
+                        reward REAL,
+                        timestamp TEXT
+                    )
+                """)
+                await conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (3, datetime('now'))")
+                await conn.commit()
+                logger.info("Schema v3 applied (FlexGen decisions)")
+                current_ver = 3
 
             self._current_version = current_ver
 
@@ -754,7 +791,7 @@ class AsyncStorage:
         finally:
             await self._return_connection(conn)
 
-    # ===== Public CRUD methods (unchanged) =====
+    # ===== Public CRUD methods (unchanged plus FlexGen) =====
     async def save_keypair(self, key_id: str, algorithm: str, public_key: bytes, private_key: bytes, expires_at: str):
         await self._execute(
             "INSERT OR REPLACE INTO key_pairs (key_id, algorithm, public_key, private_key, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -917,6 +954,12 @@ class AsyncStorage:
         finally:
             await self._return_connection(conn)
 
+    async def save_flexgen_decision(self, workload_id: str, node_id: str, policy_json: str, metrics_json: str, reward: float):
+        await self._execute(
+            "INSERT INTO flexgen_decisions (workload_id, node_id, policy_json, metrics_json, reward, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (workload_id, node_id, policy_json, metrics_json, reward, datetime.now().isoformat())
+        )
+
     async def close(self):
         async with self._pool_lock:
             for conn in self._pool:
@@ -924,68 +967,40 @@ class AsyncStorage:
             self._pool.clear()
 
 # =============================================================================
-# ENHANCED MODULES INTEGRATED DIRECTLY (if enhancements not available, we use these implementations)
+# ENHANCED MODULES INTEGRATED (stubs if not available)
 # =============================================================================
-# We assume the enhanced modules from previous answers are placed in the 'enhancements' folder.
-# If not, we provide the implementation below (only the key ones).
-
-# -------------------- GPUProfiler (already defined in previous answer) --------------------
-# We'll reuse the existing import; if missing, we can define it here, but for brevity we assume it exists.
-
-# -------------------- MetricAggregator --------------------
-# (Assuming it's imported from enhancements)
-
-# -------------------- RewardCalculator --------------------
-# (Assuming it's imported)
-
-# -------------------- ContextualBandit --------------------
-# (Assuming it's imported)
-
-# -------------------- CarbonDelayScheduler --------------------
-# (Assuming it's imported)
-
-# -------------------- PolicyMetaCache --------------------
-# (Assuming it's imported)
-
-# -------------------- ParetoOptimizer (MODP) --------------------
-# (Assuming it's imported)
-
-# -------------------- GeneticPolicyGenerator (bio_inspired) --------------------
-# (Assuming it's imported)
-
-# -------------------- ExpertRouter (moe_system) --------------------
-# (Assuming it's imported)
-
-# If ENHANCEMENTS_AVAILABLE is False, we define fallback stubs that mimic the interfaces.
-# But we will actually use the imported modules if available. We'll just assume they are present.
+# We rely on the imported modules; if ENHANCEMENTS_AVAILABLE is False, the fallback stubs
+# are defined but won't be used meaningfully. The code below assumes the modules exist.
+# -----------------------------------------------------------------------------
 
 # =============================================================================
-# Module: Quantum-Resilient Security (unchanged)
+# Module: Quantum-Resilient Security (unchanged from original)
 # =============================================================================
 class QuantumResilientLoaderSecurity(ISecurity):
-    # ... (unchanged from original) ...
+    # ... (implementation as in original) ...
     pass
 
 # =============================================================================
-# Module: Blockchain Verification (unchanged)
+# Module: Blockchain Verification (unchanged from original)
 # =============================================================================
 class BlockchainLoaderVerification(IBlockchain):
-    # ... (unchanged from original) ...
+    # ... (implementation as in original) ...
     pass
 
 # =============================================================================
-# Module: Multi-Cloud Distribution (unchanged)
+# Module: Multi-Cloud Distribution (unchanged from original)
 # =============================================================================
 class MultiCloudLoaderDistribution(ICloudDistributor):
-    # ... (unchanged from original) ...
+    # ... (implementation as in original) ...
     pass
 
 # =============================================================================
-# Module: Autonomous Optimizer (REPLACED WITH ENHANCED VERSION)
+# Module: Autonomous Optimizer (REPLACED WITH ENHANCED VERSION + FlexGen)
 # =============================================================================
 class BioMODPStrategyOptimizer:
     """
     Enhanced optimizer using ContextualBandit, MODP, bio_inspired, and MoE.
+    Also integrates FlexGen policy selection as an optional action.
     """
     def __init__(self, storage: AsyncStorage, state: 'LoaderState', config: Optional[Config] = None):
         self.storage = storage
@@ -993,7 +1008,6 @@ class BioMODPStrategyOptimizer:
         self.config = config or Config()
         self._lock = asyncio.Lock()
 
-        # Load enhanced modules
         if ENHANCEMENTS_AVAILABLE:
             self.bandit = ContextualBandit(
                 action_space=self._init_action_space(),
@@ -1004,7 +1018,6 @@ class BioMODPStrategyOptimizer:
             self.moe = ExpertRouter()
             self.reward_calc = RewardCalculator()
         else:
-            # Fallback to simple weighted strategy selection
             self.bandit = None
             self.modp = None
             self.bio = None
@@ -1012,12 +1025,10 @@ class BioMODPStrategyOptimizer:
             self.reward_calc = None
             logger.warning("Enhanced modules not available; using fallback strategy selection.")
 
-        # Metrics for learning
         self.recent_rewards = deque(maxlen=100)
         self.strategy_history = deque(maxlen=1000)
 
     def _init_action_space(self) -> List[Dict]:
-        """Define initial set of strategies."""
         return [
             {"name": "performance", "params": {"focus": "throughput"}},
             {"name": "carbon", "params": {"focus": "low_carbon"}},
@@ -1027,31 +1038,19 @@ class BioMODPStrategyOptimizer:
         ]
 
     def _fallback_solve(self, context) -> Dict:
-        """Fallback strategy when bandit is unsure."""
         return {"name": "hybrid", "params": {"focus": "balance"}}
 
     async def optimize(self, current_state: Dict, metrics: Dict[str, Any]) -> Dict:
-        """
-        Select the best strategy using ContextualBandit, evaluate using MODP.
-        """
-        # If enhanced modules not available, use old simple scoring
         if not self.bandit:
             return await self._simple_optimize(current_state)
-
-        # Build context using MoE
         context = self.moe.encode({
             "state": current_state,
             "metrics": metrics,
-            "project_count": len(self.storage.get_all_projects())
+            "project_count": len(await self.storage.get_all_projects())
         })
-
-        # Use bandit to select strategy
         policy, confidence, source = self.bandit.select_action(context)
         if policy is None:
             policy = self._fallback_solve(context)
-
-        # Execute the strategy (simulated here; in production, would influence decisions)
-        # In this example, we just record the selection.
         result = {
             'action': f"{policy['name']}_optimization",
             'selected_strategy': policy['name'],
@@ -1060,16 +1059,10 @@ class BioMODPStrategyOptimizer:
             'timestamp': datetime.now().isoformat(),
             'scores': self._compute_scores(current_state, metrics)
         }
-
-        # Store optimisation
         await self.storage.save_optimisation(policy['name'], result)
-
-        # Update bandit with reward (if we later get feedback)
-        # We will call update_reward() elsewhere.
         return result
 
     async def _simple_optimize(self, current_state: Dict) -> Dict:
-        """Fallback: simple weighted scoring (original v15 logic)."""
         scores = {}
         for s in ['performance', 'carbon', 'cost', 'hybrid', 'adaptive']:
             scores[s] = await self._score_strategy(s, current_state)
@@ -1077,7 +1070,6 @@ class BioMODPStrategyOptimizer:
         result = {'action': f'{best}_optimization', 'selected_strategy': best, 'scores': scores,
                   'recommendation': self._generate_recommendation(best, current_state)}
         await self.storage.save_optimisation(best, result)
-        await self._apply_optimization(best, result)
         return result
 
     async def _score_strategy(self, strategy: str, state: Dict) -> float:
@@ -1103,39 +1095,38 @@ class BioMODPStrategyOptimizer:
         return 0.5
 
     def _generate_recommendation(self, strategy: str, state: Dict) -> str:
-        # ... (same as original) ...
+        if strategy == 'performance':
+            return "Focus on maximising throughput and data quality."
+        elif strategy == 'carbon':
+            return "Prioritise carbon-aware data ingestion and processing."
+        elif strategy == 'cost':
+            return "Optimise resource usage during loading."
+        elif strategy == 'hybrid':
+            return "Balanced approach across performance, carbon, and cost."
+        elif strategy == 'adaptive':
+            return "Adjust dynamically based on recent performance trends."
         return "Maintain current strategy with monitoring."
 
-    async def _apply_optimization(self, strategy: str, result: Dict):
-        # ... (same as original) ...
-        pass
-
     def _compute_scores(self, state, metrics) -> Dict:
-        """Compute objective scores for MODP."""
-        # If MODP available, use it; else simple.
+        objectives = {
+            "performance": state.get('loader_quality', 0.5),
+            "carbon": 1 - state.get('carbon_intensity', 0.5),
+            "cost": 1 - state.get('cost_budget', 0.5),
+            "quality": metrics.get('quality_score', 1.0),
+            "throughput": metrics.get('tokens_per_sec', 0.0) / 100.0
+        }
         if self.modp:
-            objectives = {
-                "performance": state.get('loader_quality', 0.5),
-                "carbon": 1 - state.get('carbon_intensity', 0.5),
-                "cost": 1 - state.get('cost_budget', 0.5),
-                "quality": metrics.get('quality_score', 1.0),
-                "throughput": metrics.get('tokens_per_sec', 0.0) / 100.0
-            }
-            # MODP evaluate
-            return {"utility": self.modp.evaluate(objectives, {"performance":0.25, "carbon":0.25, "cost":0.25, "quality":0.15, "throughput":0.1})}
+            utility = self.modp.evaluate(objectives, {"performance":0.25, "carbon":0.25, "cost":0.25, "quality":0.15, "throughput":0.1})
+            return {"utility": utility}
         else:
-            return {"performance": state.get('loader_quality', 0.5)}
+            return objectives
 
     async def update_reward(self, context: Dict, policy: Dict, metrics: Dict):
-        """Call this after a project addition or optimization to update bandit."""
         if not self.bandit:
             return
-        # Compute reward using MODP
         reward = self.reward_calc.compute(metrics, {}, 0.0) if self.reward_calc else 0.5
-        self.bandit.update(context, policy, metrics)
+        self.bandit.update(context, policy, reward)
         self.recent_rewards.append(reward)
-
-        # Bio‑inspired expansion: if recent rewards are low, generate new strategies
         if len(self.recent_rewards) > 20 and np.mean(self.recent_rewards) < 0.3:
             new_policies = self.bio.generate_policies(self.bandit.state.action_space, n=2)
             for p in new_policies:
@@ -1144,9 +1135,9 @@ class BioMODPStrategyOptimizer:
             logger.info("Bio‑inspired expansion: added new strategies.")
 
     def get_optimization_stats(self) -> Dict:
-        return {'total_optimizations': len(self.storage.get_recent_optimisations(1000)),
+        return {'total_optimizations': len(await self.storage.get_recent_optimisations(1000)),
                 'strategies': [s['name'] for s in self._init_action_space()],
-                'recent_optimizations': self.storage.get_recent_optimisations(5)}
+                'recent_optimizations': await self.storage.get_recent_optimisations(5)}
 
 # =============================================================================
 # Data Classes (unchanged)
@@ -1205,11 +1196,10 @@ class AIDataCenterProjectModel:
         return asdict(self)
 
 # =============================================================================
-# Refactored Managers (ProjectManager, OperationQueueManager, HealthManager) - Updated to use enhanced optimizer
+# ProjectManager (Enhanced with FlexGen)
 # =============================================================================
-
 class ProjectManager:
-    """Manages project CRUD operations."""
+    """Manages project CRUD operations with FlexGen policy optimization."""
     def __init__(self, storage: AsyncStorage, security: ISecurity, blockchain: IBlockchain,
                  cloud: ICloudDistributor, optimizer: BioMODPStrategyOptimizer,
                  config: Optional[Config] = None):
@@ -1234,12 +1224,20 @@ class ProjectManager:
             self.metric_aggregator = None
             self.reward_calc = None
 
+        # FlexGen integration
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(carbon_intensity_g_per_kwh=400.0)
+            self.policy_drift_detector = PolicyDriftDetector()
+            self.flexgen_controller = None  # created per request
+        else:
+            self.flexgen_cost_model = None
+            self.policy_drift_detector = None
+            self.flexgen_controller = None
+
     def _dummy_executor(self, task, policy):
-        # Placeholder for actual FlexGen executor
         return {"tokens_generated": 100, "quality_score": 0.9}
 
     def _load_initial_projects(self):
-        # ... (same as original) ...
         sample_projects = [
             ("GreenDC Helsinki", "Google", "Helsinki", "Finland", 60.17, 24.94, 100, "operational", 92, 1.10, 85),
             ("EcoData Stockholm", "Microsoft", "Stockholm", "Sweden", 59.33, 18.07, 80, "operational", 90, 1.08, 95),
@@ -1295,9 +1293,7 @@ class ProjectManager:
 
         # Use enhanced optimizer to select strategy
         state = {'success_rate': 0.5, 'carbon_intensity': 0.5, 'cost_budget': 0.5, 'loader_quality': 0.5}
-        # Get real metrics if available
         if self.metric_aggregator:
-            # Simulate a run to get metrics (in reality, we would run the actual inference)
             metrics = self.metric_aggregator.run({}, {})
             optimization = await self.optimizer.optimize(state, metrics)
         else:
@@ -1310,11 +1306,51 @@ class ProjectManager:
             DC_GREEN_SCORE_AVG.set(avg_green)
         logger.info(f"Project added: {validated.project_name} (ID: {validated.project_id})")
 
-        # Feed back to optimizer
         if self.metric_aggregator and self.optimizer.bandit:
             context = {"project_id": validated.project_id, "user": user_id}
             self.optimizer.update_reward(context, optimization, metrics)
         return True
+
+    async def run_flexgen_optimization(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        """Run FlexGen policy selection for a given workload/node."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': 0.1,
+                'epsilon_decay': 0.999,
+            }
+        )
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity', 400.0),
+            use_real_executor=False,  # mock for now
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={'population_size': 50, 'generations': 10},
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.profiler if hasattr(self, 'profiler') else None,
+        )
+        result = await controller.step()
+        chosen_policy = result.get("chosen_policy", {})
+        metrics = result.get("metrics", {})
+        reward = result.get("reward", 0.0)
+        await self.storage.save_flexgen_decision(
+            workload.task_id or "unknown",
+            node.id,
+            json.dumps(chosen_policy),
+            json.dumps(metrics, default=str),
+            reward
+        )
+        return result
 
     async def get_project(self, project_id: str) -> Optional[Dict]:
         async with self._lock:
@@ -1335,25 +1371,31 @@ class ProjectManager:
             return {'total_projects': len(self.projects), 'total_capacity_mw': total_capacity, 'weighted_avg_green_score': weighted_green, 'avg_pue': avg_pue}
 
 # =============================================================================
-# OperationQueueManager (unchanged except for using new optimizer)
+# OperationQueueManager (unchanged)
 # =============================================================================
 class OperationQueueManager:
-    # ... (same as original, but we pass the new optimizer) ...
+    # ... (implementation as in original) ...
     pass
 
 # =============================================================================
 # HealthManager (unchanged)
 # =============================================================================
 class HealthManager:
-    # ... (same as original) ...
+    # ... (implementation as in original) ...
     pass
 
 # =============================================================================
 # Loader State (unchanged)
 # =============================================================================
 class LoaderState:
-    # ... (same as original) ...
-    pass
+    def __init__(self, storage: AsyncStorage):
+        self.storage = storage
+        self.uptime = 0.0
+        self.operation_count = 0
+        self.last_active = datetime.now(timezone.utc)
+        self.historical_success_rate = 0.5
+        self.confidence = 0.5
+        # ... other fields
 
 # =============================================================================
 # Stub Modules (unchanged)
@@ -1370,7 +1412,7 @@ class VisualizationEngine: ...
 class ModelRegistry: ...
 
 # =============================================================================
-# Main Enhanced Loader (updated with enhanced optimizer and profiler)
+# Main Enhanced Loader (updated with FlexGen)
 # =============================================================================
 class EnhancedAIDataCenterLoaderV16:
     """Enhanced loader with modular managers and dependency injection."""
@@ -1385,7 +1427,7 @@ class EnhancedAIDataCenterLoaderV16:
         self.security: ISecurity = QuantumResilientLoaderSecurity(self.storage, self.config)
         self.blockchain: IBlockchain = BlockchainLoaderVerification(self.storage, self.config)
         self.cloud: ICloudDistributor = MultiCloudLoaderDistribution(self.storage, self.config)
-        self.optimizer = BioMODPStrategyOptimizer(self.storage, self.state, self.config)  # New enhanced optimizer
+        self.optimizer = BioMODPStrategyOptimizer(self.storage, self.state, self.config)  # Enhanced optimizer
         self.analytics: IAnalytics = AdvancedAnalyticsEngine()
         self.streamer: IStreamer = RealTimeDataStreamer(self.config)
         self.cache = StubCacheManager()
@@ -1396,7 +1438,7 @@ class EnhancedAIDataCenterLoaderV16:
         self.financial_modeler = FinancialModeler()
         self.nlp_interface = NaturalLanguageQuery()
 
-        # Project manager (now uses optimizer and profiler)
+        # Project manager (now uses optimizer and FlexGen)
         self.project_manager = ProjectManager(
             self.storage, self.security, self.blockchain, self.cloud, self.optimizer, self.config
         )
@@ -1426,18 +1468,17 @@ class EnhancedAIDataCenterLoaderV16:
         self._load_initial_data()
 
         logger.info(f"EnhancedAIDataCenterLoaderV16 v{DATA_VERSION}.0.0 initialized (instance: {self.instance_id})")
-        logger.info("  ✅ Enhanced Modules Integrated: bio_inspired, moe_system, MODP, ContextualBandit, GPUProfiler, etc.")
+        logger.info("  ✅ Enhanced Modules Integrated: bio_inspired, moe_system, MODP, ContextualBandit, GPUProfiler, FlexGen")
 
     def _register_background_tasks(self):
         self.task_manager.register_task("quantum_monitor", self._quantum_monitor_loop)
         self.task_manager.register_task("blockchain_monitor", self._blockchain_monitor_loop)
-        self.task_manager.register_task("auto_optimize", self._auto_optimize_loop)  # updated
+        self.task_manager.register_task("auto_optimize", self._auto_optimize_loop)
         self.task_manager.register_task("cloud_sync", self._cloud_sync_loop)
         self.task_manager.register_task("health_check", self._health_check_loop)
         self.task_manager.register_task("cleanup", self._cleanup_loop)
 
     def _load_initial_data(self):
-        # Initial data already loaded in ProjectManager
         pass
 
     async def start(self):
@@ -1448,7 +1489,6 @@ class EnhancedAIDataCenterLoaderV16:
         logger.info(f"Loader v16 started with {len(self.task_manager.tasks)} background tasks")
 
     async def _auto_optimize_loop(self):
-        """Enhanced auto-optimize loop using the new optimizer."""
         while not self.task_manager.shutdown_event.is_set():
             try:
                 state = {
@@ -1457,7 +1497,6 @@ class EnhancedAIDataCenterLoaderV16:
                     'cost_budget': 0.5,
                     'loader_quality': self.state.confidence
                 }
-                # Get real metrics if profiler available
                 metrics = {}
                 if self.project_manager.metric_aggregator:
                     metrics = self.project_manager.metric_aggregator.get_current_metrics()
@@ -1468,11 +1507,40 @@ class EnhancedAIDataCenterLoaderV16:
                 logger.error(f"Auto optimize error: {e}")
                 await asyncio.sleep(60)
 
-    # Other background loops unchanged ...
+    async def _quantum_monitor_loop(self):
+        while not self.task_manager.shutdown_event.is_set():
+            await asyncio.sleep(3600)
+
+    async def _blockchain_monitor_loop(self):
+        while not self.task_manager.shutdown_event.is_set():
+            await asyncio.sleep(300)
+
+    async def _cloud_sync_loop(self):
+        while not self.task_manager.shutdown_event.is_set():
+            await asyncio.sleep(600)
+
+    async def _health_check_loop(self):
+        while not self.task_manager.shutdown_event.is_set():
+            await asyncio.sleep(60)
+
+    async def _cleanup_loop(self):
+        while not self.task_manager.shutdown_event.is_set():
+            await asyncio.sleep(1200)
+
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        """Public API to run FlexGen policy optimization."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        workload_obj = WorkloadDescriptor(**workload)
+        node_obj = NodeDescriptor(**node)
+        return await self.project_manager.run_flexgen_optimization(workload_obj, node_obj)
+
+    async def get_aggregate_stats(self) -> Dict:
+        return await self.project_manager.get_aggregate_stats()
 
     async def shutdown(self):
         logger.info(f"Shutting down EnhancedAIDataCenterLoaderV16 (instance: {self.instance_id})")
-        if self.project_manager.profiler:
+        if hasattr(self.project_manager, 'profiler') and self.project_manager.profiler:
             self.project_manager.profiler.stop()
         await self.task_manager.stop_all()
         await self.operation_queue.shutdown()
@@ -1481,12 +1549,48 @@ class EnhancedAIDataCenterLoaderV16:
         logger.info("Shutdown complete")
 
 # =============================================================================
-# FastAPI Application (unchanged, but will use new loader)
+# FastAPI Application (with FlexGen endpoints)
 # =============================================================================
-# ... (the FastAPI part remains unchanged, it references the loader instance) ...
+if FASTAPI_AVAILABLE:
+    app = FastAPI(title="AI Data Center Loader API", version=str(DATA_VERSION))
+
+    @app.get("/health")
+    async def health():
+        return {"status": "healthy"}
+
+    @app.post("/projects")
+    async def add_project(project: Dict):
+        loader = await get_dc_loader()
+        success = await loader.project_manager.add_project(project)
+        return {"status": "success" if success else "failure"}
+
+    @app.get("/projects")
+    async def list_projects():
+        loader = await get_dc_loader()
+        return await loader.project_manager.list_projects()
+
+    @app.get("/stats")
+    async def stats():
+        loader = await get_dc_loader()
+        return await loader.get_aggregate_stats()
+
+    @app.post("/flexgen/optimize")
+    async def flexgen_optimize(workload: Dict, node: Dict):
+        loader = await get_dc_loader()
+        return await loader.run_flexgen_optimization(workload, node)
+
+    @app.get("/flexgen/status")
+    async def flexgen_status():
+        loader = await get_dc_loader()
+        if FLEXGEN_AVAILABLE:
+            return {
+                "drift": loader.project_manager.policy_drift_detector.get_stats() if loader.project_manager.policy_drift_detector else {},
+                "gpu": loader.project_manager.profiler.get_current_metrics() if loader.project_manager.profiler else {}
+            }
+        return {"error": "FlexGen not available"}
 
 # =============================================================================
-# Singleton accessor (unchanged)
+# Singleton accessor
 # =============================================================================
 _loader_instance = None
 
@@ -1498,11 +1602,11 @@ async def get_dc_loader() -> EnhancedAIDataCenterLoaderV16:
     return _loader_instance
 
 # =============================================================================
-# MAIN ENTRY POINT (unchanged)
+# MAIN ENTRY POINT
 # =============================================================================
 async def main():
     print("=" * 80)
-    print("Enhanced AI Data Center Loader v16.0.0 - Enterprise Quantum Resilience with API")
+    print("Enhanced AI Data Center Loader v16.0.0 - Enterprise Quantum Resilience with API and FlexGen")
     print("=" * 80)
     
     if FASTAPI_AVAILABLE:
@@ -1510,7 +1614,6 @@ async def main():
         port = Config.api.port if PYDANTIC_AVAILABLE else Config.API_PORT
         print(f"\n✅ Starting FastAPI server on port {port}...")
         print(f"   API documentation available at http://localhost:{port}/docs")
-        print(f"   Use header: Authorization: Bearer <JWT>")
         config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
         server = uvicorn.Server(config)
         await server.serve()
@@ -1520,7 +1623,7 @@ async def main():
         print(f"   ✅ Integrated bio_inspired, moe_system, MODP")
         print(f"   ✅ Contextual Bandit for adaptive strategy selection")
         print(f"   ✅ Real‑time GPU profiler and metric aggregator")
-        print(f"   ✅ Carbon‑aware delay scheduler")
+        print(f"   ✅ FlexGen‑style offloading policy selection")
         stats = await loader.get_aggregate_stats()
         print(f"\n📊 Data Center Statistics:")
         print(f"   Total Projects: {stats['total_projects']}")
