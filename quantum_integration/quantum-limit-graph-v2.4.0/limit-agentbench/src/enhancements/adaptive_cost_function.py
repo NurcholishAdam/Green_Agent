@@ -20,6 +20,7 @@ ENHANCEMENTS INTEGRATED:
 - GPUProfiler and MetricAggregator for real‑time hardware metrics
 - Persistence of learned models
 - New API endpoints for querying and managing the learning state
+- FlexGen integration for GPU/CPU/disk offloading policy selection (new)
 """
 
 import os
@@ -141,6 +142,30 @@ except ImportError:
     class RewardCalculator:
         def compute(self, metrics, constraints, carbon_intensity): return 0.5
 
+# FlexGen modules (with fallback)
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
+
 # =============================================================================
 # Configuration using Pydantic BaseSettings
 # =============================================================================
@@ -196,6 +221,15 @@ class Settings(BaseSettings):
     retrain_interval_seconds: int = Field(3600, env="ADAPTIVE_API_RETRAIN_INTERVAL")
     min_feedback_for_retrain: int = Field(50, env="ADAPTIVE_API_MIN_FEEDBACK_FOR_RETRAIN")
 
+    # FlexGen settings
+    flexgen_carbon_intensity_default: float = Field(400.0, env="ADAPTIVE_API_FLEXGEN_CARBON_INTENSITY_DEFAULT")
+    flexgen_population_size: int = Field(50, env="ADAPTIVE_API_FLEXGEN_POPULATION_SIZE")
+    flexgen_generations: int = Field(10, env="ADAPTIVE_API_FLEXGEN_GENERATIONS")
+    flexgen_use_real_executor: bool = Field(False, env="ADAPTIVE_API_FLEXGEN_USE_REAL_EXECUTOR")
+    flexgen_executor_type: str = Field("mock", env="ADAPTIVE_API_FLEXGEN_EXECUTOR_TYPE")
+    flexgen_selector_epsilon: float = Field(0.1, env="ADAPTIVE_API_FLEXGEN_SELECTOR_EPSILON")
+    flexgen_selector_epsilon_decay: float = Field(0.999, env="ADAPTIVE_API_FLEXGEN_SELECTOR_EPSILON_DECAY")
+
     class Config:
         env_prefix = "ADAPTIVE_API_"
 
@@ -225,7 +259,7 @@ class FeedbackRecord(Base):
     distillation_loss = Column(Float, nullable=True)
     # New fields for enhanced modules
     modp_utility = Column(Float, nullable=True)
-    context_vector = Column(JSON, nullable=True)  # MoE context
+    context_vector = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Async engine and session
@@ -398,8 +432,14 @@ bandit = ContextualBandit(
     fallback_solver=lambda ctx: settings.expert_ids[0]  # fallback to first expert
 )
 
+# FlexGen modules (lazy initialization)
+flexgen_cost_model = None
+policy_drift_detector = None
+if FLEXGEN_AVAILABLE:
+    flexgen_cost_model = FlexGenCostModel(carbon_intensity_g_per_kwh=settings.flexgen_carbon_intensity_default)
+    policy_drift_detector = PolicyDriftDetector()
+
 # State persistence: we'll store bandit and modp weights in a DB table.
-# We'll create a simple state table if not exists.
 async def init_state_table():
     async with AsyncSessionLocal() as db:
         stmt = text("""
@@ -422,7 +462,6 @@ async def load_learning_state():
             try:
                 data = json.loads(row[0])
                 # Reconstruct bandit state (assumes bandit has a .state attribute)
-                # For simplicity, we just seed the bandit with known good policies
                 pass
             except:
                 pass
@@ -434,7 +473,6 @@ async def load_learning_state():
         if row:
             try:
                 modp_weights = json.loads(row[0])
-                # MODP weights are set in settings, but we could update them
                 pass
             except:
                 pass
@@ -442,8 +480,7 @@ async def load_learning_state():
 async def save_learning_state():
     """Persist bandit and MODP weights."""
     async with AsyncSessionLocal() as db:
-        # Save bandit weights (we need to serialize bandit.state)
-        # For now, just save a dummy placeholder
+        # Save bandit weights (placeholder)
         await db.execute(
             text("INSERT OR REPLACE INTO system_state (key, value) VALUES ('bandit_weights', :value)"),
             {"value": json.dumps({"placeholder": True})}
@@ -484,7 +521,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Adaptive API",
     version=settings.api_version,
-    description="API for expert feedback and distillation with enhanced learning modules",
+    description="API for expert feedback and distillation with enhanced learning modules and FlexGen integration",
     lifespan=lifespan,
     openapi_url="/openapi.json" if not settings.debug else None,
 )
@@ -510,7 +547,6 @@ if PROMETHEUS_AVAILABLE:
     RATE_LIMIT_HITS = Counter("adaptive_rate_limit_hits_total", "Rate limit hits")
     BANDIT_CONFIDENCE = Gauge("adaptive_bandit_confidence", "Bandit confidence")
 else:
-    # Dummy objects
     DISTILLATION_LOSS = None
     FEEDBACK_RECORDS = None
     REQUEST_LATENCY = None
@@ -578,8 +614,7 @@ class FeedbackRequest(BaseModel):
     actual_metrics: Dict[str, float] = Field(default_factory=dict)
     teacher_id: Optional[str] = None
     distillation_loss: Optional[float] = None
-    # New optional fields for context
-    context_features: Optional[Dict[str, Any]] = None  # optional extra context
+    context_features: Optional[Dict[str, Any]] = None
 
 class FeedbackResponse(BaseModel):
     status: str
@@ -600,7 +635,7 @@ class BestExpertRequest(BaseModel):
 class BestExpertResponse(BaseModel):
     expert_id: str
     confidence: float
-    source: str  # "bandit" or "fallback"
+    source: str
 
 class ParetoResponse(BaseModel):
     objectives: Dict[str, float]
@@ -608,6 +643,23 @@ class ParetoResponse(BaseModel):
 
 class GeneratePoliciesResponse(BaseModel):
     new_policies: List[Dict[str, Any]]
+
+# NEW: FlexGen request/response models
+class FlexGenOptimizeRequest(BaseModel):
+    workload: Dict[str, Any]
+    node: Dict[str, Any]
+    carbon_intensity: Optional[float] = None
+
+class FlexGenOptimizeResponse(BaseModel):
+    chosen_policy: Dict[str, Any]
+    metrics: Dict[str, Any]
+    reward: float
+    pareto_count: int
+    drift_detected: bool = False
+
+class FlexGenStatusResponse(BaseModel):
+    gpu: List[Dict[str, Any]]
+    drift: Dict[str, Any]
 
 # =============================================================================
 # Main API Endpoints
@@ -638,6 +690,7 @@ async def health_check(request: Request):
         checks["rate_limiter"] = {"status": "disabled"}
     # Check enhanced modules
     checks["enhancements"] = {"status": "available" if ENHANCEMENTS_AVAILABLE else "disabled"}
+    checks["flexgen"] = {"status": "available" if FLEXGEN_AVAILABLE else "disabled"}
     overall = "healthy" if all(v.get("status") == "ok" for v in checks.values()) else "degraded"
     return HealthResponse(
         status=overall,
@@ -672,22 +725,18 @@ async def record_feedback(
         "hardware": hardware_metrics,
         "user_context": feedback.context_features or {},
     }
-    context_vector = moe.encode(context)  # returns a list/array
+    context_vector = moe.encode(context)
 
     # 3. Compute MODP utility from the actual metrics
-    # Objectives: energy, carbon, latency, accuracy
     objectives = {
-        "energy": feedback.actual_metrics.get("energy_joules", 0) / 1000.0,  # normalize
+        "energy": feedback.actual_metrics.get("energy_joules", 0) / 1000.0,
         "carbon": feedback.actual_metrics.get("carbon_kg", 0) / 10.0,
         "latency": feedback.actual_metrics.get("latency_ms", 0) / 1000.0,
         "accuracy": feedback.actual_metrics.get("accuracy", 0),
     }
-    # MODP evaluates and returns a scalar utility (higher is better)
     modp_utility = modp.evaluate(objectives, settings.modp_weights)
 
     # 4. Update the Contextual Bandit with the outcome
-    # The bandit expects a context (we'll use the context_vector) and reward.
-    # Reward is the MODP utility.
     try:
         await learning_circuit.call(lambda: bandit.update(context_vector, feedback.expert_id, modp_utility))
     except Exception as e:
@@ -786,7 +835,6 @@ async def get_best_expert(
     _: None = Depends(rate_limit),
 ):
     """Return the best expert for a given context using the Bandit."""
-    # Encode context using MoE
     context_vector = moe.encode(req.context)
     expert, confidence, source = bandit.select_action(context_vector)
     if BANDIT_CONFIDENCE and confidence is not None:
@@ -815,7 +863,6 @@ async def generate_new_policies(
     _: None = Depends(rate_limit),
 ):
     """Generate new expert policies using bio‑inspired evolution (admin only)."""
-    # Get recent feedback to evaluate fitness
     async with AsyncSessionLocal() as db:
         stmt = text("""
             SELECT expert_id, modp_utility, context_vector
@@ -828,17 +875,14 @@ async def generate_new_policies(
     if len(rows) < settings.min_feedback_for_retrain:
         raise HTTPException(status_code=400, detail="Not enough feedback data for evolution")
 
-    # Compute average utility per expert
     expert_utilities = {}
     for row in rows:
         expert = row[0]
         utility = row[1]
         expert_utilities[expert] = expert_utilities.get(expert, 0) + utility
-    # Normalize
     for expert in expert_utilities:
-        expert_utilities[expert] /= len(rows)  # rough average
+        expert_utilities[expert] /= len(rows)
 
-    # Use bio generator to create new policies (e.g., new expert IDs)
     current_policies = list(expert_utilities.keys())
     new_policies = bio.generate_policies(current_policies, n=3)
     return GeneratePoliciesResponse(new_policies=new_policies)
@@ -850,11 +894,104 @@ async def trigger_retraining(
     _: None = Depends(rate_limit),
 ):
     """Manually trigger retraining of the MoE router and Bandit (admin only)."""
-    # This could run a background task that re-trains the router using all feedback.
-    # For now, we just acknowledge.
     background_tasks = BackgroundTasks()
     background_tasks.add_task(retraining_task)
     return {"status": "retraining triggered"}
+
+# =============================================================================
+# FlexGen Endpoints (NEW)
+# =============================================================================
+
+@app.post("/flexgen/optimize", response_model=FlexGenOptimizeResponse, tags=["FlexGen"])
+async def flexgen_optimize(
+    req: FlexGenOptimizeRequest,
+    request: Request,
+    user: Dict = Depends(get_current_user),
+    _: None = Depends(rate_limit),
+):
+    """
+    Optimize a FlexGen policy for a given workload and node.
+    Returns the chosen policy, metrics, reward, and Pareto count.
+    """
+    if not FLEXGEN_AVAILABLE:
+        raise HTTPException(status_code=501, detail="FlexGen modules not available")
+
+    try:
+        # Construct descriptors from request dicts
+        workload = WorkloadDescriptor(**req.workload)
+        node = NodeDescriptor(**req.node)
+
+        # Determine carbon intensity
+        carbon_intensity = req.carbon_intensity or workload.metadata.get('carbon_intensity', settings.flexgen_carbon_intensity_default)
+
+        # Create FlexGen controller with current settings
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': settings.flexgen_selector_epsilon,
+                'epsilon_decay': settings.flexgen_selector_epsilon_decay,
+            },
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=carbon_intensity,
+            use_real_executor=settings.flexgen_use_real_executor,
+            executor=None,  # will use default mock or provided later
+            cost_model=flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={
+                'population_size': settings.flexgen_population_size,
+                'generations': settings.flexgen_generations,
+            },
+            modp_planner=None,  # not needed for single request
+            drift_detector=policy_drift_detector,
+            gpu_profiler=profiler,
+        )
+
+        result = await controller.step()
+
+        # Map result to response model
+        return FlexGenOptimizeResponse(
+            chosen_policy=result.get("chosen_policy", {}),
+            metrics=result.get("metrics", {}),
+            reward=result.get("reward", 0.0),
+            pareto_count=result.get("pareto_count", 0),
+            drift_detected=result.get("drift_detected", False),
+        )
+    except Exception as e:
+        logger.exception("FlexGen optimization failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"FlexGen optimization failed: {str(e)}")
+
+@app.get("/flexgen/status", response_model=FlexGenStatusResponse, tags=["FlexGen"])
+async def flexgen_status(
+    request: Request,
+    user: Dict = Depends(get_current_user),
+):
+    """
+    Get current GPU metrics and policy drift status.
+    """
+    if not FLEXGEN_AVAILABLE:
+        raise HTTPException(status_code=501, detail="FlexGen modules not available")
+
+    gpu_metrics = []
+    if hasattr(profiler, 'get_all_gpu_metrics'):
+        # Our GPUProfiler may have async method; handle both cases
+        try:
+            gpu_metrics = await profiler.get_all_gpu_metrics()
+        except:
+            # Fallback to sync method if exists
+            if hasattr(profiler, 'get_gpu_metrics'):
+                gpu_metrics = [profiler.get_gpu_metrics()]
+            else:
+                gpu_metrics = []
+    drift_stats = policy_drift_detector.get_stats() if policy_drift_detector else {}
+
+    return FlexGenStatusResponse(gpu=gpu_metrics, drift=drift_stats)
 
 # =============================================================================
 # Background Task Management (Supervision)
@@ -910,7 +1047,6 @@ async def retraining_loop():
 
 async def retraining_task():
     """Perform one retraining iteration."""
-    # Fetch recent feedback
     async with AsyncSessionLocal() as db:
         stmt = text("""
             SELECT expert_id, modp_utility, context_vector
@@ -923,11 +1059,6 @@ async def retraining_task():
     if len(rows) < settings.min_feedback_for_retrain:
         logger.info("Not enough feedback for retraining", count=len(rows))
         return
-
-    # For now, we just log; in a real implementation we could:
-    # - Re-train the MoE router
-    # - Update the Bandit's action weights (if we had a more sophisticated update)
-    # - Evolve new policies via bio_inspired
     logger.info("Retraining completed", records_processed=len(rows))
 
 # =============================================================================
