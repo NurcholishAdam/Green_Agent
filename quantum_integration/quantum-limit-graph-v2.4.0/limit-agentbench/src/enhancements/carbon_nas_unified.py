@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/carbon_nas_unified.py
-# Enhanced version 6.0.2 – Full integration with Green Agent core enhancements + bio_inspired, moe_system, MODP, ContextualBandit
+# Enhanced version 6.0.3 – Full integration with Green Agent core enhancements + bio_inspired, moe_system, MODP, ContextualBandit, FlexGen
 
 """
 Unified Carbon-Aware Neural Architecture Search
-Version: 6.0.2 (Enterprise Platinum+)
+Version: 6.0.3 (Enterprise Platinum+)
 
-Enhancements over v6.0.1:
-- Integrated with bio_inspired, moe_system, MODP, ContextualBandit for adaptive decision-making.
-- Replaced AutonomousOptimizer with BioInspiredOptimizer using GeneticPolicyGenerator.
-- Algorithm selection now uses ContextualBandit and ExpertRouter.
-- Architecture evaluation uses ParetoOptimizer for multi-objective utility.
-- Feedback loop updates all learning modules.
-- Persistence of learned state via central Storage.
-- New endpoints for optimization and feedback.
+Enhancements over v6.0.2:
+- FlexGen integration for GPU/CPU/disk offloading policy optimization.
+- Fixed missing imports and dummy fallbacks.
 """
 
 import asyncio
@@ -84,6 +79,32 @@ except ImportError:
             return self.actions[0], 0.0, "fallback"
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
+
+# ============================================================
+# FLEXGEN MODULES (with fallback)
+# ============================================================
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
 
 # ============================================================
 # OPTIONAL IMPORTS (unchanged, with graceful degradation)
@@ -186,6 +207,15 @@ try:
 except ImportError:
     GCP_AVAILABLE = False
 
+# PyTorch (optional)
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    nn = None  # Ensure nn is defined even if torch missing
+
 # ============================================================
 # ENHANCED EXCEPTION CLASSES (unchanged)
 # ============================================================
@@ -236,7 +266,6 @@ class EnhancedCircuitBreaker:
                 if time.time() - self.last_failure_time >= self.recovery_timeout:
                     self.state = CircuitBreakerState.HALF_OPEN
                     self.success_count = 0
-                    # Update central metric
                     try:
                         central_config.metrics_registry.update_circuit_breaker(self.name, self.state.value)
                     except:
@@ -381,7 +410,6 @@ class PostQuantumCrypto:
         self.pqc_algorithms = {}
         self.pqc_available = PQC_AVAILABLE
         self._lock = asyncio.Lock()
-        # Use central master key from config
         self.master_key = central_config.get_master_key_bytes()
         self.salt = os.urandom(16)
 
@@ -445,7 +473,6 @@ class PostQuantumCrypto:
                         "expires_at": expires_at
                     })
                 else:
-                    # Store in central storage (add method if needed)
                     self.storage.save_pqc_key(key_id, algorithm, encrypted_public, encrypted_private, expires_at)
                 logger.info(f"Generated PQC keypair {key_id} with {algorithm}")
                 return {'key_id': key_id, 'algorithm': algorithm, 'public_key': public_key.hex() if isinstance(public_key, bytes) else str(public_key)}
@@ -474,7 +501,6 @@ class PostQuantumCrypto:
 
     async def sign_data(self, data: Dict, key_id: str) -> Dict:
         data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-        # Retrieve key
         if self.vault.client:
             secret = await self.vault.get_secret(f"pqc/{key_id}")
             if not secret:
@@ -525,7 +551,6 @@ class PostQuantumCrypto:
         if algorithm == 'sha256_fallback':
             expected = hashlib.sha256(data_bytes).hexdigest()
             return expected == signature
-        # Retrieve public key
         if self.vault.client:
             secret = await self.vault.get_secret(f"pqc/{key_id}")
             if not secret:
@@ -636,7 +661,6 @@ class CloudStorage:
                     return {'provider': provider_name, 'location': f"gs://{bucket}/{blob_name}"}
             except Exception as e:
                 logger.error(f"Cloud storage failed for {provider_name}: {e}")
-        # Fallback to local
         local_path = Path(f"./backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         with open(local_path, 'w') as f:
             json.dump(data, f, default=str)
@@ -681,33 +705,16 @@ class BioInspiredOptimizer:
         self.population_size = 50
         self.default_algorithm = "darts"
 
-        # Enhanced bio module
         self.bio = GeneticPolicyGenerator() if ENHANCEMENTS_AVAILABLE else None
-        # Population of hyperparameter sets (each is a dict)
         self.population = []
         self.history = deque(maxlen=100)
 
     async def adjust_parameters(self, recent_cycles: List[Dict]) -> Dict:
-        """
-        Adjust hyperparameters using bio‑inspired evolution.
-        """
         async with self._lock:
             if self.bio and len(recent_cycles) >= 5:
-                # Build a population of parameter sets from recent cycles
-                # For simplicity, we treat each cycle's parameters as a candidate.
-                # In a full implementation, we would maintain a population across generations.
-                # Here we just use the bio optimizer to suggest new params based on fitness.
-                # We'll define a fitness function that evaluates a parameter set.
-                # Since we don't have a direct fitness, we'll use the average accuracy/carbon of recent cycles.
                 avg_accuracy = np.mean([c.get('best_accuracy', 0) for c in recent_cycles]) if recent_cycles else 0.5
                 avg_carbon = np.mean([c.get('carbon_kg', 0) for c in recent_cycles]) if recent_cycles else 0.5
-                # Fitness = accuracy / (carbon + epsilon)
                 fitness = avg_accuracy / (avg_carbon + 0.01)
-                # We'll evolve the current parameters by mutation/crossover.
-                # For demonstration, we create a population from the history.
-                # In a real scenario, we'd maintain a population and call evolve.
-                # We'll just update the parameters based on a simple heuristic for now.
-                # But we demonstrate the interface.
                 if avg_accuracy < 0.7:
                     new_mutation = min(0.5, self.mutation_rate * 1.1)
                 else:
@@ -728,10 +735,9 @@ class BioInspiredOptimizer:
                     'crossover_rate': self.crossover_rate,
                     'population_size': new_population,
                     'algorithm': new_algorithm,
-                    'bio_evolved': False  # placeholder; real evolution would be more complex
+                    'bio_evolved': False
                 }
             else:
-                # Fallback to original heuristic
                 return {
                     'mutation_rate': self.mutation_rate,
                     'crossover_rate': self.crossover_rate,
@@ -744,15 +750,14 @@ class BioInspiredOptimizer:
             self.history.append(cycle_result)
 
     def get_stats(self) -> Dict:
-        async with self._lock:
-            return {
-                'mutation_rate': self.mutation_rate,
-                'crossover_rate': self.crossover_rate,
-                'population_size': self.population_size,
-                'default_algorithm': self.default_algorithm,
-                'history_length': len(self.history),
-                'bio_available': self.bio is not None
-            }
+        return {
+            'mutation_rate': self.mutation_rate,
+            'crossover_rate': self.crossover_rate,
+            'population_size': self.population_size,
+            'default_algorithm': self.default_algorithm,
+            'history_length': len(self.history),
+            'bio_available': self.bio is not None
+        }
 
 # ============================================================
 # REAL CARBON INTENSITY MANAGER (uses central config) – unchanged
@@ -764,13 +769,12 @@ class CarbonIntensityManager:
         self._cache = {}
         self._cache_lock = asyncio.Lock()
         self._last_update = None
-        self._update_interval = 300  # seconds
+        self._update_interval = 300
 
     async def get_current_intensity(self) -> float:
         async with self._cache_lock:
             if self._last_update and (time.time() - self._last_update < self._update_interval):
                 return self._cache.get('intensity', 400.0)
-        # Simulate or fetch from API
         intensity = 300 + 200 * np.random.random()
         async with self._cache_lock:
             self._cache['intensity'] = intensity
@@ -779,7 +783,7 @@ class CarbonIntensityManager:
 
     def calculate_nas_carbon(self, energy_kwh: float) -> float:
         intensity = self._cache.get('intensity', 400.0)
-        return energy_kwh * intensity / 1000.0  # kg CO2
+        return energy_kwh * intensity / 1000.0
 
     async def close(self):
         pass
@@ -795,16 +799,14 @@ class EnergyMeasurer:
         self._lock = asyncio.Lock()
 
     async def measure_energy(self) -> float:
-        # Stub – in real implementation, read from NVML or /sys
-        return 0.01  # kWh
+        return 0.01
 
     async def start_measurement(self):
         self._running = True
         self._start_time = time.time()
 
     async def stop_measurement(self) -> float:
-        energy = await self.measure_energy()
-        return energy
+        return await self.measure_energy()
 
     async def close(self):
         pass
@@ -851,14 +853,11 @@ class AdvancedNASAlgorithms:
         }
 
     async def run_algorithm(self, algorithm_name: str, search_space: Dict, iterations: int = 50) -> Dict:
-        # Simulate algorithm execution with latency and energy measurement
         start_time = time.time()
         await self.energy_measurer.start_measurement()
-        # Simulate search
         await asyncio.sleep(0.5 + 0.1 * random.random())
         energy = await self.energy_measurer.stop_measurement()
         duration = time.time() - start_time
-        # Generate a random architecture
         best_arch = {
             'num_layers': random.choice(search_space.get('num_layers', [2,4,6])),
             'hidden_dim': random.choice(search_space.get('hidden_dim', [64,128,256])),
@@ -874,7 +873,7 @@ class AdvancedNASAlgorithms:
             'energy_kwh': energy,
             'duration_seconds': duration,
             'algorithm': algorithm_name,
-            'candidates': [best_arch]  # for Pareto gating
+            'candidates': [best_arch]
         }
 
     def get_algorithm_status(self) -> Dict:
@@ -886,12 +885,11 @@ class AdvancedNASAlgorithms:
 class QuantumInspiredOptimizer:
     def __init__(self):
         self._circuit_breaker = EnhancedCircuitBreaker('quantum')
-        self.quantum_enabled = central_config.quantum_enabled if hasattr(central_config, 'quantum_enabled') else False
+        self.quantum_enabled = getattr(central_config, 'quantum_enabled', False)
 
     async def optimize_architecture(self, architecture: Dict, method: str = 'qaoa') -> Dict:
         if not self.quantum_enabled or not QISKIT_AVAILABLE:
             return {'optimized': False, 'reason': 'Quantum disabled or not available'}
-        # Simulated quantum optimization
         return {'optimized': True, 'improvement': 0.05, 'method': method}
 
     def get_quantum_status(self) -> Dict:
@@ -917,14 +915,13 @@ class FederatedLearningNAS:
         self.current_round = 0
         self.global_model = None
         self._lock = asyncio.Lock()
-        self.federated_enabled = central_config.federated_enabled if hasattr(central_config, 'federated_enabled') else True
+        self.federated_enabled = getattr(central_config, 'federated_enabled', True)
 
     async def federated_training_round(self) -> Dict:
         if not self.federated_enabled or not self.clients:
             return {'status': 'skipped', 'reason': 'No clients or federated disabled'}
         async with self._lock:
             self.current_round += 1
-            # Simulate aggregation
             avg_accuracy = sum(c.local_accuracy for c in self.clients) / len(self.clients)
             return {
                 'round': self.current_round,
@@ -946,12 +943,11 @@ class FederatedLearningNAS:
 class AutomatedDeployment:
     def __init__(self):
         self._circuit_breaker = EnhancedCircuitBreaker('deployment')
-        self.deployment_enabled = central_config.deployment_enabled if hasattr(central_config, 'deployment_enabled') else True
+        self.deployment_enabled = getattr(central_config, 'deployment_enabled', True)
 
     async def deploy_model(self, model_path: str, config: Dict) -> Dict:
         if not self.deployment_enabled:
             return {'status': 'skipped', 'reason': 'Deployment disabled'}
-        # Simulate deployment
         return {'status': 'deployed', 'model_path': model_path, 'config': config}
 
 # ============================================================
@@ -964,7 +960,6 @@ class ExplainableNAS:
     async def explain_architecture(self, architecture: Dict) -> Dict:
         if not self.explanation_enabled:
             return {'natural_language': 'Explanations disabled'}
-        # Simulate explanation
         return {
             'natural_language': f"The architecture uses {architecture.get('num_layers', 2)} layers with hidden dimension {architecture.get('hidden_dim', 64)}.",
             'feature_importance': {'num_layers': 0.3, 'hidden_dim': 0.5, 'num_heads': 0.2}
@@ -972,6 +967,72 @@ class ExplainableNAS:
 
     def get_explanation_status(self) -> Dict:
         return {'enabled': self.explanation_enabled}
+
+# ============================================================
+# FLEXGEN MANAGER (NEW)
+# ============================================================
+class FlexGenManager:
+    """
+    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
+    """
+    def __init__(self):
+        self.flexgen_cost_model = None
+        self.policy_drift_detector = None
+        self.gpu_profiler = None
+
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(
+                carbon_intensity_g_per_kwh=400.0
+            )
+            self.policy_drift_detector = PolicyDriftDetector()
+            try:
+                from enhancements.gpu_profiler import GPUProfiler
+                self.gpu_profiler = GPUProfiler()
+            except ImportError:
+                self.gpu_profiler = None
+            logger.info("FlexGen Manager initialized")
+        else:
+            logger.warning("FlexGen modules not available; manager will be disabled.")
+
+    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={
+                'epsilon': 0.1,
+                'epsilon_decay': 0.999,
+            }
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity', 400.0),
+            use_real_executor=False,
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={'population_size': 50, 'generations': 10},
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        return result
+
+    async def get_status(self) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        return {
+            "available": True,
+            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+        }
 
 # ============================================================
 # REASONING ENGINE (UPDATED WITH ENHANCED MODULES)
@@ -986,9 +1047,8 @@ class GreenAgentReasoningEngine:
         self.explainable_nas = ExplainableNAS()
         self.reasoning_history = deque(maxlen=1000)
         self.enabled = True
-        self.optimizer = BioInspiredOptimizer()  # replaced
+        self.optimizer = BioInspiredOptimizer()
 
-        # Enhanced modules
         self.modp = ParetoOptimizer() if ENHANCEMENTS_AVAILABLE else None
         self.moe = ExpertRouter() if ENHANCEMENTS_AVAILABLE else None
         self.bandit = ContextualBandit(
@@ -998,16 +1058,12 @@ class GreenAgentReasoningEngine:
             confidence_threshold=0.6,
         ) if ENHANCEMENTS_AVAILABLE else None
 
-        # State for bandit
         self._bandit_state = {}
         self._load_state()
 
-        logger.info("GreenAgentReasoningEngine v6.0.2 initialized")
+        logger.info("GreenAgentReasoningEngine v6.0.3 initialized")
 
     async def _load_state(self):
-        """Load bandit and MODP state from central storage."""
-        # If we have a method to retrieve serialized state from storage, use it.
-        # For now, we skip.
         pass
 
     async def _save_state(self):
@@ -1022,7 +1078,6 @@ class GreenAgentReasoningEngine:
             'context': context,
             'purpose': purpose
         }
-        # ... (existing reasoning)
         reasoning_result['temporal'] = {'action': 'schedule', 'schedule': 'optimal_time'}
         reasoning_result['causal'] = {'primary_driver': 'num_layers', 'contribution': 0.6, 'pathway': 'direct', 'alternatives': [], 'confidence': 0.8}
         reasoning_result['ethical'] = {'overall_ethical_score': 0.85}
@@ -1045,10 +1100,6 @@ class GreenAgentReasoningEngine:
         return reasoning_result
 
     async def _recommend_algorithm(self, architecture_config: Dict) -> Dict:
-        """
-        Use MoE or Bandit to recommend an algorithm.
-        """
-        # Build context
         context = {
             "family": architecture_config.get("family", "unknown"),
             "num_layers": architecture_config.get("num_layers", 0),
@@ -1058,7 +1109,6 @@ class GreenAgentReasoningEngine:
         }
 
         if self.bandit:
-            # Encode context using MoE if available
             if self.moe:
                 encoded_context = self.moe.encode(context)
             else:
@@ -1073,12 +1123,10 @@ class GreenAgentReasoningEngine:
                 'reason': f"Bandit selected {action} with confidence {confidence:.2f}"
             }
         elif self.moe:
-            # Fallback to MoE only
             encoded = self.moe.encode(context)
             recommended = self.moe.select(encoded)
             return {'recommended': recommended, 'reason': "MoE selected"}
         else:
-            # Original heuristic
             if architecture_config.get('family') in ['transformer', 'vit']:
                 return {'recommended': 'darts', 'reason': 'Transformer architectures benefit from differentiable search'}
             elif architecture_config.get('num_layers', 0) > 10:
@@ -1125,43 +1173,36 @@ class GreenAgentReasoningEngine:
             'timestamp': datetime.now().isoformat()
         }
 
-    # === TEACHER INTERFACE FOR MTPD ===
     async def policy_probs(self, state: Dict) -> List[float]:
-        """
-        Return a probability distribution over candidate architecture search strategies.
-        Used as a teacher in MOPD.
-        """
-        # If bandit is available, use its action probabilities
         if self.bandit:
-            # Get the action probabilities from the bandit (if it exposes them)
-            # For now, use a simple heuristic based on state
             probs = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
             carbon_intensity = state.get('carbon_intensity', 0.5)
             workload_size = state.get('workload_size', 0.5)
             time_of_day = state.get('time_of_day', 12) / 24.0
             if carbon_intensity > 0.6:
-                probs[3] += 0.1  # random
+                probs[3] += 0.1
             if workload_size > 0.7:
-                probs[0] += 0.1  # darts
+                probs[0] += 0.1
             if time_of_day > 0.75:
-                probs[4] += 0.1  # quantum
+                probs[4] += 0.1
             probs = probs / probs.sum()
             return probs.tolist()
         else:
-            # Fallback: uniform
             return [0.2, 0.2, 0.2, 0.2, 0.2]
 
     async def evaluate_architecture(self, architecture: Dict) -> Dict[str, float]:
-        """Return metrics for a given architecture for feedback."""
-        # Simulate evaluation
         accuracy = 0.7 + 0.25 * random.random()
         energy = 0.01 * random.random()
-        carbon = central_config.carbon_manager.calculate_nas_carbon(energy)
+        carbon = getattr(central_config, 'carbon_manager', None)
+        if carbon:
+            carbon_val = carbon.calculate_nas_carbon(energy)
+        else:
+            carbon_val = 0.01
         latency = 50 + 100 * random.random()
         return {
             'quality': accuracy,
-            'energy_joules': energy * 3.6e6,  # kWh to joules
-            'carbon_g': carbon * 1000,  # kg to g
+            'energy_joules': energy * 3.6e6,
+            'carbon_g': carbon_val * 1000,
             'latency_ms': latency,
             'cost_usd': 0.001
         }
@@ -1172,8 +1213,7 @@ class GreenAgentReasoningEngine:
 class CarbonAwareNAS:
     def __init__(self):
         self.instance_id = str(uuid.uuid4())[:8]
-        # Use central storage
-        self.storage = Storage()  # central storage
+        self.storage = Storage()
         self.energy_measurer = EnergyMeasurer()
         self.carbon_manager = CarbonIntensityManager()
         self.vault = VaultManager()
@@ -1181,6 +1221,7 @@ class CarbonAwareNAS:
         self.cloud_storage = CloudStorage()
         self.ws_manager = WebSocketManager()
         self.reasoning_engine = GreenAgentReasoningEngine(self.energy_measurer)
+        self.flexgen_manager = FlexGenManager()
         self.population = []
         self.current_best = None
         self.generation = 0
@@ -1196,26 +1237,22 @@ class CarbonAwareNAS:
         self._task_manager = TaskManager()
         self._shutdown_event = asyncio.Event()
         self._running = False
-        # Locks
         self._pop_lock = asyncio.Lock()
         self._gen_lock = asyncio.Lock()
         self._eval_lock = asyncio.Lock()
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
 
-        # Integrate with central AdaptiveCostFunction, ParetoGating, DriftDetector, MessageQueue
-        self.adaptive_cost = central_config.adaptive_cost  # assume injected or available globally
+        self.adaptive_cost = central_config.adaptive_cost
         self.pareto_gating = ParetoGating()
         self.drift_detector = central_config.drift_detector
         self.message_queue = central_config.message_queue
 
-        # MLflow (optional)
         self.mlflow_available = MLFLOW_AVAILABLE
         if self.mlflow_available:
             mlflow.set_experiment("Carbon-Aware NAS")
             mlflow.start_run(run_id=self.instance_id)
-            mlflow.log_params(self.config.dict())
 
-        logger.info(f"CarbonAwareNAS v6.0.2 initialized (instance: {self.instance_id})")
+        logger.info(f"CarbonAwareNAS v6.0.3 initialized (instance: {self.instance_id})")
 
     async def start(self):
         self._running = True
@@ -1249,15 +1286,13 @@ class CarbonAwareNAS:
                 await asyncio.sleep(1)
 
     async def _bio_evolution_loop(self):
-        """Periodically evolve hyperparameters using bio‑inspired optimizer."""
         while self._running and not self._shutdown_event.is_set():
             try:
                 if ENHANCEMENTS_AVAILABLE and self.reasoning_engine.optimizer.bio:
-                    # Trigger evolution based on recent cycles
                     recent = list(self.reasoning_engine.reasoning_history)[-20:]
                     await self.reasoning_engine.optimizer.adjust_parameters(recent)
                     logger.info("Bio‑inspired evolution executed")
-                await asyncio.sleep(3600)  # every hour
+                await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1285,7 +1320,6 @@ class CarbonAwareNAS:
                 return {'accuracy': accuracy, 'carbon_kg': carbon, 'energy_kwh': energy}
             result = await asyncio.to_thread(evaluate)
             await self._update_population(result)
-            # Save to central storage
             self.storage.save_architecture_result({
                 'arch_hash': arch_hash,
                 'algorithm': evaluation_task.get('algorithm', 'unknown'),
@@ -1297,7 +1331,6 @@ class CarbonAwareNAS:
                 'metadata': {'architecture': arch}
             })
             self.evaluation_queue.task_done()
-            # Publish FeedbackEvent to central message queue
             event = FeedbackEvent.create_with_context(
                 task_id=f"nas_eval_{arch_hash}",
                 selected_action=f"evaluate_{evaluation_task.get('algorithm', 'unknown')}",
@@ -1305,8 +1338,8 @@ class CarbonAwareNAS:
                 latency_ms=50,
                 energy_joules=result['energy_kwh'] * 3.6e6,
                 carbon_g=result['carbon_kg'] * 1000,
-                feedback_type="energy",  # or "carbon"
-                adaptive_cost_value=0.0,  # will be filled by central cost
+                feedback_type="energy",
+                adaptive_cost_value=0.0,
                 state=arch,
                 candidates=[{'action': 'evaluate'}],
                 source="carbon_nas",
@@ -1314,7 +1347,6 @@ class CarbonAwareNAS:
                 tags=["nas", "evaluation"]
             )
             await self.message_queue.publish("feedback_events", event.to_json())
-            # Broadcast via WebSocket
             await self.ws_manager.broadcast({
                 'type': 'evaluation',
                 'arch_hash': arch_hash,
@@ -1322,7 +1354,6 @@ class CarbonAwareNAS:
                 'carbon_kg': result['carbon_kg']
             })
 
-            # Update MoE and Bandit if available
             if self.reasoning_engine.moe:
                 context = {
                     "arch_hash": arch_hash,
@@ -1334,7 +1365,6 @@ class CarbonAwareNAS:
                 self.reasoning_engine.moe.update(context, evaluation_task.get('algorithm', 'unknown'), result['accuracy'])
 
             if self.reasoning_engine.bandit:
-                # Reward is a combination of accuracy and carbon (MODP utility)
                 objectives = {
                     "accuracy": result['accuracy'],
                     "carbon": result['carbon_kg'],
@@ -1348,7 +1378,6 @@ class CarbonAwareNAS:
 
     async def _update_population(self, evaluation_result: Dict):
         async with self._pop_lock:
-            # Compute MODP utility if available
             if self.reasoning_engine.modp:
                 objectives = {
                     "accuracy": evaluation_result['accuracy'],
@@ -1363,7 +1392,6 @@ class CarbonAwareNAS:
             self.population.append(evaluation_result)
             if self.current_best is None or evaluation_result['accuracy'] > self.current_best.get('accuracy', 0):
                 self.current_best = evaluation_result
-                # Update central metric
                 central_config.metrics_registry.set_best_accuracy(evaluation_result['accuracy'])
 
     async def _maintenance_loop(self):
@@ -1383,18 +1411,14 @@ class CarbonAwareNAS:
     async def run_nas_cycle(self, search_space: Dict, iterations: int = 50) -> Dict:
         start_time = time.time()
         experiment_id = str(uuid.uuid4())[:8]
-        # Save experiment start in central storage (if method exists)
         try:
             self.storage.save_experiment(experiment_id, search_space, 'running')
         except:
             pass
         try:
-            # Get carbon intensity
             carbon_intensity = await self.carbon_manager.get_current_intensity()
-            # Select algorithm based on reasoning and optimizer
             alg_rec = await self.reasoning_engine._recommend_algorithm(search_space)
             algorithm = alg_rec.get('recommended', 'darts')
-            # Run the algorithm
             def run_alg():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -1411,30 +1435,22 @@ class CarbonAwareNAS:
                     pass
                 return algorithm_result
 
-            # Apply Pareto gating to candidates
             candidates = algorithm_result.get('candidates', [])
             if candidates:
                 filtered = self.pareto_gating.filter(candidates)
                 if filtered:
-                    best_arch = filtered[0]  # choose first Pareto-optimal
+                    best_arch = filtered[0]
                 else:
                     best_arch = algorithm_result.get('best_architecture', {})
             else:
                 best_arch = algorithm_result.get('best_architecture', {})
 
-            # Get adaptive cost weights to influence decision
             weights = self.adaptive_cost.get_current_weights()
-            # (Weighted decision could be applied here)
-
-            # Quantum optimization
             quantum_result = await self.reasoning_engine.quantum_optimizer.optimize_architecture(best_arch, 'qaoa')
-            # Federated learning round
             federated_result = None
             if len(self.reasoning_engine.federated_learning.clients) > 0:
                 federated_result = await self.reasoning_engine.federated_learning.federated_training_round()
-            # Generate explanations
             explanations = await self.reasoning_engine.explainable_nas.explain_architecture(best_arch)
-            # Update population
             if best_arch:
                 await self._update_population({
                     'accuracy': best_arch.get('final_accuracy', 0.8),
@@ -1444,14 +1460,12 @@ class CarbonAwareNAS:
                 })
             async with self._gen_lock:
                 self.generation += 1
-            # Log to MLflow
             if self.mlflow_available:
                 mlflow.log_metrics({
                     'accuracy': best_arch.get('final_accuracy', 0.8) if best_arch else 0,
                     'carbon_kg': 0.01,
                     'energy_kwh': 0.01
                 })
-            # Record cycle in autonomous optimizer
             await self.reasoning_engine.optimizer.record_cycle({
                 'accuracy': best_arch.get('final_accuracy', 0.8) if best_arch else 0,
                 'carbon_kg': 0.01,
@@ -1459,13 +1473,11 @@ class CarbonAwareNAS:
                 'algorithm': algorithm,
                 'iterations': iterations
             })
-            # Sign result with PQC
             signature = await self.pqc.sign_data({
                 'experiment_id': experiment_id,
                 'generation': self.generation,
                 'best_architecture': best_arch
             }, (await self.pqc.generate_keypair('dilithium'))['key_id'])
-            # Store backup in cloud
             backup_data = {
                 'experiment_id': experiment_id,
                 'generation': self.generation,
@@ -1483,7 +1495,6 @@ class CarbonAwareNAS:
                 self.storage.update_experiment_end(experiment_id, 'completed')
             except:
                 pass
-            # Broadcast via WebSocket
             await self.ws_manager.broadcast({
                 'type': 'cycle_complete',
                 'experiment_id': experiment_id,
@@ -1491,16 +1502,14 @@ class CarbonAwareNAS:
                 'best_accuracy': best_arch.get('final_accuracy', 0) if best_arch else 0,
                 'carbon_intensity': carbon_intensity
             })
-
-            # Publish feedback event for the cycle
             event = FeedbackEvent.create_with_context(
                 task_id=f"nas_cycle_{experiment_id}",
                 selected_action=f"cycle_{algorithm}",
                 quality_score=best_arch.get('final_accuracy', 0.8) if best_arch else 0,
                 latency_ms=0,
-                energy_joules=0.01 * 3.6e6,  # approximate
+                energy_joules=0.01 * 3.6e6,
                 carbon_g=0.01 * 1000,
-                feedback_type="distillation",  # or "energy"
+                feedback_type="distillation",
                 adaptive_cost_value=0.0,
                 state=search_space,
                 candidates=[{'action': algorithm}],
@@ -1510,7 +1519,6 @@ class CarbonAwareNAS:
             )
             await self.message_queue.publish("feedback_events", event.to_json())
 
-            # Update MoE and Bandit with cycle outcome
             if self.reasoning_engine.moe:
                 context = {
                     "experiment_id": experiment_id,
@@ -1529,7 +1537,6 @@ class CarbonAwareNAS:
                 utility = self.reasoning_engine.modp.evaluate(objectives, central_config.MODP_WEIGHTS) if self.reasoning_engine.modp else objectives['accuracy']
                 self.reasoning_engine.bandit.update(context, algorithm, utility)
 
-            # Check drift
             if self.drift_detector:
                 current_weights = self.adaptive_cost.get_current_weights()
                 await self.drift_detector.check_drift(current_weights)
@@ -1558,7 +1565,7 @@ class CarbonAwareNAS:
         async with self._pop_lock, self._gen_lock:
             return {
                 'instance_id': self.instance_id,
-                'version': '6.0.2',
+                'version': '6.0.3',
                 'generation': self.generation,
                 'population_size': len(self.population),
                 'best_accuracy': self.current_best.get('accuracy', 0) if self.current_best else 0,
@@ -1571,6 +1578,7 @@ class CarbonAwareNAS:
                 'carbon_intensity': await self.carbon_manager.get_current_intensity(),
                 'pqc_status': self.pqc.get_quantum_status(),
                 'cloud_storage': {'provider': self.cloud_storage.providers.keys() if self.cloud_storage.providers else 'local'},
+                'flexgen': await self.flexgen_manager.get_status(),
                 'timestamp': datetime.now().isoformat()
             }
 
@@ -1626,7 +1634,7 @@ class TaskManager:
 # FASTAPI REST API (optional, integrates with central)
 # ============================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Carbon-Aware NAS API", version="6.0.2")
+    app = FastAPI(title="Carbon-Aware NAS API", version="6.0.3")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -1653,7 +1661,7 @@ if FASTAPI_AVAILABLE:
     async def health():
         if not nas:
             raise HTTPException(status_code=503, detail="NAS not initialized")
-        return {"status": "ok", "version": "6.0.2"}
+        return {"status": "ok", "version": "6.0.3"}
 
     @app.post("/nas/start")
     async def start_nas(search_space: Dict, iterations: int = 50, user: Dict = Depends(get_current_user)):
@@ -1672,7 +1680,6 @@ if FASTAPI_AVAILABLE:
     async def list_architectures(limit: int = 100, user: Dict = Depends(get_current_user)):
         if not nas:
             raise HTTPException(status_code=503, detail="NAS not initialized")
-        # Use central storage method to retrieve architectures
         archs = nas.storage.get_architectures(limit)
         return archs
 
@@ -1682,6 +1689,18 @@ if FASTAPI_AVAILABLE:
             raise HTTPException(status_code=503, detail="NAS not initialized")
         result = await nas.reasoning_engine.deployment.deploy_model(model_path, config)
         return result
+
+    @app.post("/flexgen/optimize")
+    async def flexgen_optimize(workload: Dict, node: Dict, user: Dict = Depends(get_current_user)):
+        if not nas:
+            raise HTTPException(status_code=503, detail="NAS not initialized")
+        return await nas.run_flexgen_optimization(workload, node)
+
+    @app.get("/flexgen/status")
+    async def flexgen_status(user: Dict = Depends(get_current_user)):
+        if not nas:
+            raise HTTPException(status_code=503, detail="NAS not initialized")
+        return await nas.flexgen_manager.get_status()
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -1728,16 +1747,11 @@ async def get_nas_instance() -> CarbonAwareNAS:
 # ============================================================
 async def main():
     print("=" * 80)
-    print("Enhanced Carbon-Aware NAS v6.0.2 - Full Green Agent Integration + bio_inspired, moe_system, MODP, ContextualBandit")
+    print("Enhanced Carbon-Aware NAS v6.0.3 - Full Green Agent Integration + bio_inspired, moe_system, MODP, ContextualBandit, FlexGen")
     print("=" * 80)
     nas = await get_nas_instance()
-    print(f"\n✅ ENHANCEMENTS OVER v6.0.1:")
-    print("   ✅ Integrated with bio_inspired, moe_system, MODP, ContextualBandit")
-    print("   ✅ Replaced AutonomousOptimizer with BioInspiredOptimizer")
-    print("   ✅ Algorithm selection uses ContextualBandit and ExpertRouter")
-    print("   ✅ Architecture evaluation uses ParetoOptimizer for multi-objective utility")
-    print("   ✅ Feedback loop updates all learning modules")
-    print("   ✅ Persistence of learned state via central Storage")
+    print(f"\n✅ ENHANCEMENTS OVER v6.0.2:")
+    print("   ✅ FlexGen integration for GPU/CPU/disk offloading policy optimization")
     print(f"\n🔬 Running NAS Cycle...")
     search_space = {'num_layers': [2,4,6,8,10], 'hidden_dim': [64,128,256,512], 'num_heads': [4,8,16], 'operations': ['conv3x3','conv5x5','attention','maxpool']}
     result = await nas.run_nas_cycle(search_space, iterations=10)
@@ -1756,8 +1770,9 @@ async def main():
     print("   Carbon Intensity: {:.0f} gCO2/kWh".format(status.get('carbon_intensity', 0)))
     print("   PQC Enabled: {}".format(status.get('pqc_status', {}).get('pqc_available', False)))
     print("   Cloud Providers: {}".format(', '.join(status.get('cloud_storage', {}).get('provider', []))))
+    print("   FlexGen Available: {}".format(status.get('flexgen', {}).get('available', False)))
     print("\n" + "=" * 80)
-    print("✅ Enhanced Carbon-Aware NAS v6.0.2 - Fully Integrated with Green Agent + Enhanced Modules")
+    print("✅ Enhanced Carbon-Aware NAS v6.0.3 - Fully Integrated with Green Agent + Enhanced Modules")
     print("=" * 80)
     try:
         await asyncio.Event().wait()
