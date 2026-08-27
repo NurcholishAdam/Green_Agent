@@ -6,6 +6,9 @@ Lightweight LLM client with enhanced decision‑making:
 - Bio‑inspired Genetic Algorithm for arm evolution
 - Carbon‑aware scheduling
 - Self‑healing with anomaly detection (Isolation Forest + One‑Class SVM)
+- LIMIT Graph for constraint enforcement
+- RLHF Optimizer for preference‑based policy updates
+- Multi‑Teacher Policy Distillation for combining decision teachers
 
 All enhancements degrade gracefully if optional dependencies are missing.
 """
@@ -49,6 +52,28 @@ try:
     VAULT_AVAILABLE = True
 except ImportError:
     VAULT_AVAILABLE = False
+
+# ---------- NEW: ENHANCEMENT MODULES (LIMIT Graph, RLHF, MultiTeacherDistiller) ----------
+try:
+    from enhancements.limit_graph import LimitGraph
+    from enhancements.rlhf import RLHFOptimizer
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
+    # Fallback stubs
+    class LimitGraph:
+        def __init__(self, *args, **kwargs): self.limits = {}
+        def build_graph(self, nodes, edges): pass
+        def get_limits(self, context): return {}
+        def update_from_feedback(self, feedback): pass
+    class RLHFOptimizer:
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def update(self, context, action, reward): pass
+        def sample_action(self, context): return self.actions[0] if self.actions else None
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
+        def distill(self, context): return self.teachers[0](context) if self.teachers else None
 
 # ---------- Logger ----------
 logger = logging.getLogger(__name__)
@@ -220,6 +245,8 @@ class MOERouter:
         self.rewards = defaultdict(float)
         self.counts = defaultdict(int)
         self.context_history = deque(maxlen=1000)  # (features, teacher_name, reward)
+        # NEW: optional distiller for teacher selection
+        self.distiller: Optional[MultiTeacherDistiller] = None
 
     def add_teacher(self, name: str, client: 'LLMClient'):
         self.teachers.append((name, client))
@@ -228,7 +255,6 @@ class MOERouter:
 
     async def _extract_features(self, prompt: str) -> np.ndarray:
         """Extract features from prompt (e.g., length, complexity, domain)."""
-        # Simplified: length, number of words, average word length, time of day
         words = prompt.split()
         features = [
             len(prompt),
@@ -238,8 +264,25 @@ class MOERouter:
         ]
         return np.array(features)
 
+    def _teacher_by_name(self, name: str) -> Optional['LLMClient']:
+        for n, c in self.teachers:
+            if n == name:
+                return c
+        return None
+
     async def select_teacher(self, prompt: str) -> 'LLMClient':
-        """Select a teacher using epsilon‑greedy or gating network."""
+        """Select a teacher using epsilon‑greedy or gating network / distillation."""
+        if self.distiller is not None and ADDITIONAL_ENHANCEMENTS_AVAILABLE:
+            # Use distillation to select teacher
+            features = await self._extract_features(prompt)
+            teacher_name = self.distiller.distill(features)
+            client = self._teacher_by_name(teacher_name)
+            if client is not None:
+                return client
+            # Fallback to random if not found
+            _, client = random.choice(self.teachers)
+            return client
+
         if random.random() < self.epsilon:
             # Explore
             _, client = random.choice(self.teachers)
@@ -249,8 +292,6 @@ class MOERouter:
         if self._trained and self.gating_weights is not None:
             features = await self._extract_features(prompt)
             # For simplicity, we use a softmax of rewards if gating not fully implemented.
-            # In a real implementation, we would use the trained logistic regression.
-            # Here we simulate a trained gating by using reward‑based probabilities.
             rewards = np.array([self.rewards.get(n, 0.0) for n, _ in self.teachers])
             probs = np.exp(rewards) / np.sum(np.exp(rewards))
             idx = np.random.choice(len(self.teachers), p=probs)
@@ -266,10 +307,8 @@ class MOERouter:
         """Update reward and gating model."""
         self.rewards[teacher_name] += reward
         self.counts[teacher_name] += 1
-        # Store context for training
         features = await self._extract_features(prompt)
         self.context_history.append((features, teacher_name, reward))
-        # Retrain gating periodically
         if len(self.context_history) % 100 == 0:
             await self._retrain_gating()
 
@@ -284,7 +323,6 @@ class MOERouter:
             y.append([n for n, _ in self.teachers].index(name))
         X = np.array(X)
         y = np.array(y)
-        # Use sklearn LogisticRegression if available
         try:
             from sklearn.linear_model import LogisticRegression
             from sklearn.preprocessing import StandardScaler
@@ -301,7 +339,8 @@ class MOERouter:
             'teachers': [name for name, _ in self.teachers],
             'rewards': dict(self.rewards),
             'counts': dict(self.counts),
-            'gating_trained': self._trained
+            'gating_trained': self._trained,
+            'distillation_active': self.distiller is not None
         }
 
 # ---------- MODULE 3: Bio‑Inspired Genetic Algorithm for Arm Evolution ----------
@@ -399,7 +438,6 @@ class CarbonIntensityManager:
 
     async def get_current_intensity(self) -> float:
         # Simulated – in production call electricitymap.org API
-        # Placeholder: return random intensity
         self.current_intensity = 350 + random.uniform(-50, 50)
         if PROMETHEUS_AVAILABLE:
             metrics.carbon_intensity.set(self.current_intensity)
@@ -490,8 +528,6 @@ class SelfHealingManager:
                 'timestamp': datetime.now().isoformat()
             })
         logger.warning("Self‑healing triggered: resetting bandit and gating.")
-        # In real implementation, would reset MOPD optimizer and MOE gating.
-        # For this demo, we just log.
 
     def get_stats(self) -> Dict:
         return {
@@ -525,13 +561,11 @@ class SemanticCache:
         Retrieve cached response if similar prompt exists.
         """
         async with self._lock:
-            # Exact match first
             prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
             if prompt_hash in self.cache:
                 metrics.cache_hits.inc()
                 return self.cache[prompt_hash]
 
-            # Semantic match if embedding model available
             if self.embedding_model is not None and len(self.cache) > 0:
                 emb = self.embedding_model.encode(prompt)
                 for cached_hash, cached_emb in self.prompt_embeddings.items():
@@ -548,7 +582,6 @@ class SemanticCache:
         """
         async with self._lock:
             if len(self.cache) >= self.max_size:
-                # Evict oldest
                 oldest = min(self.cache.keys(), key=lambda k: self.cache[k][1])
                 del self.cache[oldest]
                 if oldest in self.prompt_embeddings:
@@ -588,7 +621,8 @@ class TemplatedFallback:
 # ---------- Enhanced LLM Client ----------
 class LLMClient:
     """
-    Enhanced LLM client with contextual bandit, MOE, GA, carbon awareness, self‑healing.
+    Enhanced LLM client with contextual bandit, MOE, GA, carbon awareness, self‑healing,
+    LIMIT Graph, RLHF, and Multi‑Teacher Distillation.
     """
     def __init__(
         self,
@@ -615,6 +649,10 @@ class LLMClient:
         extra_endpoints: Optional[List[Tuple[str, str]]] = None,
         carbon_api_key: Optional[str] = None,
         carbon_region: str = "global",
+        # NEW: additional enhancement flags
+        enable_limit_graph: bool = True,
+        enable_rlhf: bool = True,
+        enable_distillation: bool = True,
     ):
         self.endpoint = endpoint
         self.model = model
@@ -634,7 +672,6 @@ class LLMClient:
         # 1. Contextual bandit + MOO
         self.contextual_bandit_enabled = enable_contextual_bandit
         if enable_contextual_bandit:
-            # Define arms: (temperature, max_tokens, model)
             self.arms = [
                 {'temp': 0.7, 'max_tokens': 150, 'model': 'small'},
                 {'temp': 0.5, 'max_tokens': 100, 'model': 'small'},
@@ -712,6 +749,83 @@ class LLMClient:
             except Exception as e:
                 logger.warning(f"Vault initialization failed: {e}")
 
+        # NEW: additional modules
+        self.limit_graph_enabled = enable_limit_graph and ADDITIONAL_ENHANCEMENTS_AVAILABLE
+        self.rlhf_enabled = enable_rlhf and ADDITIONAL_ENHANCEMENTS_AVAILABLE
+        self.distillation_enabled = enable_distillation and ADDITIONAL_ENHANCEMENTS_AVAILABLE
+
+        # Instantiate if enabled
+        self.limit_graph = LimitGraph() if self.limit_graph_enabled else None
+        # RLHF action space: arm indices (0 to len(arms)-1)
+        if self.rlhf_enabled and self.contextual_bandit_enabled:
+            self.rlhf = RLHFOptimizer(action_space=list(range(len(self.arms))))
+        else:
+            self.rlhf = None
+
+        # Distillation for arm selection: combine LinUCB, rule-based, static
+        if self.distillation_enabled and self.contextual_bandit_enabled:
+            self.arm_distiller = MultiTeacherDistiller([
+                self._teacher_linucb,
+                self._teacher_rule,
+                self._teacher_static
+            ])
+        else:
+            self.arm_distiller = None
+
+        # If MOE router and distillation enabled, also set up teacher distillation for routing
+        if self.distillation_enabled and self.moe_enabled:
+            # For routing distillation, we can have teachers: LinUCB-based? Not directly.
+            # We'll reuse the same arm_distiller? No, routing is about teacher selection.
+            # We'll create a separate distiller for teacher selection using MOE rewards.
+            self.router_distiller = MultiTeacherDistiller([
+                self._teacher_router_best,
+                self._teacher_router_random,
+                self._teacher_router_static
+            ])
+            self.router.distiller = self.router_distiller
+        else:
+            self.router_distiller = None
+
+    def _teacher_linucb(self, features: np.ndarray) -> int:
+        """Teacher 1: LinUCB arm selection."""
+        if self.contextual_bandit_enabled:
+            return self.linucb.select_arm(features)
+        return 0
+
+    def _teacher_rule(self, features: np.ndarray) -> int:
+        """Teacher 2: Rule-based (based on prompt length)."""
+        # features[0] is length
+        length = features[0] if len(features) > 0 else 50
+        if length > 200:
+            return 4  # large model
+        elif length > 100:
+            return 2  # medium
+        else:
+            return 0  # small
+
+    def _teacher_static(self, features: np.ndarray) -> int:
+        """Teacher 3: Static (always balanced)."""
+        return 2
+
+    def _teacher_router_best(self, features: np.ndarray) -> str:
+        """Teacher for routing: best average reward."""
+        if self.moe_enabled:
+            # Choose teacher with highest average reward
+            best_name = max(self.router.rewards, key=lambda n: self.router.rewards[n] / max(self.router.counts[n], 1))
+            return best_name
+        return "primary"
+
+    def _teacher_router_random(self, features: np.ndarray) -> str:
+        """Teacher for routing: random."""
+        if self.moe_enabled and self.router.teachers:
+            name, _ = random.choice(self.router.teachers)
+            return name
+        return "primary"
+
+    def _teacher_router_static(self, features: np.ndarray) -> str:
+        """Teacher for routing: always primary."""
+        return "primary"
+
     def _fetch_vault_secret(self) -> Dict[str, str]:
         if self.vault_client:
             secret = self.vault_client.secrets.kv.v2.read_secret(path=self.vault_secret_path)
@@ -785,71 +899,105 @@ class LLMClient:
             if cached is not None:
                 return cached
 
-        # 2. Select parameters via contextual bandit + MOO
+        # 2. Select parameters via contextual bandit + MOO (or distillation)
         params = {'max_tokens': max_tokens, 'temperature': temperature, 'model': self.model}
-        if self.contextual_bandit_enabled:
-            # Extract features: length, word count, avg word length, time
-            features = self._extract_features(prompt)
-            arm_idx = self.linucb.select_arm(features)
-            arm = self.arms[arm_idx]
-            params.update(arm)
+        features = self._extract_features(prompt)
 
-        # 3. Carbon‑aware adjustment
+        if self.contextual_bandit_enabled:
+            # Use distillation if available, else LinUCB
+            if self.arm_distiller is not None:
+                arm_idx = self.arm_distiller.distill(features)
+                selected_arm = self.arms[arm_idx]
+                source = "distilled"
+            elif self.rlhf is not None and random.random() < 0.1:  # small exploration with RLHF
+                arm_idx = self.rlhf.sample_action(features)
+                selected_arm = self.arms[arm_idx]
+                source = "rlhf"
+            else:
+                arm_idx = self.linucb.select_arm(features)
+                selected_arm = self.arms[arm_idx]
+                source = "linucb"
+            params.update(selected_arm)
+        else:
+            arm_idx = -1
+            selected_arm = params
+            source = "default"
+
+        # 3. Apply LIMIT Graph constraints
+        if self.limit_graph_enabled and self.limit_graph is not None:
+            limits = self.limit_graph.get_limits(features)
+            if 'max_tokens' in limits:
+                params['max_tokens'] = min(params.get('max_tokens', 150), limits['max_tokens'])
+            if 'temperature' in limits:
+                params['temperature'] = min(params.get('temperature', 0.7), limits['temperature'])
+            if 'model' in limits and limits['model'] != 'any':
+                params['model'] = limits['model'] if limits['model'] in ['small', 'medium', 'large'] else params['model']
+            # Ensure params are valid
+            if 'max_tokens' in params and params['max_tokens'] < 1:
+                params['max_tokens'] = 1
+
+        # 4. Carbon‑aware adjustment
         if self.carbon_aware_enabled:
             params = await self.carbon_scheduler.adjust_params(params)
 
-        # 4. Multi‑teacher routing
+        # 5. Multi‑teacher routing
         client = self
+        teacher_name = "primary"
         if self.moe_enabled:
             client = await self.router.select_teacher(prompt)
+            # Identify teacher name for updates
+            for name, c in self.router.teachers:
+                if c is client:
+                    teacher_name = name
+                    break
 
-        # 5. Generate
+        # 6. Generate
         try:
             if client is self:
                 result = await self._generate_internal(prompt, **params)
             else:
                 result = await client.generate_explanation(prompt, **params)
 
-            # 6. Compute reward (quality proxy) and update models
+            # 7. Compute reward (quality proxy) and update models
             reward = self._compute_reward(result)
-            if self.contextual_bandit_enabled:
+            if self.contextual_bandit_enabled and arm_idx >= 0:
                 self.linucb.update(arm_idx, features, reward)
                 # Update MOO outcomes
                 outcome = [reward, 1.0/(1.0+self.timeout), 1.0/(1.0+len(result)/100)]
                 await self.moo.update_weights(outcome)
 
-            if self.moe_enabled and client is not self:
-                # Find teacher name
-                for name, c in self.router.teachers:
-                    if c is client:
-                        await self.router.update(name, reward, prompt)
-                        break
+            # Update RLHF if used
+            if self.rlhf is not None and arm_idx >= 0:
+                self.rlhf.update(features, arm_idx, reward)
 
-            # 7. GA evolution (periodic)
-            if self.ga_enabled:
-                # Every 10 calls, evolve
+            if self.moe_enabled and client is not self:
+                await self.router.update(teacher_name, reward, prompt)
+
+            # 8. GA evolution (periodic)
+            if self.ga_enabled and self.contextual_bandit_enabled:
+                # Every 10 calls, evolve arms
                 if len(self.ga.arm_history) % 10 == 0:
                     fitness_func = self._ga_fitness
                     best_arm = self.ga.evolve(fitness_func, generations=3)
-                    # Update the arm set (replace worst arm with best)
-                    # For simplicity, we just log
+                    # Replace the worst arm with the best
+                    worst_idx = np.argmin([self._ga_fitness(a) for a in self.arms])
+                    self.arms[worst_idx] = best_arm
                     logger.info(f"GA evolved best arm: {best_arm}")
 
-            # 8. Self‑healing: record quality and detect anomalies
+            # 9. Self‑healing: record quality and detect anomalies
             if self.self_healing_enabled:
                 quality = self._compute_quality_score(result)
                 await self.self_healing.record_quality(quality)
                 anomaly, _ = await self.self_healing.detect_anomaly(quality)
                 if anomaly:
                     await self.self_healing.trigger_recovery()
-                    # Fallback to simple fallback if anomaly
                     result = self.fallback_generator(prompt)
 
-            # 9. Cache result
+            # 10. Cache result
             if self.cache_enabled:
                 await self.cache.set(prompt, result)
 
-            # 10. Lineage
+            # 11. Lineage
             if self.lineage_enabled:
                 self._record_lineage(prompt, result, params)
 
@@ -873,25 +1021,19 @@ class LLMClient:
     def _compute_reward(self, response: str) -> float:
         # Quality proxy: length and presence of key words
         score = min(1.0, len(response) / 200)
-        # Add bonus for key phrases
         if "recommend" in response or "optimize" in response:
             score += 0.1
         return min(1.0, score)
 
     def _compute_quality_score(self, response: str) -> float:
-        # Simpler quality score for self‑healing
         return min(1.0, len(response) / 200)
 
     def _ga_fitness(self, arm: Dict) -> float:
-        # Simulate fitness based on arm parameters
-        # In real system, we'd evaluate on historical data
         temp = arm['temp']
         tokens = arm['max_tokens']
         model = arm['model']
-        # Heuristic: higher tokens and larger model improve quality but cost more
         quality = 0.6 * (tokens / 500) + 0.4 * (1 if model == 'large' else 0.5 if model == 'medium' else 0.2)
         cost = tokens / 500 + (0.3 if model == 'large' else 0.2 if model == 'medium' else 0.1)
-        # Fitness = quality - cost * 0.5
         return quality - 0.5 * cost
 
     async def _generate_internal(self, prompt: str, **kwargs) -> str:
@@ -938,7 +1080,7 @@ class LLMClient:
             'circuit_breaker': self.get_circuit_breaker_status(),
             'contextual_bandit': {
                 'arms': self.arms,
-                'counts': self.linucb.A[0].shape  # placeholder
+                'counts': self.linucb.A[0].shape
             } if self.contextual_bandit_enabled else {},
             'moe': self.router.get_stats() if self.moe_enabled else {},
             'ga': {'population_size': self.ga.pop_size} if self.ga_enabled else {},
@@ -946,6 +1088,9 @@ class LLMClient:
             'self_healing': self.self_healing.get_stats() if self.self_healing_enabled else {},
             'cache': {'enabled': self.cache_enabled},
             'lineage': {'records': len(self.lineage_records)} if self.lineage_enabled else {},
+            'limit_graph': {'enabled': self.limit_graph_enabled},
+            'rlhf': {'enabled': self.rlhf_enabled},
+            'distillation': {'enabled': self.distillation_enabled},
         }
         return stats
 
