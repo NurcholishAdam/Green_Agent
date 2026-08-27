@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # File: src/enhancements/energy_scaler_enhanced_v14_0.py
-# Version 14.2 – Full Green Agent MOPD Integration + bio_inspired, moe_system, MODP
+# Version 14.2 – Full Green Agent MOPD Integration + bio_inspired, moe_system, MODP + FlexGen
 
 """
 Intelligent Energy Scaler for Green Agent - Version 14.2 (MOPD‑Ready)
@@ -11,6 +11,7 @@ ENHANCEMENTS OVER v14.1:
 - Persistence of learned state via central Storage.
 - policy_probs now returns learned probabilities from the bandit.
 - Added background task for periodic bio‑evolution.
+- FlexGen integration: select optimal GPU/CPU/disk offloading policies for AI inference workloads.
 """
 
 import asyncio
@@ -74,6 +75,32 @@ except ImportError:
             return self.actions[0], 0.0, "fallback"
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
+
+# ============================================================
+# FLEXGEN MODULES (with fallback)
+# ============================================================
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
 
 # ============================================================
 # OPTIONAL IMPORTS (graceful degradation)
@@ -141,7 +168,6 @@ except ImportError:
 # ============================================================
 # CENTRAL METRICS REGISTRY – we reuse the central one
 # ============================================================
-# Energy‑specific metrics will be registered with central MetricsRegistry.
 
 # ============================================================
 # POST‑QUANTUM CRYPTOGRAPHY (reuses central master key) – unchanged
@@ -211,8 +237,6 @@ class AutonomousEnergyOptimizer:
         try:
             state = self.storage.get_energy_optimizer_state()
             if state:
-                # In a real implementation, we would deserialize bandit weights etc.
-                # For simplicity, we only load the epsilon and strategy rewards.
                 self.epsilon = state.get('epsilon', 0.1)
                 self.strategy_rewards = state.get('strategy_rewards', {s: 0.0 for s in self.strategies})
                 self.strategy_counts = state.get('strategy_counts', {s: 0 for s in self.strategies})
@@ -226,7 +250,6 @@ class AutonomousEnergyOptimizer:
                 'epsilon': self.epsilon,
                 'strategy_rewards': self.strategy_rewards,
                 'strategy_counts': self.strategy_counts,
-                # Additional state could be serialized from bandit, modp, etc.
             }
             self.storage.save_energy_optimizer_state(state)
         except Exception as e:
@@ -236,12 +259,10 @@ class AutonomousEnergyOptimizer:
         """
         Select the best strategy using the bandit (or fallback).
         """
-        # Use adaptive cost weights to influence selection (optional)
         if self.adaptive_cost:
             weights = self.adaptive_cost.get_current_weights()
             logger.debug(f"Adaptive cost weights: {weights}")
 
-        # Build context
         context = {
             "time_of_day": datetime.now().hour,
             "carbon_intensity": current_state.get('carbon_intensity', 0.5),
@@ -250,17 +271,13 @@ class AutonomousEnergyOptimizer:
         }
 
         if self.bandit:
-            # Encode context using MoE
             encoded = self.moe.encode(context) if self.moe else context
-            # Select strategy via bandit
             strategy, confidence, source = self.bandit.select_action(encoded)
             if strategy is None:
                 strategy = self.strategies[0]
 
-            # Apply the strategy and get result
             result = await self._apply_strategy(strategy, current_state)
 
-            # Compute multi‑objective utility as reward
             objectives = {
                 'savings_kwh': result.get('estimated_savings_kwh', 0),
                 'cost_usd': result.get('estimated_cost', 0),
@@ -269,14 +286,11 @@ class AutonomousEnergyOptimizer:
             }
             utility = self.modp.evaluate(objectives, central_config.optimizer.modp_weights if hasattr(central_config, 'optimizer') else {'savings_kwh':0.4, 'cost_usd':0.2, 'carbon_reduction_kg':0.3, 'implementation_time_hours':0.1}) if self.modp else result.get('estimated_savings_kwh', 0)
 
-            # Update bandit with reward
             if self.bandit:
                 await self.bandit.update(encoded, strategy, utility)
 
-            # Record history
             self.history.append({'strategy': strategy, 'reward': utility})
 
-            # Periodically save state
             if len(self.history) % 10 == 0:
                 self._save_state()
 
@@ -290,7 +304,6 @@ class AutonomousEnergyOptimizer:
                 'utility': utility,
             }
         else:
-            # Fallback epsilon-greedy (original)
             async with self._lock:
                 if random.random() < self.epsilon:
                     strategy = random.choice(self.strategies)
@@ -315,7 +328,6 @@ class AutonomousEnergyOptimizer:
     async def _apply_strategy(self, strategy: str, state: Dict) -> Dict:
         """
         Simulate applying a strategy and return estimated outcomes.
-        In a real implementation, this would call external systems.
         """
         total_power = state.get('total_power_watts', 1000)
         if strategy == 'reduce_gpu_power':
@@ -387,32 +399,23 @@ class AutonomousEnergyOptimizer:
     async def evolve_strategies(self) -> List[str]:
         """
         Use bio‑inspired evolution to generate new strategies.
-        Returns a list of new strategy names.
         """
         if not self.bio:
             return []
-        # Define fitness based on recent rewards
         def fitness(strategy):
-            # Could compute average reward for this strategy from history
-            # For simplicity, use the stored rewards
             return self.strategy_rewards.get(strategy, 0)
 
-        # Evolve a population of strategy names (or parameters)
-        # For simplicity, we treat the strategy names as the population.
-        # In a real implementation, we would evolve parameters of each strategy.
         new_strategies = self.bio.evolve(
             population=self.strategies,
             fitness_fn=fitness,
             generations=central_config.optimizer.bio_generations if hasattr(central_config, 'optimizer') else 10,
             population_size=central_config.optimizer.bio_population_size if hasattr(central_config, 'optimizer') else 20,
         )
-        # Add new strategies to the action space (if bandit exists)
         if self.bandit and new_strategies:
             for s in new_strategies:
                 if s not in self.strategies:
                     self.strategies.append(s)
-                    self.bandit.actions = self.strategies  # update bandit's action space
-                    # Also update fallback structures
+                    self.bandit.actions = self.strategies
                     self.strategy_rewards[s] = 0.0
                     self.strategy_counts[s] = 0
         return new_strategies
@@ -450,12 +453,76 @@ class MultiCloudStorage:
     pass
 
 # ============================================================
-# ENHANCED ENERGY SCALER – FULLY INTEGRATED
+# FLEXGEN MANAGER (NEW)
+# ============================================================
+class FlexGenManager:
+    """
+    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
+    Used to select optimal policies for AI inference workloads.
+    """
+    def __init__(self, carbon_intensity: float = 400.0):
+        self.carbon_intensity = carbon_intensity
+        self.flexgen_cost_model = None
+        self.policy_drift_detector = None
+        self.gpu_profiler = None
+
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(carbon_intensity_g_per_kwh=carbon_intensity)
+            self.policy_drift_detector = PolicyDriftDetector()
+            try:
+                from enhancements.gpu_profiler import GPUProfiler
+                self.gpu_profiler = GPUProfiler()
+            except ImportError:
+                self.gpu_profiler = None
+            logger.info("FlexGen Manager initialized for energy scaler")
+        else:
+            logger.warning("FlexGen modules not available; manager will be disabled.")
+
+    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={'epsilon': 0.1, 'epsilon_decay': 0.999}
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity', self.carbon_intensity),
+            use_real_executor=False,
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={'population_size': 50, 'generations': 10},
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        return result
+
+    async def get_status(self) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        return {
+            "available": True,
+            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+        }
+
+# ============================================================
+# ENHANCED ENERGY SCALER – FULLY INTEGRATED WITH FLEXGEN
 # ============================================================
 class EnhancedIntelligentEnergyScaler:
     """
     Intelligent Energy Scaler with full Green Agent MOPD integration and enhanced modules.
     Exposes a teacher interface (`policy_probs`) for MTPD optimizer.
+    FlexGen: can select offloading policies for AI workloads.
     """
 
     def __init__(self, storage: Storage, message_queue: AsyncMessageQueue,
@@ -474,10 +541,11 @@ class EnhancedIntelligentEnergyScaler:
         # Sub‑modules
         self.pqc = PostQuantumCrypto(storage)
         self.blockchain = BlockchainEnergyCredits(storage)
-        self.autonomous = AutonomousEnergyOptimizer(storage, adaptive_cost)  # enhanced
+        self.autonomous = AutonomousEnergyOptimizer(storage, adaptive_cost)
         self.forecaster = PredictiveLoadForecaster(storage, horizon_hours=24)
         self.federated = FederatedEnergyLearner(storage)
         self.cloud_storage = MultiCloudStorage()
+        self.flexgen_manager = FlexGenManager()  # NEW
 
         # State
         self.power_readings = deque(maxlen=10000)
@@ -493,16 +561,9 @@ class EnhancedIntelligentEnergyScaler:
     async def policy_probs(self, state: Dict) -> List[float]:
         """
         Return a probability distribution over energy‑optimisation strategies.
-        This allows the MTPD optimizer to treat this module as a teacher.
-        If the bandit is available, we return its action probabilities (softmax).
-        Otherwise, we fall back to the heuristic distribution.
         """
         if ENHANCEMENTS_AVAILABLE and self.autonomous.bandit:
-            # Get bandit weights for each action and compute softmax
-            # For demonstration, we return the last used strategy's probability.
-            # In a real implementation, we would access the bandit's internal state.
             probs = np.array([1/6] * 6)
-            # If we have recent history, we can bias based on recent rewards
             if len(self.autonomous.history) > 0:
                 recent = list(self.autonomous.history)[-10:]
                 for h in recent:
@@ -511,16 +572,15 @@ class EnhancedIntelligentEnergyScaler:
                 probs = probs / probs.sum()
             return probs.tolist()
         else:
-            # Original heuristic
             carbon_intensity = state.get('carbon_intensity', 0.5)
             power_load = state.get('power_load', 0.5)
             probs = np.array([1/6] * 6)
             if carbon_intensity > 0.6:
-                probs[1] += 0.1  # schedule_off_peak
-                probs[2] += 0.1  # increase_renewable
+                probs[1] += 0.1
+                probs[2] += 0.1
             if power_load > 0.7:
-                probs[0] += 0.1  # reduce_gpu_power
-                probs[4] += 0.1  # load_balancing
+                probs[0] += 0.1
+                probs[4] += 0.1
             probs = probs / probs.sum()
             return probs.tolist()
 
@@ -539,20 +599,16 @@ class EnhancedIntelligentEnergyScaler:
             'timestamp': datetime.now().isoformat()
         }
 
-        # Store in central storage (extend Storage with power readings)
         self.storage.store_power_reading(reading)
-
-        # Update forecaster
         await self.forecaster.update_history(power_watts)
 
-        # Publish FeedbackEvent
         event = FeedbackEvent.create_with_context(
             task_id=f"energy_power_{reading_id}",
             selected_action="record_power",
             quality_score=1.0,
             latency_ms=0.0,
-            energy_joules=power_watts,  # instantaneous power, not energy; but we can report as watts
-            carbon_g=0.0,  # not directly carbon
+            energy_joules=power_watts,
+            carbon_g=0.0,
             feedback_type="energy",
             adaptive_cost_value=0.0,
             state={'power_watts': power_watts, 'carbon_intensity': carbon_intensity},
@@ -563,20 +619,16 @@ class EnhancedIntelligentEnergyScaler:
         )
         await self.queue.publish("feedback_events", event.to_json())
 
-        # Update metrics
-        self.metrics.set_power_reading(power_watts)  # central metrics method
-
+        self.metrics.set_power_reading(power_watts)
         return reading
 
     async def run_optimization(self) -> Dict:
         """
         Run autonomous energy optimization and publish a FeedbackEvent.
         """
-        # Get current state (simplified: from recent readings)
         state = {'total_power_watts': 1000, 'gpu_power_watts': 250, 'carbon_intensity': 0.5}
         result = await self.autonomous.optimize_autonomously(state)
 
-        # Publish FeedbackEvent
         event = FeedbackEvent.create_with_context(
             task_id=f"energy_opt_{uuid.uuid4().hex[:8]}",
             selected_action=result.get('strategy', 'unknown'),
@@ -594,7 +646,6 @@ class EnhancedIntelligentEnergyScaler:
         )
         await self.queue.publish("feedback_events", event.to_json())
 
-        # Check drift
         if self.drift:
             await self.drift.check_drift(self.adaptive_cost.get_current_weights())
 
@@ -648,6 +699,20 @@ class EnhancedIntelligentEnergyScaler:
         return forecast
 
     # ----------------------------------------------------------------------
+    # FlexGen integration
+    # ----------------------------------------------------------------------
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        """Public method to run FlexGen policy optimization."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        workload_obj = WorkloadDescriptor(**workload)
+        node_obj = NodeDescriptor(**node)
+        return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
+
+    async def get_flexgen_status(self) -> Dict:
+        return await self.flexgen_manager.get_status()
+
+    # ----------------------------------------------------------------------
     # Lifecycle management
     # ----------------------------------------------------------------------
     async def start(self):
@@ -659,7 +724,7 @@ class EnhancedIntelligentEnergyScaler:
             loop.create_task(self._forecast_loop()),
             loop.create_task(self._federated_loop()),
             loop.create_task(self._cleanup_loop()),
-            loop.create_task(self._evolution_loop()),  # new
+            loop.create_task(self._evolution_loop()),
         ])
 
     async def _optimization_loop(self):
@@ -697,7 +762,7 @@ class EnhancedIntelligentEnergyScaler:
     async def _evolution_loop(self):
         """Periodically evolve strategies using bio‑inspired optimizer."""
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)  # every hour
+            await asyncio.sleep(3600)
             try:
                 if ENHANCEMENTS_AVAILABLE and self.autonomous.bio:
                     new_strategies = await self.autonomous.evolve_strategies()
@@ -712,7 +777,6 @@ class EnhancedIntelligentEnergyScaler:
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        # Save final state
         self.autonomous._save_state()
         logger.info("Shutdown complete")
 
@@ -741,7 +805,6 @@ async def get_energy_scaler(storage: Storage, queue: AsyncMessageQueue,
 # MAIN ENTRY POINT (for standalone testing)
 # ============================================================
 async def main():
-    # For standalone testing, we need to instantiate central components.
     from ..storage import Storage
     from ..scaling.message_queue import AsyncMessageQueue
     from ..feedback.adaptive_cost import AdaptiveCostFunction
