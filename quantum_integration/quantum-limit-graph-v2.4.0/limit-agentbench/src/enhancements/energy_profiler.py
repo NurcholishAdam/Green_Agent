@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
 """
 Per‑layer energy profiling and layer‑skipping for energy‑efficient inference.
 Enhanced version with real‑time carbon integration, adaptive skipping,
-and support for all layer types.
+support for all layer types, and FlexGen offloading policy selection.
 
 ENHANCEMENTS OVER v1.0:
 - Integrated bio_inspired, moe_system, MODP, ContextualBandit.
@@ -9,6 +10,7 @@ ENHANCEMENTS OVER v1.0:
 - Learned state persisted via Storage.
 - Feedback events published to message queue.
 - New API endpoints for optimization and feedback.
+- FlexGen integration: select optimal GPU/CPU/disk offloading policies.
 """
 
 import torch
@@ -71,6 +73,32 @@ except ImportError:
         async def publish(self, topic, message): pass
 
 # ============================================================================
+# FLEXGEN MODULES (with fallback)
+# ============================================================================
+try:
+    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
+    from enhancements.schemas.node_descriptor import NodeDescriptor
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    FLEXGEN_AVAILABLE = True
+except ImportError:
+    FLEXGEN_AVAILABLE = False
+    class FlexGenPolicy: pass
+    def generate_candidate_policies(n=20): return []
+    class FlexGenController:
+        def __init__(self, *args, **kwargs): pass
+        async def step(self): return {}
+    class FlexGenCostModel:
+        def __init__(self, *args, **kwargs): pass
+    class PolicyDriftDetector:
+        def __init__(self, *args, **kwargs): pass
+        def get_stats(self): return {}
+    class NodeDescriptor: pass
+    class WorkloadDescriptor: pass
+
+# ============================================================================
 # Custom Exceptions
 # ============================================================================
 class EnergyProfilerError(Exception):
@@ -101,51 +129,30 @@ class CircuitBreaker:
         self._state = CircuitBreakerState.CLOSED
         self._failure_count = 0
         self._last_failure_time = None
-        self._lock = asyncio.Lock() if asyncio.iscoroutinefunction else None
+        self._lock = asyncio.Lock()
 
     async def call(self, func: Callable, *args, **kwargs):
-        if asyncio.iscoroutinefunction(func):
-            async with self._lock:
-                if self._state == CircuitBreakerState.OPEN:
-                    if time.time() - self._last_failure_time >= self.recovery_timeout:
-                        self._state = CircuitBreakerState.HALF_OPEN
-                        self._failure_count = 0
-                    else:
-                        raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
-            try:
-                result = await func(*args, **kwargs)
-                async with self._lock:
-                    if self._state == CircuitBreakerState.HALF_OPEN:
-                        self._state = CircuitBreakerState.CLOSED
-                    self._failure_count = 0
-                return result
-            except Exception as e:
-                async with self._lock:
-                    self._failure_count += 1
-                    self._last_failure_time = time.time()
-                    if self._failure_count >= self.failure_threshold:
-                        self._state = CircuitBreakerState.OPEN
-                raise e
-        else:
-            # Sync version
+        async with self._lock:
             if self._state == CircuitBreakerState.OPEN:
                 if time.time() - self._last_failure_time >= self.recovery_timeout:
                     self._state = CircuitBreakerState.HALF_OPEN
                     self._failure_count = 0
                 else:
                     raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
-            try:
-                result = func(*args, **kwargs)
+        try:
+            result = await func(*args, **kwargs)
+            async with self._lock:
                 if self._state == CircuitBreakerState.HALF_OPEN:
                     self._state = CircuitBreakerState.CLOSED
                 self._failure_count = 0
-                return result
-            except Exception as e:
+            return result
+        except Exception as e:
+            async with self._lock:
                 self._failure_count += 1
                 self._last_failure_time = time.time()
                 if self._failure_count >= self.failure_threshold:
                     self._state = CircuitBreakerState.OPEN
-                raise e
+            raise e
 
     def get_metrics(self) -> Dict:
         return {
@@ -207,7 +214,6 @@ class CarbonIntensityManager:
                 raise CarbonFetchError(f"API returned {resp.status}")
 
     async def update_intensity(self) -> float:
-        """Fetch new intensity and cache it."""
         try:
             intensity = await self._circuit_breaker.call(self._fetch_intensity)
             self._last_intensity = intensity
@@ -219,7 +225,6 @@ class CarbonIntensityManager:
             return self._last_intensity
 
     async def get_current_intensity(self) -> float:
-        """Return cached intensity, update if stale."""
         now = time.time()
         if self._last_update is None or now - self._last_update > self.cache_ttl:
             await self.update_intensity()
@@ -233,13 +238,77 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# Energy Profiler (Enhanced with bio, MoE, MODP, Bandit)
+# FLEXGEN MANAGER (NEW)
+# ============================================================================
+class FlexGenManager:
+    """
+    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
+    Used to select optimal offloading policies for the model layers.
+    """
+    def __init__(self, carbon_intensity: float = 400.0):
+        self.carbon_intensity = carbon_intensity
+        self.flexgen_cost_model = None
+        self.policy_drift_detector = None
+        self.gpu_profiler = None
+
+        if FLEXGEN_AVAILABLE:
+            self.flexgen_cost_model = FlexGenCostModel(carbon_intensity_g_per_kwh=carbon_intensity)
+            self.policy_drift_detector = PolicyDriftDetector()
+            try:
+                from enhancements.gpu_profiler import GPUProfiler
+                self.gpu_profiler = GPUProfiler()
+            except ImportError:
+                self.gpu_profiler = None
+            logger.info("FlexGen Manager initialized for energy profiler")
+        else:
+            logger.warning("FlexGen modules not available; manager will be disabled.")
+
+    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+
+        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
+        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
+
+        selector = DistillationFlexGenSelector(
+            n_candidates=20,
+            config={'epsilon': 0.1, 'epsilon_decay': 0.999}
+        )
+
+        controller = FlexGenController(
+            node=node,
+            workload=workload,
+            carbon_intensity=workload.metadata.get('carbon_intensity', self.carbon_intensity),
+            use_real_executor=False,
+            executor=None,
+            cost_model=self.flexgen_cost_model,
+            use_bio_search=True,
+            bio_search_config={'population_size': 50, 'generations': 10},
+            modp_planner=None,
+            drift_detector=self.policy_drift_detector,
+            gpu_profiler=self.gpu_profiler,
+        )
+        result = await controller.step()
+        return result
+
+    async def get_status(self) -> Dict:
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        return {
+            "available": True,
+            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+        }
+
+# ============================================================================
+# Energy Profiler (Enhanced with bio, MoE, MODP, Bandit, FlexGen)
 # ============================================================================
 class EnergyProfiler:
     """
     Tracks energy per layer and provides adaptive layer‑skipping decisions.
     Integrates with CarbonIntensityProvider for real‑time carbon data.
     NEW: Uses ContextualBandit, ExpertRouter, ParetoOptimizer, and GeneticPolicyGenerator.
+    FlexGen: can select offloading policies for model layers.
     """
 
     def __init__(
@@ -250,13 +319,12 @@ class EnergyProfiler:
         default_carbon_intensity: float = 400.0,
         storage: Optional[Storage] = None,
         message_queue: Optional[AsyncMessageQueue] = None,
-        # Enhanced modules (optional, will use fallback if not provided)
+        # Enhanced modules
         bandit: Optional[ContextualBandit] = None,
         moe: Optional[ExpertRouter] = None,
         modp: Optional[ParetoOptimizer] = None,
         bio: Optional[GeneticPolicyGenerator] = None,
-        # Config for enhanced modules
-        action_space: List[str] = None,  # skipping policies: e.g., ["aggressive", "balanced", "conservative"]
+        action_space: List[str] = None,
         modp_weights: Dict[str, float] = None,
         bio_generations: int = 10,
         bio_population_size: int = 20,
@@ -268,13 +336,10 @@ class EnergyProfiler:
         self.storage = storage
         self.queue = message_queue
 
-        # Fill missing energies
         self._fill_missing_energies()
 
-        # Cache for layer order
         self.layer_order = list(self.energy_per_layer.keys())
 
-        # Enhanced modules (use provided or create)
         if ENHANCEMENTS_AVAILABLE:
             self.modp = modp or ParetoOptimizer()
             self.moe = moe or ExpertRouter()
@@ -294,12 +359,13 @@ class EnergyProfiler:
             self.bandit = None
             self.action_space = ["balanced"]
 
-        # Skipping history for adaptive learning
+        # FlexGen manager
+        self.flexgen_manager = FlexGenManager(default_carbon_intensity)
+
         self._skipping_history: Dict[str, List[bool]] = defaultdict(list)
-        self._performance_history: List[float] = []  # accuracy/performance metric
+        self._performance_history: List[float] = []
         self._energy_saved_history: List[float] = []
 
-        # Load persisted state
         self._load_state()
 
     def _fill_missing_energies(self):
@@ -313,15 +379,12 @@ class EnergyProfiler:
         if self.storage:
             state = self.storage.load_profiler_state()
             if state:
-                # Deserialize bandit weights, etc.
                 logger.info("Loaded profiler state from storage.")
-        else:
-            logger.debug("No storage provided, state not loaded.")
 
     def _save_state(self):
         if self.storage:
             state = {
-                'bandit_weights': None,  # would serialize
+                'bandit_weights': None,
                 'modp_weights': self.modp_weights,
                 'action_space': self.action_space,
             }
@@ -343,7 +406,7 @@ class EnergyProfiler:
         base_energy = self.energy_per_layer.get(layer_name, 1e-6)
         carbon_intensity = await self._get_carbon_intensity()
         carbon_factor = 1.0 + (carbon_intensity / 400 - 1.0) * 0.2
-        importance_factor = 1.0 + token_importance * 0.5  # fixed importance factor
+        importance_factor = 1.0 + token_importance * 0.5
         return base_energy * carbon_factor * importance_factor
 
     async def should_skip_layer(
@@ -353,14 +416,9 @@ class EnergyProfiler:
         current_energy_budget: float,
         context: Optional[Dict] = None,
     ) -> bool:
-        """
-        Determine whether to skip a layer using enhanced decision modules.
-        """
         if not self.bandit:
-            # Fallback to original heuristic (threshold)
             return self._should_skip_heuristic(layer_name, token_importance, current_energy_budget)
 
-        # Build context for MoE
         context = context or {}
         context.update({
             "layer_name": layer_name,
@@ -370,24 +428,18 @@ class EnergyProfiler:
             "layer_energy": self.energy_per_layer.get(layer_name, 1e-6),
         })
 
-        # Encode context using MoE
         encoded_context = self.moe.encode(context) if self.moe else context
-
-        # Select skipping policy via bandit
         policy, confidence, source = self.bandit.select_action(encoded_context)
         if policy is None:
             policy = "balanced"
 
-        # Apply the policy to decide skip
-        # Each policy maps to a different threshold strategy
         if policy == "aggressive":
             skip = (current_energy_budget < 0.6 and token_importance < 0.4) or (current_energy_budget < 0.4)
         elif policy == "conservative":
             skip = (current_energy_budget < 0.2 and token_importance < 0.2)
-        else:  # balanced
+        else:
             skip = (current_energy_budget < 0.4 and token_importance < 0.3) or (current_energy_budget < 0.2)
 
-        # Record decision for later feedback
         self._last_decision = {
             "layer": layer_name,
             "policy": policy,
@@ -399,7 +451,6 @@ class EnergyProfiler:
         return skip
 
     def _should_skip_heuristic(self, layer_name: str, token_importance: float, budget: float) -> bool:
-        # Original threshold strategy
         if budget < 0.3 and token_importance < 0.3:
             return True
         if budget < 0.7 and token_importance < 0.5:
@@ -413,15 +464,10 @@ class EnergyProfiler:
         carbon_saved: float = 0.0,
         latency_ms: float = 0.0,
     ):
-        """
-        Record the outcome of a forward pass to update learning modules.
-        """
-        # Update performance history
         self._performance_history.append(accuracy)
         self._energy_saved_history.append(energy_saved)
 
         if self.bandit and hasattr(self, '_last_decision'):
-            # Compute reward based on multiple objectives
             objectives = {
                 'accuracy': accuracy,
                 'energy': 1 - energy_saved / (self._energy_saved_history[-1] or 1),
@@ -430,14 +476,12 @@ class EnergyProfiler:
             }
             reward = self.modp.evaluate(objectives, self.modp_weights) if self.modp else accuracy
 
-            # Update bandit with the chosen policy and reward
             await self.bandit.update(
                 self._last_decision['context'],
                 self._last_decision['policy'],
                 reward
             )
 
-            # Bio-inspired evolution: periodically evolve the action space
             if len(self._performance_history) % 100 == 0 and self.bio:
                 new_policies = await self.evolve_policies()
                 if new_policies:
@@ -446,11 +490,9 @@ class EnergyProfiler:
                             self.action_space.append(p)
                             self.bandit.actions = self.action_space
 
-        # Save state periodically
         if len(self._performance_history) % 10 == 0:
             self._save_state()
 
-        # Publish feedback event
         if self.queue:
             event = FeedbackEvent.create_with_context(
                 task_id=f"skipping_{uuid.uuid4().hex[:8]}",
@@ -470,15 +512,9 @@ class EnergyProfiler:
             await self.queue.publish("feedback_events", event)
 
     async def evolve_policies(self) -> List[str]:
-        """
-        Use bio‑inspired evolution to generate new skipping policies.
-        """
         if not self.bio:
             return []
-        # Fitness: average accuracy over recent runs
         def fitness(policy):
-            # In a real implementation, we would evaluate each policy on historical data.
-            # For now, we use a heuristic based on performance history.
             return np.mean(self._performance_history[-20:]) if self._performance_history else 0.5
 
         new_policies = self.bio.evolve(
@@ -488,6 +524,14 @@ class EnergyProfiler:
             population_size=20,
         )
         return new_policies
+
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        """Public method to run FlexGen policy optimization for the model."""
+        if not FLEXGEN_AVAILABLE:
+            return {"error": "FlexGen modules not available"}
+        workload_obj = WorkloadDescriptor(**workload)
+        node_obj = NodeDescriptor(**node)
+        return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
 
     def get_energy_map(self) -> Dict[str, float]:
         return self.energy_per_layer.copy()
@@ -527,6 +571,7 @@ class LayerSkippingWrapper(nn.Module):
     """
     Wraps a model to allow selective layer skipping based on EnergyProfiler.
     Supports per‑token importance and dynamic energy budget.
+    FlexGen: can select offloading policies for the entire model.
     """
 
     def __init__(
@@ -541,10 +586,7 @@ class LayerSkippingWrapper(nn.Module):
         self.energy_budget_source = energy_budget_source
         self._energy_budget = 1.0
 
-        # Cache for layer traversal
         self._layer_list = self._build_layer_list(model)
-
-        # Track skipped layers per forward pass
         self._last_skipped: List[str] = []
 
     def _build_layer_list(self, module: nn.Module, prefix: str = "") -> List[Tuple[str, nn.Module]]:
@@ -571,14 +613,11 @@ class LayerSkippingWrapper(nn.Module):
         token_importance: Optional[torch.Tensor] = None,
         context: Optional[Dict] = None,
     ) -> torch.Tensor:
-        """
-        Async forward pass with enhanced layer skipping.
-        """
         if token_importance is None:
             token_importance = torch.ones(x.size(0), device=x.device) * 0.5
 
         if token_importance.dim() > 1:
-            token_importance = token_importance.mean(dim=1)  # (batch,)
+            token_importance = token_importance.mean(dim=1)
 
         current_budget = self._get_energy_budget()
         output = x
@@ -586,13 +625,10 @@ class LayerSkippingWrapper(nn.Module):
         total_energy_original = 0.0
         total_energy_skipped = 0.0
 
-        # Prepare a context object for the profiler
         context = context or {}
 
         for layer_name, layer_module in self._layer_list:
-            # Compute average token importance for this batch
             avg_importance = token_importance.mean().item()
-            # Estimate energy for this layer (if not skipped)
             energy = await self.profiler.estimate_energy_for_token(layer_name, avg_importance)
             total_energy_original += energy
 
@@ -602,22 +638,17 @@ class LayerSkippingWrapper(nn.Module):
                 current_budget,
                 context
             ):
-                logger.debug(f"Skipping layer {layer_name} (budget={current_budget:.2f}, importance={avg_importance:.2f})")
+                logger.debug(f"Skipping layer {layer_name}")
                 skipped.append(layer_name)
-                # Energy saved by skipping
                 total_energy_skipped += energy
                 continue
 
-            # Apply layer
             output = layer_module(output)
 
         self._last_skipped = skipped
 
-        # Record outcome after forward pass (in a real system, we would have accuracy/loss)
-        # For demonstration, we compute a fake accuracy based on number of skipped layers.
-        # In a real system, you would evaluate the model on a validation batch.
         fake_accuracy = 1.0 - (len(skipped) / len(self._layer_list)) * 0.2
-        carbon_saved = total_energy_skipped * (await self.profiler._get_carbon_intensity()) / 1000  # kg CO2
+        carbon_saved = total_energy_skipped * (await self.profiler._get_carbon_intensity()) / 1000
         await self.profiler.record_outcome(
             accuracy=fake_accuracy,
             energy_saved=total_energy_skipped,
@@ -633,10 +664,11 @@ class LayerSkippingWrapper(nn.Module):
         token_importance: Optional[torch.Tensor] = None,
         context: Optional[Dict] = None,
     ) -> torch.Tensor:
-        """
-        Synchronous forward pass (for compatibility).
-        """
         return asyncio.run(self.forward_async(x, token_importance, context))
+
+    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+        """Public method to run FlexGen policy optimization for this wrapper's model."""
+        return await self.profiler.run_flexgen_optimization(workload, node)
 
     def get_skipped_layers(self) -> List[str]:
         return self._last_skipped.copy()
@@ -679,7 +711,6 @@ class LayerSkippingWrapper(nn.Module):
 # Example usage
 # ============================================================================
 async def example():
-    # Create a dummy model
     model = nn.Sequential(
         nn.Linear(10, 20),
         nn.ReLU(),
@@ -687,7 +718,6 @@ async def example():
         nn.ReLU(),
         nn.Linear(20, 1)
     )
-    # Define per-layer energies (Joules per token)
     energy_per_layer = {
         '0': 1e-6,
         '1': 0.5e-6,
@@ -695,9 +725,7 @@ async def example():
         '3': 0.5e-6,
         '4': 2e-6,
     }
-    # Carbon provider (real API key would be used)
     carbon_provider = CarbonIntensityManager(api_key=None)
-    # Storage and queue (can be None for testing)
     storage = None
     queue = None
     profiler = EnergyProfiler(
@@ -709,7 +737,7 @@ async def example():
     )
     wrapper = LayerSkippingWrapper(model, profiler)
     x = torch.randn(4, 10)
-    importance = torch.ones(4) * 0.8  # high importance
+    importance = torch.ones(4) * 0.8
     output = await wrapper.forward_async(x, importance)
     print(f"Output shape: {output.shape}")
     print(f"Skipped layers: {wrapper.get_skipped_layers()}")
