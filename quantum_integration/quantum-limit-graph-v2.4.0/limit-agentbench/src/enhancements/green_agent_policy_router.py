@@ -11,12 +11,17 @@ Enhanced orchestration class that integrates:
   - MoE context encoding
   - Persistence of all state
   - Unified logging and statistics
+  - LIMIT Graph for constraint enforcement
+  - RLHF Optimizer for preference‑based policy updates
+  - Multi‑Teacher Policy Distillation for combining multiple policy teachers
 """
 
 import time
 import json
 import os
 import logging
+import heapq
+import numpy as np
 from typing import Dict, Any, Optional, List, Callable
 
 # Import enhanced modules (all in the enhancements folder)
@@ -50,6 +55,31 @@ except ImportError:
         def evaluate(self, objectives, weights):
             return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
 
+# Optional imports for new modules (LIMIT Graph, RLHF, Distillation)
+try:
+    from .limit_graph import LimitGraph
+except ImportError:
+    class LimitGraph:
+        def __init__(self, *args, **kwargs): self.limits = {}
+        def build_graph(self, nodes, edges): pass
+        def get_limits(self, context): return {}
+        def update_from_feedback(self, feedback): pass
+
+try:
+    from .rlhf import RLHFOptimizer
+except ImportError:
+    class RLHFOptimizer:
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def update(self, context, action, reward): pass
+        def sample_action(self, context): return self.actions[0] if self.actions else None
+
+try:
+    from .multi_teacher_policy_distillation import MultiTeacherDistiller
+except ImportError:
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
+        def distill(self, context): return self.teachers[0](context) if self.teachers else None
+
 
 class GreenAgentPolicyRouter:
     """
@@ -61,6 +91,9 @@ class GreenAgentPolicyRouter:
     - MODP for multi‑objective reward calculation
     - Persistence of all learned state
     - Comprehensive statistics and logging
+    - LIMIT Graph for constraint enforcement
+    - RLHF Optimizer for preference‑based policy updates
+    - Multi‑Teacher Policy Distillation for combining multiple policy teachers
     """
 
     def __init__(
@@ -76,6 +109,9 @@ class GreenAgentPolicyRouter:
         confidence_threshold: float = 0.6,
         persistence_file: str = "router_state.json",
         enable_profiler: bool = True,
+        enable_limit_graph: bool = True,
+        enable_rlhf: bool = True,
+        enable_distillation: bool = True,
     ):
         """
         Args:
@@ -90,6 +126,9 @@ class GreenAgentPolicyRouter:
             confidence_threshold: Minimum confidence to use bandit.
             persistence_file: File to save/load state.
             enable_profiler: Whether to start GPUProfiler.
+            enable_limit_graph: Whether to use LIMIT Graph for constraints.
+            enable_rlhf: Whether to use RLHF for preference learning.
+            enable_distillation: Whether to use Multi‑Teacher Distillation.
         """
         self.logger = logging.getLogger(__name__)
 
@@ -134,6 +173,26 @@ class GreenAgentPolicyRouter:
         else:
             self.metric_aggregator = None
 
+        # ---- NEW: LIMIT Graph ----
+        self.limit_graph = LimitGraph() if enable_limit_graph else None
+        if self.limit_graph:
+            # Build a basic graph: nodes = policies (as strings) or could be constraints
+            # For simplicity, we'll use it to store constraints on actions.
+            self.limit_graph.build_graph([], [])
+
+        # ---- NEW: RLHF Optimizer ----
+        self.rlhf = RLHFOptimizer(action_space=[json.dumps(p, sort_keys=True) for p in action_space]) if enable_rlhf else None
+
+        # ---- NEW: Multi‑Teacher Distillation ----
+        self.distiller = None
+        if enable_distillation:
+            # Teachers: cache, bandit, LP solver
+            self.distiller = MultiTeacherDistiller([
+                lambda ctx: self._teacher_cache(ctx),
+                lambda ctx: self._teacher_bandit(ctx),
+                lambda ctx: self._teacher_lp(ctx),
+            ])
+
         # ---- Statistics ----
         self.stats = {
             "total_tasks": 0,
@@ -144,6 +203,9 @@ class GreenAgentPolicyRouter:
             "lp_fallbacks": 0,
             "bio_expansions": 0,
             "total_reward": 0.0,
+            "distillation_decisions": 0,
+            "rlhf_updates": 0,
+            "limit_graph_enforced": 0,
         }
 
         # ---- Load persistent state ----
@@ -182,6 +244,8 @@ class GreenAgentPolicyRouter:
                 # Restore stats
                 if "stats" in data:
                     self.stats.update(data["stats"])
+                # Restore LIMIT Graph / RLHF / Distillation state (if any)
+                # (We don't persist their internal states for simplicity, but could be extended)
             self.logger.info("Loaded state from %s", self.persistence_file)
         except Exception as e:
             self.logger.warning("Failed to load state: %s", e)
@@ -239,6 +303,38 @@ class GreenAgentPolicyRouter:
             task["moe_context"] = context_vector
         return fp
 
+    # --------------------- Teacher methods for distillation ---------------------
+    def _teacher_cache(self, context: Dict) -> Optional[Dict]:
+        """Teacher that always returns cached policy if available."""
+        # context should contain fingerprint
+        fp = context.get("fingerprint")
+        if fp is not None:
+            cached = self.cache.get_best_policy(fp)
+            if cached is not None:
+                return cached
+        return None
+
+    def _teacher_bandit(self, context: Dict) -> Optional[Dict]:
+        """Teacher that uses bandit selection."""
+        task = context.get("task")
+        if task is None:
+            return None
+        policy, confidence = self.bandit.select_action(
+            task,
+            min_trials_before_bandit=self.min_trials,
+            confidence_threshold=self.conf_threshold,
+        )
+        if policy is not None and confidence >= self.conf_threshold:
+            return policy
+        return None
+
+    def _teacher_lp(self, context: Dict) -> Optional[Dict]:
+        """Teacher that uses LP solver."""
+        fp = context.get("fingerprint")
+        if fp is not None:
+            return self.lp_solver(fp)
+        return None
+
     # --------------------- Task Processing ---------------------
     def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -260,71 +356,119 @@ class GreenAgentPolicyRouter:
 
         # ---- Step 2: Generate fingerprint ----
         fp = self._generate_fingerprint(task)
+        context = {
+            "task": task,
+            "fingerprint": fp,
+        }
 
-        # ---- Step 3: Try cache (with MoE‑enriched fingerprint) ----
-        cached_policy = self.cache.get_best_policy(fp)
+        # ---- Step 3: Select policy using distillation if available ----
+        final_policy = None
+        policy_source = None
+
+        # First check cache (fast path) – but we might skip if distillation is used?
+        # We'll keep cache as a high-priority teacher.
+        cached_policy = self._teacher_cache(context)
         if cached_policy is not None:
             self.stats["cache_hits"] += 1
             final_policy = cached_policy
             policy_source = "cache"
         else:
-            # ---- Step 4: Bandit selection ----
-            bandit_policy, confidence = self.bandit.select_action(
-                task,  # passes full task so bandit can use MoE context
-                min_trials_before_bandit=self.min_trials,
-                confidence_threshold=self.conf_threshold,
-            )
-            if bandit_policy is not None and confidence >= self.conf_threshold:
-                self.stats["bandit_decisions"] += 1
-                final_policy = bandit_policy
-                policy_source = "bandit"
+            # Use distillation if available
+            if self.distiller is not None:
+                distilled_policy = self.distiller.distill(context)
+                if distilled_policy is not None:
+                    self.stats["distillation_decisions"] += 1
+                    final_policy = distilled_policy
+                    policy_source = "distillation"
+                else:
+                    # Fallback to bandit / LP
+                    bandit_policy, confidence = self.bandit.select_action(
+                        task, self.min_trials, self.conf_threshold
+                    )
+                    if bandit_policy is not None and confidence >= self.conf_threshold:
+                        self.stats["bandit_decisions"] += 1
+                        final_policy = bandit_policy
+                        policy_source = "bandit"
+                    else:
+                        self.stats["lp_fallbacks"] += 1
+                        final_policy = self.lp_solver(fp)
+                        policy_source = "lp_solver"
+                        # Seed bandit with this safe policy
+                        self.bandit.seed_safe_policy(task, final_policy, reward=1.0)
             else:
-                # ---- Step 5: Fallback to LP solver ----
-                self.stats["lp_fallbacks"] += 1
-                final_policy = self.lp_solver(fp)
-                policy_source = "lp_solver"
-                # Seed bandit with this safe policy
-                self.bandit.seed_safe_policy(task, final_policy, reward=1.0)
+                # Original flow: bandit then LP
+                bandit_policy, confidence = self.bandit.select_action(
+                    task, self.min_trials, self.conf_threshold
+                )
+                if bandit_policy is not None and confidence >= self.conf_threshold:
+                    self.stats["bandit_decisions"] += 1
+                    final_policy = bandit_policy
+                    policy_source = "bandit"
+                else:
+                    self.stats["lp_fallbacks"] += 1
+                    final_policy = self.lp_solver(fp)
+                    policy_source = "lp_solver"
+                    self.bandit.seed_safe_policy(task, final_policy, reward=1.0)
 
-        # ---- Step 6: Execute (using MetricAggregator if available) ----
+        # ---- Step 4: Enforce LIMIT Graph constraints ----
+        if self.limit_graph is not None:
+            limits = self.limit_graph.get_limits(context)
+            # Example: if limits contain max batch size, adjust policy
+            if "max_gpu_batch_size" in limits:
+                max_batch = limits["max_gpu_batch_size"]
+                if final_policy.get("gpu_batch_size", 0) > max_batch:
+                    self.stats["limit_graph_enforced"] += 1
+                    final_policy = final_policy.copy()
+                    final_policy["gpu_batch_size"] = max_batch
+                    self.logger.info("LIMIT Graph enforced max_gpu_batch_size=%d", max_batch)
+
+        # ---- Step 5: Execute (using MetricAggregator if available) ----
         if self.metric_aggregator:
             metrics = self.metric_aggregator.run(task, final_policy)
         else:
-            # Fallback: executor returns raw metrics
             metrics = self.executor(task, final_policy)
 
-        # ---- Step 7: Compute reward using MODP ----
+        # ---- Step 6: Compute reward using MODP ----
         constraints = task.get("constraints", {})
-        # Get carbon intensity for carbon efficiency
         carbon_intensity = self.carbon_scheduler.carbon_api.get_current()
         reward = self.reward_calc.compute(metrics, constraints, carbon_intensity)
 
         self.stats["total_reward"] += reward
 
-        # ---- Step 8: Update learning components ----
-        if policy_source == "bandit":
+        # ---- Step 7: Update learning components ----
+        if policy_source in ("bandit", "distillation"):
             self.bandit.update(task, final_policy, metrics)
         elif policy_source in ("cache", "lp_solver"):
             self.cache.update(fp, final_policy, reward)
 
-        # ---- Step 9: Feed back to carbon scheduler ----
-        # If the task was delayed, we could also adjust scheduler parameters.
-        # We pass the reward to the carbon scheduler for bio‑inspired adaptation.
+        # Update RLHF if available
+        if self.rlhf is not None:
+            # Convert policy to a string key for RLHF action space
+            policy_key = json.dumps(final_policy, sort_keys=True)
+            self.rlhf.update(context, policy_key, reward)
+            self.stats["rlhf_updates"] += 1
+
+        # Update LIMIT Graph feedback (if we enforced something)
+        if self.limit_graph is not None:
+            self.limit_graph.update_from_feedback({
+                "context": context,
+                "policy": final_policy,
+                "reward": reward,
+            })
+
+        # Feed back to carbon scheduler
         self.carbon_scheduler.report_reward(task, reward)
 
-        # ---- Step 10: Trigger bio‑inspired expansion if needed ----
-        # If bandit confidence is low and we have enough trials, expand action space
+        # ---- Step 8: Trigger bio‑inspired expansion if needed ----
         ctx_key = self.bandit._encode_context(task)
         n_trials = self.bandit.state.action_trials.get(ctx_key, 0)
         if n_trials > 10 and policy_source == "lp_solver":
-            # Bandit is still falling back after many trials -> expand
             new_policies = self.bio.generate_policies(self.bandit.state.action_space, n=2)
             if new_policies:
                 self.stats["bio_expansions"] += 1
                 for p in new_policies:
                     if p not in self.bandit.state.action_space:
                         self.bandit.state.action_space.append(p)
-                        # Extend bandit's internal structures for all contexts
                         for key in self.bandit.state.action_weights:
                             new_mean = np.append(self.bandit.state.action_weights[key], 0.0)
                             new_cov = np.zeros((len(self.bandit.state.action_weights[key])+1,
@@ -362,6 +506,9 @@ class GreenAgentPolicyRouter:
             "bandit_action_space_size": len(self.bandit.state.action_space),
             "carbon_queue_size": len(self.carbon_scheduler.queue),
             "bandit_num_contexts": len(self.bandit.state.action_weights),
+            "distillation_active": self.distiller is not None,
+            "rlhf_active": self.rlhf is not None,
+            "limit_graph_active": self.limit_graph is not None,
         }
 
     def shutdown(self):
@@ -404,6 +551,9 @@ if __name__ == "__main__":
         lp_solver=lp_solver,
         executor=executor,
         persistence_file="router_test.json",
+        enable_limit_graph=True,
+        enable_rlhf=True,
+        enable_distillation=True,
     )
 
     # Simulate a task
