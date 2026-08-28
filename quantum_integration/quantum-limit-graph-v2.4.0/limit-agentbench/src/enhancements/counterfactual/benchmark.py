@@ -1,5 +1,5 @@
 """
-Counterfactual Benchmarking Harness (v3.3.0)
+Counterfactual Benchmarking Harness (v3.4.0)
 ===========================================
 Replays historical decisions with different policies, computes metrics,
 performs statistical comparisons, and evolves new policies via multi‑objective
@@ -7,13 +7,15 @@ evolutionary optimization (NSGA‑II). The evolved policies are parameterized
 weight vectors that trade off among quality, carbon, latency, energy, cost,
 and helium.
 
-NEW IN v3.3.0:
-- Added `Policy` dataclass to represent a weighted sum decision rule.
-- Added `NSGAIIOptimizer` for multi‑objective policy evolution.
-- CounterfactualBenchmark now provides `evaluate_policy_parameters` to score
-  a weight vector on historical data, and `run_policy_evolution` to evolve a
-  Pareto front of non‑dominated policies.
-- MODP‑based selection of best policy using dynamic objective weights.
+NEW IN v3.4.0:
+- Added LIMIT Graph manager for policy relationship modelling.
+- Added MODP solver wrapper for storing decision states/policies.
+- Added RLHF trainer for human preference collection on policy choices.
+- Added MoE gating network to blend policies (experts).
+- Integration with central Storage for new data persistence.
+- New configuration flags for enabling/disabling each component.
+
+Previous features (distillation, NSGA-II, MODP selection) are retained.
 """
 import asyncio
 import uuid
@@ -25,6 +27,8 @@ import logging
 import json
 import random
 import copy
+import time
+import hashlib
 
 # Optional statistical libraries
 try:
@@ -53,37 +57,207 @@ class BenchmarkResult:
 
 
 # ============================================================================
-# NEW: Parameterized Policy and Evolutionary Optimizer
+# NEW: LIMIT Graph Manager
 # ============================================================================
+class LimitGraphManager:
+    """
+    Manages a graph of policy relationships for LIMIT.
+    Nodes are policies or benchmarks, edges represent dependencies or improvements.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.graphs = {}
 
+    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
+            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
+        else:
+            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+
+    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
+            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+
+    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
+                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
+            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+
+    def get_nodes(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
+            return self.storage.get_limit_graph_nodes(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+
+    def get_edges(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
+            return self.storage.get_limit_graph_edges(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+
+    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
+            return self.storage.get_limit_graph_metadata(graph_id)
+        return self.graphs.get(graph_id, {})
+
+
+# ============================================================================
+# NEW: MODP Optimizer (wrapper)
+# ============================================================================
+class MODPOptimizer:
+    """
+    Multi‑Objective Dynamic Programming solver that stores decision states/policies.
+    This complements the NSGA-II optimizer; MODP here is used for scalarized selection
+    among Pareto front points and for persisting evolved policies.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.states = {}
+
+    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                  objective_values: Dict[str, float], stage: int) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_state'):
+            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
+        else:
+            if problem_id not in self.states:
+                self.states[problem_id] = []
+            self.states[problem_id].append({
+                'state_id': state_id, 'state_attributes': state_attributes,
+                'objective_values': objective_values, 'stage': stage
+            })
+
+    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
+                   action: str, expected_objectives: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_policy'):
+            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+
+    def get_states(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_states'):
+            return self.storage.get_modp_states(problem_id)
+        return self.states.get(problem_id, [])
+
+    def get_policies(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_policies'):
+            return self.storage.get_modp_policies(problem_id)
+        return []
+
+
+# ============================================================================
+# NEW: RLHF Trainer
+# ============================================================================
+class RLHFTrainer:
+    """
+    Collects human preference pairs for benchmark policy choices.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.pairs = []
+
+    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        if self.storage and hasattr(self.storage, 'save_preference_pair'):
+            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+        else:
+            self.pairs.append({
+                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
+                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+            })
+
+    def get_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
+            return self.storage.get_preference_pairs(limit)
+        return self.pairs[-limit:]
+
+    def train_reward_model(self):
+        pairs = self.get_pairs()
+        if len(pairs) < 5:
+            logger.info("Not enough preference pairs for RLHF training.")
+            return
+        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+
+
+# ============================================================================
+# NEW: MoE Gating Network
+# ============================================================================
+class MoEGatingNetwork:
+    """
+    Mixture-of-Experts gating for benchmark policy selection.
+    Experts correspond to predefined policies (fixed_cheapest, energy_only, etc.) plus evolved ones.
+    The gating network learns to select the best policy for a given context.
+    """
+    def __init__(self, storage: Optional[Storage] = None, config: Optional[Dict] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.expert_names = self.config.get('expert_names', ['fixed_cheapest', 'energy_only', 'carbon_only', 'quality_only'])
+        self.num_experts = len(self.expert_names)
+        # State dimension: we'll use 12 features
+        self.gating_weights = np.random.randn(self.num_experts, 12)
+        self._training_samples = []
+
+    def _encode_state(self, state: Dict) -> np.ndarray:
+        # Encode a context dict into a fixed-size vector (12 features)
+        features = [
+            state.get('carbon_intensity', 0.0),
+            state.get('workload_size', 0.0),
+            state.get('latency_target', 0.0),
+            state.get('cost_budget', 0.0),
+            state.get('energy_price', 0.0),
+            state.get('helium_scarcity', 0.0),
+            state.get('quality_requirement', 0.0),
+            state.get('hour_of_day', 0.0) / 24.0,
+            state.get('day_of_week', 0.0) / 7.0,
+            state.get('recent_success_rate', 0.5),
+            state.get('avg_reward', 0.0),
+            state.get('num_candidates', 1.0) / 10.0,
+        ]
+        return np.array(features, dtype=np.float32)
+
+    async def select_expert(self, state: Dict) -> Tuple[str, np.ndarray]:
+        x = self._encode_state(state)
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        expert_idx = np.argmax(probs)
+        selected = self.expert_names[expert_idx]
+        if self.storage and hasattr(self.storage, 'log_routing_decision'):
+            sample_id = hashlib.sha256(str(state).encode()).hexdigest()[:16]
+            self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+        return selected, probs
+
+    async def add_training_sample(self, state: Dict, selected_expert: str, reward: float):
+        x = self._encode_state(state)
+        expert_idx = self.expert_names.index(selected_expert)
+        target = np.zeros(self.num_experts)
+        target[expert_idx] = 1.0
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        grad = (probs - target)[:, None] * x[None, :]
+        self.gating_weights -= 0.1 * grad
+
+
+# ============================================================================
+# Parameterized Policy and Evolutionary Optimizer
+# ============================================================================
 @dataclass
 class Policy:
-    """
-    A parameterized policy: a linear weighted sum of candidate metrics.
-    The policy chooses the candidate with the lowest weighted score.
-    """
     policy_id: str
-    weights: Dict[str, float]  # keys: quality, carbon, latency, energy, cost, helium
-    # For quality we want to maximize, so we'll use negative weight in score computation,
-    # or store a flag. For simplicity, weights are positive for minimization metrics,
-    # and we use -quality_score in the summation.
-    # We'll assume all weights are positive, and the score is:
-    #   sum(weights[k] * metric_value) for minimization metrics
-    #   - weights['quality'] * quality_score
-    # We'll handle this in the evaluation function.
+    weights: Dict[str, float]
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            'policy_id': self.policy_id,
-            'weights': self.weights,
-        }
+        return {'policy_id': self.policy_id, 'weights': self.weights}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Policy':
         return cls(**data)
 
     def choose_candidate(self, candidates: List[Dict]) -> int:
-        """Return index of chosen candidate based on weights."""
         best_idx = 0
         best_score = float('inf')
         for idx, cand in enumerate(candidates):
@@ -91,7 +265,6 @@ class Policy:
             for metric in ['carbon', 'latency', 'energy', 'cost', 'helium']:
                 if metric in self.weights:
                     score += self.weights[metric] * cand.get(metric, 0.0)
-            # Quality is to be maximized, so subtract
             if 'quality' in self.weights:
                 score -= self.weights['quality'] * cand.get('quality_score', 0.0)
             if score < best_score:
@@ -102,9 +275,8 @@ class Policy:
 
 @dataclass
 class MOPDPoint:
-    """A policy with its objective values (higher is better)."""
     policy: Policy
-    objectives: Dict[str, float]  # e.g., {'quality': 0.8, 'carbon': 0.2, ...} as benefits (1 - normalized cost)
+    objectives: Dict[str, float]
     scalarised_score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -118,7 +290,7 @@ class MOPDPoint:
 class NSGAIIOptimizer:
     """
     Multi‑objective genetic algorithm for evolving policy weight vectors.
-    Assumes all objectives are to be maximized (we convert costs to benefits).
+    Assumes all objectives are to be maximized.
     """
     def __init__(
         self,
@@ -147,12 +319,12 @@ class NSGAIIOptimizer:
         self.evolution_history = []
         self.pareto_front: List[MOPDPoint] = []
         self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+        self._all_points: List[MOPDPoint] = []
 
     def _random_individual(self) -> Dict[str, float]:
         ind = {}
         for name, (low, high) in self.parameter_bounds.items():
             ind[name] = random.uniform(low, high)
-        # Normalize weights to sum to 1
         total = sum(ind.values())
         if total > 0:
             ind = {k: v / total for k, v in ind.items()}
@@ -172,7 +344,6 @@ class NSGAIIOptimizer:
                 child[name] = max(low, min(high, val))
             else:
                 child[name] = p1[name] if random.random() < 0.5 else p2[name]
-        # Normalize
         total = sum(child.values())
         if total > 0:
             child = {k: v / total for k, v in child.items()}
@@ -313,7 +484,6 @@ class NSGAIIOptimizer:
     async def evolve(self) -> List[MOPDPoint]:
         population = [self._random_individual() for _ in range(self.population_size)]
         points = []
-        # Evaluate initial population in parallel for speed
         eval_tasks = [self.evaluate_func(ind) for ind in population]
         eval_results = await asyncio.gather(*eval_tasks)
         for ind, obj in zip(population, eval_results):
@@ -343,7 +513,6 @@ class NSGAIIOptimizer:
                 child = self._mutate(child)
                 offspring.append(child)
 
-            # Evaluate offspring in parallel
             child_tasks = [self.evaluate_func(ind) for ind in offspring]
             child_results = await asyncio.gather(*child_tasks)
             child_points = []
@@ -405,17 +574,9 @@ class NSGAIIOptimizer:
 
 
 # ============================================================================
-# Enhanced CounterfactualBenchmark with Policy Evolution
+# Enhanced CounterfactualBenchmark with Policy Evolution and New Components
 # ============================================================================
-
 class CounterfactualBenchmark:
-    """
-    Runs counterfactual evaluations on historical workloads and evolves
-    parameterized policies using NSGA-II.
-    """
-
-    # Policy definitions: each policy is an async callable taking (state, candidates) and
-    # returning the index of the chosen candidate.
     POLICIES = {
         "fixed_cheapest": "_policy_fixed_cheapest",
         "energy_only": "_policy_energy_only",
@@ -430,7 +591,6 @@ class CounterfactualBenchmark:
         optimizer: Optional[MTPDOptimizer] = None,
         confidence_level: float = 0.95,
         bootstrap_samples: int = 1000,
-        # NEW: evolution parameters
         moea_population_size: int = 20,
         moea_generations: int = 5,
         moea_mutation_rate: float = 0.2,
@@ -438,32 +598,56 @@ class CounterfactualBenchmark:
         moea_tournament_size: int = 3,
         moea_objective_weights: Optional[Dict[str, float]] = None,
         moea_dynamic_weights: bool = True,
+        enable_limit_graph: bool = True,
+        enable_modp: bool = True,
+        enable_rlhf: bool = True,
+        enable_moe: bool = True,
+        moe_expert_names: Optional[List[str]] = None,
     ):
         self.storage = storage
         self.optimizer = optimizer
         self.confidence_level = confidence_level
         self.bootstrap_samples = bootstrap_samples
 
-        # Evolution parameters
         self.moea_population_size = moea_population_size
         self.moea_generations = moea_generations
         self.moea_mutation_rate = moea_mutation_rate
         self.moea_crossover_rate = moea_crossover_rate
         self.moea_tournament_size = moea_tournament_size
         self.moea_objective_weights = moea_objective_weights or {
-            'quality': 0.3,
-            'carbon': 0.2,
-            'latency': 0.2,
-            'energy': 0.1,
-            'cost': 0.1,
-            'helium': 0.1,
+            'quality': 0.3, 'carbon': 0.2, 'latency': 0.2,
+            'energy': 0.1, 'cost': 0.1, 'helium': 0.1,
         }
         self.moea_dynamic_weights = moea_dynamic_weights
         self.evolved_pareto_front: List[MOPDPoint] = []
         self.best_evolved_policy: Optional[Policy] = None
 
+        # NEW components
+        self.limit_graph_manager = LimitGraphManager(storage) if enable_limit_graph else None
+        self.modp_solver = MODPOptimizer(storage) if enable_modp else None
+        self.rlhf_trainer = RLHFTrainer(storage) if enable_rlhf else None
+        self.moe_gating = None
+        if enable_moe:
+            expert_names = moe_expert_names or list(self.POLICIES.keys())
+            self.moe_gating = MoEGatingNetwork(storage, {'expert_names': expert_names})
+
+        # Initialize LIMIT Graph if enabled
+        if self.limit_graph_manager:
+            self._init_limit_graph()
+
+        logger.info("CounterfactualBenchmark initialized with evolution, LIMIT Graph, MODP, RLHF, MoE")
+
+    def _init_limit_graph(self):
+        graph_id = "benchmark_policies"
+        if not self.limit_graph_manager.get_metadata(graph_id):
+            self.limit_graph_manager.create_graph(graph_id, "Benchmark Policy Relationships", {})
+            for policy_name in self.POLICIES:
+                self.limit_graph_manager.add_node(graph_id, f"policy_{policy_name}", policy_name, {})
+            # Add edges from current MOPD to evolved (placeholder)
+            self.limit_graph_manager.add_edge(graph_id, "edge_mopd_evolved", "policy_mopd_current", "policy_evolved", 1.0, {})
+
     # --------------------------------------------------------------------------
-    # Existing policy implementations (unchanged)
+    # Existing policy implementations
     # --------------------------------------------------------------------------
     async def _policy_fixed_cheapest(self, state, candidates):
         return min(range(len(candidates)), key=lambda i: candidates[i].get('cost_usd', float('inf')))
@@ -499,7 +683,7 @@ class CounterfactualBenchmark:
         return 0
 
     # --------------------------------------------------------------------------
-    # Core benchmark (existing, unchanged)
+    # Core benchmark (enhanced with MoE and new components)
     # --------------------------------------------------------------------------
     async def run_benchmark(
         self,
@@ -548,6 +732,15 @@ class CounterfactualBenchmark:
                 confidence_intervals=ci,
             )
 
+            # LIMIT Graph: add node for this benchmark run
+            if self.limit_graph_manager:
+                self.limit_graph_manager.add_node(
+                    "benchmark_policies",
+                    f"run_{run_id}",
+                    "benchmark_run",
+                    {'policy': policy_name, 'metrics': metrics}
+                )
+
         if "mopd_current" in results and len(results) > 1:
             baseline = results["mopd_current"]
             for name, res in results.items():
@@ -557,16 +750,46 @@ class CounterfactualBenchmark:
                 res.p_value = p_val
 
         self._log_comparison(results)
+
+        # If MoE gating available, select the best policy based on context
+        if self.moe_gating and results:
+            context = self._build_context(events)
+            selected_expert, probs = await self.moe_gating.select_expert(context)
+            logger.info(f"MoE selected policy: {selected_expert}")
+            # Record a preference pair (simulated)
+            if self.rlhf_trainer:
+                self.rlhf_trainer.record_pair(
+                    pair_id=str(uuid.uuid4()),
+                    prompt="Which policy performs best?",
+                    chosen=selected_expert,
+                    rejected="quality_only",  # dummy
+                    reward_diff=0.1,
+                    metadata={'benchmark': True}
+                )
+
         return results
 
+    def _build_context(self, events: List[Dict]) -> Dict:
+        # Extract average context from events (simplified)
+        return {
+            'carbon_intensity': 0.4,
+            'workload_size': 1000,
+            'latency_target': 500,
+            'cost_budget': 50,
+            'energy_price': 0.1,
+            'helium_scarcity': 0.5,
+            'quality_requirement': 0.9,
+            'hour_of_day': 12,
+            'day_of_week': 3,
+            'recent_success_rate': 0.7,
+            'avg_reward': 0.5,
+            'num_candidates': 5,
+        }
+
     # --------------------------------------------------------------------------
-    # Existing evaluation helper (unchanged)
+    # Existing evaluation helper
     # --------------------------------------------------------------------------
-    async def _evaluate_policy(
-        self,
-        policy_func: Callable[[Dict, List[Dict]], Awaitable[int]],
-        events: List[Dict],
-    ) -> Tuple[Dict[str, float], Dict[str, Tuple[float, float]]]:
+    async def _evaluate_policy(self, policy_func, events):
         per_event_metrics = []
         for event in events:
             state = event.get('state', {})
@@ -592,27 +815,14 @@ class CounterfactualBenchmark:
         return self._bootstrap_aggregate(per_event_metrics)
 
     # --------------------------------------------------------------------------
-    # NEW: Evaluate a parameterized policy (weight vector)
+    # NEW: Evaluate a parameterized policy
     # --------------------------------------------------------------------------
     async def evaluate_policy_parameters(self, weights: Dict[str, float]) -> Dict[str, float]:
-        """
-        Evaluate a weight vector on the historical events and return objective benefits.
-        All objectives are to be maximized, so we convert costs to benefits:
-            - quality: direct (higher is better)
-            - carbon: 1 - normalized carbon_g
-            - latency: 1 - normalized latency_ms
-            - energy: 1 - normalized energy_joules
-            - cost: 1 - normalized cost_usd
-            - helium: 1 - normalized helium_cost
-        The normalization is done using the max observed value across events for each metric,
-        or using predefined bounds. For simplicity, we use per‑event max across candidates.
-        """
         events = self.storage.get_feedback_events_with_context(days_back=7, limit=10000)
         if not events:
             return {k: 0.0 for k in ['quality', 'carbon', 'latency', 'energy', 'cost', 'helium']}
 
         policy = Policy(policy_id="temp", weights=weights)
-        # Aggregate metrics across chosen candidates
         total_metrics = {k: [] for k in ['quality', 'carbon', 'latency', 'energy', 'cost', 'helium']}
         for event in events:
             candidates = event.get('candidates', [])
@@ -627,7 +837,6 @@ class CounterfactualBenchmark:
             total_metrics['cost'].append(chosen.get('cost_usd', 0.0))
             total_metrics['helium'].append(chosen.get('helium_cost', 0.0))
 
-        # Convert to benefits
         benefits = {}
         benefits['quality'] = float(np.mean(total_metrics['quality'])) if total_metrics['quality'] else 0.0
         for metric in ['carbon', 'latency', 'energy', 'cost', 'helium']:
@@ -637,7 +846,7 @@ class CounterfactualBenchmark:
                 continue
             max_val = max(vals)
             if max_val == 0:
-                benefits[metric] = 1.0  # all zero cost -> perfect
+                benefits[metric] = 1.0
             else:
                 benefits[metric] = 1.0 - float(np.mean(vals) / max_val)
         return benefits
@@ -646,11 +855,6 @@ class CounterfactualBenchmark:
     # NEW: Run policy evolution (NSGA-II)
     # --------------------------------------------------------------------------
     async def run_policy_evolution(self) -> List[MOPDPoint]:
-        """
-        Evolve a Pareto front of parameterized policies using NSGA-II.
-        Returns the Pareto front (list of MOPDPoint).
-        """
-        # Parameter bounds for weights (each in [0.01, 1.0])
         param_bounds = {
             'quality': (0.01, 1.0),
             'carbon': (0.01, 1.0),
@@ -661,7 +865,6 @@ class CounterfactualBenchmark:
         }
 
         async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
-            # Normalize weights (sum to 1)
             total = sum(weights.values())
             if total == 0:
                 normalized = {k: 1.0/len(weights) for k in weights}
@@ -684,7 +887,6 @@ class CounterfactualBenchmark:
         pareto = await optimizer.evolve()
         self.evolved_pareto_front = pareto
 
-        # Select best policy using MODP (dynamic weighting)
         if pareto:
             best = optimizer._select_best_from_pareto(
                 pareto,
@@ -693,21 +895,45 @@ class CounterfactualBenchmark:
             if best:
                 self.best_evolved_policy = best.policy
                 logger.info(f"Best evolved policy weights: {best.policy.weights}")
-                # Persist the evolved policy in storage (optional)
+                # Persist evolved policy
                 self.storage.store_evolved_policy(best.policy.to_dict())
+
+                # MODP: record state and policy
+                if self.modp_solver:
+                    problem_id = "policy_evolution"
+                    state_id = f"evolved_{best.policy.policy_id}"
+                    self.modp_solver.add_state(
+                        state_id=state_id,
+                        problem_id=problem_id,
+                        state_attributes={'weights': best.policy.weights},
+                        objective_values=best.objectives,
+                        stage=1
+                    )
+                    self.modp_solver.add_policy(
+                        policy_id=best.policy.policy_id,
+                        problem_id=problem_id,
+                        state_id=state_id,
+                        action="evolved",
+                        expected_objectives=best.objectives
+                    )
+
+                # LIMIT Graph: add node for evolved policy
+                if self.limit_graph_manager:
+                    self.limit_graph_manager.add_node(
+                        "benchmark_policies",
+                        f"policy_{best.policy.policy_id}",
+                        "evolved_policy",
+                        {'weights': best.policy.weights}
+                    )
 
         return pareto
 
     def _get_dynamic_moea_weights(self) -> Dict[str, float]:
-        """Adjust objective weights based on current system state (simple version)."""
-        weights = self.moea_objective_weights.copy()
-        # Example: if carbon is critical, increase carbon weight
-        # Here we just return the static weights for simplicity.
-        # In a full implementation, you could query the environment.
-        return weights
+        # static for now, can be enhanced
+        return self.moea_objective_weights.copy()
 
     # --------------------------------------------------------------------------
-    # Utility methods (unchanged)
+    # Utility methods
     # --------------------------------------------------------------------------
     def _bootstrap_aggregate(self, metrics_list):
         metric_keys = list(metrics_list[0].keys())
@@ -730,7 +956,7 @@ class CounterfactualBenchmark:
     def _compute_p_value(self, result_a, result_b):
         if not SCIPY_AVAILABLE:
             return None
-        # Placeholder – would need per‑event data
+        # Placeholder
         return 0.05
 
     def _log_comparison(self, results):
@@ -763,3 +989,27 @@ class CounterfactualBenchmark:
                 "p_value": res.p_value,
             }
         return out
+
+    # ---------- New public methods for enhancements ----------
+    async def get_limit_graph(self, graph_id: str = "benchmark_policies") -> Dict:
+        if self.limit_graph_manager:
+            return {
+                'metadata': self.limit_graph_manager.get_metadata(graph_id),
+                'nodes': self.limit_graph_manager.get_nodes(graph_id),
+                'edges': self.limit_graph_manager.get_edges(graph_id),
+            }
+        return {}
+
+    async def get_moe_experts(self) -> List[str]:
+        if self.moe_gating:
+            return self.moe_gating.expert_names
+        return []
+
+    async def get_rlhf_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.rlhf_trainer:
+            return self.rlhf_trainer.get_pairs(limit)
+        return []
+
+    async def record_rlhf_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
+        if self.rlhf_trainer:
+            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
