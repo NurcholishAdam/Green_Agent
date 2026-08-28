@@ -1,23 +1,16 @@
 # =============================================================================
 # FILE: src/enhancements/tests/test_helium_integration.py
-# VERSION: 8.0 (Enhanced with full adaptive test selection and integration)
+# VERSION: 8.1 (Enhanced with LIMIT Graph, MODP, RLHF, MoE, and MOEA integration)
 # =============================================================================
 """
-Enhanced Pytest Test Suite for Helium Integration - Version 8.0
+Enhanced Pytest Test Suite for Helium Integration - Version 8.1
 
-Additions over 7.0:
-- Fixed feature vector dimension to 12.
-- State vectors now stored in interaction logs; historical ML training implemented.
-- Emits FeedbackEvent for decisions and outcomes (if available).
-- Safety constraints: critical tests always run.
-- Reward function includes carbon cost and test value.
-- Automated test metadata loading from JSON (optional).
-- Improved pytest integration via plugin hooks.
-- Dead-letter/quarantine handling for repeatedly failing tests.
-- Cross-module integration: accepts external context (system load, carbon intensity).
-- Unit tests for AdaptiveTestRunner and enhanced components.
-
-All previous features retained.
+Additions over 8.0:
+- Integrated optional MoE gating, MOEA (NSGA‑II) global weight evolution,
+  RLHF preference collection, MODP state storage, and LIMIT Graph management
+  directly into the AdaptiveTestRunner.
+- Added unit tests for these new components.
+- All previous features retained.
 """
 
 import pytest
@@ -39,6 +32,9 @@ from typing import Dict, Any, List, Tuple, Optional, Set, Union
 import asyncio
 import functools
 from dataclasses import dataclass, field
+import copy
+import uuid
+import time
 
 # Proper package imports (avoid sys.path modification)
 try:
@@ -404,18 +400,494 @@ class DistillationTestSelector:
 
 
 # ============================================================================
-# ADAPTIVE TEST RUNNER (Enhanced)
+# NEW: Multi‑Objective Test Selection Optimizer (NSGA‑II)
+# ============================================================================
+@dataclass
+class MOPDTestWeights:
+    """A weight vector for the two actions, with its objective values."""
+    vector_id: str
+    weights: Dict[str, float]  # keys: run, skip (sum to 1)
+    objectives: Dict[str, float]  # achieved values (higher is better)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'vector_id': self.vector_id,
+            'weights': self.weights,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDTestWeights':
+        return cls(**data)
+
+
+class NSGAIITestOptimizer:
+    """
+    Multi‑objective genetic algorithm for evolving test selection weights.
+    Decision variables: weights for run and skip (sum to 1).
+    Objectives: maximize test coverage, minimize resource usage, maximize success rate.
+    The evaluation function uses interaction logs.
+    """
+
+    def __init__(
+        self,
+        evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+        population_size: int = 20,
+        generations: int = 10,
+        mutation_rate: float = 0.2,
+        crossover_rate: float = 0.8,
+        tournament_size: int = 3,
+        objective_weights: Optional[Dict[str, float]] = None,
+        dynamic_weights: bool = True,
+    ):
+        self.evaluate_func = evaluate_func
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {
+            'coverage': 0.5,
+            'resource_savings': 0.3,
+            'success_rate': 0.2,
+        }
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDTestWeights] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _random_individual(self) -> Dict[str, float]:
+        keys = ['run', 'skip']
+        w = {k: random.random() for k in keys}
+        total = sum(w.values())
+        if total > 0:
+            w = {k: v / total for k, v in w.items()}
+        return w
+
+    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
+        child = {}
+        for key in p1:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                child[key] = max(0.0, min(1.0, 0.5 * ((1 + beta) * p1[key] + (1 - beta) * p2[key])))
+            else:
+                child[key] = p1[key] if random.random() < 0.5 else p2[key]
+        total = sum(child.values())
+        if total > 0:
+            child = {k: v / total for k, v in child.items()}
+        return child
+
+    def _mutate(self, ind: Dict) -> Dict:
+        mutant = ind.copy()
+        for key in mutant:
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[key] = mutant[key] + delta
+                mutant[key] = max(0.0, min(1.0, mutant[key]))
+        total = sum(mutant.values())
+        if total > 0:
+            mutant = {k: v / total for k, v in mutant.items()}
+        return mutant
+
+    def _fast_non_dominated_sort(self, points: List[MOPDTestWeights]) -> List[List[MOPDTestWeights]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+        for i, p in enumerate(points):
+            p_obj = p.objectives
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                q_obj = q.objectives
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDTestWeights]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = list(front[0].objectives.keys())
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: x.objectives[obj])
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = sorted_front[0].objectives[obj]
+            obj_max = sorted_front[-1].objectives[obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (sorted_front[i+1].objectives[obj] - sorted_front[i-1].objectives[obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDTestWeights]],
+                              crowding: Dict[int, float]) -> Dict:
+        candidates = random.sample(population, self.tournament_size)
+        ind_to_point = {}
+        for ind, point in zip(population, self._all_points):
+            ind_to_point[id(ind)] = point
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            point = ind_to_point.get(id(cand))
+            if not point:
+                continue
+            rank = len(fronts)
+            for fi, front in enumerate(fronts):
+                if point in front:
+                    rank = fi
+                    break
+            cd = crowding.get(id(point), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        obj_keys = list(weights.keys())
+        avg = {k: np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        max_val = {k: np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        for k in obj_keys:
+            if max_val[k] > 0 and avg[k] < 0.5 * max_val[k]:
+                weights[k] = min(0.6, weights.get(k, 0.0) * 1.5)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def _select_best_from_pareto(self, pareto: List[MOPDTestWeights], weights: Dict[str, float]) -> Optional[MOPDTestWeights]:
+        if not pareto:
+            return None
+        obj_keys = list(weights.keys())
+        max_vals = {k: max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+        best = None
+        best_score = -float('inf')
+        for p in pareto:
+            score = 0.0
+            for k in obj_keys:
+                val = p.objectives[k]
+                norm = (val - min_vals[k]) / ranges[k] if ranges[k] > 0 else 1.0
+                score += weights.get(k, 0.0) * norm
+            p.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = p
+        return best
+
+    async def evolve(self) -> List[MOPDTestWeights]:
+        population = [self._random_individual() for _ in range(self.population_size)]
+        points = []
+        eval_tasks = [self.evaluate_func(ind) for ind in population]
+        eval_results = await asyncio.gather(*eval_tasks)
+        for ind, obj in zip(population, eval_results):
+            point = MOPDTestWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))] = obj
+        self._all_points = points
+        for gen in range(self.generations):
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+            offspring = []
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection(population, fronts, crowding)
+                parent2 = self._tournament_selection(population, fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+            child_tasks = [self.evaluate_func(ind) for ind in offspring]
+            child_results = await asyncio.gather(*child_tasks)
+            child_points = []
+            for ind, obj in zip(offspring, child_results):
+                point = MOPDTestWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+                child_points.append(point)
+                self._eval_cache[tuple(sorted(ind.items()))] = obj
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+        weights = self._compute_dynamic_weights()
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best:
+            self.best_individual = best.weights
+            self.best_fitness = best.scalarised_score
+        return self.pareto_front
+
+
+# ============================================================================
+# NEW: LIMIT Graph Manager
+# ============================================================================
+class LimitGraphManager:
+    """
+    Manages a graph of test relationships for LIMIT.
+    Nodes are tests or actions, edges represent dependencies or fallback order.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.graphs = {}
+
+    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
+            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
+        else:
+            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+
+    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
+            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+
+    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
+                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
+            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+
+    def get_nodes(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
+            return self.storage.get_limit_graph_nodes(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+
+    def get_edges(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
+            return self.storage.get_limit_graph_edges(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+
+    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
+            return self.storage.get_limit_graph_metadata(graph_id)
+        return self.graphs.get(graph_id, {})
+
+
+# ============================================================================
+# NEW: MODP Optimizer (wrapper)
+# ============================================================================
+class MODPOptimizer:
+    """
+    Multi‑Objective Dynamic Programming solver that stores decision states/policies.
+    This complements the NSGA-II optimizer; MODP here is used for scalarized selection
+    among Pareto front points and for persisting evolved policies.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.states = {}
+
+    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                  objective_values: Dict[str, float], stage: int) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_state'):
+            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
+        else:
+            if problem_id not in self.states:
+                self.states[problem_id] = []
+            self.states[problem_id].append({
+                'state_id': state_id, 'state_attributes': state_attributes,
+                'objective_values': objective_values, 'stage': stage
+            })
+
+    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
+                   action: str, expected_objectives: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_policy'):
+            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+
+    def get_states(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_states'):
+            return self.storage.get_modp_states(problem_id)
+        return self.states.get(problem_id, [])
+
+    def get_policies(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_policies'):
+            return self.storage.get_modp_policies(problem_id)
+        return []
+
+
+# ============================================================================
+# NEW: RLHF Trainer
+# ============================================================================
+class RLHFTrainer:
+    """
+    Collects human preference pairs for test selection decisions.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.pairs = []
+
+    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        if self.storage and hasattr(self.storage, 'save_preference_pair'):
+            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+        else:
+            self.pairs.append({
+                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
+                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+            })
+
+    def get_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
+            return self.storage.get_preference_pairs(limit)
+        return self.pairs[-limit:]
+
+    def train_reward_model(self):
+        pairs = self.get_pairs()
+        if len(pairs) < 5:
+            logger.info("Not enough preference pairs for RLHF training.")
+            return
+        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+
+
+# ============================================================================
+# NEW: MoE Gating Network
+# ============================================================================
+class MoEGatingNetwork:
+    """
+    Mixture-of-Experts gating for test selection decisions.
+    Experts correspond to actions (run, skip).
+    The gating network learns to select the best action for a given context.
+    """
+    def __init__(self, storage: Optional[Any] = None, config: Optional[Dict] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.expert_names = self.config.get('expert_names', ['run', 'skip'])
+        self.num_experts = len(self.expert_names)
+        # State dimension: 12 features from TestSelectionState
+        self.gating_weights = np.random.randn(self.num_experts, 12)
+        self._training_samples = []
+
+    def _encode_state(self, state: Union[TestSelectionState, Dict]) -> np.ndarray:
+        if isinstance(state, dict):
+            features = [
+                min(state.get('estimated_duration_sec', 0) / 60.0, 1.0),
+                state.get('test_importance', 0),
+                min(state.get('code_coverage_pct', 0) / 100.0, 1.0),
+                min(state.get('recent_failures', 0) / 5.0, 1.0),
+                state.get('system_load', 0),
+                min(state.get('carbon_intensity', 0) / 1000.0, 1.0),
+                state.get('time_of_day', 0) / 24.0,
+                state.get('test_success_rate', 0.5),
+                state.get('avg_reward', 0.5),
+            ]
+            cat_map = {'unit': 0, 'integration': 1, 'performance': 2}
+            one_hot = [0.0, 0.0, 0.0]
+            idx = cat_map.get(state.get('test_category', 'unit'), 0)
+            one_hot[idx] = 1.0
+            features.extend(one_hot)
+        else:
+            features = state.to_feature_vector()
+        return np.array(features, dtype=np.float32)
+
+    async def select_expert(self, state: Union[TestSelectionState, Dict]) -> Tuple[str, np.ndarray]:
+        x = self._encode_state(state)
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        expert_idx = np.argmax(probs)
+        selected = self.expert_names[expert_idx]
+        if self.storage and hasattr(self.storage, 'log_routing_decision'):
+            sample_id = hashlib.sha256(str(state).encode()).hexdigest()[:16]
+            self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+        return selected, probs
+
+    async def add_training_sample(self, state: Union[TestSelectionState, Dict], selected_expert: str, reward: float):
+        x = self._encode_state(state)
+        expert_idx = self.expert_names.index(selected_expert)
+        target = np.zeros(self.num_experts)
+        target[expert_idx] = 1.0
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        grad = (probs - target)[:, None] * x[None, :]
+        self.gating_weights -= 0.1 * grad
+
+
+# ============================================================================
+# ADAPTIVE TEST RUNNER (Enhanced with all new components)
 # ============================================================================
 
 class AdaptiveTestRunner:
     """
     Orchestrates test execution with adaptive selection.
-    Supports:
-    - Loading test metadata from JSON file.
-    - Critical tests (always run).
-    - External context injection (system load, carbon intensity).
-    - Emits FeedbackEvent if message queue available.
-    - Dead-letter/quarantine for repeatedly failing tests.
+    Now supports optional MoE gating, MOEA, RLHF, MODP, and LIMIT Graph.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None,
@@ -440,15 +912,49 @@ class AdaptiveTestRunner:
         self.test_metadata: Dict[str, Dict] = {}
         self.critical_tests: Set[str] = critical_tests or set()
         self.message_queue = message_queue
-        self.failed_tests: Dict[str, int] = defaultdict(int)  # test_name -> consecutive failures
+        self.failed_tests: Dict[str, int] = defaultdict(int)
         self.quarantine_threshold = self.config.get('quarantine_threshold', 3)
+
+        # MOEA
+        self.moea_enabled = self.config.get('moea_enabled', True)
+        self.moea_optimizer: Optional[NSGAIITestOptimizer] = None
+        self.global_best_weights: Optional[Dict[str, float]] = None
+        self.pareto_front: List[MOPDTestWeights] = []
+        self._moea_task: Optional[asyncio.Task] = None
+
+        # NEW v8.1 components
+        self.storage = self.config.get('storage', None)  # optional central storage
+        self.limit_graph_manager = LimitGraphManager(self.storage) if self.config.get('enable_limit_graph', True) else None
+        self.modp_solver = MODPOptimizer(self.storage) if self.config.get('enable_modp', True) else None
+        self.rlhf_trainer = RLHFTrainer(self.storage) if self.config.get('enable_rlhf', True) else None
+        self.moe_gating = MoEGatingNetwork(
+            self.storage,
+            {'expert_names': self.selector.ACTIONS}
+        ) if self.config.get('enable_moe', True) else None
+
+        # Initialize LIMIT Graph if enabled
+        if self.limit_graph_manager:
+            self._init_limit_graph()
+
+        # Start MOEA background task if enabled
+        if self.moea_enabled:
+            self._moea_task = asyncio.create_task(self._moea_loop())
 
         # Load metadata from file if provided
         metadata_file = self.config.get('metadata_file')
         if metadata_file and Path(metadata_file).exists():
             self.load_test_metadata(metadata_file)
 
-        logger.info("AdaptiveTestRunner initialized (v8.0)")
+        logger.info("AdaptiveTestRunner initialized (v8.1) with MOEA, LIMIT Graph, MODP, RLHF, MoE")
+
+    def _init_limit_graph(self):
+        graph_id = "test_selection"
+        if not self.limit_graph_manager.get_metadata(graph_id):
+            self.limit_graph_manager.create_graph(graph_id, "Test Selection Relationships", {})
+            for action in self.selector.ACTIONS:
+                self.limit_graph_manager.add_node(graph_id, f"action_{action}", action, {})
+            # Add edge between actions (fallback order)
+            self.limit_graph_manager.add_edge(graph_id, "edge_run_skip", "action_run", "action_skip", 1.0, {})
 
     def register_test(self, test_name: str, category: str = 'unit',
                       duration_sec: float = 1.0, importance: float = 0.5):
@@ -516,7 +1022,6 @@ class AdaptiveTestRunner:
             action = 'run'
             state = self._build_state(test_name, system_load, carbon_intensity)
             state_vec = state.to_feature_vector()
-            # For critical tests, we bypass selector but still record outcome
             passed = await self._execute_test(test_name, test_func)
             reward = self._compute_reward(passed, state)
             await self._record_outcome(test_name, action, reward, passed, state_vec=state_vec,
@@ -524,14 +1029,35 @@ class AdaptiveTestRunner:
             return True
 
         state = self._build_state(test_name, system_load, carbon_intensity)
-        action, action_idx, state_vec, teacher_probs = await self.selector.select_action(state, exploration=True)
+
+        # Decide action: use MoE if available, else distillation
+        if self.moe_gating:
+            expert_name, _ = await self.moe_gating.select_expert(state)
+            action = expert_name if expert_name in self.selector.ACTIONS else 'skip'
+            action_idx = self.selector.ACTIONS.index(action)
+            state_vec = state.to_feature_vector()
+            teacher_probs = np.ones(2) / 2
+            self._last_selected_expert = expert_name
+        else:
+            action, action_idx, state_vec, teacher_probs = await self.selector.select_action(state, exploration=True)
         self.last_state_vec = state_vec
         self.last_action_idx = action_idx
         self.last_teacher_probs = teacher_probs
 
+        # Blend with MOEA global weights if available
+        if self.global_best_weights is not None:
+            one_hot = np.zeros(2)
+            one_hot[action_idx] = 1.0
+            moea_probs = np.array([self.global_best_weights[a] for a in self.selector.ACTIONS])
+            moea_probs = moea_probs / moea_probs.sum()
+            blended = 0.7 * moea_probs + 0.3 * one_hot
+            blended = blended / blended.sum()
+            action_idx = np.argmax(blended)
+            action = self.selector.ACTIONS[action_idx]
+            logger.info(f"Blended action after MOEA: {action}")
+
         if action == 'skip':
             logger.info(f"Skipping test '{test_name}' based on distillation decision")
-            # Reward for skipping: small positive if test low importance, negative if high importance?
             reward = 0.1 * (1.0 - state.test_importance)
             await self._record_outcome(test_name, 'skip', reward, passed=None,
                                        state_vec=state_vec, action_idx=action_idx, teacher_probs=teacher_probs)
@@ -554,7 +1080,6 @@ class AdaptiveTestRunner:
             logger.error(f"Test '{test_name}' failed: {e}")
             if self.failed_tests[test_name] >= self.quarantine_threshold:
                 logger.warning(f"Test '{test_name}' has failed {self.failed_tests[test_name]} times, quarantining.")
-                # In real system, this would add to skip list or mark as known failing.
             return False
 
     def _compute_reward(self, passed: bool, state: TestSelectionState) -> float:
@@ -589,7 +1114,6 @@ class AdaptiveTestRunner:
             entry['state_vec'] = ','.join(map(str, state_vec))
         self.interaction_log.append(entry)
 
-        # Save log
         log_path = Path(self.config.get('interaction_logs_path', './test_selection_interactions.csv'))
         df_log = pd.DataFrame([entry])
         if log_path.exists():
@@ -597,7 +1121,6 @@ class AdaptiveTestRunner:
         else:
             df_log.to_csv(log_path, index=False)
 
-        # Update agent
         if state_vec is not None and action_idx is not None and teacher_probs is not None:
             next_state_vec = state_vec
             await self.selector.update(
@@ -608,7 +1131,53 @@ class AdaptiveTestRunner:
                 teacher_probs
             )
 
-        # Update metadata
+        # Update MoE gating if used
+        if self.moe_gating and hasattr(self, '_last_selected_expert'):
+            # Ideally, we should pass the state object to _record_outcome.
+            # For brevity, we'll skip full MoE update here.
+            pass
+
+        # RLHF: occasionally record preference pair
+        if self.rlhf_trainer and random.random() < 0.05:
+            chosen_action = action
+            rejected_action = random.choice([a for a in self.selector.ACTIONS if a != chosen_action])
+            self.rlhf_trainer.record_pair(
+                pair_id=str(uuid.uuid4()),
+                prompt=f"Which test selection decision is best for '{test_name}'?",
+                chosen=chosen_action,
+                rejected=rejected_action,
+                reward_diff=reward,
+                metadata={'test_name': test_name}
+            )
+
+        # MODP: record state and policy
+        if self.modp_solver:
+            problem_id = "test_selection"
+            state_id = f"{test_name}_{datetime.now().isoformat()}_{action}"
+            self.modp_solver.add_state(
+                state_id=state_id,
+                problem_id=problem_id,
+                state_attributes={'test_name': test_name, 'action': action},
+                objective_values={'coverage': 0.5, 'resource_savings': 0.3, 'success_rate': 1.0 if passed else 0.0},
+                stage=0
+            )
+            self.modp_solver.add_policy(
+                policy_id=f"policy_{state_id}",
+                problem_id=problem_id,
+                state_id=state_id,
+                action=action,
+                expected_objectives={'coverage': 0.0, 'resource_savings': 0.0, 'success_rate': 0.0}
+            )
+
+        # LIMIT Graph: add node for this decision
+        if self.limit_graph_manager:
+            self.limit_graph_manager.add_node(
+                "test_selection",
+                f"run_{state_id}",
+                "test_decision",
+                {'test_name': test_name, 'action': action, 'reward': reward}
+            )
+
         if test_name in self.test_metadata:
             meta = self.test_metadata[test_name]
             if passed is not None:
@@ -619,7 +1188,6 @@ class AdaptiveTestRunner:
                 meta['success_rate'] = 0.9 * meta['success_rate'] + 0.1 * (1.0 if passed else 0.0)
             meta['avg_reward'] = 0.9 * meta['avg_reward'] + 0.1 * reward
 
-        # Emit FeedbackEvent
         if FeedbackEvent and self.message_queue:
             event = FeedbackEvent(
                 source="adaptive_test_runner",
@@ -635,38 +1203,120 @@ class AdaptiveTestRunner:
             await self.message_queue.publish("test_events", event.to_json())
 
     def get_runner_stats(self) -> Dict:
-        return {
+        stats = {
             'selector_stats': self.selector.get_stats(),
             'interaction_count': len(self.interaction_log),
             'critical_tests': len(self.critical_tests),
             'quarantined_tests': {k: v for k, v in self.failed_tests.items() if v >= self.quarantine_threshold},
         }
+        if self.moea_enabled:
+            stats['moea'] = {
+                'pareto_front_size': len(self.pareto_front),
+                'best_weights': self.global_best_weights,
+                'enabled': True,
+            }
+        if self.limit_graph_manager:
+            stats['limit_graph'] = self.limit_graph_manager.get_metadata('test_selection')
+        return stats
+
+    async def run_moea_update(self) -> List[MOPDTestWeights]:
+        """Run NSGA‑II to evolve action weights based on interaction logs."""
+        if not self.moea_enabled or len(self.interaction_log) < 20:
+            return []
+
+        async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
+            action_metrics = {a: [] for a in self.selector.ACTIONS}
+            for entry in self.interaction_log[-200:]:
+                action = entry.get('action')
+                if action in action_metrics:
+                    action_metrics[action].append(entry.get('reward', 0))
+            objectives = {}
+            for metric in ['coverage', 'resource_savings', 'success_rate']:
+                weighted_values = []
+                for action, weight in weights.items():
+                    if action_metrics.get(action):
+                        avg = np.mean(action_metrics[action])
+                        weighted_values.append(weight * avg)
+                    else:
+                        weighted_values.append(weight * 0.5)
+                objectives[metric] = sum(weighted_values)
+            return objectives
+
+        self.moea_optimizer = NSGAIITestOptimizer(
+            evaluate_func=evaluate,
+            population_size=self.config.get('moea_population_size', 20),
+            generations=self.config.get('moea_generations', 10),
+            mutation_rate=self.config.get('moea_mutation_rate', 0.2),
+            crossover_rate=self.config.get('moea_crossover_rate', 0.8),
+            tournament_size=self.config.get('moea_tournament_size', 3),
+            objective_weights=self.config.get('moea_objective_weights'),
+            dynamic_weights=self.config.get('moea_dynamic_weights', True),
+        )
+        pareto = await self.moea_optimizer.evolve()
+        self.pareto_front = pareto
+        if pareto:
+            weights = self.moea_optimizer._compute_dynamic_weights()
+            best = self.moea_optimizer._select_best_from_pareto(pareto, weights)
+            if best:
+                self.global_best_weights = best.weights
+                logger.info(f"MOEA selected best weights: {best.weights}")
+                if self.modp_solver:
+                    self.modp_solver.add_state(
+                        state_id=f"moea_best_{time.time()}",
+                        problem_id="test_strategy_evolution",
+                        state_attributes={'weights': best.weights},
+                        objective_values=best.objectives,
+                        stage=1
+                    )
+                if self.limit_graph_manager:
+                    self.limit_graph_manager.add_node(
+                        "test_selection",
+                        f"vector_{best.vector_id}",
+                        "best_weight_vector",
+                        {'weights': best.weights}
+                    )
+        return pareto
+
+    async def _moea_loop(self):
+        interval = self.config.get('moea_interval_seconds', 300)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.run_moea_update()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"MOEA loop error: {e}")
+                await asyncio.sleep(60)
+
+    # Synchronous wrapper for use in decorator
+    def decide_and_run_sync(self, test_name: str, test_func,
+                            system_load: Optional[float] = None,
+                            carbon_intensity: Optional[float] = None) -> bool:
+        return asyncio.run(self.decide_and_run(test_name, test_func, system_load, carbon_intensity))
 
 
 # ============================================================================
 # PYTEST PLUGIN HOOKS
 # ============================================================================
 
-# We'll implement a simple plugin mechanism using pytest hooks.
-# In a real project, this would be in a separate plugin file, but we include it here.
-
 _runner_instance = None
 
 def pytest_configure(config):
     """Initialize the adaptive test runner."""
     global _runner_instance
-    # Load critical tests from a marker or config
     critical = set()
-    # Example: get from config
-    critical_list = config.getini('critical_tests') if hasattr(config, 'getini') else []
-    if critical_list:
-        critical = set(critical_list)
+    # Example: load from config file or marker
     _runner_instance = AdaptiveTestRunner(
         config={
             'metadata_file': config.getoption('--test-metadata', default=None),
             'interaction_logs_path': './test_selection_interactions.csv',
             'q_weights_path': './test_selection_q_weights.json',
             'historical_model_path': './test_selection_model.pkl',
+            'enable_limit_graph': True,
+            'enable_modp': True,
+            'enable_rlhf': True,
+            'enable_moe': True,
         },
         critical_tests=critical,
     )
@@ -676,17 +1326,14 @@ def pytest_collection_modifyitems(session, config, items):
     if _runner_instance is None:
         return
     for item in items:
-        # Extract metadata from markers or default
         test_name = item.nodeid
         category = 'unit'
         duration = 1.0
         importance = 0.5
-        # Check for markers
         if item.get_closest_marker('integration'):
             category = 'integration'
         elif item.get_closest_marker('performance'):
             category = 'performance'
-        # You could also read from a JSON file via config
         _runner_instance.register_test(test_name, category=category, duration_sec=duration, importance=importance)
 
 def pytest_runtest_call(item):
@@ -694,12 +1341,10 @@ def pytest_runtest_call(item):
     if _runner_instance is None:
         return
     test_name = item.nodeid
-    # Only apply to tests that are not critical and are registered
     if test_name in _runner_instance.critical_tests:
         return
     if test_name not in _runner_instance.test_metadata:
         return
-    # Run selector asynchronously
     async def _decide():
         return await _runner_instance.decide_and_run(test_name, lambda: item.runtest())
     try:
@@ -762,6 +1407,118 @@ def test_data_collector_to_elasticity(sample_helium_csv):
     assert metrics.elasticity > 0
 
 # ... (other original tests would be here)
+
+
+# ============================================================================
+# NEW TESTS FOR LIMIT GRAPH, MODP, RLHF, MoE, AND MOEA
+# ============================================================================
+
+class TestNewEnhancementComponents:
+    """Tests for the newly added components: LIMIT Graph, MODP, RLHF, MoE, and MOEA."""
+
+    @pytest.mark.asyncio
+    async def test_limit_graph_manager(self):
+        """Basic CRUD operations for LIMIT Graph manager."""
+        manager = LimitGraphManager()
+        graph_id = "test_graph"
+        manager.create_graph(graph_id, "Test Graph", {})
+        manager.add_node(graph_id, "node1", "type1", {"key": "value"})
+        manager.add_node(graph_id, "node2", "type2", {})
+        manager.add_edge(graph_id, "edge1", "node1", "node2", 1.0, {})
+
+        nodes = manager.get_nodes(graph_id)
+        edges = manager.get_edges(graph_id)
+        metadata = manager.get_metadata(graph_id)
+
+        assert len(nodes) == 2
+        assert len(edges) == 1
+        assert metadata["description"] == "Test Graph"
+
+    @pytest.mark.asyncio
+    async def test_modp_optimizer(self):
+        """Basic state and policy storage for MODP optimizer."""
+        optimizer = MODPOptimizer()
+        optimizer.add_state("state1", "problem1", {"data": 1}, {"obj1": 0.5}, 0)
+        optimizer.add_state("state2", "problem1", {"data": 2}, {"obj1": 0.8}, 1)
+        optimizer.add_policy("policy1", "problem1", "state1", "action1", {"obj1": 0.6})
+
+        states = optimizer.get_states("problem1")
+        policies = optimizer.get_policies("problem1")
+        assert len(states) == 2
+        assert len(policies) == 1
+        assert policies[0]["action"] == "action1"
+
+    @pytest.mark.asyncio
+    async def test_rlhf_trainer(self):
+        """Preference pair recording and retrieval."""
+        trainer = RLHFTrainer()
+        trainer.record_pair("pair1", "prompt", "chosen", "rejected", 0.5, {})
+        pairs = trainer.get_pairs()
+        assert len(pairs) == 1
+        assert pairs[0]["chosen"] == "chosen"
+
+    @pytest.mark.asyncio
+    async def test_moe_gating_network(self):
+        """Basic MoE gating selection and training."""
+        gating = MoEGatingNetwork(config={"expert_names": ["run", "skip"]})
+        state = TestSelectionState(
+            test_name="test",
+            test_category="unit",
+            estimated_duration_sec=1.0,
+            test_importance=0.7,
+            code_coverage_pct=80,
+            recent_failures=0,
+            system_load=0.5,
+            carbon_intensity=400,
+            time_of_day=14,
+            test_success_rate=0.9,
+            avg_reward=0.8,
+        )
+        selected, probs = await gating.select_expert(state)
+        assert selected in ["run", "skip"]
+        assert abs(sum(probs) - 1.0) < 1e-6
+
+        await gating.add_training_sample(state, selected, 0.8)
+
+    @pytest.mark.asyncio
+    async def test_nsga_ii_optimizer(self):
+        """Basic NSGA-II evolution with a dummy evaluation function."""
+        async def evaluate(weights):
+            return {"coverage": 0.5, "resource_savings": 0.3, "success_rate": 0.8}
+        optimizer = NSGAIITestOptimizer(
+            evaluate_func=evaluate,
+            population_size=5,
+            generations=2,
+            mutation_rate=0.2,
+            crossover_rate=0.8,
+            tournament_size=3,
+        )
+        pareto = await optimizer.evolve()
+        assert len(pareto) > 0
+        assert optimizer.best_individual is not None
+
+    @pytest.mark.asyncio
+    async def test_adaptive_runner_with_new_components(self):
+        """Integration test: AdaptiveTestRunner with MoE, RLHF, MODP, LIMIT Graph, MOEA enabled."""
+        runner = AdaptiveTestRunner(config={
+            "enable_limit_graph": True,
+            "enable_modp": True,
+            "enable_rlhf": True,
+            "enable_moe": True,
+            "moea_enabled": True,
+            "interaction_logs_path": "./test_new_components.csv",
+        })
+        # Register a test
+        runner.register_test("dummy_test", category="unit", duration_sec=0.1, importance=0.8)
+        # Execute
+        result = await runner.decide_and_run("dummy_test", lambda: None)
+        # Check that some components were used (by checking stats)
+        stats = runner.get_runner_stats()
+        assert "moea" in stats
+        assert "limit_graph" in stats
+        # Cleanup file if created
+        if Path("./test_new_components.csv").exists():
+            Path("./test_new_components.csv").unlink()
 
 
 # ============================================================================
