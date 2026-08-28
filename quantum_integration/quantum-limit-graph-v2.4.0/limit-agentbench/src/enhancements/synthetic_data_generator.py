@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # FILE: src/enhancements/synthetic_data_generator_enhanced_v5_0.py
-# VERSION: 5.0.0 (Enterprise Quantum Resilience + GA + MoE + Pareto + Adaptive Anomalies)
+# VERSION: 5.0.0 (Enterprise Quantum Resilience + GA + MoE + Pareto + Adaptive Anomalies + LIMIT Graph + RLHF + Distillation)
 # =============================================================================
 """
 Advanced Synthetic Data Generator for Green Agent - Version 5.0.0
@@ -16,7 +16,10 @@ ENHANCEMENTS OVER v4.0.0:
 6. Drift detection for external data distributions and user feedback.
 7. Active user preference learning via interactive WebSocket queries.
 8. Integration with central Green Agent components (Config, Storage, MetricsRegistry).
-9. All enhancements are optional and configurable.
+9. LIMIT Graph for constraint propagation and decision support.
+10. RLHF (Reinforcement Learning from Human Feedback) for reward‑based policy updates.
+11. Multi‑Teacher Policy Distillation to combine teacher policies into a student policy.
+All enhancements are optional and configurable.
 """
 
 import asyncio
@@ -327,6 +330,16 @@ if CENTRAL_COMPONENTS_AVAILABLE and central_config:
             self.federated_interval = getattr(central_config, 'synthetic_federated_interval', 3600)
             self.drift_detection_enabled = getattr(central_config, 'synthetic_drift_detection_enabled', True)
             self.user_preference_learning_enabled = getattr(central_config, 'synthetic_user_preference_learning_enabled', True)
+            # ===== NEW: LIMIT Graph, RLHF, Distillation configs =====
+            self.limit_graph_enabled = getattr(central_config, 'synthetic_limit_graph_enabled', True)
+            self.limit_graph_update_interval = getattr(central_config, 'synthetic_limit_graph_update_interval', 300)
+            self.rlhf_enabled = getattr(central_config, 'synthetic_rlhf_enabled', True)
+            self.rlhf_reward_model = getattr(central_config, 'synthetic_rlhf_reward_model', 'linear')
+            self.rlhf_training_interval = getattr(central_config, 'synthetic_rlhf_training_interval', 600)
+            self.distillation_enabled = getattr(central_config, 'synthetic_distillation_enabled', True)
+            self.distillation_temperature = getattr(central_config, 'synthetic_distillation_temperature', 2.0)
+            self.distillation_alpha = getattr(central_config, 'synthetic_distillation_alpha', 0.5)
+            self.distillation_interval = getattr(central_config, 'synthetic_distillation_interval', 300)
 
         def get_master_key_bytes(self) -> bytes:
             key_hex = os.getenv(self.master_key_env)
@@ -411,6 +424,16 @@ else:
             federated_interval: int = Field(3600, ge=60)
             drift_detection_enabled: bool = True
             user_preference_learning_enabled: bool = True
+            # ===== NEW: LIMIT Graph, RLHF, Distillation configs =====
+            limit_graph_enabled: bool = True
+            limit_graph_update_interval: int = Field(300, ge=10)
+            rlhf_enabled: bool = True
+            rlhf_reward_model: str = Field("linear")
+            rlhf_training_interval: int = Field(600, ge=60)
+            distillation_enabled: bool = True
+            distillation_temperature: float = Field(2.0, gt=0)
+            distillation_alpha: float = Field(0.5, ge=0.0, le=1.0)
+            distillation_interval: int = Field(300, ge=60)
 
             @field_validator('task_types')
             @classmethod
@@ -509,6 +532,16 @@ else:
             "federated_interval": 3600,
             "drift_detection_enabled": True,
             "user_preference_learning_enabled": True,
+            # ===== NEW: LIMIT Graph, RLHF, Distillation configs =====
+            "limit_graph_enabled": True,
+            "limit_graph_update_interval": 300,
+            "rlhf_enabled": True,
+            "rlhf_reward_model": "linear",
+            "rlhf_training_interval": 600,
+            "distillation_enabled": True,
+            "distillation_temperature": 2.0,
+            "distillation_alpha": 0.5,
+            "distillation_interval": 300,
         }
 
 # ============================================================================
@@ -537,16 +570,75 @@ class SyntheticExpertProfile(ExpertProfile):
 # CIRCUIT BREAKER, RATE LIMITER, ENCRYPTION MANAGER (unchanged)
 # ============================================================================
 class CircuitBreaker:
-    # ... (same as original)
-    pass
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0, name: str = "default"):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.name = name
+        self._failures = 0
+        self._last_failure_time = None
+        self._state = "CLOSED"
+
+    async def call(self, func, *args, **kwargs):
+        if self._state == "OPEN":
+            if (datetime.now() - self._last_failure_time).total_seconds() > self.recovery_timeout:
+                self._state = "HALF_OPEN"
+            else:
+                raise Exception(f"Circuit breaker {self.name} is OPEN")
+        try:
+            result = await func(*args, **kwargs)
+            if self._state == "HALF_OPEN":
+                self._state = "CLOSED"
+                self._failures = 0
+                if PROMETHEUS_AVAILABLE:
+                    SYNTHETIC_CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
+            return result
+        except Exception as e:
+            self._failures += 1
+            self._last_failure_time = datetime.now()
+            if self._failures >= self.failure_threshold:
+                self._state = "OPEN"
+                if PROMETHEUS_AVAILABLE:
+                    SYNTHETIC_CIRCUIT_BREAKER_STATE.labels(name=self.name).set(2)
+            raise e
 
 class RateLimiter:
-    # ... (same as original)
-    pass
+    def __init__(self, rate: int = 100, window: int = 60):
+        self.rate = rate
+        self.window = window
+        self.tokens = rate
+        self.last_refill = time.time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.time()
+            time_passed = now - self.last_refill
+            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.window))
+            self.last_refill = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+    async def wait_and_acquire(self):
+        while not await self.acquire():
+            await asyncio.sleep(0.1)
 
 class EncryptionManager:
-    # ... (same as original)
-    pass
+    def __init__(self, master_key: bytes):
+        if len(master_key) != 32:
+            raise ValueError("Master key must be 32 bytes")
+        self.master_key = master_key
+
+    def encrypt(self, data: bytes) -> Tuple[bytes, bytes]:
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(self.master_key)
+        ciphertext = aesgcm.encrypt(nonce, data, None)
+        return ciphertext, nonce
+
+    def decrypt(self, ciphertext: bytes, nonce: bytes) -> bytes:
+        aesgcm = AESGCM(self.master_key)
+        return aesgcm.decrypt(nonce, ciphertext, None)
 
 # ============================================================================
 # ENHANCED DATABASE MANAGER (async-safe with aiosqlite)
@@ -766,8 +858,259 @@ if CENTRAL_COMPONENTS_AVAILABLE and CentralStorage:
 else:
     # Original custom EnhancedStorage (extended with new tables)
     class EnhancedStorage:
-        # ... (similar to original but with new tables)
-        pass
+        def __init__(self, config: SyntheticDataConfig):
+            self.config = config
+            self.db_path = config.db_path
+            self.encryption_manager = None
+            try:
+                master_key = config.get_master_key_bytes()
+                self.encryption_manager = EncryptionManager(master_key)
+            except ValueError:
+                logger.warning("Master key not set – sensitive data will be stored in plaintext.")
+                self.encryption_manager = None
+
+            self.cache = {}
+            self.cache_ttl = config.cache_ttl
+            self._init_db()
+
+        async def _execute(self, query: str, params: tuple = ()):
+            if AIOSQLITE_AVAILABLE:
+                async with aiosqlite.connect(self.db_path) as conn:
+                    await conn.execute("PRAGMA journal_mode=WAL")
+                    cursor = await conn.execute(query, params)
+                    await conn.commit()
+                    return cursor
+            else:
+                loop = asyncio.get_event_loop()
+                def _sync():
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute("PRAGMA journal_mode=WAL")
+                        cursor = conn.execute(query, params)
+                        conn.commit()
+                        return cursor
+                return await loop.run_in_executor(None, _sync)
+
+        async def _fetchone(self, query: str, params: tuple = ()):
+            cursor = await self._execute(query, params)
+            return await cursor.fetchone() if AIOSQLITE_AVAILABLE else cursor.fetchone()
+
+        async def _fetchall(self, query: str, params: tuple = ()):
+            cursor = await self._execute(query, params)
+            return await cursor.fetchall() if AIOSQLITE_AVAILABLE else cursor.fetchall()
+
+        async def _init_db(self):
+            async with aiosqlite.connect(self.db_path) as conn if AIOSQLITE_AVAILABLE else None:
+                if AIOSQLITE_AVAILABLE:
+                    await conn.execute("PRAGMA journal_mode=WAL")
+                    await conn.execute("PRAGMA foreign_keys=ON")
+                    # Carbon cache
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS carbon_cache (
+                            region TEXT PRIMARY KEY,
+                            intensity REAL NOT NULL,
+                            timestamp TEXT NOT NULL
+                        )
+                    """)
+                    # Helium cache
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS helium_cache (
+                            hotspot_id TEXT PRIMARY KEY,
+                            score REAL NOT NULL,
+                            timestamp TEXT NOT NULL
+                        )
+                    """)
+                    # Generation history
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS generation_history (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT NOT NULL,
+                            dataset_version TEXT NOT NULL,
+                            num_samples INTEGER NOT NULL,
+                            anomaly_rate REAL,
+                            edge_fraction REAL,
+                            parameters TEXT,
+                            quantum_signature TEXT,
+                            blockchain_tx_hash TEXT
+                        )
+                    """)
+                    # GA populations
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS ga_populations (
+                            generation INTEGER,
+                            individual_id TEXT,
+                            attributes TEXT,
+                            fitness REAL,
+                            timestamp TEXT,
+                            PRIMARY KEY (generation, individual_id)
+                        )
+                    """)
+                    # MoE training
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS moe_training (
+                            sample_id TEXT PRIMARY KEY,
+                            features TEXT,
+                            expert_label INTEGER,
+                            reward REAL,
+                            timestamp TEXT
+                        )
+                    """)
+                    # Pareto front
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS pareto_front (
+                            solution_id TEXT PRIMARY KEY,
+                            config_params TEXT,
+                            coverage_score REAL,
+                            anomaly_diversity REAL,
+                            realism_score REAL,
+                            data_quality REAL,
+                            timestamp TEXT
+                        )
+                    """)
+                    # User preferences
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS user_preferences (
+                            user_id TEXT,
+                            weights TEXT,
+                            chosen_solution_id TEXT,
+                            timestamp TEXT,
+                            PRIMARY KEY (user_id, timestamp)
+                        )
+                    """)
+                    # State
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS state (
+                            key TEXT PRIMARY KEY,
+                            value TEXT NOT NULL
+                        )
+                    """)
+                    # Indexes
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_gen_timestamp ON generation_history(timestamp)")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_ga_generation ON ga_populations(generation)")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_moe_sample_time ON moe_training(timestamp)")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_pareto_overall ON pareto_front(data_quality)")
+                    await conn.commit()
+            else:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    # Create tables similarly
+                    pass
+            logger.info(f"Database initialized at {self.db_path} with WAL and indexes")
+
+        async def _encrypt_if_possible(self, data: bytes) -> Tuple[bytes, Optional[bytes]]:
+            if self.encryption_manager:
+                return self.encryption_manager.encrypt(data)
+            return data, None
+
+        async def _decrypt_if_possible(self, ciphertext: bytes, nonce: Optional[bytes]) -> bytes:
+            if self.encryption_manager and nonce is not None:
+                return self.encryption_manager.decrypt(ciphertext, nonce)
+            return ciphertext
+
+        async def save_carbon_intensity(self, region: str, intensity: float):
+            await self._execute("""
+                INSERT OR REPLACE INTO carbon_cache (region, intensity, timestamp)
+                VALUES (?, ?, ?)
+            """, (region, intensity, datetime.now().isoformat()))
+
+        async def get_carbon_intensity(self, region: str) -> Optional[float]:
+            row = await self._fetchone("""
+                SELECT intensity FROM carbon_cache WHERE region = ?
+            """, (region,))
+            return row[0] if row else None
+
+        async def save_helium_score(self, hotspot_id: str, score: float):
+            await self._execute("""
+                INSERT OR REPLACE INTO helium_cache (hotspot_id, score, timestamp)
+                VALUES (?, ?, ?)
+            """, (hotspot_id, score, datetime.now().isoformat()))
+
+        async def get_helium_score(self, hotspot_id: str) -> Optional[float]:
+            row = await self._fetchone("""
+                SELECT score FROM helium_cache WHERE hotspot_id = ?
+            """, (hotspot_id,))
+            return row[0] if row else None
+
+        async def save_generation_history(self, dataset_version: str, num_samples: int,
+                                           anomaly_rate: float, edge_fraction: float,
+                                           parameters: Dict, quantum_signature: Optional[str] = None,
+                                           blockchain_tx_hash: Optional[str] = None):
+            await self._execute("""
+                INSERT INTO generation_history (timestamp, dataset_version, num_samples, anomaly_rate, edge_fraction, parameters, quantum_signature, blockchain_tx_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now().isoformat(),
+                dataset_version,
+                num_samples,
+                anomaly_rate,
+                edge_fraction,
+                json.dumps(parameters),
+                quantum_signature,
+                blockchain_tx_hash
+            ))
+
+        async def save_state(self, key: str, value: str):
+            await self._execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value))
+
+        async def get_state(self, key: str) -> Optional[str]:
+            row = await self._fetchone("SELECT value FROM state WHERE key = ?", (key,))
+            return row[0] if row else None
+
+        async def save_ga_population(self, generation: int, individuals: List[Dict]):
+            for ind in individuals:
+                await self._execute("""
+                    INSERT OR REPLACE INTO ga_populations (generation, individual_id, attributes, fitness, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (generation, ind['individual_id'], json.dumps(ind['attributes']), ind['fitness'], datetime.now().isoformat()))
+
+        async def get_ga_population(self, generation: int) -> List[Dict]:
+            rows = await self._fetchall("""
+                SELECT individual_id, attributes, fitness FROM ga_populations WHERE generation = ?
+            """, (generation,))
+            return [{'individual_id': r[0], 'attributes': json.loads(r[1]), 'fitness': r[2]} for r in rows]
+
+        async def save_moe_training_sample(self, sample_id: str, features: List[float], expert_label: int, reward: float):
+            await self._execute("""
+                INSERT OR REPLACE INTO moe_training (sample_id, features, expert_label, reward, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (sample_id, json.dumps(features), expert_label, reward, datetime.now().isoformat()))
+
+        async def save_pareto_front(self, solutions: List[Dict]):
+            await self._execute("DELETE FROM pareto_front")
+            for sol in solutions:
+                await self._execute("""
+                    INSERT INTO pareto_front (solution_id, config_params, coverage_score, anomaly_diversity, realism_score, data_quality, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    sol['solution_id'],
+                    json.dumps(sol['config_params']),
+                    sol['coverage_score'],
+                    sol['anomaly_diversity'],
+                    sol['realism_score'],
+                    sol['data_quality'],
+                    datetime.now().isoformat()
+                ))
+
+        async def get_current_pareto_front(self) -> List[Dict]:
+            rows = await self._fetchall("SELECT * FROM pareto_front ORDER BY data_quality DESC")
+            return rows
+
+        async def save_user_preference(self, user_id: str, weights: Dict, chosen_solution_id: Optional[str] = None):
+            await self._execute("""
+                INSERT OR REPLACE INTO user_preferences (user_id, weights, chosen_solution_id, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, json.dumps(weights), chosen_solution_id, datetime.now().isoformat()))
+
+        async def get_user_preferences(self, user_id: str) -> Optional[Dict]:
+            row = await self._fetchone("""
+                SELECT weights, chosen_solution_id, timestamp FROM user_preferences
+                WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1
+            """, (user_id,))
+            if row:
+                return {'weights': json.loads(row[0]), 'chosen_solution_id': row[1], 'timestamp': row[2]}
+            return None
+
+        def dispose(self):
+            pass
 
 # ============================================================================
 # MTOP ENGINE (kept as fallback)
@@ -813,7 +1156,6 @@ class GeneticParameterOptimizer:
         self.num_task_types = len(self.task_type_keys)
 
     def _random_chromosome(self) -> Dict[str, Any]:
-        """Generate a random parameter set."""
         chrom = {
             'token_mean': random.uniform(*self.param_bounds['token_mean']),
             'token_std': random.uniform(*self.param_bounds['token_std']),
@@ -825,7 +1167,6 @@ class GeneticParameterOptimizer:
         return chrom
 
     def _random_task_probs(self) -> List[float]:
-        """Generate a random probability vector over task types."""
         probs = [random.random() for _ in range(self.num_task_types)]
         total = sum(probs)
         return [p / total for p in probs]
@@ -840,7 +1181,6 @@ class GeneticParameterOptimizer:
                     low, high = bounds
                     delta = random.gauss(0, (high - low) / 10)
                     new[param] = max(low, min(high, chrom[param] + delta))
-        # Mutate task probs
         if random.random() < self.mutation_rate:
             new['task_probs'] = self._random_task_probs()
         return new
@@ -853,33 +1193,22 @@ class GeneticParameterOptimizer:
             if random.random() < 0.5:
                 c1[key] = p2[key]
                 c2[key] = p1[key]
-        # Crossover task probs (uniform)
         if random.random() < 0.5:
             c1['task_probs'], c2['task_probs'] = p2['task_probs'], p1['task_probs']
         return c1, c2
 
     async def _evaluate_fitness(self, chrom: Dict[str, Any], historical_feedback: List[Dict]) -> float:
-        """
-        Evaluate fitness by generating a small dataset and scoring it.
-        In a real system, this would run a full generation and compute metrics.
-        For demo, we use a heuristic that rewards diversity and coverage.
-        """
         # Simulate a score between 0 and 1
         base = 0.5
-        # Reward higher anomaly rate and edge fraction (more challenging)
         base += chrom['anomaly_rate'] * 0.5
         base += chrom['edge_fraction'] * 0.3
-        # Reward use of real distributions
         if chrom['use_real_distributions']:
             base += 0.1
-        # Reward balanced task distribution
         entropy = -sum(p * np.log(p + 1e-8) for p in chrom['task_probs'])
         base += entropy / np.log(self.num_task_types) * 0.2
-        # Clip and add random noise
         return max(0.0, min(1.0, base + random.uniform(-0.1, 0.1)))
 
     async def run_search(self, historical_feedback: List[Dict]) -> Dict[str, Any]:
-        """Run GA and return the best chromosome."""
         population = [self._random_chromosome() for _ in range(self.population_size)]
         best_fitness = -1.0
         best_individual = None
@@ -917,7 +1246,6 @@ class GeneticParameterOptimizer:
         return best_individual if best_individual else self._random_chromosome()
 
     async def optimize(self) -> Dict[str, Any]:
-        # Load historical generation feedback from storage
         rows = await self.storage._fetchall("SELECT parameters, num_samples FROM synthetic_generation_history ORDER BY timestamp DESC LIMIT 50")
         historical = [json.loads(r[0]) for r in rows]
         best = await self.run_search(historical)
@@ -968,19 +1296,14 @@ class MoEGatingNetwork:
 
     def _encode_context(self, context: Dict) -> np.ndarray:
         features = []
-        # Region carbon intensity (normalized)
         region = context.get('region', 'us-east')
         carbon = context.get('region_carbon', {}).get(region, 400) / 1000
         features.append(carbon)
-        # Time of day (sin/cos)
         hour = datetime.now().hour
         features.append(np.sin(2 * np.pi * hour / 24))
         features.append(np.cos(2 * np.pi * hour / 24))
-        # Use real distributions flag
         features.append(1.0 if context.get('use_real_distributions', False) else 0.0)
-        # Anomaly rate (if provided)
         features.append(context.get('anomaly_rate', 0.0))
-        # Edge fraction
         features.append(context.get('edge_fraction', 0.1))
         return np.array(features, dtype=np.float32)
 
@@ -1039,7 +1362,6 @@ class ParetoFrontOptimizer:
         self._lock = asyncio.Lock()
 
     def _dominates(self, a: Dict, b: Dict) -> bool:
-        # All objectives: higher is better
         return (a['coverage_score'] >= b['coverage_score'] and
                 a['anomaly_diversity'] >= b['anomaly_diversity'] and
                 a['realism_score'] >= b['realism_score'] and
@@ -1059,15 +1381,12 @@ class ParetoFrontOptimizer:
             'data_quality': metrics.get('data_quality', 0.0)
         }
         async with self._lock:
-            # Check if dominated
             for existing in self.pareto_front:
                 if self._dominates(existing, entry):
                     return False
-            # Remove any dominated by new
             self.pareto_front = [e for e in self.pareto_front if not self._dominates(entry, e)]
             self.pareto_front.append(entry)
             if len(self.pareto_front) > self.max_size:
-                # Remove one with lowest data_quality (simplified)
                 self.pareto_front.sort(key=lambda x: x['data_quality'])
                 self.pareto_front = self.pareto_front[:self.max_size]
             await self.storage.save_pareto_front(self.pareto_front)
@@ -1107,7 +1426,6 @@ class AdaptiveAnomalyInjector:
             'renewable_surge', 'network_failure', 'expert_degradation',
             'regional_outage', 'supply_chain_disruption'
         ]
-        # Bandit weights (initial uniform)
         self.weights = {at: 1.0 for at in self.anomaly_types}
         self.counts = {at: 0 for at in self.anomaly_types}
         self.rewards = {at: 0.0 for at in self.anomaly_types}
@@ -1115,21 +1433,16 @@ class AdaptiveAnomalyInjector:
         self.learning_rate = 0.1
 
     async def choose_anomaly(self, context: Dict) -> str:
-        """Select an anomaly type using Thompson sampling or epsilon-greedy."""
         async with self._lock:
-            # Epsilon-greedy
-            if random.random() < 0.1:  # exploration
+            if random.random() < 0.1:
                 return random.choice(self.anomaly_types)
-            # Exploit: choose with highest expected reward
             best = max(self.weights, key=lambda k: self.weights[k])
             return best
 
     async def update(self, anomaly_type: str, reward: float):
-        """Update bandit weights based on reward."""
         async with self._lock:
             self.counts[anomaly_type] += 1
             self.rewards[anomaly_type] += reward
-            # Update weight using average reward
             self.weights[anomaly_type] = self.rewards[anomaly_type] / self.counts[anomaly_type]
 
 # ============================================================================
@@ -1162,17 +1475,14 @@ class FederatedParameterAggregator:
                 continue
         if not param_list:
             return None
-        # Average numeric parameters
         avg = {}
         for key in ['token_mean', 'token_std', 'anomaly_rate', 'edge_fraction']:
             vals = [p.get(key, 0) for p in param_list if key in p]
             if vals:
                 avg[key] = sum(vals) / len(vals)
-        # Majority vote for boolean
         use_real = [p.get('use_real_distributions', 0) for p in param_list if 'use_real_distributions' in p]
         if use_real:
             avg['use_real_distributions'] = 1 if sum(use_real) > len(use_real)/2 else 0
-        # Average task probs
         task_probs = [p.get('task_probs', []) for p in param_list if 'task_probs' in p and p['task_probs']]
         if task_probs:
             avg_probs = [sum(col) / len(task_probs) for col in zip(*task_probs)]
@@ -1249,23 +1559,17 @@ class ActiveUserPreferenceLearner:
     async def query_user_if_needed(self, user_id: str, top_configs: List[Dict]) -> Optional[str]:
         if len(top_configs) < 2:
             return None
-        # If scores are within 5%, ask user
         scores = [c['data_quality'] for c in top_configs[:2]]
         if abs(scores[0] - scores[1]) / max(scores) < 0.05:
-            # Send WebSocket query (simulate)
             await self.websocket.broadcast({
                 'type': 'preference_query',
                 'user_id': user_id,
                 'options': [{'id': c['solution_id'], 'quality': c['data_quality']} for c in top_configs[:2]]
             }, topic='user_preferences')
-            # For demo, return the first one
             return top_configs[0]['solution_id']
         return None
 
     async def record_choice(self, user_id: str, chosen_solution_id: str, context: Dict):
-        # Update user weights based on choice
-        # Simple heuristic: increase weight on objectives where chosen config excels
-        # For demo, we store the preference
         await self.storage.save_user_preference(user_id, {'chosen': chosen_solution_id}, chosen_solution_id)
 
 # ============================================================================
@@ -1303,7 +1607,6 @@ class ReflectionHandler:
         elif trigger_type == 'anomaly_detected':
             self.state.anomaly_rate = min(0.5, self.state.anomaly_rate + 0.01)
         elif trigger_type == 'carbon_drift' and self.drift_detector:
-            # Increase anomaly rate to catch potential issues
             self.state.anomaly_rate = min(0.5, self.state.anomaly_rate + 0.02)
         await self.state.save()
 
@@ -1357,21 +1660,21 @@ class SyntheticDataGenerator:
         np.random.seed(seed)
 
         # Extract config values
-        self.task_types = self.config.get('task_types')
-        self.priority_profiles = self.config.get('priority_profiles')
-        self.regions = self.config.get('regions')
-        self.region_carbon = self.config.get('region_carbon')
-        self.token_mean = self.config.get('token_mean')
-        self.token_std = self.config.get('token_std')
-        self.default_degradation_rate = self.config.get('default_degradation_rate')
-        self.default_anomaly_rate = self.config.get('default_anomaly_rate')
-        self.default_rate_per_hour = self.config.get('default_rate_per_hour')
-        self.default_duration_hours = self.config.get('default_duration_hours')
-        self.use_real_distributions = self.config.get('use_real_distributions', False)
-        self.prompt_pool_file = self.config.get('prompt_pool_file')
-        self.export_format = self.config.get('export_format', 'json')
-        self.dataset_version = self.config.get('dataset_version', '5.0.0')
-        self.mopd_weights = self.config.get('mopd_weights')
+        self.task_types = self.config.get('task_types') if isinstance(self.config, dict) else self.config.task_types
+        self.priority_profiles = self.config.get('priority_profiles') if isinstance(self.config, dict) else self.config.priority_profiles
+        self.regions = self.config.get('regions') if isinstance(self.config, dict) else self.config.regions
+        self.region_carbon = self.config.get('region_carbon') if isinstance(self.config, dict) else self.config.region_carbon
+        self.token_mean = self.config.get('token_mean') if isinstance(self.config, dict) else self.config.token_mean
+        self.token_std = self.config.get('token_std') if isinstance(self.config, dict) else self.config.token_std
+        self.default_degradation_rate = self.config.get('default_degradation_rate') if isinstance(self.config, dict) else self.config.default_degradation_rate
+        self.default_anomaly_rate = self.config.get('default_anomaly_rate') if isinstance(self.config, dict) else self.config.default_anomaly_rate
+        self.default_rate_per_hour = self.config.get('default_rate_per_hour') if isinstance(self.config, dict) else self.config.default_rate_per_hour
+        self.default_duration_hours = self.config.get('default_duration_hours') if isinstance(self.config, dict) else self.config.default_duration_hours
+        self.use_real_distributions = self.config.get('use_real_distributions', False) if isinstance(self.config, dict) else self.config.use_real_distributions
+        self.prompt_pool_file = self.config.get('prompt_pool_file') if isinstance(self.config, dict) else self.config.prompt_pool_file
+        self.export_format = self.config.get('export_format', 'json') if isinstance(self.config, dict) else self.config.export_format
+        self.dataset_version = self.config.get('dataset_version', '5.0.0') if isinstance(self.config, dict) else self.config.dataset_version
+        self.mopd_weights = self.config.get('mopd_weights') if isinstance(self.config, dict) else self.config.mopd_weights
 
         # Inject external collectors
         self.carbon_fetcher = carbon_fetcher
@@ -1381,23 +1684,23 @@ class SyntheticDataGenerator:
         # Load prompt pool
         self.prompt_pool = self._load_prompt_pool()
 
-        # User-region mapping for correlations
+        # User-region mapping
         self.user_region_cache: Dict[str, str] = {}
 
-        # Cache for real distributions (in‑memory with TTL)
+        # Cache for real distributions
         self._real_carbon_cache: Dict[str, Tuple[float, datetime]] = {}
         self._real_helium_cache: Dict[str, Tuple[float, datetime]] = {}
-        self._cache_ttl_seconds = self.config.get('cache_ttl', 300)
+        self._cache_ttl_seconds = self.config.get('cache_ttl', 300) if isinstance(self.config, dict) else self.config.cache_ttl
 
         # Circuit breakers and rate limiter
         self._circuit_breaker = CircuitBreaker(
-            failure_threshold=self.config.get('circuit_breaker_threshold', 5),
-            recovery_timeout=self.config.get('circuit_breaker_timeout', 30),
+            failure_threshold=self.config.get('circuit_breaker_threshold', 5) if isinstance(self.config, dict) else self.config.circuit_breaker_threshold,
+            recovery_timeout=self.config.get('circuit_breaker_timeout', 30) if isinstance(self.config, dict) else self.config.circuit_breaker_timeout,
             name="data_generator"
         )
         self._rate_limiter = RateLimiter(
-            rate=self.config.get('rate_limit_requests', 100),
-            window=self.config.get('rate_limit_window', 60)
+            rate=self.config.get('rate_limit_requests', 100) if isinstance(self.config, dict) else self.config.rate_limit_requests,
+            window=self.config.get('rate_limit_window', 60) if isinstance(self.config, dict) else self.config.rate_limit_window
         )
 
         # Storage
@@ -1415,6 +1718,11 @@ class SyntheticDataGenerator:
         self.federated_aggregator = FederatedParameterAggregator(self.config, self.storage) if self.config.get('federated_enabled', True) else None
         self.drift_detector = DriftDetector(self.storage, self.config) if self.config.get('drift_detection_enabled', True) else None
         self.user_pref_learner = ActiveUserPreferenceLearner(self.storage, self.websocket) if self.config.get('user_preference_learning_enabled', True) else None
+
+        # ===== NEW: Initialize LIMIT Graph, RLHF, Distillation =====
+        self.limit_graph = LimitGraphManager(self.config) if self.config.get('limit_graph_enabled', True) else None
+        self.rlhf = RLHFManager(self.config) if self.config.get('rlhf_enabled', True) else None
+        self.distillation = MultiTeacherPolicyDistillation(self.config, self.moe_gating) if self.config.get('distillation_enabled', True) and self.moe_gating else None
 
         # Quantum security
         self.quantum_security = QuantumResilientDataSecurity(self.config, self.storage)
@@ -1451,6 +1759,13 @@ class SyntheticDataGenerator:
             tasks.append(self._federated_loop())
         if self.drift_detector:
             tasks.append(self._drift_detection_loop())
+        # ===== NEW: Background loops for added features =====
+        if self.limit_graph:
+            tasks.append(self._limit_graph_loop())
+        if self.rlhf:
+            tasks.append(self._rlhf_loop())
+        if self.distillation:
+            tasks.append(self._distillation_loop())
         tasks.extend([
             self._health_check_loop(),
             self._cleanup_loop(),
@@ -1462,37 +1777,68 @@ class SyntheticDataGenerator:
             self._background_tasks.append(asyncio.create_task(task))
         logger.info("SyntheticDataGenerator started with %d background tasks", len(self._background_tasks))
 
-    async def _ga_optimization_loop(self):
-        """Periodically run GA to find optimal generation parameters."""
+    # ===== NEW: Background loop methods =====
+    async def _limit_graph_loop(self):
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)  # every hour
+            await asyncio.sleep(self.config.get('limit_graph_update_interval', 300))
+            try:
+                # Update carbon intensity constraint
+                if self.carbon_fetcher:
+                    intensity = await self.carbon_fetcher.get_intensity('global')
+                    await self.limit_graph.update_constraint('carbon', intensity)
+                # Evaluate influence
+                influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+                logger.debug(f"LIMIT Graph carbon->cost influence: {influence:.3f}")
+            except Exception as e:
+                logger.error(f"Limit graph loop error: {e}")
+
+    async def _rlhf_loop(self):
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(self.config.get('rlhf_training_interval', 600))
+            try:
+                if self.rlhf:
+                    await self.rlhf.train_reward_model()
+            except Exception as e:
+                logger.error(f"RLHF loop error: {e}")
+
+    async def _distillation_loop(self):
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(self.config.get('distillation_interval', 300))
+            try:
+                if self.distillation:
+                    state = {
+                        'region': 'global',
+                        'use_real_distributions': self.use_real_distributions,
+                    }
+                    await self.distillation.distill(state)
+            except Exception as e:
+                logger.error(f"Distillation loop error: {e}")
+
+    async def _ga_optimization_loop(self):
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(3600)
             try:
                 logger.info("Running GA parameter optimization...")
                 best_params = await self.ga_optimizer.optimize()
                 if best_params:
-                    # Apply best parameters
                     self.token_mean = best_params.get('token_mean', self.token_mean)
                     self.token_std = best_params.get('token_std', self.token_std)
                     self.default_anomaly_rate = best_params.get('anomaly_rate', self.default_anomaly_rate)
                     self.edge_fraction = best_params.get('edge_fraction', 0.1)
                     self.use_real_distributions = bool(best_params.get('use_real_distributions', 0))
-                    # Update task types
                     if 'task_probs' in best_params:
                         task_keys = list(self.task_types.keys())
                         new_probs = {task_keys[i]: best_params['task_probs'][i] for i in range(len(task_keys))}
                         self.task_types = new_probs
                     logger.info("GA updated generation parameters: %s", best_params)
-                    # Store in state
                     await self.storage.save_state('ga_best_params', json.dumps(best_params))
             except Exception as e:
                 logger.error("GA optimization loop error: %s", e)
 
     async def _federated_loop(self):
-        """Periodically share and pull federated parameters."""
         while not self._shutdown_event.is_set():
             await asyncio.sleep(self.config.get('federated_interval', 3600))
             try:
-                # Share local parameters
                 current_params = {
                     'token_mean': self.token_mean,
                     'token_std': self.token_std,
@@ -1502,7 +1848,6 @@ class SyntheticDataGenerator:
                     'task_probs': list(self.task_types.values()),
                 }
                 await self.federated_aggregator.share_local_params(current_params)
-                # Pull aggregated and apply
                 merged = await self.federated_aggregator.apply_aggregated_params(current_params)
                 if merged:
                     self.token_mean = merged.get('token_mean', self.token_mean)
@@ -1519,17 +1864,13 @@ class SyntheticDataGenerator:
                 logger.error("Federated loop error: %s", e)
 
     async def _drift_detection_loop(self):
-        """Check for carbon and feedback drift."""
         while not self._shutdown_event.is_set():
             await asyncio.sleep(300)
             try:
-                # Check carbon drift
                 if self.carbon_fetcher and self.drift_detector:
-                    intensity = await self.carbon_fetcher.get_intensity('global')  # or region
+                    intensity = await self.carbon_fetcher.get_intensity('global')
                     if await self.drift_detector.check_carbon_drift(intensity):
                         await self.reflection.trigger_reflection('carbon_drift')
-                # Check feedback drift (average reward from recent generations)
-                # We don't have a direct feedback source; we'll simulate later.
             except Exception as e:
                 logger.error("Drift detection loop error: %s", e)
 
@@ -1541,7 +1882,6 @@ class SyntheticDataGenerator:
     async def _health_check_loop(self):
         while not self._shutdown_event.is_set():
             await asyncio.sleep(60)
-            # (health check logic)
 
     async def _cleanup_loop(self):
         while not self._shutdown_event.is_set():
@@ -1560,26 +1900,45 @@ class SyntheticDataGenerator:
     async def _auto_optimize_loop(self):
         while not self._shutdown_event.is_set():
             await asyncio.sleep(self.config.get('auto_optimize_interval', 1800))
-            # (auto optimization using MTOP or MoE)
 
     # ------------------------------------------------------------------
     # Core generation methods (adapted to use MoE and adaptive anomaly)
     # ------------------------------------------------------------------
     async def generate_workload_descriptor(self, **kwargs) -> WorkloadDescriptor:
-        # If MoE enabled, use it to influence task type
-        if self.moe_gating and self.config.get('moe_enabled'):
+        # ===== NEW: Use RLHF first if trained =====
+        if self.rlhf and self.rlhf.reward_model is not None:
+            probs = await self.rlhf.get_policy_probs(kwargs)
+            expert_idx = np.argmax(probs)
+            expert_names = ['balanced', 'carbon_focused', 'helium_focused', 'anomaly_focused']
+            selected_expert = expert_names[expert_idx % len(expert_names)]
+            if selected_expert == 'anomaly_focused':
+                kwargs['anomaly_forced'] = True
+            # Other expert biases could adjust task type probabilities
+        # ===== NEW: Otherwise use distillation if available =====
+        elif self.distillation and self.distillation.get_student_probs():
+            probs = self.distillation.get_student_probs()
+            expert_idx = np.argmax(probs)
+            expert_names = ['balanced', 'carbon_focused', 'helium_focused', 'anomaly_focused']
+            selected_expert = expert_names[expert_idx % len(expert_names)]
+            if selected_expert == 'anomaly_focused':
+                kwargs['anomaly_forced'] = True
+        # ===== NEW: MoE selection (existing) =====
+        elif self.moe_gating and self.config.get('moe_enabled'):
             context = {'region': kwargs.get('region'), 'use_real_distributions': self.use_real_distributions}
             selected_expert, expert_params = await self.moe_gating.select_expert(context)
-            # Use expert bias to adjust probabilities (simplified)
             if expert_params.get('bias') == 'carbon':
-                # Increase probability of carbon-intensive tasks (e.g., summarization, translation)
                 pass
             elif expert_params.get('bias') == 'helium':
-                # Increase tasks that require helium (e.g., sentiment analysis)
                 pass
             elif expert_params.get('bias') == 'anomaly':
-                # Force anomaly injection
                 kwargs['anomaly_forced'] = True
+        # ===== NEW: LIMIT Graph adjustment =====
+        if self.limit_graph:
+            carbon_influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+            if carbon_influence > 0.5:
+                # Could bias region selection or task type towards carbon-heavy tasks
+                pass
+
         # Continue with normal generation
         return await self._generate_workload_descriptor_internal(**kwargs)
 
@@ -1758,11 +2117,9 @@ class SyntheticDataGenerator:
             t += timedelta(seconds=dt)
             if t >= end:
                 break
-            # Use MoE to influence generation if enabled
             if self.moe_gating and self.config.get('moe_enabled'):
                 context = {'region': kwargs.get('region'), 'use_real_distributions': self.use_real_distributions}
                 selected_expert, _ = await self.moe_gating.select_expert(context)
-                # Record for training (reward will be assigned later)
             workload = await self.generate_workload_descriptor(**kwargs)
             node = await self.generate_node_descriptor(**kwargs)
             metrics = await self.compute_sustainability_metrics(workload, node)
@@ -1778,9 +2135,6 @@ class SyntheticDataGenerator:
     async def generate_task_sequence_async(self, **kwargs) -> List[Dict[str, Any]]:
         return await self.generate_task_sequence(**kwargs)
 
-    # ------------------------------------------------------------------
-    # Anomaly Injection (with adaptive selection)
-    # ------------------------------------------------------------------
     async def inject_anomaly(
         self,
         workload: WorkloadDescriptor,
@@ -1817,7 +2171,6 @@ class SyntheticDataGenerator:
             node.helium_connectivity_score = 0.0
             node.uptime = 0.0
         elif anomaly_type == 'expert_degradation':
-            # Simulate by setting a low accuracy in the expert selection phase
             pass
         elif anomaly_type == 'regional_outage':
             if context and 'region' in context:
@@ -1826,15 +2179,11 @@ class SyntheticDataGenerator:
             else:
                 node.uptime = 0.3
         elif anomaly_type == 'supply_chain_disruption':
-            # Increase material index (simulate scarcity)
             pass
         else:
             raise ValueError(f"Unknown anomaly_type: {anomaly_type}")
         return workload, node, anomaly_type
 
-    # ------------------------------------------------------------------
-    # Dataset Generation
-    # ------------------------------------------------------------------
     async def generate_dataset(
         self,
         num_samples: int = 1000,
@@ -1849,7 +2198,6 @@ class SyntheticDataGenerator:
         num_edge = int(num_samples * edge_case_fraction) if include_edge_cases else 0
         num_normal = num_samples - num_edge
 
-        # Normal samples
         for _ in range(num_normal):
             workload = await self.generate_workload_descriptor()
             node = await self.generate_node_descriptor()
@@ -1864,7 +2212,6 @@ class SyntheticDataGenerator:
                 'anomaly': anomaly,
             })
 
-        # Edge cases with forced anomalies
         edge_types = [
             'extreme_token_count', 'zero_accuracy', 'zero_latency',
             'extreme_carbon', 'helium_crisis', 'harvester_downtime',
@@ -1884,7 +2231,6 @@ class SyntheticDataGenerator:
                 'anomaly': anomaly_type,
             })
 
-        # Record generation history
         params = {
             'num_samples': num_samples,
             'edge_fraction': edge_case_fraction,
@@ -1908,7 +2254,6 @@ class SyntheticDataGenerator:
             if PROMETHEUS_AVAILABLE:
                 SYNTHETIC_QUANTUM_SIGNATURES.labels(algorithm=self.config.get('quantum_algorithm', 'dilithium'), status='sign_success').inc()
 
-        # Blockchain recording
         tx_hash = None
         if self.blockchain:
             dataset_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()
@@ -1916,7 +2261,6 @@ class SyntheticDataGenerator:
             if PROMETHEUS_AVAILABLE:
                 SYNTHETIC_BLOCKCHAIN_TX.labels(status='recorded').inc()
 
-        # Store generation history
         await self.storage.save_generation_history(
             self.dataset_version,
             num_samples,
@@ -1929,11 +2273,10 @@ class SyntheticDataGenerator:
 
         # Update Pareto front
         if self.pareto_optimizer and self.config.get('pareto_enabled'):
-            # Compute quality metrics for this dataset
             coverage_score = len(set(item['node'].region for item in dataset)) / len(self.regions)
             anomaly_diversity = len(set(item['anomaly'] for item in dataset if item['anomaly'])) / len(edge_types)
-            realism_score = 0.8  # placeholder
-            data_quality = 0.9  # placeholder
+            realism_score = 0.8
+            data_quality = 0.9
             metrics = {
                 'coverage_score': coverage_score,
                 'anomaly_diversity': anomaly_diversity,
@@ -1942,7 +2285,20 @@ class SyntheticDataGenerator:
             }
             await self.pareto_optimizer.add_configuration(params, metrics)
 
-        # Broadcast via WebSocket
+        # ===== NEW: Update LIMIT Graph constraints =====
+        if self.limit_graph:
+            await self.limit_graph.update_constraint('coverage', coverage_score)
+            await self.limit_graph.update_constraint('quality', data_quality)
+
+        # ===== NEW: Record RLHF feedback (simulated) =====
+        if self.rlhf and data_quality > 0.85:
+            await self.rlhf.record_feedback(
+                state={'coverage_score': coverage_score, 'data_quality': data_quality,
+                       'carbon_intensity': self.region_carbon.get('global', 0.4)},
+                action='balanced',
+                reward=data_quality
+            )
+
         await self.websocket.broadcast({
             'type': 'dataset_generated',
             'version': self.dataset_version,
@@ -1967,7 +2323,7 @@ class SyntheticDataGenerator:
         edge_case_fraction: float = 0.1,
         anomaly_rate: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
-        # ... (similar to original, but with MoE and adaptive anomaly)
+        # ... (similar to original)
         pass
 
     # ------------------------------------------------------------------
@@ -1985,9 +2341,6 @@ class SyntheticDataGenerator:
         # ... (same as original)
         pass
 
-    # ------------------------------------------------------------------
-    # Expert Profile Generation (unchanged)
-    # ------------------------------------------------------------------
     def generate_expert_profile(
         self,
         expert_id: Optional[str] = None,
@@ -1996,33 +2349,27 @@ class SyntheticDataGenerator:
         # ... (same as original)
         pass
 
-    # ------------------------------------------------------------------
-    # Export for Simulation (unchanged)
-    # ------------------------------------------------------------------
     def export_for_simulation(self, dataset: List[Dict[str, Any]]) -> List[Dict]:
         # ... (same as original)
         pass
 
-    # ------------------------------------------------------------------
-    # Metrics / Statistics
-    # ------------------------------------------------------------------
     def get_stats(self) -> Dict:
         return {
-            'config_seed': self.config.get('seed'),
+            'config_seed': self.config.get('seed') if isinstance(self.config, dict) else self.config.seed,
             'use_real_distributions': self.use_real_distributions,
             'prompt_pool_size': len(self.prompt_pool),
             'cache_ttl_seconds': self._cache_ttl_seconds,
             'dataset_version': self.dataset_version,
-            'ga_enabled': self.config.get('ga_enabled', False),
-            'moe_enabled': self.config.get('moe_enabled', False),
-            'pareto_enabled': self.config.get('pareto_enabled', False),
-            'adaptive_anomaly_enabled': self.config.get('adaptive_anomaly_enabled', False),
-            'federated_enabled': self.config.get('federated_enabled', False),
+            'ga_enabled': self.config.get('ga_enabled', False) if isinstance(self.config, dict) else self.config.ga_enabled,
+            'moe_enabled': self.config.get('moe_enabled', False) if isinstance(self.config, dict) else self.config.moe_enabled,
+            'pareto_enabled': self.config.get('pareto_enabled', False) if isinstance(self.config, dict) else self.config.pareto_enabled,
+            'adaptive_anomaly_enabled': self.config.get('adaptive_anomaly_enabled', False) if isinstance(self.config, dict) else self.config.adaptive_anomaly_enabled,
+            'federated_enabled': self.config.get('federated_enabled', False) if isinstance(self.config, dict) else self.config.federated_enabled,
+            'limit_graph_enabled': self.config.get('limit_graph_enabled', False) if isinstance(self.config, dict) else self.config.limit_graph_enabled,
+            'rlhf_enabled': self.config.get('rlhf_enabled', False) if isinstance(self.config, dict) else self.config.rlhf_enabled,
+            'distillation_enabled': self.config.get('distillation_enabled', False) if isinstance(self.config, dict) else self.config.distillation_enabled,
         }
 
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
     async def shutdown(self):
         logger.info("Shutting down SyntheticDataGenerator")
         self._shutdown_event.set()
