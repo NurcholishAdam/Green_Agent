@@ -3,7 +3,8 @@
 Decision Audit & Dashboard Persistence
 =======================================
 Enhanced FastAPI server for decision audit, benchmark results, drift events,
-MoE expert metrics, and MODP Pareto front – with central component integration.
+MoE expert metrics, MODP Pareto front, LIMIT Graph, RLHF preference pairs,
+and bio‑inspired optimizer runs – with central component integration.
 """
 
 import asyncio
@@ -11,7 +12,7 @@ import threading
 import time
 import uuid
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Header, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
@@ -27,6 +28,21 @@ from ..feedback.adaptive_cost import AdaptiveCostFunction
 from ..safety.drift_detector import DriftDetector
 from ..scaling.message_queue import AsyncMessageQueue
 from ..metrics import MetricsRegistry
+
+# Import new components (with fallback)
+try:
+    from ..core import (
+        LimitGraphManager,
+        MODPOptimizer,
+        RLHFTrainer,
+        ParticleSwarmOptimizer,
+        MoEGatingNetwork,
+        GeneticHyperparameterOptimizer,
+    )
+    ENHANCEMENTS_CORE_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_CORE_AVAILABLE = False
+    logger.warning("Enhanced core components not available; some dashboard features will be disabled.")
 
 # --------------------------------------------------------------------------
 # Security
@@ -97,6 +113,40 @@ class ParetoFrontResponse(BaseModel):
     latency_ms: float
     energy_joules: float
 
+class LimitGraphNodeResponse(BaseModel):
+    node_id: str
+    graph_id: str
+    node_type: Optional[str]
+    attributes: Dict[str, Any]
+    timestamp: str
+
+class LimitGraphEdgeResponse(BaseModel):
+    edge_id: str
+    graph_id: str
+    source_node: str
+    target_node: str
+    weight: Optional[float]
+    attributes: Dict[str, Any]
+    timestamp: str
+
+class RLHFPairResponse(BaseModel):
+    pair_id: str
+    prompt: str
+    chosen_response: str
+    rejected_response: str
+    reward_difference: float
+    metadata: Optional[Dict[str, Any]]
+    timestamp: str
+
+class BioRunResponse(BaseModel):
+    run_id: str
+    algorithm: str
+    problem_id: Optional[str]
+    parameters: Dict[str, Any]
+    best_solution: Dict[str, Any]
+    best_fitness: float
+    timestamp: str
+
 # --------------------------------------------------------------------------
 # Request logging middleware
 # --------------------------------------------------------------------------
@@ -120,7 +170,8 @@ async def log_requests(request: Request, call_next):
 class DecisionAudit:
     """
     Handles high‑fidelity decision logging and exposure via a FastAPI REST API.
-    Enhanced with authentication, pagination, filtering, MoE metrics, and MODP.
+    Enhanced with authentication, pagination, filtering, MoE metrics, MODP,
+    LIMIT Graph, RLHF, and bio‑inspired optimizer endpoints.
     """
 
     def __init__(
@@ -141,6 +192,29 @@ class DecisionAudit:
         self.metrics = metrics
         self.bio_core = bio_core
 
+        # Instantiate new components if available and storage supports them
+        self.limit_graph_manager = None
+        self.modp_solver = None
+        self.rlhf_trainer = None
+        self.pso_optimizer = None
+        self.moe_gating = None
+        self.ga_optimizer = None
+
+        if ENHANCEMENTS_CORE_AVAILABLE and storage:
+            # Check if storage has the necessary methods (simple check via hasattr)
+            if hasattr(storage, 'save_limit_graph_metadata'):
+                self.limit_graph_manager = LimitGraphManager(storage)
+            if hasattr(storage, 'save_modp_state'):
+                self.modp_solver = MODPOptimizer(storage)
+            if hasattr(storage, 'save_preference_pair'):
+                self.rlhf_trainer = RLHFTrainer(storage)
+            if hasattr(storage, 'save_bio_run'):
+                self.pso_optimizer = ParticleSwarmOptimizer(storage, config if hasattr(config, 'dict') else config.__dict__)
+            if hasattr(storage, 'log_routing_decision'):
+                self.moe_gating = MoEGatingNetwork(storage, config if hasattr(config, 'dict') else config.__dict__)
+            if hasattr(storage, 'save_ga_population'):
+                self.ga_optimizer = GeneticHyperparameterOptimizer(storage, config if hasattr(config, 'dict') else config.__dict__)
+
         self._app: Optional[FastAPI] = None
         self._server: Optional[uvicorn.Server] = None
         self._server_thread: Optional[threading.Thread] = None
@@ -159,9 +233,21 @@ class DecisionAudit:
         # ----- Health (public) -----
         @self.router.get("/health")
         async def health():
-            return {"status": "healthy", "service": "green-agent-audit", "version": "3.3.0"}
+            return {
+                "status": "healthy",
+                "service": "green-agent-audit",
+                "version": "3.4.0",
+                "new_modules": {
+                    "limit_graph": self.limit_graph_manager is not None,
+                    "modp": self.modp_solver is not None,
+                    "rlhf": self.rlhf_trainer is not None,
+                    "pso": self.pso_optimizer is not None,
+                    "moe": self.moe_gating is not None,
+                    "ga": self.ga_optimizer is not None,
+                },
+            }
 
-        # ----- Decisions -----
+        # ----- Decisions (existing) -----
         @self.router.get("/decisions", response_model=DecisionListResponse)
         async def get_decisions(
             limit: int = Query(100, ge=1, le=1000),
@@ -207,7 +293,7 @@ class DecisionAudit:
                 logger.exception(f"Error fetching decision for task_id={task_id}")
                 raise HTTPException(status_code=500, detail="Internal server error")
 
-        # ----- Benchmarks -----
+        # ----- Benchmarks (existing) -----
         @self.router.get("/benchmark/latest", response_model=List[BenchmarkResultResponse])
         async def get_latest_benchmarks(api_key: str = Depends(verify_api_key)):
             """Return the most recent benchmark result for each policy."""
@@ -265,7 +351,7 @@ class DecisionAudit:
                 logger.exception("Error fetching benchmark history")
                 raise HTTPException(status_code=500, detail="Internal server error")
 
-        # ----- Drift events -----
+        # ----- Drift events (existing) -----
         @self.router.get("/drift/events", response_model=List[DriftEventResponse])
         async def get_drift_events(
             limit: int = Query(50, ge=1),
@@ -281,7 +367,7 @@ class DecisionAudit:
                 logger.exception("Error fetching drift events")
                 raise HTTPException(status_code=500, detail="Internal server error")
 
-        # ----- MoE Expert Metrics (NEW) -----
+        # ----- MoE Expert Metrics (existing) -----
         @self.router.get("/experts/metrics", response_model=List[ExpertMetricsResponse])
         async def get_expert_metrics(
             api_key: str = Depends(verify_api_key),
@@ -306,7 +392,7 @@ class DecisionAudit:
                 logger.exception("Error fetching expert metrics")
                 raise HTTPException(status_code=500, detail="Internal server error")
 
-        # ----- MODP Pareto Front (NEW) -----
+        # ----- MODP Pareto Front (existing) -----
         @self.router.get("/mopd/pareto-front", response_model=List[ParetoFrontResponse])
         async def get_pareto_front(
             api_key: str = Depends(verify_api_key),
@@ -330,7 +416,7 @@ class DecisionAudit:
                 logger.exception("Error fetching Pareto front")
                 raise HTTPException(status_code=500, detail="Internal server error")
 
-        # ----- Adaptive Cost Weights (NEW) -----
+        # ----- Adaptive Cost Weights (existing) -----
         @self.router.get("/mopd/weights")
         async def get_adaptive_weights(api_key: str = Depends(verify_api_key)):
             """Get current adaptive cost weights."""
@@ -352,6 +438,119 @@ class DecisionAudit:
             except Exception as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
+        # ------------------- NEW ENDPOINTS (v3.4.0) -------------------
+
+        # ----- LIMIT Graph -----
+        @self.router.get("/limit-graph/{graph_id}/nodes", response_model=List[LimitGraphNodeResponse])
+        async def get_limit_graph_nodes(graph_id: str, api_key: str = Depends(verify_api_key)):
+            if self.limit_graph_manager is None:
+                raise HTTPException(status_code=404, detail="LimitGraphManager not available")
+            try:
+                nodes = self.limit_graph_manager.get_nodes(graph_id)
+                return nodes
+            except Exception:
+                logger.exception(f"Error fetching LIMIT graph nodes for {graph_id}")
+                raise HTTPException(status_code=500, detail="Internal server error")
+
+        @self.router.get("/limit-graph/{graph_id}/edges", response_model=List[LimitGraphEdgeResponse])
+        async def get_limit_graph_edges(graph_id: str, api_key: str = Depends(verify_api_key)):
+            if self.limit_graph_manager is None:
+                raise HTTPException(status_code=404, detail="LimitGraphManager not available")
+            try:
+                edges = self.limit_graph_manager.get_edges(graph_id)
+                return edges
+            except Exception:
+                logger.exception(f"Error fetching LIMIT graph edges for {graph_id}")
+                raise HTTPException(status_code=500, detail="Internal server error")
+
+        @self.router.post("/limit-graph/{graph_id}/nodes")
+        async def add_limit_graph_node(
+            graph_id: str,
+            node_id: str,
+            node_type: Optional[str] = None,
+            attributes: Dict[str, Any] = {},
+            api_key: str = Depends(verify_api_key),
+        ):
+            if self.limit_graph_manager is None:
+                raise HTTPException(status_code=404, detail="LimitGraphManager not available")
+            self.limit_graph_manager.add_node(graph_id, node_id, node_type, attributes)
+            return {"status": "success", "node_id": node_id}
+
+        @self.router.post("/limit-graph/{graph_id}/edges")
+        async def add_limit_graph_edge(
+            graph_id: str,
+            edge_id: str,
+            source: str,
+            target: str,
+            weight: Optional[float] = None,
+            attributes: Dict[str, Any] = {},
+            api_key: str = Depends(verify_api_key),
+        ):
+            if self.limit_graph_manager is None:
+                raise HTTPException(status_code=404, detail="LimitGraphManager not available")
+            self.limit_graph_manager.add_edge(edge_id, graph_id, source, target, weight, attributes)
+            return {"status": "success", "edge_id": edge_id}
+
+        # ----- RLHF Preference Pairs -----
+        @self.router.get("/rlhf/pairs", response_model=List[RLHFPairResponse])
+        async def get_rlhf_pairs(limit: int = Query(100, ge=1), api_key: str = Depends(verify_api_key)):
+            if self.rlhf_trainer is None:
+                raise HTTPException(status_code=404, detail="RLHFTrainer not available")
+            try:
+                pairs = self.rlhf_trainer.get_pairs(limit)
+                return pairs
+            except Exception:
+                logger.exception("Error fetching RLHF preference pairs")
+                raise HTTPException(status_code=500, detail="Internal server error")
+
+        @self.router.post("/rlhf/pairs")
+        async def record_rlhf_pair(
+            pair_id: str,
+            prompt: str,
+            chosen: str,
+            rejected: str,
+            reward_diff: float,
+            metadata: Optional[Dict[str, Any]] = None,
+            api_key: str = Depends(verify_api_key),
+        ):
+            if self.rlhf_trainer is None:
+                raise HTTPException(status_code=404, detail="RLHFTrainer not available")
+            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+            return {"status": "success", "pair_id": pair_id}
+
+        # ----- Bio‑inspired Optimizer Runs -----
+        @self.router.get("/bio/runs", response_model=List[BioRunResponse])
+        async def get_bio_runs(
+            algorithm: Optional[str] = Query(None),
+            limit: int = Query(100, ge=1),
+            api_key: str = Depends(verify_api_key),
+        ):
+            if self.storage is None:
+                raise HTTPException(status_code=404, detail="Storage not available")
+            try:
+                runs = self.storage.get_bio_runs(algorithm=algorithm, limit=limit) if hasattr(self.storage, 'get_bio_runs') else []
+                return runs
+            except Exception:
+                logger.exception("Error fetching bio-inspired runs")
+                raise HTTPException(status_code=500, detail="Internal server error")
+
+        @self.router.post("/bio/pso/optimize")
+        async def run_pso_optimization(api_key: str = Depends(verify_api_key)):
+            if self.pso_optimizer is None:
+                raise HTTPException(status_code=404, detail="PSO optimizer not available")
+            best = await self.pso_optimizer.optimize()
+            return {"status": "success", "best_hyperparameters": best}
+
+        # ----- MoE Gating Info -----
+        @self.router.get("/moe/experts")
+        async def list_moe_experts(api_key: str = Depends(verify_api_key)):
+            if self.moe_gating is None:
+                raise HTTPException(status_code=404, detail="MoE gating not available")
+            return {"expert_names": self.moe_gating.expert_names}
+
+        # ----- WebSocket for real-time updates (optional) -----
+        # This is handled when the app is created, not in the router.
+
     # --------------------------------------------------------------------------
     # Lifecycle management
     # --------------------------------------------------------------------------
@@ -367,11 +566,11 @@ class DecisionAudit:
         # Create FastAPI app
         self._app = FastAPI(
             title="Green Agent Audit Dashboard",
-            version="3.3.0",
-            description="API for decision audit, benchmarks, drift events, and MoE metrics.",
+            version="3.4.0",
+            description="API for decision audit, benchmarks, drift events, MoE metrics, LIMIT Graph, RLHF, and bio‑inspired optimization.",
         )
 
-        # Add CORS middleware (before routes)
+        # Add CORS middleware
         self._app.add_middleware(
             CORSMiddleware,
             allow_origins=self.cors_origins,
@@ -380,11 +579,23 @@ class DecisionAudit:
             allow_headers=["*"],
         )
 
-        # Add request logging middleware (before routes)
+        # Add request logging middleware
         self._app.middleware("http")(log_requests)
 
         # Include router
         self._app.include_router(self.router, prefix="/api/v1")
+
+        # WebSocket endpoint for real-time updates
+        @self._app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    # Echo for now; could push updates
+                    await websocket.send_text(f"Echo: {data}")
+            except WebSocketDisconnect:
+                pass
 
         config_kwargs = {
             "host": "0.0.0.0",
@@ -415,7 +626,6 @@ class DecisionAudit:
         if self._server:
             self._server.should_exit = True
         if self._server_thread and self._server_thread.is_alive():
-            # Wait a short time for the thread to exit
             self._server_thread.join(timeout=5)
         self._running = False
         logger.info("Dashboard stopped.")
