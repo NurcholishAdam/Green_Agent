@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Central Storage module for Green Agent enhancements – Version 3.0.0
+Central Storage module for Green Agent enhancements – Version 4.0.0
 
 Provides persistent SQLite storage with tables for:
 - Model weights (BLOB)
@@ -29,6 +29,14 @@ NEW IN v3.0.0:
 - Configurable data retention policies.
 - Storage statistics tracking.
 - High‑level query methods for all new tables.
+
+NEW IN v4.0.0:
+- LIMIT Graph storage (nodes, edges, metadata).
+- MODP (Multi‑Objective Dynamic Programming) states, transitions, policies.
+- RLHF human preference pairs.
+- Multi‑Teacher Policy Distillation (teacher policies, episodes, student updates).
+- Bio‑inspired algorithm runs (beyond GA).
+- MoE expert models and routing history.
 
 All methods are synchronous; async wrappers are provided via `asyncio.to_thread`
 or via `aiosqlite` if available.
@@ -93,7 +101,7 @@ class Storage:
     """
 
     # Schema version – increment when tables change
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None):
         self.db_path = Path(db_path or DEFAULT_DB)
@@ -531,6 +539,160 @@ class Storage:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_preferences_user ON user_preferences(user_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_scenario_time ON scenarios(timestamp);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_time ON decision_catalogue(timestamp);")
+
+    def _migrate_to_v4(self, conn: sqlite3.Connection) -> None:
+        """New tables for v4: LIMIT Graph, MODP, RLHF preferences, multi-teacher distillation, bio-inspired runs, MoE models & routing."""
+        # LIMIT Graph
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS limit_graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                graph_id TEXT NOT NULL,
+                node_type TEXT,
+                attributes TEXT,          -- JSON of node properties
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS limit_graph_edges (
+                edge_id TEXT PRIMARY KEY,
+                graph_id TEXT NOT NULL,
+                source_node TEXT NOT NULL,
+                target_node TEXT NOT NULL,
+                weight REAL,
+                attributes TEXT,          -- JSON of edge properties
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS limit_graph_metadata (
+                graph_id TEXT PRIMARY KEY,
+                description TEXT,
+                configuration TEXT,       -- JSON of graph-specific settings
+                created_at TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_limit_graph_nodes_graph ON limit_graph_nodes(graph_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_limit_graph_edges_graph ON limit_graph_edges(graph_id);")
+
+        # MODP (Multi-Objective Dynamic Programming)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS modp_states (
+                state_id TEXT PRIMARY KEY,
+                problem_id TEXT NOT NULL,
+                state_attributes TEXT,    -- JSON of state variables
+                objective_values TEXT,    -- JSON dict of objective names -> values
+                stage INTEGER,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS modp_transitions (
+                transition_id TEXT PRIMARY KEY,
+                problem_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                action TEXT,
+                cost REAL,
+                objective_deltas TEXT,    -- JSON dict of objective changes
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS modp_policies (
+                policy_id TEXT PRIMARY KEY,
+                problem_id TEXT NOT NULL,
+                state_id TEXT NOT NULL,
+                action TEXT,
+                expected_objectives TEXT, -- JSON dict
+                timestamp TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_modp_states_problem ON modp_states(problem_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_modp_trans_problem ON modp_transitions(problem_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_modp_policy_problem ON modp_policies(problem_id);")
+
+        # RLHF preference pairs
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rlhf_preference_pairs (
+                pair_id TEXT PRIMARY KEY,
+                prompt TEXT,
+                chosen_response TEXT,
+                rejected_response TEXT,
+                reward_difference REAL,
+                metadata TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rlhf_time ON rlhf_preference_pairs(timestamp);")
+
+        # Multi-Teacher Policy Distillation
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teacher_policies (
+                teacher_id TEXT PRIMARY KEY,
+                policy_name TEXT,
+                architecture TEXT,
+                parameters BLOB,          -- serialized weights
+                performance_score REAL,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS distillation_episodes (
+                episode_id TEXT PRIMARY KEY,
+                student_policy_id TEXT,
+                teacher_policy_ids TEXT,  -- JSON list of teacher IDs
+                state_features TEXT,      -- JSON of input state
+                teacher_actions TEXT,     -- JSON mapping teacher_id -> action
+                student_action TEXT,
+                loss REAL,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS student_policy_updates (
+                update_id TEXT PRIMARY KEY,
+                student_policy_id TEXT,
+                parameters_before BLOB,
+                parameters_after BLOB,
+                loss_before REAL,
+                loss_after REAL,
+                timestamp TEXT
+            )
+        """)
+
+        # Bio-inspired algorithm runs (beyond GA)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bio_inspired_runs (
+                run_id TEXT PRIMARY KEY,
+                algorithm TEXT NOT NULL,  -- e.g., 'pso', 'aco', 'abc'
+                problem_id TEXT,
+                parameters TEXT,          -- JSON of algorithm parameters
+                best_solution TEXT,       -- JSON of best solution
+                best_fitness REAL,
+                timestamp TEXT
+            )
+        """)
+
+        # MoE expert models and routing history
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS moe_expert_models (
+                expert_id TEXT PRIMARY KEY,
+                model_type TEXT,
+                parameters BLOB,
+                version TEXT,
+                training_timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS moe_routing_history (
+                routing_id TEXT PRIMARY KEY,
+                sample_id TEXT,
+                routed_expert_id TEXT,
+                gating_score REAL,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_moe_routing_time ON moe_routing_history(timestamp);")
 
     # --------------------------------------------------------------------------
     # Encryption helpers (optional)
@@ -1294,6 +1456,362 @@ class Storage:
         self._execute("DELETE FROM decision_catalogue WHERE timestamp < ?", (cutoff,))
 
     # =========================================================================
+    # NEW v4.0.0 METHODS: LIMIT Graph
+    # =========================================================================
+    def save_limit_graph_node(self, node_id: str, graph_id: str, node_type: Optional[str],
+                              attributes: Dict[str, Any]) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO limit_graph_nodes (node_id, graph_id, node_type, attributes, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (node_id, graph_id, node_type, json.dumps(attributes), datetime.now().isoformat())
+        )
+
+    def get_limit_graph_nodes(self, graph_id: str) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT node_id, graph_id, node_type, attributes, timestamp FROM limit_graph_nodes WHERE graph_id = ?",
+            (graph_id,)
+        )
+        for r in rows:
+            r["attributes"] = json.loads(r["attributes"]) if r["attributes"] else {}
+        return rows
+
+    def save_limit_graph_edge(self, edge_id: str, graph_id: str, source: str, target: str,
+                              weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO limit_graph_edges (edge_id, graph_id, source_node, target_node, weight, attributes, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (edge_id, graph_id, source, target, weight, json.dumps(attributes), datetime.now().isoformat())
+        )
+
+    def get_limit_graph_edges(self, graph_id: str) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT edge_id, graph_id, source_node, target_node, weight, attributes, timestamp FROM limit_graph_edges WHERE graph_id = ?",
+            (graph_id,)
+        )
+        for r in rows:
+            r["attributes"] = json.loads(r["attributes"]) if r["attributes"] else {}
+        return rows
+
+    def save_limit_graph_metadata(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO limit_graph_metadata (graph_id, description, configuration, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (graph_id, description, json.dumps(configuration), datetime.now().isoformat())
+        )
+
+    def get_limit_graph_metadata(self, graph_id: str) -> Optional[Dict]:
+        row = self._fetchone(
+            "SELECT * FROM limit_graph_metadata WHERE graph_id = ?",
+            (graph_id,)
+        )
+        if row:
+            row["configuration"] = json.loads(row["configuration"]) if row["configuration"] else {}
+        return row
+
+    def clean_limit_graph(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self._execute("DELETE FROM limit_graph_nodes WHERE timestamp < ?", (cutoff,))
+        self._execute("DELETE FROM limit_graph_edges WHERE timestamp < ?", (cutoff,))
+        # metadata not cleaned automatically? maybe keep
+
+    # =========================================================================
+    # NEW v4.0.0 METHODS: MODP
+    # =========================================================================
+    def save_modp_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                        objective_values: Dict[str, float], stage: int) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO modp_states (state_id, problem_id, state_attributes, objective_values, stage, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state_id,
+                problem_id,
+                json.dumps(state_attributes),
+                json.dumps(objective_values),
+                stage,
+                datetime.now().isoformat()
+            )
+        )
+
+    def get_modp_states(self, problem_id: str) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT * FROM modp_states WHERE problem_id = ? ORDER BY stage",
+            (problem_id,)
+        )
+        for r in rows:
+            r["state_attributes"] = json.loads(r["state_attributes"]) if r["state_attributes"] else {}
+            r["objective_values"] = json.loads(r["objective_values"]) if r["objective_values"] else {}
+        return rows
+
+    def save_modp_transition(self, transition_id: str, problem_id: str, from_state: str,
+                             to_state: str, action: str, cost: float,
+                             objective_deltas: Dict[str, float]) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO modp_transitions
+            (transition_id, problem_id, from_state, to_state, action, cost, objective_deltas, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transition_id,
+                problem_id,
+                from_state,
+                to_state,
+                action,
+                cost,
+                json.dumps(objective_deltas),
+                datetime.now().isoformat()
+            )
+        )
+
+    def get_modp_transitions(self, problem_id: str) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT * FROM modp_transitions WHERE problem_id = ? ORDER BY timestamp",
+            (problem_id,)
+        )
+        for r in rows:
+            r["objective_deltas"] = json.loads(r["objective_deltas"]) if r["objective_deltas"] else {}
+        return rows
+
+    def save_modp_policy(self, policy_id: str, problem_id: str, state_id: str,
+                         action: str, expected_objectives: Dict[str, float]) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO modp_policies (policy_id, problem_id, state_id, action, expected_objectives, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                policy_id,
+                problem_id,
+                state_id,
+                action,
+                json.dumps(expected_objectives),
+                datetime.now().isoformat()
+            )
+        )
+
+    def get_modp_policies(self, problem_id: str) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT * FROM modp_policies WHERE problem_id = ? ORDER BY state_id",
+            (problem_id,)
+        )
+        for r in rows:
+            r["expected_objectives"] = json.loads(r["expected_objectives"]) if r["expected_objectives"] else {}
+        return rows
+
+    def clean_modp(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self._execute("DELETE FROM modp_states WHERE timestamp < ?", (cutoff,))
+        self._execute("DELETE FROM modp_transitions WHERE timestamp < ?", (cutoff,))
+        self._execute("DELETE FROM modp_policies WHERE timestamp < ?", (cutoff,))
+
+    # =========================================================================
+    # NEW v4.0.0 METHODS: RLHF Preference Pairs
+    # =========================================================================
+    def save_preference_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                             reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO rlhf_preference_pairs
+            (pair_id, prompt, chosen_response, rejected_response, reward_difference, metadata, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pair_id,
+                prompt,
+                chosen,
+                rejected,
+                reward_diff,
+                json.dumps(metadata) if metadata else None,
+                datetime.now().isoformat()
+            )
+        )
+
+    def get_preference_pairs(self, limit: int = 100) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT * FROM rlhf_preference_pairs ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        for r in rows:
+            r["metadata"] = json.loads(r["metadata"]) if r["metadata"] else {}
+        return rows
+
+    def clean_rlhf_preference_pairs(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self._execute("DELETE FROM rlhf_preference_pairs WHERE timestamp < ?", (cutoff,))
+
+    # =========================================================================
+    # NEW v4.0.0 METHODS: Multi-Teacher Policy Distillation
+    # =========================================================================
+    def save_teacher_policy(self, teacher_id: str, policy_name: str, architecture: str,
+                            parameters: bytes, performance_score: float) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO teacher_policies
+            (teacher_id, policy_name, architecture, parameters, performance_score, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (teacher_id, policy_name, architecture, parameters, performance_score, datetime.now().isoformat())
+        )
+
+    def get_teacher_policy(self, teacher_id: str) -> Optional[Dict]:
+        row = self._fetchone(
+            "SELECT * FROM teacher_policies WHERE teacher_id = ?",
+            (teacher_id,)
+        )
+        return row
+
+    def list_teacher_policies(self) -> List[Dict]:
+        return self._fetchall("SELECT * FROM teacher_policies ORDER BY performance_score DESC")
+
+    def save_distillation_episode(self, episode_id: str, student_policy_id: str,
+                                  teacher_ids: List[str], state_features: Dict[str, Any],
+                                  teacher_actions: Dict[str, str], student_action: str,
+                                  loss: float) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO distillation_episodes
+            (episode_id, student_policy_id, teacher_policy_ids, state_features, teacher_actions, student_action, loss, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                episode_id,
+                student_policy_id,
+                json.dumps(teacher_ids),
+                json.dumps(state_features),
+                json.dumps(teacher_actions),
+                student_action,
+                loss,
+                datetime.now().isoformat()
+            )
+        )
+
+    def get_distillation_episodes(self, limit: int = 100) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT * FROM distillation_episodes ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        for r in rows:
+            r["teacher_policy_ids"] = json.loads(r["teacher_policy_ids"])
+            r["state_features"] = json.loads(r["state_features"])
+            r["teacher_actions"] = json.loads(r["teacher_actions"])
+        return rows
+
+    def save_student_update(self, update_id: str, student_policy_id: str,
+                            parameters_before: Optional[bytes], parameters_after: Optional[bytes],
+                            loss_before: float, loss_after: float) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO student_policy_updates
+            (update_id, student_policy_id, parameters_before, parameters_after, loss_before, loss_after, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (update_id, student_policy_id, parameters_before, parameters_after, loss_before, loss_after, datetime.now().isoformat())
+        )
+
+    def get_student_updates(self, student_policy_id: str, limit: int = 100) -> List[Dict]:
+        rows = self._fetchall(
+            "SELECT * FROM student_policy_updates WHERE student_policy_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (student_policy_id, limit)
+        )
+        return rows
+
+    def clean_distillation(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self._execute("DELETE FROM distillation_episodes WHERE timestamp < ?", (cutoff,))
+        self._execute("DELETE FROM student_policy_updates WHERE timestamp < ?", (cutoff,))
+
+    # =========================================================================
+    # NEW v4.0.0 METHODS: Bio-inspired algorithm runs
+    # =========================================================================
+    def save_bio_run(self, run_id: str, algorithm: str, problem_id: Optional[str],
+                     parameters: Dict[str, Any], best_solution: Dict[str, Any],
+                     best_fitness: float) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO bio_inspired_runs
+            (run_id, algorithm, problem_id, parameters, best_solution, best_fitness, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                algorithm,
+                problem_id,
+                json.dumps(parameters),
+                json.dumps(best_solution),
+                best_fitness,
+                datetime.now().isoformat()
+            )
+        )
+
+    def get_bio_runs(self, algorithm: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        if algorithm:
+            rows = self._fetchall(
+                "SELECT * FROM bio_inspired_runs WHERE algorithm = ? ORDER BY timestamp DESC LIMIT ?",
+                (algorithm, limit)
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT * FROM bio_inspired_runs ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+        for r in rows:
+            r["parameters"] = json.loads(r["parameters"]) if r["parameters"] else {}
+            r["best_solution"] = json.loads(r["best_solution"]) if r["best_solution"] else {}
+        return rows
+
+    def clean_bio_runs(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self._execute("DELETE FROM bio_inspired_runs WHERE timestamp < ?", (cutoff,))
+
+    # =========================================================================
+    # NEW v4.0.0 METHODS: MoE expert models & routing
+    # =========================================================================
+    def save_expert_model(self, expert_id: str, model_type: str, parameters: bytes,
+                          version: str) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO moe_expert_models (expert_id, model_type, parameters, version, training_timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (expert_id, model_type, parameters, version, datetime.now().isoformat())
+        )
+
+    def get_expert_model(self, expert_id: str) -> Optional[Dict]:
+        row = self._fetchone(
+            "SELECT * FROM moe_expert_models WHERE expert_id = ?",
+            (expert_id,)
+        )
+        return row
+
+    def log_routing_decision(self, routing_id: str, sample_id: str,
+                             routed_expert_id: str, gating_score: float) -> None:
+        self._execute(
+            """
+            INSERT OR REPLACE INTO moe_routing_history (routing_id, sample_id, routed_expert_id, gating_score, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (routing_id, sample_id, routed_expert_id, gating_score, datetime.now().isoformat())
+        )
+
+    def get_routing_history(self, limit: int = 100) -> List[Dict]:
+        return self._fetchall(
+            "SELECT * FROM moe_routing_history ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+
+    def clean_moe_routing(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self._execute("DELETE FROM moe_routing_history WHERE timestamp < ?", (cutoff,))
+
+    # =========================================================================
     # CONFIGURABLE DATA RETENTION POLICIES
     # =========================================================================
     def apply_retention_policy(self, policies: Dict[str, int]) -> None:
@@ -1323,7 +1841,12 @@ class Storage:
             "emission_records", "optimisation_history", "distribution_history",
             "thermal_optimizations", "ga_populations", "ga_fitness_history",
             "moe_gating_training", "moe_expert_metadata", "pareto_front",
-            "user_preferences", "scenarios", "decision_catalogue"
+            "user_preferences", "scenarios", "decision_catalogue",
+            "limit_graph_nodes", "limit_graph_edges", "limit_graph_metadata",
+            "modp_states", "modp_transitions", "modp_policies",
+            "rlhf_preference_pairs", "teacher_policies", "distillation_episodes",
+            "student_policy_updates", "bio_inspired_runs", "moe_expert_models",
+            "moe_routing_history"
         ]
         for table in tables:
             row = self._fetchone(f"SELECT COUNT(*) as cnt FROM {table}")
@@ -1976,6 +2499,352 @@ class Storage:
     async def clean_decision_catalogue_async(self, days: int) -> None:
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         await self._execute_async("DELETE FROM decision_catalogue WHERE timestamp < ?", (cutoff,))
+
+    # --------------------------------------------------------------------------
+    # NEW v4.0.0 ASYNC WRAPPERS
+    # --------------------------------------------------------------------------
+    # LIMIT Graph async
+    async def save_limit_graph_node_async(self, node_id: str, graph_id: str, node_type: Optional[str],
+                                          attributes: Dict[str, Any]) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO limit_graph_nodes (node_id, graph_id, node_type, attributes, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (node_id, graph_id, node_type, json.dumps(attributes), datetime.now().isoformat())
+        )
+
+    async def get_limit_graph_nodes_async(self, graph_id: str) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT node_id, graph_id, node_type, attributes, timestamp FROM limit_graph_nodes WHERE graph_id = ?",
+            (graph_id,)
+        )
+        for r in rows:
+            r["attributes"] = json.loads(r["attributes"]) if r["attributes"] else {}
+        return rows
+
+    async def save_limit_graph_edge_async(self, edge_id: str, graph_id: str, source: str, target: str,
+                                          weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO limit_graph_edges (edge_id, graph_id, source_node, target_node, weight, attributes, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (edge_id, graph_id, source, target, weight, json.dumps(attributes), datetime.now().isoformat())
+        )
+
+    async def get_limit_graph_edges_async(self, graph_id: str) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT edge_id, graph_id, source_node, target_node, weight, attributes, timestamp FROM limit_graph_edges WHERE graph_id = ?",
+            (graph_id,)
+        )
+        for r in rows:
+            r["attributes"] = json.loads(r["attributes"]) if r["attributes"] else {}
+        return rows
+
+    async def save_limit_graph_metadata_async(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO limit_graph_metadata (graph_id, description, configuration, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (graph_id, description, json.dumps(configuration), datetime.now().isoformat())
+        )
+
+    async def get_limit_graph_metadata_async(self, graph_id: str) -> Optional[Dict]:
+        row = await self._fetchone_async(
+            "SELECT * FROM limit_graph_metadata WHERE graph_id = ?",
+            (graph_id,)
+        )
+        if row:
+            row["configuration"] = json.loads(row["configuration"]) if row["configuration"] else {}
+        return row
+
+    async def clean_limit_graph_async(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        await self._execute_async("DELETE FROM limit_graph_nodes WHERE timestamp < ?", (cutoff,))
+        await self._execute_async("DELETE FROM limit_graph_edges WHERE timestamp < ?", (cutoff,))
+
+    # MODP async
+    async def save_modp_state_async(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                                    objective_values: Dict[str, float], stage: int) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO modp_states (state_id, problem_id, state_attributes, objective_values, stage, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state_id,
+                problem_id,
+                json.dumps(state_attributes),
+                json.dumps(objective_values),
+                stage,
+                datetime.now().isoformat()
+            )
+        )
+
+    async def get_modp_states_async(self, problem_id: str) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT * FROM modp_states WHERE problem_id = ? ORDER BY stage",
+            (problem_id,)
+        )
+        for r in rows:
+            r["state_attributes"] = json.loads(r["state_attributes"]) if r["state_attributes"] else {}
+            r["objective_values"] = json.loads(r["objective_values"]) if r["objective_values"] else {}
+        return rows
+
+    async def save_modp_transition_async(self, transition_id: str, problem_id: str, from_state: str,
+                                         to_state: str, action: str, cost: float,
+                                         objective_deltas: Dict[str, float]) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO modp_transitions
+            (transition_id, problem_id, from_state, to_state, action, cost, objective_deltas, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transition_id,
+                problem_id,
+                from_state,
+                to_state,
+                action,
+                cost,
+                json.dumps(objective_deltas),
+                datetime.now().isoformat()
+            )
+        )
+
+    async def get_modp_transitions_async(self, problem_id: str) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT * FROM modp_transitions WHERE problem_id = ? ORDER BY timestamp",
+            (problem_id,)
+        )
+        for r in rows:
+            r["objective_deltas"] = json.loads(r["objective_deltas"]) if r["objective_deltas"] else {}
+        return rows
+
+    async def save_modp_policy_async(self, policy_id: str, problem_id: str, state_id: str,
+                                     action: str, expected_objectives: Dict[str, float]) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO modp_policies (policy_id, problem_id, state_id, action, expected_objectives, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                policy_id,
+                problem_id,
+                state_id,
+                action,
+                json.dumps(expected_objectives),
+                datetime.now().isoformat()
+            )
+        )
+
+    async def get_modp_policies_async(self, problem_id: str) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT * FROM modp_policies WHERE problem_id = ? ORDER BY state_id",
+            (problem_id,)
+        )
+        for r in rows:
+            r["expected_objectives"] = json.loads(r["expected_objectives"]) if r["expected_objectives"] else {}
+        return rows
+
+    async def clean_modp_async(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        await self._execute_async("DELETE FROM modp_states WHERE timestamp < ?", (cutoff,))
+        await self._execute_async("DELETE FROM modp_transitions WHERE timestamp < ?", (cutoff,))
+        await self._execute_async("DELETE FROM modp_policies WHERE timestamp < ?", (cutoff,))
+
+    # RLHF async
+    async def save_preference_pair_async(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                                         reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO rlhf_preference_pairs
+            (pair_id, prompt, chosen_response, rejected_response, reward_difference, metadata, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pair_id,
+                prompt,
+                chosen,
+                rejected,
+                reward_diff,
+                json.dumps(metadata) if metadata else None,
+                datetime.now().isoformat()
+            )
+        )
+
+    async def get_preference_pairs_async(self, limit: int = 100) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT * FROM rlhf_preference_pairs ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        for r in rows:
+            r["metadata"] = json.loads(r["metadata"]) if r["metadata"] else {}
+        return rows
+
+    async def clean_rlhf_preference_pairs_async(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        await self._execute_async("DELETE FROM rlhf_preference_pairs WHERE timestamp < ?", (cutoff,))
+
+    # Multi-Teacher Distillation async
+    async def save_teacher_policy_async(self, teacher_id: str, policy_name: str, architecture: str,
+                                        parameters: bytes, performance_score: float) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO teacher_policies
+            (teacher_id, policy_name, architecture, parameters, performance_score, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (teacher_id, policy_name, architecture, parameters, performance_score, datetime.now().isoformat())
+        )
+
+    async def get_teacher_policy_async(self, teacher_id: str) -> Optional[Dict]:
+        row = await self._fetchone_async(
+            "SELECT * FROM teacher_policies WHERE teacher_id = ?",
+            (teacher_id,)
+        )
+        return row
+
+    async def list_teacher_policies_async(self) -> List[Dict]:
+        return await self._fetchall_async("SELECT * FROM teacher_policies ORDER BY performance_score DESC")
+
+    async def save_distillation_episode_async(self, episode_id: str, student_policy_id: str,
+                                              teacher_ids: List[str], state_features: Dict[str, Any],
+                                              teacher_actions: Dict[str, str], student_action: str,
+                                              loss: float) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO distillation_episodes
+            (episode_id, student_policy_id, teacher_policy_ids, state_features, teacher_actions, student_action, loss, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                episode_id,
+                student_policy_id,
+                json.dumps(teacher_ids),
+                json.dumps(state_features),
+                json.dumps(teacher_actions),
+                student_action,
+                loss,
+                datetime.now().isoformat()
+            )
+        )
+
+    async def get_distillation_episodes_async(self, limit: int = 100) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT * FROM distillation_episodes ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        for r in rows:
+            r["teacher_policy_ids"] = json.loads(r["teacher_policy_ids"])
+            r["state_features"] = json.loads(r["state_features"])
+            r["teacher_actions"] = json.loads(r["teacher_actions"])
+        return rows
+
+    async def save_student_update_async(self, update_id: str, student_policy_id: str,
+                                        parameters_before: Optional[bytes], parameters_after: Optional[bytes],
+                                        loss_before: float, loss_after: float) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO student_policy_updates
+            (update_id, student_policy_id, parameters_before, parameters_after, loss_before, loss_after, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (update_id, student_policy_id, parameters_before, parameters_after, loss_before, loss_after, datetime.now().isoformat())
+        )
+
+    async def get_student_updates_async(self, student_policy_id: str, limit: int = 100) -> List[Dict]:
+        rows = await self._fetchall_async(
+            "SELECT * FROM student_policy_updates WHERE student_policy_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (student_policy_id, limit)
+        )
+        return rows
+
+    async def clean_distillation_async(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        await self._execute_async("DELETE FROM distillation_episodes WHERE timestamp < ?", (cutoff,))
+        await self._execute_async("DELETE FROM student_policy_updates WHERE timestamp < ?", (cutoff,))
+
+    # Bio-inspired async
+    async def save_bio_run_async(self, run_id: str, algorithm: str, problem_id: Optional[str],
+                                 parameters: Dict[str, Any], best_solution: Dict[str, Any],
+                                 best_fitness: float) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO bio_inspired_runs
+            (run_id, algorithm, problem_id, parameters, best_solution, best_fitness, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                algorithm,
+                problem_id,
+                json.dumps(parameters),
+                json.dumps(best_solution),
+                best_fitness,
+                datetime.now().isoformat()
+            )
+        )
+
+    async def get_bio_runs_async(self, algorithm: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        if algorithm:
+            rows = await self._fetchall_async(
+                "SELECT * FROM bio_inspired_runs WHERE algorithm = ? ORDER BY timestamp DESC LIMIT ?",
+                (algorithm, limit)
+            )
+        else:
+            rows = await self._fetchall_async(
+                "SELECT * FROM bio_inspired_runs ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+        for r in rows:
+            r["parameters"] = json.loads(r["parameters"]) if r["parameters"] else {}
+            r["best_solution"] = json.loads(r["best_solution"]) if r["best_solution"] else {}
+        return rows
+
+    async def clean_bio_runs_async(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        await self._execute_async("DELETE FROM bio_inspired_runs WHERE timestamp < ?", (cutoff,))
+
+    # MoE expert models & routing async
+    async def save_expert_model_async(self, expert_id: str, model_type: str, parameters: bytes,
+                                      version: str) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO moe_expert_models (expert_id, model_type, parameters, version, training_timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (expert_id, model_type, parameters, version, datetime.now().isoformat())
+        )
+
+    async def get_expert_model_async(self, expert_id: str) -> Optional[Dict]:
+        row = await self._fetchone_async(
+            "SELECT * FROM moe_expert_models WHERE expert_id = ?",
+            (expert_id,)
+        )
+        return row
+
+    async def log_routing_decision_async(self, routing_id: str, sample_id: str,
+                                         routed_expert_id: str, gating_score: float) -> None:
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO moe_routing_history (routing_id, sample_id, routed_expert_id, gating_score, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (routing_id, sample_id, routed_expert_id, gating_score, datetime.now().isoformat())
+        )
+
+    async def get_routing_history_async(self, limit: int = 100) -> List[Dict]:
+        return await self._fetchall_async(
+            "SELECT * FROM moe_routing_history ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+
+    async def clean_moe_routing_async(self, days: int) -> None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        await self._execute_async("DELETE FROM moe_routing_history WHERE timestamp < ?", (cutoff,))
 
     # --------------------------------------------------------------------------
     # Cleanup / close (optional)
