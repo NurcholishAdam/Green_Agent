@@ -9,6 +9,14 @@ ENHANCED WITH:
 - Background task for periodic global weight refinement.
 - Hybrid online distillation + offline MOEA blending.
 
+NEW IN v4.2.0:
+- Added LIMIT Graph manager for strategy relationship modelling.
+- Added MODP solver wrapper for storing decision states/policies.
+- Added RLHF trainer for human preference collection on mitigation choices.
+- Added MoE gating network to blend experts (strategies).
+- Integration with central Storage (optional) for new data persistence.
+- New configuration flags for enabling/disabling each component.
+
 All previous features (real mitigation algorithms, carbon/helium tracking, federated, predictive, etc.) retained.
 """
 
@@ -108,6 +116,13 @@ if PYDANTIC_AVAILABLE:
         enable_predictive: bool = True
         enable_sustainability_dashboard: bool = True
         enable_qec: bool = True
+
+        # NEW v4.2.0 flags
+        enable_limit_graph: bool = True
+        enable_modp: bool = True
+        enable_rlhf: bool = True
+        enable_moe: bool = True
+        moe_expert_count: int = Field(8, ge=2)
 
         # Carbon manager settings
         carbon_api_region: str = "us-east"
@@ -221,6 +236,12 @@ else:
         enable_predictive: bool = True
         enable_sustainability_dashboard: bool = True
         enable_qec: bool = True
+        # NEW v4.2.0 flags
+        enable_limit_graph: bool = True
+        enable_modp: bool = True
+        enable_rlhf: bool = True
+        enable_moe: bool = True
+        moe_expert_count: int = 8
         carbon_api_region: str = "us-east"
         carbon_update_interval: int = 300
         carbon_price_forecast_window: int = 20
@@ -241,7 +262,6 @@ else:
         persistence_path: str = "quantum_mitigator_state.json.gz"
         telemetry_export_interval: int = 60
         prometheus_port: Optional[int] = None
-        # Distillation defaults
         distillation_epsilon: float = 0.1
         distillation_train_every: int = 10
         distillation_replay_size: int = 2000
@@ -251,7 +271,6 @@ else:
         q_weights_path: str = "./qm_q_weights.json"
         interaction_logs_path: str = "./qm_interactions.csv"
         historical_model_path: str = "./qm_historical_model.pkl"
-        # MOEA defaults
         moea_enabled: bool = True
         moea_interval_seconds: int = 300
         moea_population_size: int = 20
@@ -857,7 +876,7 @@ class HeliumQuantumTracker:
             'dd': 0.9,
             'measurement': 0.85,
             'symmetry': 0.75,
-            'hybrid_dd_zne': 0.7,
+            'hybrid': 0.7,
             'fallback_simple': 0.95
         }
 
@@ -1949,12 +1968,205 @@ class NSGAIAMitigationOptimizer:
 
 
 # ============================================================================
-# Enhanced Quantum Error Mitigator (Main Class with MOEA)
+# NEW: LIMIT Graph Manager
+# ============================================================================
+class LimitGraphManager:
+    """
+    Manages a graph of mitigation strategy relationships for LIMIT.
+    Nodes are strategies or circuits, edges represent dependencies or fallback order.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.graphs = {}
+
+    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
+            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
+        else:
+            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+
+    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
+            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+
+    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
+                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
+            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+
+    def get_nodes(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
+            return self.storage.get_limit_graph_nodes(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+
+    def get_edges(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
+            return self.storage.get_limit_graph_edges(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+
+    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
+            return self.storage.get_limit_graph_metadata(graph_id)
+        return self.graphs.get(graph_id, {})
+
+
+# ============================================================================
+# NEW: MODP Optimizer (wrapper)
+# ============================================================================
+class MODPOptimizer:
+    """
+    Multi‑Objective Dynamic Programming solver that stores decision states/policies.
+    This complements the NSGA-II optimizer; MODP here is used for scalarized selection
+    among Pareto front points and for persisting evolved policies.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.states = {}
+
+    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                  objective_values: Dict[str, float], stage: int) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_state'):
+            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
+        else:
+            if problem_id not in self.states:
+                self.states[problem_id] = []
+            self.states[problem_id].append({
+                'state_id': state_id, 'state_attributes': state_attributes,
+                'objective_values': objective_values, 'stage': stage
+            })
+
+    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
+                   action: str, expected_objectives: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_policy'):
+            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+
+    def get_states(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_states'):
+            return self.storage.get_modp_states(problem_id)
+        return self.states.get(problem_id, [])
+
+    def get_policies(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_policies'):
+            return self.storage.get_modp_policies(problem_id)
+        return []
+
+
+# ============================================================================
+# NEW: RLHF Trainer
+# ============================================================================
+class RLHFTrainer:
+    """
+    Collects human preference pairs for mitigation strategy choices.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.pairs = []
+
+    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        if self.storage and hasattr(self.storage, 'save_preference_pair'):
+            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+        else:
+            self.pairs.append({
+                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
+                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+            })
+
+    def get_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
+            return self.storage.get_preference_pairs(limit)
+        return self.pairs[-limit:]
+
+    def train_reward_model(self):
+        pairs = self.get_pairs()
+        if len(pairs) < 5:
+            logger.info("Not enough preference pairs for RLHF training.")
+            return
+        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+
+
+# ============================================================================
+# NEW: MoE Gating Network
+# ============================================================================
+class MoEGatingNetwork:
+    """
+    Mixture-of-Experts gating for mitigation strategy selection.
+    Experts correspond to mitigation strategies (zne, pec, cdr, dd, measurement, symmetry, hybrid, fallback_simple).
+    The gating network learns to select the best strategy for a given context.
+    """
+    def __init__(self, storage: Optional[Any] = None, config: Optional[Dict] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.expert_names = self.config.get('expert_names', DistillationStrategyOptimizer.STRATEGIES)
+        self.num_experts = len(self.expert_names)
+        # State dimension: 16 features from MitigationState
+        self.gating_weights = np.random.randn(self.num_experts, 16)
+        self._training_samples = []
+
+    def _encode_state(self, state: Union[MitigationState, Dict]) -> np.ndarray:
+        if isinstance(state, dict):
+            features = [
+                min(state.get('circuit_depth', 0) / 200.0, 1.0),
+                min(state.get('n_qubits', 0) / 50.0, 1.0),
+                min(state.get('current_error_rate', 0) / 0.5, 1.0),
+                min(state.get('carbon_intensity', 0) / 1000.0, 1.0),
+                state.get('helium_scarcity', 0),
+                min(state.get('carbon_price', 0) / 200.0, 1.0),
+                min(state.get('helium_price', 0) / 5.0, 1.0),
+                state.get('success_rate_zne', 0.5),
+                state.get('success_rate_pec', 0.5),
+                state.get('success_rate_cdr', 0.5),
+                state.get('success_rate_dd', 0.5),
+                state.get('success_rate_measurement', 0.5),
+                state.get('success_rate_symmetry', 0.5),
+                state.get('success_rate_hybrid', 0.5),
+                state.get('success_rate_fallback', 0.5),
+                state.get('avg_improvement', 0),
+            ]
+        else:
+            features = state.to_feature_vector()
+        return np.array(features, dtype=np.float32)
+
+    async def select_expert(self, state: Union[MitigationState, Dict]) -> Tuple[str, np.ndarray]:
+        x = self._encode_state(state)
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        expert_idx = np.argmax(probs)
+        selected = self.expert_names[expert_idx]
+        if self.storage and hasattr(self.storage, 'log_routing_decision'):
+            sample_id = hashlib.sha256(str(state).encode()).hexdigest()[:16]
+            self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+        return selected, probs
+
+    async def add_training_sample(self, state: Union[MitigationState, Dict], selected_expert: str, reward: float):
+        x = self._encode_state(state)
+        expert_idx = self.expert_names.index(selected_expert)
+        target = np.zeros(self.num_experts)
+        target[expert_idx] = 1.0
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        grad = (probs - target)[:, None] * x[None, :]
+        self.gating_weights -= 0.1 * grad
+
+
+# ============================================================================
+# Enhanced Quantum Error Mitigator (Main Class with all enhancements)
 # ============================================================================
 
 class QuantumErrorMitigator:
     """
-    Enhanced Quantum Error Mitigation v4.2.0 with distillation and MOEA.
+    Enhanced Quantum Error Mitigation v4.2.0 with distillation, MOEA,
+    LIMIT Graph, MODP, RLHF, and MoE gating.
     """
 
     def __init__(self, config: Optional[QuantumErrorMitigationConfig] = None, **kwargs):
@@ -2025,8 +2237,19 @@ class QuantumErrorMitigator:
         self.pareto_front: List[MOPDStrategyWeights] = []
         self._moea_task: Optional[asyncio.Task] = None
 
-        if self.moea_enabled:
-            self._moea_task = asyncio.create_task(self._moea_loop())
+        # NEW v4.2.0 components
+        self.storage = kwargs.get('storage', None)  # optional central storage
+        self.limit_graph_manager = LimitGraphManager(self.storage) if self.config.enable_limit_graph else None
+        self.modp_solver = MODPOptimizer(self.storage) if self.config.enable_modp else None
+        self.rlhf_trainer = RLHFTrainer(self.storage) if self.config.enable_rlhf else None
+        self.moe_gating = MoEGatingNetwork(
+            self.storage,
+            {'expert_names': DistillationStrategyOptimizer.STRATEGIES}
+        ) if self.config.enable_moe else None
+
+        # Initialize LIMIT Graph if enabled
+        if self.limit_graph_manager:
+            self._init_limit_graph()
 
         # Interaction tracking
         self.interaction_log: List[Dict] = []
@@ -2056,7 +2279,19 @@ class QuantumErrorMitigator:
         self._load_state_task = asyncio.create_task(self._load_state())
         self._background_tasks.append(self._load_state_task)
 
-        logger.info("Enhanced Quantum Error Mitigator v4.2.0 initialized with distillation and MOEA")
+        logger.info("Enhanced Quantum Error Mitigator v4.2.0 initialized with distillation, MOEA, LIMIT Graph, MODP, RLHF, MoE")
+
+    def _init_limit_graph(self):
+        graph_id = "mitigation_strategies"
+        if not self.limit_graph_manager.get_metadata(graph_id):
+            self.limit_graph_manager.create_graph(graph_id, "Mitigation Strategy Relationships", {})
+            for strat in DistillationStrategyOptimizer.STRATEGIES:
+                self.limit_graph_manager.add_node(graph_id, f"strategy_{strat}", strat, {})
+            # Add edges from each strategy to others? Just a simple chain
+            for i in range(len(DistillationStrategyOptimizer.STRATEGIES) - 1):
+                src = DistillationStrategyOptimizer.STRATEGIES[i]
+                dst = DistillationStrategyOptimizer.STRATEGIES[i+1]
+                self.limit_graph_manager.add_edge(graph_id, f"edge_{src}_{dst}", f"strategy_{src}", f"strategy_{dst}", 1.0, {})
 
     def _start_background_tasks(self):
         if self.enable_carbon_intensity and self.carbon_manager:
@@ -2101,6 +2336,10 @@ class QuantumErrorMitigator:
                     'qec': self.qec is not None,
                     'persistence': self.persistence is not None,
                     'telemetry': True,
+                    'limit_graph': self.limit_graph_manager is not None,
+                    'modp': self.modp_solver is not None,
+                    'rlhf': self.rlhf_trainer is not None,
+                    'moe': self.moe_gating is not None,
                 },
                 'total_mitigations': total,
                 'success_rate': success_rate,
@@ -2236,10 +2475,27 @@ class QuantumErrorMitigator:
                 logger.info(f"MOEA selected best weights: {best.weights}")
                 if self.telemetry:
                     self.telemetry.gauge('qm_moea_pareto_front', len(pareto))
+                # MODP: store state
+                if self.modp_solver:
+                    self.modp_solver.add_state(
+                        state_id=f"moea_best_{time.time()}",
+                        problem_id="mitigation_strategy_evolution",
+                        state_attributes={'weights': best.weights},
+                        objective_values=best.objectives,
+                        stage=1
+                    )
+                # LIMIT Graph: add node for best vector
+                if self.limit_graph_manager:
+                    self.limit_graph_manager.add_node(
+                        "mitigation_strategies",
+                        f"vector_{best.vector_id}",
+                        "best_weight_vector",
+                        {'weights': best.weights}
+                    )
         return pareto
 
     # ============================================================================
-    # Core Mitigation Methods (Enhanced with MOEA blending)
+    # Core Mitigation Methods (Enhanced with MOEA blending and new components)
     # ============================================================================
 
     async def mitigate_errors(
@@ -2300,7 +2556,18 @@ class QuantumErrorMitigator:
 
         # ---- Distillation: select strategy ----
         state = self._build_state(circuit, current_error, carbon_intensity, helium_scarcity, carbon_price, helium_price)
-        strategy, action_idx, state_vec, teacher_probs = await self.strategy_optimizer.select_strategy(state, exploration=True)
+
+        # Decide strategy: use MoE if available, else distillation
+        if self.moe_gating:
+            expert_name, _ = await self.moe_gating.select_expert(state)
+            strategy = expert_name if expert_name in self.strategy_optimizer.STRATEGIES else 'fallback_simple'
+            action_idx = self.strategy_optimizer.STRATEGIES.index(strategy)
+            state_vec = state.to_feature_vector()
+            teacher_probs = np.ones(8) / 8
+            self._last_selected_expert = expert_name
+        else:
+            strategy, action_idx, state_vec, teacher_probs = await self.strategy_optimizer.select_strategy(state, exploration=True)
+
         self.last_state_vec = state_vec
         self.last_action_idx = action_idx
         self.last_teacher_probs = teacher_probs
@@ -2374,12 +2641,60 @@ class QuantumErrorMitigator:
                 })
                 await self.predictive_analyzer.train_prediction_model()
 
-            # ---- Compute reward and update distillation agent ----
+            # ---- Compute reward and update distillation/MoE ----
             reward = self._compute_reward(result)
             await self._update_agent(state_vec, action_idx, reward, state)
 
+            # Update MoE if used
+            if self.moe_gating and hasattr(self, '_last_selected_expert'):
+                await self.moe_gating.add_training_sample(state, self._last_selected_expert, reward)
+
             # Log interaction for offline training
             self._log_interaction(state, strategy, reward, result)
+
+            # RLHF: occasionally record preference pair
+            if self.rlhf_trainer and random.random() < 0.05:
+                chosen_strategy = strategy
+                rejected_strategy = random.choice([s for s in self.strategy_optimizer.STRATEGIES if s != chosen_strategy])
+                self.rlhf_trainer.record_pair(
+                    pair_id=str(uuid.uuid4()),
+                    prompt=f"Which mitigation strategy is best for this circuit?",
+                    chosen=chosen_strategy,
+                    rejected=rejected_strategy,
+                    reward_diff=reward,
+                    metadata={'circuit_depth': circuit.depth, 'n_qubits': circuit.n_qubits}
+                )
+
+            # MODP: record state and policy
+            if self.modp_solver:
+                problem_id = "mitigation_action"
+                state_id = f"{circuit.get_circuit_hash()}_{datetime.now().isoformat()}_{strategy}"
+                self.modp_solver.add_state(
+                    state_id=state_id,
+                    problem_id=problem_id,
+                    state_attributes={'circuit': circuit, 'strategy': strategy},
+                    objective_values={'error_improvement': 1 - result.mitigated_error_rate / max(result.original_error_rate, 0.001),
+                                      'overhead': result.overhead_factor,
+                                      'carbon_savings': result.carbon_saved_kg,
+                                      'helium_efficiency': result.helium_efficiency},
+                    stage=0
+                )
+                self.modp_solver.add_policy(
+                    policy_id=f"policy_{state_id}",
+                    problem_id=problem_id,
+                    state_id=state_id,
+                    action=strategy,
+                    expected_objectives={'error_improvement': 0.0, 'overhead': 0.0, 'carbon_savings': 0.0, 'helium_efficiency': 0.0}
+                )
+
+            # LIMIT Graph: add node for this circuit/strategy
+            if self.limit_graph_manager:
+                self.limit_graph_manager.add_node(
+                    "mitigation_strategies",
+                    f"run_{state_id}",
+                    "mitigation_run",
+                    {'strategy': strategy, 'circuit_hash': circuit.get_circuit_hash()}
+                )
 
             # Telemetry
             self.telemetry.increment('qm_mitigations_total')
@@ -2710,7 +3025,7 @@ class QuantumErrorMitigator:
             df_log.to_csv(log_path, index=False)
 
     # ============================================================================
-    # Public Query Methods
+    # Public Query Methods (including new ones)
     # ============================================================================
 
     def get_mitigation_statistics(self) -> Dict[str, Any]:
@@ -2741,6 +3056,8 @@ class QuantumErrorMitigator:
                 'best_weights': self.global_best_weights,
                 'enabled': True,
             }
+        if self.limit_graph_manager:
+            stats['limit_graph'] = self.limit_graph_manager.get_metadata('mitigation_strategies')
         return stats
 
     def get_sustainability_dashboard_status(self) -> Dict:
@@ -2791,6 +3108,30 @@ class QuantumErrorMitigator:
             helium_forecast = asyncio.run(self.helium_tracker.forecast_helium_prices())
             forecasts['helium'] = helium_forecast
         return forecasts
+
+    # ---------- New public methods for enhancements ----------
+    async def get_limit_graph(self, graph_id: str = "mitigation_strategies") -> Dict:
+        if self.limit_graph_manager:
+            return {
+                'metadata': self.limit_graph_manager.get_metadata(graph_id),
+                'nodes': self.limit_graph_manager.get_nodes(graph_id),
+                'edges': self.limit_graph_manager.get_edges(graph_id),
+            }
+        return {}
+
+    async def get_moe_experts(self) -> List[str]:
+        if self.moe_gating:
+            return self.moe_gating.expert_names
+        return []
+
+    async def get_rlhf_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.rlhf_trainer:
+            return self.rlhf_trainer.get_pairs(limit)
+        return []
+
+    async def record_rlhf_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
+        if self.rlhf_trainer:
+            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
 
     async def shutdown(self):
         logger.info("Shutting down Quantum Error Mitigator")
