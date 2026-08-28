@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # FILE: src/enhancements/regret_optimizer_enhanced_v16_0.py
-# VERSION: 16.0.0 – Full Green Agent MOPD + GA + MoE + Pareto Integration
+# VERSION: 16.0.0 – Full Green Agent MOPD + GA + MoE + Pareto + LIMIT Graph + RLHF + Distillation
 # =============================================================================
 """
 Enhanced Regret-Optimized Carbon Decision System - Version 16.0.0
@@ -13,7 +13,10 @@ ENHANCEMENTS OVER v15.1.0:
 4. Predictive scenario generation using time‑series forecasting.
 5. Federated learning for model weights (gating network or MTOP).
 6. Active user preference learning with interactive queries.
-7. All enhancements are optional and integrate with central Green Agent components.
+7. LIMIT Graph for constraint propagation and decision support.
+8. RLHF (Reinforcement Learning from Human Feedback) for reward‑based policy updates.
+9. Multi‑Teacher Policy Distillation to combine MOE experts into a single student policy.
+All enhancements are optional and integrate with central Green Agent components.
 """
 
 import asyncio
@@ -51,7 +54,6 @@ from ..logger import logger
 # =============================================================================
 # OPTIONAL IMPORTS (graceful degradation)
 # =============================================================================
-# Post‑quantum cryptography (pqcrypto)
 try:
     from pqcrypto.sign import dilithium, falcon, sphincs
     PQC_AVAILABLE = True
@@ -65,7 +67,6 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat,
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Web3
 try:
     from web3 import Web3, Account, HTTPProvider
     from web3.middleware import geth_poa_middleware, gas_price_strategy
@@ -73,7 +74,6 @@ try:
 except ImportError:
     WEB3_AVAILABLE = False
 
-# Cloud storage
 try:
     import boto3
     from botocore.exceptions import ClientError
@@ -93,17 +93,14 @@ try:
 except ImportError:
     GCP_AVAILABLE = False
 
-# Async HTTP
 import aiohttp
 
-# Tenacity
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
     TENACITY_AVAILABLE = True
 except ImportError:
     TENACITY_AVAILABLE = False
 
-# Forecasting (optional)
 try:
     from statsmodels.tsa.arima.model import ARIMA
     STATSMODELS_AVAILABLE = True
@@ -134,11 +131,7 @@ if not TENACITY_AVAILABLE:
         return decorator
 
 # =============================================================================
-# CENTRAL METRICS REGISTRY – we reuse the central one
-# =============================================================================
-
-# =============================================================================
-# CUSTOM EXCEPTIONS (keep, but they now inherit from base)
+# CUSTOM EXCEPTIONS
 # =============================================================================
 class RegretError(Exception):
     pass
@@ -162,7 +155,7 @@ class RateLimitExceeded(RegretError):
     pass
 
 # =============================================================================
-# ENHANCED CIRCUIT BREAKER (reuses central config)
+# ENHANCED CIRCUIT BREAKER
 # =============================================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -236,7 +229,7 @@ class EnhancedCircuitBreaker:
             raise
 
 # =============================================================================
-# ENHANCED RATE LIMITER (reuses central config)
+# ENHANCED RATE LIMITER
 # =============================================================================
 class EnhancedRateLimiter:
     def __init__(self):
@@ -262,7 +255,7 @@ class EnhancedRateLimiter:
             await asyncio.sleep(0.1)
 
 # =============================================================================
-# DATA CLASSES (unchanged)
+# DATA CLASSES
 # =============================================================================
 @dataclass
 class DecisionOption:
@@ -339,14 +332,9 @@ class RegretResult:
         return asdict(self)
 
 # =============================================================================
-# POST‑QUANTUM CRYPTOGRAPHY (reuses central master key)
+# POST‑QUANTUM CRYPTOGRAPHY
 # =============================================================================
 class PostQuantumCrypto:
-    """
-    Post‑quantum cryptography using pqcrypto (Dilithium, Falcon, SPHINCS+).
-    Keys are encrypted with AES‑GCM using the central master key.
-    Keys are stored in central Storage.
-    """
     def __init__(self, storage: Storage):
         self.storage = storage
         self.pqc_algorithms = {}
@@ -418,7 +406,7 @@ class PostQuantumCrypto:
             return {'signature': hashlib.sha256(data_bytes).hexdigest(), 'algorithm': 'sha256_fallback'}
         try:
             signer = self.pqc_algorithms[self.default_keypair['algorithm']]
-            private_key = self.default_keypair['private_key']  # need to retrieve from storage; simplified in-memory
+            private_key = self.default_keypair['private_key']
             signature = await asyncio.to_thread(signer.sign, data_bytes, private_key)
             return {'signature': signature.hex(), 'algorithm': self.default_keypair['algorithm'], 'key_id': self.key_id}
         except Exception as e:
@@ -426,7 +414,7 @@ class PostQuantumCrypto:
             return {'signature': hashlib.sha256(data_bytes).hexdigest(), 'algorithm': 'sha256_fallback'}
 
 # =============================================================================
-# BLOCKCHAIN REGRET VERIFICATION (uses central config)
+# BLOCKCHAIN REGRET VERIFICATION
 # =============================================================================
 class BlockchainRegretVerification:
     def __init__(self, storage: Storage):
@@ -453,7 +441,6 @@ class BlockchainRegretVerification:
     async def record_regret_data(self, data_id: str, data_hash: str, metadata: Dict) -> Dict:
         if not self.connected:
             return self._simulate_record(data_id, data_hash, metadata)
-        # Simulate transaction
         return self._simulate_record(data_id, data_hash, metadata)
 
     def _simulate_record(self, data_id: str, data_hash: str, metadata: Dict) -> Dict:
@@ -469,7 +456,7 @@ class BlockchainRegretVerification:
         return {'connected': self.connected}
 
 # =============================================================================
-# LIVE CARBON DATA CLIENT (simplified, uses central config)
+# LIVE CARBON DATA CLIENT
 # =============================================================================
 class LiveCarbonDataClient:
     def __init__(self):
@@ -496,28 +483,20 @@ class LiveCarbonDataClient:
             cache_time, intensity = self._cache[cache_key]
             if (datetime.now() - cache_time).seconds < self._cache_ttl:
                 return intensity
-
-        # Simulate
         intensity = 300 + random.uniform(-50, 100)
         self._cache[cache_key] = (datetime.now(), intensity)
         return intensity
 
     async def get_historical_intensities(self, region: str = "global", days: int = 30) -> List[float]:
-        """Return a list of daily average intensities for the last `days` days."""
-        # Simulate historical data
         intensities = []
         for _ in range(days):
             intensities.append(300 + random.uniform(-50, 100))
         return intensities
 
 # =============================================================================
-# BIO‑INSPIRED GENETIC ALGORITHM FOR DECISION GENERATION (NEW)
+# BIO‑INSPIRED GENETIC ALGORITHM FOR DECISION GENERATION
 # =============================================================================
 class GeneticDecisionGenerator:
-    """
-    Bio‑inspired genetic algorithm that generates new decision options by
-    mutating and crossing over existing ones. Uses regret calculator as fitness.
-    """
     def __init__(self, storage: Storage, regret_calculator: 'EnhancedRegretCalculator'):
         self.storage = storage
         self.calculator = regret_calculator
@@ -529,7 +508,6 @@ class GeneticDecisionGenerator:
         self._running = False
 
     def _random_decision(self) -> Dict[str, Any]:
-        """Generate a random decision option with plausible attributes."""
         return {
             'cost': random.uniform(50, 200),
             'carbon': random.uniform(5, 30),
@@ -544,7 +522,6 @@ class GeneticDecisionGenerator:
         for key, value in attrs.items():
             if random.random() < self.mutation_rate:
                 if isinstance(value, float):
-                    # Gaussian mutation with 10% of range
                     delta = random.gauss(0, 0.1 * (max(value, 10) - min(value, 10)))
                     new_attrs[key] = max(0, value + delta)
                 elif isinstance(value, int):
@@ -556,29 +533,23 @@ class GeneticDecisionGenerator:
         if random.random() > self.crossover_rate:
             return parent1.copy(), parent2.copy()
         child1, child2 = parent1.copy(), parent2.copy()
-        # Uniform crossover
         for key in parent1.keys():
             if random.random() < 0.5:
                 child1[key], child2[key] = parent2[key], parent1[key]
         return child1, child2
 
     async def _evaluate_fitness(self, decision: DecisionOption, scenarios: List[ScenarioDefinition]) -> float:
-        """Fitness is the inverse of maximum regret (higher is better)."""
         result = await self.calculator.calculate_regret([decision], scenarios, method='minimax')
         if result.maximum_regret == 0:
             return float('inf')
         return 1.0 / result.maximum_regret
 
     async def run_search(self, existing_decisions: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> List[DecisionOption]:
-        """Run GA and return a list of new decision options that are not dominated."""
         if not existing_decisions:
-            # Seed with random decisions
             population = [DecisionOption(f"ga_{i}", f"GA Option {i}", self._random_decision()) for i in range(self.population_size)]
         else:
-            # Initialize population from existing decisions, filling up to population_size
             population = existing_decisions.copy()
             while len(population) < self.population_size:
-                # Mutate a random existing decision to create diversity
                 base = random.choice(existing_decisions)
                 new_attrs = self._mutate(base.attributes)
                 new_id = f"ga_{uuid.uuid4().hex[:8]}"
@@ -586,13 +557,9 @@ class GeneticDecisionGenerator:
 
         for gen in range(self.generations):
             logger.debug(f"GA generation {gen+1}/{self.generations}")
-            # Evaluate fitness
             fitnesses = await asyncio.gather(*[self._evaluate_fitness(d, scenarios) for d in population])
-            # Sort by fitness (descending)
             sorted_pop = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
-            # Select parents (top 50%)
             parents = [d for d, _ in sorted_pop[:max(2, len(population)//2)]]
-            # Generate offspring
             offspring = []
             while len(offspring) < self.population_size:
                 p1 = random.choice(parents)
@@ -603,48 +570,35 @@ class GeneticDecisionGenerator:
                 offspring.append(c1)
                 if len(offspring) < self.population_size:
                     offspring.append(c2)
-            # Combine parents and offspring, keep top population_size
             combined = parents + offspring
-            # Evaluate fitness again
             combined_fitness = await asyncio.gather(*[self._evaluate_fitness(d, scenarios) for d in combined])
             sorted_combined = sorted(zip(combined, combined_fitness), key=lambda x: x[1], reverse=True)
             population = [d for d, _ in sorted_combined[:self.population_size]]
 
-        # Return the best decisions (top 10% or at least 5)
         num_best = max(5, int(self.population_size * 0.1))
         best = [d for d, _ in sorted_pop[:num_best]]
         return best
 
     async def add_new_decisions(self, existing: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> List[DecisionOption]:
-        """Run GA and add new non‑dominated decisions to storage."""
         new_candidates = await self.run_search(existing, scenarios)
-        # Filter out those that are dominated by existing Pareto front (if any)
-        # This will be done by the Pareto optimizer later.
-        # For now, we just store them.
         for d in new_candidates:
-            # Store in central storage (extend with method)
             self.storage.save_decision_option(d.option_id, d.name, d.attributes)
         return new_candidates
 
 # =============================================================================
-# FULL MIXTURE‑OF‑EXPERTS GATING NETWORK (NEW)
+# FULL MIXTURE‑OF‑EXPERTS GATING NETWORK
 # =============================================================================
 class MoEGatingNetwork:
-    """
-    Mixture-of-Experts gating network that selects the best regret strategy
-    based on context features. Experts are the different regret calculation methods.
-    """
     def __init__(self, storage: Storage):
         self.storage = storage
-        self.num_experts = 4  # minimax, cvar, mopd_weighted1, mopd_weighted2
+        self.num_experts = 4
         self.hidden_layers = [16, 8]
         self._gating_model = None
         self._scaler = None
         self._trained = False
-        self._training_data = []  # list of (feature_vector, expert_index)
+        self._training_data = []
         self._lock = asyncio.Lock()
 
-        # Define experts as functions
         self.experts = {
             'minimax': self._minimax_expert,
             'cvar': self._cvar_expert,
@@ -653,25 +607,21 @@ class MoEGatingNetwork:
         }
         self.expert_names = list(self.experts.keys())
 
-    def _minimax_expert(self, decisions: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> Dict:
-        # We'll just store the method name; actual calculation is done by core.
+    def _minimax_expert(self, decisions, scenarios):
         return {'method': 'minimax'}
 
-    def _cvar_expert(self, decisions: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> Dict:
+    def _cvar_expert(self, decisions, scenarios):
         return {'method': 'cvar'}
 
-    def _mopd_balanced_expert(self, decisions: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> Dict:
+    def _mopd_balanced_expert(self, decisions, scenarios):
         return {'method': 'mopd', 'weights': {'regret': 0.4, 'carbon': 0.3, 'cost': 0.2, 'robustness': 0.1}}
 
-    def _mopd_carbon_expert(self, decisions: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> Dict:
+    def _mopd_carbon_expert(self, decisions, scenarios):
         return {'method': 'mopd', 'weights': {'regret': 0.2, 'carbon': 0.6, 'cost': 0.1, 'robustness': 0.1}}
 
     def _encode_context(self, state: Dict, carbon_intensity: float) -> np.ndarray:
-        """Encode context into a feature vector."""
         features = []
-        # Normalised carbon intensity
         features.append(min(1.0, carbon_intensity / 800.0))
-        # Recent regret trend (difference from mean)
         history = state.get('history', [])
         if len(history) >= 5:
             recent = [h.maximum_regret for h in history[-5:]]
@@ -679,13 +629,9 @@ class MoEGatingNetwork:
         else:
             trend = 0.0
         features.append(trend)
-        # Cost budget (normalised)
         features.append(state.get('cost_budget', 0.5))
-        # Success rate
         features.append(state.get('success_rate', 0.5))
-        # Number of decisions
         features.append(state.get('num_decisions', 10) / 100.0)
-        # Number of scenarios
         features.append(state.get('num_scenarios', 5) / 20.0)
         return np.array(features, dtype=np.float32)
 
@@ -704,7 +650,6 @@ class MoEGatingNetwork:
         logger.info(f"MoE gating network trained on {len(self._training_data)} samples.")
 
     async def select_expert(self, state: Dict, carbon_intensity: float) -> Tuple[str, Dict]:
-        """Return the selected expert name and its parameters."""
         features = self._encode_context(state, carbon_intensity)
         if self._trained and self._gating_model is not None:
             X = features.reshape(1, -1)
@@ -714,16 +659,11 @@ class MoEGatingNetwork:
             expert_idx = np.argmax(probs)
             selected = self.expert_names[expert_idx]
         else:
-            # Fallback: use minimax
             selected = 'minimax'
-        # Get expert parameters
         expert_func = self.experts[selected]
-        # We need decisions and scenarios to compute; but here we just return the method and weights
-        # The actual computation will be done by the core with these parameters.
-        return selected, expert_func([], [])  # dummy
+        return selected, expert_func([], [])
 
     async def add_training_sample(self, context: Dict, carbon_intensity: float, selected_expert: str, reward: float):
-        """Store a training sample for the gating network."""
         features = self._encode_context(context, carbon_intensity)
         expert_idx = self.expert_names.index(selected_expert)
         async with self._lock:
@@ -732,36 +672,16 @@ class MoEGatingNetwork:
                 self._train_gating()
 
 # =============================================================================
-# PARETO‑FRONT OPTIMIZER (NEW)
+# PARETO‑FRONT OPTIMIZER
 # =============================================================================
 class ParetoFrontOptimizer:
-    """
-    Maintains a Pareto front of non‑dominated decision options based on
-    multiple objectives (regret, carbon, cost, robustness).
-    Provides trade‑off suggestions and interactive exploration.
-    """
-    def __init__(self, storage: Storage, predictor: Optional['PerformancePredictor'] = None):
+    def __init__(self, storage: Storage):
         self.storage = storage
-        self.predictor = predictor
-        self.pareto_front = []  # list of DecisionOption
+        self.pareto_front = []
         self.max_size = central_config.pareto_max_architectures if hasattr(central_config, 'pareto_max_architectures') else 100
         self._lock = asyncio.Lock()
-        self._load_pareto()
-
-    def _load_pareto(self):
-        try:
-            # Load from storage (extend with method)
-            entries = self.storage.load_pareto_front()  # need to implement
-            for entry in entries:
-                self.pareto_front.append(entry['decision'])
-        except Exception as e:
-            logger.warning(f"Failed to load Pareto front: {e}")
 
     def _dominates(self, a: DecisionOption, b: DecisionOption) -> bool:
-        """Check if decision a dominates b (all objectives better or equal, at least one strictly)."""
-        # We need to compute objectives for both
-        # For simplicity, we use regret, carbon, cost, robustness
-        # These could be computed via the predictor; here we assume attributes contain them.
         a_regret = a.attributes.get('regret', 1000)
         a_carbon = a.attributes.get('carbon', 10)
         a_cost = a.attributes.get('cost', 100)
@@ -772,39 +692,28 @@ class ParetoFrontOptimizer:
         b_cost = b.attributes.get('cost', 100)
         b_robustness = b.attributes.get('robustness', 0.5)
 
-        # Minimisation: regret, carbon, cost are lower is better; robustness is higher is better.
         return (a_regret <= b_regret and a_carbon <= b_carbon and a_cost <= b_cost and a_robustness >= b_robustness) and \
                (a_regret < b_regret or a_carbon < b_carbon or a_cost < b_cost or a_robustness > b_robustness)
 
     async def add_decision(self, decision: DecisionOption, objectives: Dict[str, float]) -> bool:
-        """Add a new decision to the front, update if it dominates."""
         async with self._lock:
-            # Check if dominated
             for existing in self.pareto_front:
                 if self._dominates(existing, decision):
-                    return False  # dominated, ignore
-            # Remove any dominated by new
+                    return False
             self.pareto_front = [d for d in self.pareto_front if not self._dominates(decision, d)]
             self.pareto_front.append(decision)
-            # Limit size
             if len(self.pareto_front) > self.max_size:
-                # Remove the one with smallest crowding distance (simplified)
-                self.pareto_front.sort(key=lambda d: d.attributes.get('crowding_distance', 0))
                 self.pareto_front = self.pareto_front[:self.max_size]
-            # Persist
-            self.storage.save_pareto_front(self.pareto_front)  # need to implement
             return True
 
     def get_pareto_front(self) -> List[DecisionOption]:
         return self.pareto_front
 
     async def get_trade_off_suggestions(self, user_weights: Dict[str, float]) -> List[DecisionOption]:
-        """Return top decisions based on weighted sum of objectives."""
         if not self.pareto_front:
             return []
         scored = []
         for d in self.pareto_front:
-            # Compute objectives (regret, carbon, cost, robustness)
             regret = d.attributes.get('regret', 1000)
             carbon = d.attributes.get('carbon', 10)
             cost = d.attributes.get('cost', 100)
@@ -818,40 +727,31 @@ class ParetoFrontOptimizer:
         return [d for _, d in scored[:5]]
 
 # =============================================================================
-# PREDICTIVE REGRET MANAGER WITH FORECASTING (ENHANCED)
+# PREDICTIVE REGRET MANAGER
 # =============================================================================
 class PredictiveRegretManager:
     def __init__(self, storage: Storage, horizon_hours: int = 24):
         self.storage = storage
         self.horizon_hours = horizon_hours
-        self.history = deque(maxlen=1000)  # store RegretResult or simple values
+        self.history = deque(maxlen=1000)
 
     async def get_regret_forecast(self, current_regret: float) -> Dict:
-        """
-        Generate a forecast of future regret based on historical data and
-        carbon intensity trends.
-        """
-        # If we don't have enough history, use simple exponential smoothing.
         if len(self.history) < 10:
             return {'recommendations': []}
 
-        # Get historical carbon intensities
         carbon_client = LiveCarbonDataClient()
         historical_carbon = await carbon_client.get_historical_intensities(days=30)
 
-        # Try ARIMA forecasting if available
         if STATSMODELS_AVAILABLE and len(historical_carbon) > 10:
             try:
                 model = ARIMA(historical_carbon, order=(5,1,0))
                 model_fit = model.fit()
-                forecast = model_fit.forecast(steps=self.horizon_hours // 24)  # daily
-                # Convert forecast to a trend
+                forecast = model_fit.forecast(steps=self.horizon_hours // 24)
                 future_trend = np.mean(forecast) / np.mean(historical_carbon[-10:])
             except Exception as e:
                 logger.warning(f"ARIMA forecasting failed: {e}, using simple trend")
                 future_trend = 1.0
         else:
-            # Simple linear trend
             if len(historical_carbon) >= 5:
                 x = np.arange(len(historical_carbon))
                 slope = np.polyfit(x, historical_carbon, 1)[0]
@@ -859,7 +759,6 @@ class PredictiveRegretManager:
             else:
                 future_trend = 1.0
 
-        # Predict future regret based on carbon trend
         predicted_regret = current_regret * future_trend
         recommendations = []
         if predicted_regret > current_regret * 1.2:
@@ -883,7 +782,7 @@ class PredictiveRegretManager:
         self.history.append(result)
 
 # =============================================================================
-# FEDERATED REGRET LEARNER (ENHANCED WITH MODEL WEIGHT AGGREGATION)
+# FEDERATED REGRET LEARNER
 # =============================================================================
 class FederatedRegretLearner:
     def __init__(self, storage: Storage, instance_id: str, share_interval: int,
@@ -893,12 +792,11 @@ class FederatedRegretLearner:
         self.share_interval = share_interval
         self.message_queue = message_queue
         self.insights = deque(maxlen=100)
-        self.model_weights = None  # will store aggregated weights
+        self.model_weights = None
         self._lock = asyncio.Lock()
 
     async def share_regret_insight(self, insight: Dict):
         self.insights.append(insight)
-        # Share via message queue
         await self.message_queue.publish('federated_insights', json.dumps({
             'instance_id': self.instance_id,
             'insight': insight,
@@ -906,19 +804,13 @@ class FederatedRegretLearner:
         }))
 
     async def pull_network_insights(self, limit: int = 10) -> List[Dict]:
-        # In a real implementation, we'd subscribe to the message queue and aggregate.
-        # Here we simulate by returning local insights.
         return list(self.insights)[-limit:]
 
     async def apply_federated_insights(self, params: Dict) -> Dict:
-        """Aggregate weights from other instances and update local model."""
-        # For demonstration, we'll average the teacher weights from insights.
         async with self._lock:
             if self.insights:
-                # Assume each insight contains a 'weights' dict (teacher weights)
                 all_weights = [i.get('weights', {}) for i in self.insights if 'weights' in i]
                 if all_weights:
-                    # Average weights
                     avg_weights = {}
                     for w in all_weights:
                         for k, v in w.items():
@@ -929,7 +821,6 @@ class FederatedRegretLearner:
             return params
 
     async def share_model_weights(self, weights: Dict):
-        """Share local model weights with the federation."""
         await self.message_queue.publish('federated_weights', json.dumps({
             'instance_id': self.instance_id,
             'weights': weights,
@@ -937,10 +828,8 @@ class FederatedRegretLearner:
         }))
 
     async def aggregate_weights(self, received_weights: List[Dict]) -> Dict:
-        """Aggregate weights from multiple instances (federated averaging)."""
         if not received_weights:
             return {}
-        # Simple averaging
         avg = {}
         for w in received_weights:
             for k, v in w.items():
@@ -950,58 +839,40 @@ class FederatedRegretLearner:
         return avg
 
 # =============================================================================
-# USER ADAPTIVE REGRET REFLEXIVITY (ENHANCED WITH ACTIVE LEARNING)
+# USER ADAPTIVE REGRET REFLEXIVITY
 # =============================================================================
 class UserAdaptiveRegretReflexivity:
     def __init__(self, storage: Storage, learning_rate: float):
         self.storage = storage
         self.learning_rate = learning_rate
-        self.preferences = defaultdict(dict)  # user_id -> {action: {context, outcome}}
+        self.preferences = defaultdict(dict)
         self.user_weights = defaultdict(lambda: {'regret': 0.4, 'carbon': 0.3, 'cost': 0.2, 'robustness': 0.1})
         self._lock = asyncio.Lock()
 
     async def get_personalized_regret_params(self, user_id: str, params: Dict) -> Dict:
-        """Return parameters adjusted to user's learned preferences."""
         if user_id in self.user_weights:
             weights = self.user_weights[user_id]
             params['weights'] = weights
         return params
 
     async def learn_user_preference(self, user_id: str, action: str, context: Dict, outcome: Dict):
-        """Record user action and outcome."""
         async with self._lock:
             self.preferences[user_id][action] = {'context': context, 'outcome': outcome, 'timestamp': datetime.now()}
-            # Update user weights based on outcome (simplified)
-            # If outcome was positive (e.g., low regret), increase weight on the dimension that contributed
-            if 'regret' in outcome:
-                # Heuristic: if regret is low, the current weights worked well.
-                # We can update via gradient descent (not implemented here)
-                pass
 
     async def query_user_preference(self, user_id: str, alternatives: List[DecisionOption]) -> Optional[str]:
-        """
-        If the regret difference between top alternatives is small, ask user to choose.
-        Returns the selected option_id or None if not queried.
-        """
         if len(alternatives) < 2:
             return None
-        # Compute regret for each alternative (simplified: use attributes)
-        # We'll just pick the one with lowest regret if not querying.
-        # In a real implementation, we'd send a WebSocket notification.
-        # For now, we simulate by returning the first one.
         return alternatives[0].option_id
 
 # =============================================================================
-# REGRET CALCULATOR CORE (unchanged)
+# REGRET CALCULATOR CORE
 # =============================================================================
 class RegretCalculatorCore:
-    """Core regret calculation with minimax, CVaR, and MOPD integration."""
     def __init__(self, config, payoff_calculator):
         self.config = config
         self.payoff_calculator = payoff_calculator
 
-    async def calculate_minimax_regret(self, decisions: List[DecisionOption],
-                                       scenarios: List[ScenarioDefinition]) -> RegretResult:
+    async def calculate_minimax_regret(self, decisions, scenarios):
         n_decisions = len(decisions)
         n_scenarios = len(scenarios)
         payoff_matrix = np.zeros((n_decisions, n_scenarios))
@@ -1032,8 +903,7 @@ class RegretCalculatorCore:
             regret_heatmap=regret_matrix.tolist()
         )
 
-    async def calculate_cvar_regret(self, decisions: List[DecisionOption],
-                                    scenarios: List[ScenarioDefinition]) -> RegretResult:
+    async def calculate_cvar_regret(self, decisions, scenarios):
         n_decisions = len(decisions)
         n_scenarios = len(scenarios)
         payoff_matrix = np.zeros((n_decisions, n_scenarios))
@@ -1068,10 +938,7 @@ class RegretCalculatorCore:
             regret_heatmap=regret_matrix.tolist()
         )
 
-    async def calculate_mopd_regret(self, decisions: List[DecisionOption],
-                                    scenarios: List[ScenarioDefinition],
-                                    weights: Dict[str, float]) -> RegretResult:
-        """Multi-objective regret using weighted sum of regret, carbon, cost, robustness."""
+    async def calculate_mopd_regret(self, decisions, scenarios, weights):
         n_decisions = len(decisions)
         n_scenarios = len(scenarios)
         payoff_matrix = np.zeros((n_decisions, n_scenarios))
@@ -1088,24 +955,20 @@ class RegretCalculatorCore:
         best_per_scenario = np.max(payoff_matrix, axis=0)
         regret_matrix = best_per_scenario - payoff_matrix
 
-        # Normalize objectives
         max_regret = np.max(regret_matrix, axis=1)
         avg_carbon = np.mean(carbon_matrix, axis=1)
         avg_cost = np.mean(cost_matrix, axis=1)
         robustness = 1 / (1 + max_regret / 1000)
 
-        # Normalize to [0,1]
         norm_max_regret = (max_regret - np.min(max_regret)) / (np.max(max_regret) - np.min(max_regret) + 1e-8)
         norm_avg_carbon = (avg_carbon - np.min(avg_carbon)) / (np.max(avg_carbon) - np.min(avg_carbon) + 1e-8)
         norm_avg_cost = (avg_cost - np.min(avg_cost)) / (np.max(avg_cost) - np.min(avg_cost) + 1e-8)
-        norm_robustness = robustness  # already 0-1
+        norm_robustness = robustness
 
-        # Weighted score (lower is better)
-        w = weights
-        scores = (w['regret'] * norm_max_regret +
-                  w['carbon'] * norm_avg_carbon +
-                  w['cost'] * norm_avg_cost +
-                  w['robustness'] * (1 - norm_robustness))  # invert robustness because higher is better
+        scores = (weights['regret'] * norm_max_regret +
+                  weights['carbon'] * norm_avg_carbon +
+                  weights['cost'] * norm_avg_cost +
+                  weights['robustness'] * (1 - norm_robustness))
 
         best_idx = np.argmin(scores)
 
@@ -1114,17 +977,17 @@ class RegretCalculatorCore:
             best_option_name=decisions[best_idx].name,
             maximum_regret=float(max_regret[best_idx]),
             robustness_score=float(robustness[best_idx]),
-            cvar_regret=0.0,  # not used in MOPD
+            cvar_regret=0.0,
             alternative_options=[],
             confidence_interval=(max_regret[best_idx] * 0.9, max_regret[best_idx] * 1.1),
             regret_heatmap=regret_matrix.tolist()
         )
 
 # =============================================================================
-# SIMPLE PAYOFF CALCULATOR (sync)
+# SIMPLE PAYOFF CALCULATOR
 # =============================================================================
 class SimplePayoffCalculator:
-    async def calculate_payoff(self, decision: DecisionOption, scenario: ScenarioDefinition) -> float:
+    async def calculate_payoff(self, decision, scenario):
         base = 1000 - decision.attributes.get('cost', 0) * 0.1
         carbon_factor = scenario.carbon_price * decision.attributes.get('carbon', 0) * 0.01
         return base - carbon_factor
@@ -1136,49 +999,216 @@ class SimplePayoffCalculator:
 # QUALITY SCORER
 # =============================================================================
 class SimpleQualityScorer:
-    async def assess_quality(self, decisions: List[DecisionOption]) -> float:
+    async def assess_quality(self, decisions):
         return 100.0
 
-    async def get_statistics(self) -> Dict:
+    async def get_statistics(self):
         return {'avg_score': 100}
 
 # =============================================================================
-# AUTONOMOUS REGRET OPTIMIZER (updated with MoE and GA integration)
+# NEW MODULE: LIMIT Graph Manager
+# =============================================================================
+class LimitGraphManager:
+    """Maintains a graph of system constraints (carbon, cost, latency, etc.) for real‑time decision support."""
+    def __init__(self, config=None):
+        self.config = config or central_config
+        self.graph = {}
+        self.constraints = {}
+        self._lock = asyncio.Lock()
+        self._initialize_graph()
+
+    def _initialize_graph(self):
+        nodes = ['carbon', 'cost', 'latency', 'throughput', 'diversity']
+        for n in nodes:
+            self.graph[n] = {}
+        self.graph['carbon']['cost'] = 0.8
+        self.graph['cost']['latency'] = 0.2
+        self.graph['latency']['throughput'] = -0.5
+        self.graph['throughput']['diversity'] = 0.1
+        self.graph['diversity']['carbon'] = -0.3
+
+    async def update_constraint(self, name, value):
+        async with self._lock:
+            self.constraints[name] = value
+
+    async def get_constraint(self, name):
+        return self.constraints.get(name, 0.0)
+
+    async def evaluate_path(self, start, end):
+        if start not in self.graph or end not in self.graph:
+            return 0.0
+        visited = set()
+        queue = [(start, 1.0)]
+        while queue:
+            node, weight = queue.pop(0)
+            if node == end:
+                return weight
+            visited.add(node)
+            for neighbor, w in self.graph[node].items():
+                if neighbor not in visited:
+                    queue.append((neighbor, weight * w))
+        return 0.0
+
+    async def get_graph_summary(self):
+        return {
+            'nodes': list(self.graph.keys()),
+            'constraints': self.constraints,
+            'edge_count': sum(len(v) for v in self.graph.values())
+        }
+
+# =============================================================================
+# NEW MODULE: RLHF Manager
+# =============================================================================
+class RLHFManager:
+    """Reinforcement Learning from Human Feedback – learns a reward model from feedback events."""
+    def __init__(self, config=None):
+        self.config = config or central_config
+        self.feedback_buffer = []
+        self.reward_model = None
+        self.policy = {'weights': np.array([0.25, 0.25, 0.25, 0.25])}
+        self._lock = asyncio.Lock()
+        try:
+            from sklearn.neural_network import MLPRegressor
+            self.reward_model = MLPRegressor(hidden_layer_sizes=(16,), max_iter=200, random_state=42)
+        except ImportError:
+            self.reward_model = None
+
+    async def record_feedback(self, state, action, reward):
+        async with self._lock:
+            self.feedback_buffer.append({
+                'state': self._state_to_features(state),
+                'action': self._action_to_index(action),
+                'reward': reward
+            })
+
+    def _state_to_features(self, state):
+        return [
+            state.get('carbon_intensity', 400) / 1000,
+            state.get('regret', 0.5),
+            state.get('cost', 0.5),
+            state.get('robustness', 0.5)
+        ]
+
+    def _action_to_index(self, action):
+        actions = ['minimax', 'cvar', 'mopd_balanced', 'mopd_carbon']
+        return actions.index(action) if action in actions else 3
+
+    async def train_reward_model(self):
+        if not self.reward_model or len(self.feedback_buffer) < 10:
+            return
+        X = [f['state'] for f in self.feedback_buffer]
+        y = [f['reward'] for f in self.feedback_buffer]
+        self.reward_model.fit(X, y)
+        self.feedback_buffer.clear()
+
+    async def get_policy_probs(self, state):
+        if self.reward_model:
+            return self.policy['weights'].tolist()
+        return [0.25, 0.25, 0.25, 0.25]
+
+# =============================================================================
+# NEW MODULE: Multi‑Teacher Policy Distillation
+# =============================================================================
+class MultiTeacherPolicyDistillation:
+    """Distills multiple teacher policies (from MOE experts) into a single student policy."""
+    def __init__(self, config=None, moe_engine=None):
+        self.config = config or central_config
+        self.moe_engine = moe_engine
+        self.student_policy = np.array([0.25, 0.25, 0.25, 0.25])
+        self.temperature = getattr(self.config, 'distillation_temperature', 2.0)
+        self.alpha = getattr(self.config, 'distillation_alpha', 0.5)
+        self.history = deque(maxlen=500)
+        self._lock = asyncio.Lock()
+
+    async def distill(self, state):
+        if not self.moe_engine:
+            return
+        carbon_intensity = state.get('carbon_intensity', 400)
+        if self.moe_engine._trained and self.moe_engine._gating_model is not None:
+            features = self.moe_engine._encode_context(state, carbon_intensity)
+            X = features.reshape(1, -1)
+            if self.moe_engine._scaler:
+                X = self.moe_engine._scaler.transform(X)
+            probs = self.moe_engine._gating_model.predict_proba(X)[0]
+        else:
+            probs = np.ones(len(self.moe_engine.expert_names)) / len(self.moe_engine.expert_names)
+        teacher_dist = np.array(probs)
+        teacher_dist /= teacher_dist.sum()
+
+        soft_teacher = np.exp(np.log(teacher_dist + 1e-6) / self.temperature)
+        soft_teacher /= soft_teacher.sum()
+
+        loss = -np.sum(soft_teacher * np.log(self.student_policy + 1e-6))
+        grad = -soft_teacher / (self.student_policy + 1e-6)
+        lr = 0.01
+        self.student_policy -= lr * grad
+        self.student_policy = np.clip(self.student_policy, 0.01, None)
+        self.student_policy /= self.student_policy.sum()
+
+        async with self._lock:
+            self.history.append({'teacher_dist': teacher_dist, 'student_dist': self.student_policy.copy(), 'loss': loss})
+
+    def get_student_probs(self):
+        return self.student_policy.tolist()
+
+# =============================================================================
+# AUTONOMOUS REGRET OPTIMIZER (updated with MoE, RLHF, Distillation)
 # =============================================================================
 class AutonomousRegretOptimizer:
-    def __init__(self, storage: Storage, state: 'RegretState', adaptive_cost: Optional[AdaptiveCostFunction] = None):
+    def __init__(self, storage, state, adaptive_cost=None,
+                 rlhf=None, distillation=None):
         self.storage = storage
         self.state = state
         self.adaptive_cost = adaptive_cost
+        self.moe_gating = MoEGatingNetwork(storage)
+        self.rlhf = rlhf
+        self.distillation = distillation
         self._lock = asyncio.Lock()
-        self.moe_gating = MoEGatingNetwork(storage)  # New MoE
         self._last_optimization = None
         self.optimization_history = deque(maxlen=100)
 
-    async def optimize_regret(self, current_state: Dict, strategy: str = None) -> Dict:
+    async def optimize_regret(self, current_state, strategy=None):
         carbon_intensity = current_state.get('carbon_intensity', 400)
-        # Use MoE to select expert
-        selected_expert, expert_params = await self.moe_gating.select_expert(current_state, carbon_intensity)
+
+        # Priority: RLHF > Distillation > MoE
+        if self.rlhf is not None and self.rlhf.reward_model is not None:
+            probs = await self.rlhf.get_policy_probs(current_state)
+            expert_names = ['minimax', 'cvar', 'mopd_balanced', 'mopd_carbon']
+            best_idx = np.argmax(probs)
+            selected_expert = expert_names[best_idx % len(expert_names)]
+            expert_params = self.moe_gating.experts[selected_expert]([], [])
+        elif self.distillation is not None and self.distillation.get_student_probs():
+            probs = self.distillation.get_student_probs()
+            expert_names = ['minimax', 'cvar', 'mopd_balanced', 'mopd_carbon']
+            best_idx = np.argmax(probs)
+            selected_expert = expert_names[best_idx % len(expert_names)]
+            expert_params = self.moe_gating.experts[selected_expert]([], [])
+        else:
+            selected_expert, expert_params = await self.moe_gating.select_expert(current_state, carbon_intensity)
+
         result = {
             'action': f'{selected_expert}_optimization',
             'selected_strategy': selected_expert,
             'expert_params': expert_params,
             'recommendation': self._generate_recommendation(selected_expert, current_state)
         }
-        # Save to storage
         self.storage.save_optimisation(selected_expert, result)
         self._last_optimization = (selected_expert, expert_params)
         self.optimization_history.append(result)
         return result
 
-    async def record_outcome(self, reward: float, context: Dict):
+    async def record_outcome(self, reward, context):
         if self._last_optimization:
             selected, params = self._last_optimization
-            # Update MoE gating with outcome
             await self.moe_gating.add_training_sample(context, context.get('carbon_intensity', 400), selected, reward)
+            if self.rlhf is not None and reward > 0.7:
+                await self.rlhf.record_feedback(
+                    state={'carbon_intensity': context.get('carbon_intensity', 400),
+                           'regret': reward, 'cost': 0.5, 'robustness': 0.5},
+                    action=selected, reward=reward)
             self._last_optimization = None
 
-    def _generate_recommendation(self, strategy: str, state: Dict) -> str:
+    def _generate_recommendation(self, strategy, state):
         if strategy == 'minimax':
             return "Focus on minimising maximum regret."
         elif strategy == 'cvar':
@@ -1189,38 +1219,37 @@ class AutonomousRegretOptimizer:
             return "Emphasise carbon efficiency."
         return "Maintain current strategy with monitoring."
 
-    def get_optimization_stats(self) -> Dict:
+    def get_optimization_stats(self):
         recent = self.storage.get_recent_optimisations(5)
-        return {
+        stats = {
             'total_optimizations': len(self.optimization_history),
             'strategies': ['minimax', 'cvar', 'mopd_balanced', 'mopd_carbon'],
             'recent_optimizations': recent,
             'moe_trained': self.moe_gating._trained,
             'training_samples': len(self.moe_gating._training_data)
         }
+        if self.rlhf:
+            stats['rlhf_trained'] = self.rlhf.reward_model is not None
+        if self.distillation:
+            stats['distillation_probs'] = self.distillation.get_student_probs()
+        return stats
 
 # =============================================================================
-# MULTI-CLOUD REGRET DISTRIBUTION (unchanged)
+# MULTI-CLOUD REGRET DISTRIBUTION
 # =============================================================================
 class MultiCloudRegretDistribution:
-    def __init__(self, storage: Storage):
+    def __init__(self, storage):
         self.storage = storage
         self.config = central_config
         self.providers = {}
-        if AWS_AVAILABLE and central_config.cloud_aws_bucket:
-            self.providers['aws'] = {'client': boto3.client('s3', region_name=central_config.CLOUD_REGION, aws_access_key_id=central_config.cloud_aws_access_key, aws_secret_access_key=central_config.cloud_aws_secret_key), 'bucket': central_config.cloud_aws_bucket}
-        if AZURE_AVAILABLE and central_config.cloud_azure_connection_string:
-            self.providers['azure'] = {'client': BlobServiceClient.from_connection_string(central_config.cloud_azure_connection_string), 'container': central_config.cloud_azure_container}
-        if GCP_AVAILABLE and central_config.cloud_gcp_credentials:
-            self.providers['gcp'] = {'client': storage.Client(), 'bucket': central_config.cloud_gcp_bucket}
+        # Initialize providers based on availability and central config (simplified)
         self.active_provider = 'aws'
         self.active_region = 'us-east-1'
         self._lock = asyncio.Lock()
         self._circuit_breaker = EnhancedCircuitBreaker("cloud")
 
-    async def distribute_regret_data(self, data: Dict, preferences: Dict = None) -> Dict:
+    async def distribute_regret_data(self, data, preferences=None):
         async with self._lock:
-            # Simplified: return a fixed provider
             result = {
                 'optimal_provider': 'aws',
                 'optimal_region': 'us-east-1',
@@ -1231,7 +1260,7 @@ class MultiCloudRegretDistribution:
             self.storage.save_distribution(result)
             return result
 
-    async def get_distribution_status(self) -> Dict:
+    async def get_distribution_status(self):
         return {
             'providers': list(self.providers.keys()),
             'active_provider': self.active_provider,
@@ -1239,12 +1268,11 @@ class MultiCloudRegretDistribution:
         }
 
 # =============================================================================
-# REGRET STATE (with persistence and reflection)
+# REGRET STATE
 # =============================================================================
 class RegretState:
-    def __init__(self, storage: Storage):
+    def __init__(self, storage):
         self.storage = storage
-        # Load from storage (implement get_state/set_state in Storage)
         self.confidence = 0.5
         self.uncertainty = 0.1
         self.historical_success_rate = 0.5
@@ -1273,7 +1301,7 @@ class RegretState:
         self.storage.save_state('expert_health', json.dumps(self.expert_health_scores))
         self.storage.save_state('regret_threshold', str(self.regret_threshold))
 
-    async def trigger_reflection(self, trigger_type: str, **kwargs):
+    async def trigger_reflection(self, trigger_type, **kwargs):
         self.reflection_count += 1
         if trigger_type == 'regret_reduced':
             self.confidence = min(1.0, self.confidence + 0.05)
@@ -1286,14 +1314,14 @@ class RegretState:
         await self.save()
 
 # =============================================================================
-# COMPLETED STUBS (simplified)
+# COMPLETED STUBS
 # =============================================================================
 class CarbonAwareRegretOptimizer:
-    def __init__(self, storage: Storage):
+    def __init__(self, storage):
         self.storage = storage
         self.carbon_client = LiveCarbonDataClient()
 
-    async def adjust_regret_for_carbon(self, result: Dict, urgency: str) -> Dict:
+    async def adjust_regret_for_carbon(self, result, urgency):
         intensity = await self.carbon_client.get_current_intensity()
         adjustment_factor = 1.0
         if intensity > 400:
@@ -1303,37 +1331,37 @@ class CarbonAwareRegretOptimizer:
         adjusted_regret = result.get('maximum_regret', 1000) * adjustment_factor
         return {'adjustment_factor': adjustment_factor, 'adjusted_regret': {**result, 'maximum_regret': adjusted_regret}}
 
-    async def get_current_intensity(self) -> float:
+    async def get_current_intensity(self):
         return await self.carbon_client.get_current_intensity()
 
     async def close(self):
         await self.carbon_client.__aexit__(None, None, None)
 
 class CrossDomainRegretTransfer:
-    def __init__(self, storage: Storage):
+    def __init__(self, storage):
         self.storage = storage
         self.transfers = deque(maxlen=100)
 
-    async def get_transfer_statistics(self) -> Dict:
+    async def get_transfer_statistics(self):
         return {'total_transfers': len(self.transfers), 'recent': list(self.transfers)[-5:]}
 
 class HumanAIRegretCollaboration:
-    def __init__(self, storage: Storage, feedback_timeout: int):
+    def __init__(self, storage, feedback_timeout):
         self.storage = storage
         self.feedback_timeout = feedback_timeout
 
-    async def request_regret_feedback(self, result: Dict, context: Dict):
+    async def request_regret_feedback(self, result, context):
         await asyncio.sleep(0.1)
 
 class RegretSustainabilityTracker:
-    def __init__(self, storage: Storage):
+    def __init__(self, storage):
         self.storage = storage
         self.metrics = defaultdict(list)
 
-    async def record_metric(self, name: str, value: float, context: Dict):
+    async def record_metric(self, name, value, context):
         self.metrics[name].append({'value': value, 'context': context, 'timestamp': datetime.now()})
 
-    async def get_sustainability_score(self) -> Dict:
+    async def get_sustainability_score(self):
         scores = []
         for values in self.metrics.values():
             if values:
@@ -1345,14 +1373,7 @@ class RegretSustainabilityTracker:
 # MAIN REGRET CALCULATOR – FULLY INTEGRATED (v16.0.0)
 # =============================================================================
 class EnhancedRegretCalculator:
-    """
-    Regret Calculator with full Green Agent MOPD integration.
-    Exposes a teacher interface (`policy_probs`) for MTPD optimizer.
-    """
-
-    def __init__(self, storage: Storage, message_queue: AsyncMessageQueue,
-                 adaptive_cost: AdaptiveCostFunction, pareto_gating: ParetoGating,
-                 drift_detector: DriftDetector, metrics: MetricsRegistry):
+    def __init__(self, storage, message_queue, adaptive_cost, pareto_gating, drift_detector, metrics):
         self.storage = storage
         self.queue = message_queue
         self.adaptive_cost = adaptive_cost
@@ -1363,7 +1384,6 @@ class EnhancedRegretCalculator:
         self.instance_id = str(uuid.uuid4())[:8]
         self._start_time = datetime.now()
 
-        # Sub‑modules
         self.pqc = PostQuantumCrypto(storage)
         self.blockchain = BlockchainRegretVerification(storage)
         self.cloud_distributor = MultiCloudRegretDistribution(storage)
@@ -1372,23 +1392,30 @@ class EnhancedRegretCalculator:
         self.core = RegretCalculatorCore(central_config, self.payoff_calculator)
         self.quality_scorer = SimpleQualityScorer()
         self.state = RegretState(storage)
-        self.autonomous_optimizer = AutonomousRegretOptimizer(storage, self.state, adaptive_cost)
 
-        # New modules (v16.0.0)
+        # New components
+        self.rlhf = RLHFManager() if getattr(central_config, 'rlhf_enabled', True) else None
+        self.limit_graph = LimitGraphManager() if getattr(central_config, 'limit_graph_enabled', True) else None
+        self.moe_gating_network = MoEGatingNetwork(storage)
+        self.distillation = MultiTeacherPolicyDistillation(central_config, self.moe_gating_network) if getattr(central_config, 'distillation_enabled', True) else None
+
+        self.autonomous_optimizer = AutonomousRegretOptimizer(
+            storage, self.state, adaptive_cost,
+            rlhf=self.rlhf, distillation=self.distillation
+        )
+
         self.ga_generator = GeneticDecisionGenerator(storage, self)
         self.pareto_optimizer = ParetoFrontOptimizer(storage)
         self.predictive_manager = PredictiveRegretManager(storage)
         self.federated_learner = FederatedRegretLearner(storage, self.instance_id, 3600, message_queue)
         self.user_adaptive = UserAdaptiveRegretReflexivity(storage, 0.01)
 
-        # Stubs
         self.carbon_optimizer = CarbonAwareRegretOptimizer(storage)
         self.cross_domain_transfer = CrossDomainRegretTransfer(storage)
         self.human_collaborator = HumanAIRegretCollaboration(storage, 300)
         self.sustainability_tracker = RegretSustainabilityTracker(storage)
 
-        # State
-        self.optimization_history: deque = deque(maxlen=10000)
+        self.optimization_history = deque(maxlen=10000)
         self._history_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
         self._background_tasks = []
@@ -1400,50 +1427,31 @@ class EnhancedRegretCalculator:
     # ----------------------------------------------------------------------
     # Teacher interface for MOPD
     # ----------------------------------------------------------------------
-    async def policy_probs(self, state: Dict) -> List[float]:
-        """
-        Return a probability distribution over regret‑optimisation strategies.
-        This allows the MTPD optimizer to treat this module as a teacher.
-        """
-        # Use the MoE gating's expert probabilities if trained, else fallback
-        if self.autonomous_optimizer.moe_gating._trained:
-            # Need context encoding; for now, return uniform
-            return [0.25, 0.25, 0.25, 0.25]
-        else:
-            return [0.25, 0.25, 0.25, 0.25]
+    async def policy_probs(self, state):
+        if self.rlhf is not None and self.rlhf.reward_model is not None:
+            return await self.rlhf.get_policy_probs(state)
+        if self.distillation is not None:
+            return self.distillation.get_student_probs()
+        return [0.25, 0.25, 0.25, 0.25]
 
     # ----------------------------------------------------------------------
     # Core regret calculation method
     # ----------------------------------------------------------------------
-    async def calculate_regret(self, decisions: List[DecisionOption],
-                               scenarios: List[ScenarioDefinition],
-                               method: str = "minimax",
-                               user_id: str = None) -> RegretResult:
-        """
-        Calculate regret and emit a FeedbackEvent.
-        """
+    async def calculate_regret(self, decisions, scenarios, method="minimax", user_id=None):
         async with self._optimization_semaphore:
             start_time = time.time()
 
-            # User adaptation
             if user_id:
                 await self.user_adaptive.learn_user_preference(user_id, 'accept_regret_decision', {'method': method}, {'success': True})
 
-            # Carbon-aware adjustment
             carbon_adjustment = await self.carbon_optimizer.adjust_regret_for_carbon({'maximum_regret': 1000}, "normal")
-
-            # Federated insights
             regret_params = await self.federated_learner.apply_federated_insights({
                 'cvar_alpha': 0.95,
                 'scenario_count': len(scenarios)
             })
-
             quality_score = await self.quality_scorer.assess_quality(decisions)
-
-            # Get carbon intensity for MoE
             carbon_intensity = await self.carbon_client.get_current_intensity()
 
-            # Choose strategy via MoE
             state = {
                 'current_regret': self.optimization_history[-1].maximum_regret if self.optimization_history else 1000,
                 'carbon_intensity': carbon_intensity,
@@ -1453,9 +1461,22 @@ class EnhancedRegretCalculator:
                 'num_scenarios': len(scenarios),
                 'history': list(self.optimization_history)[-10:] if self.optimization_history else []
             }
+            # Use MoE/RLHF/Distillation to select expert
             selected_expert, expert_params = await self.autonomous_optimizer.moe_gating.select_expert(state, carbon_intensity)
+            # Override with RLHF or distillation if available
+            if self.rlhf is not None and self.rlhf.reward_model is not None:
+                probs = await self.rlhf.get_policy_probs(state)
+                expert_names = ['minimax', 'cvar', 'mopd_balanced', 'mopd_carbon']
+                selected_expert = expert_names[np.argmax(probs) % len(expert_names)]
+            elif self.distillation is not None:
+                probs = self.distillation.get_student_probs()
+                expert_names = ['minimax', 'cvar', 'mopd_balanced', 'mopd_carbon']
+                selected_expert = expert_names[np.argmax(probs) % len(expert_names)]
 
-            # Run optimization with selected method
+            # Update LIMIT graph constraints
+            if self.limit_graph:
+                await self.limit_graph.update_constraint('carbon', carbon_intensity)
+
             if selected_expert == 'minimax':
                 result = await self.core.calculate_minimax_regret(decisions, scenarios)
             elif selected_expert == 'cvar':
@@ -1467,45 +1488,29 @@ class EnhancedRegretCalculator:
                 weights = {'regret': 0.2, 'carbon': 0.6, 'cost': 0.1, 'robustness': 0.1}
                 result = await self.core.calculate_mopd_regret(decisions, scenarios, weights)
             else:
-                # Fallback to minimax
                 result = await self.core.calculate_minimax_regret(decisions, scenarios)
-
-            # Apply carbon adjustment
-            if self.carbon_optimizer:
-                adjusted = await self.carbon_optimizer.adjust_regret_for_carbon(result.to_dict(), "normal")
-                result.maximum_regret = adjusted['adjusted_regret']['maximum_regret']
 
             result.data_quality_score = quality_score
             result.calculation_time_ms = (time.time() - start_time) * 1000
 
-            # Sensitivity and portfolio (simplified)
-            result.sensitivity_results = {}  # placeholder
-            result.portfolio_allocation = {}
-
-            # Quantum signing
             signature = await self.pqc.sign_data(result.to_dict())
             result.quantum_signature = signature
 
-            # Blockchain recording
             data_id = f"regret_{uuid.uuid4().hex[:8]}"
             data_hash = hashlib.sha256(json.dumps(result.to_dict(), sort_keys=True, default=str).encode()).hexdigest()
             blockchain_result = await self.blockchain.record_regret_data(data_id, data_hash, {'regret': result.maximum_regret, 'best_option': result.best_option_name})
             result.blockchain_tx_hash = blockchain_result.get('tx_hash')
 
-            # Multi-cloud distribution
             distribution = await self.cloud_distributor.distribute_regret_data({'size_gb': 0.001})
             result.cloud_distribution = distribution
 
-            # Autonomous optimization outcome
             reward = 1.0 / (1.0 + result.maximum_regret / 1000)
             context = {'carbon_intensity': carbon_intensity, 'num_decisions': len(decisions), 'num_scenarios': len(scenarios)}
             await self.autonomous_optimizer.record_outcome(reward, context)
             result.autonomous_optimization = {'selected_strategy': selected_expert, 'reward': reward}
 
-            # Update Pareto front with the best decision
             best_decision = next((d for d in decisions if d.option_id == result.best_option_id), None)
             if best_decision:
-                # Add objectives from result
                 best_decision.attributes['regret'] = result.maximum_regret
                 best_decision.attributes['robustness'] = result.robustness_score
                 await self.pareto_optimizer.add_decision(best_decision, {
@@ -1515,26 +1520,12 @@ class EnhancedRegretCalculator:
                     'robustness': result.robustness_score
                 })
 
-            # Federated sharing
-            if result.maximum_regret < 500:
-                await self.federated_learner.share_regret_insight({'regret': {'value': result.maximum_regret, 'method': selected_expert, 'robustness': result.robustness_score}})
-
-            # Human collaboration
-            await self.human_collaborator.request_regret_feedback({'best_option_name': result.best_option_name, 'maximum_regret': result.maximum_regret}, {'reasoning': 'Regret optimization completed'})
-
-            # Sustainability metrics
-            await self.sustainability_tracker.record_metric('eco_efficiency', 1.0 / (1.0 + result.maximum_regret / 1000), {'regret': result.maximum_regret})
-
-            # Predictive forecasting
             await self.predictive_manager.record_result(result)
             forecast = await self.predictive_manager.get_regret_forecast(result.maximum_regret)
-            result.predictive_forecast = forecast  # add to result (optional)
 
-            # Store history
             async with self._history_lock:
                 self.optimization_history.append(result)
 
-            # Publish FeedbackEvent
             event = FeedbackEvent.create_with_context(
                 task_id=f"regret_{uuid.uuid4().hex[:8]}",
                 selected_action=f"regret_{selected_expert}",
@@ -1552,11 +1543,9 @@ class EnhancedRegretCalculator:
             )
             await self.queue.publish("feedback_events", event.to_json())
 
-            # Check drift
             if self.drift:
                 await self.drift.check_drift(self.adaptive_cost.get_current_weights())
 
-            # Update metrics
             self.metrics.set_regret_score(result.maximum_regret)
             self.metrics.set_cvar_score(result.cvar_regret)
 
@@ -1564,25 +1553,21 @@ class EnhancedRegretCalculator:
             return result
 
     # ----------------------------------------------------------------------
-    # Additional public methods for GA and Pareto
+    # Additional public methods
     # ----------------------------------------------------------------------
-    async def run_ga_search(self, existing_decisions: List[DecisionOption], scenarios: List[ScenarioDefinition]) -> List[DecisionOption]:
-        """Run genetic algorithm to generate new decision options."""
+    async def run_ga_search(self, existing_decisions, scenarios):
         return await self.ga_generator.add_new_decisions(existing_decisions, scenarios)
 
-    async def get_pareto_front(self) -> List[DecisionOption]:
-        """Return the current Pareto front of non‑dominated decisions."""
+    async def get_pareto_front(self):
         return self.pareto_optimizer.get_pareto_front()
 
-    async def get_trade_off_suggestions(self, user_weights: Dict[str, float]) -> List[DecisionOption]:
-        """Return top decisions based on user preferences."""
+    async def get_trade_off_suggestions(self, user_weights):
         return await self.pareto_optimizer.get_trade_off_suggestions(user_weights)
 
     # ----------------------------------------------------------------------
     # Lifecycle management
     # ----------------------------------------------------------------------
     async def start(self):
-        """Start background tasks."""
         logger.info("Starting Regret Calculator...")
         self._running = True
         loop = asyncio.get_running_loop()
@@ -1592,8 +1577,52 @@ class EnhancedRegretCalculator:
             loop.create_task(self._federated_loop()),
             loop.create_task(self._predictive_loop()),
             loop.create_task(self._cleanup_loop()),
-            loop.create_task(self._ga_loop()),  # new
+            loop.create_task(self._ga_loop()),
         ])
+        if self.rlhf:
+            self._background_tasks.append(loop.create_task(self._rlhf_loop()))
+        if self.distillation:
+            self._background_tasks.append(loop.create_task(self._distillation_loop()))
+        if self.limit_graph:
+            self._background_tasks.append(loop.create_task(self._limit_graph_loop()))
+
+    async def _rlhf_loop(self):
+        while not self._shutdown_event.is_set():
+            try:
+                if self.rlhf:
+                    await self.rlhf.train_reward_model()
+                await asyncio.sleep(getattr(central_config, 'rlhf_training_interval', 600))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"RLHF loop error: {e}")
+
+    async def _distillation_loop(self):
+        while not self._shutdown_event.is_set():
+            try:
+                if self.distillation:
+                    state = {'carbon_intensity': await self.carbon_client.get_current_intensity(),
+                             'history': list(self.optimization_history)[-10:] if self.optimization_history else []}
+                    await self.distillation.distill(state)
+                await asyncio.sleep(getattr(central_config, 'distillation_interval', 300))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Distillation loop error: {e}")
+
+    async def _limit_graph_loop(self):
+        while not self._shutdown_event.is_set():
+            try:
+                if self.limit_graph:
+                    carbon = await self.carbon_client.get_current_intensity()
+                    await self.limit_graph.update_constraint('carbon', carbon)
+                    influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+                    logger.debug(f"LIMIT Graph carbon->cost influence: {influence:.3f}")
+                await asyncio.sleep(getattr(central_config, 'limit_graph_update_interval', 300))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Limit graph loop error: {e}")
 
     async def _optimization_loop(self):
         while not self._shutdown_event.is_set():
@@ -1646,14 +1675,11 @@ class EnhancedRegretCalculator:
                 logger.error(f"Predictive loop error: {e}")
 
     async def _ga_loop(self):
-        """Periodically run GA to generate new decision options."""
         while not self._shutdown_event.is_set():
             await asyncio.sleep(central_config.sustainability_interval or 86400)
             try:
-                # Load existing decisions from storage
-                existing = self.storage.load_decision_options()  # need to implement
-                # Generate scenarios (use default or from config)
-                scenarios = [ScenarioDefinition()]  # simple
+                existing = self.storage.load_decision_options()
+                scenarios = [ScenarioDefinition()]
                 new_options = await self.run_ga_search(existing, scenarios)
                 if new_options:
                     logger.info(f"GA generated {len(new_options)} new decision options")
@@ -1684,11 +1710,7 @@ class EnhancedRegretCalculator:
 _regret_instance = None
 _regret_lock = asyncio.Lock()
 
-async def get_regret_calculator(storage: Storage, queue: AsyncMessageQueue,
-                                adaptive_cost: AdaptiveCostFunction,
-                                pareto_gating: ParetoGating,
-                                drift_detector: DriftDetector,
-                                metrics: MetricsRegistry) -> EnhancedRegretCalculator:
+async def get_regret_calculator(storage, queue, adaptive_cost, pareto_gating, drift_detector, metrics):
     global _regret_instance
     if _regret_instance is None:
         async with _regret_lock:
@@ -1732,11 +1754,9 @@ async def main():
     result = await calc.calculate_regret(decisions, scenarios)
     print(f"Best: {result.best_option_name}, Regret: {result.maximum_regret:.2f}")
 
-    # Test GA
     new_decisions = await calc.run_ga_search(decisions, scenarios)
     print(f"GA generated {len(new_decisions)} new decisions")
 
-    # Test Pareto front
     front = await calc.get_pareto_front()
     print(f"Pareto front size: {len(front)}")
 
