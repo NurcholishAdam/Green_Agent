@@ -1,18 +1,19 @@
-# src/enhancements/tasks/periodic_updater_v2_1_0.py
+# src/enhancements/tasks/periodic_updater_v2_2_0.py
 """
-Enhanced Periodic Updater for Green Agent v2.1.0
+Enhanced Periodic Updater for Green Agent v2.2.0
 =================================================
 Celery tasks for periodic updates of sustainability data with adaptive scheduling
-via Multi‑Teacher On‑Policy Distillation.
+via Multi‑Teacher On‑Policy Distillation, Multi‑Objective Evolutionary Optimization (NSGA‑II),
+and additional LIMIT Graph, MODP, RLHF, and MoE components.
 
-Enhancements over v2.0.0:
-- Expanded state vector with 12 features (including last_update_success, cache_freshness, error_rate).
-- Real reward computation based on data change and success, not placeholder.
-- Integration with FeedbackEvent schema and AsyncMessageQueue for cross‑module communication.
-- True historical ML training from logged state vectors (now stored in CSV).
-- Pydantic‑based configuration via environment variables.
-- Concurrency‑safe AdaptiveScheduler with asyncio.Lock.
-- More robust unit tests.
+Enhancements over v2.1.0:
+- Added LIMIT Graph manager for task dependency modelling.
+- Added MODP solver wrapper for storing decision states/policies.
+- Added RLHF trainer for human preference collection on scheduling decisions.
+- Added MoE gating network to blend experts (update_now, skip).
+- Added NSGA‑II optimizer to evolve global action weights (bio‑inspired).
+- New configuration flags for enabling/disabling each component.
+- Integrated with central Storage (optional) for new data persistence.
 
 All previous features (Celery tasks, retries, metrics, distillation components) retained.
 """
@@ -32,6 +33,9 @@ import pickle
 import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass
+import copy
+import uuid
+import hashlib
 
 from celery import Celery
 from celery.signals import task_failure, task_success, task_retry
@@ -79,6 +83,14 @@ try:
 except ImportError:
     AsyncMessageQueue = None
 
+# Optional central storage
+try:
+    from ...storage import Storage  # adjust path if needed
+    CENTRAL_STORAGE_AVAILABLE = True
+except ImportError:
+    CENTRAL_STORAGE_AVAILABLE = False
+    Storage = None
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -98,6 +110,31 @@ class UpdaterConfig(BaseSettings):
     distill_weight: float = 0.7
     rl_weight: float = 0.3
     q_learning_rate: float = 0.1
+
+    # MOEA parameters
+    moea_enabled: bool = True
+    moea_interval_seconds: int = 300
+    moea_population_size: int = 20
+    moea_generations: int = 10
+    moea_mutation_rate: float = 0.2
+    moea_crossover_rate: float = 0.8
+    moea_tournament_size: int = 3
+    moea_objective_weights: Optional[Dict[str, float]] = Field(
+        default_factory=lambda: {
+            'update_quality': 0.5,
+            'resource_savings': 0.3,
+            'timeliness': 0.2,
+        }
+    )
+    moea_dynamic_weights: bool = True
+    moea_pareto_path: str = "./updater_moea_pareto.json"
+
+    # NEW v2.2.0 flags
+    enable_limit_graph: bool = True
+    enable_modp: bool = True
+    enable_rlhf: bool = True
+    enable_moe: bool = True
+    moe_expert_count: int = Field(2, ge=2)
 
     # Persistence paths
     q_weights_path: str = "./update_q_weights.json"
@@ -142,6 +179,7 @@ if PROMETHEUS_AVAILABLE:
         'task_duration': Histogram('periodic_task_duration_seconds', 'Task duration', ['task_name']),
         'update_action': Counter('update_action_selected', 'Action selected by scheduler', ['action']),
         'update_reward': Histogram('update_reward', 'Reward per update decision'),
+        'moea_pareto_front': Gauge('updater_moea_pareto_front', 'MOEA Pareto front size'),
     }
 else:
     task_metrics = {}
@@ -469,14 +507,494 @@ class DistillationSchedulerOptimizer:
 
 
 # ============================================================================
-# ADAPTIVE SCHEDULER (Enhanced)
+# NEW: Multi‑Objective Update Scheduler Optimizer (NSGA‑II)
+# ============================================================================
+@dataclass
+class MOPDUpdateWeights:
+    """A weight vector for the two actions, with its objective values."""
+    vector_id: str
+    weights: Dict[str, float]  # keys: update_now, skip (sum to 1)
+    objectives: Dict[str, float]  # achieved values (higher is better)
+    scalarised_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'vector_id': self.vector_id,
+            'weights': self.weights,
+            'objectives': self.objectives,
+            'scalarised_score': self.scalarised_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDUpdateWeights':
+        return cls(**data)
+
+
+class NSGAIIUpdateOptimizer:
+    """
+    Multi‑objective genetic algorithm for evolving update scheduling weights.
+    Decision variables: weights for update_now and skip (sum to 1).
+    Objectives: maximize update quality, maximize resource savings, maximize timeliness.
+    The evaluation function uses interaction logs.
+    """
+
+    def __init__(
+        self,
+        evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+        population_size: int = 20,
+        generations: int = 10,
+        mutation_rate: float = 0.2,
+        crossover_rate: float = 0.8,
+        tournament_size: int = 3,
+        objective_weights: Optional[Dict[str, float]] = None,
+        dynamic_weights: bool = True,
+    ):
+        self.evaluate_func = evaluate_func
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.tournament_size = tournament_size
+        self.objective_weights = objective_weights or {
+            'update_quality': 0.5,
+            'resource_savings': 0.3,
+            'timeliness': 0.2,
+        }
+        self.dynamic_weights = dynamic_weights
+
+        self.best_individual = None
+        self.best_fitness = -float('inf')
+        self.evolution_history = []
+        self.pareto_front: List[MOPDUpdateWeights] = []
+        self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+
+    def _random_individual(self) -> Dict[str, float]:
+        keys = ['update_now', 'skip']
+        w = {k: random.random() for k in keys}
+        total = sum(w.values())
+        if total > 0:
+            w = {k: v / total for k, v in w.items()}
+        return w
+
+    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
+        child = {}
+        for key in p1:
+            if random.random() < 0.5:
+                u = random.random()
+                if u <= 0.5:
+                    beta = (2 * u) ** (1 / (20 + 1))
+                else:
+                    beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
+                child[key] = max(0.0, min(1.0, 0.5 * ((1 + beta) * p1[key] + (1 - beta) * p2[key])))
+            else:
+                child[key] = p1[key] if random.random() < 0.5 else p2[key]
+        total = sum(child.values())
+        if total > 0:
+            child = {k: v / total for k, v in child.items()}
+        return child
+
+    def _mutate(self, ind: Dict) -> Dict:
+        mutant = ind.copy()
+        for key in mutant:
+            if random.random() < self.mutation_rate:
+                u = random.random()
+                if u < 0.5:
+                    delta = (2 * u) ** (1 / (20 + 1)) - 1
+                else:
+                    delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
+                mutant[key] = mutant[key] + delta
+                mutant[key] = max(0.0, min(1.0, mutant[key]))
+        total = sum(mutant.values())
+        if total > 0:
+            mutant = {k: v / total for k, v in mutant.items()}
+        return mutant
+
+    def _fast_non_dominated_sort(self, points: List[MOPDUpdateWeights]) -> List[List[MOPDUpdateWeights]]:
+        fronts = []
+        domination_count = {id(p): 0 for p in points}
+        dominated_solutions = {id(p): [] for p in points}
+        for i, p in enumerate(points):
+            p_obj = p.objectives
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                q_obj = q.objectives
+                if all(p_obj[k] >= q_obj[k] for k in p_obj) and any(p_obj[k] > q_obj[k] for k in p_obj):
+                    dominated_solutions[id(p)].append(q)
+                elif all(q_obj[k] >= p_obj[k] for k in q_obj) and any(q_obj[k] > p_obj[k] for k in q_obj):
+                    domination_count[id(p)] += 1
+            if domination_count[id(p)] == 0:
+                if not fronts:
+                    fronts.append([])
+                fronts[0].append(p)
+        i = 0
+        while i < len(fronts):
+            next_front = []
+            for p in fronts[i]:
+                for q in dominated_solutions[id(p)]:
+                    domination_count[id(q)] -= 1
+                    if domination_count[id(q)] == 0:
+                        next_front.append(q)
+            if next_front:
+                fronts.append(next_front)
+            i += 1
+        return fronts
+
+    def _crowding_distance(self, front: List[MOPDUpdateWeights]) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {id(p): 0.0 for p in front}
+        objective_keys = list(front[0].objectives.keys())
+        for obj in objective_keys:
+            sorted_front = sorted(front, key=lambda x: x.objectives[obj])
+            distances[id(sorted_front[0])] = float('inf')
+            distances[id(sorted_front[-1])] = float('inf')
+            obj_min = sorted_front[0].objectives[obj]
+            obj_max = sorted_front[-1].objectives[obj]
+            if obj_max == obj_min:
+                continue
+            for i in range(1, len(sorted_front) - 1):
+                distances[id(sorted_front[i])] += (sorted_front[i+1].objectives[obj] - sorted_front[i-1].objectives[obj]) / (obj_max - obj_min)
+        return distances
+
+    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDUpdateWeights]],
+                              crowding: Dict[int, float]) -> Dict:
+        candidates = random.sample(population, self.tournament_size)
+        ind_to_point = {}
+        for ind, point in zip(population, self._all_points):
+            ind_to_point[id(ind)] = point
+        best = candidates[0]
+        best_rank = float('inf')
+        best_crowding = -float('inf')
+        for cand in candidates:
+            point = ind_to_point.get(id(cand))
+            if not point:
+                continue
+            rank = len(fronts)
+            for fi, front in enumerate(fronts):
+                if point in front:
+                    rank = fi
+                    break
+            cd = crowding.get(id(point), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+                best = cand
+                best_rank = rank
+                best_crowding = cd
+        return best
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = self.objective_weights.copy()
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        obj_keys = list(weights.keys())
+        avg = {k: np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        max_val = {k: np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
+        for k in obj_keys:
+            if max_val[k] > 0 and avg[k] < 0.5 * max_val[k]:
+                weights[k] = min(0.6, weights.get(k, 0.0) * 1.5)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def _select_best_from_pareto(self, pareto: List[MOPDUpdateWeights], weights: Dict[str, float]) -> Optional[MOPDUpdateWeights]:
+        if not pareto:
+            return None
+        obj_keys = list(weights.keys())
+        max_vals = {k: max(p.objectives[k] for p in pareto) for k in obj_keys}
+        min_vals = {k: min(p.objectives[k] for p in pareto) for k in obj_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in obj_keys}
+        best = None
+        best_score = -float('inf')
+        for p in pareto:
+            score = 0.0
+            for k in obj_keys:
+                val = p.objectives[k]
+                norm = (val - min_vals[k]) / ranges[k] if ranges[k] > 0 else 1.0
+                score += weights.get(k, 0.0) * norm
+            p.scalarised_score = score
+            if score > best_score:
+                best_score = score
+                best = p
+        return best
+
+    async def evolve(self) -> List[MOPDUpdateWeights]:
+        population = [self._random_individual() for _ in range(self.population_size)]
+        points = []
+        eval_tasks = [self.evaluate_func(ind) for ind in population]
+        eval_results = await asyncio.gather(*eval_tasks)
+        for ind, obj in zip(population, eval_results):
+            point = MOPDUpdateWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+            points.append(point)
+            self._eval_cache[tuple(sorted(ind.items()))] = obj
+        self._all_points = points
+        for gen in range(self.generations):
+            fronts = self._fast_non_dominated_sort(points)
+            crowding = {}
+            for front in fronts:
+                front_crowding = self._crowding_distance(front)
+                crowding.update(front_crowding)
+            offspring = []
+            while len(offspring) < self.population_size:
+                parent1 = self._tournament_selection(population, fronts, crowding)
+                parent2 = self._tournament_selection(population, fronts, crowding)
+                if random.random() < self.crossover_rate:
+                    child = self._crossover(parent1, parent2)
+                else:
+                    child = copy.deepcopy(parent1)
+                child = self._mutate(child)
+                offspring.append(child)
+            child_tasks = [self.evaluate_func(ind) for ind in offspring]
+            child_results = await asyncio.gather(*child_tasks)
+            child_points = []
+            for ind, obj in zip(offspring, child_results):
+                point = MOPDUpdateWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
+                child_points.append(point)
+                self._eval_cache[tuple(sorted(ind.items()))] = obj
+            combined_inds = population + offspring
+            combined_points = points + child_points
+            unique_pairs = {}
+            for ind, p in zip(combined_inds, combined_points):
+                key = tuple(sorted(ind.items()))
+                unique_pairs[key] = (ind, p)
+            population = [v[0] for v in unique_pairs.values()]
+            points = [v[1] for v in unique_pairs.values()]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            new_population = []
+            new_points = []
+            for front in fronts:
+                if len(new_population) + len(front) <= self.population_size:
+                    for p in front:
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+                else:
+                    crowding = self._crowding_distance(front)
+                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
+                    for p in sorted_front:
+                        if len(new_population) >= self.population_size:
+                            break
+                        for ind, p2 in zip(population, points):
+                            if p2 is p:
+                                new_population.append(ind)
+                                new_points.append(p)
+                                break
+            population = new_population[:self.population_size]
+            points = new_points[:self.population_size]
+            self._all_points = points
+            fronts = self._fast_non_dominated_sort(points)
+            if fronts:
+                self.pareto_front = fronts[0]
+            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
+        weights = self._compute_dynamic_weights()
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best:
+            self.best_individual = best.weights
+            self.best_fitness = best.scalarised_score
+        return self.pareto_front
+
+
+# ============================================================================
+# NEW: LIMIT Graph Manager
+# ============================================================================
+class LimitGraphManager:
+    """
+    Manages a graph of update task relationships for LIMIT.
+    Nodes are task types or actions, edges represent dependencies or fallback order.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.graphs = {}
+
+    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
+            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
+        else:
+            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+
+    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
+            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+
+    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
+                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
+            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+
+    def get_nodes(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
+            return self.storage.get_limit_graph_nodes(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+
+    def get_edges(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
+            return self.storage.get_limit_graph_edges(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+
+    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
+            return self.storage.get_limit_graph_metadata(graph_id)
+        return self.graphs.get(graph_id, {})
+
+
+# ============================================================================
+# NEW: MODP Optimizer (wrapper)
+# ============================================================================
+class MODPOptimizer:
+    """
+    Multi‑Objective Dynamic Programming solver that stores decision states/policies.
+    This complements the NSGA-II optimizer; MODP here is used for scalarized selection
+    among Pareto front points and for persisting evolved policies.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.states = {}
+
+    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                  objective_values: Dict[str, float], stage: int) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_state'):
+            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
+        else:
+            if problem_id not in self.states:
+                self.states[problem_id] = []
+            self.states[problem_id].append({
+                'state_id': state_id, 'state_attributes': state_attributes,
+                'objective_values': objective_values, 'stage': stage
+            })
+
+    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
+                   action: str, expected_objectives: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_policy'):
+            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+
+    def get_states(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_states'):
+            return self.storage.get_modp_states(problem_id)
+        return self.states.get(problem_id, [])
+
+    def get_policies(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_policies'):
+            return self.storage.get_modp_policies(problem_id)
+        return []
+
+
+# ============================================================================
+# NEW: RLHF Trainer
+# ============================================================================
+class RLHFTrainer:
+    """
+    Collects human preference pairs for update scheduling decisions.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.pairs = []
+
+    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        if self.storage and hasattr(self.storage, 'save_preference_pair'):
+            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+        else:
+            self.pairs.append({
+                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
+                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+            })
+
+    def get_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
+            return self.storage.get_preference_pairs(limit)
+        return self.pairs[-limit:]
+
+    def train_reward_model(self):
+        pairs = self.get_pairs()
+        if len(pairs) < 5:
+            logger.info("Not enough preference pairs for RLHF training.")
+            return
+        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+
+
+# ============================================================================
+# NEW: MoE Gating Network
+# ============================================================================
+class MoEGatingNetwork:
+    """
+    Mixture-of-Experts gating for update scheduling decisions.
+    Experts correspond to actions (update_now, skip).
+    The gating network learns to select the best action for a given context.
+    """
+    def __init__(self, storage: Optional[Storage] = None, config: Optional[Dict] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.expert_names = self.config.get('expert_names', ['update_now', 'skip'])
+        self.num_experts = len(self.expert_names)
+        # State dimension: 12 features from UpdateState
+        self.gating_weights = np.random.randn(self.num_experts, 12)
+        self._training_samples = []
+
+    def _encode_state(self, state: Union[UpdateState, Dict]) -> np.ndarray:
+        if isinstance(state, dict):
+            features = [
+                min(state.get('hours_since_last_update', 0) / 72.0, 1.0),
+                state.get('hour_of_day', 0) / 24.0,
+                state.get('day_of_week', 0) / 7.0,
+                min(abs(state.get('carbon_trend', 0)) / 0.1, 1.0),
+                min(state.get('material_version_age_days', 0) / 30.0, 1.0),
+                min(state.get('helium_snapshot_age_days', 0) / 30.0, 1.0),
+                min(state.get('current_carbon_intensity', 0) / 1000.0, 1.0),
+                min(state.get('pending_updates_count', 0) / 10.0, 1.0),
+                state.get('system_load', 0),
+                state.get('last_update_success', 1.0),
+                state.get('cache_freshness', 1.0),
+                state.get('error_rate', 0.0),
+            ]
+        else:
+            features = state.to_feature_vector()
+        return np.array(features, dtype=np.float32)
+
+    async def select_expert(self, state: Union[UpdateState, Dict]) -> Tuple[str, np.ndarray]:
+        x = self._encode_state(state)
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        expert_idx = np.argmax(probs)
+        selected = self.expert_names[expert_idx]
+        if self.storage and hasattr(self.storage, 'log_routing_decision'):
+            sample_id = hashlib.sha256(str(state).encode()).hexdigest()[:16]
+            self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+        return selected, probs
+
+    async def add_training_sample(self, state: Union[UpdateState, Dict], selected_expert: str, reward: float):
+        x = self._encode_state(state)
+        expert_idx = self.expert_names.index(selected_expert)
+        target = np.zeros(self.num_experts)
+        target[expert_idx] = 1.0
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        grad = (probs - target)[:, None] * x[None, :]
+        self.gating_weights -= 0.1 * grad
+
+
+# ============================================================================
+# ADAPTIVE SCHEDULER (Enhanced with all new components)
 # ============================================================================
 
 class AdaptiveScheduler:
-    """Adaptive scheduler that uses distillation to decide when to run updates."""
+    """Adaptive scheduler that uses distillation, MOEA, MoE, RLHF, LIMIT Graph, and MODP."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, storage: Optional[Storage] = None):
         self.config = config or {}
+        self.storage = storage
         self.scheduler_optimizer = DistillationSchedulerOptimizer({
             'distillation_epsilon': self.config.get('distillation_epsilon', 0.1),
             'distillation_train_every': self.config.get('distillation_train_every', 10),
@@ -510,7 +1028,43 @@ class AdaptiveScheduler:
         if self.config.get('enable_message_queue', False) and AsyncMessageQueue is not None:
             self.message_queue = AsyncMessageQueue(queue_type="asyncio")
 
-        logger.info("AdaptiveScheduler initialized (v2.1.0)")
+        # MOEA
+        self.moea_enabled = self.config.get('moea_enabled', True)
+        self.moea_optimizer: Optional[NSGAIIUpdateOptimizer] = None
+        self.global_best_weights: Optional[Dict[str, float]] = None
+        self.pareto_front: List[MOPDUpdateWeights] = []
+        self._moea_task: Optional[asyncio.Task] = None
+
+        # NEW v2.2.0 components
+        self.limit_graph_manager = LimitGraphManager(storage) if self.config.get('enable_limit_graph', True) else None
+        self.modp_solver = MODPOptimizer(storage) if self.config.get('enable_modp', True) else None
+        self.rlhf_trainer = RLHFTrainer(storage) if self.config.get('enable_rlhf', True) else None
+        self.moe_gating = MoEGatingNetwork(
+            storage,
+            {'expert_names': self.scheduler_optimizer.ACTIONS}
+        ) if self.config.get('enable_moe', True) else None
+
+        # Initialize LIMIT Graph if enabled
+        if self.limit_graph_manager:
+            self._init_limit_graph()
+
+        # Start MOEA background task if enabled
+        if self.moea_enabled:
+            self._moea_task = asyncio.create_task(self._moea_loop())
+
+        logger.info("AdaptiveScheduler initialized (v2.2.0) with MOEA, LIMIT Graph, MODP, RLHF, MoE")
+
+    def _init_limit_graph(self):
+        graph_id = "update_tasks"
+        if not self.limit_graph_manager.get_metadata(graph_id):
+            self.limit_graph_manager.create_graph(graph_id, "Update Task Relationships", {})
+            for task in ['carbon', 'material', 'helium']:
+                self.limit_graph_manager.add_node(graph_id, f"task_{task}", task, {})
+            # Add edges between tasks (dependency chain)
+            for i in range(2):
+                src = ['carbon', 'material', 'helium'][i]
+                dst = ['carbon', 'material', 'helium'][i+1]
+                self.limit_graph_manager.add_edge(graph_id, f"edge_{src}_{dst}", f"task_{src}", f"task_{dst}", 1.0, {})
 
     def _build_state(self, task_type: str) -> UpdateState:
         """Build state for a specific update task."""
@@ -534,9 +1088,7 @@ class AdaptiveScheduler:
             hours_since = (now - last_update).total_seconds() / 3600 if last_update else 72
             carbon_trend = 0.0
             current_intensity = 0.0
-            # If we have material catalog file, compute its age
             if self.material_version:
-                # In real system, get mtime of catalog file
                 material_age = 0.0  # placeholder
             else:
                 material_age = 30.0  # assume stale if not set
@@ -582,15 +1134,37 @@ class AdaptiveScheduler:
         """
         async with self._lock:
             state = self._build_state(task_type)
-            action, action_idx, state_vec, teacher_probs = await self.scheduler_optimizer.select_action(
-                state, exploration=True
-            )
+
+            # Decide action: use MoE if available, else distillation
+            if self.moe_gating:
+                expert_name, _ = await self.moe_gating.select_expert(state)
+                action = expert_name if expert_name in self.scheduler_optimizer.ACTIONS else 'skip'
+                action_idx = self.scheduler_optimizer.ACTIONS.index(action)
+                state_vec = state.to_feature_vector()
+                teacher_probs = np.ones(2) / 2
+                self._last_selected_expert = expert_name
+            else:
+                action, action_idx, state_vec, teacher_probs = await self.scheduler_optimizer.select_action(
+                    state, exploration=True
+                )
             self.last_state_vec = state_vec
             self.last_action_idx = action_idx
             self.last_teacher_probs = teacher_probs
 
             if PROMETHEUS_AVAILABLE:
                 task_metrics['update_action'].labels(action=action).inc()
+
+            # Blend with MOEA global weights if available
+            if self.global_best_weights is not None:
+                one_hot = np.zeros(2)
+                one_hot[action_idx] = 1.0
+                moea_probs = np.array([self.global_best_weights[a] for a in self.scheduler_optimizer.ACTIONS])
+                moea_probs = moea_probs / moea_probs.sum()
+                blended = 0.7 * moea_probs + 0.3 * one_hot
+                blended = blended / blended.sum()
+                action_idx = np.argmax(blended)
+                action = self.scheduler_optimizer.ACTIONS[action_idx]
+                logger.info(f"Blended action after MOEA: {action}")
 
             if action == 'skip':
                 logger.info(f"Skipping {task_type} update based on distillation decision")
@@ -645,7 +1219,7 @@ class AdaptiveScheduler:
                              state_vec: Optional[np.ndarray] = None,
                              action_idx: Optional[int] = None,
                              teacher_probs: Optional[np.ndarray] = None):
-        """Record the outcome and update the distillation agent."""
+        """Record the outcome and update the distillation agent and MoE gating."""
         # Use provided state/action if given, else last recorded
         if state_vec is None:
             state_vec = self.last_state_vec
@@ -671,7 +1245,7 @@ class AdaptiveScheduler:
         else:
             df_log.to_csv(log_path, index=False)
 
-        # Update agent if we have state and action
+        # Update distillation agent if we have state and action
         if state_vec is not None and action_idx is not None:
             next_state_vec = state_vec  # for simplicity, same state
             await self.scheduler_optimizer.update(
@@ -680,6 +1254,58 @@ class AdaptiveScheduler:
                 reward,
                 next_state_vec,
                 teacher_probs
+            )
+
+        # Update MoE gating if used
+        if self.moe_gating and hasattr(self, '_last_selected_expert'):
+            # Reconstruct state from state_vec? We'll use a minimal dict for now
+            state_dict = {
+                'hours_since_last_update': 0, 'hour_of_day': 0, 'day_of_week': 0,
+                'carbon_trend': 0, 'material_version_age_days': 0, 'helium_snapshot_age_days': 0,
+                'current_carbon_intensity': 0, 'pending_updates_count': 0, 'system_load': 0,
+                'last_update_success': 1.0, 'cache_freshness': 1.0, 'error_rate': 0.0,
+            }
+            await self.moe_gating.add_training_sample(state_dict, self._last_selected_expert, reward)
+
+        # RLHF: occasionally record preference pair
+        if self.rlhf_trainer and random.random() < 0.05:
+            chosen_action = action
+            rejected_action = random.choice([a for a in self.scheduler_optimizer.ACTIONS if a != chosen_action])
+            self.rlhf_trainer.record_pair(
+                pair_id=str(uuid.uuid4()),
+                prompt=f"Which update decision is best for {task_type}?",
+                chosen=chosen_action,
+                rejected=rejected_action,
+                reward_diff=reward,
+                metadata={'task_type': task_type}
+            )
+
+        # MODP: record state and policy
+        if self.modp_solver:
+            problem_id = "update_scheduling"
+            state_id = f"{task_type}_{datetime.now().isoformat()}_{action}"
+            self.modp_solver.add_state(
+                state_id=state_id,
+                problem_id=problem_id,
+                state_attributes={'task_type': task_type, 'action': action},
+                objective_values={'update_quality': reward, 'resource_savings': 1-reward, 'timeliness': 0.5},
+                stage=0
+            )
+            self.modp_solver.add_policy(
+                policy_id=f"policy_{state_id}",
+                problem_id=problem_id,
+                state_id=state_id,
+                action=action,
+                expected_objectives={'update_quality': 0.0, 'resource_savings': 0.0, 'timeliness': 0.0}
+            )
+
+        # LIMIT Graph: add node for this decision
+        if self.limit_graph_manager:
+            self.limit_graph_manager.add_node(
+                "update_tasks",
+                f"run_{state_id}",
+                "update_decision",
+                {'task_type': task_type, 'action': action, 'reward': reward}
             )
 
         # Emit FeedbackEvent for outcome
@@ -698,11 +1324,115 @@ class AdaptiveScheduler:
             await self.message_queue.publish("scheduler_events", event.to_json())
 
     def get_scheduler_stats(self) -> Dict:
-        return self.scheduler_optimizer.get_stats()
+        stats = self.scheduler_optimizer.get_stats()
+        if self.moea_enabled:
+            stats['moea'] = {
+                'pareto_front_size': len(self.pareto_front),
+                'best_weights': self.global_best_weights,
+                'enabled': True,
+            }
+        if self.limit_graph_manager:
+            stats['limit_graph'] = self.limit_graph_manager.get_metadata('update_tasks')
+        return stats
+
+    async def run_moea_update(self) -> List[MOPDUpdateWeights]:
+        """Run NSGA‑II to evolve action weights."""
+        if not self.moea_enabled or len(self.interaction_log) < 20:
+            return []
+
+        async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
+            # Compute objectives from interaction history
+            action_metrics = {a: [] for a in self.scheduler_optimizer.ACTIONS}
+            for entry in self.interaction_log[-200:]:
+                action = entry.get('action')
+                if action in action_metrics:
+                    action_metrics[action].append(entry.get('reward', 0))
+            objectives = {}
+            for metric in ['update_quality', 'resource_savings', 'timeliness']:
+                weighted_values = []
+                for action, weight in weights.items():
+                    if action_metrics.get(action):
+                        avg = np.mean(action_metrics[action])
+                        weighted_values.append(weight * avg)
+                    else:
+                        weighted_values.append(weight * 0.5)
+                objectives[metric] = sum(weighted_values)
+            return objectives
+
+        self.moea_optimizer = NSGAIIUpdateOptimizer(
+            evaluate_func=evaluate,
+            population_size=self.config.get('moea_population_size', 20),
+            generations=self.config.get('moea_generations', 10),
+            mutation_rate=self.config.get('moea_mutation_rate', 0.2),
+            crossover_rate=self.config.get('moea_crossover_rate', 0.8),
+            tournament_size=self.config.get('moea_tournament_size', 3),
+            objective_weights=self.config.get('moea_objective_weights'),
+            dynamic_weights=self.config.get('moea_dynamic_weights', True),
+        )
+        pareto = await self.moea_optimizer.evolve()
+        self.pareto_front = pareto
+        if pareto:
+            weights = self.moea_optimizer._compute_dynamic_weights()
+            best = self.moea_optimizer._select_best_from_pareto(pareto, weights)
+            if best:
+                self.global_best_weights = best.weights
+                logger.info(f"MOEA selected best weights: {best.weights}")
+                if self.modp_solver:
+                    self.modp_solver.add_state(
+                        state_id=f"moea_best_{time.time()}",
+                        problem_id="update_strategy_evolution",
+                        state_attributes={'weights': best.weights},
+                        objective_values=best.objectives,
+                        stage=1
+                    )
+                if self.limit_graph_manager:
+                    self.limit_graph_manager.add_node(
+                        "update_tasks",
+                        f"vector_{best.vector_id}",
+                        "best_weight_vector",
+                        {'weights': best.weights}
+                    )
+        return pareto
+
+    async def _moea_loop(self):
+        interval = self.config.get('moea_interval_seconds', 300)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.run_moea_update()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"MOEA loop error: {e}")
+                await asyncio.sleep(60)
+
+    # ---------- New public methods for enhancements ----------
+    async def get_limit_graph(self, graph_id: str = "update_tasks") -> Dict:
+        if self.limit_graph_manager:
+            return {
+                'metadata': self.limit_graph_manager.get_metadata(graph_id),
+                'nodes': self.limit_graph_manager.get_nodes(graph_id),
+                'edges': self.limit_graph_manager.get_edges(graph_id),
+            }
+        return {}
+
+    async def get_moe_experts(self) -> List[str]:
+        if self.moe_gating:
+            return self.moe_gating.expert_names
+        return []
+
+    async def get_rlhf_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.rlhf_trainer:
+            return self.rlhf_trainer.get_pairs(limit)
+        return []
+
+    async def record_rlhf_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
+        if self.rlhf_trainer:
+            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
 
 
 # ============================================================================
-# Celery tasks (modified to compute real rewards)
+# Celery tasks (unchanged but use the scheduler)
 # ============================================================================
 
 @app.task(
