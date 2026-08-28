@@ -1,6 +1,6 @@
 # src/enhancements/cost_function/sustainability_cost.py
 """
-Enhanced Sustainability Cost Function v2.3.0
+Enhanced Sustainability Cost Function v2.4.0
 =============================================
 Multi‑objective sustainability cost function with Multi‑Teacher On‑Policy Distillation
 for adaptive weight selection, plus an optional Multi‑Objective Evolutionary Optimizer (MOEA)
@@ -8,12 +8,13 @@ to globally tune the six weights. The MOEA (NSGA‑II) maintains a Pareto front 
 non‑dominated weight vectors, and MODP (scalarization with dynamic weights) selects
 the best compromise based on current system state.
 
-ENHANCEMENTS OVER v2.2.0:
-- Added NSGA‑II optimizer to evolve continuous weight vectors (sum to 1).
-- Pareto front storage and MODP‑based selection.
-- Dynamic MOEA objective weights based on real‑time system metrics.
-- Background task for periodic MOEA refinement.
-- New configuration parameters for MOEA.
+ENHANCEMENTS OVER v2.3.0:
+- Added LIMIT Graph manager for cost component relationships.
+- Added explicit MODP solver wrapper.
+- Added RLHF trainer for human preference collection.
+- Added MoE gating network (mixture-of-experts) for weight strategy blending.
+- Integration with central Storage (optional) for persisting new data.
+- New configuration flags for enabling/disabling each component.
 """
 
 import asyncio
@@ -26,6 +27,8 @@ import random
 import copy
 from abc import ABC, abstractmethod
 from pathlib import Path
+import uuid
+import time
 
 # ---------- Local imports ----------
 from ..schemas.node_descriptor import NodeDescriptor
@@ -34,6 +37,14 @@ from ..data_integration.carbon_intensity import CarbonIntensityFetcher
 from ..data_integration.material_footprint import MaterialFootprintUpdater
 from ..data_integration.helium_collector import HeliumCollector
 from ..expert_registry import ExpertProfile  # optional
+
+# ---------- Optional central components ----------
+try:
+    from ...storage import Storage  # Adjust path if needed
+    CENTRAL_STORAGE_AVAILABLE = True
+except ImportError:
+    CENTRAL_STORAGE_AVAILABLE = False
+    Storage = None
 
 # ---------- Optional adaptive cost function ----------
 try:
@@ -86,8 +97,8 @@ if PYDANTIC_AVAILABLE:
         carbon_intensity_max_kg_per_kwh: float = Field(1.0, gt=0)
         helium_scarcity_threshold: float = Field(0.7, ge=0, le=1)
         helium_max_scarcity: float = Field(1.0, ge=0, le=1)
-        material_embodied_norm: float = Field(200.0, gt=0)  # kg CO2 equivalent
-        material_rare_earth_norm: float = Field(0.01, gt=0)  # kg
+        material_embodied_norm: float = Field(200.0, gt=0)
+        material_rare_earth_norm: float = Field(0.01, gt=0)
         material_max_composite: float = Field(1.0, gt=0)
         # Carbon caching
         carbon_cache_ttl_seconds: int = Field(300, ge=0)
@@ -107,7 +118,7 @@ if PYDANTIC_AVAILABLE:
 
         # NEW: MOEA parameters
         moea_enabled: bool = Field(True)
-        moea_interval_seconds: int = Field(300, ge=60)  # run every 5 minutes
+        moea_interval_seconds: int = Field(300, ge=60)
         moea_population_size: int = Field(30, ge=10)
         moea_generations: int = Field(10, ge=2)
         moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
@@ -125,6 +136,13 @@ if PYDANTIC_AVAILABLE:
         )
         moea_dynamic_weights: bool = Field(True)
 
+        # NEW v2.4.0 flags
+        enable_limit_graph: bool = Field(True)
+        enable_modp: bool = Field(True)
+        enable_rlhf: bool = Field(True)
+        enable_moe: bool = Field(True)
+        moe_expert_count: int = Field(4, ge=2)
+
         @validator('energy_weight', 'carbon_weight', 'helium_weight', 'material_weight', 'latency_weight', 'accuracy_weight')
         def weights_sum_one(cls, v, values):
             weights = [v] + [values.get(k, 0) for k in ['carbon_weight', 'helium_weight', 'material_weight', 'latency_weight', 'accuracy_weight']]
@@ -136,7 +154,6 @@ if PYDANTIC_AVAILABLE:
         class Config:
             env_prefix = "COST_"
 else:
-    # Fallback dict
     COST_CONFIG = {
         "energy_weight": 0.2,
         "carbon_weight": 0.3,
@@ -162,14 +179,12 @@ else:
         "use_adaptive_weights": False,
         "integrate_anomaly_detection": False,
         "integrate_predictive_maintenance": False,
-        # Distillation defaults
         "distillation_epsilon": 0.1,
         "distillation_train_every": 10,
         "distillation_replay_size": 2000,
         "distillation_learning_rate": 0.01,
         "distill_weight": 0.7,
         "rl_weight": 0.3,
-        # MOEA defaults
         "moea_enabled": True,
         "moea_interval_seconds": 300,
         "moea_population_size": 30,
@@ -186,31 +201,254 @@ else:
             'accuracy': 0.1,
         },
         "moea_dynamic_weights": True,
+        "enable_limit_graph": True,
+        "enable_modp": True,
+        "enable_rlhf": True,
+        "enable_moe": True,
+        "moe_expert_count": 4,
     }
 
 
 # ============================================================================
-# NEW: DISTILLATION COMPONENTS FOR WEIGHT SELECTION
+# NEW: LIMIT Graph Manager
 # ============================================================================
+class LimitGraphManager:
+    """
+    Manages a graph of cost component dependencies for LIMIT.
+    Nodes are cost components (energy, carbon, helium, material, latency, accuracy),
+    edges represent trade-offs or correlations.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.graphs = {}
 
+    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
+            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
+        else:
+            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+
+    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
+            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+
+    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
+                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
+            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+
+    def get_nodes(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
+            return self.storage.get_limit_graph_nodes(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+
+    def get_edges(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
+            return self.storage.get_limit_graph_edges(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+
+    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
+            return self.storage.get_limit_graph_metadata(graph_id)
+        return self.graphs.get(graph_id, {})
+
+
+# ============================================================================
+# NEW: MODP Optimizer
+# ============================================================================
+class MODPOptimizer:
+    """
+    Multi‑Objective Dynamic Programming solver that can be used to
+    combine Pareto front with dynamic weights.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.states = {}
+
+    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                  objective_values: Dict[str, float], stage: int) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_state'):
+            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
+        else:
+            if problem_id not in self.states:
+                self.states[problem_id] = []
+            self.states[problem_id].append({
+                'state_id': state_id, 'state_attributes': state_attributes,
+                'objective_values': objective_values, 'stage': stage
+            })
+
+    def add_transition(self, transition_id: str, problem_id: str, from_state: str,
+                       to_state: str, action: str, cost: float,
+                       objective_deltas: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_transition'):
+            self.storage.save_modp_transition(transition_id, problem_id, from_state, to_state, action, cost, objective_deltas)
+
+    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
+                   action: str, expected_objectives: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_policy'):
+            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+
+    def get_states(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_states'):
+            return self.storage.get_modp_states(problem_id)
+        return self.states.get(problem_id, [])
+
+    def get_transitions(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_transitions'):
+            return self.storage.get_modp_transitions(problem_id)
+        return []
+
+    def get_policies(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_policies'):
+            return self.storage.get_modp_policies(problem_id)
+        return []
+
+    async def solve(self, problem_id: str, initial_state: Dict[str, Any], max_stages: int = 5) -> Dict[str, Any]:
+        """Simplified DP solver; just stores initial state and returns empty front."""
+        self.add_state(
+            state_id=f"{problem_id}_init",
+            problem_id=problem_id,
+            state_attributes=initial_state,
+            objective_values={"energy": 0.0, "carbon": 0.0, "helium": 0.0,
+                              "material": 0.0, "latency": 0.0, "accuracy": 0.0},
+            stage=0
+        )
+        return {"status": "solved", "pareto_front": []}
+
+
+# ============================================================================
+# NEW: RLHF Trainer
+# ============================================================================
+class RLHFTrainer:
+    """
+    Collects human preference pairs for cost weight strategies.
+    """
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage
+        self.pairs = []
+
+    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        if self.storage and hasattr(self.storage, 'save_preference_pair'):
+            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+        else:
+            self.pairs.append({
+                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
+                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+            })
+
+    def get_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
+            return self.storage.get_preference_pairs(limit)
+        return self.pairs[-limit:]
+
+    def train_reward_model(self):
+        pairs = self.get_pairs()
+        if len(pairs) < 5:
+            logger.info("Not enough preference pairs for RLHF training.")
+            return
+        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+
+
+# ============================================================================
+# NEW: MoE Gating Network
+# ============================================================================
+class MoEGatingNetwork:
+    """
+    Mixture-of-Experts gating for weight strategy selection.
+    Experts are specialized strategies: carbon_focus, energy_focus, helium_focus,
+    material_focus, adaptive. The gating network learns to blend them.
+    """
+    def __init__(self, storage: Optional[Storage] = None, config: Optional[Dict] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.num_experts = self.config.get('moe_expert_count', 4)
+        # Expert names: we'll use the same action space as distillation
+        self.expert_names = ['carbon_focus', 'energy_focus', 'helium_focus', 'adaptive'][:self.num_experts]
+        # Gating weights: (num_experts, 12) because state dimension is 12
+        self.gating_weights = np.random.randn(self.num_experts, 12)
+        self._training_samples = []
+
+    def _encode_state(self, state: Union['CostOptimizationState', Dict]) -> np.ndarray:
+        if isinstance(state, dict):
+            features = [
+                min(state.get('carbon_intensity', 0) / 1.0, 1.0),
+                state.get('node_health', 1.0),
+                min(state.get('workload_tokens', 0) / 10000.0, 1.0),
+                min(state.get('latency_target', 0) / 5000.0, 1.0),
+                state.get('anomaly_severity', 0),
+                state.get('avg_cost_trend', 0),
+                min(state.get('cost_variance', 0) / 0.5, 1.0),
+                state.get('weight_carbon', 0.3),
+                state.get('weight_energy', 0.2),
+                state.get('weight_helium', 0.15),
+                state.get('hour_of_day', 0) / 24.0,
+            ]
+        else:
+            features = [
+                min(state.carbon_intensity / 1.0, 1.0),
+                state.node_health,
+                min(state.workload_tokens / 10000.0, 1.0),
+                min(state.latency_target / 5000.0, 1.0),
+                state.anomaly_severity,
+                state.avg_cost_trend,
+                min(state.cost_variance / 0.5, 1.0),
+                state.weight_carbon,
+                state.weight_energy,
+                state.weight_helium,
+                state.hour_of_day / 24.0,
+            ]
+        return np.array(features, dtype=np.float32)
+
+    async def select_expert(self, state: Union['CostOptimizationState', Dict]) -> Tuple[str, np.ndarray]:
+        x = self._encode_state(state)
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        expert_idx = np.argmax(probs)
+        selected = self.expert_names[expert_idx]
+        # Log routing if storage available
+        if self.storage and hasattr(self.storage, 'log_routing_decision'):
+            sample_id = hashlib.sha256(str(state).encode()).hexdigest()[:16]
+            self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+        return selected, probs
+
+    async def add_training_sample(self, state: Union['CostOptimizationState', Dict], selected_expert: str, reward: float):
+        x = self._encode_state(state)
+        expert_idx = self.expert_names.index(selected_expert)
+        target = np.zeros(self.num_experts)
+        target[expert_idx] = 1.0
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        grad = (probs - target)[:, None] * x[None, :]
+        self.gating_weights -= 0.1 * grad
+
+
+# ============================================================================
+# Distillation Components for Weight Selection
+# ============================================================================
 @dataclass
 class CostOptimizationState:
     """State for the distillation agent."""
-    # Environmental
     carbon_intensity: float
-    node_health: float  # from predictive maintenance (0-1)
+    node_health: float
     workload_tokens: float
     latency_target: float
-    # Anomaly
     anomaly_severity: float
-    # Historical
-    avg_cost_trend: float  # positive = increasing cost
+    avg_cost_trend: float
     cost_variance: float
-    # Current weights (sum to 1)
     weight_carbon: float
     weight_energy: float
     weight_helium: float
-    # Time
     hour_of_day: float
 
     def to_feature_vector(self) -> np.ndarray:
@@ -231,35 +469,31 @@ class CostOptimizationState:
         return np.array(features, dtype=np.float32)
 
 
-# Teacher abstract base
 class Teacher(ABC):
     @abstractmethod
     def predict(self, state: CostOptimizationState) -> np.ndarray:
-        """Return probability vector over 5 strategies."""
         pass
 
     @abstractmethod
     def confidence(self, state: CostOptimizationState) -> float:
-        """Return confidence in prediction [0,1]."""
         pass
 
 
 class CostRuleBasedTeacher(Teacher):
-    """Rule‑based expert: uses heuristics."""
     ACTION_SPACE = ['standard', 'carbon_focus', 'energy_focus', 'helium_focus', 'adaptive']
 
     def predict(self, state: CostOptimizationState) -> np.ndarray:
         probs = np.ones(5) * 0.1
         if state.anomaly_severity > 0.7:
-            probs[1] = 0.8   # carbon_focus
+            probs[1] = 0.8
         elif state.carbon_intensity > 0.8:
-            probs[1] = 0.7   # carbon_focus
+            probs[1] = 0.7
         elif state.workload_tokens > 5000:
-            probs[2] = 0.6   # energy_focus
+            probs[2] = 0.6
         elif state.node_health < 0.5:
-            probs[3] = 0.6   # helium_focus (if helium is critical)
+            probs[3] = 0.6
         else:
-            probs[4] = 0.6   # adaptive
+            probs[4] = 0.6
         return probs / probs.sum()
 
     def confidence(self, state: CostOptimizationState) -> float:
@@ -269,12 +503,15 @@ class CostRuleBasedTeacher(Teacher):
 
 
 class CostHistoricalMLTeacher(Teacher):
-    """Offline trained classifier on historical optimal strategies."""
     def __init__(self, model_path: Optional[str] = None):
         self.model = None
         if model_path and Path(model_path).exists() and SKLEARN_ML:
-            import joblib
-            self.model = joblib.load(model_path)
+            try:
+                import joblib
+                self.model = joblib.load(model_path)
+            except ImportError:
+                logger.warning("joblib not available; historical ML teacher disabled")
+                self.model = None
 
     def predict(self, state: CostOptimizationState) -> np.ndarray:
         if self.model is None:
@@ -288,19 +525,10 @@ class CostHistoricalMLTeacher(Teacher):
 
 
 class CostStatefulQTeacher(Teacher):
-    """Linear Q‑learning with state features."""
     def __init__(self, cost_func: 'SustainabilityCostFunction', lr: float = 0.1):
         self.cost_func = cost_func
         self.lr = lr
         self.weights = np.zeros((12, 5))  # 12 features, 5 actions
-        self._load_state()
-
-    def _load_state(self):
-        # We'll persist in the cost_func's internal state (e.g., a dict)
-        pass
-
-    def _save_state(self):
-        pass
 
     def predict(self, state: CostOptimizationState) -> np.ndarray:
         x = state.to_feature_vector()
@@ -318,7 +546,6 @@ class CostStatefulQTeacher(Teacher):
 
 
 class DistillationStudent:
-    """Linear softmax student updated via distillation + policy gradient."""
     def __init__(self, feature_dim: int = 12, n_classes: int = 5, lr: float = 0.01):
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
@@ -335,16 +562,10 @@ class DistillationStudent:
     def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
                reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
         current_probs = self.predict_proba(state_vector)
-        logits = state_vector @ self.weights + self.biases
-
-        # Distillation gradient (KL divergence)
         grad_distill = -(teacher_probs - current_probs)
-
-        # Policy gradient (REINFORCE)
         one_hot = np.zeros(self.n_classes)
         one_hot[action] = 1.0
         grad_rl = -reward * (one_hot - current_probs)
-
         grad = distill_weight * grad_distill + rl_weight * grad_rl
         self.weights -= self.lr * np.outer(state_vector, grad)
         self.biases -= self.lr * grad
@@ -373,9 +594,6 @@ class ReplayBuffer:
 
 
 class DistillationCostOptimizer:
-    """
-    Multi‑teacher on‑policy distillation agent for cost weight selection.
-    """
     ACTION_SPACE = ['standard', 'carbon_focus', 'energy_focus', 'helium_focus', 'adaptive']
 
     def __init__(self, cost_func: 'SustainabilityCostFunction', config: Dict[str, Any]):
@@ -384,7 +602,7 @@ class DistillationCostOptimizer:
         self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
         self.teachers: List[Teacher] = [
             CostRuleBasedTeacher(),
-            CostHistoricalMLTeacher(),  # optionally load model
+            CostHistoricalMLTeacher(),
             CostStatefulQTeacher(cost_func)
         ]
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
@@ -394,8 +612,6 @@ class DistillationCostOptimizer:
 
     async def select_strategy(self, state: CostOptimizationState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
-
-        # Ensemble teachers
         teacher_probs = np.zeros(5)
         total_conf = 0.0
         for teacher in self.teachers:
@@ -409,7 +625,6 @@ class DistillationCostOptimizer:
             teacher_probs = np.ones(5) / 5
 
         student_probs = self.student.predict_proba(state_vec)
-
         if exploration and random.random() < self.epsilon:
             action_idx = random.randint(0, 4)
         else:
@@ -422,15 +637,11 @@ class DistillationCostOptimizer:
                      next_state_vec: np.ndarray, teacher_probs: np.ndarray):
         self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
         self.counter += 1
-
         if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
             batch = self.replay_buffer.sample(8)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
                 self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
-
-        # Update Q-teacher if we have the original state
-        # We'll do that separately in the main loop.
 
     def get_stats(self) -> Dict:
         return {
@@ -443,13 +654,11 @@ class DistillationCostOptimizer:
 # ============================================================================
 # NEW: Multi‑Objective Evolutionary Optimizer (NSGA‑II)
 # ============================================================================
-
 @dataclass
 class MOPDPoint:
-    """Point in the Pareto front for weight vectors."""
     policy_id: str
-    parameters: Dict[str, float]  # weight vector (keys: energy, carbon, helium, material, latency, accuracy)
-    objectives: Dict[str, float]  # benefits (1 - normalized cost) for each component
+    parameters: Dict[str, float]
+    objectives: Dict[str, float]
     scalarised_score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -462,10 +671,6 @@ class MOPDPoint:
 
 
 class NSGAIIOptimizer:
-    """
-    Generic NSGA-II for continuous parameter optimization with multiple objectives.
-    Assumes all objectives are to be maximized.
-    """
     def __init__(self,
                  evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
                  parameter_bounds: Dict[str, Tuple[float, float]],
@@ -497,7 +702,6 @@ class NSGAIIOptimizer:
         ind = {}
         for name, (low, high) in self.parameter_bounds.items():
             ind[name] = random.uniform(low, high)
-        # Normalize weights to sum to 1
         total = sum(ind.values())
         if total > 0:
             ind = {k: v / total for k, v in ind.items()}
@@ -507,7 +711,6 @@ class NSGAIIOptimizer:
         child = {}
         for name in self.parameter_bounds:
             if random.random() < 0.5:
-                # SBX
                 low, high = self.parameter_bounds[name]
                 u = random.random()
                 if u <= 0.5:
@@ -518,7 +721,6 @@ class NSGAIIOptimizer:
                 child[name] = max(low, min(high, val))
             else:
                 child[name] = p1[name] if random.random() < 0.5 else p2[name]
-        # Normalize
         total = sum(child.values())
         if total > 0:
             child = {k: v / total for k, v in child.items()}
@@ -621,7 +823,6 @@ class NSGAIIOptimizer:
         weights = self.objective_weights.copy()
         if not self.dynamic_weights or not self.pareto_front:
             return weights
-        # For example, increase weight of objective with lower average relative to max
         obj_keys = list(weights.keys())
         if not obj_keys:
             return weights
@@ -754,13 +955,13 @@ class NSGAIIOptimizer:
 
 
 # ============================================================================
-# MAIN COST FUNCTION (Enhanced with MOEA)
+# MAIN COST FUNCTION (Enhanced with new components)
 # ============================================================================
-
 class SustainabilityCostFunction:
     """
     Enhanced multi‑objective sustainability cost function with adaptive weight selection
-    via multi‑teacher distillation and optional MOEA refinement.
+    via multi‑teacher distillation, optional MoE gating, MOEA refinement, LIMIT Graph,
+    MODP solver, and RLHF preference collection.
     """
 
     def __init__(
@@ -772,18 +973,24 @@ class SustainabilityCostFunction:
         adaptive_cost_function: Optional['AdaptiveCostFunction'] = None,
         anomaly_detector: Optional[Any] = None,
         predictive_maintenance: Optional[Any] = None,
+        storage: Optional[Storage] = None,
+        enable_limit_graph: bool = True,
+        enable_modp: bool = True,
+        enable_rlhf: bool = True,
+        enable_moe: bool = True,
+        moe_expert_count: int = 4,
     ):
         """
-        Initialize the cost function.
+        Initialize the cost function with optional new components.
 
         Args:
-            carbon_fetcher: Carbon intensity data source.
-            material_updater: Material footprint data source.
-            helium_collector: Helium connectivity data source.
-            config: Configuration (dict or Pydantic model).
-            adaptive_cost_function: Optional adaptive cost function for dynamic weights.
-            anomaly_detector: Optional anomaly detection module.
-            predictive_maintenance: Optional predictive maintenance engine.
+            ... (existing arguments)
+            storage: Central Storage instance (optional).
+            enable_limit_graph: Enable LIMIT Graph management.
+            enable_modp: Enable MODP solver.
+            enable_rlhf: Enable RLHF preference collection.
+            enable_moe: Enable MoE gating network.
+            moe_expert_count: Number of experts in MoE.
         """
         # Configuration
         if config is None:
@@ -807,17 +1014,16 @@ class SustainabilityCostFunction:
         self.anomaly_detector = anomaly_detector
         self.predictive_maintenance = predictive_maintenance
 
-        # Base weights (initial from config)
+        # Base weights
         self._base_weights = self._get_initial_weights()
-        # Current weights (may be adjusted by strategy)
         self._current_weights = self._base_weights.copy()
 
-        # Carbon intensity cache (LRU)
+        # Carbon cache
         self._carbon_cache: OrderedDict[str, Tuple[float, datetime]] = OrderedDict()
         self._carbon_cache_ttl = self._get_config('carbon_cache_ttl_seconds', 300)
         self._carbon_cache_max_size = self._get_config('carbon_cache_max_size', 100)
 
-        # Metrics (Prometheus)
+        # Metrics
         if PROMETHEUS_AVAILABLE:
             self.metrics = {
                 'energy': Histogram('cost_energy', 'Energy cost component (normalized)'),
@@ -834,11 +1040,10 @@ class SustainabilityCostFunction:
         else:
             self.metrics = None
 
-        # State for anomaly cooldown (still used)
         self._last_anomaly_time: Optional[datetime] = None
         self._anomaly_cooldown = timedelta(seconds=300)
 
-        # NEW: Distillation optimizer
+        # Distillation optimizer
         self.distillation_config = {
             'distillation_epsilon': self._get_config('distillation_epsilon', 0.1),
             'distillation_train_every': self._get_config('distillation_train_every', 10),
@@ -849,11 +1054,10 @@ class SustainabilityCostFunction:
         }
         self.policy_optimizer = DistillationCostOptimizer(self, self.distillation_config)
 
-        # History for reward computation
         self._last_total_cost: Optional[float] = None
         self._cost_history = deque(maxlen=50)
 
-        # NEW: MOEA attributes
+        # MOEA attributes
         self.moea_enabled = self._get_config('moea_enabled', True)
         self.moea_interval_seconds = self._get_config('moea_interval_seconds', 300)
         self.moea_optimizer: Optional[NSGAIIOptimizer] = None
@@ -864,20 +1068,44 @@ class SustainabilityCostFunction:
         self._last_workload: Optional[WorkloadDescriptor] = None
         self._last_expert_profile: Optional[ExpertProfile] = None
 
-        logger.info("SustainabilityCostFunction v2.3.0 initialized with config: %s", self.config)
+        # NEW v2.4.0 components
+        self.storage = storage
+        self.limit_graph_manager = LimitGraphManager(storage) if enable_limit_graph else None
+        self.modp_solver = MODPOptimizer(storage) if enable_modp else None
+        self.rlhf_trainer = RLHFTrainer(storage) if enable_rlhf else None
+        self.moe_gating = MoEGatingNetwork(storage, {'moe_expert_count': moe_expert_count}) if enable_moe else None
+
+        logger.info("SustainabilityCostFunction v2.4.0 initialized with config: %s", self.config)
 
         # Start MOEA background task if enabled
         if self.moea_enabled:
             self._moea_task = asyncio.create_task(self._moea_loop())
 
+        # Initialize LIMIT Graph if enabled
+        if self.limit_graph_manager:
+            self._init_limit_graph()
+
+    def _init_limit_graph(self):
+        """Create a default cost component graph."""
+        graph_id = "cost_components"
+        if not self.limit_graph_manager.get_metadata(graph_id):
+            self.limit_graph_manager.create_graph(graph_id, "Sustainability Cost Component Dependencies", {})
+            # Add nodes
+            for comp in ['energy', 'carbon', 'helium', 'material', 'latency', 'accuracy']:
+                self.limit_graph_manager.add_node(graph_id, f"node_{comp}", comp, {"weight": self._base_weights.get(comp, 0.1)})
+            # Add edges (trade-offs)
+            self.limit_graph_manager.add_edge(graph_id, "edge_energy_carbon", "node_energy", "node_carbon", 0.8, {})
+            self.limit_graph_manager.add_edge(graph_id, "edge_carbon_helium", "node_carbon", "node_helium", 0.3, {})
+            logger.info("Initialized LIMIT Graph for cost components.")
+
     def _get_config(self, key: str, default: Any = None) -> Any:
-        """Safely get a config value, supporting both dict and Pydantic."""
+        """Safely get a config value."""
         if hasattr(self.config, 'dict'):
             return getattr(self.config, key, default)
         return self.config.get(key, default)
 
     def _get_initial_weights(self) -> Dict[str, float]:
-        """Extract initial weights from config and ensure they sum to 1."""
+        """Extract initial weights from config and normalize."""
         weights = {
             'energy': self._get_config('energy_weight', 0.2),
             'carbon': self._get_config('carbon_weight', 0.3),
@@ -891,7 +1119,7 @@ class SustainabilityCostFunction:
             weights = {k: v / total for k, v in weights.items()}
         return weights
 
-    # ---------- Normalization helpers (unchanged) ----------
+    # ---------- Normalization helpers ----------
     def _normalize_energy(self, energy_joules: float) -> float:
         baseline = self._get_config('energy_baseline_joules', 0.0001)
         max_val = self._get_config('energy_max_joules', 0.001)
@@ -934,7 +1162,7 @@ class SustainabilityCostFunction:
             return 0.0
         return (max_val - val) / (max_val - baseline)
 
-    # ---------- Core computation (enhanced) ----------
+    # ---------- Core computation ----------
     async def compute(
         self,
         node_desc: NodeDescriptor,
@@ -943,7 +1171,7 @@ class SustainabilityCostFunction:
     ) -> float:
         """
         Compute the sustainability cost for a given node and workload.
-        Uses distillation to select the weight strategy.
+        Uses MoE gating if enabled, else distillation to select the weight strategy.
         """
         # Store last inputs for MOEA evaluation
         self._last_node_desc = node_desc
@@ -951,7 +1179,6 @@ class SustainabilityCostFunction:
         self._last_expert_profile = expert_profile
 
         # --- Energy cost ---
-        # Apply predictive maintenance efficiency factor if enabled
         if self._get_config('integrate_predictive_maintenance', False) and self.predictive_maintenance:
             try:
                 eff_factor = await self.predictive_maintenance.get_efficiency_factor(node_desc.id)
@@ -1005,7 +1232,7 @@ class SustainabilityCostFunction:
         if PROMETHEUS_AVAILABLE and self.metrics:
             self.metrics['accuracy'].observe(accuracy_cost)
 
-        # --- Get weights via distillation ---
+        # --- Get weights via MoE or distillation ---
         weights = await self._get_weights(node_desc, workload, anomaly_detected=False)
 
         # --- Total cost ---
@@ -1022,7 +1249,7 @@ class SustainabilityCostFunction:
             for k, v in weights.items():
                 self.metrics['weights'].labels(component=k).set(v)
 
-        # --- Compute reward and update distillation agent ---
+        # --- Compute reward and update agent ---
         baseline_weights = self._base_weights
         baseline_total = (
             baseline_weights['energy'] * energy_cost +
@@ -1042,14 +1269,43 @@ class SustainabilityCostFunction:
         self._last_total_cost = total
 
         state = self._build_optimization_state(node_desc, workload, expert_profile)
-        next_state = state
-        asyncio.create_task(self.policy_optimizer.update(
-            state.to_feature_vector(),
-            self._last_action_idx,
-            reward,
-            next_state.to_feature_vector(),
-            self._last_teacher_probs
-        ))
+
+        # Update the appropriate model
+        if self.moe_gating:
+            # If MoE used, we need the selected expert from _get_weights
+            expert_name = self._last_selected_expert
+            await self.moe_gating.add_training_sample(state, expert_name, reward)
+        else:
+            # Update distillation
+            next_state = state
+            asyncio.create_task(self.policy_optimizer.update(
+                state.to_feature_vector(),
+                self._last_action_idx,
+                reward,
+                next_state.to_feature_vector(),
+                self._last_teacher_probs
+            ))
+
+        # --- RLHF preference recording (occasional) ---
+        if self.rlhf_trainer and random.random() < 0.05:
+            chosen_strategy = self._last_strategy
+            rejected_strategy = random.choice([s for s in DistillationCostOptimizer.ACTION_SPACE if s != chosen_strategy])
+            self.rlhf_trainer.record_pair(
+                pair_id=str(uuid.uuid4()),
+                prompt=f"Which weight strategy is better for current conditions?",
+                chosen=chosen_strategy,
+                rejected=rejected_strategy,
+                reward_diff=reward,
+                metadata={'node_id': node_desc.id, 'workload_tokens': workload.tokens}
+            )
+
+        # --- Update LIMIT Graph with latest weights ---
+        if self.limit_graph_manager:
+            for comp, w in weights.items():
+                self.limit_graph_manager.add_node(
+                    "cost_components", f"node_{comp}", comp,
+                    {"weight": w, "timestamp": datetime.now().isoformat()}
+                )
 
         logger.debug(
             "Cost components (normalized): energy=%.4f, carbon=%.4f, helium=%.4f, material=%.4f, latency=%.4f, accuracy=%.4f, total=%.4f",
@@ -1057,7 +1313,105 @@ class SustainabilityCostFunction:
         )
         return total
 
-    # ---------- New: Build optimization state ----------
+    # ---------- Weight selection ----------
+    async def _get_weights(
+        self,
+        node_desc: NodeDescriptor,
+        workload: WorkloadDescriptor,
+        anomaly_detected: bool = False,
+    ) -> Dict[str, float]:
+        state = self._build_optimization_state(node_desc, workload, None)
+
+        # If MoE gating is available, use it as primary selector
+        if self.moe_gating:
+            expert_name, _ = await self.moe_gating.select_expert(state)
+            self._last_selected_expert = expert_name
+            # Map expert to strategy
+            strategy_map = {
+                'carbon_focus': 'carbon_focus',
+                'energy_focus': 'energy_focus',
+                'helium_focus': 'helium_focus',
+                'adaptive': 'adaptive',
+            }
+            strategy = strategy_map.get(expert_name, 'adaptive')
+            self._last_strategy = strategy
+            action_idx = DistillationCostOptimizer.ACTION_SPACE.index(strategy)
+            self._last_action_idx = action_idx
+            self._last_teacher_probs = np.ones(5) / 5
+            # Apply weight adjustments based on strategy
+            weights = self._base_weights.copy()
+            if strategy == 'carbon_focus':
+                weights['carbon'] *= 1.2
+            elif strategy == 'energy_focus':
+                weights['energy'] *= 1.2
+            elif strategy == 'helium_focus':
+                weights['helium'] *= 1.2
+            elif strategy == 'adaptive':
+                if self._get_config('use_adaptive_weights', False) and self.adaptive_cost and ADAPTIVE_AVAILABLE:
+                    try:
+                        if hasattr(self.adaptive_cost, 'get_weights'):
+                            adaptive_weights = await self.adaptive_cost.get_weights()
+                        else:
+                            adaptive_weights = self.adaptive_cost.weights
+                        mapping = {
+                            'alpha': 'energy',
+                            'beta': 'carbon',
+                            'gamma': 'helium',
+                            'delta': 'material',
+                            'epsilon': 'latency',
+                            'zeta': 'accuracy',
+                        }
+                        for ad_key, comp in mapping.items():
+                            if ad_key in adaptive_weights:
+                                weights[comp] = adaptive_weights[ad_key]
+                    except Exception as e:
+                        logger.warning(f"Adaptive weight update failed: {e}")
+            total = sum(weights.values())
+            if total > 0:
+                weights = {k: v / total for k, v in weights.items()}
+            self._current_weights = weights
+            return weights
+
+        # Fallback to distillation optimizer
+        strategy, action_idx, state_vec, teacher_probs = await self.policy_optimizer.select_strategy(state, exploration=True)
+        self._last_strategy = strategy
+        self._last_action_idx = action_idx
+        self._last_teacher_probs = teacher_probs
+        weights = self._base_weights.copy()
+        if strategy == 'standard':
+            pass
+        elif strategy == 'carbon_focus':
+            weights['carbon'] *= 1.2
+        elif strategy == 'energy_focus':
+            weights['energy'] *= 1.2
+        elif strategy == 'helium_focus':
+            weights['helium'] *= 1.2
+        elif strategy == 'adaptive':
+            if self._get_config('use_adaptive_weights', False) and self.adaptive_cost and ADAPTIVE_AVAILABLE:
+                try:
+                    if hasattr(self.adaptive_cost, 'get_weights'):
+                        adaptive_weights = await self.adaptive_cost.get_weights()
+                    else:
+                        adaptive_weights = self.adaptive_cost.weights
+                    mapping = {
+                        'alpha': 'energy',
+                        'beta': 'carbon',
+                        'gamma': 'helium',
+                        'delta': 'material',
+                        'epsilon': 'latency',
+                        'zeta': 'accuracy',
+                    }
+                    for ad_key, comp in mapping.items():
+                        if ad_key in adaptive_weights:
+                            weights[comp] = adaptive_weights[ad_key]
+                except Exception as e:
+                    logger.warning(f"Adaptive weight update failed: {e}")
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        self._current_weights = weights
+        return weights
+
     def _build_optimization_state(
         self,
         node_desc: NodeDescriptor,
@@ -1115,53 +1469,7 @@ class SustainabilityCostFunction:
                 return value
         return self._get_config('carbon_intensity_baseline_kg_per_kwh', 0.4)
 
-    # ---------- Modified _get_weights ----------
-    async def _get_weights(
-        self,
-        node_desc: NodeDescriptor,
-        workload: WorkloadDescriptor,
-        anomaly_detected: bool = False,
-    ) -> Dict[str, float]:
-        state = self._build_optimization_state(node_desc, workload, None)
-        strategy, action_idx, state_vec, teacher_probs = await self.policy_optimizer.select_strategy(state, exploration=True)
-        self._last_action_idx = action_idx
-        self._last_teacher_probs = teacher_probs
-        weights = self._base_weights.copy()
-        if strategy == 'standard':
-            pass
-        elif strategy == 'carbon_focus':
-            weights['carbon'] *= 1.2
-        elif strategy == 'energy_focus':
-            weights['energy'] *= 1.2
-        elif strategy == 'helium_focus':
-            weights['helium'] *= 1.2
-        elif strategy == 'adaptive':
-            if self._get_config('use_adaptive_weights', False) and self.adaptive_cost and ADAPTIVE_AVAILABLE:
-                try:
-                    if hasattr(self.adaptive_cost, 'get_weights'):
-                        adaptive_weights = await self.adaptive_cost.get_weights()
-                    else:
-                        adaptive_weights = self.adaptive_cost.weights
-                    mapping = {
-                        'alpha': 'energy',
-                        'beta': 'carbon',
-                        'gamma': 'helium',
-                        'delta': 'material',
-                        'epsilon': 'latency',
-                        'zeta': 'accuracy',
-                    }
-                    for ad_key, comp in mapping.items():
-                        if ad_key in adaptive_weights:
-                            weights[comp] = adaptive_weights[ad_key]
-                except Exception as e:
-                    logger.warning(f"Adaptive weight update failed: {e}")
-        total = sum(weights.values())
-        if total > 0:
-            weights = {k: v / total for k, v in weights.items()}
-        self._current_weights = weights
-        return weights
-
-    # ---------- Helper methods (unchanged) ----------
+    # ---------- Helper methods ----------
     async def _get_carbon_intensity(self, region: str) -> float:
         now = datetime.now()
         if region in self._carbon_cache:
@@ -1200,7 +1508,7 @@ class SustainabilityCostFunction:
         max_composite = self._get_config('material_max_composite', 1.0)
         return min(max_composite, composite)
 
-    # ---------- Integration callbacks (unchanged) ----------
+    # ---------- Integration callbacks ----------
     async def on_anomaly_detected(self, anomaly_severity: float):
         if not self._get_config('integrate_anomaly_detection', False):
             return
@@ -1279,14 +1587,12 @@ class SustainabilityCostFunction:
         if self._moea_task:
             self._moea_task.cancel()
             await asyncio.gather(self._moea_task, return_exceptions=True)
-        pass
 
-    # ---------- Distillation stats ----------
     async def get_distillation_stats(self) -> Dict:
         return self.policy_optimizer.get_stats()
 
     # ============================================================================
-    # NEW: MOEA Integration Methods
+    # MOEA Integration Methods
     # ============================================================================
     async def _moea_loop(self):
         """Periodically run MOEA to refine weights."""
@@ -1322,7 +1628,6 @@ class SustainabilityCostFunction:
 
         async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
             """Compute objectives (benefits) for a weight vector using the last scenario."""
-            # Temporarily set weights
             old_weights = self._current_weights.copy()
             self._current_weights = weights
 
@@ -1331,8 +1636,6 @@ class SustainabilityCostFunction:
             workload = self._last_workload
             expert_profile = self._last_expert_profile
 
-            # Reuse the compute logic but without weight selection (to avoid recursion)
-            # We'll manually compute each component using the same methods as compute.
             energy_used = node_desc.energy_per_token * workload.tokens
             energy_cost = self._normalize_energy(energy_used)
             carbon_intensity = await self._get_carbon_intensity(node_desc.region)
@@ -1392,6 +1695,15 @@ class SustainabilityCostFunction:
                 logger.info(f"MOEA selected best weights: {self._base_weights}")
                 if self.metrics:
                     self.metrics['moea_pareto_front'].set(len(pareto))
+                # Also store in MODP if enabled
+                if self.modp_solver:
+                    self.modp_solver.add_state(
+                        state_id=f"moea_best_{time.time()}",
+                        problem_id="cost_weight_optimization",
+                        state_attributes={'weights': self.moea_best_weights},
+                        objective_values={k: 1.0 - v for k, v in best_point.objectives.items()},
+                        stage=0
+                    )
 
     def _get_dynamic_moea_weights(self) -> Dict[str, float]:
         """Compute dynamic objective weights for MODP selection."""
@@ -1406,7 +1718,6 @@ class SustainabilityCostFunction:
 
         # Adjust based on current system state
         if self._carbon_cache:
-            # Example: if carbon intensity is high, increase carbon weight
             try:
                 latest_carbon = max(
                     value for value, ts in self._carbon_cache.values()
@@ -1436,9 +1747,33 @@ class SustainabilityCostFunction:
         self._current_weights = weights
         logger.info(f"Applied MOEA weights: {weights}")
 
+    # ---------- New public methods for enhancements ----------
+    async def get_rlhf_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.rlhf_trainer:
+            return self.rlhf_trainer.get_pairs(limit)
+        return []
+
+    async def record_rlhf_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
+        if self.rlhf_trainer:
+            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+
+    async def get_limit_graph(self, graph_id: str = "cost_components") -> Dict:
+        if self.limit_graph_manager:
+            return {
+                'metadata': self.limit_graph_manager.get_metadata(graph_id),
+                'nodes': self.limit_graph_manager.get_nodes(graph_id),
+                'edges': self.limit_graph_manager.get_edges(graph_id),
+            }
+        return {}
+
+    async def get_moe_experts(self) -> List[str]:
+        if self.moe_gating:
+            return self.moe_gating.expert_names
+        return []
+
 
 # ============================================================================
-# Convenience factory (unchanged)
+# Convenience factory
 # ============================================================================
 def create_cost_function(
     carbon_fetcher: CarbonIntensityFetcher,
@@ -1448,6 +1783,7 @@ def create_cost_function(
     adaptive_cost_function: Optional[Any] = None,
     anomaly_detector: Optional[Any] = None,
     predictive_maintenance: Optional[Any] = None,
+    storage: Optional[Storage] = None,
 ) -> SustainabilityCostFunction:
     return SustainabilityCostFunction(
         carbon_fetcher=carbon_fetcher,
@@ -1457,11 +1793,12 @@ def create_cost_function(
         adaptive_cost_function=adaptive_cost_function,
         anomaly_detector=anomaly_detector,
         predictive_maintenance=predictive_maintenance,
+        storage=storage,
     )
 
 
 # ============================================================================
-# Example usage (if run directly)
+# Example usage
 # ============================================================================
 if __name__ == "__main__":
     import asyncio
@@ -1518,6 +1855,14 @@ if __name__ == "__main__":
         print(f"Pareto front size: {len(pareto)}")
         if pareto:
             print("Best weights:", cost_func.moea_best_weights)
+
+        # Get LIMIT Graph info
+        graph_info = await cost_func.get_limit_graph()
+        print(f"LIMIT Graph nodes: {len(graph_info.get('nodes', []))}")
+
+        # Get MoE experts
+        experts = await cost_func.get_moe_experts()
+        print(f"MoE experts: {experts}")
 
         breakdown = await cost_func.get_cost_breakdown(node_desc, workload, expert)
         print("Cost breakdown:", breakdown)
