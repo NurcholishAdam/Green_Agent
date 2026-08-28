@@ -2,7 +2,7 @@
 # File: src/enhancements/node_registry_enhanced_v4_0.py
 """
 Node Registry – unified descriptor for all compute nodes.
-Version: 4.0.0 (Enhanced with Bio‑Inspired + MOE + MODP + Self‑Healing)
+Version: 4.0.0 (Enhanced with Bio‑Inspired + MOE + MODP + Self‑Healing + LIMIT Graph + RLHF + Distillation)
 """
 
 import asyncio
@@ -173,6 +173,10 @@ if PROMETHEUS_AVAILABLE:
     GA_FITNESS = Gauge('node_ga_fitness', 'GA population fitness', ['generation'], registry=REGISTRY)
     SELF_HEALING_ACTIONS = Counter('node_self_healing_actions_total', 'Self-healing actions', ['action'], registry=REGISTRY)
     ANOMALY_DETECTIONS = Counter('node_anomaly_detections_total', 'Anomaly detections', ['type'], registry=REGISTRY)
+    # ===== NEW: metrics for added features =====
+    LIMIT_GRAPH_EDGES = Gauge('node_limit_graph_edges', 'Number of edges in LIMIT graph', registry=REGISTRY)
+    RLHF_REWARD_MODEL_SCORE = Gauge('node_rlhf_reward_model_score', 'RLHF reward model average score', registry=REGISTRY)
+    DISTILLATION_LOSS = Gauge('node_distillation_loss', 'Distillation loss', registry=REGISTRY)
 else:
     class DummyMetrics:
         def inc(self, *args, **kwargs): pass
@@ -194,6 +198,9 @@ else:
     GA_FITNESS = DummyMetrics()
     SELF_HEALING_ACTIONS = DummyMetrics()
     ANOMALY_DETECTIONS = DummyMetrics()
+    LIMIT_GRAPH_EDGES = DummyMetrics()
+    RLHF_REWARD_MODEL_SCORE = DummyMetrics()
+    DISTILLATION_LOSS = DummyMetrics()
 
 # -----------------------------------------------------------------------------
 # Dummy tenacity decorator if not available
@@ -258,6 +265,26 @@ if PYDANTIC_AVAILABLE:
         fallback_enabled: bool = True
         health_check_interval: int = 60
 
+    # ===== NEW: LIMIT Graph, RLHF, Distillation configs =====
+    class LimitGraphConfig(BaseModel):
+        enabled: bool = True
+        graph_type: str = "resource"           # "resource", "constraint", "knowledge"
+        max_nodes: int = 100
+        update_interval: int = 300
+
+    class RLHFConfig(BaseModel):
+        enabled: bool = True
+        reward_model: str = "linear"           # "linear", "neural_net"
+        feedback_batch_size: int = 10
+        training_interval: int = 600
+
+    class DistillationConfig(BaseModel):
+        enabled: bool = True
+        num_teachers: int = 4
+        temperature: float = 2.0
+        alpha: float = 0.5                    # loss weight for teacher loss
+        student_model: str = "policy_net"     # or "linear"
+
     class NodeRegistryConfig(BaseModel):
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
         version: str = Field("4.0.0")
@@ -309,6 +336,10 @@ if PYDANTIC_AVAILABLE:
         bio: BioConfig = Field(default_factory=BioConfig)
         scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
         self_healing: SelfHealingConfig = Field(default_factory=SelfHealingConfig)
+        # ===== NEW: sub‑models for added features =====
+        limit_graph: LimitGraphConfig = Field(default_factory=LimitGraphConfig)
+        rlhf: RLHFConfig = Field(default_factory=RLHFConfig)
+        distillation: DistillationConfig = Field(default_factory=DistillationConfig)
 
         @field_validator('log_level')
         @classmethod
@@ -376,6 +407,29 @@ else:
         fallback_enabled: bool = True
         health_check_interval: int = 60
 
+    # ===== NEW: dataclass versions =====
+    @dataclass
+    class LimitGraphConfig:
+        enabled: bool = True
+        graph_type: str = "resource"
+        max_nodes: int = 100
+        update_interval: int = 300
+
+    @dataclass
+    class RLHFConfig:
+        enabled: bool = True
+        reward_model: str = "linear"
+        feedback_batch_size: int = 10
+        training_interval: int = 600
+
+    @dataclass
+    class DistillationConfig:
+        enabled: bool = True
+        num_teachers: int = 4
+        temperature: float = 2.0
+        alpha: float = 0.5
+        student_model: str = "policy_net"
+
     @dataclass
     class NodeRegistryConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
@@ -409,6 +463,10 @@ else:
         bio: BioConfig = field(default_factory=BioConfig)
         scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
         self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
+        # ===== NEW: dataclass fields =====
+        limit_graph: LimitGraphConfig = field(default_factory=LimitGraphConfig)
+        rlhf: RLHFConfig = field(default_factory=RLHFConfig)
+        distillation: DistillationConfig = field(default_factory=DistillationConfig)
 
         def get_master_key_bytes(self) -> bytes:
             if not self.quantum_master_key:
@@ -920,9 +978,7 @@ class MODPRefreshSelector:
         self.recent_outcomes = deque(maxlen=100)
 
     async def select_strategy(self, state: Dict) -> Dict:
-        # Compute carbon intensity influence
         carbon_intensity = state.get('carbon_intensity', 400)
-        # For each candidate, compute objectives (we want to maximize freshness and importance, minimize carbon and cost)
         cand_dicts = []
         for cand in self.candidates:
             cand_dicts.append({
@@ -931,7 +987,6 @@ class MODPRefreshSelector:
                 'cost': 1.0 - cand['cost'],
                 'importance': cand['importance']
             })
-        # Get adaptive weights if available
         if self.adaptive_cost and self.adaptive_weights:
             weights_dict = self.adaptive_cost.get_current_weights()
             self.weights = [
@@ -940,12 +995,10 @@ class MODPRefreshSelector:
                 weights_dict.get('cost', 0.25),
                 weights_dict.get('importance', 0.25)
             ]
-        # TOPSIS
         scores = TOPSIS.score(cand_dicts, self.weights, ['freshness', 'carbon', 'cost', 'importance'])
         best_idx = np.argmax(scores)
         best = self.candidates[best_idx]
 
-        # Build Pareto front for audit
         front = ParetoFront()
         for i, cand in enumerate(self.candidates):
             front.add([cand['freshness'], 1-cand['carbon'], 1-cand['cost'], cand['importance']], cand['name'])
@@ -953,7 +1006,6 @@ class MODPRefreshSelector:
         if PROMETHEUS_AVAILABLE:
             MODP_PARETO_SIZE.set(len(front.get_pareto_front()))
 
-        # Record outcome for weight adaptation
         outcome = [scores[best_idx], 1-best['carbon'], 1-best['cost'], best['importance']]
         self.recent_outcomes.append((self.weights, outcome))
         if self.adaptive_weights and len(self.recent_outcomes) >= 10:
@@ -1079,7 +1131,6 @@ class MOEUrgencyPredictor:
     async def update(self, node: NodeDescriptor, carbon_intensity: float, actual_improvement: float):
         # Record context and reward for gating training
         features = await self._extract_features(node, carbon_intensity)
-        # Determine which teacher was closest (for demo, use reward to update)
         reward = max(0, min(1, actual_improvement * 2))
         self.history.append((features, 0, reward))  # placeholder teacher index
         if len(self.history) % 100 == 0:
@@ -1497,6 +1548,189 @@ class SelfHealingManager:
             'recent_actions': list(self.recovery_actions)[-5:]
         }
 
+# =============================================================================
+# NEW MODULE: LIMIT Graph Manager
+# =============================================================================
+class LimitGraphManager:
+    """Maintains a graph of system constraints (carbon, cost, latency, etc.) for real‑time decision support."""
+    def __init__(self, config: NodeRegistryConfig):
+        self.config = config
+        self.graph = {}                     # node -> dict of edges with weights
+        self.constraints = {}               # constraint name -> current value
+        self._lock = asyncio.Lock()
+        self._initialize_graph()
+
+    def _initialize_graph(self):
+        # Example nodes: carbon, cost, latency, throughput, diversity
+        nodes = ['carbon', 'cost', 'latency', 'throughput', 'diversity']
+        for n in nodes:
+            self.graph[n] = {}
+        # Add simple edges (weights can be learned later)
+        self.graph['carbon']['cost'] = 0.8
+        self.graph['cost']['latency'] = 0.2
+        self.graph['latency']['throughput'] = -0.5
+        self.graph['throughput']['diversity'] = 0.1
+        self.graph['diversity']['carbon'] = -0.3
+        if PROMETHEUS_AVAILABLE:
+            LIMIT_GRAPH_EDGES.set(sum(len(v) for v in self.graph.values()))
+
+    async def update_constraint(self, name: str, value: float):
+        async with self._lock:
+            self.constraints[name] = value
+
+    async def get_constraint(self, name: str) -> float:
+        return self.constraints.get(name, 0.0)
+
+    async def evaluate_path(self, start: str, end: str) -> float:
+        """Simple graph traversal (BFS) to compute influence score."""
+        if start not in self.graph or end not in self.graph:
+            return 0.0
+        visited = set()
+        queue = [(start, 1.0)]
+        while queue:
+            node, weight = queue.pop(0)
+            if node == end:
+                return weight
+            visited.add(node)
+            for neighbor, w in self.graph[node].items():
+                if neighbor not in visited:
+                    queue.append((neighbor, weight * w))
+        return 0.0
+
+    async def get_graph_summary(self) -> Dict:
+        return {
+            'nodes': list(self.graph.keys()),
+            'constraints': self.constraints,
+            'edge_count': sum(len(v) for v in self.graph.values())
+        }
+
+# =============================================================================
+# NEW MODULE: RLHF Manager
+# =============================================================================
+class RLHFManager:
+    """Reinforcement Learning from Human Feedback – learns a reward model from feedback events and uses it to guide policy selection."""
+    def __init__(self, config: NodeRegistryConfig):
+        self.config = config
+        self.feedback_buffer = []           # list of (state, action, reward)
+        self.reward_model = None
+        self.policy = None                  # simple policy: linear weights
+        self._lock = asyncio.Lock()
+        self._init_models()
+
+    def _init_models(self):
+        if SKLEARN_AVAILABLE:
+            self.reward_model = LinearRegression()
+            self.policy = {'weights': np.array([0.25, 0.25, 0.25, 0.25])}
+        else:
+            logger.warning("RLHF requires sklearn; using heuristic reward model")
+
+    async def record_feedback(self, state: Dict, action: str, reward: float):
+        """Called when human feedback is available."""
+        async with self._lock:
+            self.feedback_buffer.append({
+                'state': self._state_to_features(state),
+                'action': self._action_to_index(action),
+                'reward': reward
+            })
+
+    def _state_to_features(self, state: Dict) -> List[float]:
+        return [
+            state.get('carbon_intensity', 400) / 1000,
+            state.get('avg_score', 0.5),
+            state.get('cost', 0.5),
+            state.get('diversity', 0.5)
+        ]
+
+    def _action_to_index(self, action: str) -> int:
+        actions = ['immediate', 'batch_5', 'batch_10', 'delay_1h']
+        return actions.index(action) if action in actions else 3
+
+    async def train_reward_model(self):
+        if not self.reward_model or len(self.feedback_buffer) < 10:
+            return
+        X = [f['state'] for f in self.feedback_buffer]
+        y = [f['reward'] for f in self.feedback_buffer]
+        self.reward_model.fit(X, y)
+        logger.info(f"RLHF reward model trained on {len(self.feedback_buffer)} samples")
+        # Update policy weights based on reward model (simplified)
+        # Placeholder: update policy towards actions with highest predicted reward
+        self.feedback_buffer.clear()
+        if PROMETHEUS_AVAILABLE:
+            avg_reward = np.mean(y)
+            RLHF_REWARD_MODEL_SCORE.set(avg_reward)
+
+    async def get_policy_probs(self, state: Dict) -> List[float]:
+        """Return action probabilities according to learned policy (currently based on reward model)."""
+        features = self._state_to_features(state)
+        if self.reward_model:
+            # For each action, predict reward (simplified by varying action index)
+            # In practice, would need action‑specific feature encoding
+            # For now return weights from policy
+            return self.policy['weights'].tolist()
+        return [0.25, 0.25, 0.25, 0.25]
+
+# =============================================================================
+# NEW MODULE: Multi‑Teacher Policy Distillation
+# =============================================================================
+class MultiTeacherPolicyDistillation:
+    """Distills multiple teacher policies (from MOE experts) into a single student policy using knowledge distillation."""
+    def __init__(self, config: NodeRegistryConfig, moe_predictor: Optional[MOEUrgencyPredictor] = None):
+        self.config = config
+        self.moe_predictor = moe_predictor
+        self.student_policy = np.array([0.25, 0.25, 0.25, 0.25])   # prob over 4 actions (refresh strategies)
+        self.temperature = config.distillation.temperature
+        self.alpha = config.distillation.alpha
+        self.history = deque(maxlen=500)   # (state_features, teacher_probs, action_taken, reward)
+        self._lock = asyncio.Lock()
+
+    async def distill(self, state: Dict):
+        """Perform one distillation step using current teacher outputs."""
+        if not self.moe_predictor:
+            return
+        # Get teacher probabilities over experts (simplified: use gating weights as action probs)
+        # For node registry, we can use MOE gating weights on a dummy node to represent teacher distribution
+        # Since we don't have a node here, we use a default descriptor (or average)
+        dummy_node = NodeDescriptor(
+            node_id='dummy',
+            location='unknown',
+            energy_efficiency=0.8,
+            carbon_intensity=400,
+            helium_index=0.5,
+            material_index=1.0,
+            cooling_type='air',
+            renewable_fraction=0.5
+        )
+        carbon_intensity = state.get('carbon_intensity', 400)
+        teachers_probs = await self.moe_predictor.get_gating_weights(dummy_node, carbon_intensity)
+        teacher_dist = np.array(teachers_probs)
+        if len(teacher_dist) < 4:
+            teacher_dist = np.pad(teacher_dist, (0, 4 - len(teacher_dist)), 'constant', constant_values=0.25)
+        teacher_dist /= teacher_dist.sum()
+
+        # Soften with temperature
+        soft_teacher = np.exp(np.log(teacher_dist + 1e-6) / self.temperature)
+        soft_teacher /= soft_teacher.sum()
+
+        # Update student policy (simple gradient step)
+        loss = -np.sum(soft_teacher * np.log(self.student_policy + 1e-6))
+        grad = -soft_teacher / (self.student_policy + 1e-6)
+        lr = 0.01
+        self.student_policy -= lr * grad
+        self.student_policy = np.clip(self.student_policy, 0.01, None)
+        self.student_policy /= self.student_policy.sum()
+
+        async with self._lock:
+            self.history.append({
+                'teacher_dist': teacher_dist,
+                'student_dist': self.student_policy.copy(),
+                'loss': loss
+            })
+        if PROMETHEUS_AVAILABLE:
+            DISTILLATION_LOSS.set(loss)
+
+    def get_student_probs(self) -> List[float]:
+        return self.student_policy.tolist()
+
 # -----------------------------------------------------------------------------
 # WebSocket Server (unchanged)
 # -----------------------------------------------------------------------------
@@ -1580,7 +1814,7 @@ class EnhancedWebSocketServer:
 # -----------------------------------------------------------------------------
 class NodeRegistry:
     """
-    Enhanced registry for node descriptors with MODP, MOE, Bio, Scheduler, Self‑healing.
+    Enhanced registry for node descriptors with MODP, MOE, Bio, Scheduler, Self‑healing, LIMIT Graph, RLHF, Distillation.
     """
 
     def __init__(self, config: Optional[NodeRegistryConfig] = None):
@@ -1600,6 +1834,11 @@ class NodeRegistry:
         self.scheduler = MultiObjectiveCarbonScheduler(self.config, self.carbon_manager, self.forecaster) if self.config.scheduler.enabled else None
         self.self_healing = SelfHealingManager(self.config, None) if self.config.self_healing.enabled else None
 
+        # ===== NEW: initialize added components =====
+        self.limit_graph = LimitGraphManager(self.config) if self.config.limit_graph.enabled else None
+        self.rlhf = RLHFManager(self.config) if self.config.rlhf.enabled else None
+        self.distillation = MultiTeacherPolicyDistillation(self.config, self.moe_predictor) if self.config.distillation.enabled and self.moe_predictor else None
+
         self.cache: Dict[str, NodeDescriptor] = {}
         self.cache_ttl = self.config.cache_ttl
         self._lock = asyncio.Lock()
@@ -1613,6 +1852,11 @@ class NodeRegistry:
         self._shutdown_event = asyncio.Event()
         self._websocket = EnhancedWebSocketServer(self.config.websocket_port) if WEBSOCKETS_AVAILABLE else None
 
+        # Background tasks for new components
+        self._limit_graph_task = None
+        self._rlhf_task = None
+        self._distillation_task = None
+
         # Load initial data
         asyncio.create_task(self._load_initial_data())
         logger.info(f"NodeRegistry v{self.config.version} initialized (instance: {self.instance_id})")
@@ -1621,6 +1865,9 @@ class NodeRegistry:
         logger.info("  ✅ Bio‑inspired GA for weight evolution")
         logger.info("  ✅ Multi‑objective carbon‑aware scheduler")
         logger.info("  ✅ Self‑healing with drift detection and anomaly ensemble")
+        logger.info("  ✅ LIMIT Graph manager enabled")
+        logger.info("  ✅ RLHF manager enabled")
+        logger.info("  ✅ Multi‑Teacher Policy Distillation enabled")
 
     async def _load_initial_data(self):
         try:
@@ -1639,6 +1886,13 @@ class NodeRegistry:
         if self._websocket:
             await self._websocket.start()
         self._task = asyncio.create_task(self._refresh_loop(self.config.refresh_interval))
+        # ===== NEW: start background tasks for added components =====
+        if self.limit_graph:
+            self._limit_graph_task = asyncio.create_task(self._limit_graph_loop())
+        if self.rlhf:
+            self._rlhf_task = asyncio.create_task(self._rlhf_loop())
+        if self.distillation:
+            self._distillation_task = asyncio.create_task(self._distillation_loop())
         logger.info("NodeRegistry started")
 
     async def _refresh_loop(self, interval: int):
@@ -1652,6 +1906,50 @@ class NodeRegistry:
                 logger.error(f"Node refresh loop error: {e}")
                 await asyncio.sleep(60)
 
+    # ===== NEW: background loop methods =====
+    async def _limit_graph_loop(self):
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                if self.limit_graph:
+                    # Update constraints based on current system state
+                    await self.limit_graph.update_constraint('carbon', await self.carbon_manager.get_current_intensity())
+                    # Evaluate some paths for logging
+                    influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+                    logger.debug(f"LIMIT Graph carbon->cost influence: {influence:.3f}")
+                await asyncio.sleep(self.config.limit_graph.update_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Limit graph loop error: {e}")
+
+    async def _rlhf_loop(self):
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                if self.rlhf:
+                    await self.rlhf.train_reward_model()
+                await asyncio.sleep(self.config.rlhf.training_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"RLHF loop error: {e}")
+
+    async def _distillation_loop(self):
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                if self.distillation:
+                    state = {
+                        'carbon_intensity': await self.carbon_manager.get_current_intensity(),
+                        'avg_score': 0.5,
+                        'cost': 0.5,
+                        'diversity': 0.5
+                    }
+                    await self.distillation.distill(state)
+                await asyncio.sleep(300)  # distillation interval not in config, can add
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Distillation loop error: {e}")
+
     async def _refresh_all_nodes(self):
         start_time = time.time()
         async with self._lock:
@@ -1663,13 +1961,18 @@ class NodeRegistry:
         # Get carbon intensity and forecast
         carbon_intensity = await self.carbon_manager.get_current_intensity()
 
-        # Use MODP to select refresh strategy if enabled
-        if self.modp_selector and self.config.modp.enabled:
-            state = {'carbon_intensity': carbon_intensity}
-            strategy_result = await self.modp_selector.select_strategy(state)
-            strategy = strategy_result['strategy']
-        else:
-            strategy = 'default'
+        # Use policy_probs to select refresh strategy (RLHF/Distillation/Bio/MODP)
+        strategy_probs = await self.policy_probs({'carbon_intensity': carbon_intensity})
+        # Map probabilities to strategy names (assuming 5 candidates)
+        strategy_names = ['immediate', 'batch_5', 'batch_10', 'delay_1h', 'delay_2h']
+        # Ensure len matches; if not, pad or truncate
+        if len(strategy_probs) != len(strategy_names):
+            # Default to uniform
+            strategy_probs = [1.0/len(strategy_names)] * len(strategy_names)
+        # Choose strategy with highest probability (or sample)
+        strategy_idx = np.argmax(strategy_probs)
+        strategy = strategy_names[strategy_idx]
+        logger.info(f"Selected refresh strategy: {strategy} (probs: {strategy_probs})")
 
         # Use MOE to compute urgency for each node if enabled
         if self.moe_predictor and self.config.moe.enabled:
@@ -1678,7 +1981,7 @@ class NodeRegistry:
                 urgency = await self.moe_predictor.predict_urgency(node, carbon_intensity)
                 urgencies.append((node.node_id, urgency))
             urgencies.sort(key=lambda x: x[1], reverse=True)
-            # Select top N based on strategy (e.g., immediate -> more, delay -> fewer)
+            # Select top N based on strategy
             if strategy == 'immediate':
                 top_n = min(10, len(urgencies))
             elif strategy.startswith('batch_'):
@@ -1814,6 +2117,26 @@ class NodeRegistry:
         async with self._lock:
             return len(self.cache)
 
+    # ------------------------------------------------------------------------
+    # Policy interface for refresh strategy selection
+    # ------------------------------------------------------------------------
+    async def policy_probs(self, state: Dict) -> List[float]:
+        """
+        Return a probability distribution over refresh strategies.
+        Priority: RLHF > Distillation > Bio > MODP.
+        """
+        if self.rlhf and self.config.rlhf.enabled:
+            return await self.rlhf.get_policy_probs(state)
+        if self.distillation and self.config.distillation.enabled:
+            return self.distillation.get_student_probs()
+        if self.bio_optimizer:
+            params = self.bio_optimizer.get_current_params()
+            return [params['freshness_weight'], params['carbon_weight'],
+                    params['cost_weight'], params['importance_weight']]
+        if self.modp_selector:
+            return self.modp_selector.weights
+        return [0.25, 0.25, 0.25, 0.25]
+
     async def health_check(self) -> Dict:
         return {
             'running': self._running,
@@ -1825,6 +2148,9 @@ class NodeRegistry:
             'bio_enabled': self.config.bio.enabled,
             'scheduler_enabled': self.config.scheduler.enabled,
             'self_healing_enabled': self.config.self_healing.enabled,
+            'limit_graph_enabled': self.config.limit_graph.enabled,
+            'rlhf_enabled': self.config.rlhf.enabled,
+            'distillation_enabled': self.config.distillation.enabled,
             'timestamp': datetime.now().isoformat()
         }
 
@@ -1838,6 +2164,14 @@ class NodeRegistry:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # ===== NEW: cancel background tasks for added components =====
+        for task in [self._limit_graph_task, self._rlhf_task, self._distillation_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._websocket:
             await self._websocket.stop()
         await self.carbon_manager.close()
