@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # FILE: src/enhancements/sustainability_signals_enhanced_v16_0.py
-# VERSION: 16.0.0 (Enterprise Quantum Resilience + GA + MoE + Pareto + Forecasting)
+# VERSION: 16.0.0 (Enterprise Quantum Resilience + GA + MoE + Pareto + Forecasting + LIMIT Graph + RLHF + Distillation)
 # =============================================================================
 """
 Enhanced Sustainability Signals System - Version 16.0.0
@@ -15,7 +15,10 @@ ENHANCEMENTS OVER v15.0.0:
 6. Advanced reflection with drift detection and proactive adjustments.
 7. Active user preference learning via interactive WebSocket queries.
 8. Integration with central Green Agent components (Config, Storage, MetricsRegistry).
-9. All enhancements are optional and configurable.
+9. LIMIT Graph for constraint propagation and decision support.
+10. RLHF (Reinforcement Learning from Human Feedback) for reward‑based policy updates.
+11. Multi‑Teacher Policy Distillation to combine teacher policies into a student policy.
+All enhancements are optional and configurable.
 """
 
 import asyncio
@@ -138,6 +141,7 @@ try:
     from sklearn.linear_model import LinearRegression, RandomForestRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import train_test_split
+    from sklearn.neural_network import MLPRegressor, MLPClassifier
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -331,7 +335,36 @@ else:
             def inc(self, **kwargs): pass
             def set(self, **kwargs): pass
             def observe(self, **kwargs): pass
-        # Dummy assignments for all metrics (omitted for brevity)
+        SUSTAINABILITY_ASSESSMENTS = DummyMetric()
+        ASSESSMENT_DURATION = DummyMetric()
+        ESG_SCORE = DummyMetric()
+        DATA_QUALITY = DummyMetric()
+        SCOPE3_EMISSIONS = DummyMetric()
+        MATERIALITY_SCORE = DummyMetric()
+        REGULATORY_COMPLIANCE = DummyMetric()
+        API_CALLS = DummyMetric()
+        API_LATENCY = DummyMetric()
+        CIRCUIT_BREAKER_STATE = DummyMetric()
+        HEALTH_SCORE = DummyMetric()
+        DB_SIZE = DummyMetric()
+        DATA_QUALITY_SCORE = DummyMetric()
+        ASSESSMENT_QUEUE_SIZE = DummyMetric()
+        WS_CONNECTIONS = DummyMetric()
+        ESG_TREND_DIRECTION = DummyMetric()
+        SUPPLY_CHAIN_RISK_SCORE = DummyMetric()
+        NLP_MATERIALITY_SCORE = DummyMetric()
+        SCENARIO_IMPACT = DummyMetric()
+        FINANCIAL_IMPACT_ESG = DummyMetric()
+        DASHBOARD_USERS = DummyMetric()
+        QUANTUM_SIGNATURES = DummyMetric()
+        BLOCKCHAIN_VERIFICATIONS = DummyMetric()
+        AUTONOMOUS_OPTIMIZATIONS = DummyMetric()
+        CLOUD_DISTRIBUTIONS = DummyMetric()
+        MTOP_TEACHER_WEIGHTS = DummyMetric()
+        MTOP_STUDENT_UPDATES = DummyMetric()
+        GA_POPULATION_FITNESS = DummyMetric()
+        MOE_GATING_PROBABILITIES = DummyMetric()
+        PARETO_FRONT_SIZE = DummyMetric()
 
 # -----------------------------------------------------------------------------
 # Central configuration (if available) or fallback to custom config
@@ -391,6 +424,16 @@ if CENTRAL_COMPONENTS_AVAILABLE and central_config:
             self.federated_learning_enabled = getattr(central_config, 'sustainability_federated_learning_enabled', True)
             self.drift_detection_enabled = getattr(central_config, 'sustainability_drift_detection_enabled', True)
             self.user_preference_learning_enabled = getattr(central_config, 'sustainability_user_preference_learning_enabled', True)
+            # ===== NEW: LIMIT Graph, RLHF, Distillation configs =====
+            self.limit_graph_enabled = getattr(central_config, 'sustainability_limit_graph_enabled', True)
+            self.limit_graph_update_interval = getattr(central_config, 'sustainability_limit_graph_update_interval', 300)
+            self.rlhf_enabled = getattr(central_config, 'sustainability_rlhf_enabled', True)
+            self.rlhf_reward_model = getattr(central_config, 'sustainability_rlhf_reward_model', 'linear')
+            self.rlhf_training_interval = getattr(central_config, 'sustainability_rlhf_training_interval', 600)
+            self.distillation_enabled = getattr(central_config, 'sustainability_distillation_enabled', True)
+            self.distillation_temperature = getattr(central_config, 'sustainability_distillation_temperature', 2.0)
+            self.distillation_alpha = getattr(central_config, 'sustainability_distillation_alpha', 0.5)
+            self.distillation_interval = getattr(central_config, 'sustainability_distillation_interval', 300)
 
         def get_master_key(self) -> bytes:
             key_hex = os.getenv(self.master_key_env)
@@ -456,6 +499,16 @@ else:
             federated_learning_enabled: bool = Field(True)
             drift_detection_enabled: bool = Field(True)
             user_preference_learning_enabled: bool = Field(True)
+            # ===== NEW: LIMIT Graph, RLHF, Distillation configs =====
+            limit_graph_enabled: bool = Field(True)
+            limit_graph_update_interval: int = Field(300, ge=10)
+            rlhf_enabled: bool = Field(True)
+            rlhf_reward_model: str = Field("linear")
+            rlhf_training_interval: int = Field(600, ge=60)
+            distillation_enabled: bool = Field(True)
+            distillation_temperature: float = Field(2.0, gt=0)
+            distillation_alpha: float = Field(0.5, ge=0.0, le=1.0)
+            distillation_interval: int = Field(300, ge=60)
 
             @field_validator('log_level')
             @classmethod
@@ -528,6 +581,16 @@ else:
             federated_learning_enabled: bool = True
             drift_detection_enabled: bool = True
             user_preference_learning_enabled: bool = True
+            # ===== NEW: dataclass fields =====
+            limit_graph_enabled: bool = True
+            limit_graph_update_interval: int = 300
+            rlhf_enabled: bool = True
+            rlhf_reward_model: str = "linear"
+            rlhf_training_interval: int = 600
+            distillation_enabled: bool = True
+            distillation_temperature: float = 2.0
+            distillation_alpha: float = 0.5
+            distillation_interval: int = 300
 
             def get_master_key(self) -> bytes:
                 key_hex = os.getenv(self.master_key_env)
@@ -764,7 +827,6 @@ if CENTRAL_COMPONENTS_AVAILABLE and CentralStorage:
                      'data_size_gb': r[3], 'timestamp': r[4]} for r in rows]
 
         async def save_pareto_front(self, solutions: List[Dict]):
-            # Clear old front and insert new
             await self._execute("DELETE FROM esg_pareto_front")
             for sol in solutions:
                 await self._execute("""
@@ -1870,30 +1932,47 @@ class AutonomousESGOptimizer:
         self.drift_detector = DriftDetector(storage, config) if config.drift_detection_enabled else None
         self.user_pref_learner = None  # will be set later
 
+        # ===== NEW: Initialize LIMIT Graph, RLHF, Distillation =====
+        self.limit_graph = LimitGraphManager(config) if getattr(config, 'limit_graph_enabled', True) else None
+        self.rlhf = RLHFManager(config) if getattr(config, 'rlhf_enabled', True) else None
+        self.distillation = MultiTeacherPolicyDistillation(config, self.moe_gating) if getattr(config, 'distillation_enabled', True) and self.moe_gating else None
+
     async def optimize_esg(self, current_state: Dict, strategy: str = None) -> Dict:
         carbon_intensity = current_state.get('carbon_intensity', 400)
-        if self.moe_gating and self.config.moe_enabled:
-            # Use MoE to select expert
-            selected_expert, weights = await self.moe_gating.select_expert(current_state, carbon_intensity, {})
-            result = {
-                'action': f'{selected_expert}_optimization',
-                'selected_strategy': selected_expert,
-                'weights': weights,
-                'recommendation': self._generate_recommendation(selected_expert, current_state)
-            }
-        elif self.mtop_engine:
-            # Fallback to MTOP
-            mtop_result = await self.mtop_engine.select_strategy(current_state, carbon_intensity)
-            selected = mtop_result['selected_strategy']
-            result = {
-                'action': f'{selected}_optimization',
-                'selected_strategy': selected,
-                'scores': mtop_result['scores'],
-                'recommendation': self._generate_recommendation(selected, current_state)
-            }
+        # ===== NEW: Use RLHF first if trained =====
+        if self.rlhf and self.rlhf.reward_model is not None:
+            probs = await self.rlhf.get_policy_probs(current_state)
+            expert_names = ['environmental_focused', 'social_focused', 'governance_focused', 'balanced']
+            selected_expert = expert_names[np.argmax(probs) % len(expert_names)]
+            weights = {'environmental': probs[0], 'social': probs[1], 'governance': probs[2]}
+        # ===== NEW: Otherwise use distillation if available =====
+        elif self.distillation and self.distillation.get_student_probs():
+            probs = self.distillation.get_student_probs()
+            expert_names = ['environmental_focused', 'social_focused', 'governance_focused', 'balanced']
+            selected_expert = expert_names[np.argmax(probs) % len(expert_names)]
+            weights = {'environmental': probs[0], 'social': probs[1], 'governance': probs[2]}
         else:
-            result = {'action': 'no_op', 'selected_strategy': 'balanced', 'recommendation': 'No optimizer available'}
-
+            # Fallback to existing MoE or MTOP
+            if self.moe_gating and self.config.moe_enabled:
+                selected_expert, weights = await self.moe_gating.select_expert(current_state, carbon_intensity, {})
+            else:
+                mtop_result = await self.mtop_engine.select_strategy(current_state, carbon_intensity)
+                selected_expert = mtop_result['selected_strategy']
+                weights = mtop_result['scores']
+        # ===== NEW: LIMIT Graph adjustment =====
+        if self.limit_graph:
+            await self.limit_graph.update_constraint('carbon', carbon_intensity)
+            influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+            if influence > 0.5:
+                # Boost governance weight slightly when carbon impact high
+                weights['governance'] = weights.get('governance', 0.3) + 0.1
+                weights = {k: v / sum(weights.values()) for k, v in weights.items()}
+        result = {
+            'action': f'{selected_expert}_optimization',
+            'selected_strategy': selected_expert,
+            'weights': weights,
+            'recommendation': self._generate_recommendation(selected_expert, current_state)
+        }
         await self.storage.save_optimisation(result['selected_strategy'], result)
         if PROMETHEUS_AVAILABLE:
             AUTONOMOUS_OPTIMIZATIONS.labels(strategy=result['selected_strategy'], status='success').inc()
@@ -2116,7 +2195,7 @@ class SustainabilityAssessmentResult:
 # -----------------------------------------------------------------------------
 class EnhancedSustainabilitySystemV16:
     """
-    Enhanced sustainability system v16.0.0 with GA, MoE, Pareto, forecasting, etc.
+    Enhanced sustainability system v16.0.0 with GA, MoE, Pareto, forecasting, LIMIT Graph, RLHF, Distillation.
     """
 
     def __init__(self, config: Optional[ESGConfig] = None):
@@ -2134,7 +2213,7 @@ class EnhancedSustainabilitySystemV16:
         self.carbon_client = CarbonIntensityManager(self.config, self.storage)
         self.cloud_distributor = MultiCloudESGDistribution(self.config, self.storage)
 
-        # Autonomous optimizer (with GA, MoE, Pareto)
+        # Autonomous optimizer (with GA, MoE, Pareto, etc.)
         self.autonomous_optimizer = AutonomousESGOptimizer(self.config, self.storage, self.state)
 
         # Completed stubs
@@ -2156,6 +2235,11 @@ class EnhancedSustainabilitySystemV16:
         self.forecaster = CarbonForecaster(self.storage, self.config) if self.config.forecast_enabled else None
         self.user_pref_learner = ActiveUserPreferenceLearner(self.storage, self.websocket) if self.config.user_preference_learning_enabled else None
         self.drift_detector = DriftDetector(self.storage, self.config) if self.config.drift_detection_enabled else None
+
+        # ===== NEW: Initialize LIMIT Graph, RLHF, Distillation =====
+        self.limit_graph = LimitGraphManager(self.config) if self.config.limit_graph_enabled else None
+        self.rlhf = RLHFManager(self.config) if self.config.rlhf_enabled else None
+        self.distillation = MultiTeacherPolicyDistillation(self.config, self.autonomous_optimizer.moe_gating) if self.config.distillation_enabled and self.autonomous_optimizer.moe_gating else None
 
         # WebSocket and dashboard
         self.websocket = EnhancedWebSocketServer(self.config.websocket_port)
@@ -2227,52 +2311,51 @@ class EnhancedSustainabilitySystemV16:
             asyncio.create_task(self._drift_detection_loop()),
         ]
 
+        # ===== NEW: Background loops for added features =====
+        if self.limit_graph:
+            tasks.append(asyncio.create_task(self._limit_graph_loop()))
+        if self.rlhf:
+            tasks.append(asyncio.create_task(self._rlhf_loop()))
+        if self.distillation:
+            tasks.append(asyncio.create_task(self._distillation_loop()))
+
         for task in tasks:
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
 
         logger.info("Sustainability system started with %d background tasks", len(self.background_tasks))
 
-    async def _ga_optimization_loop(self):
+    async def _limit_graph_loop(self):
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)  # every hour
-            if self.config.ga_enabled and self.autonomous_optimizer.ga_optimizer:
-                try:
-                    logger.info("Running GA weight optimization...")
-                    best = await self.autonomous_optimizer.ga_optimizer.optimize()
-                    if best:
-                        self.state.mopd_weights.update(best)
-                        await self.state.save()
-                        logger.info("GA updated weights to: %s", best)
-                except Exception as e:
-                    logger.error("GA optimization loop error: %s", e)
+            await asyncio.sleep(self.config.limit_graph_update_interval)
+            try:
+                carbon_intensity = await self.carbon_client.get_current_intensity()
+                await self.limit_graph.update_constraint('carbon', carbon_intensity)
+                influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+                logger.debug(f"LIMIT Graph carbon->cost influence: {influence:.3f}")
+            except Exception as e:
+                logger.error(f"Limit graph loop error: {e}")
 
-    async def _forecast_update_loop(self):
+    async def _rlhf_loop(self):
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
-            if self.forecaster:
-                try:
-                    intensity = await self.carbon_client.get_current_intensity()
-                    await self.forecaster.record_intensity(intensity)
-                except Exception as e:
-                    logger.error("Forecast update loop error: %s", e)
+            await asyncio.sleep(self.config.rlhf_training_interval)
+            try:
+                if self.rlhf:
+                    await self.rlhf.train_reward_model()
+            except Exception as e:
+                logger.error(f"RLHF loop error: {e}")
 
-    async def _drift_detection_loop(self):
+    async def _distillation_loop(self):
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
-            if self.drift_detector:
-                try:
-                    intensity = await self.carbon_client.get_current_intensity()
-                    if await self.drift_detector.check_carbon_drift(intensity):
-                        # Trigger reflection or re-train
-                        await self.state.trigger_reflection('carbon_drift')
-                except Exception as e:
-                    logger.error("Drift detection loop error: %s", e)
-
-    async def _websocket_heartbeat(self):
-        while not self._shutdown_event.is_set():
-            await asyncio.sleep(30)
-            await self.websocket.broadcast({'type': 'heartbeat', 'timestamp': datetime.now().isoformat()})
+            await asyncio.sleep(self.config.distillation_interval)
+            try:
+                if self.distillation:
+                    # Use current carbon intensity as context
+                    carbon_intensity = await self.carbon_client.get_current_intensity()
+                    state = {'carbon_intensity': carbon_intensity, 'node_data': {}}
+                    await self.distillation.distill(state)
+            except Exception as e:
+                logger.error(f"Distillation loop error: {e}")
 
     # ... (other loops remain similar)
 
@@ -2420,6 +2503,11 @@ class EnhancedSustainabilitySystemV16:
                 'suppliers': getattr(validated_data, 'suppliers', [])
             }
 
+            # ===== NEW: LIMIT Graph constraint update =====
+            if self.limit_graph:
+                await self.limit_graph.update_constraint('carbon', carbon_intensity)
+                result.limit_graph = await self.limit_graph.get_graph_summary()
+
             # Use MoE if enabled, else MTOP
             if self.config.moe_enabled and self.autonomous_optimizer.moe_gating:
                 selected_strategy, weights = await self.autonomous_optimizer.moe_gating.select_expert(state, carbon_intensity, {})
@@ -2437,23 +2525,25 @@ class EnhancedSustainabilitySystemV16:
             if PROMETHEUS_AVAILABLE:
                 AUTONOMOUS_OPTIMIZATIONS.labels(strategy=selected_strategy, status='success').inc()
 
+            # ===== NEW: RLHF feedback if high confidence =====
+            if self.rlhf and result.overall_sustainability_score > 80:
+                await self.rlhf.record_feedback(
+                    state={'carbon_intensity': carbon_intensity, 'esg_score': result.overall_sustainability_score},
+                    action=selected_strategy,
+                    reward=result.overall_sustainability_score / 100
+                )
+
             # Update Pareto front
             if self.config.pareto_enabled and self.autonomous_optimizer.pareto_optimizer:
                 await self.autonomous_optimizer.pareto_optimizer.add_assessment(result)
 
-            # ============================================================
             # Quantum-Resilient Signing
-            # ============================================================
             result_dict = result.to_dict()
             quantum_key = await self.quantum_security.generate_keypair(self.config.quantum_algorithm)
             signature = await self.quantum_security.sign_esg_data(result_dict, quantum_key['key_id'])
             result.quantum_signature = signature
-            if PROMETHEUS_AVAILABLE:
-                QUANTUM_SIGNATURES.labels(algorithm=self.config.quantum_algorithm, status='sign_success').inc()
 
-            # ============================================================
             # Blockchain Verification
-            # ============================================================
             data_id = f"esg_{uuid.uuid4().hex[:8]}"
             data_hash = hashlib.sha256(json.dumps(result_dict, sort_keys=True, default=str).encode()).hexdigest()
             blockchain_result = await self.blockchain.record_esg_data(
@@ -2462,17 +2552,11 @@ class EnhancedSustainabilitySystemV16:
                 {'esg_score': result.overall_sustainability_score, 'sector': validated_data.sector}
             )
             result.blockchain_tx_hash = blockchain_result.get('tx_hash')
-            if PROMETHEUS_AVAILABLE:
-                BLOCKCHAIN_VERIFICATIONS.labels(status='recorded').inc()
 
-            # ============================================================
             # Multi-Cloud Distribution
-            # ============================================================
             data = {'size_gb': 0.001}
             distribution = await self.cloud_distributor.distribute_esg_data(data)
             result.cloud_distribution = distribution
-            if PROMETHEUS_AVAILABLE:
-                CLOUD_DISTRIBUTIONS.labels(provider=distribution['optimal_provider'], status='success').inc()
 
             # Federated sharing
             if result.overall_sustainability_score > 80:
@@ -2621,7 +2705,7 @@ async def main():
         loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
 
     print("=" * 80)
-    print("Enhanced Sustainability Signals System v16.0.0 - GA + MoE + Pareto + Forecasting")
+    print("Enhanced Sustainability Signals System v16.0.0 - GA + MoE + Pareto + Forecasting + LIMIT Graph + RLHF + Distillation")
     print("=" * 80)
 
     system = await get_sustainability_system()
@@ -2635,6 +2719,9 @@ async def main():
     print("   ✅ Advanced reflection with drift detection and proactive adjustments.")
     print("   ✅ Active user preference learning via interactive WebSocket queries.")
     print("   ✅ Integration with central Green Agent components (Config, Storage, Metrics).")
+    print("   ✅ LIMIT Graph for constraint propagation and decision support.")
+    print("   ✅ RLHF (Reinforcement Learning from Human Feedback) for reward‑based policy updates.")
+    print("   ✅ Multi‑Teacher Policy Distillation to combine teacher policies into a student policy.")
 
     # Show status
     quantum_status = await system.quantum_security.get_quantum_status()
