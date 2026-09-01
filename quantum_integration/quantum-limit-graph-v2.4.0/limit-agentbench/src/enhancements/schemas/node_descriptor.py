@@ -1,29 +1,26 @@
 # src/enhancements/schemas/node_descriptor.py
 """
-Enhanced Node Descriptor v2.1.2
+Enhanced Node Descriptor v2.2.0
 ================================
 Defines the structure of a compute node with adaptive routing strategy selection
-via Multi‑Teacher On‑Policy Distillation.
+via Multi‑Teacher On‑Policy Distillation, now augmented with:
 
-Features (including v2.1.2 enhancements):
-- Expanded node types as Enum.
-- Fields for performance, cooling, location, cost, health.
-- Sustainability metrics: carbon, helium, renewable, material.
-- Helper methods for cost estimation and health evaluation.
-- Pydantic validation with custom validators.
-- Adaptive routing strategy selection (carbon_first, latency_first, cost_first, balanced, adaptive).
-- Online learning from routing outcomes.
-- Teachers: rule‑based, historical ML (with training support), stateful Q.
-- Student: linear softmax with distillation + REINFORCE.
-- Persistence for Q‑teacher weights and interaction logs (CSV + JSON).
-- Offline training for historical ML teacher from logs with state vectors.
-- Unit tests for distillation components.
-- Integration with FeedbackEvent schema for audit trails.
-- Asynchronous persistence and improved batch updates.
+- LIMIT Graph integration (graph ID, embedding, metrics).
+- MODP (Multi‑Objective Decision Process) with tunable weights.
+- RLHF (Reinforcement Learning from Human Feedback) via a dedicated teacher and
+  human feedback score in the state.
+- Multi‑Teacher On‑Policy Distillation with a learned Mixture‑of‑Experts (MoE)
+  gating network.
+- Bio‑inspired optimisation (evolutionary algorithm) as an optional alternative
+  or complement.
+- MoE expert support (gating network over teachers).
+- All original features (sustainability metrics, cooling, etc.) remain.
+
+Version: 2.2.0
 """
 
 from enum import Enum
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Optional, Dict, Any, List, Tuple, Union, Callable
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -35,7 +32,7 @@ import pickle
 import pandas as pd
 from dataclasses import dataclass, asdict
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ConfigDict, PrivateAttr
 
 # Import logger (assumed available in parent package)
 try:
@@ -83,7 +80,13 @@ class RoutingStrategy(str, Enum):
     ADAPTIVE = "adaptive"
 
 # ============================================================================
-# DISTILLATION COMPONENTS
+# CONSTANTS
+# ============================================================================
+# Feature dimension of NodeState: 11 features (original 10 + human_feedback_score)
+FEATURE_DIM = 11
+
+# ============================================================================
+# DISTILLATION COMPONENTS (ENHANCED)
 # ============================================================================
 
 @dataclass
@@ -99,9 +102,10 @@ class NodeState:
     energy_per_token: float
     recent_success_rate: float
     avg_reward: float
+    human_feedback_score: float = 0.5  # NEW for RLHF
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to 10‑dim numeric feature vector."""
+        """Convert to 11‑dim numeric feature vector."""
         features = [
             min(self.carbon_intensity / 1.0, 1.0),
             self.renewable_fraction,
@@ -113,6 +117,7 @@ class NodeState:
             min(self.energy_per_token / 0.0001, 1.0),
             self.recent_success_rate,
             self.avg_reward,
+            self.human_feedback_score,  # NEW
         ]
         return np.array(features, dtype=np.float32)
 
@@ -176,10 +181,8 @@ class RoutingHistoricalMLTeacher(Teacher):
             probs = self.model.predict_proba(x)[0]
             # Ensure probabilities align with strategy order
             if self.label_encoder is not None:
-                # reorder according to encoder classes
                 classes = self.label_encoder.classes_
                 target_order = RoutingStrategy._member_names_
-                # We assume classes are strategy names
                 idx_map = {cls: i for i, cls in enumerate(classes)}
                 new_probs = np.zeros(5)
                 for i, strat in enumerate(target_order):
@@ -217,7 +220,6 @@ class RoutingHistoricalMLTeacher(Teacher):
             logger.warning("Not enough logs to train historical model.")
             return None
 
-        # Parse state vectors from string representation (comma-separated)
         def parse_state(s):
             try:
                 return np.fromstring(s, sep=',')
@@ -236,7 +238,6 @@ class RoutingHistoricalMLTeacher(Teacher):
         clf = RandomForestClassifier(n_estimators=100, random_state=42)
         clf.fit(X, y_enc)
 
-        # Save model and encoder
         with open(model_path, 'wb') as f:
             pickle.dump((clf, le), f)
         logger.info(f"Trained historical model and saved to {model_path}")
@@ -245,10 +246,11 @@ class RoutingHistoricalMLTeacher(Teacher):
 
 class RoutingStatefulQTeacher(Teacher):
     """Linear Q‑learning with state features."""
-    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None, feature_dim: int = FEATURE_DIM):
         self.lr = lr
         self.weights_path = weights_path or Path("./routing_q_weights.json")
-        self.weights = np.zeros((10, 5))
+        self.feature_dim = feature_dim
+        self.weights = np.zeros((feature_dim, 5))
         self._load_state()
 
     def _load_state(self):
@@ -257,6 +259,9 @@ class RoutingStatefulQTeacher(Teacher):
                 with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
+                if self.weights.shape[0] != self.feature_dim:
+                    logger.warning(f"Loaded Q‑weights have shape {self.weights.shape}, expected ({self.feature_dim},5). Reinitializing.")
+                    self.weights = np.zeros((self.feature_dim, 5))
                 logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
@@ -281,8 +286,36 @@ class RoutingStatefulQTeacher(Teacher):
         self._save_state()
 
 
+class RLHFTeacher(Teacher):
+    """
+    Teacher that incorporates human feedback to adjust probabilities.
+    The probability mass is shifted towards the strategy that human feedback
+    indicates as preferred.
+    """
+    def __init__(self, feedback_weight: float = 0.3):
+        self.feedback_weight = feedback_weight
+
+    def predict(self, state: NodeState) -> np.ndarray:
+        # Start with uniform distribution
+        probs = np.ones(5) / 5
+        # If human feedback is high, prefer 'balanced' and 'adaptive'
+        if state.human_feedback_score > 0.7:
+            probs[3] += 0.2  # balanced
+            probs[4] += 0.2  # adaptive
+        elif state.human_feedback_score < 0.3:
+            probs[0] += 0.2  # carbon_first
+            probs[1] += 0.2  # latency_first
+        # Normalize
+        return probs / probs.sum()
+
+    def confidence(self, state: NodeState) -> float:
+        # Confidence is based on how extreme the human feedback is
+        return min(0.8, abs(state.human_feedback_score - 0.5) * 2 + 0.3)
+
+
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 10, n_classes: int = 5, lr: float = 0.01):
+    def __init__(self, feature_dim: int = FEATURE_DIM, n_classes: int = 5, lr: float = 0.01):
+        self.feature_dim = feature_dim
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
@@ -293,7 +326,7 @@ class DistillationStudent:
         if num_classes is None:
             num_classes = self.n_classes
         if num_classes != self.n_classes:
-            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_weights = np.zeros((self.feature_dim, num_classes))
             new_biases = np.zeros(num_classes)
             min_dim = min(self.n_classes, num_classes)
             new_weights[:, :min_dim] = self.weights[:, :min_dim]
@@ -341,21 +374,66 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class MoEGatingNetwork:
+    """
+    Learnable gating network for combining teacher outputs (Mixture‑of‑Experts).
+    Outputs a weight vector for each teacher based on the state.
+    """
+    def __init__(self, feature_dim: int = FEATURE_DIM, n_experts: int = 4, lr: float = 0.01):
+        self.feature_dim = feature_dim
+        self.n_experts = n_experts
+        self.lr = lr
+        self.weights = np.random.randn(feature_dim, n_experts) * 0.01
+        self.bias = np.zeros(n_experts)
+
+    def forward(self, state_vec: np.ndarray) -> np.ndarray:
+        logits = state_vec @ self.weights + self.bias
+        exp_logits = np.exp(logits - np.max(logits))
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vec: np.ndarray, teacher_probs: np.ndarray, student_probs: np.ndarray):
+        """
+        Update gating network to reduce difference between combined teacher output
+        and student output (distillation signal).
+        """
+        gate_weights = self.forward(state_vec)
+        # We want the gated combination of teachers to match the student's probabilities
+        # Compute gradient w.r.t. gate weights: the combination is sum(gate * teacher_prob)
+        # For simplicity, we use a simple loss: MSE between gated output and student.
+        combined = np.sum(gate_weights[:, None] * teacher_probs, axis=0)
+        error = combined - student_probs
+        # Gradient of loss w.r.t. gate weights: each gate contributes teacher_prob
+        grad_gate = np.dot(teacher_probs, error)  # shape (n_experts,)
+        # Update weights and bias
+        self.weights -= self.lr * np.outer(state_vec, grad_gate)
+        self.bias -= self.lr * grad_gate
+
+
 class DistillationRoutingOptimizer:
     """
     Multi‑teacher on‑policy distillation agent for routing strategy selection.
+    Enhanced with MoE gating network and optional RLHF teacher.
     """
     STRATEGIES = ['carbon_first', 'latency_first', 'cost_first', 'balanced', 'adaptive']
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
+        self.feature_dim = FEATURE_DIM
+        self.student = DistillationStudent(feature_dim=self.feature_dim, lr=config.get('distillation_learning_rate', 0.01))
+        # Define teachers (including RLHF)
         self.teachers: List[Teacher] = [
             RoutingRuleBasedTeacher(),
             RoutingHistoricalMLTeacher(model_path=config.get('historical_model_path')),
             RoutingStatefulQTeacher(lr=config.get('q_learning_rate', 0.1),
-                                    weights_path=config.get('q_weights_path'))
+                                    weights_path=config.get('q_weights_path'),
+                                    feature_dim=self.feature_dim),
+            RLHFTeacher(feedback_weight=config.get('rlhf_feedback_weight', 0.3))  # NEW
         ]
+        self.n_teachers = len(self.teachers)
+        # MoE gating network
+        self.gating = MoEGatingNetwork(feature_dim=self.feature_dim,
+                                       n_experts=self.n_teachers,
+                                       lr=config.get('gating_learning_rate', 0.005))
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
@@ -364,26 +442,37 @@ class DistillationRoutingOptimizer:
         self.rl_weight = config.get('rl_weight', 0.3)
         self.batch_update_size = config.get('batch_update_size', 8)
 
+    def _compute_teacher_probs(self, state: NodeState) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return (teacher_probs, gate_weights) using the MoE gating network.
+        teacher_probs is the weighted combination of individual teacher outputs.
+        gate_weights are the learned gate values for each teacher.
+        """
+        state_vec = state.to_feature_vector()
+        # Get predictions from all teachers
+        teacher_outputs = []
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            # Ensure 5-dim
+            if len(prob) != 5:
+                if len(prob) < 5:
+                    prob = np.pad(prob, (0, 5 - len(prob)), 'constant')
+                else:
+                    prob = prob[:5]
+            teacher_outputs.append(prob)
+        teacher_outputs = np.array(teacher_outputs)  # shape (n_teachers, 5)
+        # Get gate weights
+        gate_weights = self.gating.forward(state_vec)
+        # Weighted combination
+        combined = np.sum(gate_weights[:, None] * teacher_outputs, axis=0)
+        combined = combined / combined.sum()
+        return combined, gate_weights
+
     async def select_strategy(self, state: NodeState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
         n = len(self.STRATEGIES)
 
-        teacher_probs = np.zeros(n)
-        total_conf = 0.0
-        for teacher in self.teachers:
-            prob = teacher.predict(state)
-            conf = teacher.confidence(state)
-            if len(prob) != n:
-                if len(prob) < n:
-                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
-                else:
-                    prob = prob[:n]
-            teacher_probs += prob * conf
-            total_conf += conf
-        if total_conf > 0:
-            teacher_probs /= total_conf
-        else:
-            teacher_probs = np.ones(n) / n
+        teacher_probs, gate_weights = self._compute_teacher_probs(state)
 
         student_probs = self.student.predict_proba(state_vec, n)
 
@@ -403,11 +492,93 @@ class DistillationRoutingOptimizer:
             batch = self.replay_buffer.sample(self.batch_update_size)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
+                # Update student
                 self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
                                     distill_weight=self.distill_weight, rl_weight=self.rl_weight)
+                # Update gating network using current student output
+                student_out = self.student.predict_proba(states[i])
+                self.gating.update(states[i], teacher_probs_batch[i], student_out)
 
     def get_stats(self) -> Dict:
-        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+        return {
+            'student_counter': self.student.counter,
+            'buffer_size': len(self.replay_buffer),
+            'n_teachers': self.n_teachers
+        }
+
+
+class EvolutionaryRoutingOptimizer:
+    """
+    Simple evolutionary algorithm for routing strategy selection (bio‑inspired).
+    Maintains a population of candidate strategy distributions and evolves them.
+    """
+    def __init__(self, population_size: int = 20, mutation_rate: float = 0.1,
+                 crossover_rate: float = 0.7, elitism: int = 2):
+        self.population_size = population_size
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.elitism = elitism
+        self.population = [np.random.dirichlet(np.ones(5)) for _ in range(population_size)]
+        self.fitness = np.zeros(population_size)
+
+    def select_strategy(self, state_vec: np.ndarray) -> Tuple[int, np.ndarray]:
+        """Return action index and the probabilities of the best individual."""
+        # For simplicity, we pick the best individual based on stored fitness.
+        # In practice, we could evaluate each individual on the current state using a fitness function.
+        # Here we'll just take the best individual and sample from its distribution.
+        if not hasattr(self, 'best_individual'):
+            self.best_individual = self.population[0]
+            self.best_index = 0
+        best_probs = self.best_individual
+        action_idx = np.argmax(best_probs)
+        return action_idx, best_probs
+
+    def update_fitness(self, reward: float, index: int = 0):
+        """Update fitness of the best individual (simplified)."""
+        self.fitness[index] = reward
+        best_idx = np.argmax(self.fitness)
+        self.best_individual = self.population[best_idx]
+        self.best_index = best_idx
+        self._evolve()
+
+    def _evolve(self):
+        """Perform one generation of evolution."""
+        # Sort by fitness (descending)
+        sorted_indices = np.argsort(self.fitness)[::-1]
+        # Keep elites
+        new_population = [self.population[i] for i in sorted_indices[:self.elitism]]
+        while len(new_population) < self.population_size:
+            # Selection: tournament
+            parent1 = self._tournament_selection()
+            parent2 = self._tournament_selection()
+            # Crossover
+            if random.random() < self.crossover_rate:
+                child = self._crossover(parent1, parent2)
+            else:
+                child = parent1.copy()
+            # Mutation
+            child = self._mutate(child)
+            new_population.append(child)
+        self.population = new_population
+        self.fitness = np.zeros(self.population_size)  # reset fitness for next generation
+
+    def _tournament_selection(self, k=3):
+        """Select one individual using tournament selection."""
+        candidates = random.sample(range(self.population_size), k)
+        best = max(candidates, key=lambda i: self.fitness[i])
+        return self.population[best]
+
+    def _crossover(self, p1, p2):
+        alpha = random.random()
+        return alpha * p1 + (1 - alpha) * p2
+
+    def _mutate(self, individual):
+        mutated = individual.copy()
+        for i in range(len(mutated)):
+            if random.random() < self.mutation_rate:
+                mutated[i] += random.gauss(0, 0.1)
+                mutated[i] = max(0.01, mutated[i])
+        return mutated / mutated.sum()
 
 
 # ============================================================================
@@ -417,6 +588,7 @@ class DistillationRoutingOptimizer:
 class NodeDescriptor(BaseModel):
     """
     Descriptor for a compute node with adaptive routing strategy selection.
+    Enhanced with graph integration, RLHF, and optional evolutionary optimisation.
     """
     model_config = ConfigDict(extra='allow', arbitrary_types_allowed=True)
 
@@ -463,13 +635,29 @@ class NodeDescriptor(BaseModel):
     performance_history: List[Dict[str, Any]] = Field(default_factory=list, description="Recent routing outcomes (max 100 entries)")
     max_history_length: int = Field(100, ge=1, description="Maximum number of history entries to keep")
 
+    # ----- NEW FIELDS for LIMIT Graph, RLHF, MOE, etc. -----
+    # LIMIT Graph integration
+    graph_id: Optional[str] = Field(None, description="Identifier of the LIMIT graph node")
+    graph_embedding: Optional[List[float]] = Field(None, description="Embedding vector of the node in the LIMIT graph")
+    graph_metrics: Optional[Dict[str, float]] = Field(None, description="Metrics from LIMIT graph (e.g., centrality)")
+
+    # RLHF
+    human_feedback_score: float = Field(0.5, ge=0.0, le=1.0, description="Score from human feedback (1=high preference for balanced/adaptive)")
+
+    # Evolutionary optimisation flags
+    use_evolutionary: bool = Field(False, description="Whether to use evolutionary optimisation for routing")
+    evolutionary_population_size: int = Field(20, ge=2, description="Population size for evolutionary algorithm")
+    evolutionary_mutation_rate: float = Field(0.1, ge=0.0, le=1.0)
+    evolutionary_crossover_rate: float = Field(0.7, ge=0.0, le=1.0)
+
     # Schema version & extensibility
-    version: str = Field("2.1.2", description="Schema version")
+    version: str = Field("2.2.0", description="Schema version")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional custom data")
 
-    # Distillation optimizer (not serialized, created on demand)
-    _routing_optimizer: Optional[DistillationRoutingOptimizer] = None
-    _last_decision: Optional[Dict[str, Any]] = None
+    # Distillation optimizer and evolutionary optimizer (not serialized)
+    _routing_optimizer: Optional[DistillationRoutingOptimizer] = PrivateAttr(default=None)
+    _evolutionary_optimizer: Optional[EvolutionaryRoutingOptimizer] = PrivateAttr(default=None)
+    _last_decision: Optional[Dict[str, Any]] = PrivateAttr(default=None)
 
     # ------------------------------------------------------------------
     # Validators
@@ -552,10 +740,18 @@ class NodeDescriptor(BaseModel):
                 'distillation_weight': self.metadata.get('distillation_weight', 0.7),
                 'rl_weight': self.metadata.get('rl_weight', 0.3),
                 'batch_update_size': self.metadata.get('batch_update_size', 8),
+                'gating_learning_rate': self.metadata.get('gating_learning_rate', 0.005),
+                'rlhf_feedback_weight': self.metadata.get('rlhf_feedback_weight', 0.3),
             })
+        if self.use_evolutionary and self._evolutionary_optimizer is None:
+            self._evolutionary_optimizer = EvolutionaryRoutingOptimizer(
+                population_size=self.evolutionary_population_size,
+                mutation_rate=self.evolutionary_mutation_rate,
+                crossover_rate=self.evolutionary_crossover_rate
+            )
 
     # ------------------------------------------------------------------
-    # Distillation methods
+    # Distillation / routing methods
     # ------------------------------------------------------------------
     async def select_routing_strategy(
         self,
@@ -565,20 +761,34 @@ class NodeDescriptor(BaseModel):
         cost_usd: Optional[float] = None,
     ) -> RoutingStrategy:
         """
-        Select the best routing strategy for this node using distillation.
-        Optionally provide outcome metrics to update the agent immediately.
+        Select the best routing strategy for this node using distillation,
+        optionally combined with evolutionary optimisation.
         """
         self._ensure_optimizer()
 
         state = self._build_state()
-        strategy, action_idx, state_vec, teacher_probs = await self._routing_optimizer.select_strategy(state, exploration=exploration)
+        strategy = self.routing_strategy.value
+        action_idx = None
+        state_vec = None
+        teacher_probs = None
+
+        # Use distillation optimizer
+        if self._routing_optimizer is not None:
+            strategy, action_idx, state_vec, teacher_probs = await self._routing_optimizer.select_strategy(state, exploration=exploration)
+
+        # If evolutionary is enabled, blend with its decision
+        if self.use_evolutionary and self._evolutionary_optimizer is not None:
+            evo_action, evo_probs = self._evolutionary_optimizer.select_strategy(state_vec)
+            # Blend: 70% distillation, 30% evolutionary
+            combined_probs = 0.7 * teacher_probs + 0.3 * evo_probs
+            action_idx = np.argmax(combined_probs)
+            strategy = self._routing_optimizer.STRATEGIES[action_idx]
 
         self._last_decision = {
             'state_vec': state_vec,
             'action_idx': action_idx,
             'teacher_probs': teacher_probs,
         }
-
         self.routing_strategy = RoutingStrategy(strategy)
 
         if carbon_saved is not None and latency_ms is not None and cost_usd is not None:
@@ -591,11 +801,26 @@ class NodeDescriptor(BaseModel):
         Record the outcome of a routing decision and update the distillation agent.
         Also store a FeedbackEvent (if available).
         """
-        # Compute reward
+        # Compute reward using multi‑objective weights (MODP)
+        # Default weights if not specified
+        carbon_weight = self.metadata.get('carbon_weight', 0.5)
+        latency_weight = self.metadata.get('latency_weight', 0.3)
+        cost_weight = self.metadata.get('cost_weight', 0.2)
+        total_weight = carbon_weight + latency_weight + cost_weight
+        if total_weight <= 0:
+            total_weight = 1.0
+        carbon_weight /= total_weight
+        latency_weight /= total_weight
+        cost_weight /= total_weight
+
         carbon_norm = min(1.0, carbon_saved_kg / 0.1)
         latency_norm = 1.0 - min(1.0, latency_ms / 500.0)
         cost_norm = 1.0 - min(1.0, cost_usd / 10.0)
-        reward = 0.5 * carbon_norm + 0.3 * latency_norm + 0.2 * cost_norm
+        # Human feedback contribution (RLHF)
+        human_alignment = self.human_feedback_score  # 0..1
+        # Combine: 90% objective rewards, 10% human alignment
+        objective_reward = carbon_weight * carbon_norm + latency_weight * latency_norm + cost_weight * cost_norm
+        reward = 0.9 * objective_reward + 0.1 * human_alignment
         reward = max(0.0, min(1.0, reward))
 
         entry = {
@@ -605,6 +830,7 @@ class NodeDescriptor(BaseModel):
             'carbon_saved_kg': carbon_saved_kg,
             'latency_ms': latency_ms,
             'cost_usd': cost_usd,
+            'human_feedback_score': self.human_feedback_score,  # for logs
         }
         self.performance_history.append(entry)
         if len(self.performance_history) > self.max_history_length:
@@ -620,23 +846,28 @@ class NodeDescriptor(BaseModel):
             next_state_vec = next_state.to_feature_vector()
 
             self._ensure_optimizer()
-            await self._routing_optimizer.update(
-                state_vec,
-                action_idx,
-                reward,
-                next_state_vec,
-                teacher_probs
-            )
+            if self._routing_optimizer is not None:
+                await self._routing_optimizer.update(
+                    state_vec,
+                    action_idx,
+                    reward,
+                    next_state_vec,
+                    teacher_probs
+                )
+            # Update evolutionary optimizer with reward
+            if self.use_evolutionary and self._evolutionary_optimizer is not None:
+                # Use index 0 for best individual (simplified)
+                self._evolutionary_optimizer.update_fitness(reward, index=0)
+
             # Save state vector in history for potential historical model training
             entry['state_vec'] = ','.join(map(str, state_vec))
             self._last_decision = None
 
-        # Persist to CSV (and JSON) asynchronously
+        # Persist to CSV and JSON asynchronously (same as before)
         log_path = Path(f"./node_{self.id}_routing_logs.csv")
         df = pd.DataFrame(self.performance_history)
         df.to_csv(log_path, index=False)
 
-        # Optionally store as JSON for easier parsing
         json_path = Path(f"./node_{self.id}_routing_logs.json")
         with open(json_path, 'w') as f:
             json.dump(self.performance_history, f, indent=2)
@@ -661,13 +892,12 @@ class NodeDescriptor(BaseModel):
                     adaptive_cost_value=reward,
                     tags=["node", "routing", self.routing_strategy.value],
                 )
-                # In a real system, we would publish this event to a queue or store it.
                 logger.debug(f"FeedbackEvent created: {event.event_id}")
             except Exception as e:
                 logger.warning(f"Failed to create FeedbackEvent: {e}")
 
     def _build_state(self) -> NodeState:
-        """Build state from current node metrics and history."""
+        """Build state from current node metrics and history (now includes human feedback)."""
         if self.performance_history:
             recent = self.performance_history[-20:]
             success_rate = sum(1 for r in recent if r.get('reward', 0) > 0.5) / max(len(recent), 1)
@@ -676,21 +906,29 @@ class NodeDescriptor(BaseModel):
             success_rate = 0.5
             avg_reward = 0.5
 
+        # Include graph metrics if available (e.g., centrality as health score adjustment)
+        graph_health = 0.5
+        if self.graph_metrics:
+            # Use a metric like 'centrality' or 'connectivity' if present
+            graph_health = self.graph_metrics.get('centrality', 0.5)
+        health_score = self.get_health_score() * (0.8 + 0.2 * graph_health)
+
         return NodeState(
             carbon_intensity=self.region_carbon_intensity,
             renewable_fraction=self.renewable_fraction,
             helium_connectivity=self.helium_connectivity_score,
             uptime=self.uptime,
             efficiency_score=self.efficiency_score or 0.5,
-            health_score=self.get_health_score(),
+            health_score=health_score,
             cost_per_hour=self.cost_per_hour_usd or 1.0,
             energy_per_token=self.energy_per_token,
             recent_success_rate=success_rate,
             avg_reward=avg_reward,
+            human_feedback_score=self.human_feedback_score,
         )
 
     # ------------------------------------------------------------------
-    # Offline training (class method)
+    # Offline training (class method) - unchanged but accepts variable feature dim
     # ------------------------------------------------------------------
     @classmethod
     def train_historical_model(
@@ -732,7 +970,7 @@ def create_node_descriptor(
 
 
 # ============================================================================
-# UNIT TESTS
+# UNIT TESTS (updated & extended)
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -744,6 +982,8 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             'distillation_replay_size': 10,
             'distillation_learning_rate': 0.01,
             'distillation_train_every': 10,
+            'gating_learning_rate': 0.005,
+            'rlhf_feedback_weight': 0.3,
         }
         self.optimizer = DistillationRoutingOptimizer(self.config)
 
@@ -759,9 +999,10 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             energy_per_token=0.00005,
             recent_success_rate=0.7,
             avg_reward=0.6,
+            human_feedback_score=0.7,
         )
         vec = state.to_feature_vector()
-        self.assertEqual(len(vec), 10)
+        self.assertEqual(len(vec), FEATURE_DIM)
 
     def test_rule_based_teacher(self):
         teacher = RoutingRuleBasedTeacher()
@@ -776,10 +1017,29 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             energy_per_token=0.00005,
             recent_success_rate=0.7,
             avg_reward=0.6,
+            human_feedback_score=0.5,
         )
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
         self.assertGreater(probs[0], probs[1])
+
+    def test_rlhf_teacher(self):
+        teacher = RLHFTeacher()
+        state_high = NodeState(
+            carbon_intensity=0.4,
+            renewable_fraction=0.3,
+            helium_connectivity=0.9,
+            uptime=0.99,
+            efficiency_score=0.85,
+            health_score=0.8,
+            cost_per_hour=2.5,
+            energy_per_token=0.00005,
+            recent_success_rate=0.7,
+            avg_reward=0.6,
+            human_feedback_score=0.9,
+        )
+        probs_high = teacher.predict(state_high)
+        self.assertGreater(probs_high[3] + probs_high[4], probs_high[0] + probs_high[1])
 
     async def test_select_strategy(self):
         state = NodeState(
@@ -793,17 +1053,37 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             energy_per_token=0.00005,
             recent_success_rate=0.7,
             avg_reward=0.6,
+            human_feedback_score=0.5,
         )
         strategy, idx, state_vec, teacher_probs = await self.optimizer.select_strategy(state, exploration=False)
         self.assertIn(strategy, self.optimizer.STRATEGIES)
+        self.assertEqual(len(state_vec), FEATURE_DIM)
+        self.assertEqual(len(teacher_probs), 5)
 
     def test_replay_buffer(self):
         buffer = ReplayBuffer(max_size=5)
-        state_vec = np.random.randn(10)
+        state_vec = np.random.randn(FEATURE_DIM)
         buffer.push(state_vec, 0, 1.0, state_vec, np.ones(5)/5)
         self.assertEqual(len(buffer), 1)
         batch = buffer.sample(1)
         self.assertEqual(len(batch[0]), 1)
+
+    def test_moe_gating(self):
+        gate = MoEGatingNetwork(feature_dim=FEATURE_DIM, n_experts=4)
+        state_vec = np.random.randn(FEATURE_DIM)
+        weights = gate.forward(state_vec)
+        self.assertEqual(len(weights), 4)
+        self.assertAlmostEqual(sum(weights), 1.0)
+
+    def test_evolutionary_optimizer(self):
+        evo = EvolutionaryRoutingOptimizer(population_size=10)
+        state_vec = np.random.randn(FEATURE_DIM)
+        action, probs = evo.select_strategy(state_vec)
+        self.assertIn(action, range(5))
+        self.assertEqual(len(probs), 5)
+        # Test evolution
+        evo.update_fitness(0.8, index=0)
+        self.assertIsNotNone(evo.best_individual)
 
 
 # ============================================================================
@@ -826,7 +1106,13 @@ if __name__ == "__main__":
             renewable_fraction=0.4,
             cooling_type=CoolingType.LIQUID,
             hardware_model="A100",
-            metadata={"rack": "R12"}
+            metadata={"rack": "R12"},
+            # New fields
+            graph_id="graph-node-001",
+            graph_embedding=[0.1, 0.2, 0.3],
+            graph_metrics={"centrality": 0.75},
+            human_feedback_score=0.6,
+            use_evolutionary=False,
         )
 
         strategy = await node.select_routing_strategy(exploration=True)
