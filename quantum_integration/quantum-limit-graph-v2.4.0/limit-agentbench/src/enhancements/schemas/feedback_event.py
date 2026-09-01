@@ -6,7 +6,7 @@ Enhanced with:
 - Logical sub-models for better organization.
 - Multi-objective vector support.
 - Flexible metrics and resource usage.
-- Optional fields for bio_inspired, moe_system, and MODP.
+- Optional fields for bio_inspired, moe_system, MODP, RLHF, and Graph.
 - Improved serialization using Pydantic's JSON mode.
 - Envelope fields (priority, retention, trace).
 - Discriminated event types for future extensibility.
@@ -49,6 +49,9 @@ class PerformanceMetrics(BaseModel):
 class LearningMetrics(BaseModel):
     """Metrics related to learning/distillation."""
     distillation_loss: Optional[float] = Field(None, ge=0.0)
+    # --- Enhanced: Multi‑teacher policy distillation ---
+    multi_teacher_loss: Optional[float] = Field(None, ge=0.0, description="Aggregated loss across all teachers")
+    teacher_individual_losses: Optional[Dict[str, float]] = Field(None, description="Per‑teacher distillation loss")
 
 
 class ContextInfo(BaseModel):
@@ -65,6 +68,10 @@ class EvolutionaryInfo(BaseModel):
     population_id: Optional[str] = None
     parent_ids: Optional[List[str]] = None
     fitness_vector: Optional[List[float]] = None
+    # --- Enhanced: Evolutionary hyperparameters ---
+    selection_pressure: Optional[float] = Field(None, ge=0.0)
+    mutation_rate: Optional[float] = Field(None, ge=0.0, le=1.0)
+    crossover_rate: Optional[float] = Field(None, ge=0.0, le=1.0)
 
 
 class ExpertInfo(BaseModel):
@@ -72,6 +79,9 @@ class ExpertInfo(BaseModel):
     expert_id: Optional[str] = None
     gate_weights: Optional[Dict[str, float]] = None
     expert_outputs: Optional[Dict[str, Any]] = None
+    # --- Enhanced: MoE load balancing ---
+    load_balancing_loss: Optional[float] = Field(None, ge=0.0)
+    expert_utilization: Optional[Dict[str, float]] = Field(None, description="Fraction of tokens routed to each expert")
 
 
 class DecisionProcessInfo(BaseModel):
@@ -80,6 +90,27 @@ class DecisionProcessInfo(BaseModel):
     next_state: Optional[Any] = None
     reward_vector: Optional[List[float]] = None
     done: Optional[bool] = None
+    # --- Enhanced: Policy information ---
+    policy_vector: Optional[List[float]] = Field(None, description="Output policy distribution")
+    value_estimate: Optional[float] = Field(None, description="Value function estimate for the state")
+
+
+class RLHFInfo(BaseModel):
+    """Fields specific to RLHF (Reinforcement Learning from Human Feedback)."""
+    reward_model_id: Optional[str] = None
+    human_feedback_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    preference_pair: Optional[Dict[str, Any]] = Field(None, description="Chosen and rejected responses")
+    reward_model_score: Optional[float] = Field(None, description="Score from the reward model")
+    kl_penalty: Optional[float] = Field(None, ge=0.0, description="KL divergence penalty applied during RLHF")
+
+
+class GraphInfo(BaseModel):
+    """Fields specific to LIMIT Graph integration."""
+    graph_id: Optional[str] = None
+    node_id: Optional[str] = None
+    edge_id: Optional[str] = None
+    graph_embedding: Optional[List[float]] = Field(None, description="Embedding of the graph state")
+    graph_metrics: Optional[Dict[str, float]] = Field(None, description="Graph metrics (e.g., centrality, density)")
 
 
 class EventEnvelope(BaseModel):
@@ -91,11 +122,11 @@ class EventEnvelope(BaseModel):
 
 
 class FeedbackEvent(BaseModel):
-    """Standardized feedback event for Green Agent (v2.1 schema)."""
+    """Standardized feedback event for Green Agent (v2.2 schema)."""
     model_config = ConfigDict(extra='allow')  # allow additional fields for flexibility
 
-    # Schema version
-    schema_version: str = Field("2.1", description="Schema version for compatibility")
+    # Schema version (bumped to 2.2)
+    schema_version: str = Field("2.2", description="Schema version for compatibility")
 
     # Core identifiers
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -127,7 +158,7 @@ class FeedbackEvent(BaseModel):
     custom_metrics: Dict[str, Any] = Field(default_factory=dict)
 
     # Feedback type (can be extended via config)
-    feedback_type: str  # "routing", "distillation", "energy", "carbon", "helium", or custom
+    feedback_type: str  # "routing", "distillation", "energy", "carbon", "helium", "rlhf", "graph", or custom
 
     # Adaptive cost result
     adaptive_cost_value: float
@@ -142,6 +173,9 @@ class FeedbackEvent(BaseModel):
     evolutionary: Optional[EvolutionaryInfo] = None
     expert: Optional[ExpertInfo] = None
     decision_process: Optional[DecisionProcessInfo] = None
+    # --- Enhanced: New optional sub‑models ---
+    rlhf: Optional[RLHFInfo] = None
+    graph: Optional[GraphInfo] = None
 
     @field_validator('feedback_type')
     @classmethod
@@ -159,6 +193,10 @@ class FeedbackEvent(BaseModel):
     def validate_consistency(self) -> 'FeedbackEvent':
         if self.feedback_type == "helium" and self.performance.helium_cost is None:
             raise ValueError("helium_cost must be provided when feedback_type='helium'")
+        if self.feedback_type == "rlhf" and self.rlhf is None:
+            raise ValueError("rlhf info must be provided when feedback_type='rlhf'")
+        if self.feedback_type == "graph" and self.graph is None:
+            raise ValueError("graph info must be provided when feedback_type='graph'")
         return self
 
     # --------------------------------------------------------------------------
@@ -174,7 +212,8 @@ class FeedbackEvent(BaseModel):
             data.update({f"{field}_{k}": v for k, v in sub.items()})
         # Convert lists/dicts to JSON strings for storage
         for field in ['context_teacher_ids', 'tags', 'multi_objective', 'custom_metrics',
-                      'evolutionary', 'expert', 'decision_process']:
+                      'evolutionary', 'expert', 'decision_process',
+                      'rlhf', 'graph']:  # <-- Enhanced: include new sub‑models
             if field in data:
                 data[field] = json.dumps(data[field])
         return data
@@ -194,7 +233,8 @@ class FeedbackEvent(BaseModel):
             nested[field] = sub
         # Parse JSON fields
         for field in ['context_teacher_ids', 'tags', 'multi_objective', 'custom_metrics',
-                      'evolutionary', 'expert', 'decision_process']:
+                      'evolutionary', 'expert', 'decision_process',
+                      'rlhf', 'graph']:  # <-- Enhanced: parse new sub‑models
             if field in data and isinstance(data[field], str):
                 data[field] = json.loads(data[field])
         # Convert timestamp
