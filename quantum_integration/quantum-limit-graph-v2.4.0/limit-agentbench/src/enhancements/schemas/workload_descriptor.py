@@ -1,19 +1,21 @@
 # src/enhancements/schemas/workload_descriptor.py
 """
-Enhanced Workload Descriptor v2.1.1
+Enhanced Workload Descriptor v2.2.0
 ====================================
 Defines the structure of a workload/task with adaptive priority selection
-via Multi‑Teacher On‑Policy Distillation.
+via Multi‑Teacher On‑Policy Distillation, augmented with:
 
-Improvements over v2.1.0:
-- Self-contained imports (dataclass, logging).
-- Pydantic v2 config (ConfigDict).
-- Parameterised persistence paths (per workload ID).
-- True historical ML training from logged state vectors.
-- Integration with FeedbackEvent schema (optional).
-- Performance history as List (no deque).
-- Enhanced state representation (more features).
-- Asynchronous lock for safe updates.
+- LIMIT Graph integration (graph ID, embedding, metrics).
+- MODP (Multi‑Objective Decision Process) with tunable weights.
+- RLHF (Reinforcement Learning from Human Feedback) via a dedicated teacher and
+  human feedback score in the state.
+- Multi‑Teacher On‑Policy Distillation with a learned Mixture‑of‑Experts (MoE)
+  gating network.
+- Bio‑inspired optimisation (evolutionary algorithm) as an optional complement.
+- MoE expert support (gating network over teachers).
+- All original features (task types, bio‑modes, persistence, etc.) remain.
+
+Version: 2.2.0
 """
 
 from enum import Enum
@@ -28,7 +30,7 @@ import pickle
 import pandas as pd
 from dataclasses import dataclass
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ConfigDict, PrivateAttr
 
 # Logger setup
 import logging
@@ -73,7 +75,13 @@ class BioMode(str, Enum):
     NONE = "none"
 
 # ============================================================================
-# Distillation components
+# CONSTANTS
+# ============================================================================
+# Feature dimension: original 21 + human_feedback_score = 22
+FEATURE_DIM = 22
+
+# ============================================================================
+# Distillation components (ENHANCED)
 # ============================================================================
 
 @dataclass
@@ -105,9 +113,11 @@ class WorkloadState:
     # Historical performance
     recent_success_rate: float = 0.5
     avg_reward: float = 0.5
+    # NEW for RLHF
+    human_feedback_score: float = 0.5  # 0..1
 
     def to_feature_vector(self) -> np.ndarray:
-        """Convert to numeric feature vector."""
+        """Convert to numeric feature vector (22 dims)."""
         features = [
             min(self.tokens / 10000.0, 1.0),
             min(self.latency_target / 1000.0, 1.0),
@@ -130,6 +140,7 @@ class WorkloadState:
             self.bio_mode_chemotactic,
             self.recent_success_rate,
             self.avg_reward,
+            self.human_feedback_score,  # NEW
         ]
         return np.array(features, dtype=np.float32)
 
@@ -184,8 +195,6 @@ class PriorityHistoricalMLTeacher(Teacher):
             return np.ones(3) / 3
         x = state.to_feature_vector().reshape(1, -1)
         probs = self.model.predict_proba(x)[0]
-        # Reorder if necessary (assume classes are ['accuracy','green','balanced'])
-        # For simplicity, we assume the model was trained with same label order.
         return probs
 
     def confidence(self, state: WorkloadState) -> float:
@@ -216,7 +225,6 @@ class PriorityHistoricalMLTeacher(Teacher):
             logger.warning("Not enough logs to train historical model.")
             return None
 
-        # Parse state vectors from string
         def parse_state(s):
             try:
                 return np.fromstring(s, sep=',')
@@ -243,10 +251,11 @@ class PriorityHistoricalMLTeacher(Teacher):
 
 
 class PriorityStatefulQTeacher(Teacher):
-    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None, feature_dim: int = FEATURE_DIM):
         self.lr = lr
         self.weights_path = weights_path or Path("./priority_q_weights.json")
-        self.weights = np.zeros((21, 3))  # 21 features, 3 actions
+        self.feature_dim = feature_dim
+        self.weights = np.zeros((feature_dim, 3))  # 3 actions
         self._load_state()
 
     def _load_state(self):
@@ -255,6 +264,9 @@ class PriorityStatefulQTeacher(Teacher):
                 with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
+                if self.weights.shape[0] != self.feature_dim:
+                    logger.warning(f"Loaded Q‑weights have shape {self.weights.shape}, expected ({self.feature_dim},3). Reinitializing.")
+                    self.weights = np.zeros((self.feature_dim, 3))
                 logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
@@ -279,8 +291,33 @@ class PriorityStatefulQTeacher(Teacher):
         self._save_state()
 
 
+class RLHFPriorityTeacher(Teacher):
+    """
+    Teacher that incorporates human feedback to adjust priority probabilities.
+    High human feedback prefers 'balanced', low prefers 'green' (sustainability).
+    """
+    def __init__(self, feedback_weight: float = 0.3):
+        self.feedback_weight = feedback_weight
+
+    def predict(self, state: WorkloadState) -> np.ndarray:
+        probs = np.ones(3) / 3
+        if state.human_feedback_score > 0.7:
+            probs[2] += 0.2  # balanced
+        elif state.human_feedback_score < 0.3:
+            probs[1] += 0.2  # green
+        else:
+            probs[0] += 0.1  # accuracy
+            probs[1] += 0.1
+            probs[2] += 0.1
+        return probs / probs.sum()
+
+    def confidence(self, state: WorkloadState) -> float:
+        return min(0.8, abs(state.human_feedback_score - 0.5) * 2 + 0.3)
+
+
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 21, n_classes: int = 3, lr: float = 0.01):
+    def __init__(self, feature_dim: int = FEATURE_DIM, n_classes: int = 3, lr: float = 0.01):
+        self.feature_dim = feature_dim
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
@@ -291,7 +328,7 @@ class DistillationStudent:
         if num_classes is None:
             num_classes = self.n_classes
         if num_classes != self.n_classes:
-            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_weights = np.zeros((self.feature_dim, num_classes))
             new_biases = np.zeros(num_classes)
             min_dim = min(self.n_classes, num_classes)
             new_weights[:, :min_dim] = self.weights[:, :min_dim]
@@ -339,27 +376,67 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class MoEGatingNetwork:
+    """
+    Learnable gating network for combining teacher outputs (Mixture‑of‑Experts).
+    Outputs a weight vector for each teacher based on the state.
+    """
+    def __init__(self, feature_dim: int = FEATURE_DIM, n_experts: int = 4, lr: float = 0.01):
+        self.feature_dim = feature_dim
+        self.n_experts = n_experts
+        self.lr = lr
+        self.weights = np.random.randn(feature_dim, n_experts) * 0.01
+        self.bias = np.zeros(n_experts)
+
+    def forward(self, state_vec: np.ndarray) -> np.ndarray:
+        logits = state_vec @ self.weights + self.bias
+        exp_logits = np.exp(logits - np.max(logits))
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vec: np.ndarray, teacher_probs: np.ndarray, student_probs: np.ndarray):
+        """
+        Update gating network to reduce difference between combined teacher output
+        and student output (distillation signal).
+        """
+        gate_weights = self.forward(state_vec)
+        combined = np.sum(gate_weights[:, None] * teacher_probs, axis=0)
+        error = combined - student_probs
+        grad_gate = np.dot(teacher_probs, error)  # shape (n_experts,)
+        self.weights -= self.lr * np.outer(state_vec, grad_gate)
+        self.bias -= self.lr * grad_gate
+
+
 class DistillationPriorityOptimizer:
     """
     Multi‑teacher on‑policy distillation agent for priority selection.
     Priorities: accuracy, green, balanced.
+    Enhanced with MoE gating and RLHF teacher.
     """
     PRIORITIES = ['accuracy', 'green', 'balanced']
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self.feature_dim = FEATURE_DIM
         self.student = DistillationStudent(
-            feature_dim=config.get('feature_dim', 21),
+            feature_dim=self.feature_dim,
             lr=config.get('distillation_learning_rate', 0.01)
         )
+        # Teachers (including RLHF)
         self.teachers: List[Teacher] = [
             PriorityRuleBasedTeacher(),
             PriorityHistoricalMLTeacher(model_path=config.get('historical_model_path')),
             PriorityStatefulQTeacher(
                 lr=config.get('q_learning_rate', 0.1),
-                weights_path=config.get('q_weights_path')
-            )
+                weights_path=config.get('q_weights_path'),
+                feature_dim=self.feature_dim
+            ),
+            RLHFPriorityTeacher(feedback_weight=config.get('rlhf_feedback_weight', 0.3))  # NEW
         ]
+        self.n_teachers = len(self.teachers)
+        # MoE gating network
+        self.gating = MoEGatingNetwork(feature_dim=self.feature_dim,
+                                       n_experts=self.n_teachers,
+                                       lr=config.get('gating_learning_rate', 0.005))
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
@@ -368,26 +445,33 @@ class DistillationPriorityOptimizer:
         self.rl_weight = config.get('rl_weight', 0.3)
         self.batch_update_size = config.get('batch_update_size', 8)
 
+    def _compute_teacher_probs(self, state: WorkloadState) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return (teacher_probs, gate_weights) using the MoE gating network.
+        teacher_probs is the weighted combination of individual teacher outputs.
+        gate_weights are the learned gate values for each teacher.
+        """
+        state_vec = state.to_feature_vector()
+        teacher_outputs = []
+        for teacher in self.teachers:
+            prob = teacher.predict(state)
+            if len(prob) != 3:
+                if len(prob) < 3:
+                    prob = np.pad(prob, (0, 3 - len(prob)), 'constant')
+                else:
+                    prob = prob[:3]
+            teacher_outputs.append(prob)
+        teacher_outputs = np.array(teacher_outputs)  # shape (n_teachers, 3)
+        gate_weights = self.gating.forward(state_vec)
+        combined = np.sum(gate_weights[:, None] * teacher_outputs, axis=0)
+        combined = combined / combined.sum()
+        return combined, gate_weights
+
     async def select_priority(self, state: WorkloadState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
         n = len(self.PRIORITIES)
 
-        teacher_probs = np.zeros(n)
-        total_conf = 0.0
-        for teacher in self.teachers:
-            prob = teacher.predict(state)
-            conf = teacher.confidence(state)
-            if len(prob) != n:
-                if len(prob) < n:
-                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
-                else:
-                    prob = prob[:n]
-            teacher_probs += prob * conf
-            total_conf += conf
-        if total_conf > 0:
-            teacher_probs /= total_conf
-        else:
-            teacher_probs = np.ones(n) / n
+        teacher_probs, gate_weights = self._compute_teacher_probs(state)
 
         student_probs = self.student.predict_proba(state_vec, n)
 
@@ -407,11 +491,82 @@ class DistillationPriorityOptimizer:
             batch = self.replay_buffer.sample(self.batch_update_size)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
+                # Update student
                 self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
                                     distill_weight=self.distill_weight, rl_weight=self.rl_weight)
+                # Update gating network using current student output
+                student_out = self.student.predict_proba(states[i])
+                self.gating.update(states[i], teacher_probs_batch[i], student_out)
 
     def get_stats(self) -> Dict:
-        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+        return {
+            'student_counter': self.student.counter,
+            'buffer_size': len(self.replay_buffer),
+            'n_teachers': self.n_teachers
+        }
+
+
+class EvolutionaryPriorityOptimizer:
+    """
+    Simple evolutionary algorithm for priority selection (bio‑inspired).
+    Maintains a population of candidate priority distributions and evolves them.
+    """
+    def __init__(self, population_size: int = 20, mutation_rate: float = 0.1,
+                 crossover_rate: float = 0.7, elitism: int = 2):
+        self.population_size = population_size
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.elitism = elitism
+        self.population = [np.random.dirichlet(np.ones(3)) for _ in range(population_size)]
+        self.fitness = np.zeros(population_size)
+        self.best_individual = self.population[0]
+        self.best_index = 0
+
+    def select_priority(self, state_vec: np.ndarray) -> Tuple[int, np.ndarray]:
+        """Return action index and the probabilities of the best individual."""
+        best_probs = self.best_individual
+        action_idx = np.argmax(best_probs)
+        return action_idx, best_probs
+
+    def update_fitness(self, reward: float, index: int = 0):
+        """Update fitness of the best individual (simplified)."""
+        self.fitness[index] = reward
+        best_idx = np.argmax(self.fitness)
+        self.best_individual = self.population[best_idx]
+        self.best_index = best_idx
+        self._evolve()
+
+    def _evolve(self):
+        sorted_indices = np.argsort(self.fitness)[::-1]
+        new_population = [self.population[i] for i in sorted_indices[:self.elitism]]
+        while len(new_population) < self.population_size:
+            parent1 = self._tournament_selection()
+            parent2 = self._tournament_selection()
+            if random.random() < self.crossover_rate:
+                child = self._crossover(parent1, parent2)
+            else:
+                child = parent1.copy()
+            child = self._mutate(child)
+            new_population.append(child)
+        self.population = new_population
+        self.fitness = np.zeros(self.population_size)
+
+    def _tournament_selection(self, k=3):
+        candidates = random.sample(range(self.population_size), k)
+        best = max(candidates, key=lambda i: self.fitness[i])
+        return self.population[best]
+
+    def _crossover(self, p1, p2):
+        alpha = random.random()
+        return alpha * p1 + (1 - alpha) * p2
+
+    def _mutate(self, individual):
+        mutated = individual.copy()
+        for i in range(len(mutated)):
+            if random.random() < self.mutation_rate:
+                mutated[i] += random.gauss(0, 0.1)
+                mutated[i] = max(0.01, mutated[i])
+        return mutated / mutated.sum()
 
 
 # ============================================================================
@@ -450,19 +605,35 @@ class WorkloadDescriptor(BaseModel):
     # Bio‑inspired mode
     bio_mode: BioMode = Field(BioMode.NONE, description="Bio‑inspired operation mode")
 
+    # ----- NEW FIELDS for LIMIT Graph, RLHF, evolutionary -----
+    # LIMIT Graph integration
+    graph_id: Optional[str] = Field(None, description="Identifier of the LIMIT graph node")
+    graph_embedding: Optional[List[float]] = Field(None, description="Embedding vector in LIMIT graph")
+    graph_metrics: Optional[Dict[str, float]] = Field(None, description="Metrics from LIMIT graph (e.g., centrality)")
+
+    # RLHF
+    human_feedback_score: float = Field(0.5, ge=0.0, le=1.0, description="Score from human feedback (1=high preference for balanced)")
+
+    # Evolutionary optimisation flags
+    use_evolutionary: bool = Field(False, description="Whether to use evolutionary optimisation for priority")
+    evolutionary_population_size: int = Field(20, ge=2)
+    evolutionary_mutation_rate: float = Field(0.1, ge=0.0, le=1.0)
+    evolutionary_crossover_rate: float = Field(0.7, ge=0.0, le=1.0)
+
     # Adaptive priority
     adaptive_priority: Priority = Field(Priority.BALANCED, description="Current adaptive priority")
     performance_history: List[Dict[str, Any]] = Field(default_factory=list, description="Recent scheduling outcomes")
     max_history_length: int = Field(100, ge=1, description="Maximum history entries")
 
     # Schema version & extensibility
-    version: str = Field("2.1.1", description="Schema version")
+    version: str = Field("2.2.0", description="Schema version")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional custom data")
 
-    # Distillation optimizer (not serialized)
-    _priority_optimizer: Optional[DistillationPriorityOptimizer] = None
-    _last_decision: Optional[Dict[str, Any]] = None
-    _lock: Any = None  # asyncio.Lock, will be created on demand
+    # Distillation optimizer and evolutionary optimizer (not serialized)
+    _priority_optimizer: Optional[DistillationPriorityOptimizer] = PrivateAttr(default=None)
+    _evolutionary_optimizer: Optional[EvolutionaryPriorityOptimizer] = PrivateAttr(default=None)
+    _last_decision: Optional[Dict[str, Any]] = PrivateAttr(default=None)
+    _lock: Any = PrivateAttr(default=None)  # asyncio.Lock
 
     # ------------------------------------------------------------------
     # Validators
@@ -512,7 +683,6 @@ class WorkloadDescriptor(BaseModel):
     # ------------------------------------------------------------------
     def _ensure_optimizer(self):
         if self._priority_optimizer is None:
-            # Create unique paths based on workload ID
             workload_id = self.task_id or "unknown"
             self._priority_optimizer = DistillationPriorityOptimizer({
                 'distillation_epsilon': self.metadata.get('distillation_epsilon', 0.1),
@@ -525,8 +695,16 @@ class WorkloadDescriptor(BaseModel):
                 'distillation_weight': self.metadata.get('distillation_weight', 0.7),
                 'rl_weight': self.metadata.get('rl_weight', 0.3),
                 'batch_update_size': self.metadata.get('batch_update_size', 8),
-                'feature_dim': 21,
+                'gating_learning_rate': self.metadata.get('gating_learning_rate', 0.005),
+                'rlhf_feedback_weight': self.metadata.get('rlhf_feedback_weight', 0.3),
+                'feature_dim': FEATURE_DIM,
             })
+        if self.use_evolutionary and self._evolutionary_optimizer is None:
+            self._evolutionary_optimizer = EvolutionaryPriorityOptimizer(
+                population_size=self.evolutionary_population_size,
+                mutation_rate=self.evolutionary_mutation_rate,
+                crossover_rate=self.evolutionary_crossover_rate
+            )
 
     async def _get_lock(self):
         if self._lock is None:
@@ -549,6 +727,14 @@ class WorkloadDescriptor(BaseModel):
             priority, action_idx, state_vec, teacher_probs = await self._priority_optimizer.select_priority(
                 state, exploration=exploration
             )
+
+            # Evolutionary blending if enabled
+            if self.use_evolutionary and self._evolutionary_optimizer is not None:
+                evo_action, evo_probs = self._evolutionary_optimizer.select_priority(state_vec)
+                combined_probs = 0.7 * teacher_probs + 0.3 * evo_probs
+                action_idx = np.argmax(combined_probs)
+                priority = self._priority_optimizer.PRIORITIES[action_idx]
+
             self._last_decision = {
                 'state_vec': state_vec,
                 'action_idx': action_idx,
@@ -569,14 +755,27 @@ class WorkloadDescriptor(BaseModel):
 
     async def _record_outcome_locked(self, latency_achieved_ms: float, carbon_saved_kg: float, energy_used_joules: float):
         """Record outcome and update the distillation agent (assumes lock held)."""
-        # Reward calculation
+        # MODP: use configurable objective weights from metadata
+        latency_weight = self.metadata.get('latency_weight', 0.4)
+        carbon_weight = self.metadata.get('carbon_weight', 0.3)
+        energy_weight = self.metadata.get('energy_weight', 0.3)
+        total_weight = latency_weight + carbon_weight + energy_weight
+        if total_weight <= 0:
+            total_weight = 1.0
+        latency_weight /= total_weight
+        carbon_weight /= total_weight
+        energy_weight /= total_weight
+
         latency_score = 1.0 - min(1.0, abs(latency_achieved_ms - self.latency_target) / self.latency_target)
         carbon_norm = min(1.0, carbon_saved_kg / 0.1)
         energy_norm = 1.0 - min(1.0, energy_used_joules / (self.estimated_energy_joules or 0.1))
-        reward = 0.4 * latency_score + 0.3 * carbon_norm + 0.3 * energy_norm
+        objective_reward = latency_weight * latency_score + carbon_weight * carbon_norm + energy_weight * energy_norm
+
+        # RLHF: incorporate human feedback (10% weight)
+        human_alignment = self.human_feedback_score
+        reward = 0.9 * objective_reward + 0.1 * human_alignment
         reward = max(0.0, min(1.0, reward))
 
-        # Build entry
         entry = {
             'timestamp': datetime.utcnow().isoformat(),
             'priority': self.adaptive_priority.value,
@@ -584,9 +783,9 @@ class WorkloadDescriptor(BaseModel):
             'latency_achieved_ms': latency_achieved_ms,
             'carbon_saved_kg': carbon_saved_kg,
             'energy_used_joules': energy_used_joules,
+            'human_feedback_score': self.human_feedback_score,
         }
 
-        # Update agent if we have decision context
         if self._last_decision is not None:
             state_vec = self._last_decision['state_vec']
             action_idx = self._last_decision['action_idx']
@@ -595,6 +794,7 @@ class WorkloadDescriptor(BaseModel):
             next_state = self._build_state()
             next_state_vec = next_state.to_feature_vector()
 
+            self._ensure_optimizer()
             await self._priority_optimizer.update(
                 state_vec,
                 action_idx,
@@ -603,19 +803,20 @@ class WorkloadDescriptor(BaseModel):
                 teacher_probs
             )
 
-            # Save state vector for future training
+            # Evolutionary update
+            if self.use_evolutionary and self._evolutionary_optimizer is not None:
+                self._evolutionary_optimizer.update_fitness(reward, index=0)
+
             entry['state_vec'] = ','.join(map(str, state_vec))
             self._last_decision = None
         else:
-            # If no decision context (e.g., outcome recorded without prior selection), we still store but cannot update
             logger.debug("No decision context available for update.")
 
-        # Append to history and limit length
         self.performance_history.append(entry)
         if len(self.performance_history) > self.max_history_length:
             self.performance_history = self.performance_history[-self.max_history_length:]
 
-        # Persist logs (CSV and JSON)
+        # Persist logs
         log_path = Path(f"./workload_{self.task_id or 'unknown'}_logs.csv")
         df = pd.DataFrame(self.performance_history)
         df.to_csv(log_path, index=False)
@@ -624,7 +825,7 @@ class WorkloadDescriptor(BaseModel):
         with open(json_path, 'w') as f:
             json.dump(self.performance_history, f, indent=2)
 
-        # Emit FeedbackEvent if available
+        # Emit FeedbackEvent
         if FeedbackEvent is not None:
             try:
                 event = FeedbackEvent(
@@ -644,25 +845,21 @@ class WorkloadDescriptor(BaseModel):
                     adaptive_cost_value=reward,
                     tags=["workload", "scheduling", self.adaptive_priority.value],
                 )
-                # In production, publish to queue or store.
                 logger.debug(f"FeedbackEvent created: {event.event_id}")
             except Exception as e:
                 logger.warning(f"Failed to create FeedbackEvent: {e}")
 
     def _build_state(self) -> WorkloadState:
-        """Build state from current workload metrics and history."""
+        """Build state from current workload metrics and history (now includes human feedback and graph health)."""
         urgency_map = {Urgency.LOW: 0, Urgency.MEDIUM: 1, Urgency.HIGH: 2, Urgency.CRITICAL: 3}
         urgency_val = urgency_map.get(self.urgency, 1)
 
-        # One-hot for task type
         task_type_onehot = {t: 0.0 for t in TaskType}
         task_type_onehot[self.task_type] = 1.0
 
-        # Bio mode one-hot
         bio_mode_photosynthetic = 1.0 if self.bio_mode == BioMode.PHOTOSYNTHETIC else 0.0
         bio_mode_chemotactic = 1.0 if self.bio_mode == BioMode.CHEMOTACTIC else 0.0
 
-        # Historical stats
         if self.performance_history:
             recent = self.performance_history[-20:]
             success_rate = sum(1 for r in recent if r.get('reward', 0) > 0.5) / max(len(recent), 1)
@@ -670,6 +867,16 @@ class WorkloadDescriptor(BaseModel):
         else:
             success_rate = 0.5
             avg_reward = 0.5
+
+        # Graph health factor (if graph_metrics present)
+        graph_health = 0.5
+        if self.graph_metrics:
+            graph_health = self.graph_metrics.get('centrality', 0.5)
+
+        # Incorporate graph health into state? Could be added as a separate feature,
+        # but to keep feature dim consistent we just use it to adjust avg_reward slightly.
+        # We'll multiply avg_reward by a factor based on graph_health.
+        adjusted_avg_reward = avg_reward * (0.8 + 0.2 * graph_health)
 
         return WorkloadState(
             tokens=self.tokens,
@@ -692,7 +899,8 @@ class WorkloadDescriptor(BaseModel):
             bio_mode_photosynthetic=bio_mode_photosynthetic,
             bio_mode_chemotactic=bio_mode_chemotactic,
             recent_success_rate=success_rate,
-            avg_reward=avg_reward,
+            avg_reward=adjusted_avg_reward,
+            human_feedback_score=self.human_feedback_score,
         )
 
     # ------------------------------------------------------------------
@@ -730,7 +938,7 @@ def create_workload_descriptor(
 
 
 # ============================================================================
-# UNIT TESTS
+# UNIT TESTS (updated & extended)
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -742,38 +950,70 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             'distillation_replay_size': 10,
             'distillation_learning_rate': 0.01,
             'distillation_train_every': 10,
-            'feature_dim': 21,
+            'feature_dim': FEATURE_DIM,
+            'gating_learning_rate': 0.005,
+            'rlhf_feedback_weight': 0.3,
         }
         self.optimizer = DistillationPriorityOptimizer(self.config)
 
     def test_state_feature_vector(self):
         state = WorkloadState(tokens=512, latency_target=200, urgency=1,
                               task_type_inference=1.0, estimated_energy=0.05,
-                              estimated_carbon=0.0002, helium_units=0.001)
+                              estimated_carbon=0.0002, helium_units=0.001,
+                              human_feedback_score=0.7)
         vec = state.to_feature_vector()
-        self.assertEqual(len(vec), 21)
+        self.assertEqual(len(vec), FEATURE_DIM)
 
     def test_rule_based_teacher(self):
         teacher = PriorityRuleBasedTeacher()
         state = WorkloadState(tokens=512, latency_target=200, urgency=2,
                               task_type_inference=1.0, estimated_energy=0.05,
-                              estimated_carbon=0.0002, helium_units=0.001)
+                              estimated_carbon=0.0002, helium_units=0.001,
+                              human_feedback_score=0.5)
         probs = teacher.predict(state)
         self.assertAlmostEqual(sum(probs), 1.0)
         self.assertGreater(probs[0], probs[1])
 
+    def test_rlhf_teacher(self):
+        teacher = RLHFPriorityTeacher()
+        state_high = WorkloadState(tokens=512, latency_target=200, urgency=1,
+                                   task_type_inference=1.0, estimated_energy=0.05,
+                                   estimated_carbon=0.0002, helium_units=0.001,
+                                   human_feedback_score=0.9)
+        probs_high = teacher.predict(state_high)
+        self.assertGreater(probs_high[2], probs_high[0])
+
     async def test_select_priority(self):
         state = WorkloadState(tokens=512, latency_target=200, urgency=1,
                               task_type_inference=1.0, estimated_energy=0.05,
-                              estimated_carbon=0.0002, helium_units=0.001)
+                              estimated_carbon=0.0002, helium_units=0.001,
+                              human_feedback_score=0.5)
         priority, idx, state_vec, teacher_probs = await self.optimizer.select_priority(state, exploration=False)
         self.assertIn(priority, self.optimizer.PRIORITIES)
+        self.assertEqual(len(state_vec), FEATURE_DIM)
+        self.assertEqual(len(teacher_probs), 3)
 
     def test_replay_buffer(self):
         buffer = ReplayBuffer(max_size=5)
-        state_vec = np.random.randn(21)
+        state_vec = np.random.randn(FEATURE_DIM)
         buffer.push(state_vec, 0, 1.0, state_vec, np.ones(3)/3)
         self.assertEqual(len(buffer), 1)
+
+    def test_moe_gating(self):
+        gate = MoEGatingNetwork(feature_dim=FEATURE_DIM, n_experts=4)
+        state_vec = np.random.randn(FEATURE_DIM)
+        weights = gate.forward(state_vec)
+        self.assertEqual(len(weights), 4)
+        self.assertAlmostEqual(sum(weights), 1.0)
+
+    def test_evolutionary_optimizer(self):
+        evo = EvolutionaryPriorityOptimizer(population_size=10)
+        state_vec = np.random.randn(FEATURE_DIM)
+        action, probs = evo.select_priority(state_vec)
+        self.assertIn(action, range(3))
+        self.assertEqual(len(probs), 3)
+        evo.update_fitness(0.8, index=0)
+        self.assertIsNotNone(evo.best_individual)
 
 
 # ============================================================================
@@ -794,7 +1034,13 @@ if __name__ == "__main__":
             estimated_energy_joules=0.1,
             estimated_carbon_kg=0.0005,
             user_id="user-123",
-            metadata={"region": "eu-west"}
+            metadata={"region": "eu-west", "latency_weight": 0.5, "carbon_weight": 0.3, "energy_weight": 0.2},
+            # New fields
+            graph_id="graph-task-001",
+            graph_embedding=[0.1, 0.2, 0.3],
+            graph_metrics={"centrality": 0.75},
+            human_feedback_score=0.6,
+            use_evolutionary=False,
         )
 
         priority = await wl.select_priority(exploration=True)
