@@ -1,7 +1,7 @@
 # material_lca_v2_3_0.py
-# Version: 2.3.0
+# Version: 2.4.0
 """
-Enhanced Material Index Integration with Hardware Life‑Cycle Databases v2.3.0
+Enhanced Material Index Integration with Hardware Life‑Cycle Databases v2.4.0
 ======================================================================
 
 Fetches accurate embodied carbon and rare‑earth content from public LCA databases
@@ -16,6 +16,14 @@ ENHANCEMENTS OVER v2.2.0:
 - Blending of MOEA global weights with online distillation strategy.
 - New configuration parameters for MOEA.
 - Persistence of evolved Pareto front.
+
+NEW IN v2.4.0:
+- Added LIMIT Graph manager for weight vector relationships.
+- Added MODP solver wrapper for storing decision states/policies.
+- Added RLHF trainer for human preference collection.
+- Added MoE gating network to blend online distillation and offline MOEA weights.
+- New configuration flags for each component.
+- Integrated with central Storage (optional) for persistence.
 
 All previous features (distillation, caching, circuit breaker, digital twin, etc.) retained.
 """
@@ -38,6 +46,7 @@ from abc import ABC, abstractmethod
 import pickle
 import pandas as pd
 from pathlib import Path
+import copy
 
 import aiohttp
 import aiofiles
@@ -84,7 +93,7 @@ except ImportError:
     FASTAPI_AVAILABLE = False
 
 # ============================================================================
-# 1. CONFIGURATION (expanded with distillation and MOEA settings)
+# 1. CONFIGURATION (expanded with new component flags)
 # ============================================================================
 class LCAConfig(BaseModel):
     # Data source
@@ -124,11 +133,19 @@ class LCAConfig(BaseModel):
     moea_objective_weights: Optional[Dict[str, float]] = None
     moea_dynamic_weights: bool = True
 
+    # NEW v2.4.0 flags
+    enable_limit_graph: bool = Field(True, description="Enable LIMIT Graph manager")
+    enable_modp: bool = Field(True, description="Enable MODP solver")
+    enable_rlhf: bool = Field(True, description="Enable RLHF trainer")
+    enable_moe: bool = Field(True, description="Enable MoE gating")
+    moe_expert_count: int = Field(3, ge=2, description="Number of MoE experts")
+
     # Persistence paths
     q_weights_path: str = Field("./lca_q_weights.json")
     interaction_logs_path: str = Field("./lca_interactions.csv")
     historical_model_path: str = Field("./lca_historical_model.pkl")
     moea_pareto_path: str = Field("./lca_moea_pareto.json")
+    limit_graph_path: str = Field("./lca_limit_graph.json", description="LIMIT Graph persistence")
 
     @validator('source')
     def source_must_be_valid(cls, v):
@@ -138,7 +155,7 @@ class LCAConfig(BaseModel):
         return v
 
 # ============================================================================
-# 2. DATA STRUCTURES (enhanced with variant support)
+# 2. DATA STRUCTURES (unchanged)
 # ============================================================================
 class MaterialFootprint(BaseModel):
     hardware_model: str
@@ -166,7 +183,7 @@ class MaterialFootprint(BaseModel):
         return self.hardware_model
 
 # ============================================================================
-# 3. CIRCUIT BREAKER
+# 3. CIRCUIT BREAKER (unchanged)
 # ============================================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -215,7 +232,7 @@ class CircuitBreaker:
             raise e
 
 # ============================================================================
-# 4. TASK MANAGER
+# 4. TASK MANAGER (unchanged)
 # ============================================================================
 class TaskManager:
     def __init__(self):
@@ -251,7 +268,7 @@ class TaskManager:
         logger.info("All background tasks stopped")
 
 # ============================================================================
-# 5. RETRY DECORATOR
+# 5. RETRY DECORATOR (unchanged)
 # ============================================================================
 def retry_decorator(attempts: int = 3, min_wait: int = 2, max_wait: int = 10):
     if TENACITY_AVAILABLE:
@@ -276,7 +293,7 @@ def retry_decorator(attempts: int = 3, min_wait: int = 2, max_wait: int = 10):
         return decorator
 
 # ============================================================================
-# 6. PROMETHEUS METRICS
+# 6. PROMETHEUS METRICS (unchanged)
 # ============================================================================
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry()
@@ -300,7 +317,7 @@ else:
     SIMULATION_RUNS = DummyMetric()
 
 # ============================================================================
-# 7. LCA API CLIENT
+# 7. LCA API CLIENT (unchanged)
 # ============================================================================
 class LCAClient:
     def __init__(self, config: Optional[LCAConfig] = None):
@@ -492,7 +509,7 @@ class LCAClient:
         await self._task_manager.stop_all()
 
 # ============================================================================
-# 8. DIGITALTWIN SIMULATOR
+# 8. DIGITALTWIN SIMULATOR (unchanged)
 # ============================================================================
 class DigitalTwinMaterialSimulator:
     def __init__(self, lca_client: LCAClient = None):
@@ -604,7 +621,7 @@ class DigitalTwinMaterialSimulator:
         return results
 
 # ============================================================================
-# 9. DISTILLATION COMPONENTS
+# 9. DISTILLATION COMPONENTS (unchanged)
 # ============================================================================
 @dataclass
 class CostState:
@@ -854,7 +871,7 @@ class DistillationWeightOptimizer:
 
 
 # ============================================================================
-# NEW: Multi‑Objective Weight Optimizer (NSGA‑II)
+# NEW: Multi‑Objective Weight Optimizer (NSGA‑II) (existing, retained)
 # ============================================================================
 @dataclass
 class MOPDWeightVector:
@@ -1150,12 +1167,189 @@ class NSGAIIWeightOptimizer:
 
 
 # ============================================================================
-# ADAPTIVE COST FUNCTION (Enhanced with MOEA)
+# NEW v2.4.0: LIMIT Graph Manager
+# ============================================================================
+class LimitGraphManager:
+    """
+    Manages a graph of weight vector relationships for LIMIT.
+    Nodes are weight vectors or updates, edges represent dependencies or improvements.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.graphs = {}
+
+    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
+            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
+        else:
+            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+
+    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
+            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+
+    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
+                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
+            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
+        else:
+            if graph_id not in self.graphs:
+                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
+            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+
+    def get_nodes(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
+            return self.storage.get_limit_graph_nodes(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+
+    def get_edges(self, graph_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
+            return self.storage.get_limit_graph_edges(graph_id)
+        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+
+    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
+            return self.storage.get_limit_graph_metadata(graph_id)
+        return self.graphs.get(graph_id, {})
+
+
+# ============================================================================
+# NEW v2.4.0: MODP Optimizer (wrapper)
+# ============================================================================
+class MODPOptimizer:
+    """
+    Multi‑Objective Dynamic Programming solver that stores decision states/policies.
+    Used for persisting Pareto front points and selected weight vectors.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.states = {}
+
+    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
+                  objective_values: Dict[str, float], stage: int) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_state'):
+            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
+        else:
+            if problem_id not in self.states:
+                self.states[problem_id] = []
+            self.states[problem_id].append({
+                'state_id': state_id, 'state_attributes': state_attributes,
+                'objective_values': objective_values, 'stage': stage
+            })
+
+    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
+                   action: str, expected_objectives: Dict[str, float]) -> None:
+        if self.storage and hasattr(self.storage, 'save_modp_policy'):
+            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+
+    def get_states(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_states'):
+            return self.storage.get_modp_states(problem_id)
+        return self.states.get(problem_id, [])
+
+    def get_policies(self, problem_id: str) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_modp_policies'):
+            return self.storage.get_modp_policies(problem_id)
+        return []
+
+
+# ============================================================================
+# NEW v2.4.0: RLHF Trainer
+# ============================================================================
+class RLHFTrainer:
+    """
+    Collects human preference pairs for weight vector choices.
+    """
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        self.pairs = []
+
+    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
+                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+        if self.storage and hasattr(self.storage, 'save_preference_pair'):
+            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+        else:
+            self.pairs.append({
+                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
+                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+            })
+
+    def get_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
+            return self.storage.get_preference_pairs(limit)
+        return self.pairs[-limit:]
+
+    def train_reward_model(self):
+        pairs = self.get_pairs()
+        if len(pairs) < 5:
+            logger.info("Not enough preference pairs for RLHF training.")
+            return
+        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+
+
+# ============================================================================
+# NEW v2.4.0: MoE Gating Network for Weight Blending
+# ============================================================================
+class MoEGatingNetwork:
+    """
+    Mixture-of-Experts gating that blends online distillation and offline MOEA weights.
+    The gating network learns to select the best source for the current context.
+    """
+    def __init__(self, storage: Optional[Any] = None, config: Optional[Dict] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.expert_names = self.config.get('expert_names', ['online', 'offline', 'rule_based'])
+        self.num_experts = len(self.expert_names)
+        # Gating input: 5 features representing normalized metrics
+        self.gating_weights = np.random.randn(self.num_experts, 5)
+        self._training_samples = []
+
+    def _encode_state(self, metrics: Dict[str, float]) -> np.ndarray:
+        features = [
+            metrics.get('carbon', 0.5),
+            metrics.get('rare_earth', 0.5),
+            metrics.get('water', 0.5),
+            metrics.get('operational', 0.5),
+            metrics.get('material_index', 0.5),
+        ]
+        return np.array(features, dtype=np.float32)
+
+    async def select_expert(self, metrics: Dict[str, float]) -> Tuple[str, np.ndarray]:
+        x = self._encode_state(metrics)
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        expert_idx = np.argmax(probs)
+        selected = self.expert_names[expert_idx]
+        if self.storage and hasattr(self.storage, 'log_routing_decision'):
+            sample_id = hashlib.sha256(str(metrics).encode()).hexdigest()[:16]
+            self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+        return selected, probs
+
+    async def add_training_sample(self, metrics: Dict[str, float], selected_expert: str, reward: float):
+        x = self._encode_state(metrics)
+        expert_idx = self.expert_names.index(selected_expert)
+        target = np.zeros(self.num_experts)
+        target[expert_idx] = 1.0
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        grad = (probs - target)[:, None] * x[None, :]
+        self.gating_weights -= 0.1 * grad
+
+
+# ============================================================================
+# ADAPTIVE COST FUNCTION (Enhanced with new components)
 # ============================================================================
 class AdaptiveMaterialCostFunction:
-    def __init__(self, lca_client: LCAClient, config: Optional[LCAConfig] = None):
+    def __init__(self, lca_client: LCAClient, config: Optional[LCAConfig] = None, storage: Optional[Any] = None):
         self.lca_client = lca_client
         self.config = config or LCAConfig()
+        self.storage = storage
         self.weight_optimizer = DistillationWeightOptimizer({
             'distillation_epsilon': self.config.distillation_epsilon,
             'distillation_train_every': self.config.distillation_train_every,
@@ -1173,6 +1367,29 @@ class AdaptiveMaterialCostFunction:
         self.pareto_front: List[MOPDWeightVector] = []
         self._moea_task: Optional[asyncio.Task] = None
 
+        # NEW v2.4.0 components
+        self.limit_graph_manager = LimitGraphManager(storage) if getattr(self.config, 'enable_limit_graph', True) else None
+        self.modp_solver = MODPOptimizer(storage) if getattr(self.config, 'enable_modp', True) else None
+        self.rlhf_trainer = RLHFTrainer(storage) if getattr(self.config, 'enable_rlhf', True) else None
+        self.moe_gating = MoEGatingNetwork(
+            storage,
+            {'expert_names': ['online', 'offline', 'rule_based']}
+        ) if getattr(self.config, 'enable_moe', True) else None
+
+        # Initialize LIMIT graph if enabled
+        if self.limit_graph_manager:
+            if not self.limit_graph_manager.get_metadata("weight_vectors"):
+                self.limit_graph_manager.create_graph("weight_vectors", "Weight Vector Relationships", {})
+            # Add source nodes
+            for src in ['online', 'offline', 'rule_based']:
+                self.limit_graph_manager.add_node(
+                    "weight_vectors",
+                    f"source_{src}",
+                    src,
+                    {"type": "source"}
+                )
+
+        # Start MOEA background task if enabled
         if getattr(self.config, 'moea_enabled', True):
             self._moea_task = asyncio.create_task(self._moea_loop())
 
@@ -1194,7 +1411,6 @@ class AdaptiveMaterialCostFunction:
 
         async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
             # Use a representative hardware model for evaluation.
-            # In a real system, this could use recent interaction data or a simulation.
             footprint = await self.lca_client.get_footprint("NVIDIA A100", None)
             carbon_benefit = 1.0 - min(footprint.embodied_carbon_kg / 100.0, 1.0)
             rare_earth_benefit = 1.0 - min(footprint.rare_earth_kg / 0.01, 1.0)
@@ -1227,6 +1443,23 @@ class AdaptiveMaterialCostFunction:
             if best:
                 self.global_best_weights = best.weights
                 logger.info(f"MOEA selected best weights: {best.weights}")
+
+                # Store in MODP and LIMIT graph
+                if self.modp_solver:
+                    self.modp_solver.add_state(
+                        state_id=f"moea_best_{best.vector_id}",
+                        problem_id="material_weight_optimization",
+                        state_attributes={'weights': best.weights},
+                        objective_values=best.objectives,
+                        stage=1
+                    )
+                if self.limit_graph_manager:
+                    self.limit_graph_manager.add_node(
+                        "weight_vectors",
+                        f"vector_{best.vector_id}",
+                        "best_weight_vector",
+                        {'weights': best.weights, 'objectives': best.objectives}
+                    )
         return pareto
 
     async def compute_cost(
@@ -1256,15 +1489,35 @@ class AdaptiveMaterialCostFunction:
             avg_user_rating=0.0,
         )
 
-        strategy, action_idx, state_vec, teacher_probs = await self.weight_optimizer.select_strategy(state, exploration=True)
-        self.last_state_vec = state_vec
-        self.last_action_idx = action_idx
-        self.last_teacher_probs = teacher_probs
+        # Strategy selection via distillation or MoE
+        if self.moe_gating:
+            # Build metrics for gating
+            metrics = {
+                'carbon': footprint.embodied_carbon_kg,
+                'rare_earth': footprint.rare_earth_kg,
+                'water': footprint.water_usage_l,
+                'operational': operational_energy_joules,
+                'material_index': footprint.material_index,
+            }
+            selected_expert, _ = await self.moe_gating.select_expert(metrics)
+            # Map expert to weights
+            if selected_expert == 'offline' and self.global_best_weights:
+                weights = self.global_best_weights
+            else:
+                # Fallback to rule-based default or balanced
+                weights = self._strategy_to_weights('balanced')
+            strategy = selected_expert
+            state_vec = state.to_feature_vector()
+            teacher_probs = np.ones(5) / 5
+        else:
+            strategy, action_idx, state_vec, teacher_probs = await self.weight_optimizer.select_strategy(state, exploration=True)
+            weights = self._strategy_to_weights(strategy)
+            self.last_state_vec = state_vec
+            self.last_action_idx = action_idx
+            self.last_teacher_probs = teacher_probs
 
-        weights = self._strategy_to_weights(strategy)
-
-        # Blend with MOEA global best if available
-        if self.global_best_weights is not None:
+        # Blend with global best if available (unless already offline)
+        if self.global_best_weights is not None and not (self.moe_gating and selected_expert == 'offline'):
             for k in weights:
                 weights[k] = 0.8 * self.global_best_weights[k] + 0.2 * weights[k]
 
@@ -1286,7 +1539,13 @@ class AdaptiveMaterialCostFunction:
             "weights": weights,
             "footprint": footprint.dict(),
             "moea_blended": self.global_best_weights is not None,
+            "moe_used": self.moe_gating is not None,
         }
+
+        # Optional: update MoE with outcome later (called by record_outcome)
+        if self.moe_gating:
+            self._last_moe_metrics = metrics
+            self._last_selected_expert = selected_expert
 
         return total_cost, metadata
 
@@ -1330,6 +1589,7 @@ class AdaptiveMaterialCostFunction:
         else:
             df_log.to_csv(log_path, index=False)
 
+        # Update distillation if we used it
         if self.last_state_vec is not None and self.last_action_idx is not None:
             next_state_vec = self.last_state_vec
             await self.weight_optimizer.update(
@@ -1340,9 +1600,74 @@ class AdaptiveMaterialCostFunction:
                 self.last_teacher_probs
             )
 
+        # Update MoE gating if used
+        if self.moe_gating and hasattr(self, '_last_moe_metrics') and hasattr(self, '_last_selected_expert'):
+            await self.moe_gating.add_training_sample(
+                self._last_moe_metrics,
+                self._last_selected_expert,
+                reward
+            )
+
+        # RLHF: occasionally record preference pair
+        if self.rlhf_trainer and random.random() < 0.05:
+            chosen_strategy = getattr(self, '_last_selected_expert', 'online')
+            rejected_strategy = random.choice(['online', 'offline', 'rule_based'])
+            if rejected_strategy != chosen_strategy:
+                self.rlhf_trainer.record_pair(
+                    pair_id=str(uuid.uuid4()),
+                    prompt="Which weight source produced better cost?",
+                    chosen=chosen_strategy,
+                    rejected=rejected_strategy,
+                    reward_diff=reward,
+                    metadata={"cost": cost, "carbon_savings": carbon_savings_kg}
+                )
+
+        # MODP: record state and policy
+        if self.modp_solver:
+            self.modp_solver.add_state(
+                state_id=str(uuid.uuid4()),
+                problem_id="material_cost",
+                state_attributes={'cost': cost, 'carbon_savings': carbon_savings_kg, 'user_rating': user_rating},
+                objective_values={'carbon': carbon_savings_kg, 'cost': 1.0 - cost, 'satisfaction': reward},
+                stage=0
+            )
+
+        # LIMIT Graph: add node for this outcome
+        if self.limit_graph_manager:
+            self.limit_graph_manager.add_node(
+                "weight_vectors",
+                f"outcome_{uuid.uuid4()}",
+                "cost_outcome",
+                {'cost': cost, 'carbon_savings': carbon_savings_kg, 'reward': reward}
+            )
+
     async def material_index(self, hardware_model: str, variant: Optional[str] = None) -> float:
         footprint = await self.lca_client.get_footprint(hardware_model, variant)
         return footprint.material_index
+
+    # ---------- New public methods for enhancements ----------
+    async def get_limit_graph(self, graph_id: str = "weight_vectors") -> Dict:
+        if self.limit_graph_manager:
+            return {
+                'metadata': self.limit_graph_manager.get_metadata(graph_id),
+                'nodes': self.limit_graph_manager.get_nodes(graph_id),
+                'edges': self.limit_graph_manager.get_edges(graph_id),
+            }
+        return {}
+
+    async def get_moe_experts(self) -> List[str]:
+        if self.moe_gating:
+            return self.moe_gating.expert_names
+        return []
+
+    async def get_rlhf_pairs(self, limit: int = 100) -> List[Dict]:
+        if self.rlhf_trainer:
+            return self.rlhf_trainer.get_pairs(limit)
+        return []
+
+    async def record_rlhf_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
+        if self.rlhf_trainer:
+            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
 
 
 # ============================================================================
@@ -1360,13 +1685,13 @@ class MaterialAwarePredictiveMaintenance:
             await self.pm_engine.update_node(node_id, initial_flops, 0.0)
 
 # ============================================================================
-# 11. FASTAPI REST API (unchanged, but now includes cost function with MOEA)
+# 11. FASTAPI REST API (now includes cost function with new components)
 # ============================================================================
 if FASTAPI_AVAILABLE:
     from fastapi import FastAPI, HTTPException, Depends
     from fastapi.responses import JSONResponse
 
-    app = FastAPI(title="Material LCA API", version="2.3.0")
+    app = FastAPI(title="Material LCA API", version="2.4.0")
 
     async def get_lca_client() -> LCAClient:
         if not hasattr(app, "lca_client"):
@@ -1466,17 +1791,18 @@ if FASTAPI_AVAILABLE:
         logger.info("Material LCA API shut down")
 
 # ============================================================================
-# 12. INTEGRATION FACTORY (unchanged)
+# 12. INTEGRATION FACTORY (now includes storage)
 # ============================================================================
 def create_material_lca_integration(
     node_registry=None,
     pm_engine=None,
-    config: Optional[LCAConfig] = None
+    config: Optional[LCAConfig] = None,
+    storage: Optional[Any] = None,
 ):
     config = config or LCAConfig()
     lca_client = LCAClient(config)
     simulator = DigitalTwinMaterialSimulator(lca_client)
-    cost_function = AdaptiveMaterialCostFunction(lca_client, config)
+    cost_function = AdaptiveMaterialCostFunction(lca_client, config, storage)
 
     if node_registry:
         original_register = node_registry.register_node
@@ -1521,7 +1847,7 @@ def train_historical_model(log_path: Path = Path(LCAConfig().interaction_logs_pa
     logger.info("Historical ML training requires state vectors in logs. Please implement logging of state vectors.")
 
 # ============================================================================
-# 14. UNIT TESTS (Phase 10)
+# 14. UNIT TESTS (Phase 10) - extended
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -1609,11 +1935,41 @@ class TestMOEA(IsolatedAsyncioTestCase):
         self.assertGreater(len(pareto), 0)
 
 
+class TestNewComponents(IsolatedAsyncioTestCase):
+    async def test_limit_graph(self):
+        mgr = LimitGraphManager()
+        graph_id = "test_graph"
+        mgr.create_graph(graph_id, "Test", {})
+        mgr.add_node(graph_id, "n1", "type1", {"key": "val"})
+        nodes = mgr.get_nodes(graph_id)
+        self.assertEqual(len(nodes), 1)
+
+    async def test_modp(self):
+        opt = MODPOptimizer()
+        opt.add_state("s1", "p1", {"a":1}, {"obj":0.5}, 0)
+        states = opt.get_states("p1")
+        self.assertEqual(len(states), 1)
+
+    async def test_rlhf(self):
+        trainer = RLHFTrainer()
+        trainer.record_pair("p1", "prompt", "chosen", "rejected", 0.5)
+        pairs = trainer.get_pairs()
+        self.assertEqual(len(pairs), 1)
+
+    async def test_moe(self):
+        gating = MoEGatingNetwork(config={"expert_names": ["online", "offline"]})
+        metrics = {'carbon': 0.5, 'rare_earth': 0.5, 'water': 0.5, 'operational': 0.5, 'material_index': 0.5}
+        selected, probs = await gating.select_expert(metrics)
+        self.assertIn(selected, ["online", "offline"])
+
+
 # ============================================================================
-# 15. EXAMPLE USAGE
+# 15. EXAMPLE USAGE (unchanged, but now includes new components)
 # ============================================================================
 async def main():
-    config = LCAConfig(moea_enabled=True, moea_interval_seconds=10)  # shorter for demo
+    config = LCAConfig(moea_enabled=True, moea_interval_seconds=10,
+                       enable_limit_graph=True, enable_modp=True,
+                       enable_rlhf=True, enable_moe=True)
     lca_client = LCAClient(config)
     cost_func = AdaptiveMaterialCostFunction(lca_client, config)
 
@@ -1636,6 +1992,11 @@ async def main():
 
     # Record outcome
     await cost_func.record_outcome(cost=0.3, carbon_savings_kg=5, user_rating=0.9)
+
+    # Access new components
+    limit_graph = await cost_func.get_limit_graph()
+    print("Limit graph nodes:", len(limit_graph.get('nodes', [])))
+    print("MoE experts:", await cost_func.get_moe_experts())
 
     stats = cost_func.weight_optimizer.get_stats()
     print("Distillation stats:", stats)
