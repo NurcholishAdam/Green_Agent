@@ -6,7 +6,7 @@ ENHANCED WITH:
 - Adaptive authentication level selection via Multi‑Teacher On‑Policy Distillation.
 - State‑aware choice of auth level (light, standard, enhanced) based on context.
 - Online learning from authentication outcomes.
-- Teachers: rule‑based, historical ML, stateful Q.
+- Teachers: rule‑based, historical ML, stateful Q, RLHF.
 - Student: linear softmax with distillation + REINFORCE.
 - Persistence for Q‑teacher weights and interaction logs.
 - Offline training for historical ML teacher.
@@ -15,6 +15,13 @@ ENHANCED WITH:
 - Expanded state vector with additional security context features.
 - Public API for other modules to query security context.
 All previous features (carbon/helium tracking, predictive analytics, ledger, rate limiting, etc.) retained.
+
+New in this version:
+- Mixture‑of‑Experts (MoE) gating network for teacher combination.
+- Reinforcement Learning from Human Feedback (RLHF) teacher.
+- Evolutionary (bio‑inspired) optimizer for auth level selection.
+- LIMIT Graph integration (graph ID, embedding, metrics).
+- Multi‑Objective Decision Process (MODP) with configurable weights.
 """
 
 import asyncio
@@ -160,6 +167,21 @@ class ZeroTrustConfig(BaseSettings):
     distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
     distill_weight: float = Field(0.7, ge=0, le=1)
     rl_weight: float = Field(0.3, ge=0, le=1)
+
+    # NEW: MoE and RLHF parameters
+    gating_learning_rate: float = Field(0.005, ge=0.0001, le=1)
+    rlhf_feedback_weight: float = Field(0.3, ge=0, le=1)
+
+    # NEW: MODP objective weights
+    security_weight: float = Field(0.5, ge=0, le=1)
+    sustainability_weight: float = Field(0.3, ge=0, le=1)
+    latency_weight: float = Field(0.2, ge=0, le=1)
+
+    # NEW: Bio‑inspired / evolutionary
+    use_evolutionary: bool = False
+    evolutionary_population_size: int = Field(20, ge=2)
+    evolutionary_mutation_rate: float = Field(0.1, ge=0, le=1)
+    evolutionary_crossover_rate: float = Field(0.7, ge=0, le=1)
 
     # Persistence paths for distillation
     q_weights_path: str = Field("./auth_q_weights.json")
@@ -1135,25 +1157,29 @@ class SecurityContext:
         return grant in self.authorization_grants
 
 # ============================================================================
-# DISTILLATION COMPONENTS (Enhanced with more features)
+# DISTILLATION COMPONENTS (ENHANCED)
 # ============================================================================
+
+# Feature dimension increased to 13 (original 11 + human_feedback_score + graph_health)
+FEATURE_DIM = 13
 
 @dataclass
 class AuthState:
-    """State for the distillation agent, now with more features."""
+    """State for the distillation agent, with additional features."""
     carbon_intensity: float
     carbon_price: float
     helium_price: float
     threat_level: float
     request_sensitivity: float  # 0-1
-    # Historical performance
     recent_success_rate: float
     avg_sustainability_score: float
-    # NEW: additional context features
-    request_origin_trusted: float = 0.0  # 1 if trusted origin
-    identity_violation_count: float = 0.0  # normalized
-    current_load: float = 0.0  # 0-1 (request volume relative to limit)
-    time_since_key_rotation: float = 0.0  # in hours, normalized
+    request_origin_trusted: float = 0.0
+    identity_violation_count: float = 0.0
+    current_load: float = 0.0
+    time_since_key_rotation: float = 0.0
+    # NEW
+    human_feedback_score: float = 0.5  # 0..1
+    graph_health: float = 0.5  # 0..1 from LIMIT graph metrics
 
     def to_feature_vector(self) -> np.ndarray:
         features = [
@@ -1168,6 +1194,8 @@ class AuthState:
             min(self.identity_violation_count / 10.0, 1.0),
             self.current_load,
             min(self.time_since_key_rotation / 24.0, 1.0),
+            self.human_feedback_score,
+            self.graph_health,
         ]
         return np.array(features, dtype=np.float32)
 
@@ -1194,9 +1222,9 @@ class AuthRuleBasedTeacher(Teacher):
         elif state.carbon_price > 50 and state.helium_price > 1.0:
             probs[1] = 0.6  # standard
         elif state.identity_violation_count > 2.0:
-            probs[2] = 0.7  # enhanced due to violations
+            probs[2] = 0.7
         else:
-            probs[1] = 0.6  # standard default
+            probs[1] = 0.6
         return probs / probs.sum()
 
     def confidence(self, state: AuthState) -> float:
@@ -1233,7 +1261,7 @@ class AuthStatefulQTeacher(Teacher):
     def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
         self.lr = lr
         self.weights_path = weights_path or Path(ZeroTrustConfig().q_weights_path)
-        self.weights = np.zeros((11, 3))  # 11 features, 3 actions
+        self.weights = np.zeros((FEATURE_DIM, 3))  # 13 features, 3 actions
         self._load_state()
 
     def _load_state(self):
@@ -1242,6 +1270,9 @@ class AuthStatefulQTeacher(Teacher):
                 with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
+                if self.weights.shape[0] != FEATURE_DIM:
+                    logger.warning(f"Loaded Q‑weights shape {self.weights.shape}, expected ({FEATURE_DIM},3). Reinitializing.")
+                    self.weights = np.zeros((FEATURE_DIM, 3))
                 logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
@@ -1266,17 +1297,45 @@ class AuthStatefulQTeacher(Teacher):
         self._save_state()
 
 
+# NEW: RLHF Teacher
+class RLHFAuthTeacher(Teacher):
+    """
+    Teacher that incorporates human feedback to adjust authentication level probabilities.
+    High human feedback prefers 'standard' (balanced); low prefers 'light' (sustainability).
+    """
+    def __init__(self, feedback_weight: float = 0.3):
+        self.feedback_weight = feedback_weight
+
+    def predict(self, state: AuthState) -> np.ndarray:
+        probs = np.ones(3) / 3
+        if state.human_feedback_score > 0.7:
+            probs[1] += 0.2  # standard
+        elif state.human_feedback_score < 0.3:
+            probs[0] += 0.2  # light (sustainability)
+        else:
+            probs[0] += 0.1
+            probs[1] += 0.1
+            probs[2] += 0.1
+        return probs / probs.sum()
+
+    def confidence(self, state: AuthState) -> float:
+        return min(0.8, abs(state.human_feedback_score - 0.5) * 2 + 0.3)
+
+
 class DistillationStudent:
-    def __init__(self, feature_dim: int = 11, n_classes: int = 3, lr: float = 0.01):
+    def __init__(self, feature_dim: int = FEATURE_DIM, n_classes: int = 3, lr: float = 0.01):
+        self.feature_dim = feature_dim
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
         self.n_classes = n_classes
         self.counter = 0
 
-    def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
+    def predict_proba(self, state_vector: np.ndarray, num_classes: int = None) -> np.ndarray:
+        if num_classes is None:
+            num_classes = self.n_classes
         if num_classes != self.n_classes:
-            new_weights = np.zeros((self.weights.shape[0], num_classes))
+            new_weights = np.zeros((self.feature_dim, num_classes))
             new_biases = np.zeros(num_classes)
             min_dim = min(self.n_classes, num_classes)
             new_weights[:, :min_dim] = self.weights[:, :min_dim]
@@ -1324,23 +1383,59 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+# NEW: MoE Gating Network
+class MoEGatingNetwork:
+    """
+    Learnable gating network for combining teacher outputs (Mixture‑of‑Experts).
+    """
+    def __init__(self, feature_dim: int = FEATURE_DIM, n_experts: int = 4, lr: float = 0.005):
+        self.feature_dim = feature_dim
+        self.n_experts = n_experts
+        self.lr = lr
+        self.weights = np.random.randn(feature_dim, n_experts) * 0.01
+        self.bias = np.zeros(n_experts)
+
+    def forward(self, state_vec: np.ndarray) -> np.ndarray:
+        logits = state_vec @ self.weights + self.bias
+        exp_logits = np.exp(logits - np.max(logits))
+        return exp_logits / exp_logits.sum()
+
+    def update(self, state_vec: np.ndarray, teacher_probs: np.ndarray, student_probs: np.ndarray):
+        gate_weights = self.forward(state_vec)
+        combined = np.sum(gate_weights[:, None] * teacher_probs, axis=0)
+        error = combined - student_probs
+        grad_gate = np.dot(teacher_probs, error)
+        self.weights -= self.lr * np.outer(state_vec, grad_gate)
+        self.bias -= self.lr * grad_gate
+
+
 class DistillationAuthOptimizer:
     LEVELS = ['light', 'standard', 'enhanced']
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self.feature_dim = FEATURE_DIM
         self.student = DistillationStudent(
-            feature_dim=11,
+            feature_dim=self.feature_dim,
             lr=config.get('distillation_learning_rate', 0.01)
         )
+        # Teachers: rule-based, historical, Q, RLHF
         self.teachers: List[Teacher] = [
             AuthRuleBasedTeacher(),
             AuthHistoricalMLTeacher(model_path=config.get('historical_model_path')),
             AuthStatefulQTeacher(
                 lr=config.get('q_learning_rate', 0.1),
                 weights_path=config.get('q_weights_path')
-            )
+            ),
+            RLHFAuthTeacher(feedback_weight=config.get('rlhf_feedback_weight', 0.3))
         ]
+        self.n_teachers = len(self.teachers)
+        # MoE gating
+        self.gating = MoEGatingNetwork(
+            feature_dim=self.feature_dim,
+            n_experts=self.n_teachers,
+            lr=config.get('gating_learning_rate', 0.005)
+        )
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
         self.train_every = config.get('distillation_train_every', 10)
@@ -1348,31 +1443,31 @@ class DistillationAuthOptimizer:
         self.distill_weight = config.get('distill_weight', 0.7)
         self.rl_weight = config.get('rl_weight', 0.3)
 
-    async def select_auth_level(self, state: AuthState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+    def _compute_teacher_probs(self, state: AuthState) -> Tuple[np.ndarray, np.ndarray]:
         state_vec = state.to_feature_vector()
-        n = 3
-
-        teacher_probs = np.zeros(n)
-        total_conf = 0.0
+        teacher_outputs = []
         for teacher in self.teachers:
             prob = teacher.predict(state)
-            conf = teacher.confidence(state)
-            if len(prob) != n:
-                if len(prob) < n:
-                    prob = np.pad(prob, (0, n - len(prob)), 'constant')
+            if len(prob) != 3:
+                if len(prob) < 3:
+                    prob = np.pad(prob, (0, 3 - len(prob)), 'constant')
                 else:
-                    prob = prob[:n]
-            teacher_probs += prob * conf
-            total_conf += conf
-        if total_conf > 0:
-            teacher_probs /= total_conf
-        else:
-            teacher_probs = np.ones(n) / n
+                    prob = prob[:3]
+            teacher_outputs.append(prob)
+        teacher_outputs = np.array(teacher_outputs)  # (n_teachers, 3)
+        gate_weights = self.gating.forward(state_vec)
+        combined = np.sum(gate_weights[:, None] * teacher_outputs, axis=0)
+        combined = combined / combined.sum()
+        return combined, gate_weights
 
-        student_probs = self.student.predict_proba(state_vec, n)
+    async def select_auth_level(self, state: AuthState, exploration: bool = True) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        state_vec = state.to_feature_vector()
+        teacher_probs, gate_weights = self._compute_teacher_probs(state)
+
+        student_probs = self.student.predict_proba(state_vec, 3)
 
         if exploration and random.random() < self.epsilon:
-            action_idx = random.randint(0, n - 1)
+            action_idx = random.randint(0, 2)
         else:
             combined = 0.8 * student_probs + 0.2 * teacher_probs
             action_idx = np.argmax(combined)
@@ -1387,11 +1482,80 @@ class DistillationAuthOptimizer:
             batch = self.replay_buffer.sample(8)
             states, actions, rewards, _, teacher_probs_batch = batch
             for i in range(len(states)):
+                # Update student
                 self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
                                     distill_weight=self.distill_weight, rl_weight=self.rl_weight)
+                # Update gating
+                student_out = self.student.predict_proba(states[i])
+                self.gating.update(states[i], teacher_probs_batch[i], student_out)
 
     def get_stats(self) -> Dict:
-        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+        return {
+            'student_counter': self.student.counter,
+            'buffer_size': len(self.replay_buffer),
+            'n_teachers': self.n_teachers
+        }
+
+
+# NEW: Evolutionary (Bio-inspired) Optimizer
+class EvolutionaryAuthOptimizer:
+    """
+    Simple genetic algorithm for auth level selection.
+    """
+    def __init__(self, population_size: int = 20, mutation_rate: float = 0.1,
+                 crossover_rate: float = 0.7, elitism: int = 2):
+        self.population_size = population_size
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.elitism = elitism
+        self.population = [np.random.dirichlet(np.ones(3)) for _ in range(population_size)]
+        self.fitness = np.zeros(population_size)
+        self.best_individual = self.population[0]
+        self.best_index = 0
+
+    def select_auth_level(self, state_vec: np.ndarray) -> Tuple[int, np.ndarray]:
+        best_probs = self.best_individual
+        action_idx = np.argmax(best_probs)
+        return action_idx, best_probs
+
+    def update_fitness(self, reward: float, index: int = 0):
+        self.fitness[index] = reward
+        best_idx = np.argmax(self.fitness)
+        self.best_individual = self.population[best_idx]
+        self.best_index = best_idx
+        self._evolve()
+
+    def _evolve(self):
+        sorted_indices = np.argsort(self.fitness)[::-1]
+        new_population = [self.population[i] for i in sorted_indices[:self.elitism]]
+        while len(new_population) < self.population_size:
+            parent1 = self._tournament_selection()
+            parent2 = self._tournament_selection()
+            if random.random() < self.crossover_rate:
+                child = self._crossover(parent1, parent2)
+            else:
+                child = parent1.copy()
+            child = self._mutate(child)
+            new_population.append(child)
+        self.population = new_population
+        self.fitness = np.zeros(self.population_size)
+
+    def _tournament_selection(self, k=3):
+        candidates = random.sample(range(self.population_size), k)
+        best = max(candidates, key=lambda i: self.fitness[i])
+        return self.population[best]
+
+    def _crossover(self, p1, p2):
+        alpha = random.random()
+        return alpha * p1 + (1 - alpha) * p2
+
+    def _mutate(self, individual):
+        mutated = individual.copy()
+        for i in range(len(mutated)):
+            if random.random() < self.mutation_rate:
+                mutated[i] += random.gauss(0, 0.1)
+                mutated[i] = max(0.01, mutated[i])
+        return mutated / mutated.sum()
 
 
 # ============================================================================
@@ -1405,22 +1569,34 @@ class CarbonAwareAuthenticator:
         self.auth_history = deque(maxlen=1000)
         self._lock = asyncio.Lock()
         self.message_queue = message_queue
+
+        config = ZeroTrustConfig()
         self.auth_optimizer = DistillationAuthOptimizer({
-            'distillation_epsilon': ZeroTrustConfig().distillation_epsilon,
-            'distillation_train_every': ZeroTrustConfig().distillation_train_every,
-            'distillation_replay_size': ZeroTrustConfig().distillation_replay_size,
-            'distillation_learning_rate': ZeroTrustConfig().distillation_learning_rate,
-            'distill_weight': ZeroTrustConfig().distill_weight,
-            'rl_weight': ZeroTrustConfig().rl_weight,
-            'historical_model_path': ZeroTrustConfig().historical_model_path,
-            'q_weights_path': ZeroTrustConfig().q_weights_path,
+            'distillation_epsilon': config.distillation_epsilon,
+            'distillation_train_every': config.distillation_train_every,
+            'distillation_replay_size': config.distillation_replay_size,
+            'distillation_learning_rate': config.distillation_learning_rate,
+            'distill_weight': config.distill_weight,
+            'rl_weight': config.rl_weight,
+            'historical_model_path': config.historical_model_path,
+            'q_weights_path': config.q_weights_path,
+            'gating_learning_rate': config.gating_learning_rate,
+            'rlhf_feedback_weight': config.rlhf_feedback_weight,
         })
+        self.evolutionary_optimizer = None
+        if config.use_evolutionary:
+            self.evolutionary_optimizer = EvolutionaryAuthOptimizer(
+                population_size=config.evolutionary_population_size,
+                mutation_rate=config.evolutionary_mutation_rate,
+                crossover_rate=config.evolutionary_crossover_rate
+            )
+
         self.interaction_log: List[Dict] = []
         self.last_state_vec: Optional[np.ndarray] = None
         self.last_action_idx: Optional[int] = None
         self.last_teacher_probs: Optional[np.ndarray] = None
 
-        logger.info("Carbon-Aware Authenticator initialized with distillation, FeedbackEvent, and optional message queue")
+        logger.info("Carbon-Aware Authenticator initialized with distillation, MoE, RLHF, evolutionary, FeedbackEvent, and message queue")
 
     async def authenticate_with_carbon_awareness(
         self,
@@ -1442,7 +1618,7 @@ class CarbonAwareAuthenticator:
 
         helium_price = helium_price or 0.5
 
-        # Build state with extra features if provided
+        # Build state with extra features
         state = AuthState(
             carbon_intensity=carbon_intensity,
             carbon_price=carbon_price,
@@ -1455,15 +1631,25 @@ class CarbonAwareAuthenticator:
             identity_violation_count=extra_state.get('identity_violation_count', 0.0) if extra_state else 0.0,
             current_load=extra_state.get('current_load', 0.0) if extra_state else 0.0,
             time_since_key_rotation=extra_state.get('time_since_key_rotation', 0.0) if extra_state else 0.0,
+            human_feedback_score=extra_state.get('human_feedback_score', 0.5) if extra_state else 0.5,
+            graph_health=extra_state.get('graph_health', 0.5) if extra_state else 0.5,
         )
+
         auth_level, action_idx, state_vec, teacher_probs = await self.auth_optimizer.select_auth_level(
             state, exploration=True
         )
+
+        # Evolutionary blending if enabled
+        if self.evolutionary_optimizer is not None:
+            evo_action, evo_probs = self.evolutionary_optimizer.select_auth_level(state_vec)
+            combined_probs = 0.7 * teacher_probs + 0.3 * evo_probs
+            action_idx = np.argmax(combined_probs)
+            auth_level = self.auth_optimizer.LEVELS[action_idx]
+
         self.last_state_vec = state_vec
         self.last_action_idx = action_idx
         self.last_teacher_probs = teacher_probs
 
-        # Map auth level to parameters
         if auth_level == 'light':
             auth_factors = 1
             session_duration = 7200
@@ -1491,12 +1677,12 @@ class CarbonAwareAuthenticator:
                 'sustainability_score': sustainability_score
             })
 
-        # Emit FeedbackEvent (if available and message queue configured)
+        # Emit FeedbackEvent
         if FeedbackEvent is not None and self.message_queue is not None:
             try:
                 event = FeedbackEvent(
                     source="carbon_aware_authenticator",
-                    feedback_type="routing",  # or "security", but using existing types
+                    feedback_type="routing",
                     task_id=extra_state.get('task_id', 'unknown') if extra_state else 'unknown',
                     context={"auth_level": auth_level},
                     action={"selected_action": auth_level,
@@ -1528,12 +1714,36 @@ class CarbonAwareAuthenticator:
         }
 
     async def record_outcome(self, success: bool, carbon_saved_kg: float, sustainability_score: float, latency_ms: float = 0.0):
-        if success:
-            reward = 0.6
-            reward += 0.2 * min(1.0, carbon_saved_kg / 0.1)
-            reward += 0.2 * sustainability_score
-        else:
-            reward = 0.0
+        # MODP: read weights from config (or defaults)
+        config = ZeroTrustConfig()
+        security_weight = config.security_weight
+        sustainability_weight = config.sustainability_weight
+        latency_weight = config.latency_weight
+        total_weight = security_weight + sustainability_weight + latency_weight
+        if total_weight <= 0:
+            total_weight = 1.0
+        security_weight /= total_weight
+        sustainability_weight /= total_weight
+        latency_weight /= total_weight
+
+        # Compute reward components
+        security_score = 1.0 if success else 0.0
+        sustainability_score = max(0.0, min(1.0, sustainability_score))
+        latency_score = 1.0 - min(1.0, latency_ms / 1000.0)  # assume max 1s
+
+        # Human feedback contribution (10%)
+        human_alignment = 0.5  # default, could be from extra state if available
+        # For simplicity, use 0.5 if not available; in full integration we'd store last human feedback
+        if self.last_state_vec is not None:
+            # human_feedback_score is at index 11 in feature vector
+            human_alignment = self.last_state_vec[11]
+
+        objective_reward = (
+            security_weight * security_score +
+            sustainability_weight * sustainability_score +
+            latency_weight * latency_score
+        )
+        reward = 0.9 * objective_reward + 0.1 * human_alignment
         reward = max(0.0, min(1.0, reward))
 
         self.interaction_log.append({
@@ -1559,6 +1769,9 @@ class CarbonAwareAuthenticator:
                 next_state_vec,
                 self.last_teacher_probs
             )
+            # Evolutionary update
+            if self.evolutionary_optimizer is not None:
+                self.evolutionary_optimizer.update_fitness(reward, index=0)
 
     def _get_recent_success_rate(self) -> float:
         if not self.interaction_log:
@@ -1678,7 +1891,6 @@ class SecuritySustainabilityDashboard:
             if len(self.history) > 1000:
                 self.history = self.history[-1000:]
 
-        # Optionally publish dashboard status
         if self.message_queue:
             try:
                 await self.message_queue.publish("sustainability_dashboard", status)
@@ -1797,6 +2009,13 @@ class ZeroTrustArchitecture:
         self.sustainability_score = 0.0
         self.total_carbon_savings_kg = 0.0
 
+        # NEW: LIMIT Graph fields
+        self.graph_id: Optional[str] = None
+        self.graph_embedding: Optional[List[float]] = None
+        self.graph_metrics: Optional[Dict[str, float]] = None
+        self.human_feedback_score: float = 0.5  # global default, can be per request
+        self.use_evolutionary = config.use_evolutionary
+
         self._background_tasks: List[asyncio.Task] = []
 
         self._initialize_security()
@@ -1806,7 +2025,7 @@ class ZeroTrustArchitecture:
             self._load_state_task = asyncio.create_task(self._load_state())
             self._background_tasks.append(self._load_state_task)
 
-        logger.info("Enhanced Zero Trust Architecture v4.2.0 initialized with distillation, FeedbackEvent, and message queue")
+        logger.info("Enhanced Zero Trust Architecture v4.2.0 initialized with distillation, MoE, RLHF, evolutionary, graph, and message queue")
 
     def _start_background_tasks(self):
         if self.enable_carbon_intensity:
@@ -1850,6 +2069,7 @@ class ZeroTrustArchitecture:
                 'security_violations': len(self.security_events),
                 'sustainability_score': self.sustainability_score,
                 'carbon_savings_kg': self.total_carbon_savings_kg,
+                'graph_health': self.graph_metrics.get('centrality', 0.5) if self.graph_metrics else 0.5,
             }
         }
 
@@ -1985,6 +2205,9 @@ class ZeroTrustArchitecture:
             'rate_limit_multiplier': self.rate_limiter.get_current_threat_multiplier() if self.rate_limiter else 1.0,
             'active_sessions': len(self.active_sessions),
             'sustainability_score': self.sustainability_score,
+            # NEW
+            'graph_health': self.graph_metrics.get('centrality', 0.5) if self.graph_metrics else 0.5,
+            'human_feedback_score': self.human_feedback_score,
         }
         return context
 
@@ -2015,15 +2238,19 @@ class ZeroTrustArchitecture:
         request_sensitivity = self._determine_security_level(request).value / 4.0
 
         # Additional state for distillation
+        graph_health = self.graph_metrics.get('centrality', 0.5) if self.graph_metrics else 0.5
         extra_state = {
             'request_origin_trusted': 1.0 if request.get('origin') in self.identities.get(credentials.get('identity'), {}).get('trusted_origins', []) else 0.0,
             'identity_violation_count': self._count_violations(credentials.get('identity', '')),
-            'current_load': len(self.audit_log) / 1000.0,  # rough load indicator
+            'current_load': len(self.audit_log) / 1000.0,
             'time_since_key_rotation': (datetime.utcnow() - datetime.fromtimestamp(self._key_rotation_counter)).total_seconds() / 3600.0 if self._key_rotation_counter else 0.0,
             'task_id': request.get('task_id', 'unknown'),
+            'human_feedback_score': self.human_feedback_score,
+            'graph_health': graph_health,
         }
 
         auth_level = 'standard'
+        auth_result = None
         if self.enable_carbon_auth and self.carbon_authenticator:
             auth_result = await self.carbon_authenticator.authenticate_with_carbon_awareness(
                 request, credentials, carbon_intensity, carbon_price, helium_price,
@@ -2127,7 +2354,7 @@ class ZeroTrustArchitecture:
             await self.carbon_authenticator.record_outcome(
                 success=True,
                 carbon_saved_kg=carbon_saved,
-                sustainability_score=auth_result.get('sustainability_score', 0.5) if self.enable_carbon_auth else 0.5
+                sustainability_score=auth_result.get('sustainability_score', 0.5) if auth_result else 0.5
             )
 
         return context
@@ -2718,7 +2945,7 @@ class SecurityException(Exception):
 
 
 # ============================================================================
-# UNIT TESTS (Phase 10) - updated for new feature dimension
+# UNIT TESTS (updated for new feature dimension)
 # ============================================================================
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -2732,6 +2959,8 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             'distillation_train_every': 10,
             'distill_weight': 0.7,
             'rl_weight': 0.3,
+            'gating_learning_rate': 0.005,
+            'rlhf_feedback_weight': 0.3,
         }
         self.optimizer = DistillationAuthOptimizer(self.config)
 
@@ -2744,9 +2973,11 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
             request_sensitivity=0.5,
             recent_success_rate=0.7,
             avg_sustainability_score=0.6,
+            human_feedback_score=0.7,
+            graph_health=0.6,
         )
         vec = state.to_feature_vector()
-        self.assertEqual(len(vec), 11)
+        self.assertEqual(len(vec), FEATURE_DIM)
 
     def test_rule_based_teacher(self):
         teacher = AuthRuleBasedTeacher()
@@ -2763,6 +2994,21 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         self.assertAlmostEqual(sum(probs), 1.0)
         self.assertGreater(probs[0], probs[1])
 
+    def test_rlhf_teacher(self):
+        teacher = RLHFAuthTeacher()
+        state_high = AuthState(
+            carbon_intensity=400,
+            carbon_price=50,
+            helium_price=0.5,
+            threat_level=0.3,
+            request_sensitivity=0.5,
+            recent_success_rate=0.7,
+            avg_sustainability_score=0.6,
+            human_feedback_score=0.9,
+        )
+        probs_high = teacher.predict(state_high)
+        self.assertGreater(probs_high[1], probs_high[0])
+
     async def test_select_auth_level(self):
         state = AuthState(
             carbon_intensity=400,
@@ -2775,14 +3021,31 @@ class TestDistillationComponents(IsolatedAsyncioTestCase):
         )
         level, idx, state_vec, teacher_probs = await self.optimizer.select_auth_level(state, exploration=False)
         self.assertIn(level, self.optimizer.LEVELS)
+        self.assertEqual(len(state_vec), FEATURE_DIM)
 
     def test_replay_buffer(self):
         buffer = ReplayBuffer(max_size=5)
-        state_vec = np.random.randn(11)
+        state_vec = np.random.randn(FEATURE_DIM)
         buffer.push(state_vec, 0, 1.0, state_vec, np.ones(3)/3)
         self.assertEqual(len(buffer), 1)
         batch = buffer.sample(1)
         self.assertEqual(len(batch[0]), 1)
+
+    def test_moe_gating(self):
+        gate = MoEGatingNetwork(feature_dim=FEATURE_DIM, n_experts=4)
+        state_vec = np.random.randn(FEATURE_DIM)
+        weights = gate.forward(state_vec)
+        self.assertEqual(len(weights), 4)
+        self.assertAlmostEqual(sum(weights), 1.0)
+
+    def test_evolutionary_optimizer(self):
+        evo = EvolutionaryAuthOptimizer(population_size=10)
+        state_vec = np.random.randn(FEATURE_DIM)
+        action, probs = evo.select_auth_level(state_vec)
+        self.assertIn(action, range(3))
+        self.assertEqual(len(probs), 3)
+        evo.update_fitness(0.8, index=0)
+        self.assertIsNotNone(evo.best_individual)
 
 
 # ============================================================================
@@ -2837,6 +3100,12 @@ if __name__ == "__main__":
             "trusted_origins": ["internal"],
             "roles": ["expert"]
         }
+        # Set graph fields
+        zta.graph_id = "graph-security-001"
+        zta.graph_embedding = [0.1, 0.2, 0.3]
+        zta.graph_metrics = {"centrality": 0.75}
+        zta.human_feedback_score = 0.6
+
         # Authenticate
         context = await zta.authenticate_request(
             {"data_classification": "internal"},
