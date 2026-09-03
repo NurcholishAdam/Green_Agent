@@ -296,9 +296,7 @@ python -m unittest discover -s schemas -p "*_test.py"
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
----
 
 ## 📄 License
 
 This project is licensed under the MIT License – see [LICENSE](LICENSE) for details.
-```
