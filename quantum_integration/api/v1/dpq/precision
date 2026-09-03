@@ -1,4 +1,6 @@
-# OpenAPI 3.0 Specification (excerpt)
+# OpenAPI 3.0 Specification (Enhanced Excerpt)
+# Includes enhancements for LIMIT Graph, MODP, RLHF,
+# Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, and MoE Expert Gating.
 
 paths:
   /api/v1/dpq/precision:
@@ -25,7 +27,19 @@ paths:
                   last_transition:
                     type: string
                     format: date-time
-                    
+                  # Enhanced fields
+                  graph_metrics:
+                    $ref: '#/components/schemas/GraphMetrics'
+                  modp_weights:
+                    $ref: '#/components/schemas/MODPWeights'
+                  human_feedback_score:
+                    type: number
+                    format: float
+                    minimum: 0
+                    maximum: 1
+                  distillation_stats:
+                    $ref: '#/components/schemas/DistillationStats'
+
     post:
       summary: Manually trigger precision transition
       requestBody:
@@ -44,6 +58,17 @@ paths:
                   type: boolean
                   default: false
                   description: Bypass carbon zone policy
+                # Enhanced: optional inputs for decision support
+                graph_metrics:
+                  $ref: '#/components/schemas/GraphMetrics'
+                human_feedback_score:
+                  type: number
+                  format: float
+                  minimum: 0
+                  maximum: 1
+                use_evolutionary:
+                  type: boolean
+                  default: false
       responses:
         '202':
           description: Transition initiated
@@ -51,7 +76,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransitionRequest'
-                
+
   /api/v1/dpq/precision/{region}/models:
     get:
       summary: List models and their precision variants
@@ -61,6 +86,13 @@ paths:
           required: true
           schema:
             type: string
+        # Enhanced query params for graph metrics
+        - name: include_graph
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include graph embeddings and metrics in response
       responses:
         '200':
           content:
@@ -86,7 +118,196 @@ paths:
                               $ref: '#/components/schemas/ModelVariant'
                             int4:
                               $ref: '#/components/schemas/ModelVariant'
-                              
+                        graph_embedding:
+                          type: array
+                          items:
+                            type: number
+                            format: float
+                        graph_metrics:
+                          $ref: '#/components/schemas/GraphMetrics'
+
+  # ------------------------------------------------------------------
+  # New endpoints for advanced decision-making
+  # ------------------------------------------------------------------
+
+  /api/v1/dpq/precision/decision:
+    post:
+      summary: Obtain adaptive precision recommendation via distillation/MoE
+      description: >
+        Uses multi‑teacher on‑policy distillation with MoE gating to select
+        the optimal precision for the given workload and context.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [region, workload_features]
+              properties:
+                region:
+                  type: string
+                workload_features:
+                  $ref: '#/components/schemas/WorkloadFeatures'
+                graph_metrics:
+                  $ref: '#/components/schemas/GraphMetrics'
+                human_feedback_score:
+                  type: number
+                  format: float
+                  minimum: 0
+                  maximum: 1
+                modp_weights:
+                  $ref: '#/components/schemas/MODPWeights'
+                use_evolutionary:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Recommendation generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recommended_precision:
+                    type: string
+                    enum: [fp32, fp16, int8, int4]
+                  confidence:
+                    type: number
+                    format: float
+                    minimum: 0
+                    maximum: 1
+                  teacher_probs:
+                    type: array
+                    items:
+                      type: number
+                      format: float
+                  student_probs:
+                    type: array
+                    items:
+                      type: number
+                      format: float
+                  gate_weights:
+                    type: array
+                    items:
+                      type: number
+                      format: float
+                  modp_scores:
+                    $ref: '#/components/schemas/MODPScores'
+                  decision_id:
+                    type: string
+
+  /api/v1/dpq/precision/rlhf:
+    post:
+      summary: Submit human feedback for RLHF updates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision_id, feedback_score]
+              properties:
+                decision_id:
+                  type: string
+                feedback_score:
+                  type: number
+                  format: float
+                  minimum: 0
+                  maximum: 1
+                comment:
+                  type: string
+      responses:
+        '200':
+          description: Feedback accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [received, pending, applied]
+                  rlhf_teacher_updated:
+                    type: boolean
+
+  /api/v1/dpq/precision/graph:
+    get:
+      summary: Retrieve LIMIT Graph metrics for the current region
+      parameters:
+        - name: region
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  region:
+                    type: string
+                  graph_id:
+                    type: string
+                  centrality:
+                    type: number
+                    format: float
+                  connectivity:
+                    type: number
+                    format: float
+                  density:
+                    type: number
+                    format: float
+                  embedding:
+                    type: array
+                    items:
+                      type: number
+                      format: float
+
+  /api/v1/dpq/precision/evolution:
+    post:
+      summary: Trigger evolutionary optimisation of precision policy
+      description: >
+        Runs a genetic algorithm to evolve the weights used in the
+        precision decision process.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                population_size:
+                  type: integer
+                  default: 20
+                generations:
+                  type: integer
+                  default: 50
+                mutation_rate:
+                  type: number
+                  format: float
+                  default: 0.1
+                crossover_rate:
+                  type: number
+                  format: float
+                  default: 0.7
+      responses:
+        '200':
+          description: Evolution completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  best_weights:
+                    $ref: '#/components/schemas/MODPWeights'
+                  fitness_history:
+                    type: array
+                    items:
+                      type: number
+                      format: float
+
 components:
   schemas:
     ModelVariant:
@@ -103,7 +324,7 @@ components:
         last_converted:
           type: string
           format: date-time
-          
+
     TransitionRequest:
       type: object
       properties:
@@ -115,3 +336,130 @@ components:
         estimated_completion:
           type: string
           format: date-time
+        # Enhanced
+        modp_scores:
+          $ref: '#/components/schemas/MODPScores'
+        graph_metrics:
+          $ref: '#/components/schemas/GraphMetrics'
+        teacher_probs:
+          type: array
+          items:
+            type: number
+            format: float
+
+    GraphMetrics:
+      type: object
+      properties:
+        centrality:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        connectivity:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        density:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        graph_id:
+          type: string
+        embedding:
+          type: array
+          items:
+            type: number
+            format: float
+
+    MODPWeights:
+      type: object
+      properties:
+        carbon:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        energy:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        latency:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        cost:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        quality:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+
+    MODPScores:
+      type: object
+      properties:
+        carbon_score:
+          type: number
+          format: float
+        energy_score:
+          type: number
+          format: float
+        latency_score:
+          type: number
+          format: float
+        cost_score:
+          type: number
+          format: float
+        quality_score:
+          type: number
+          format: float
+        overall:
+          type: number
+          format: float
+
+    WorkloadFeatures:
+      type: object
+      properties:
+        token_count:
+          type: integer
+          minimum: 1
+        latency_target_ms:
+          type: number
+          format: float
+          minimum: 0
+        data_size_bytes:
+          type: integer
+          minimum: 0
+        model_size_bytes:
+          type: integer
+          minimum: 0
+        task_type:
+          type: string
+          enum: [inference, training, batch]
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 10
+
+    DistillationStats:
+      type: object
+      properties:
+        student_counter:
+          type: integer
+        buffer_size:
+          type: integer
+        n_teachers:
+          type: integer
+        epsilon:
+          type: number
+          format: float
+        gating_lr:
+          type: number
+          format: float
