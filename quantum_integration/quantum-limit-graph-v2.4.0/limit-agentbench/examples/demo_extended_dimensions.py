@@ -7,11 +7,22 @@ Showcases:
 3. Inference variance (stability under repeated execution)
 4. Three specialized 2D plots (policy-oriented visualizations)
 
-Run with: python examples/demo_extended_dimensions.py
+Enhanced with optional advanced techniques:
+- LIMIT Graph metrics influence decision-making
+- MODP (Multi-Objective Decision Process) weights are evolved or tuned
+- RLHF (human feedback) adjusts preferences
+- Multi-Teacher Distillation with MoE gating combines different ranking methods
+- Bio-inspired optimisation (evolutionary algorithm) finds optimal constraint weights
+
+Run with: python examples/demo_extended_dimensions.py [--enhanced]
 """
 
 import sys
+import argparse
 from pathlib import Path
+import random
+import numpy as np
+from collections import deque
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
@@ -22,9 +33,140 @@ from visualization.pareto_plotter import ParetoPlotter
 
 def print_section(title):
     """Print formatted section header"""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print(f"  {title}")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Enhanced Demo 7: Integration of LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio-inspired
+# ---------------------------------------------------------------------------
+def demo_enhanced_analysis_with_advanced_techniques(agents, analyzer):
+    """
+    Demonstrates advanced techniques applied to the 7D Pareto analysis.
+    """
+    print_section("DEMO 7: Enhanced Analysis with LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio-inspired")
+
+    # 1. LIMIT Graph metrics (assumed from causal/policy graphs)
+    # In a real system, these would come from GraphRegistry.health()
+    graph_metrics = {
+        "centrality": 0.7,
+        "connectivity": 0.6,
+        "density": 0.5
+    }
+    print(f"🌐 LIMIT Graph Metrics: {graph_metrics}")
+
+    # 2. RLHF: human feedback score (0-1, higher = prefers accuracy over efficiency)
+    human_feedback = 0.8
+    print(f"👤 RLHF Feedback Score: {human_feedback} (prefers accuracy)")
+
+    # 3. MODP: objective weights (accuracy, energy, carbon, latency, memory, circuit_depth, variance)
+    # We'll evolve these using a simple genetic algorithm (bio-inspired)
+    print("\n🧬 Evolving MODP weights using genetic algorithm...")
+    n_objectives = 7
+    population_size = 20
+    generations = 15
+    mutation_rate = 0.3
+    crossover_rate = 0.7
+    elitism = 2
+
+    def fitness(weights):
+        """Evaluate a weight vector by how well it separates frontier agents from dominated ones."""
+        # We want a high score for frontier agents and low for dominated
+        frontier_ids = {a.agent_id for a in analyzer.compute_frontier(agents)}
+        total = 0.0
+        for agent in agents:
+            # Normalize metrics (higher better for accuracy, lower for others)
+            acc = agent.accuracy
+            energy = 1.0 - min(agent.energy_kwh * 1000 / 10.0, 1.0)
+            carbon = 1.0 - min(agent.carbon_co2e_kg * 1000 / 2.0, 1.0)
+            latency = 1.0 - min(agent.latency_ms / 500.0, 1.0)
+            memory = 1.0 - min(agent.memory_mb / 2048.0, 1.0)
+            depth = 1.0 - min(agent.circuit_depth / 50.0, 1.0)
+            variance = 1.0 - agent.variance_score
+            vec = np.array([acc, energy, carbon, latency, memory, depth, variance])
+            score = np.dot(weights, vec)
+            # If agent is on frontier, we want higher score; else lower
+            if agent.agent_id in frontier_ids:
+                total += score
+            else:
+                total -= score * 0.5
+        return total / len(agents)
+
+    population = [np.random.dirichlet(np.ones(n_objectives)) for _ in range(population_size)]
+    best_weights = population[0]
+
+    for gen in range(generations):
+        scores = [fitness(w) for w in population]
+        best_idx = np.argmax(scores)
+        best_weights = population[best_idx]
+        # Create new population
+        sorted_indices = np.argsort(scores)[::-1]
+        new_pop = [population[i] for i in sorted_indices[:elitism]]
+        while len(new_pop) < population_size:
+            parent1 = population[random.randint(0, population_size-1)]
+            parent2 = population[random.randint(0, population_size-1)]
+            if random.random() < crossover_rate:
+                alpha = random.random()
+                child = alpha * parent1 + (1 - alpha) * parent2
+            else:
+                child = parent1.copy()
+            child += np.random.dirichlet(np.ones(n_objectives)) * mutation_rate
+            child = child / child.sum()
+            new_pop.append(child)
+        population = new_pop
+
+    print(f"   Evolved weights (accuracy, energy, carbon, latency, memory, depth, variance):")
+    print(f"   {np.round(best_weights, 3)}")
+
+    # 4. Multi-Teacher Distillation with MoE gating (simplified)
+    # Three teachers: Rule-based, RLHF-based, Historical (simulated)
+    def rule_teacher(agent):
+        # Rule: prefer high accuracy if centrality high, else prefer efficiency
+        if graph_metrics["centrality"] > 0.5:
+            return agent.accuracy
+        else:
+            return 1.0 - min(agent.energy_kwh * 1000 / 10.0, 1.0)
+
+    def rlhf_teacher(agent):
+        # Human feedback: high -> accuracy; low -> energy efficiency
+        if human_feedback > 0.5:
+            return agent.accuracy
+        else:
+            return 1.0 - min(agent.energy_kwh * 1000 / 10.0, 1.0)
+
+    def historical_teacher(agent):
+        # Simulate a model that has learned from history
+        return 0.7 * agent.accuracy + 0.3 * (1.0 - min(agent.energy_kwh * 1000 / 10.0, 1.0))
+
+    # MoE gating weights (learned or fixed for demo)
+    gate_weights = np.array([0.4, 0.4, 0.2])
+
+    def moe_score(agent):
+        scores = np.array([rule_teacher(agent), rlhf_teacher(agent), historical_teacher(agent)])
+        return np.dot(gate_weights, scores)
+
+    # 5. Combine MODP and MoE scores for final ranking
+    print("\n📊 Enhanced agent ranking (MODP + MoE):")
+    agent_scores = {}
+    for agent in agents:
+        # Normalize metrics for MODP
+        acc = agent.accuracy
+        energy = 1.0 - min(agent.energy_kwh * 1000 / 10.0, 1.0)
+        carbon = 1.0 - min(agent.carbon_co2e_kg * 1000 / 2.0, 1.0)
+        latency = 1.0 - min(agent.latency_ms / 500.0, 1.0)
+        memory = 1.0 - min(agent.memory_mb / 2048.0, 1.0)
+        depth = 1.0 - min(agent.circuit_depth / 50.0, 1.0)
+        variance = 1.0 - agent.variance_score
+        vec = np.array([acc, energy, carbon, latency, memory, depth, variance])
+        modp_score = np.dot(best_weights, vec)
+        moe = moe_score(agent)
+        final_score = 0.6 * modp_score + 0.4 * moe
+        agent_scores[agent.agent_id] = final_score
+        print(f"   {agent.agent_id}: MODP={modp_score:.3f}, MoE={moe:.3f}, Final={final_score:.3f}")
+
+    best_agent_id = max(agent_scores, key=agent_scores.get)
+    print(f"\n🏆 Best agent with enhancements: {best_agent_id}")
 
 
 def demo_7d_pareto_analysis():
@@ -33,45 +175,37 @@ def demo_7d_pareto_analysis():
     
     print("Scenario: Compare Cinebench classifiers with ALL dimensions\n")
     
-    # Create agents with realistic extended dimensions
     agents = [
-        # ResNet50: High accuracy, high resource usage
         ExtendedParetoPoint(
             agent_id='ResNet50',
             accuracy=0.94,
             energy_kwh=0.008,
             carbon_co2e_kg=0.0016,
             latency_ms=350,
-            memory_mb=512,         # Large memory footprint
-            circuit_depth=0,       # Classical (no quantum)
-            variance_score=0.05    # Very stable
+            memory_mb=512,
+            circuit_depth=0,
+            variance_score=0.05
         ),
-        
-        # EfficientNet: Balanced
         ExtendedParetoPoint(
             agent_id='EfficientNet',
             accuracy=0.92,
             energy_kwh=0.003,
             carbon_co2e_kg=0.0006,
             latency_ms=180,
-            memory_mb=256,         # Medium memory
+            memory_mb=256,
             circuit_depth=0,
-            variance_score=0.08    # Stable
+            variance_score=0.08
         ),
-        
-        # MobileNet: Efficient, lower accuracy
         ExtendedParetoPoint(
             agent_id='MobileNet',
             accuracy=0.86,
             energy_kwh=0.001,
             carbon_co2e_kg=0.0002,
             latency_ms=80,
-            memory_mb=128,         # Small memory (edge-ready!)
+            memory_mb=128,
             circuit_depth=0,
-            variance_score=0.12    # Moderate stability
+            variance_score=0.12
         ),
-        
-        # QuantumHybrid: Experimental quantum-enhanced
         ExtendedParetoPoint(
             agent_id='QuantumHybrid',
             accuracy=0.91,
@@ -79,11 +213,9 @@ def demo_7d_pareto_analysis():
             carbon_co2e_kg=0.0008,
             latency_ms=500,
             memory_mb=384,
-            circuit_depth=25,      # Quantum circuit!
-            variance_score=0.25    # Less stable (quantum noise)
+            circuit_depth=25,
+            variance_score=0.25
         ),
-        
-        # FastButUnstable: High variance
         ExtendedParetoPoint(
             agent_id='FastButUnstable',
             accuracy=0.89,
@@ -92,23 +224,20 @@ def demo_7d_pareto_analysis():
             latency_ms=100,
             memory_mb=300,
             circuit_depth=0,
-            variance_score=0.35    # Unstable!
+            variance_score=0.35
         ),
-        
-        # MemoryHog: Uses too much RAM
         ExtendedParetoPoint(
             agent_id='MemoryHog',
             accuracy=0.96,
             energy_kwh=0.010,
             carbon_co2e_kg=0.0020,
             latency_ms=400,
-            memory_mb=2048,        # Huge memory!
+            memory_mb=2048,
             circuit_depth=0,
             variance_score=0.06
         )
     ]
     
-    # Compute 7D frontier
     analyzer = ExtendedParetoAnalyzer()
     frontier = analyzer.compute_frontier(agents)
     
@@ -134,7 +263,6 @@ def demo_memory_analysis(agents, analyzer):
     
     print("Scenario: Edge device with 512 MB RAM limit\n")
     
-    # Analyze with 512 MB constraint (typical edge device)
     memory_analysis = analyzer.analyze_memory_constraint(agents, max_memory_mb=512)
     
     print(f"Memory Constraint: {memory_analysis['max_memory_mb']} MB\n")
@@ -249,9 +377,9 @@ def demo_comprehensive_analysis(agents, analyzer):
     print("Scenario: Production deployment with ALL constraints\n")
     
     constraints = {
-        'max_memory_mb': 512,      # Edge device limit
-        'max_circuit_depth': 50,   # Quantum noise limit
-        'max_variance': 0.2        # Stability requirement
+        'max_memory_mb': 512,
+        'max_circuit_depth': 50,
+        'max_variance': 0.2
     }
     
     print("🎯 Deployment Constraints:")
@@ -295,34 +423,22 @@ def demo_specialized_plots(agents, frontier):
         
         print("📊 Generating three specialized plots...\n")
         
-        # Plot 1: Accuracy vs Carbon
         print("1️⃣  Accuracy vs Carbon")
         print("   Question: 'What performance per unit environmental cost?'")
         print("   Users: Sustainability reviewers, ESG officers")
-        fig1 = plotter.plot_accuracy_vs_carbon(
-            agents, frontier,
-            save_path='accuracy_vs_carbon.html'
-        )
+        fig1 = plotter.plot_accuracy_vs_carbon(agents, frontier, save_path='accuracy_vs_carbon.html')
         print("   ✅ Saved to: accuracy_vs_carbon.html\n")
         
-        # Plot 2: Latency vs Energy
         print("2️⃣  Latency vs Energy")
         print("   Question: 'Are fast agents inherently wasteful?'")
         print("   Users: Systems engineers, edge teams")
-        fig2 = plotter.plot_latency_vs_energy(
-            agents, frontier,
-            save_path='latency_vs_energy.html'
-        )
+        fig2 = plotter.plot_latency_vs_energy(agents, frontier, save_path='latency_vs_energy.html')
         print("   ✅ Saved to: latency_vs_energy.html\n")
         
-        # Plot 3: Carbon vs Energy (Pure Green!)
-        print("3️⃣  Carbon vs Energy (Pure Green Plot)")
+        print("3️⃣  Carbon vs Energy (Pure Green!)")
         print("   Question: 'Which agents are environmentally efficient?'")
         print("   Users: Green AI researchers, carbon planners")
-        fig3 = plotter.plot_carbon_vs_energy(
-            agents, frontier,
-            save_path='carbon_vs_energy.html'
-        )
+        fig3 = plotter.plot_carbon_vs_energy(agents, frontier, save_path='carbon_vs_energy.html')
         print("   ✅ Saved to: carbon_vs_energy.html\n")
         
         print("🎨 All plots saved! Open in browser to interact.\n")
@@ -339,10 +455,14 @@ def demo_specialized_plots(agents, frontier):
 
 
 def main():
-    """Run all demos"""
-    print("\n" + "🌟"*35)
+    parser = argparse.ArgumentParser(description="Extended 7D Pareto Analysis Demo")
+    parser.add_argument("--enhanced", action="store_true",
+                        help="Include enhanced demo (Demo 7) with LIMIT Graph, MODP, RLHF, etc.")
+    args = parser.parse_args()
+
+    print("\n" + "🌟" * 35)
     print("Green_Agent: Extended 7D Pareto Analysis")
-    print("🌟"*35)
+    print("🌟" * 35)
     
     print("\nNew Dimensions:")
     print("  1. Memory Footprint (MB) - Edge deployment constraints")
@@ -355,7 +475,6 @@ def main():
     
     input("Press Enter to start demos...")
     
-    # Run all demos
     agents, frontier, analyzer = demo_7d_pareto_analysis()
     input("\nPress Enter for next demo...")
     
@@ -373,9 +492,12 @@ def main():
     
     demo_specialized_plots(agents, frontier)
     
-    print("\n" + "="*70)
+    if args.enhanced:
+        demo_enhanced_analysis_with_advanced_techniques(agents, analyzer)
+    
+    print("\n" + "=" * 70)
     print("✅ All Demos Complete!")
-    print("="*70)
+    print("=" * 70)
     
     print("\n📈 Key Takeaways:")
     print("   1. Memory is a HARD constraint for edge deployment")
@@ -383,6 +505,10 @@ def main():
     print("   3. Variance matters - unpredictable = less green")
     print("   4. Multiple 2D plots > one 7D plot for policy decisions")
     print("   5. Each dimension captures different failure modes\n")
+    
+    if args.enhanced:
+        print("   6. Advanced techniques (MODP, RLHF, distillation, etc.) improve ranking")
+        print("      by accounting for context and human preferences.\n")
     
     print("Next steps:")
     print("   • Open the HTML plots in your browser")
