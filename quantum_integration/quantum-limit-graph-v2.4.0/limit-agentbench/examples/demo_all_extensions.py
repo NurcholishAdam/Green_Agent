@@ -7,12 +7,22 @@ Demonstrates:
 3. RLHF Reward Shaping
 4. Multi-Layer Reporting
 
-Run with: python examples/demo_all_extensions.py
+Enhanced with optional advanced techniques (DEMO 7):
+- LIMIT Graph metrics
+- MODP (Multi-Objective Decision Process)
+- RLHF (human feedback)
+- Multi-Teacher On-Policy Distillation + MoE gating
+- Bio-inspired (evolutionary) optimisation
+
+Run with: python examples/demo_all_extensions.py [--enhanced]
 """
 
 import sys
+import argparse
 from pathlib import Path
 import asyncio
+import random
+import numpy as np
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
@@ -34,7 +44,7 @@ def print_section(title):
 
 
 # ============================================================================
-# DEMO 1: Task Complexity Normalization
+# DEMO 1: Task Complexity Normalization (unchanged)
 # ============================================================================
 
 def demo_complexity_normalization():
@@ -42,7 +52,6 @@ def demo_complexity_normalization():
     
     print("Scenario: Compare Cinebench classifiers on different task complexities\n")
     
-    # Simulate results from different task complexities
     results = [
         {
             'agent_id': 'ResNet50',
@@ -63,12 +72,12 @@ def demo_complexity_normalization():
             'agent_id': 'ResNet50',
             'task_id': 'complex_classification',
             'accuracy': 0.95,
-            'energy_kwh': 0.010,  # 5x more energy
+            'energy_kwh': 0.010,
             'carbon_kg': 0.0020,
             'latency_ms': 500,
             'trace': {
                 'prompt': 'Analyze this complex Cinebench benchmark with multiple metrics...',
-                'reasoning': [f'Step {i}' for i in range(10)],  # More reasoning
+                'reasoning': [f'Step {i}' for i in range(10)],
                 'tool_calls': [{'tool': 'benchmark_db'}, {'tool': 'specs_api'}],
                 'execution_time_ms': 500,
                 'context_tokens': 500
@@ -76,13 +85,11 @@ def demo_complexity_normalization():
         }
     ]
     
-    # Without normalization
     print("❌ WITHOUT Complexity Normalization:")
     print(f"  Simple task: {results[0]['energy_kwh']:.4f} kWh - looks 'efficient'")
     print(f"  Complex task: {results[1]['energy_kwh']:.4f} kWh - looks 'wasteful'")
     print(f"  Conclusion: Simple task seems 5x better\n")
     
-    # With normalization
     calculator = NormalizedEfficiencyCalculator()
     comparison = calculator.compare_across_complexities(results)
     
@@ -100,7 +107,7 @@ def demo_complexity_normalization():
 
 
 # ============================================================================
-# DEMO 2: Budget Constraints
+# DEMO 2: Budget Constraints (unchanged)
 # ============================================================================
 
 async def demo_budget_constraints():
@@ -108,29 +115,25 @@ async def demo_budget_constraints():
     
     print("Scenario: Deploy Cinebench classifier with strict energy budget\n")
     
-    # Create eco-friendly budget
     budget = Budget.eco_budget()
     print(f"Budget: {budget.name}")
     print(f"  Max Energy: {budget.max_energy_wh} Wh")
     print(f"  Max Carbon: {budget.max_carbon_g} g CO₂")
     print(f"  Max Latency: {budget.max_latency_ms} ms\n")
     
-    # Create enforcer
     enforcer = BudgetEnforcer(budget)
     
-    # Mock agent function
     async def classifier_agent(task):
         return {
             'output': 'classification_result',
             'accuracy': 0.93,
             'metrics': {
-                'energy_kwh': 0.003,  # 3 Wh
-                'carbon_kg': 0.0006,  # 0.6 g
+                'energy_kwh': 0.003,
+                'carbon_kg': 0.0006,
                 'latency_ms': 300
             }
         }
     
-    # Execute with budget enforcement
     print("Executing classifier within budget...\n")
     
     task = {'input': 'benchmark_data'}
@@ -152,7 +155,6 @@ async def demo_budget_constraints():
         print("❌ Execution BLOCKED!")
         print(f"  Violations: {result['violations']}")
     
-    # Show budget report
     print("\n📊 Budget Report:")
     report = enforcer.get_budget_report()
     util = report['utilization']
@@ -161,7 +163,7 @@ async def demo_budget_constraints():
 
 
 # ============================================================================
-# DEMO 3: RLHF Reward Shaping
+# DEMO 3: RLHF Reward Shaping (unchanged)
 # ============================================================================
 
 def demo_rlhf_reward_shaping():
@@ -169,7 +171,6 @@ def demo_rlhf_reward_shaping():
     
     print("Scenario: Compare agents across different execution modes\n")
     
-    # Sample agent results
     agent_results = [
         {
             'agent_id': 'HighAccuracy_Agent',
@@ -194,7 +195,6 @@ def demo_rlhf_reward_shaping():
         }
     ]
     
-    # Test different modes
     modes = [ExecutionMode.ECO_MODE, ExecutionMode.FAST_MODE, ExecutionMode.ACCURACY_MODE]
     
     for mode in modes:
@@ -204,7 +204,7 @@ def demo_rlhf_reward_shaping():
         print(f"\n🎯 {mode.value.upper()} MODE:")
         print(f"   Best Agent: {comparison['best_agent']}")
         
-        for rank in comparison['rankings'][:2]:  # Top 2
+        for rank in comparison['rankings'][:2]:
             print(f"\n   #{rank['rank']} {rank['agent_id']}")
             print(f"      Reward: {rank['reward']:.3f}")
             print(f"      Success: {rank['raw_metrics']['task_success']:.2%}")
@@ -212,7 +212,7 @@ def demo_rlhf_reward_shaping():
 
 
 # ============================================================================
-# DEMO 4: Policy Evaluation Environment
+# DEMO 4: Policy Evaluation Environment (unchanged)
 # ============================================================================
 
 def demo_policy_evaluation():
@@ -220,7 +220,6 @@ def demo_policy_evaluation():
     
     print("Scenario: Evaluate agent policy across all modes\n")
     
-    # Mock agent policy
     def my_classifier(task):
         return {
             'accuracy': 0.92,
@@ -229,10 +228,8 @@ def demo_policy_evaluation():
             'latency_ms': 200
         }
     
-    # Create test tasks
     tasks = [{'task_id': f'task_{i}'} for i in range(10)]
     
-    # Evaluate across all modes
     env = PolicyEvaluationEnvironment()
     results = env.multi_mode_evaluation(my_classifier, tasks, verbose=False)
     
@@ -251,7 +248,7 @@ def demo_policy_evaluation():
 
 
 # ============================================================================
-# DEMO 5: Multi-Layer Reporting
+# DEMO 5: Multi-Layer Reporting (unchanged)
 # ============================================================================
 
 def demo_multi_layer_reporting():
@@ -259,7 +256,6 @@ def demo_multi_layer_reporting():
     
     print("Scenario: Generate transparent three-layer reports\n")
     
-    # Sample evaluation results
     results = [
         {
             'agent_id': 'Agent_A',
@@ -293,7 +289,6 @@ def demo_multi_layer_reporting():
         }
     ]
     
-    # Generate full report
     reporter = LayeredReporter()
     full_report = reporter.generate_full_report(results, scenario='production')
     
@@ -307,21 +302,19 @@ def demo_multi_layer_reporting():
         print(f"  Layer 3 (Scenario): Score={agent_report['layer3_scenario']['weighted_score']:.3f}, "
               f"Rank=#{agent_report['layer3_scenario']['rank']}\n")
     
-    # Generate formatted reports
     print("\n📄 Generating formatted reports...\n")
     
     report_gen = ReportGenerator()
     
-    # Executive summary
     exec_summary = report_gen.generate_executive_summary(full_report)
     print("Executive Summary:")
-    print(exec_summary[:500] + "...\n")  # First 500 chars
+    print(exec_summary[:500] + "...\n")
     
     print("✅ Full technical and research reports also available")
 
 
 # ============================================================================
-# DEMO 6: Cinebench Integration (All Modules Combined)
+# DEMO 6: Cinebench Integration (All Modules Combined) - unchanged
 # ============================================================================
 
 async def demo_cinebench_integration():
@@ -329,15 +322,13 @@ async def demo_cinebench_integration():
     
     print("Scenario: Complete Cinebench classifier evaluation workflow\n")
     
-    # Step 1: Define budget
     budget = Budget(
-        max_energy_wh=50.0,  # 50 Wh for batch
-        max_carbon_g=10.0,   # 10g CO₂
-        max_latency_ms=5000, # 5s per task
+        max_energy_wh=50.0,
+        max_carbon_g=10.0,
+        max_latency_ms=5000,
         name="Cinebench Production Budget"
     )
     
-    # Step 2: Mock classifiers with different characteristics
     classifiers_results = [
         {
             'agent_id': 'ResNet50',
@@ -416,11 +407,9 @@ async def demo_cinebench_integration():
     print("\nStep 3: RLHF Mode Selection")
     print("-" * 40)
     
-    # Test eco mode
     eco_shaper = RewardShaper(ExecutionMode.ECO_MODE)
     eco_comparison = eco_shaper.compare_policies(classifiers_results)
     
-    # Test fast mode
     fast_shaper = RewardShaper(ExecutionMode.FAST_MODE)
     fast_comparison = fast_shaper.compare_policies(classifiers_results)
     
@@ -446,11 +435,132 @@ async def demo_cinebench_integration():
 
 
 # ============================================================================
+# DEMO 7: Advanced Techniques (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio-inspired)
+# ============================================================================
+
+def demo_advanced_techniques():
+    print_section("DEMO 7: Advanced Techniques Integration")
+    
+    # 1. LIMIT Graph metrics (simulated)
+    graph_metrics = {
+        "centrality": 0.7,
+        "connectivity": 0.6,
+        "density": 0.5
+    }
+    print("🌐 LIMIT Graph Metrics:")
+    for k, v in graph_metrics.items():
+        print(f"   {k}: {v}")
+    
+    # 2. RLHF human feedback
+    human_feedback = 0.8  # prefers accuracy
+    print(f"\n👤 RLHF Feedback: {human_feedback} (prefers accuracy)")
+    
+    # 3. Sample agents (simplified data, similar to demo 6)
+    agents = [
+        {'id': 'ResNet50', 'accuracy': 0.94, 'energy_kwh': 0.008, 'carbon_kg': 0.0016, 'latency_ms': 350},
+        {'id': 'EfficientNet', 'accuracy': 0.92, 'energy_kwh': 0.003, 'carbon_kg': 0.0006, 'latency_ms': 180},
+        {'id': 'MobileNet', 'accuracy': 0.86, 'energy_kwh': 0.001, 'carbon_kg': 0.0002, 'latency_ms': 80},
+    ]
+    
+    # 4. MODP: evolve weights using bio-inspired genetic algorithm
+    print("\n🧬 Evolving MODP weights (genetic algorithm)...")
+    n_obj = 4  # accuracy, energy, carbon, latency
+    pop_size = 20
+    generations = 10
+    mutation_rate = 0.3
+    crossover_rate = 0.7
+    
+    def fitness(weights):
+        score = 0
+        for a in agents:
+            acc = a['accuracy']
+            energy = 1 - min(a['energy_kwh']*1000/10.0, 1)
+            carbon = 1 - min(a['carbon_kg']*1000/2.0, 1)
+            latency = 1 - min(a['latency_ms']/500.0, 1)
+            vec = np.array([acc, energy, carbon, latency])
+            score += np.dot(weights, vec)
+        return score / len(agents)
+    
+    population = [np.random.dirichlet(np.ones(n_obj)) for _ in range(pop_size)]
+    best_weights = population[0]
+    for gen in range(generations):
+        scores = [fitness(w) for w in population]
+        best_idx = np.argmax(scores)
+        best_weights = population[best_idx]
+        # create next gen
+        new_pop = [best_weights]  # elitism
+        while len(new_pop) < pop_size:
+            p1 = population[random.randint(0, pop_size-1)]
+            p2 = population[random.randint(0, pop_size-1)]
+            if random.random() < crossover_rate:
+                alpha = random.random()
+                child = alpha * p1 + (1 - alpha) * p2
+            else:
+                child = p1.copy()
+            child += np.random.dirichlet(np.ones(n_obj)) * mutation_rate
+            child = child / child.sum()
+            new_pop.append(child)
+        population = new_pop
+    
+    print(f"   Evolved weights (accuracy, energy, carbon, latency): {np.round(best_weights, 3)}")
+    
+    # 5. Multi-teacher distillation with MoE gating (simplified)
+    print("\n🎓 Multi-Teacher Distillation + MoE:")
+    
+    # Three simple teachers
+    def rule_teacher(agent):
+        # Prefer high accuracy if centrality high
+        if graph_metrics["centrality"] > 0.5:
+            return agent['accuracy']
+        else:
+            return 1 - min(agent['energy_kwh']*1000/10.0, 1)
+    
+    def rlhf_teacher(agent):
+        if human_feedback > 0.5:
+            return agent['accuracy']
+        else:
+            return 1 - min(agent['energy_kwh']*1000/10.0, 1)
+    
+    def historical_teacher(agent):
+        return 0.7 * agent['accuracy'] + 0.3 * (1 - min(agent['energy_kwh']*1000/10.0, 1))
+    
+    # Gating weights (fixed for demo)
+    gate_weights = np.array([0.4, 0.4, 0.2])
+    
+    def moe_score(agent):
+        scores = np.array([rule_teacher(agent), rlhf_teacher(agent), historical_teacher(agent)])
+        return np.dot(gate_weights, scores)
+    
+    # 6. Combine MODP and MoE scores
+    print("\n📊 Final Enhanced Ranking:")
+    final_scores = {}
+    for a in agents:
+        # MODP score
+        acc = a['accuracy']
+        energy = 1 - min(a['energy_kwh']*1000/10.0, 1)
+        carbon = 1 - min(a['carbon_kg']*1000/2.0, 1)
+        latency = 1 - min(a['latency_ms']/500.0, 1)
+        vec = np.array([acc, energy, carbon, latency])
+        modp = np.dot(best_weights, vec)
+        moe = moe_score(a)
+        final = 0.6 * modp + 0.4 * moe
+        final_scores[a['id']] = final
+        print(f"   {a['id']}: MODP={modp:.3f}, MoE={moe:.3f}, Final={final:.3f}")
+    
+    best_agent = max(final_scores, key=final_scores.get)
+    print(f"\n🏆 Best Agent with Advanced Techniques: {best_agent}")
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
 async def main():
-    """Run all demos"""
+    parser = argparse.ArgumentParser(description="Green_Agent Extensions Demo")
+    parser.add_argument("--enhanced", action="store_true",
+                        help="Include advanced techniques demo (DEMO 7)")
+    args = parser.parse_args()
+
     print("\n" + "🌟"*35)
     print("Green_Agent Extensions - Complete Demo")
     print("🌟"*35 + "\n")
@@ -461,11 +571,12 @@ async def main():
     print("  3. RLHF Reward Shaping")
     print("  4. Multi-Layer Reporting")
     print("  5. Policy Evaluation")
-    print("  6. Complete Cinebench Integration\n")
+    print("  6. Complete Cinebench Integration")
+    if args.enhanced:
+        print("  7. Advanced Techniques (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio-inspired)")
     
     input("Press Enter to start demos...")
     
-    # Run demos
     demo_complexity_normalization()
     input("\nPress Enter for next demo...")
     
@@ -479,9 +590,12 @@ async def main():
     input("\nPress Enter for next demo...")
     
     demo_multi_layer_reporting()
-    input("\nPress Enter for final demo...")
+    input("\nPress Enter for next demo...")
     
     await demo_cinebench_integration()
+    
+    if args.enhanced:
+        demo_advanced_techniques()
     
     print("\n" + "="*70)
     print("✅ All Demos Complete!")
