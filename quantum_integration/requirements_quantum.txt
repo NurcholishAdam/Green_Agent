@@ -16,6 +16,7 @@ tensorflow>=2.13.0
 # Async support
 asyncio>=3.4.3
 aiohttp>=3.8.0
+aiofiles>=23.0.0                # Asynchronous file operations (persistence, logging)
 
 # Visualization
 matplotlib>=3.7.0
@@ -28,3 +29,25 @@ pytest-asyncio>=0.21.0
 # Utilities
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+pydantic-settings>=2.0.0        # Pydantic settings management (ZeroTrustConfig)
+
+# ------------------------------------------------------------------
+# Dependencies for Enhanced Modules (LIMIT Graph, MODP, RLHF,
+# Multi‑Teacher Distillation, Bio‑inspired, MoE)
+# ------------------------------------------------------------------
+
+# Historical ML teachers, RandomForest models for distillation
+scikit-learn>=1.3.0
+# Data handling for interaction logs and state vectors (CSV/JSON)
+pandas>=2.0.0
+# Graph operations for LIMIT Graph integration
+networkx>=3.0
+# Security: encryption, tokens, authentication for Zero Trust
+cryptography>=41.0.0
+pyjwt>=2.8.0
+# Telemetry and monitoring (optional)
+prometheus-client>=0.17.0
+# Retry logic with exponential backoff (used in circuit breakers)
+tenacity>=8.2.0
+# Joblib for model serialization (already included with scikit-learn but explicit)
+joblib>=1.3.0
