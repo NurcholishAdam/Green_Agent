@@ -1,17 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-Feedback Integration & Audit Logger
+Feedback Integration & Audit Logger (Enhanced)
 
 Tracks expert invocations, feedback integration, and sustainability metrics.
 Provides transparency reports for accountability.
+
+Enhancements:
+- Optional integration with LIMIT Graph metrics, MODP weights, RLHF feedback,
+  Multi‑Teacher Distillation stats, Bio‑inspired optimisation, and MoE gating.
+- New fields in AuditEvent and TransparencyReport for enhanced metrics.
+- Transparency score can optionally use MODP weights and graph health.
 """
 
-from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 from datetime import datetime
 import json
 import hashlib
+import numpy as np
+
+# Optional imports for enhancements (graceful if missing)
+try:
+    from src.enhancements.schemas.feedback_event import FeedbackEvent
+    from src.enhancements.schemas.node_descriptor import NodeDescriptor
+    from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+    FeedbackEvent = None
+    NodeDescriptor = None
+    WorkloadDescriptor = None
 
 
 class FeedbackType(Enum):
@@ -32,6 +51,11 @@ class AuditEventType(Enum):
     ESCALATION_TRIGGERED = "escalation_triggered"
     ENERGY_SAVED = "energy_saved"
     CARBON_SAVED = "carbon_saved"
+    # New event types for enhancements
+    GRAPH_METRICS_UPDATED = "graph_metrics_updated"
+    DISTILLATION_UPDATED = "distillation_updated"
+    RLHF_FEEDBACK_LOGGED = "rlhf_feedback_logged"
+    MODP_SCORE_LOGGED = "modp_score_logged"
 
 
 @dataclass
@@ -46,6 +70,9 @@ class ExpertFeedback:
     confidence: float
     energy_impact: float  # Positive = savings, negative = cost
     timestamp: float
+    # Enhanced fields
+    human_feedback_score: Optional[float] = None  # RLHF
+    graph_metrics: Optional[Dict[str, float]] = None  # LIMIT Graph
 
 
 @dataclass
@@ -60,6 +87,12 @@ class AuditEvent:
     carbon_emitted_kg: float
     details: Dict[str, Any]
     timestamp: float
+    # Enhanced fields
+    graph_metrics: Optional[Dict[str, float]] = None
+    modp_weights: Optional[Dict[str, float]] = None
+    human_feedback_score: Optional[float] = None
+    distillation_stats: Optional[Dict[str, Any]] = None
+    moe_gate_weights: Optional[List[float]] = None
 
 
 @dataclass
@@ -98,22 +131,25 @@ class TransparencyReport:
     audit_events: int
     transparency_score: float
 
+    # Enhanced metrics
+    graph_health_score: Optional[float] = None
+    modp_overall_score: Optional[float] = None
+    rlhf_average_feedback: Optional[float] = None
+    distillation_updates: Optional[int] = None
+    moe_experts_used: Optional[int] = None
+
 
 class AuditLogger:
     """
     Audit logger for expert collaboration system.
-    
-    Features:
-    - Event logging
-    - Feedback tracking
-    - Sustainability metrics
-    - Transparency reporting
+    Enhanced with optional LIMIT Graph, MODP, RLHF, distillation, and MoE tracking.
     """
     
     def __init__(
         self,
         log_file: Optional[str] = None,
-        enable_persistence: bool = True
+        enable_persistence: bool = True,
+        config: Optional[Dict[str, Any]] = None
     ):
         """
         Initialize audit logger.
@@ -121,9 +157,12 @@ class AuditLogger:
         Args:
             log_file: Path to log file
             enable_persistence: Enable persistent logging
+            config: Optional configuration dict for enhancements
         """
         self.log_file = log_file
         self.enable_persistence = enable_persistence
+        self.config = config or {}
+        self.use_enhancements = self.config.get('use_enhancements', False) and ENHANCEMENTS_AVAILABLE
         
         # In-memory storage
         self.audit_events: List[AuditEvent] = []
@@ -134,6 +173,19 @@ class AuditLogger:
         self.total_carbon_emitted = 0.0
         self.total_energy_saved = 0.0
         self.total_carbon_saved = 0.0
+        
+        # Enhanced metrics aggregates
+        self.graph_metrics_history: List[Dict[str, float]] = []
+        self.rlhf_feedback_scores: List[float] = []
+        self.modp_scores: List[float] = []
+        self.distillation_updates = 0
+        self.moe_gate_weights_history: List[List[float]] = []
+        
+        # MODP weights (default if not provided)
+        self.modp_weights = self.config.get(
+            'modp_weights',
+            {'carbon': 0.4, 'energy': 0.3, 'latency': 0.2, 'cost': 0.1}
+        )
         
         # Load from file if exists
         if self.enable_persistence and self.log_file:
@@ -146,9 +198,11 @@ class AuditLogger:
         expert_type: str,
         energy_wh: float,
         carbon_kg: float,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
+        graph_metrics: Optional[Dict[str, float]] = None,
+        human_feedback_score: Optional[float] = None
     ):
-        """Log expert model invocation."""
+        """Log expert model invocation, optionally with graph metrics and RLHF."""
         event = AuditEvent(
             event_id=self._generate_event_id(),
             event_type=AuditEventType.EXPERT_INVOKED,
@@ -158,7 +212,9 @@ class AuditLogger:
             energy_consumed_wh=energy_wh,
             carbon_emitted_kg=carbon_kg,
             details=details or {},
-            timestamp=datetime.now().timestamp()
+            timestamp=datetime.now().timestamp(),
+            graph_metrics=graph_metrics,
+            human_feedback_score=human_feedback_score
         )
         
         self._add_event(event)
@@ -166,6 +222,12 @@ class AuditLogger:
         # Update metrics
         self.total_energy_consumed += energy_wh
         self.total_carbon_emitted += carbon_kg
+        
+        # Track graph metrics if provided
+        if graph_metrics and self.use_enhancements:
+            self.graph_metrics_history.append(graph_metrics)
+        if human_feedback_score is not None and self.use_enhancements:
+            self.rlhf_feedback_scores.append(human_feedback_score)
     
     def log_feedback_received(
         self,
@@ -173,6 +235,13 @@ class AuditLogger:
     ):
         """Log feedback received from expert."""
         self.feedback_history.append(feedback)
+        
+        # If enhanced, extract RLHF and graph metrics from feedback
+        if self.use_enhancements:
+            if feedback.human_feedback_score is not None:
+                self.rlhf_feedback_scores.append(feedback.human_feedback_score)
+            if feedback.graph_metrics:
+                self.graph_metrics_history.append(feedback.graph_metrics)
         
         event = AuditEvent(
             event_id=self._generate_event_id(),
@@ -186,7 +255,9 @@ class AuditLogger:
                 "feedback_type": feedback.feedback_type.value,
                 "confidence": feedback.confidence
             },
-            timestamp=feedback.timestamp
+            timestamp=feedback.timestamp,
+            graph_metrics=feedback.graph_metrics,
+            human_feedback_score=feedback.human_feedback_score
         )
         
         self._add_event(event)
@@ -197,9 +268,11 @@ class AuditLogger:
         task_id: str,
         agent_id: str,
         integration_success: bool,
-        energy_impact: float
+        energy_impact: float,
+        modp_score: Optional[float] = None,
+        distillation_stats: Optional[Dict[str, Any]] = None
     ):
-        """Log feedback integration."""
+        """Log feedback integration, optionally with MODP score and distillation stats."""
         event = AuditEvent(
             event_id=self._generate_event_id(),
             event_type=AuditEventType.FEEDBACK_INTEGRATED,
@@ -213,7 +286,8 @@ class AuditLogger:
                 "success": integration_success,
                 "energy_impact": energy_impact
             },
-            timestamp=datetime.now().timestamp()
+            timestamp=datetime.now().timestamp(),
+            distillation_stats=distillation_stats
         )
         
         self._add_event(event)
@@ -223,13 +297,24 @@ class AuditLogger:
             self.total_energy_saved += energy_impact
             carbon_saved = energy_impact * 0.000385  # Default grid
             self.total_carbon_saved += carbon_saved
+        
+        # Enhanced tracking
+        if self.use_enhancements:
+            if modp_score is not None:
+                self.modp_scores.append(modp_score)
+            if distillation_stats:
+                self.distillation_updates += distillation_stats.get('student_counter', 0) or 0
+                self.moe_gate_weights_history.append(
+                    distillation_stats.get('gate_weights', [])
+                )
     
     def log_escalation(
         self,
         task_id: str,
         agent_id: str,
         reasons: List[str],
-        expert_type: str
+        expert_type: str,
+        graph_metrics: Optional[Dict[str, float]] = None
     ):
         """Log escalation decision."""
         event = AuditEvent(
@@ -241,10 +326,13 @@ class AuditLogger:
             energy_consumed_wh=0.0,
             carbon_emitted_kg=0.0,
             details={"reasons": reasons},
-            timestamp=datetime.now().timestamp()
+            timestamp=datetime.now().timestamp(),
+            graph_metrics=graph_metrics
         )
         
         self._add_event(event)
+        if graph_metrics and self.use_enhancements:
+            self.graph_metrics_history.append(graph_metrics)
     
     def log_energy_saved(
         self,
@@ -279,22 +367,13 @@ class AuditLogger:
         period_end: Optional[float] = None
     ) -> TransparencyReport:
         """
-        Generate comprehensive transparency report.
-        
-        Args:
-            period_start: Start timestamp (None = all time)
-            period_end: End timestamp (None = now)
-            
-        Returns:
-            Transparency report
+        Generate comprehensive transparency report, including enhanced metrics.
         """
-        # Filter events by period
         if period_start is None:
             period_start = min(
                 (e.timestamp for e in self.audit_events),
                 default=datetime.now().timestamp()
             )
-        
         if period_end is None:
             period_end = datetime.now().timestamp()
         
@@ -303,87 +382,63 @@ class AuditLogger:
             if period_start <= e.timestamp <= period_end
         ]
         
-        # Calculate metrics
+        # Calculate base metrics (same as before)
         total_tasks = len(set(e.task_id for e in period_events))
-        
-        escalations = [
-            e for e in period_events
-            if e.event_type == AuditEventType.ESCALATION_TRIGGERED
-        ]
+        escalations = [e for e in period_events if e.event_type == AuditEventType.ESCALATION_TRIGGERED]
         tasks_escalated = len(set(e.task_id for e in escalations))
         escalation_rate = tasks_escalated / total_tasks if total_tasks > 0 else 0
         
-        expert_invocations_events = [
-            e for e in period_events
-            if e.event_type == AuditEventType.EXPERT_INVOKED
-        ]
+        expert_invocations_events = [e for e in period_events if e.event_type == AuditEventType.EXPERT_INVOKED]
         expert_invocations = len(expert_invocations_events)
-        
         experts_by_type = {}
         for e in expert_invocations_events:
             expert = e.expert_involved or "unknown"
             experts_by_type[expert] = experts_by_type.get(expert, 0) + 1
         
-        feedback_received_events = [
-            e for e in period_events
-            if e.event_type == AuditEventType.FEEDBACK_RECEIVED
-        ]
+        feedback_received_events = [e for e in period_events if e.event_type == AuditEventType.FEEDBACK_RECEIVED]
         feedback_received = len(feedback_received_events)
-        
-        feedback_integrated_events = [
-            e for e in period_events
-            if e.event_type == AuditEventType.FEEDBACK_INTEGRATED
-        ]
+        feedback_integrated_events = [e for e in period_events if e.event_type == AuditEventType.FEEDBACK_INTEGRATED]
         feedback_integrated = len(feedback_integrated_events)
+        feedback_integration_rate = feedback_integrated / feedback_received if feedback_received > 0 else 0
         
-        feedback_integration_rate = (
-            feedback_integrated / feedback_received
-            if feedback_received > 0 else 0
-        )
-        
-        # Energy metrics
-        total_energy = sum(
-            e.energy_consumed_wh for e in period_events
-            if e.energy_consumed_wh > 0
-        )
-        
-        energy_saved = sum(
-            abs(e.energy_consumed_wh) for e in period_events
-            if e.energy_consumed_wh < 0
-        )
-        
+        total_energy = sum(e.energy_consumed_wh for e in period_events if e.energy_consumed_wh > 0)
+        energy_saved = sum(abs(e.energy_consumed_wh) for e in period_events if e.energy_consumed_wh < 0)
         net_energy = total_energy - energy_saved
         
-        # Carbon metrics
-        total_carbon = sum(
-            e.carbon_emitted_kg for e in period_events
-            if e.carbon_emitted_kg > 0
-        )
-        
-        carbon_saved = sum(
-            abs(e.carbon_emitted_kg) for e in period_events
-            if e.carbon_emitted_kg < 0
-        )
-        
+        total_carbon = sum(e.carbon_emitted_kg for e in period_events if e.carbon_emitted_kg > 0)
+        carbon_saved = sum(abs(e.carbon_emitted_kg) for e in period_events if e.carbon_emitted_kg < 0)
         net_carbon = total_carbon - carbon_saved
         
-        # Efficiency metrics
         avg_task_energy = total_energy / total_tasks if total_tasks > 0 else 0
-        avg_expert_energy = (
-            total_energy / expert_invocations
-            if expert_invocations > 0 else 0
-        )
+        avg_expert_energy = total_energy / expert_invocations if expert_invocations > 0 else 0
+        sustainability_improvement = (energy_saved / total_energy * 100) if total_energy > 0 else 0
         
-        sustainability_improvement = (
-            (energy_saved / total_energy * 100)
-            if total_energy > 0 else 0
-        )
+        # Enhanced metrics
+        graph_health_score = None
+        modp_overall_score = None
+        rlhf_average_feedback = None
+        distillation_updates = self.distillation_updates
+        moe_experts_used = len(self.moe_gate_weights_history) if self.moe_gate_weights_history else None
         
-        # Transparency score (0-1)
+        if self.use_enhancements:
+            # Graph health: average centrality across recorded graph metrics
+            if self.graph_metrics_history:
+                centralities = [gm.get('centrality', 0.5) for gm in self.graph_metrics_history]
+                graph_health_score = float(np.mean(centralities))
+            
+            # Average MODP score
+            if self.modp_scores:
+                modp_overall_score = float(np.mean(self.modp_scores))
+            
+            # Average RLHF feedback
+            if self.rlhf_feedback_scores:
+                rlhf_average_feedback = float(np.mean(self.rlhf_feedback_scores))
+        
         transparency_score = self._calculate_transparency_score(
             feedback_integration_rate,
             escalation_rate,
-            len(period_events)
+            len(period_events),
+            graph_health_score=graph_health_score
         )
         
         return TransparencyReport(
@@ -408,7 +463,12 @@ class AuditLogger:
             avg_expert_energy_wh=avg_expert_energy,
             sustainability_improvement_pct=sustainability_improvement,
             audit_events=len(period_events),
-            transparency_score=transparency_score
+            transparency_score=transparency_score,
+            graph_health_score=graph_health_score,
+            modp_overall_score=modp_overall_score,
+            rlhf_average_feedback=rlhf_average_feedback,
+            distillation_updates=distillation_updates,
+            moe_experts_used=moe_experts_used
         )
     
     def export_report(
@@ -419,7 +479,6 @@ class AuditLogger:
     ):
         """Export transparency report to file."""
         report_dict = asdict(report)
-        
         if format == "json":
             with open(filepath, 'w') as f:
                 json.dump(report_dict, f, indent=2)
@@ -429,21 +488,16 @@ class AuditLogger:
                 f.write(html)
     
     def _add_event(self, event: AuditEvent):
-        """Add event to log."""
         self.audit_events.append(event)
-        
-        # Persist if enabled
         if self.enable_persistence and self.log_file:
             self._append_to_file(event)
     
     def _generate_event_id(self) -> str:
-        """Generate unique event ID."""
         timestamp = datetime.now().timestamp()
         content = f"event:{timestamp}"
         return hashlib.md5(content.encode()).hexdigest()[:16]
     
     def _generate_report_id(self) -> str:
-        """Generate unique report ID."""
         timestamp = datetime.now().timestamp()
         content = f"report:{timestamp}"
         return hashlib.md5(content.encode()).hexdigest()[:16]
@@ -452,16 +506,12 @@ class AuditLogger:
         self,
         integration_rate: float,
         escalation_rate: float,
-        event_count: int
+        event_count: int,
+        graph_health_score: Optional[float] = None
     ) -> float:
-        """Calculate transparency score (0-1)."""
-        # High integration rate = good
-        # Moderate escalation rate = good (not too high or too low)
-        # High event count = good (detailed logging)
-        
+        """Calculate transparency score (0-1), optionally incorporating graph health."""
         integration_score = integration_rate
         
-        # Optimal escalation rate: 0.1-0.3 (10-30%)
         if 0.1 <= escalation_rate <= 0.3:
             escalation_score = 1.0
         elif escalation_rate < 0.1:
@@ -469,20 +519,19 @@ class AuditLogger:
         else:
             escalation_score = max(0, 1.0 - (escalation_rate - 0.3) / 0.7)
         
-        # Event count score (saturates at 100 events)
         event_score = min(event_count / 100, 1.0)
         
-        # Weighted combination
-        score = (
-            0.4 * integration_score +
-            0.3 * escalation_score +
-            0.3 * event_score
-        )
+        # Base weighted score
+        score = 0.4 * integration_score + 0.3 * escalation_score + 0.3 * event_score
         
-        return score
+        # If enhanced and graph health available, blend slightly
+        if self.use_enhancements and graph_health_score is not None:
+            # Graph health indicates topology awareness; factor it in
+            score = 0.9 * score + 0.1 * graph_health_score
+        
+        return min(1.0, max(0.0, score))
     
     def _append_to_file(self, event: AuditEvent):
-        """Append event to log file."""
         try:
             with open(self.log_file, 'a') as f:
                 f.write(json.dumps(asdict(event)) + '\n')
@@ -490,7 +539,6 @@ class AuditLogger:
             print(f"Warning: Failed to write to log file: {e}")
     
     def _load_from_file(self):
-        """Load events from log file."""
         try:
             with open(self.log_file, 'r') as f:
                 for line in f:
@@ -498,14 +546,13 @@ class AuditLogger:
                     event_dict['event_type'] = AuditEventType(event_dict['event_type'])
                     self.audit_events.append(AuditEvent(**event_dict))
         except FileNotFoundError:
-            pass  # File doesn't exist yet
+            pass
         except Exception as e:
             print(f"Warning: Failed to load from log file: {e}")
     
     def _generate_html_report(self, report: TransparencyReport) -> str:
-        """Generate HTML transparency report."""
-        html = f"""
-<!DOCTYPE html>
+        # Extended HTML with enhanced metrics if present
+        html = f"""<!DOCTYPE html>
 <html>
 <head>
     <title>Transparency Report - {report.report_id}</title>
@@ -525,35 +572,35 @@ class AuditLogger:
     <p>Period: {datetime.fromtimestamp(report.period_start).strftime('%Y-%m-%d %H:%M')} 
        to {datetime.fromtimestamp(report.period_end).strftime('%Y-%m-%d %H:%M')}</p>
     
-    <div class="section">
-        <h2>Task Metrics</h2>
-        <div class="metric">Total Tasks: <span class="metric-value">{report.total_tasks}</span></div>
-        <div class="metric">Tasks Escalated: <span class="metric-value">{report.tasks_escalated}</span></div>
-        <div class="metric">Escalation Rate: <span class="metric-value">{report.escalation_rate:.1%}</span></div>
-    </div>
+    <div class="section"><h2>Task Metrics</h2>
+    <div class="metric">Total Tasks: <span class="metric-value">{report.total_tasks}</span></div>
+    <div class="metric">Tasks Escalated: <span class="metric-value">{report.tasks_escalated}</span></div>
+    <div class="metric">Escalation Rate: <span class="metric-value">{report.escalation_rate:.1%}</span></div></div>
     
-    <div class="section">
-        <h2>Expert Metrics</h2>
-        <div class="metric">Expert Invocations: <span class="metric-value">{report.expert_invocations}</span></div>
-        <div class="metric">Feedback Received: <span class="metric-value">{report.feedback_received}</span></div>
-        <div class="metric">Feedback Integrated: <span class="metric-value">{report.feedback_integrated}</span></div>
-        <div class="metric">Integration Rate: <span class="metric-value">{report.feedback_integration_rate:.1%}</span></div>
-    </div>
+    <div class="section"><h2>Expert Metrics</h2>
+    <div class="metric">Expert Invocations: <span class="metric-value">{report.expert_invocations}</span></div>
+    <div class="metric">Feedback Received: <span class="metric-value">{report.feedback_received}</span></div>
+    <div class="metric">Feedback Integrated: <span class="metric-value">{report.feedback_integrated}</span></div>
+    <div class="metric">Integration Rate: <span class="metric-value">{report.feedback_integration_rate:.1%}</span></div></div>
     
-    <div class="section">
-        <h2>Sustainability Metrics</h2>
-        <div class="metric">Total Energy Consumed: <span class="metric-value">{report.total_energy_consumed_wh*1000:.1f} mWh</span></div>
-        <div class="metric">Energy Saved: <span class="metric-value">{report.energy_saved_wh*1000:.1f} mWh</span></div>
-        <div class="metric">Net Energy: <span class="metric-value">{report.net_energy_wh*1000:.1f} mWh</span></div>
-        <div class="metric">Carbon Saved: <span class="metric-value">{report.carbon_saved_kg*1000:.1f} g CO2</span></div>
-        <div class="metric">Sustainability Improvement: <span class="metric-value">{report.sustainability_improvement_pct:.1f}%</span></div>
-    </div>
+    <div class="section"><h2>Sustainability Metrics</h2>
+    <div class="metric">Total Energy Consumed: <span class="metric-value">{report.total_energy_consumed_wh*1000:.1f} mWh</span></div>
+    <div class="metric">Energy Saved: <span class="metric-value">{report.energy_saved_wh*1000:.1f} mWh</span></div>
+    <div class="metric">Net Energy: <span class="metric-value">{report.net_energy_wh*1000:.1f} mWh</span></div>
+    <div class="metric">Carbon Saved: <span class="metric-value">{report.carbon_saved_kg*1000:.1f} g CO2</span></div>
+    <div class="metric">Sustainability Improvement: <span class="metric-value">{report.sustainability_improvement_pct:.1f}%</span></div></div>
     
-    <div class="section">
-        <h2>Transparency Score</h2>
-        <div class="metric">Score: <span class="metric-value">{report.transparency_score:.2f} / 1.00</span></div>
-    </div>
+    <div class="section"><h2>Transparency Score</h2>
+    <div class="metric">Score: <span class="metric-value">{report.transparency_score:.2f} / 1.00</span></div></div>
+    
+    <!-- Enhanced metrics -->
+    {f'<div class="section"><h2>Enhanced Metrics</h2>' if report.graph_health_score is not None else ''}
+    {f'<div class="metric">Graph Health: <span class="metric-value">{report.graph_health_score:.2f}</span></div>' if report.graph_health_score is not None else ''}
+    {f'<div class="metric">MODP Overall Score: <span class="metric-value">{report.modp_overall_score:.2f}</span></div>' if report.modp_overall_score is not None else ''}
+    {f'<div class="metric">Avg RLHF Feedback: <span class="metric-value">{report.rlhf_average_feedback:.2f}</span></div>' if report.rlhf_average_feedback is not None else ''}
+    {f'<div class="metric">Distillation Updates: <span class="metric-value">{report.distillation_updates}</span></div>' if report.distillation_updates is not None else ''}
+    {f'<div class="metric">MoE Experts Used: <span class="metric-value">{report.moe_experts_used}</span></div>' if report.moe_experts_used is not None else ''}
+    {f'</div>' if report.graph_health_score is not None else ''}
 </body>
-</html>
-        """
+</html>"""
         return html
