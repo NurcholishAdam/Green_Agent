@@ -17,6 +17,74 @@ configMapGenerator:
   - LOG_LEVEL=INFO
   - RAY_ENABLED=true
   - CARBON_API_PROVIDER=electricitymap
+  # ── Enhancement settings ──
+  - ENHANCEMENTS_ENABLED=true
+  - LIMIT_GRAPH_ENABLED=true
+  - LIMIT_GRAPH_CENTRALITY=0.7
+  - LIMIT_GRAPH_CONNECTIVITY=0.6
+  - MODP_ENABLED=true
+  - MODP_WEIGHTS=[0.4,0.3,0.2,0.1]
+  - RLHF_ENABLED=true
+  - HUMAN_FEEDBACK_SCORE=0.6
+  - DISTILLATION_ENABLED=true
+  - MOE_GATING_ENABLED=true
+  - EVOLUTIONARY_ENABLED=true
+  - POPULATION_SIZE=20
+  - MUTATION_RATE=0.1
+
+patches:
+- patch: |-
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    metadata:
+      name: green-agent-cluster
+    spec:
+      headGroupSpec:
+        template:
+          spec:
+            containers:
+            - name: ray-head
+              env:
+              - name: ENHANCEMENTS_ENABLED
+                value: "true"
+              - name: LIMIT_GRAPH_ENABLED
+                value: "true"
+              - name: MODP_ENABLED
+                value: "true"
+              - name: RLHF_ENABLED
+                value: "true"
+              - name: DISTILLATION_ENABLED
+                value: "true"
+              - name: MOE_GATING_ENABLED
+                value: "true"
+              - name: EVOLUTIONARY_ENABLED
+                value: "true"
+      workerGroupSpecs:
+      - groupName: standard-workers
+        template:
+          spec:
+            containers:
+            - name: ray-worker
+              env:
+              - name: ENHANCEMENTS_ENABLED
+                value: "true"
+              - name: LIMIT_GRAPH_ENABLED
+                value: "true"
+              - name: MODP_ENABLED
+                value: "true"
+              - name: RLHF_ENABLED
+                value: "true"
+              - name: DISTILLATION_ENABLED
+                value: "true"
+              - name: MOE_GATING_ENABLED
+                value: "true"
+              - name: EVOLUTIONARY_ENABLED
+                value: "true"
+  target:
+    group: ray.io
+    version: v1
+    kind: RayCluster
+    name: green-agent-cluster
 
 images:
 - name: ghcr.io/nurcholishadam/green_agent
