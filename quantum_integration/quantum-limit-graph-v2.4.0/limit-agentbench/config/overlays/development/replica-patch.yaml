@@ -2,12 +2,49 @@ apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
+  labels:
+    app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
 spec:
   headGroupSpec:
     template:
       spec:
         containers:
         - name: ray-head
+          env:
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.5"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.5"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.5"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "10"
+          - name: MUTATION_RATE
+            value: "0.1"
           resources:
             requests:
               cpu: "1"
@@ -27,6 +64,33 @@ spec:
       spec:
         containers:
         - name: ray-worker
+          env:
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.5"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.5"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.5"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "10"
+          - name: MUTATION_RATE
+            value: "0.1"
           resources:
             requests:
               cpu: "1"
