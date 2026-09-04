@@ -787,4 +787,3 @@ graph_centrality_gauge = Gauge('green_agent_graph_centrality', 'LIMIT Graph cent
 **Version**: 1.0  
 **Date**: 2026-02-24  
 **Status**: Production Ready
-```
