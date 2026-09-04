@@ -1,4 +1,7 @@
-# Add: .github/workflows/agentbeats.yml
+# .github/workflows/agentbeats.yml (Enhanced)
+# AgentBeats Assessment workflow with advanced enhancements:
+# LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
+# Bio‑inspired Optimisation, MoE expert gating, and optional FlexGen.
 
 name: AgentBeats Assessment
 
@@ -8,29 +11,91 @@ on:
       purple_agent_id:
         description: 'Purple agent ID to evaluate'
         required: true
+      enable_enhancements:
+        description: 'Enable advanced enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio‑inspired)'
+        type: boolean
+        default: true
 
 jobs:
   run-assessment:
     runs-on: ubuntu-latest
+    env:
+      ENHANCEMENTS_ENABLED: ${{ github.event.inputs.enable_enhancements == 'true' }}
+      LIMIT_GRAPH_ENABLED: "true"
+      MODP_ENABLED: "true"
+      RLHF_ENABLED: "true"
+      DISTILLATION_ENABLED: "true"
+      MOE_GATING_ENABLED: "true"
+      EVOLUTIONARY_ENABLED: "true"
+      FLEXGEN_ENABLED: "false"   # set true if FlexGen should be used
+      HUMAN_FEEDBACK_SCORE: "0.6"
+      MODP_WEIGHTS: "[0.4,0.3,0.2,0.1]"
+      GRAPH_CENTRALITY: "0.7"
+      GRAPH_CONNECTIVITY: "0.6"
+
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Build Green Agent
-        run: docker build -t green-sustainability:latest .
-      
-      - name: Run Assessment
+      - uses: actions/checkout@v4
+
+      - name: Build Green Agent with enhancement build args
+        run: |
+          docker build -t green-sustainability:latest . \
+            --build-arg ENHANCEMENTS_ENABLED="${ENHANCEMENTS_ENABLED}" \
+            --build-arg LIMIT_GRAPH_ENABLED="${LIMIT_GRAPH_ENABLED}" \
+            --build-arg MODP_ENABLED="${MODP_ENABLED}" \
+            --build-arg RLHF_ENABLED="${RLHF_ENABLED}" \
+            --build-arg DISTILLATION_ENABLED="${DISTILLATION_ENABLED}" \
+            --build-arg MOE_GATING_ENABLED="${MOE_GATING_ENABLED}" \
+            --build-arg EVOLUTIONARY_ENABLED="${EVOLUTIONARY_ENABLED}" \
+            --build-arg FLEXGEN_ENABLED="${FLEXGEN_ENABLED}"
+
+      - name: Run Assessment with Enhanced Environment
         env:
           PURPLE_AGENT_ID: ${{ github.event.inputs.purple_agent_id }}
           AGENTBEATS_API_KEY: ${{ secrets.AGENTBEATS_API_KEY }}
+          ENHANCEMENTS_ENABLED: ${{ env.ENHANCEMENTS_ENABLED }}
+          LIMIT_GRAPH_ENABLED: ${{ env.LIMIT_GRAPH_ENABLED }}
+          MODP_ENABLED: ${{ env.MODP_ENABLED }}
+          RLHF_ENABLED: ${{ env.RLHF_ENABLED }}
+          DISTILLATION_ENABLED: ${{ env.DISTILLATION_ENABLED }}
+          MOE_GATING_ENABLED: ${{ env.MOE_GATING_ENABLED }}
+          EVOLUTIONARY_ENABLED: ${{ env.EVOLUTIONARY_ENABLED }}
+          FLEXGEN_ENABLED: ${{ env.FLEXGEN_ENABLED }}
+          HUMAN_FEEDBACK_SCORE: ${{ env.HUMAN_FEEDBACK_SCORE }}
+          MODP_WEIGHTS: ${{ env.MODP_WEIGHTS }}
+          GRAPH_CENTRALITY: ${{ env.GRAPH_CENTRALITY }}
+          GRAPH_CONNECTIVITY: ${{ env.GRAPH_CONNECTIVITY }}
         run: |
           docker run --rm \
             -e PURPLE_AGENT_ID \
             -e AGENTBEATS_API_KEY \
+            -e ENHANCEMENTS_ENABLED \
+            -e LIMIT_GRAPH_ENABLED \
+            -e MODP_ENABLED \
+            -e RLHF_ENABLED \
+            -e DISTILLATION_ENABLED \
+            -e MOE_GATING_ENABLED \
+            -e EVOLUTIONARY_ENABLED \
+            -e FLEXGEN_ENABLED \
+            -e HUMAN_FEEDBACK_SCORE \
+            -e MODP_WEIGHTS \
+            -e GRAPH_CENTRALITY \
+            -e GRAPH_CONNECTIVITY \
             -v $(pwd)/results:/app/results \
             green-sustainability:latest
-      
+
+      - name: Verify Enhanced Metrics in Results (optional)
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        run: |
+          echo "🔍 Checking for enhanced metrics in results directory..."
+          if grep -rq "modp_score" results/ || grep -rq "graph_centrality" results/; then
+            echo "✅ Enhanced metrics detected in results"
+          else
+            echo "⚠️ No enhanced metrics found; verify enhancements are properly configured."
+          fi
+
       - name: Upload Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: assessment-results
           path: results/
+          if-no-files-found: warn
