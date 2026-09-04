@@ -1,6 +1,14 @@
 """
 Network Policy Tests
-Green Agent v5.0.0
+Green Agent v5.0.0 (Enhanced)
+
+Adds tests for advanced enhancement integration:
+- LIMIT Graph
+- MODP (Multi-Objective Decision Process)
+- RLHF (Reinforcement Learning from Human Feedback)
+- Multi-Teacher On-Policy Distillation with MoE
+- Bio-inspired Optimisation
+- FlexGen execution backend
 """
 
 import pytest
@@ -78,3 +86,67 @@ class TestNetworkPolicy:
                     break
         
         assert has_namespace_selector
+
+    # ------------------------------------------------------------------
+    # Enhanced tests for advanced enhancement integration
+    # ------------------------------------------------------------------
+    def test_enhanced_labels_present(self, k8s_client, test_namespace):
+        """Verify NetworkPolicy has enhancement labels and annotations."""
+        policy = k8s_client['networking'].read_namespaced_network_policy(
+            name="green-agent-network-policy",
+            namespace=test_namespace
+        )
+        # Check labels
+        assert policy.metadata.labels.get('enhancements') == 'enabled'
+        # Check annotations for advanced modules
+        annotations = policy.metadata.annotations or {}
+        expected_annotations = {
+            'green-agent/limit-graph': 'true',
+            'green-agent/modp': 'true',
+            'green-agent/rlhf': 'true',
+            'green-agent/distillation': 'true',
+            'green-agent/bio-inspired': 'true',
+            'green-agent/moe': 'true',
+            'green-agent/flexgen': 'true',
+        }
+        for key, value in expected_annotations.items():
+            assert annotations.get(key) == value, f"Missing annotation {key}"
+
+    def test_enhanced_ingress_ports(self, k8s_client, test_namespace):
+        """Verify additional ingress ports for enhanced modules are present."""
+        policy = k8s_client['networking'].read_namespaced_network_policy(
+            name="green-agent-network-policy",
+            namespace=test_namespace
+        )
+        enhanced_ports = {8080, 50051, 7687, 7474}
+        found_ports = set()
+        for rule in policy.spec.ingress:
+            for port in (rule.ports or []):
+                found_ports.add(port.port)
+        # At least some enhanced ports should be open
+        assert enhanced_ports & found_ports, "No enhanced ports found in ingress rules"
+
+    def test_enhanced_egress_ports(self, k8s_client, test_namespace):
+        """Verify additional egress ports for enhanced services are present."""
+        policy = k8s_client['networking'].read_namespaced_network_policy(
+            name="green-agent-network-policy",
+            namespace=test_namespace
+        )
+        enhanced_egress_ports = {7687, 9443, 443}  # graph DB, enhanced service, FlexGen API
+        found_ports = set()
+        for rule in policy.spec.egress:
+            for port in (rule.ports or []):
+                found_ports.add(port.port)
+        assert enhanced_egress_ports & found_ports, "No enhanced egress ports found"
+
+    def test_default_deny_policy_present(self, k8s_client, test_namespace):
+        """Verify default-deny NetworkPolicy exists with enhancement labels."""
+        try:
+            deny_policy = k8s_client['networking'].read_namespaced_network_policy(
+                name="green-agent-default-deny",
+                namespace=test_namespace
+            )
+        except Exception:
+            pytest.fail("Default deny network policy not found")
+        assert deny_policy.metadata.labels.get('enhancements') == 'enabled'
+        assert deny_policy.spec.pod_selector.match_labels['app'] == 'green-agent'
