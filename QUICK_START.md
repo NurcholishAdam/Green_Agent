@@ -416,5 +416,4 @@ meta_cognitive:
 
 For issues or questions:
 - GitHub Issues: https://github.com/NurcholishAdam/Green_Agent/issues
-- Email: nurcholishadam@gmail.com
-```
+- Email: nurcholisadam@gmail.com
