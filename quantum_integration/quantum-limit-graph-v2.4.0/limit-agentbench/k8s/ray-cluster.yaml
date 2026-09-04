@@ -1,4 +1,4 @@
-# Update the headGroupSpec with enhanced health probes
+# Update the headGroupSpec with enhanced health probes and advanced enhancement integration
 
 apiVersion: ray.io/v1
 kind: RayCluster
@@ -8,6 +8,15 @@ metadata:
   labels:
     app: green-agent
     version: "5.0.0"
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   headGroupSpec:
     rayStartParams:
@@ -40,10 +49,8 @@ spec:
             name: client
           - containerPort: 9090
             name: prometheus
-          
-          # ✅ ENHANCED HEALTH PROBES
-          
-          # Liveness probe - restart if unhealthy
+
+          # ✅ ENHANCED HEALTH PROBES (original)
           livenessProbe:
             httpGet:
               path: /health
@@ -54,8 +61,7 @@ spec:
             timeoutSeconds: 5
             successThreshold: 1
             failureThreshold: 3
-          
-          # Readiness probe - don't route traffic until ready
+
           readinessProbe:
             httpGet:
               path: /ready
@@ -66,8 +72,7 @@ spec:
             timeoutSeconds: 3
             successThreshold: 1
             failureThreshold: 3
-          
-          # Startup probe - allow slow startup
+
           startupProbe:
             httpGet:
               path: /health
@@ -76,9 +81,9 @@ spec:
             initialDelaySeconds: 0
             periodSeconds: 5
             timeoutSeconds: 3
-            failureThreshold: 30  # Allow up to 150 seconds for startup
-          
-          # Resource limits
+            failureThreshold: 30
+
+          # Resource limits (original)
           resources:
             requests:
               cpu: "2"
@@ -86,8 +91,8 @@ spec:
             limits:
               cpu: "4"
               memory: "8Gi"
-          
-          # Environment variables
+
+          # Environment variables – original plus enhanced flags
           env:
           - name: RAY_DISABLE_DOCKER_CPU_WARNING
             value: "1"
@@ -102,8 +107,41 @@ spec:
             value: "unified"
           - name: LOG_LEVEL
             value: "INFO"
-          
-          # Volume mounts
+          # ── Advanced Enhancement Flags ──
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.7"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.6"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.6"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "20"
+          - name: MUTATION_RATE
+            value: "0.1"
+          - name: FLEXGEN_ENABLED
+            value: "true"
+          - name: FLEXGEN_MODEL_NAME
+            value: "facebook/opt-6.7b"
+          - name: FLEXGEN_DEFAULT_PRECISION
+            value: "fp16"
+
+          # Volume mounts (original plus enhanced state volume)
           volumeMounts:
           - name: config-volume
             mountPath: /app/config
@@ -111,8 +149,10 @@ spec:
             mountPath: /app/data
           - name: logs-volume
             mountPath: /app/logs
-        
-        # Volumes
+          - name: enhancement-state
+            mountPath: /app/enhancement_state
+
+        # Volumes (original plus enhancement state PVC)
         volumes:
         - name: config-volume
           configMap:
@@ -122,12 +162,82 @@ spec:
             claimName: green-agent-data-pvc
         - name: logs-volume
           emptyDir: {}
-        
-        # Service account (if using RBAC)
+        - name: enhancement-state
+          persistentVolumeClaim:
+            claimName: green-agent-enhancement-pvc   # optional; use emptyDir if not needed
+
         serviceAccountName: green-agent-sa
-        
-        # Security context
+
         securityContext:
           runAsNonRoot: true
           runAsUser: 1000
           fsGroup: 1000
+
+  # Worker group specs – added for completeness, with same enhancement flags
+  workerGroupSpecs:
+  - replicas: 4
+    minReplicas: 2
+    maxReplicas: 20
+    groupName: standard-workers
+    rayStartParams:
+      num-cpus: '2'
+      memory: '4294967296'
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: worker
+      spec:
+        containers:
+        - name: ray-worker
+          image: ghcr.io/nurcholishadam/green_agent:latest
+          env:
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.7"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.6"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.6"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "20"
+          - name: MUTATION_RATE
+            value: "0.1"
+          - name: FLEXGEN_ENABLED
+            value: "true"
+          - name: FLEXGEN_DEFAULT_PRECISION
+            value: "fp16"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+          - name: enhancement-state
+            mountPath: /app/enhancement_state
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+        - name: enhancement-state
+          persistentVolumeClaim:
+            claimName: green-agent-enhancement-pvc
