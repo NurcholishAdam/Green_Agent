@@ -1,5 +1,6 @@
-# Prometheus Adapter Helm Values for Green Agent
-# Enables custom metrics for carbon-aware autoscaling
+# Prometheus Adapter Helm Values for Green Agent (Enhanced)
+# Enables custom metrics for carbon-aware autoscaling and advanced enhancements:
+# LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation, Bio‑inspired, MoE expert gating.
 
 prometheus:
   url: http://prometheus-server.monitoring.svc.cluster.local
@@ -65,6 +66,96 @@ rules:
       as: "tasks_completed_rate"
     metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>)'
 
+  # ── Enhanced Metrics for Advanced Modules ──
+
+  # MODP Composite Score
+  - seriesQuery: 'green_agent_modp_score{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_modp_score"
+      as: "modp_score"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # RLHF Feedback Score
+  - seriesQuery: 'green_agent_rlhf_feedback{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_rlhf_feedback"
+      as: "rlhf_feedback_score"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # LIMIT Graph Centrality
+  - seriesQuery: 'green_agent_graph_centrality{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_graph_centrality"
+      as: "graph_centrality"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # LIMIT Graph Connectivity
+  - seriesQuery: 'green_agent_graph_connectivity{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_graph_connectivity"
+      as: "graph_connectivity"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # Distillation Update Rate (updates per minute)
+  - seriesQuery: 'green_agent_distillation_update_count{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_distillation_update_count"
+      as: "distillation_update_rate"
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>)'
+
+  # MoE Gating Stability (inverse of variance; we can use stddev)
+  - seriesQuery: 'green_agent_moe_gate_weight{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_moe_gate_weight"
+      as: "moe_gate_stddev"
+    metricsQuery: 'stddev_over_time(<<.Series>>{<<.LabelMatchers>>}[15m])'
+
+  # Evolutionary Best Fitness
+  - seriesQuery: 'green_agent_evolutionary_best_fitness{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_evolutionary_best_fitness"
+      as: "evolutionary_best_fitness"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # FlexGen Energy Consumption (if FlexGen used)
+  - seriesQuery: 'green_agent_flexgen_energy_joules_total{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "green_agent_flexgen_energy_joules_total"
+      as: "flexgen_energy_rate"
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>)'
+
   external:
   # External Carbon Intensity for HPA
   - seriesQuery: 'green_agent_carbon_intensity{namespace!=""}'
@@ -83,6 +174,15 @@ rules:
       matches: "green_agent_queue_depth"
       as: "queue_depth_external"
     metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # External MODP Score (for cluster-wide scaling)
+  - seriesQuery: 'green_agent_modp_score{namespace!=""}'
+    resources:
+      template: "green_agent_modp_score"
+    name:
+      matches: "green_agent_modp_score"
+      as: "modp_score_external"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
 
 # Resource limits for adapter
 resources:
