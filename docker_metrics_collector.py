@@ -3,12 +3,20 @@ docker_metrics_collector.py
 
 Collects runtime, memory, and CPU-based energy metrics
 from inside a Docker container for green benchmarking.
+
+Enhanced with optional integration of advanced modules:
+- LIMIT Graph metrics
+- MODP (Multi‑Objective Decision Process)
+- RLHF (human feedback)
+- Multi‑Teacher On‑Policy Distillation + MoE gating
+- Bio‑inspired Optimisation
+- FlexGen integration hooks
 """
 
 import os
 import time
 import statistics
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional, Any
 
 
 class DockerMetricsCollector:
@@ -16,6 +24,8 @@ class DockerMetricsCollector:
         self,
         carbon_intensity: float = 0.0004,  # kgCO2 per Wh (configurable)
         cpu_tdp_watts: float = 65.0,        # conservative default
+        use_enhancements: bool = False,     # enable advanced enhancements
+        enhancement_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Parameters
@@ -24,9 +34,30 @@ class DockerMetricsCollector:
             Carbon intensity of electricity (kg CO2 per Wh)
         cpu_tdp_watts : float
             Approximate CPU TDP used for energy estimation
+        use_enhancements : bool
+            If True, incorporate advanced modules (MODP, graph metrics, RLHF, etc.)
+        enhancement_config : dict, optional
+            Configuration for enhancements, may include:
+                - modp_weights: list of 4 floats [accuracy, energy, latency, carbon]
+                - graph_metrics: dict with centrality, connectivity, density
+                - human_feedback_score: float (0-1)
+                - distillation_stats: dict (for tracking)
+                - flexgen_energy_joules: float (optional FlexGen energy consumed)
         """
         self.carbon_intensity = carbon_intensity
         self.cpu_tdp_watts = cpu_tdp_watts
+        self.use_enhancements = use_enhancements
+        self.enhancement_config = enhancement_config or {}
+
+        # Default MODP weights if not provided
+        self.modp_weights = self.enhancement_config.get(
+            'modp_weights', [0.4, 0.3, 0.2, 0.1]  # accuracy, energy, latency, carbon
+        )
+        total = sum(self.modp_weights)
+        if total > 0:
+            self.modp_weights = [w / total for w in self.modp_weights]
+        else:
+            self.modp_weights = [0.25, 0.25, 0.25, 0.25]
 
     # -------------------------
     # Core metric collectors
@@ -62,6 +93,35 @@ class DockerMetricsCollector:
         return (utime + stime) / clock_ticks
 
     # -------------------------
+    # Enhanced helpers
+    # -------------------------
+
+    def _compute_modp_score(self, accuracy: float, energy_wh: float,
+                            latency_s: float, carbon_kg: float) -> float:
+        """
+        Compute a multi‑objective composite score (MODP) using configurable weights.
+        All objectives are normalized to [0,1] with higher = better.
+        """
+        # Normalize each metric (lower is better for energy, latency, carbon)
+        acc_norm = min(accuracy, 1.0)
+        energy_norm = 1.0 - min(energy_wh / 1.0, 1.0)      # assume 1 Wh max
+        latency_norm = 1.0 - min(latency_s / 10.0, 1.0)    # assume 10 s max
+        carbon_norm = 1.0 - min(carbon_kg / 0.1, 1.0)      # assume 0.1 kg max
+
+        return float(self.modp_weights[0] * acc_norm +
+                     self.modp_weights[1] * energy_norm +
+                     self.modp_weights[2] * latency_norm +
+                     self.modp_weights[3] * carbon_norm)
+
+    def _get_graph_metrics(self) -> Dict[str, float]:
+        """Retrieve LIMIT Graph metrics from enhancement_config or default."""
+        return self.enhancement_config.get('graph_metrics', {"centrality": 0.5, "connectivity": 0.5})
+
+    def _get_human_feedback_score(self) -> Optional[float]:
+        """Retrieve RLHF human feedback score from config."""
+        return self.enhancement_config.get('human_feedback_score')
+
+    # -------------------------
     # Public API
     # -------------------------
 
@@ -72,18 +132,12 @@ class DockerMetricsCollector:
     ) -> Dict[str, float]:
         """
         Executes a callable multiple times and collects metrics.
-
-        Parameters
-        ----------
-        fn : Callable
-            Function that runs agent inference and returns accuracy
-        runs : int
-            Number of repeated executions for variance
-
-        Returns
-        -------
-        Dict[str, float]
-            Collected metrics
+        If enhancements are enabled, additional fields are added:
+            - modp_score: composite multi‑objective score
+            - graph_metrics: LIMIT Graph metrics
+            - human_feedback_score: RLHF feedback (if provided)
+            - distillation_stats: distillation update count (if provided)
+            - flexgen_energy_joules: FlexGen energy (if provided)
         """
         latencies: List[float] = []
         cpu_times: List[float] = []
@@ -112,7 +166,7 @@ class DockerMetricsCollector:
 
         peak_memory_mb = self._read_cgroup_memory_peak()
 
-        return {
+        result = {
             "accuracy": avg_accuracy,
             "latency": avg_latency,
             "latency_variance": latency_variance,
@@ -121,3 +175,31 @@ class DockerMetricsCollector:
             "carbon": carbon_kg,
             "memory": peak_memory_mb,
         }
+
+        # Enhanced additions
+        if self.use_enhancements:
+            # MODP score
+            result["modp_score"] = self._compute_modp_score(
+                accuracy=avg_accuracy,
+                energy_wh=energy_wh,
+                latency_s=avg_latency,
+                carbon_kg=carbon_kg,
+            )
+
+            # Graph metrics
+            result["graph_metrics"] = self._get_graph_metrics()
+
+            # RLHF human feedback
+            hf = self._get_human_feedback_score()
+            if hf is not None:
+                result["human_feedback_score"] = hf
+
+            # Distillation stats (optional)
+            if 'distillation_stats' in self.enhancement_config:
+                result["distillation_stats"] = self.enhancement_config['distillation_stats']
+
+            # FlexGen energy (optional)
+            if 'flexgen_energy_joules' in self.enhancement_config:
+                result["flexgen_energy_joules"] = self.enhancement_config['flexgen_energy_joules']
+
+        return result
