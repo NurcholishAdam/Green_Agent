@@ -1,9 +1,14 @@
 # Symbolic Policy Rules for Green Agent
 # Extends green_policy.yaml with explicit symbolic constraints
+# Enhanced with advanced modules: LIMIT Graph, MODP, RLHF,
+# Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation,
+# MoE expert gating, and FlexGen integration.
 
-version: "1.0"
+version: "1.1"
 
-# Symbolic Rules - Explicit logical constraints
+# ---------------------------------------------------------------------------
+# Original symbolic rules (unchanged)
+# ---------------------------------------------------------------------------
 symbolic_rules:
   # Sustainability Rules
   - id: "SUST-001"
@@ -169,3 +174,107 @@ evaluation_config:
     include_metric_snapshot: true
     include_historical_context: true
     format: "structured_json"
+
+# ---------------------------------------------------------------------------
+# Advanced Enhancements Section (NEW)
+# These settings align the symbolic rules with advanced modules.
+# ---------------------------------------------------------------------------
+
+enhancements:
+  enabled: true          # Master switch
+
+  # LIMIT Graph integration
+  limit_graph:
+    enabled: true
+    # Graph metrics used in composite rules (centrality, connectivity)
+    graph_metrics:
+      centrality: 0.7
+      connectivity: 0.6
+    # How graph metrics influence policy decisions (e.g., weight in rules)
+    influence_weight: 0.3
+
+  # MODP (Multi‑Objective Decision Process) weights
+  modp:
+    enabled: true
+    objective_weights: [0.4, 0.3, 0.2, 0.1]   # accuracy, energy, latency, carbon
+    normalize_weights: true
+    # MODP score can be used in rules: e.g., modp_score < threshold
+    score_threshold_low: 0.4
+    score_threshold_high: 0.7
+
+  # RLHF (Reinforcement Learning from Human Feedback)
+  rlhf:
+    enabled: true
+    human_feedback_score: 0.6      # default human feedback (0-1)
+    feedback_source: "dashboard"
+    collect_feedback: true
+
+  # Multi‑Teacher On‑Policy Distillation with MoE gating
+  distillation:
+    enabled: true
+    use_moe_gating: true
+    distillation_lr: 0.01
+    gating_lr: 0.005
+    replay_size: 2000
+    train_every: 10
+    epsilon: 0.1
+    teachers:
+      - "rule_based"
+      - "historical_ml"
+      - "q_learning"
+      - "rlhf"
+
+  # Bio‑inspired Optimisation (Evolutionary)
+  bio_inspired:
+    enabled: true
+    use_evolutionary: true
+    population_size: 20
+    mutation_rate: 0.1
+    crossover_rate: 0.7
+    elitism: 2
+
+  # MoE expert gating details
+  moe_expert:
+    enabled: true
+    n_experts: 4
+    gating_lr: 0.005
+
+  # FlexGen integration (optional high‑throughput LLM execution)
+  flexgen:
+    enabled: true
+    model_name: "facebook/opt-6.7b"
+    batch_size: 16
+    memory_limit_mb: 4096
+    precision_options: ["fp32", "fp16", "int8"]
+    default_precision: "fp16"
+    delegation_policy: "adaptive"   # adaptive | always | never
+
+# New composite rules that use advanced metrics
+enhanced_composite_rules:
+  - id: "ENH-MODP-001"
+    name: "Low MODP Score Alert"
+    priority: "warning"
+    condition: "modp_score < 0.4"
+    action: "trigger_policy_review"
+    explanation: "Overall multi‑objective performance is poor; consider adjusting weights or policies."
+
+  - id: "ENH-GRAPH-001"
+    name: "Low Graph Centrality"
+    priority: "info"
+    condition: "graph_centrality < 0.3"
+    action: "check_topology"
+    explanation: "LIMIT Graph centrality is low; system may be operating in a suboptimal topology."
+
+  - id: "ENH-RLHF-001"
+    name: "Low Human Feedback Score"
+    priority: "warning"
+    condition: "human_feedback_score < 0.3"
+    action: "collect_more_feedback"
+    explanation: "Human feedback indicates dissatisfaction; consider adjusting behavior or prompting."
+
+  - id: "ENH-FLEX-001"
+    name: "FlexGen Energy Spike"
+    priority: "warning"
+    condition: "flexgen_energy_joules > 1000"
+    action: "switch_precision"
+    explanation: "FlexGen energy consumption is high; consider using lower precision (fp16/int8)."
