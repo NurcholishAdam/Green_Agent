@@ -1,3 +1,4 @@
+```markdown
 # lean-ctx — Context Engineering Layer
 
 PREFER lean-ctx MCP tools over native equivalents for token savings:
@@ -12,3 +13,64 @@ PREFER lean-ctx MCP tools over native equivalents for token savings:
 
 Edit files: use native Edit/StrReplace if available. If Edit requires Read and Read is unavailable, use ctx_edit.
 Write, Delete, Glob — use normally. NEVER loop on Edit failures — switch to ctx_edit immediately.
+
+---
+
+## 🧠 Advanced Enhancement Integration
+
+When working with files under `src/enhancements/` or interacting with Green Agent's advanced modules, use the **enhanced read modes** available in lean-ctx to fetch only the most relevant state without reading entire files. This saves tokens and keeps context focused.
+
+### Enhanced Read Modes (in addition to standard modes)
+
+| Mode | Purpose | Example Module |
+|------|---------|----------------|
+| `graph` | LIMIT Graph metrics (centrality, connectivity) | `core/graph_registry.py`, `core/causal_graph.py` |
+| `modp` | MODP weights and composite score | `schemas/node_descriptor.py`, `schemas/workload_descriptor.py` |
+| `rlhf` | Human feedback score | `schemas/feedback_event.py`, `zero_trust_architecture.py` |
+| `distillation` | Student stats, replay buffer size, MoE gate weights | `schemas/node_descriptor.py` (distillation optimizers) |
+| `evolutionary` | Best fitness and population parameters | `schemas/node_descriptor.py` (evolutionary optimizers) |
+| `moe` | MoE gating network weights and expert routing stats | `schemas/node_descriptor.py`, `schemas/workload_descriptor.py` |
+| `flexgen` | FlexGen configuration, precision, energy metrics | `config/green_agent_config.yaml`, runtime logs |
+
+### Usage Examples
+
+```python
+# Get LIMIT Graph metrics without reading entire registry implementation
+ctx_read("src/enhancements/core/graph_registry.py", mode="graph")
+
+# Get current MODP weights and score from NodeDescriptor
+ctx_read("src/enhancements/schemas/node_descriptor.py", mode="modp")
+
+# Get RLHF feedback score from FeedbackEvent
+ctx_read("src/enhancements/schemas/feedback_event.py", mode="rlhf")
+
+# Get distillation student stats and MoE gate weights
+ctx_read("src/enhancements/schemas/node_descriptor.py", mode="distillation")
+
+# Get evolutionary optimizer best fitness
+ctx_read("src/enhancements/schemas/node_descriptor.py", mode="evolutionary")
+
+# Get MoE gate weights
+ctx_read("src/enhancements/schemas/workload_descriptor.py", mode="moe")
+
+# Get FlexGen configuration and energy usage
+ctx_read("config/green_agent_config.yaml", mode="flexgen")
+```
+
+### When to Use Enhanced Modes
+
+- **LIMIT Graph**: When you need topology context for routing or anomaly analysis.
+- **MODP**: When evaluating trade‑offs between accuracy, energy, latency, and carbon.
+- **RLHF**: When human feedback influences policy adjustments or routing priorities.
+- **Distillation**: When checking if the student policy is learning or the replay buffer is filling.
+- **Evolutionary**: When monitoring whether evolutionary optimisation is converging or stalled.
+- **MoE**: When diagnosing expert routing stability or gate weight changes.
+- **FlexGen**: When deciding to delegate LLM inference and checking energy consumption.
+
+These modes are designed to work with the advanced enhancement modules under `src/enhancements/` and require that the corresponding modules are enabled via `ENHANCEMENTS_ENABLED=true` or the appropriate configuration flags.
+
+If the enhancements are not enabled or the modules are missing, these modes will gracefully fall back to standard file reading or return an empty result.
+
+---
+
+**Remember**: Always prefer the most context‑efficient read mode; use `full` only for files you intend to edit, and use the enhanced modes for quick state inspection.
