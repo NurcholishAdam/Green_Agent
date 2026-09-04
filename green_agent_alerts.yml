@@ -299,3 +299,130 @@ groups:
           rate(green_agent_policy_edge_weight_bucket[5m])
         )
       )
+
+# -----------------------------------------------------------------------
+# NEW: Enhanced Alerts for Advanced Modules
+# (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
+# Bio‑inspired Optimisation, MoE expert gating, FlexGen)
+# -----------------------------------------------------------------------
+- name: green_agent_enhanced
+  interval: 30s
+  rules:
+
+  # MODP composite score too low
+  - alert: GreenAgentLowMODPScore
+    expr: green_agent_modp_score < 0.4
+    for: 10m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: modp
+    annotations:
+      summary: "Low MODP composite score"
+      description: |
+        MODP score is {{ $value }} (target > 0.6). 
+        Check objective weights and system performance.
+      runbook_url: https://wiki.example.com/runbooks/modp-low-score
+
+  # RLHF feedback score dropping
+  - alert: GreenAgentLowRLHFFeedback
+    expr: green_agent_rlhf_feedback < 0.3
+    for: 15m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: rlhf
+    annotations:
+      summary: "Low RLHF feedback score"
+      description: |
+        Human feedback score is {{ $value }}. 
+        Consider adjusting agent behavior or collecting more feedback.
+      runbook_url: https://wiki.example.com/runbooks/rlhf-low-feedback
+
+  # LIMIT Graph centrality anomaly
+  - alert: GreenAgentGraphCentralityLow
+    expr: green_agent_graph_centrality < 0.3
+    for: 10m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: limit-graph
+    annotations:
+      summary: "Low LIMIT Graph centrality"
+      description: |
+        Graph centrality is {{ $value }}. Topology may be suboptimal.
+      runbook_url: https://wiki.example.com/runbooks/graph-centrality-low
+
+  # Distillation updates stalled
+  - alert: GreenAgentDistillationStalled
+    expr: rate(green_agent_distillation_update_count[30m]) < 1
+    for: 30m
+    labels:
+      severity: info
+      team: ai-platform
+      component: distillation
+    annotations:
+      summary: "Distillation updates stalled"
+      description: |
+        Few or no distillation updates in the last 30 minutes. 
+        Check if training loop is active.
+      runbook_url: https://wiki.example.com/runbooks/distillation-stalled
+
+  # MoE gating instability
+  - alert: GreenAgentMoEUnstable
+    expr: stddev_over_time(green_agent_moe_gate_weight[15m]) > 0.2
+    for: 15m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: moe
+    annotations:
+      summary: "MoE gating unstable"
+      description: |
+        Gate weight standard deviation is {{ $value }}. 
+        Investigate stability of expert routing.
+      runbook_url: https://wiki.example.com/runbooks/moe-unstable
+
+  # Bio‑inspired evolutionary fitness stagnating
+  - alert: GreenAgentEvolutionStalled
+    expr: green_agent_evolutionary_best_fitness - green_agent_evolutionary_best_fitness offset 1h < 0.01
+    for: 1h
+    labels:
+      severity: info
+      team: ai-platform
+      component: evolutionary
+    annotations:
+      summary: "Evolutionary optimisation stalled"
+      description: |
+        Best fitness has not improved significantly in the last hour.
+      runbook_url: https://wiki.example.com/runbooks/evolution-stalled
+
+  # FlexGen energy consumption high
+  - alert: GreenAgentFlexGenHighEnergy
+    expr: rate(green_agent_flexgen_energy_joules_total[5m]) > 1000
+    for: 10m
+    labels:
+      severity: warning
+      team: ai-platform
+      component: flexgen
+    annotations:
+      summary: "High FlexGen energy consumption"
+      description: |
+        FlexGen energy rate is {{ $value }} J/s. 
+        Consider switching precision or delegation policy.
+      runbook_url: https://wiki.example.com/runbooks/flexgen-high-energy
+
+# -----------------------------------------------------------------------
+# Enhanced Recording Rules (optional, for dashboards)
+# -----------------------------------------------------------------------
+- name: green_agent_enhanced_recording_rules
+  interval: 1m
+  rules:
+  - record: green_agent:modp_score:avg5m
+    expr: avg_over_time(green_agent_modp_score[5m])
+  - record: green_agent:rlhf_feedback:avg1h
+    expr: avg_over_time(green_agent_rlhf_feedback[1h])
+  - record: green_agent:graph_centrality:avg1h
+    expr: avg_over_time(green_agent_graph_centrality[1h])
+  - record: green_agent:distillation_update_rate:sum5m
+    expr: sum(rate(green_agent_distillation_update_count[5m]))
