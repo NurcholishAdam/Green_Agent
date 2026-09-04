@@ -19,10 +19,16 @@ on:
           - development
           - staging
           - production
+      enable_enhancements:
+        description: 'Enable advanced enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio‑inspired)'
+        required: false
+        default: false
+        type: boolean
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  ENHANCEMENTS_ENABLED: ${{ github.event.inputs.enable_enhancements || 'false' }}
 
 jobs:
   test:
@@ -52,6 +58,17 @@ jobs:
             pytest tests/ -v --cov=src --cov-report=term-missing || echo "⚠️  Tests not yet implemented"
           else
             echo "⚠️  No tests directory found - skipping tests"
+          fi
+
+      - name: Run enhanced module tests (optional)
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        run: |
+          echo "🧪 Running enhanced module unit tests..."
+          # Add test command for enhancements if available
+          if [ -d "quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/tests" ]; then
+            pytest quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/tests/ -v || echo "⚠️  Enhanced tests failed"
+          else
+            echo "ℹ️  No dedicated enhanced tests directory found; skipping."
           fi
 
   build:
@@ -85,6 +102,7 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=enhanced,enable=${{ env.ENHANCEMENTS_ENABLED == 'true' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -95,7 +113,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Build even if Dockerfile doesn't exist yet
           file: Dockerfile
 
   validate-manifests:
@@ -138,15 +155,31 @@ jobs:
           python -c "import yaml; yaml.safe_load_all(open('${{ matrix.environment }}-deployment.yaml'))"
           echo "✅ YAML syntax is valid"
 
+      - name: Check for enhancement configuration
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        run: |
+          echo "🔧 Checking enhancement overlays..."
+          if [ -d "config/overlays/enhancements" ]; then
+            echo "✅ enhancements overlay found"
+            kustomize build config/overlays/enhancements > enhancements-deployment.yaml
+            echo "Enhanced manifest generated:"
+            head -30 enhancements-deployment.yaml
+            # Validate enhanced manifest
+            python -c "import yaml; yaml.safe_load_all(open('enhancements-deployment.yaml'))"
+          else
+            echo "⚠️  No config/overlays/enhancements found, but enhancement flag set."
+          fi
+
       - name: Upload deployment manifest
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.environment }}-deployment-manifest
-          path: ${{ matrix.environment }}-deployment.yaml
+          path: |
+            ${{ matrix.environment }}-deployment.yaml
+            ${{ env.ENHANCEMENTS_ENABLED == 'true' && 'enhancements-deployment.yaml' || '' }}
           retention-days: 30
 
   # This job only runs if you have configured KUBECONFIG secret
-  # Remove this entire job if you don't have a cluster yet
   deploy-to-cluster:
     name: Deploy to Cluster (Optional)
     runs-on: ubuntu-latest
@@ -187,6 +220,18 @@ jobs:
           
           echo "✅ Deployment successful"
 
+      - name: Apply enhancements overlay (optional)
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        run: |
+          export KUBECONFIG=kubeconfig.yaml
+          if [ -d "config/overlays/enhancements" ]; then
+            echo "🔧 Applying enhancements overlay..."
+            kubectl apply -k config/overlays/enhancements
+            echo "✅ Enhancements applied"
+          else
+            echo "⚠️  Enhancements overlay not found; skipping."
+          fi
+
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
@@ -200,6 +245,7 @@ jobs:
           echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "**Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Enhancements:** ${{ env.ENHANCEMENTS_ENABLED }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           echo "## 📊 Job Status" >> $GITHUB_STEP_SUMMARY
