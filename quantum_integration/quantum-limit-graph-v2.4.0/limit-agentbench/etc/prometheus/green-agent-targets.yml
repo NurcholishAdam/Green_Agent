@@ -1,4 +1,8 @@
-# /etc/prometheus/green-agent-targets.yml
+# /etc/prometheus/green-agent-targets.yml (Enhanced)
+# Static targets for Green Agent monitoring, including advanced enhancement metrics.
+# The enhanced modules expose additional metrics (MODP, RLHF, LIMIT Graph, etc.)
+# on the same /metrics endpoint, so no additional port changes are required.
+
 - targets:
   - 'green-agent-prod-1.example.com:8000'
   - 'green-agent-prod-2.example.com:8000'
@@ -8,6 +12,7 @@
     datacenter: us-east-1
     team: ai-platform
     cluster: green-agent-prod
+    enhancements: enabled          # Indicates advanced enhancement metrics are available
 
 - targets:
   - 'green-agent-staging-1.example.com:8000'
@@ -16,3 +21,14 @@
     datacenter: us-west-2
     team: ai-platform
     cluster: green-agent-staging
+    enhancements: enabled
+
+# Optional: Development environment (if needed)
+# - targets:
+#   - 'green-agent-dev-1.example.com:8000'
+#   labels:
+#     environment: development
+#     datacenter: us-east-1
+#     team: ai-platform
+#     cluster: green-agent-dev
+#     enhancements: enabled
