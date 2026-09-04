@@ -1,4 +1,4 @@
-```markdown
+
 # Extended Pareto Analysis: 7D + Specialized Plots (Enhanced)
 
 ## 🎯 Overview
@@ -525,4 +525,3 @@ python examples/demo_extended_dimensions.py --enhanced
 **Advanced Integration:** LIMIT Graph, MODP, RLHF, Distillation, MoE, Evolutionary, FlexGen
 
 **This extension makes Green_Agent the most comprehensive multi-objective agent benchmarking platform available.** 🌟
-```
