@@ -8,6 +8,7 @@ This guide shows how to integrate the Expert Collaboration Layer into Green Agen
 ```
 ## Architecture
 
+```
 User Layer
    │
    ▼
@@ -71,6 +72,7 @@ Feedback Integration & Audit (audit_logger.py)
    ▼
 Green Agent Dashboard / Monitoring (Prometheus, Grafana)
    • MODP scores, RLHF feedback, graph metrics, distillation updates
+```
 ```
 
 ## File Structure
