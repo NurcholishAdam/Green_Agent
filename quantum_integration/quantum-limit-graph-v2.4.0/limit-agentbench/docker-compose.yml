@@ -6,9 +6,42 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # Core configuration (original)
       - GRID_REGION=${GRID_REGION:-US-CA}
       - AGENTBEATS_API_KEY=${AGENTBEATS_API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # ── Advanced Enhancement Flags ──
+      # Master switch
+      - ENHANCEMENTS_ENABLED=${ENHANCEMENTS_ENABLED:-true}
+      
+      # LIMIT Graph
+      - LIMIT_GRAPH_ENABLED=${LIMIT_GRAPH_ENABLED:-true}
+      - LIMIT_GRAPH_CENTRALITY=${LIMIT_GRAPH_CENTRALITY:-0.7}
+      - LIMIT_GRAPH_CONNECTIVITY=${LIMIT_GRAPH_CONNECTIVITY:-0.6}
+      
+      # MODP (Multi‑Objective Decision Process)
+      - MODP_ENABLED=${MODP_ENABLED:-true}
+      - MODP_WEIGHTS=${MODP_WEIGHTS:-[0.4,0.3,0.2,0.1]}
+      
+      # RLHF
+      - RLHF_ENABLED=${RLHF_ENABLED:-true}
+      - HUMAN_FEEDBACK_SCORE=${HUMAN_FEEDBACK_SCORE:-0.6}
+      
+      # Multi‑Teacher Distillation + MoE
+      - DISTILLATION_ENABLED=${DISTILLATION_ENABLED:-true}
+      - MOE_GATING_ENABLED=${MOE_GATING_ENABLED:-true}
+      
+      # Bio‑inspired Optimisation (Evolutionary)
+      - EVOLUTIONARY_ENABLED=${EVOLUTIONARY_ENABLED:-true}
+      - POPULATION_SIZE=${POPULATION_SIZE:-20}
+      - MUTATION_RATE=${MUTATION_RATE:-0.1}
+      
+      # FlexGen (optional execution backend)
+      - FLEXGEN_ENABLED=${FLEXGEN_ENABLED:-false}
+      - FLEXGEN_MODEL_NAME=${FLEXGEN_MODEL_NAME:-facebook/opt-6.7b}
+      - FLEXGEN_DEFAULT_PRECISION=${FLEXGEN_DEFAULT_PRECISION:-fp16}
+      
     volumes:
       - ./results:/app/results
     restart: unless-stopped
