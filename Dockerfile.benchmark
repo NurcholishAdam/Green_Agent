@@ -8,19 +8,52 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
+# Python deps (includes enhancements dependencies if added to requirements.txt)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Source
+# Source code (includes src/enhancements/ subfolder)
 COPY quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src ./src
 COPY run_agent.py .
 COPY docker_metrics_collector.py .
 COPY agentbeats.json .
 
+# Optionally copy any additional config files required by enhancements
+# COPY symbolic_policy.yaml .
+# COPY green_policy.yaml .
+
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
+# ---------------------------------------------------------------
+# Advanced Enhancements Environment Variables
+# These toggles enable/disable the modules from src/enhancements/
+# Set to "true" to activate; they are defaulted to false for
+# minimal footprint unless overridden at runtime.
+# ---------------------------------------------------------------
+ENV ENHANCEMENTS_ENABLED=true
+ENV LIMIT_GRAPH_ENABLED=true
+ENV LIMIT_GRAPH_CENTRALITY=0.7
+ENV LIMIT_GRAPH_CONNECTIVITY=0.6
+ENV MODP_ENABLED=true
+ENV MODP_WEIGHTS=[0.4,0.3,0.2,0.1]
+ENV RLHF_ENABLED=true
+ENV HUMAN_FEEDBACK_SCORE=0.6
+ENV DISTILLATION_ENABLED=true
+ENV MOE_GATING_ENABLED=true
+ENV EVOLUTIONARY_ENABLED=true
+ENV POPULATION_SIZE=20
+ENV MUTATION_RATE=0.1
+ENV FLEXGEN_ENABLED=false
+ENV FLEXGEN_MODEL_NAME=facebook/opt-6.7b
+ENV FLEXGEN_DEFAULT_PRECISION=fp16
+ENV FLEXGEN_DELEGATION_POLICY=adaptive
+
+# Volume for cgroup metrics (unchanged)
 VOLUME ["/sys/fs/cgroup"]
 
+# Labels to indicate enhanced image
+LABEL org.green-agent.enhancements="true"
+
+# Default command (unchanged, but enhancements can be controlled via env)
 CMD ["python", "run_agent.py"]
