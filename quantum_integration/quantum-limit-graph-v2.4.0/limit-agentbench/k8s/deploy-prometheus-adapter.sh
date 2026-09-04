@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Green Agent - Prometheus Adapter Deployment Script
-# Enables custom metrics for carbon-aware autoscaling
+# Green Agent - Prometheus Adapter Deployment Script (Enhanced)
+# Enables custom metrics for carbon-aware autoscaling and advanced enhancements:
+# LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation, Bio‑inspired, MoE expert gating.
 
 set -e
 
@@ -18,8 +19,17 @@ RELEASE_NAME="prometheus-adapter"
 CHART_VERSION="3.4.0"
 TIMEOUT="5m"
 
+# Parse optional --enhancements flag
+ENHANCEMENTS=false
+if [[ "$*" == *"--enhancements"* ]]; then
+    ENHANCEMENTS=true
+fi
+
 echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║   Green Agent - Prometheus Adapter Deployment         ║${NC}"
+if $ENHANCEMENTS; then
+    echo -e "${BLUE}║   Enhanced Mode: LIMIT Graph, MODP, RLHF, etc.        ║${NC}"
+fi
 echo -e "${BLUE}╚════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -135,7 +145,52 @@ else
     print_warning "No HPA resources found in green-agent namespace"
 fi
 
-# Step 9: Display access commands
+# ---------------------------------------------------------------------------
+# Enhanced Verification (if --enhancements flag provided)
+# ---------------------------------------------------------------------------
+if $ENHANCEMENTS; then
+    echo ""
+    print_status "Running enhanced metrics verification..."
+
+    ENHANCED_METRICS=(
+        "green_agent_modp_score"
+        "green_agent_rlhf_feedback"
+        "green_agent_graph_centrality"
+        "green_agent_graph_connectivity"
+        "green_agent_distillation_update_rate"
+        "green_agent_moe_gate_stddev"
+        "green_agent_evolutionary_best_fitness"
+        "green_agent_flexgen_energy_rate"
+    )
+
+    for metric in "${ENHANCED_METRICS[@]}"; do
+        # Check if the metric appears in the custom metrics API
+        if kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 2>/dev/null | grep -q "$metric"; then
+            print_success "$metric is available"
+        else
+            print_warning "$metric not found yet (may appear after Green Agent starts exporting)"
+        fi
+    done
+
+    # Optionally check HPA using enhanced metrics
+    HPA_ENHANCED=$(kubectl get hpa -n green-agent -o json 2>/dev/null | \
+        jq -r '.items[] | select(.spec.metrics[]?.pods.metric.name? // empty | startswith("green_agent_modp")) | .metadata.name' 2>/dev/null)
+    if [ -n "$HPA_ENHANCED" ]; then
+        print_success "HPA configured with enhanced metrics: $HPA_ENHANCED"
+    else
+        print_status "HPA may not yet be using enhanced metrics; you can update it manually with the metrics defined in k8s/prometheus-adapter-values.yaml"
+    fi
+
+    echo ""
+    echo -e "${BLUE}Enhanced metrics next steps:${NC}"
+    echo "1. Ensure Green Agent pods are exporting the enhanced metrics."
+    echo "2. Update HPA to include enhanced metrics (e.g., MODP score, RLHF feedback)."
+    echo "3. Verify with:"
+    echo -e "   ${YELLOW}kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1/namespaces/green-agent/pods/*/modp_score${NC}"
+    echo "   ${YELLOW}kubectl get hpa -n green-agent -o yaml | grep -A5 enhanced${NC}"
+fi
+
+# Step 9: Display access commands (always)
 echo ""
 echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║              Deployment Complete!                      ║${NC}"
@@ -154,6 +209,11 @@ echo -e "   ${YELLOW}kubectl logs -l app.kubernetes.io/name=prometheus-adapter -
 echo ""
 echo "4. View available metrics:"
 echo -e "   ${YELLOW}kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name'${NC}"
+echo ""
+if $ENHANCEMENTS; then
+    echo "5. Enhanced metrics (MODP, RLHF, Graph, etc.) can be verified similarly."
+    echo "   See output above for their status."
+fi
 echo ""
 echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
 echo ""
