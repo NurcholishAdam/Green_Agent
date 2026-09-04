@@ -1,4 +1,4 @@
-```markdown
+
 # AgentBeats Compliance Guide (Enhanced)
 
 Complete guide for AgentBeats-ready Green_Agent architecture implementation, now augmented with advanced enhancement modules (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, MoE expert gating, and FlexGen integration).
@@ -555,4 +555,3 @@ See `CONTRIBUTING.md` for guidelines on improving AgentBeats compliance.
 ## 📄 License
 
 See `LICENSE` file for details.
-```
