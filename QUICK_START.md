@@ -1,3 +1,4 @@
+```markdown
 # Quick Start Guide: Meta-Cognitive Green Agent
 
 ## Installation
@@ -7,8 +8,11 @@
 git clone https://github.com/NurcholishAdam/Green_Agent.git
 cd Green_Agent
 
-# Install dependencies
+# Install core dependencies
 pip install -r requirements.txt
+
+# (Optional) Install dependencies for advanced enhancements
+pip install scikit-learn pandas pydantic pydantic-settings cryptography pyjwt prometheus-client tenacity aiofiles networkx
 ```
 
 ## Basic Usage
@@ -54,6 +58,12 @@ python run_agent.py \
   --dashboard dashboard.html
 ```
 
+**Optionally enable advanced enhancements:**
+
+```bash
+python run_agent.py --config example_config.json --policy green_policy.yaml --enhancements
+```
+
 ## Configuration
 
 ### Policy Configuration (`green_policy.yaml`)
@@ -93,7 +103,39 @@ meta_cognitive:
       "id": "query-1",
       "task": "Your task description"
     }
-  ]
+  ],
+  "enhancements": {
+    "enabled": true,
+    "limit_graph": {
+      "enabled": true,
+      "graph_metrics": { "centrality": 0.7, "connectivity": 0.6 }
+    },
+    "modp": {
+      "enabled": true,
+      "objective_weights": [0.4, 0.3, 0.2, 0.1]
+    },
+    "rlhf": {
+      "enabled": true,
+      "human_feedback_score": 0.6
+    },
+    "distillation": {
+      "enabled": true,
+      "use_moe_gating": true
+    },
+    "bio_inspired": {
+      "enabled": true,
+      "use_evolutionary": true
+    },
+    "moe_expert": {
+      "enabled": true,
+      "n_experts": 4
+    },
+    "flexgen": {
+      "enabled": false,
+      "model_name": "facebook/opt-6.7b",
+      "delegation_policy": "adaptive"
+    }
+  }
 }
 ```
 
@@ -261,6 +303,73 @@ meta_cognitive:
     history_window: 20  # Consider last 20 runs
 ```
 
+### Integrating LIMIT Graph, MODP, RLHF, Distillation, MoE, Evolutionary, FlexGen
+
+The enhancements folder (`src/enhancements`) provides additional modules that can be enabled to improve decision‑making and sustainability. When enabled, the agent can:
+
+- **Select routing strategies** using a learned distillation policy with MoE gating.
+- **Choose task priority** based on MODP (Multi‑Objective Decision Process) weights.
+- **Incorporate human feedback** (RLHF) into decisions.
+- **Use LIMIT Graph metrics** (centrality, connectivity) for context awareness.
+- **Evolve parameters** via bio‑inspired optimisation.
+- **Delegate LLM inference** to FlexGen with adaptive precision.
+
+#### Enabling Enhancements
+
+Set `ENHANCEMENTS_ENABLED=true` in your environment or include the `enhancements` block in `config.json`. The agent will automatically initialize the advanced modules.
+
+#### Example: Using NodeDescriptor and WorkloadDescriptor
+
+```python
+import asyncio
+from src.enhancements.schemas.node_descriptor import NodeDescriptor, NodeType, CoolingType
+from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType, Urgency
+
+async def main():
+    node = NodeDescriptor(
+        id="node1",
+        type=NodeType.EDGE,
+        region="us-east",
+        region_carbon_intensity=350.0,
+        energy_per_token=0.00004,
+        use_evolutionary=True,
+        human_feedback_score=0.7,
+        graph_metrics={"centrality": 0.8, "connectivity": 0.6},
+    )
+    strategy = await node.select_routing_strategy()
+    print(f"Selected routing strategy: {strategy}")
+
+    workload = WorkloadDescriptor(
+        task_id="task1",
+        task_type=TaskType.INFERENCE,
+        tokens=1000,
+        latency_target=300.0,
+        urgency=Urgency.MEDIUM,
+        use_evolutionary=True,
+        human_feedback_score=0.6,
+        graph_metrics={"centrality": 0.7},
+        metadata={"latency_weight": 0.5, "carbon_weight": 0.3, "energy_weight": 0.2}
+    )
+    priority = await workload.select_priority()
+    print(f"Selected priority: {priority}")
+
+asyncio.run(main())
+```
+
+#### FlexGen Integration
+
+If FlexGen is available and enabled, the agent can delegate LLM tasks to FlexGen for high‑throughput inference. Set `flexgen.enabled` to `true` and adjust `delegation_policy`. The decision to delegate is made by the distillation policy based on context (carbon intensity, task complexity, etc.).
+
+```yaml
+# In config.json
+flexgen:
+  enabled: true
+  model_name: "facebook/opt-6.7b"
+  batch_size: 16
+  default_precision: "fp16"
+  delegation_policy: "adaptive"   # adaptive | always | never
+```
+
 ## Troubleshooting
 
 ### Issue: No reflections generated
@@ -280,21 +389,32 @@ meta_cognitive:
 
 **Solution**: Ensure at least one complete run has finished.
 
+### Issue: Enhancements not activating
+
+**Solution**: Verify:
+- The `src/enhancements` folder exists.
+- Required dependencies installed (see Installation).
+- `enhancements.enabled` is `true` in config or `ENHANCEMENTS_ENABLED=true` env var set.
+- The modules are importable (run `python -c "from src.enhancements.schemas.node_descriptor import NodeDescriptor"`).
+
 ## Next Steps
 
 1. **Run Baseline**: Execute without meta-cognitive features
 2. **Run Enhanced**: Execute with all features enabled
 3. **Compare**: Use Pareto analysis to compare performance
 4. **Iterate**: Adjust thresholds and frequencies based on results
+5. **Enable Advanced Modules**: Turn on LIMIT Graph, MODP, RLHF, distillation, MoE, evolutionary, FlexGen for improved sustainability and decision quality.
 
 ## Resources
 
 - **Architecture Documentation**: `META_COGNITIVE_ARCHITECTURE.md`
 - **Repository**: https://github.com/NurcholishAdam/Green_Agent
 - **AgentBeats Platform**: https://agentbeats.ai
+- **Enhancements Documentation**: `src/enhancements/README.md`
 
 ## Support
 
 For issues or questions:
 - GitHub Issues: https://github.com/NurcholishAdam/Green_Agent/issues
 - Email: nurcholishadam@gmail.com
+```
