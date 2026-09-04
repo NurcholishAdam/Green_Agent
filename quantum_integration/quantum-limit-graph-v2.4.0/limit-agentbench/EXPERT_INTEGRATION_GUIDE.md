@@ -5,9 +5,9 @@
 
 This guide shows how to integrate the Expert Collaboration Layer into Green Agent, adding intelligent escalation to external experts while maintaining sustainability focus. It also explains how to leverage the advanced enhancement modules (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, MoE expert gating, and FlexGen) to improve decision‑making and sustainability.
 
+```
 ## Architecture
 
-```
 User Layer
    │
    ▼
