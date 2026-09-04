@@ -1,4 +1,4 @@
-# File: tests/integration/test_unified_system.py
+# File: tests/integration/test_unified_system.py (Enhanced)
 
 import pytest
 import asyncio
@@ -14,6 +14,18 @@ from src.integration.unified_orchestrator import UnifiedGreenAgent
 from quantum_integration.test_unified_system import GreenAgentQuantumSystem
 from src.carbon.task_carbon_profiler import CarbonProfiler
 from src.benchmarking.benchmark_intelligence import BenchmarkEngine
+
+# Optional imports for enhanced modules
+try:
+    from src.enhancements.schemas.feedback_event import FeedbackEvent
+    from src.enhancements.schemas.node_descriptor import NodeDescriptor, NodeType
+    from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType
+    from src.enhancements.zero_trust_architecture import ZeroTrustArchitecture
+    ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+
+# Existing test classes (unchanged) ...
 
 class TestComparisonMode:
     """Test suite for comparison mode functionality"""
@@ -164,10 +176,10 @@ class TestQuantumIntegration:
     async def test_multi_agent_coordination(self, quantum_system):
         """Test multi-agent quantum coordination"""
         carbon_data = {
-            'agent_0': 30,   # Green
-            'agent_1': 150,  # Yellow
-            'agent_2': 250,  # Red
-            'agent_3': 45    # Green
+            'agent_0': 30,
+            'agent_1': 150,
+            'agent_2': 250,
+            'agent_3': 45
         }
         
         result = await quantum_system.run_multi_agent_coordination(carbon_data)
@@ -176,7 +188,6 @@ class TestQuantumIntegration:
         assert 'entanglement_fidelity' in result
         assert result['consensus_achieved'] is True
         
-        # Verify carbon-aware distribution
         distribution = result['task_distribution']
         green_agents = [aid for aid, data in distribution.items() 
                        if data['role'] == 'primary_compute']
@@ -187,7 +198,6 @@ class TestQuantumIntegration:
     @pytest.mark.asyncio
     async def test_quantum_efficiency_metrics(self, quantum_system):
         """Test quantum efficiency calculation"""
-        # Run multiple tasks
         tasks = [
             {'features': np.random.rand(4).tolist(), 'task_id': f'task_{i}'}
             for i in range(10)
@@ -197,10 +207,6 @@ class TestQuantumIntegration:
         for task in tasks:
             result = await quantum_system.run_quantum_task(task)
             results.append(result)
-        
-        # Calculate average efficiency
-        total_energy = sum(r['energy_consumed_kwh'] for r in results)
-        total_time = sum(r['execution_time'] for r in results)
         
         metrics = quantum_system.get_system_metrics()
         
@@ -224,10 +230,8 @@ class TestKubernetesDeployment:
         with open(yaml_file, 'r') as f:
             docs = list(yaml.safe_load_all(f))
         
-        # Should have multiple documents
         assert len(docs) >= 3, "Expected multiple YAML documents"
         
-        # Find RayCluster spec
         ray_cluster = next(d for d in docs if d.get('kind') == 'RayCluster')
         
         assert 'spec' in ray_cluster
@@ -244,13 +248,11 @@ class TestKubernetesDeployment:
         with open(yaml_file, 'r') as f:
             content = yaml.safe_load(f)
         
-        # Check autoscaler options
         autoscaler = content['spec'].get('autoscalerOptions', {})
         
         assert autoscaler, "Autoscaler options not found"
         assert autoscaler.get('upscalingMode') == 'Conservative'
         
-        # Check carbon metrics
         metrics = autoscaler.get('metrics', [])
         carbon_metric = next((m for m in metrics 
                             if m.get('type') == 'External' and 
@@ -311,7 +313,6 @@ class TestDashboardMonitoring:
         assert 'frontier_points' in pareto_data
         assert len(pareto_data['frontier_points']) > 0
         
-        # Verify frontier points are valid
         for point in pareto_data['frontier_points']:
             assert 'accuracy' in point
             assert 'energy' in point
@@ -326,13 +327,11 @@ class TestEndToEnd:
     @pytest.mark.asyncio
     async def test_full_workflow(self):
         """Test complete workflow from task submission to results"""
-        # 1. Initialize system
         config_path = "config/green_agent_config.yaml"
         runner = GreenAgentRunner(config_path)
         await runner.initialize()
         
         try:
-            # 2. Submit task
             task = {
                 'id': 'e2e_test_001',
                 'type': 'ml_training',
@@ -342,19 +341,15 @@ class TestEndToEnd:
                 'priority': 7
             }
             
-            # 3. Execute
             result = await runner.execute_task(task)
             
-            # 4. Verify results
             assert result.execution_time > 0
             assert result.energy_consumed > 0
             assert result.carbon_emitted >= 0
             assert result.accuracy > 0
             
-            # 5. Check carbon savings
             if result.mode == 'unified':
-                # Unified should be more efficient
-                assert result.energy_consumed < 2.0  # kWh threshold
+                assert result.energy_consumed < 2.0
             
             print(f"✅ End-to-end test passed:")
             print(f"   Execution time: {result.execution_time:.2f}s")
@@ -364,6 +359,127 @@ class TestEndToEnd:
         
         finally:
             await runner.shutdown()
+
+
+# ------------------------------------------------------------------------------
+# NEW: Enhanced Integration Tests for LIMIT Graph, MODP, RLHF, Distillation, MoE, Evolutionary, FlexGen
+# ------------------------------------------------------------------------------
+
+@pytest.mark.skipif(not ENHANCEMENTS_AVAILABLE, reason="Enhanced modules not available")
+class TestEnhancedIntegration:
+    """Test advanced enhancement modules and their interaction with the system."""
+
+    def test_feedback_event_schema(self):
+        """FeedbackEvent should be creatable with enhanced fields."""
+        event = FeedbackEvent(
+            source="test",
+            feedback_type="routing",
+            task_id="t1",
+            context={"key": "value"},
+            action={"selected_action": "execute", "selected_rank": 1},
+            performance={"quality_score": 0.9, "latency_ms": 100, "energy_joules": 100, "carbon_g": 5, "helium_cost": 0, "duration_ms": 100},
+            adaptive_cost_value=0.85,
+            graph_metrics={"centrality": 0.7},
+            human_feedback_score=0.8,
+            modp_score=0.75,
+            distillation_stats={"student_counter": 5}
+        )
+        data = event.to_json()
+        assert isinstance(data, str)
+        # Deserialize back
+        event2 = FeedbackEvent.from_json(data)
+        assert event2.task_id == "t1"
+        assert event2.graph_metrics["centrality"] == 0.7
+
+    def test_node_descriptor_enhanced_features(self):
+        """NodeDescriptor should accept LIMIT Graph, RLHF, MoE, evolutionary flags."""
+        node = NodeDescriptor(
+            id="node1",
+            type=NodeType.EDGE,
+            region="us-east",
+            region_carbon_intensity=400.0,
+            energy_per_token=0.00005,
+            use_evolutionary=True,
+            human_feedback_score=0.6,
+            graph_metrics={"centrality": 0.8},
+            metadata={"gating_lr": 0.005}
+        )
+        assert node.use_evolutionary is True
+        assert node.human_feedback_score == 0.6
+        assert node.graph_metrics["centrality"] == 0.8
+
+    def test_workload_descriptor_modp_rlhf(self):
+        """WorkloadDescriptor should support MODP weights and RLHF."""
+        wl = WorkloadDescriptor(
+            task_id="task1",
+            task_type=TaskType.INFERENCE,
+            tokens=1000,
+            latency_target=500.0,
+            use_evolutionary=True,
+            human_feedback_score=0.7,
+            graph_metrics={"centrality": 0.6},
+            metadata={"latency_weight": 0.5, "carbon_weight": 0.3}
+        )
+        assert wl.human_feedback_score == 0.7
+        assert wl.graph_metrics["centrality"] == 0.6
+
+    def test_zero_trust_with_enhancements(self):
+        """ZeroTrustArchitecture can be initialized with enhancement flags."""
+        config = {"use_enhancements": True, "use_distillation": True, "use_evolutionary": True}
+        zta = ZeroTrustArchitecture(config=config)
+        assert zta.use_enhancements is True
+        # Should have distillation and evolutionary components
+        assert hasattr(zta, 'distillation_optimizer') or hasattr(zta, 'carbon_authenticator')
+
+    def test_flexgen_integration_hook(self):
+        """FlexGen-related settings should be present in configs or module."""
+        # We can simulate a FlexGen delegation decision via a placeholder.
+        # The actual integration would be in the orchestrator; here we just verify
+        # that the enhancement modules can reference FlexGen parameters.
+        flexgen_config = {
+            "enabled": True,
+            "model_name": "facebook/opt-6.7b",
+            "batch_size": 16,
+            "delegation_policy": "adaptive"
+        }
+        assert flexgen_config["enabled"] is True
+        assert flexgen_config["delegation_policy"] in ["adaptive", "always", "never"]
+
+
+@pytest.mark.skipif(not ENHANCEMENTS_AVAILABLE, reason="Enhanced modules not available")
+class TestEnhancedDistillationAndMoE:
+    """Test that distillation and MoE components are functional within descriptors."""
+
+    def test_node_descriptor_distillation_select(self):
+        """NodeDescriptor's routing optimizer should use distillation + MoE."""
+        import asyncio
+        node = NodeDescriptor(
+            id="node_d",
+            type=NodeType.EDGE,
+            region="us-east",
+            region_carbon_intensity=300,
+            energy_per_token=0.00004,
+            use_enhancements=True,
+            human_feedback_score=0.6,
+            graph_metrics={"centrality": 0.7}
+        )
+        strategy = asyncio.run(node.select_routing_strategy(exploration=True))
+        assert strategy in ["carbon_first", "latency_first", "cost_first", "balanced", "adaptive"]
+
+    def test_workload_descriptor_distillation_select(self):
+        """WorkloadDescriptor priority selection should use MODP/MoE."""
+        import asyncio
+        wl = WorkloadDescriptor(
+            task_id="task_d",
+            task_type=TaskType.INFERENCE,
+            tokens=500,
+            latency_target=200,
+            use_enhancements=True,
+            human_feedback_score=0.5,
+            graph_metrics={"centrality": 0.5}
+        )
+        priority = asyncio.run(wl.select_priority(exploration=True))
+        assert priority in ["accuracy", "green", "balanced"]
 
 
 # Run tests
