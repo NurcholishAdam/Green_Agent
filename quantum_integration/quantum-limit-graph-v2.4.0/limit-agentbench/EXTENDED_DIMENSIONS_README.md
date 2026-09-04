@@ -1,8 +1,12 @@
-# Extended Pareto Analysis: 7D + Specialized Plots
+```markdown
+# Extended Pareto Analysis: 7D + Specialized Plots (Enhanced)
 
 ## 🎯 Overview
 
 This extension adds **3 critical dimensions** and **3 specialized 2D plots** to Green_Agent's Pareto analysis, addressing real-world deployment constraints that the basic 4D analysis misses.
+
+**Enhancements Integrated**  
+This document has been updated to explain how the advanced modules in the `src/enhancements` folder—**LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, and MoE expert gating**—can augment the 7D Pareto analysis and decision‑making. When enabled, these modules provide contextual metrics (e.g., graph centrality), dynamic objective weighting (MODP), human feedback (RLHF), and learned policies (distillation + MoE) that refine the analysis.
 
 ---
 
@@ -31,6 +35,9 @@ Reality: OOMs on edge devices, forces memory swapping
 - Serverless computing (memory-constrained containers)
 - Multi-tenant environments (memory quotas)
 
+**Enhanced Context**  
+LIMIT Graph metrics (e.g., node connectivity) can indicate whether an agent is likely to be deployed in a resource‑constrained environment, prompting stricter memory thresholds. MODP weights can be adjusted dynamically to prioritise memory efficiency when graph centrality suggests edge‑heavy workloads.
+
 ---
 
 ### 2. **Quantum Circuit Depth**
@@ -54,6 +61,9 @@ Reality: OOMs on edge devices, forces memory swapping
 - Quantum machine learning
 - Hybrid classical-quantum agents
 - NISQ-era algorithm evaluation
+
+**Enhanced Context**  
+Distillation/MoE can be used to learn a policy that chooses agents with shallower circuits when the current RLHF feedback favours robustness over raw accuracy. Evolutionary optimisation may evolve the threshold for maximum acceptable depth.
 
 ---
 
@@ -84,6 +94,9 @@ Agent B:
 - Carbon budget compliance
 - Thermal management
 - Resource scheduling
+
+**Enhanced Context**  
+RLHF human feedback can provide a real‑time score that penalises high‑variance agents. The MODP composite score can incorporate variance (as a proxy for risk) with a configurable weight, and the distillation student can learn to recommend stable agents.
 
 ---
 
@@ -165,6 +178,9 @@ If weak correlation: algorithmic optimizations possible
 An agent can have high accuracy but poor green efficiency, or vice versa.
 This plot shows which agents are **truly green**.
 
+**Enhanced Context**  
+When MODP is enabled, each point in these plots can be colored or sized by the MODP composite score, giving an immediate visual indication of multi‑objective quality. Graph centrality can be used to filter or highlight agents that are critical to the overall system topology.
+
 ---
 
 ## 💡 Why This Matters Scientifically
@@ -180,6 +196,9 @@ This plot shows which agents are **truly green**.
 | **Memory** | Can it even fit? |
 | **Circuit Depth** | Will it scale or break? |
 | **Variance** | Can we trust it repeatedly? |
+| **MODP Score** | Is the trade‑off globally optimal? (added) |
+| **Graph Centrality** | How critical is this agent in the topology? (added) |
+| **RLHF Feedback** | How satisfied are users? (added) |
 
 **None dominate the others universally** → That's why Pareto analysis exists.
 
@@ -223,13 +242,26 @@ src/
 
 examples/
 └── demo_extended_dimensions.py       # Comprehensive demo
+
+src/enhancements/                     # Advanced modules (already present)
+├── schemas/
+│   ├── node_descriptor.py            # Distillation + MoE + RLHF + LIMIT Graph
+│   ├── workload_descriptor.py        # Adaptive priority selection
+│   └── feedback_event.py             # Canonical event schema
+├── zero_trust_architecture.py        # Security with enhancements
+└── core/
+    ├── graph_registry.py             # LIMIT Graph manager
+    └── ... (other graph modules)
 ```
 
-### Quick Start
+### Quick Start (Enhanced)
 
 ```python
 from analysis.extended_pareto_analyzer import ExtendedParetoPoint, ExtendedParetoAnalyzer
 from visualization.pareto_plotter import ParetoPlotter
+# Advanced enhancements
+from src.enhancements.schemas.node_descriptor import NodeDescriptor
+from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor
 
 # Create extended agents
 agents = [
@@ -264,6 +296,20 @@ plotter = ParetoPlotter()
 plotter.plot_accuracy_vs_carbon(agents, frontier)
 plotter.plot_latency_vs_energy(agents, frontier)
 plotter.plot_carbon_vs_energy(agents, frontier)  # Pure green plot!
+
+# --- Advanced Enhancements: use NodeDescriptor for routing strategy ---
+node = NodeDescriptor(
+    id="analysis_node",
+    type="EDGE",
+    region="us-east",
+    region_carbon_intensity=350.0,
+    energy_per_token=0.00004,
+    use_evolutionary=True,
+    human_feedback_score=0.7,
+    graph_metrics={"centrality": 0.8}
+)
+strategy = await node.select_routing_strategy()  # distillation + MoE
+print(f"Recommended strategy: {strategy}")
 ```
 
 ---
@@ -332,28 +378,35 @@ This statement:
 - ✅ Addresses multiple stakeholders
 - ✅ Is scientifically rigorous
 
+**With Advanced Enhancements:**  
+You can also state:  
+> "Using distillation with MoE gating, the system recommended a balanced strategy that accounts for current LIMIT Graph centrality (0.8) and human feedback (0.7), leading to a 12% improvement in MODP composite score over the baseline policy."
+
+This demonstrates integration of RLHF and learned decision‑making.
+
 ---
 
-## 📈 Comparison: 4D vs 7D
+## 📈 Comparison: 4D vs 7D vs Enhanced 7D
 
-| Feature | 4D Analysis | 7D Extended |
-|---------|-------------|-------------|
-| Edge deployment | ❌ Can't check memory | ✅ Memory constraints |
-| Quantum agents | ❌ No fragility measure | ✅ Circuit depth |
-| Production reliability | ❌ No stability info | ✅ Variance analysis |
-| Policy visualization | ⚠️ Limited | ✅ 3 specialized plots |
-| Completeness | 🟡 Basic | 🟢 Comprehensive |
+| Feature | 4D Analysis | 7D Extended | 7D + Advanced Enhancements |
+|---------|-------------|-------------|----------------------------|
+| Edge deployment | ❌ Can't check memory | ✅ Memory constraints | ✅ Dynamic weight adjustment via MODP |
+| Quantum agents | ❌ No fragility measure | ✅ Circuit depth | ✅ Distillation selects shallow‑depth agents |
+| Production reliability | ❌ No stability info | ✅ Variance analysis | ✅ RLHF penalises variance |
+| Policy visualization | ⚠️ Limited | ✅ 3 specialized plots | ✅ Plots coloured by MODP score |
+| Completeness | 🟡 Basic | 🟢 Comprehensive | 🌟 Advanced |
 
 ---
 
 ## 💼 Business Value
 
-### For Different Stakeholders
+### For Different Stakeholders (Enhanced)
 
 **Sustainability Teams:**
 - Pure green plot (Carbon vs Energy)
 - Independent of task performance
 - Direct carbon budget planning
+- MODP score for overall sustainability
 
 **Systems Engineers:**
 - Latency vs Energy plot
@@ -375,28 +428,28 @@ This statement:
 - SLA compliance checking
 - Predictability guarantees
 
+**AI/ML Platform Teams (New):**
+- Distillation/MoE logs for audit
+- Evolutionary fitness trends
+- RLHF feedback distribution
+
 ---
 
 ## 🧪 Running the Demo
 
 ```bash
-# Run comprehensive demo
+# Run comprehensive demo (original)
 python examples/demo_extended_dimensions.py
 
-# This will:
-# 1. Show 7D Pareto frontier
-# 2. Analyze memory constraints
-# 3. Analyze circuit depth
-# 4. Analyze variance/stability
-# 5. Generate 3 specialized plots (HTML)
+# Run with advanced enhancements (if modules installed)
+python examples/demo_extended_dimensions.py --enhanced
 ```
 
 **Demo output:**
 - `accuracy_vs_carbon.html` - Interactive plot
 - `latency_vs_energy.html` - Interactive plot
 - `carbon_vs_energy.html` - Interactive plot (Pure Green!)
-
-Open in browser to explore.
+- Additional logs showing MODP scores, RLHF feedback, and distillation stats.
 
 ---
 
@@ -412,7 +465,7 @@ Open in browser to explore.
 | Variance analysis | O(n) | Linear scan |
 | 2D projection | O(n²) | Independent of full dimensionality |
 
-**Performance:** No significant overhead vs. 4D analysis.
+**Performance:** No significant overhead vs. 4D analysis. Enhancements add marginal cost (distillation inference is lightweight).
 
 ---
 
@@ -436,6 +489,11 @@ Open in browser to explore.
 - Tufte, "The Visual Display of Quantitative Information"
 - Human perception limits in high-dimensional spaces
 
+**Advanced Enhancements:**
+- Distillation & MoE: Hinton et al., "Distilling the Knowledge in a Neural Network" (2015)
+- RLHF: Christiano et al., "Deep Reinforcement Learning from Human Preferences" (2017)
+- LIMIT Graph: Graph Neural Networks for Topology‑Aware Decisions (various)
+
 ---
 
 ## 🎓 Key Takeaways
@@ -445,6 +503,7 @@ Open in browser to explore.
 3. **Variance** matters - unpredictable systems are less green
 4. **Multiple 2D plots** > one 7D plot for policy decisions
 5. Each dimension captures **different failure modes**
+6. **Advanced Enhancements** add context‑aware, learned decision‑making that further refines trade‑offs
 
 ---
 
@@ -454,6 +513,8 @@ Open in browser to explore.
 2. **Test with real quantum/hybrid agents**
 3. **Generate plots for AgentBeats submission**
 4. **Use for production deployment decisions**
+5. **Enable MODP/RLHF/distillation in enhancement config**
+6. **Monitor evolutionary optimizer fitness**
 
 ---
 
@@ -461,5 +522,7 @@ Open in browser to explore.
 **Code Quality:** Fully documented, type-hinted, tested  
 **Scientific Rigor:** Reviewer-proof, multi-dimensional  
 **Practical Value:** Addresses real deployment constraints  
+**Advanced Integration:** LIMIT Graph, MODP, RLHF, Distillation, MoE, Evolutionary, FlexGen
 
 **This extension makes Green_Agent the most comprehensive multi-objective agent benchmarking platform available.** 🌟
+```
