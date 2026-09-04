@@ -4,6 +4,15 @@ metadata:
   name: green-agent-dashboard
   labels:
     app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   type: ClusterIP
   ports:
@@ -16,6 +25,10 @@ spec:
   - name: metrics
     port: 9090
     targetPort: 9090
+  # Optional: additional port for enhanced API if exposed
+  # - name: enhanced-api
+  #   port: 8080
+  #   targetPort: 8080
   selector:
     app: green-agent
     component: head
