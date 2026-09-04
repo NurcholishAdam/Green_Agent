@@ -1,6 +1,7 @@
-# AgentBeats Compliance Guide
+```markdown
+# AgentBeats Compliance Guide (Enhanced)
 
-Complete guide for AgentBeats-ready Green_Agent architecture implementation.
+Complete guide for AgentBeats-ready Green_Agent architecture implementation, now augmented with advanced enhancement modules (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, MoE expert gating, and FlexGen integration).
 
 ## 🏆 Four Pillars of AgentBeats Compliance
 
@@ -309,6 +310,103 @@ print(f"Suggestions: {feedback['improvement_suggestions']}")
 
 ---
 
+## 🧠 Advanced Enhancements Integration (Optional but Recommended)
+
+The following advanced modules from `src/enhancements` can be integrated with the four pillars to improve sustainability, decision quality, and security. They are not required for basic AgentBeats compliance, but they strengthen the submission.
+
+### 5. LIMIT Graph Integration
+
+**Implementation:** `src/enhancements/core/graph_registry.py`, `causal_graph.py`, `meta_cognition.py`
+
+Provides topology-aware context using graph centrality and connectivity metrics.
+
+- **Context-aware routing**: Node selection can consider graph centrality.
+- **Root-cause attribution**: Causal graph identifies why anomalies occur.
+- **Carbon backpropagation**: DAG ledger propagates carbon debt upstream.
+
+**Usage:**
+
+```python
+from src.enhancements.core.graph_registry import GraphRegistry, GraphType
+from src.enhancements.core.causal_graph import CausalGraph
+
+registry = GraphRegistry()
+causal_graph = registry.get_or_create(GraphType.CAUSAL)
+# Observe telemetry, diagnose anomalies, get recommended actions
+```
+
+### 6. MODP (Multi‑Objective Decision Process)
+
+**Implementation:** Used within `node_descriptor.py`, `workload_descriptor.py`, and other modules.
+
+Enables configurable trade-offs between accuracy, energy, latency, and carbon.
+
+```python
+# Example: MODP weights in WorkloadDescriptor metadata
+wl = WorkloadDescriptor(
+    task_id="task1",
+    task_type=TaskType.INFERENCE,
+    tokens=1000,
+    latency_target=300.0,
+    metadata={"latency_weight": 0.5, "carbon_weight": 0.3, "energy_weight": 0.2}
+)
+```
+
+### 7. RLHF (Human Feedback) in Decision-Making
+
+Human feedback score is included in state vectors and teachers.
+
+```python
+# NodeDescriptor with human feedback
+node = NodeDescriptor(
+    id="node1",
+    type=NodeType.EDGE,
+    region="us-east",
+    region_carbon_intensity=400.0,
+    energy_per_token=0.00005,
+    human_feedback_score=0.7,
+    graph_metrics={"centrality": 0.8}
+)
+```
+
+### 8. Multi‑Teacher On‑Policy Distillation with MoE Gating
+
+**Implementation:** `DistillationRoutingOptimizer` in `node_descriptor.py`, `DistillationPriorityOptimizer` in `workload_descriptor.py`, etc.
+
+A lightweight student policy learns from rule-based, historical ML, Q-learning, and RLHF teachers, blended via a MoE gating network.
+
+```python
+# Automatic routing strategy selection using distillation + MoE
+strategy = await node.select_routing_strategy(exploration=False)
+```
+
+### 9. Bio‑inspired Optimisation (Evolutionary)
+
+**Implementation:** `EvolutionaryOptimizer` classes in descriptors and elsewhere.
+
+Genetic algorithms evolve MODP weights and other hyperparameters.
+
+```python
+# Enable evolutionary blending
+node = NodeDescriptor(..., use_evolutionary=True, population_size=20)
+```
+
+### 10. FlexGen Integration
+
+**Implementation:** Optional delegation hooks in decision core and orchestrator.
+
+For high‑throughput LLM tasks, the system can delegate to FlexGen with adaptive precision (fp32/fp16/int8) based on MODP and RLHF.
+
+```yaml
+flexgen:
+  enabled: true
+  model_name: "facebook/opt-6.7b"
+  default_precision: "fp16"
+  delegation_policy: "adaptive"
+```
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Run Complete Demo
@@ -320,33 +418,43 @@ python demo_agentbeats_integration.py
 
 This demonstrates all four pillars in action.
 
-### 2. Integrate with Your Agent
+### 2. Run Enhanced Demo (with Advanced Modules)
+
+```bash
+python demo_agentbeats_integration.py --enhanced
+```
+
+This additionally exercises LIMIT Graph, MODP, RLHF, distillation, MoE, and evolutionary features.
+
+### 3. Integrate with Your Agent
 
 ```python
 from core.a2a_gateway import A2AGateway
 from core.rlhf_feedback_engine import RLHFFeedbackEngine
 from core.green_metrics import GreenMetricsCollector
+# Advanced enhancements
+from src.enhancements.schemas.node_descriptor import NodeDescriptor, NodeType
+from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType
 
 # Initialize components
 gateway = A2AGateway()
 rlhf = RLHFFeedbackEngine()
 metrics = GreenMetricsCollector()
 
+# Optional advanced descriptors
+node = NodeDescriptor(
+    id="agent_node", type=NodeType.EDGE, region="us-east",
+    region_carbon_intensity=400.0, energy_per_token=0.00005,
+    human_feedback_score=0.6, graph_metrics={"centrality": 0.7}
+)
+
 # Your agent execution
 def execute_agent_task(task_request):
-    # Validate A2A request
     validated = gateway.validate_request(task_request)
-    
-    # Start metrics
     metrics.start_collection()
-    
-    # Execute your agent
     result = your_agent.run(validated.input_data)
-    
-    # Stop metrics
     green_metrics = metrics.stop_collection()
     
-    # Generate RLHF feedback
     feedback = rlhf.analyze_reasoning_trace(
         reasoning_trace=result['trace'],
         task_type=validated.task_type,
@@ -354,7 +462,6 @@ def execute_agent_task(task_request):
         success=result['success']
     )
     
-    # Create A2A response
     response = gateway.create_success_response(
         task_id=validated.task_id,
         output=result['output'],
@@ -363,11 +470,10 @@ def execute_agent_task(task_request):
         reasoning_trace=result['trace'],
         metadata={'rlhf_feedback': feedback}
     )
-    
     return response.to_dict()
 ```
 
-### 3. Build Docker Container
+### 4. Build Docker Container (with Enhancement Dependencies)
 
 ```bash
 # Generate Dockerfile and entrypoint
@@ -377,7 +483,7 @@ create_dockerfile()
 create_entrypoint()
 "
 
-# Build image
+# Build image (ensure enhancement dependencies are included)
 docker build -t your-agent:latest -f Dockerfile.agent .
 
 # Test
@@ -385,6 +491,8 @@ echo '{"task_id":"test","task_type":"qa","input_data":{"query":"Test?"}}' > inpu
 docker run --rm \
   -v $(pwd)/input.json:/app/input.json:ro \
   -v $(pwd)/output.json:/app/output.json:rw \
+  --cpus 2.0 \
+  --memory 4g \
   your-agent:latest
 cat output.json
 ```
@@ -402,10 +510,9 @@ All responses include sustainability metrics:
     "carbon_kg": 0.018,
     "sustainability_index": 0.73,
     "efficiency_score": 0.85,
-    "comparative_baseline": {
-      "percentile": 75,
-      "vs_average": "+15%"
-    }
+    "modp_score": 0.71,          // if enhancements enabled
+    "graph_centrality": 0.8,     // if graph metrics available
+    "rlhf_feedback": 0.7
   }
 }
 ```
@@ -424,6 +531,8 @@ See `GREEN_AGENT_BENCHMARKING_COMPLETE.md` for details.
 - [ ] Green metrics included in responses
 - [ ] Documentation complete
 - [ ] Tests pass
+- [ ] (Optional) Advanced enhancements enabled and functioning
+- [ ] (Optional) FlexGen integration configured (if high‑throughput required)
 
 ---
 
@@ -433,6 +542,7 @@ See `GREEN_AGENT_BENCHMARKING_COMPLETE.md` for details.
 - **AgentBeats Leaderboard**: [Link to leaderboard]
 - **Green Metrics Guide**: `GREEN_AGENT_BENCHMARKING_COMPLETE.md`
 - **Integration Examples**: `demo_agentbeats_integration.py`
+- **Enhancements Documentation**: `src/enhancements/README.md`
 
 ---
 
@@ -445,3 +555,4 @@ See `CONTRIBUTING.md` for guidelines on improving AgentBeats compliance.
 ## 📄 License
 
 See `LICENSE` file for details.
+```
