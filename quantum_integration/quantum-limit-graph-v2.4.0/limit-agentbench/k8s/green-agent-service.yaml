@@ -1,4 +1,4 @@
-# k8s/green-agent-service.yaml
+# k8s/green-agent-service.yaml (Enhanced)
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,21 +7,36 @@ metadata:
   labels:
     app: green-agent
     component: metrics
+    enhancements: enabled
   annotations:
-    # Prometheus auto-discovery annotations
+    # Prometheus auto-discovery annotations (original)
     prometheus.io/scrape: "true"
     prometheus.io/port: "8000"
     prometheus.io/path: "/metrics"
     prometheus.io/scheme: "http"
-    # Optional: Custom scrape interval for this service
     prometheus.io/scrape_interval: "30s"
+    # Enhanced module indicators
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   type: ClusterIP
   ports:
+  # Original metrics port
   - name: metrics
     port: 8000
     targetPort: 8000
     protocol: TCP
+  # Additional optional port for enhanced API (if exposed)
+  # Uncomment if needed
+  # - name: enhanced-api
+  #   port: 8080
+  #   targetPort: 8080
+  #   protocol: TCP
   selector:
     app: green-agent
     component: head
