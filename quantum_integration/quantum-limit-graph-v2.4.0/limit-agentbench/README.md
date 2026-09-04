@@ -1,5 +1,3 @@
-Here is the enhanced version of the documentation index, now updated to include the advanced enhancement modules (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, MoE expert gating, and FlexGen integration) along with the original core documentation.
-
 
 # LIMIT-AgentBench - Documentation Index
 
