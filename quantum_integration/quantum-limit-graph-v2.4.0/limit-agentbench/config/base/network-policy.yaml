@@ -4,6 +4,15 @@ metadata:
   name: green-agent-network-policy
   labels:
     app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   podSelector:
     matchLabels:
@@ -12,12 +21,16 @@ spec:
   - Ingress
   - Egress
   ingress:
+  # Dashboard / metrics (existing)
   - from: []
     ports:
     - protocol: TCP
       port: 8000
     - protocol: TCP
       port: 8265
+    - protocol: TCP
+      port: 9090        # Prometheus metrics
+  # Ray internal communication (existing)
   - from:
     - podSelector:
         matchLabels:
@@ -25,7 +38,17 @@ spec:
     ports:
     - protocol: TCP
       port: 6379
+  # Enhanced modules may need additional internal ports (if exposed)
+  # e.g., RLHF feedback endpoint from dashboard to backend
+  - from:
+    - podSelector:
+        matchLabels:
+          app: green-agent
+    ports:
+    - protocol: TCP
+      port: 8080        # optional enhanced API
   egress:
+  # DNS (existing)
   - to:
     - namespaceSelector: {}
     ports:
@@ -33,9 +56,26 @@ spec:
       port: 53
     - protocol: TCP
       port: 53
+  # External HTTPS access for APIs (existing)
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
     ports:
     - protocol: TCP
       port: 443
+  # Additional egress for enhanced services:
+  # LIMIT Graph external database / graph service
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 7687        # Neo4j Bolt, or your graph DB port
+  # MODP / RLHF / distillation may need external model APIs (HTTPS already covered)
+  # FlexGen external LLM service (if using hosted)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 9443        # example secured endpoint
