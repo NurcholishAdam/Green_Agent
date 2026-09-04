@@ -1,5 +1,5 @@
 """
-Integration Demo — All 5 Enhancement Phases
+Integration Demo — All 5 Enhancement Phases (+ Phase 6: Advanced Enhancements)
 =============================================
 Demonstrates every enhancement running in the correct implementation order:
 
@@ -8,12 +8,16 @@ Demonstrates every enhancement running in the correct implementation order:
   Phase 3  →  DAG Carbon Ledger + Backpropagation
   Phase 4  →  Policy Graph decision engine
   Phase 5  →  Dual-Graph Evaluator + XAI output
+  Phase 6  →  Advanced Enhancements (LIMIT Graph, MODP, RLHF,
+               Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation,
+               MoE expert gating, FlexGen hooks)
 
 Run:
     cd green_agent_enhanced
     python demo_enhanced_green_agent.py
 
-Dependencies: stdlib only (no pip installs required).
+Dependencies: stdlib only for Phases 1‑5; Phase 6 requires optional packages
+from the enhancements folder.
 """
 
 import sys
@@ -305,6 +309,112 @@ def phase_5_demo():
 
 
 # ===========================================================================
+# PHASE 6 — Advanced Enhancements (Optional)
+# ===========================================================================
+
+def phase_6_demo():
+    """
+    Demonstrate integration of advanced enhancement modules:
+    LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
+    Bio‑inspired Optimisation, MoE expert gating, and FlexGen hooks.
+    """
+    section("PHASE 6 — Advanced Enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Evolutionary, FlexGen)")
+
+    try:
+        # Import advanced modules from the enhancements folder
+        from enhancements.schemas.node_descriptor import NodeDescriptor, NodeType, CoolingType
+        from enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType, Urgency
+        from enhancements.schemas.feedback_event import FeedbackEvent
+        from enhancements.zero_trust_architecture import ZeroTrustArchitecture, ZeroTrustConfig
+
+        # 1. Create a NodeDescriptor with LIMIT Graph, RLHF, MoE, evolutionary flags
+        print("\n1. Creating enhanced NodeDescriptor...")
+        node = NodeDescriptor(
+            id="demo_node",
+            type=NodeType.EDGE,
+            region="us-east",
+            region_carbon_intensity=350.0,
+            energy_per_token=0.00004,
+            use_evolutionary=True,
+            human_feedback_score=0.7,
+            graph_metrics={"centrality": 0.8, "connectivity": 0.6},
+            metadata={"gating_lr": 0.005}
+        )
+        print(f"   ✓ NodeDescriptor created: {node.id}")
+        print(f"     - Graph centrality: {node.graph_metrics['centrality']}")
+        print(f"     - Human feedback: {node.human_feedback_score}")
+        print(f"     - Evolutionary enabled: {node.use_evolutionary}")
+
+        # 2. Select routing strategy using distillation + MoE
+        print("\n2. Selecting routing strategy (distillation + MoE)...")
+        import asyncio
+        strategy = asyncio.run(node.select_routing_strategy(exploration=False))
+        print(f"   ✓ Selected strategy: {strategy}")
+
+        # 3. Create a WorkloadDescriptor with MODP weights and RLHF
+        print("\n3. Creating enhanced WorkloadDescriptor...")
+        wl = WorkloadDescriptor(
+            task_id="demo_task",
+            task_type=TaskType.INFERENCE,
+            tokens=1000,
+            latency_target=300.0,
+            urgency=Urgency.MEDIUM,
+            use_evolutionary=True,
+            human_feedback_score=0.6,
+            graph_metrics={"centrality": 0.7},
+            metadata={"latency_weight": 0.5, "carbon_weight": 0.3, "energy_weight": 0.2}
+        )
+        print(f"   ✓ WorkloadDescriptor created: {wl.task_id}")
+        print(f"     - MODP weights: {wl.metadata}")
+        print(f"     - Graph centrality: {wl.graph_metrics['centrality']}")
+
+        # 4. Select priority using distillation + MoE
+        print("\n4. Selecting priority (distillation + MoE)...")
+        priority = asyncio.run(wl.select_priority(exploration=False))
+        print(f"   ✓ Selected priority: {priority}")
+
+        # 5. Create a FeedbackEvent with enhanced fields
+        print("\n5. Creating FeedbackEvent with enhanced fields...")
+        event = FeedbackEvent(
+            source="integration_demo",
+            feedback_type="routing",
+            task_id="demo_enhanced",
+            context={"region": "us-east"},
+            action={"selected_action": strategy, "selected_rank": 1},
+            performance={"quality_score": 0.9, "latency_ms": 100, "energy_joules": 100,
+                         "carbon_g": 5, "helium_cost": 0, "duration_ms": 100},
+            adaptive_cost_value=0.85,
+            graph_metrics={"centrality": 0.8},
+            human_feedback_score=0.7,
+            modp_score=0.75,
+            distillation_stats={"student_counter": 5}
+        )
+        print(f"   ✓ FeedbackEvent created: {event.event_id[:8]}...")
+        print(f"     - MODP score: {event.modp_score}")
+        print(f"     - Graph centrality: {event.graph_metrics['centrality']}")
+
+        # 6. Initialize Zero Trust with enhancements (optional)
+        print("\n6. Initializing Zero Trust with enhancements...")
+        zt_config = ZeroTrustConfig(use_enhancements=True, use_distillation=True, use_evolutionary=True)
+        zta = ZeroTrustArchitecture(config=zt_config)
+        print("   ✓ ZeroTrustArchitecture initialized")
+        print(f"     - Enhancements enabled: {zta.use_enhancements}")
+
+        print("\n" + "=" * 80)
+        print("✓ Advanced enhancements demo completed successfully!")
+        print("=" * 80 + "\n")
+
+    except ImportError as e:
+        print("\n⚠ Advanced enhancement modules not installed.")
+        print(f"   Error: {e}")
+        print("   Skipping enhanced demo.")
+        print("=" * 80 + "\n")
+    except Exception as e:
+        print(f"\n✗ Enhanced demo failed: {e}")
+        print("=" * 80 + "\n")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -317,7 +427,8 @@ if __name__ == "__main__":
     phase_3_demo()
     phase_4_demo()
     phase_5_demo()
+    phase_6_demo()   # NEW: Advanced enhancements (optional)
 
     print(f"\n{DIVIDER}")
-    print("  All 5 phases completed successfully.")
+    print("  All phases completed successfully.")
     print(DIVIDER)
