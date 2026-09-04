@@ -1,6 +1,8 @@
 ---
-# Network Policy for Green Agent
-# Provides security isolation and access control
+# Network Policy for Green Agent (Enhanced)
+# Provides security isolation and access control,
+# with additional rules for advanced enhancement modules:
+# LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation, Bio‑inspired, MoE expert gating.
 
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -10,17 +12,26 @@ metadata:
   labels:
     app: green-agent
     security: enhanced
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   # Apply to all Green Agent pods
   podSelector:
     matchLabels:
       app: green-agent
-  
+
   # Apply to both ingress and egress traffic
   policyTypes:
   - Ingress
   - Egress
-  
+
   # Ingress rules (incoming traffic)
   ingress:
   # Allow dashboard access from anywhere (for external users)
@@ -32,7 +43,7 @@ spec:
     - protocol: TCP
       port: 8265
       name: ray-dashboard
-  
+
   # Allow internal cluster communication between Green Agent pods
   - from:
     - podSelector:
@@ -51,7 +62,20 @@ spec:
     - protocol: TCP
       port: 9090
       name: metrics
-  
+    # Additional internal ports for enhanced modules
+    - protocol: TCP
+      port: 8080
+      name: enhanced-api          # optional enhanced API endpoint
+    - protocol: TCP
+      port: 50051
+      name: rlhf-feedback         # RLHF feedback service (if gRPC)
+    - protocol: TCP
+      port: 7687
+      name: graph-db-bolt        # LIMIT Graph database (Neo4j bolt)
+    - protocol: TCP
+      port: 7474
+      name: graph-db-http        # LIMIT Graph database HTTP
+
   # Allow monitoring from Prometheus namespace
   - from:
     - namespaceSelector:
@@ -64,7 +88,7 @@ spec:
     - protocol: TCP
       port: 9090
       name: metrics
-  
+
   # Allow health checks from Kubernetes API server
   - from:
     - namespaceSelector: {}
@@ -72,7 +96,7 @@ spec:
     - protocol: TCP
       port: 8000
       name: health
-  
+
   # Egress rules (outgoing traffic)
   egress:
   # Allow DNS resolution
@@ -83,13 +107,12 @@ spec:
       port: 53
     - protocol: TCP
       port: 53
-  
+
   # Allow HTTPS for external APIs (carbon APIs, etc.)
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
         except:
-        # Exclude private networks (optional, remove if internal APIs needed)
         - 10.0.0.0/8
         - 172.16.0.0/12
         - 192.168.0.0/16
@@ -97,7 +120,7 @@ spec:
     - protocol: TCP
       port: 443
       name: https
-  
+
   # Allow HTTP for external APIs (if needed)
   - to:
     - ipBlock:
@@ -106,7 +129,7 @@ spec:
     - protocol: TCP
       port: 80
       name: http
-  
+
   # Allow internal cluster communication
   - to:
     - podSelector:
@@ -121,7 +144,20 @@ spec:
       port: 8000
     - protocol: TCP
       port: 9090
-  
+    # Additional internal ports for enhanced modules
+    - protocol: TCP
+      port: 8080
+      name: enhanced-api
+    - protocol: TCP
+      port: 50051
+      name: rlhf-feedback
+    - protocol: TCP
+      port: 7687
+      name: graph-db-bolt
+    - protocol: TCP
+      port: 7474
+      name: graph-db-http
+
   # Allow communication with Kubernetes API server
   - to:
     - ipBlock:
@@ -130,6 +166,32 @@ spec:
     - protocol: TCP
       port: 443
       name: kubernetes-api
+
+  # Additional egress for enhanced services:
+  # LIMIT Graph external database (if not internal)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 7687
+      name: external-graph-db-bolt
+  # RLHF feedback / MODP service endpoints (if external)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 9443
+      name: external-enhanced-service
+  # FlexGen model service (if using hosted)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 443
+      name: flexgen-api
 
 ---
 # Default deny policy for additional security
@@ -143,6 +205,14 @@ metadata:
   labels:
     app: green-agent
     security: strict
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
 spec:
   podSelector:
     matchLabels:
