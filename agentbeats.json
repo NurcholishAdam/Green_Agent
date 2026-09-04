@@ -1,14 +1,65 @@
 {
   "agent_name": "GreenAgent",
-  "description": "Minimal green benchmarking agent",
+  "description": "Minimal green benchmarking agent with advanced enhancements (LIMIT Graph, MODP, RLHF, distillation, MoE, evolutionary, FlexGen)",
   "image": "ghcr.io/nurcholishadam/green-agent:latest",
+  "enhancements": {
+    "enabled": true,
+    "limit_graph": {
+      "enabled": true,
+      "graph_metrics": {
+        "centrality": 0.7,
+        "connectivity": 0.6,
+        "density": 0.5
+      }
+    },
+    "modp": {
+      "enabled": true,
+      "objective_weights": [0.4, 0.3, 0.2, 0.1]
+    },
+    "rlhf": {
+      "enabled": true,
+      "human_feedback_score": 0.6
+    },
+    "distillation": {
+      "enabled": true,
+      "use_moe_gating": true
+    },
+    "bio_inspired": {
+      "enabled": true,
+      "use_evolutionary": true
+    },
+    "moe_expert": {
+      "enabled": true,
+      "n_experts": 4
+    },
+    "flexgen": {
+      "enabled": false,
+      "model_name": "facebook/opt-6.7b",
+      "default_precision": "fp16",
+      "delegation_policy": "adaptive"
+    }
+  },
   "queries": [
     {
       "id": "low-energy",
       "command": ["python", "run_agent.py"],
       "environment": {
         "QUERY_MODE": "low_energy",
-        "MAX_ENERGY_WH": "0.03"
+        "MAX_ENERGY_WH": "0.03",
+        "ENHANCEMENTS_ENABLED": "true",
+        "LIMIT_GRAPH_ENABLED": "true",
+        "LIMIT_GRAPH_CENTRALITY": "0.7",
+        "LIMIT_GRAPH_CONNECTIVITY": "0.6",
+        "MODP_ENABLED": "true",
+        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]",
+        "RLHF_ENABLED": "true",
+        "HUMAN_FEEDBACK_SCORE": "0.6",
+        "DISTILLATION_ENABLED": "true",
+        "MOE_GATING_ENABLED": "true",
+        "EVOLUTIONARY_ENABLED": "true",
+        "FLEXGEN_ENABLED": "false",
+        "FLEXGEN_MODEL_NAME": "facebook/opt-6.7b",
+        "FLEXGEN_DEFAULT_PRECISION": "fp16"
       }
     },
     {
@@ -16,7 +67,21 @@
       "command": ["python", "run_agent.py"],
       "environment": {
         "QUERY_MODE": "balanced",
-        "MAX_ENERGY_WH": "0.05"
+        "MAX_ENERGY_WH": "0.05",
+        "ENHANCEMENTS_ENABLED": "true",
+        "LIMIT_GRAPH_ENABLED": "true",
+        "LIMIT_GRAPH_CENTRALITY": "0.7",
+        "LIMIT_GRAPH_CONNECTIVITY": "0.6",
+        "MODP_ENABLED": "true",
+        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]",
+        "RLHF_ENABLED": "true",
+        "HUMAN_FEEDBACK_SCORE": "0.6",
+        "DISTILLATION_ENABLED": "true",
+        "MOE_GATING_ENABLED": "true",
+        "EVOLUTIONARY_ENABLED": "true",
+        "FLEXGEN_ENABLED": "false",
+        "FLEXGEN_MODEL_NAME": "facebook/opt-6.7b",
+        "FLEXGEN_DEFAULT_PRECISION": "fp16"
       }
     },
     {
@@ -24,7 +89,21 @@
       "command": ["python", "run_agent.py"],
       "environment": {
         "QUERY_MODE": "high_accuracy",
-        "MAX_ENERGY_WH": "0.08"
+        "MAX_ENERGY_WH": "0.08",
+        "ENHANCEMENTS_ENABLED": "true",
+        "LIMIT_GRAPH_ENABLED": "true",
+        "LIMIT_GRAPH_CENTRALITY": "0.7",
+        "LIMIT_GRAPH_CONNECTIVITY": "0.6",
+        "MODP_ENABLED": "true",
+        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]",
+        "RLHF_ENABLED": "true",
+        "HUMAN_FEEDBACK_SCORE": "0.6",
+        "DISTILLATION_ENABLED": "true",
+        "MOE_GATING_ENABLED": "true",
+        "EVOLUTIONARY_ENABLED": "true",
+        "FLEXGEN_ENABLED": "false",
+        "FLEXGEN_MODEL_NAME": "facebook/opt-6.7b",
+        "FLEXGEN_DEFAULT_PRECISION": "fp16"
       }
     }
   ]
