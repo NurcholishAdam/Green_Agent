@@ -1,8 +1,13 @@
+
 # Meta-Cognitive Architecture for Green Agent
 
 ## Overview
 
 This document describes the enhanced meta-cognitive architecture that adds sustained reflection and interpretability to the Green Agent system.
+
+**New in this version:** The architecture now also integrates advanced enhancement modules from `src/enhancements/` – **LIMIT Graph**, **MODP (Multi‑Objective Decision Process)**, **RLHF (Reinforcement Learning from Human Feedback)**, **Multi‑Teacher On‑Policy Distillation**, **Bio‑inspired Optimisation**, **MoE expert gating**, and **FlexGen execution backend**. These modules further strengthen decision‑making, sustainability, and security, and can be used alongside the meta‑cognitive features.
+
+---
 
 ## Architecture Enhancements
 
@@ -196,6 +201,80 @@ This document describes the enhanced meta-cognitive architecture that adds susta
   - Adaptability (policy adjustments, pattern learning)
 - Use Pareto analysis to show reflection moves agents toward optimal trade-offs
 
+---
+
+## Advanced Enhancement Modules Integration (NEW)
+
+The following advanced modules are now integrated into the meta‑cognitive architecture, providing context‑aware, learned decision‑making and enhanced sustainability enforcement.
+
+### LIMIT Graph
+
+**What it provides**: Topology‑aware metrics (centrality, connectivity) that indicate the system’s importance within the overall graph. These metrics are used to influence routing and priority decisions.
+
+**Integration point**: `src/enhancements/core/graph_registry.py` and `causal_graph.py` maintain the graph state. The metrics are made available to the reflection engine and policy feedback, enabling rules like:
+
+```yaml
+- id: "ENH-GRAPH-001"
+  condition: "graph_centrality < 0.3"
+  action: "check_topology"
+```
+
+### MODP (Multi‑Objective Decision Process)
+
+**What it provides**: Configurable weights for accuracy, energy, latency, and carbon. The composite `modp_score` is used to evaluate overall performance and trigger policy reviews when low.
+
+**Integration point**: `NodeDescriptor` and `WorkloadDescriptor` compute the MODP score using distillation. The score is included in the metrics collected at each step, so reflection checkpoints can reference it:
+
+```yaml
+- id: "ENH-MODP-001"
+  condition: "modp_score < 0.4"
+  action: "trigger_policy_review"
+```
+
+### RLHF (Reinforcement Learning from Human Feedback)
+
+**What it provides**: Human feedback score (0‑1) that influences teacher predictions and reward shaping. This feedback can be used to adapt policies based on user satisfaction.
+
+**Integration point**: `RLHFTeacher` in descriptors; the `human_feedback_score` is stored in `FeedbackEvent` and made available for symbolic rules.
+
+### Multi‑Teacher On‑Policy Distillation with MoE Gating
+
+**What it provides**: A lightweight student policy trained online from rule‑based, historical ML, Q‑learning, and RLHF teachers, blended via a gating network.
+
+**Integration point**: `DistillationRoutingOptimizer` and `DistillationPriorityOptimizer` are used by `NodeDescriptor` and `WorkloadDescriptor` respectively. During reflection checkpoints, if the current strategy is suboptimal, the agent can call these optimizers to select a better routing strategy or priority.
+
+### Bio‑inspired Optimisation (Evolutionary)
+
+**What it provides**: Genetic algorithms that tune MODP weights and other hyperparameters over time.
+
+**Integration point**: `EvolutionaryOptimizer` classes in descriptors. When enabled, the best fitness is tracked and can be used in rules to detect stagnation:
+
+```yaml
+- id: "ENH-EVOL-001"
+  condition: "evolutionary_best_fitness - evolutionary_best_fitness offset 1h < 0.01"
+  action: "restart_evolution"
+```
+
+### MoE Expert Gating
+
+**What it provides**: Dynamic weighting of expert predictions; its stability (`moe_gate_stddev`) is monitored.
+
+**Integration point**: The gating network is part of the distillation optimizers. The `moe_gate_stddev` metric is exported and can trigger alerts if the routing becomes unstable.
+
+### FlexGen Integration
+
+**What it provides**: High‑throughput LLM inference with adaptive precision (fp32/fp16/int8) for efficient execution.
+
+**Integration point**: When `flexgen.enabled` is `true`, the agent may delegate tasks to FlexGen. The decision is made by the distillation policy based on context (carbon intensity, task complexity). FlexGen energy consumption is tracked and can be used in rules:
+
+```yaml
+- id: "ENH-FLEX-001"
+  condition: "flexgen_energy_joules > 1000"
+  action: "switch_precision"
+```
+
+---
+
 ## Data Flow
 
 ```
@@ -209,6 +288,8 @@ This document describes the enhanced meta-cognitive architecture that adds susta
 │  • Latency, Energy, Carbon, Memory, Tool Calls          │
 │  • Cumulative tracking                                   │
 │  • Mid-execution access                                  │
+│  • Enhanced metrics: modp_score, graph_centrality,      │
+│    human_feedback_score, distillation stats, etc.       │
 └────────────────────┬────────────────────────────────────┘
                      │
                      ▼
@@ -218,6 +299,7 @@ This document describes the enhanced meta-cognitive architecture that adds susta
 │  • Self-explanation generation                           │
 │  • Decision determination                                │
 │  • Confidence scoring                                    │
+│  • Evaluate enhanced symbolic rules                      │
 └────────────────────┬────────────────────────────────────┘
                      │
                      ├──────────────────────────────────┐
@@ -232,6 +314,20 @@ This document describes the enhanced meta-cognitive architecture that adds susta
                    └──────────────┬───────────────────┘
                                   ▼
 ┌─────────────────────────────────────────────────────────┐
+│           Advanced Enhancement Modules (optional)       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ LIMIT Graph  │  │     MODP     │  │     RLHF     │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ Distillation │  │ Bio‑inspired │  │     MoE      │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+│  ┌──────────────┐                                      │
+│  │   FlexGen    │                                      │
+│  └──────────────┘                                      │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────┐
 │                  Run Memory (Persistent)                 │
 │  • Store complete run history                            │
 │  • Track performance trends                              │
@@ -244,6 +340,7 @@ This document describes the enhanced meta-cognitive architecture that adds susta
 │  • Objective metrics (Pareto position)                   │
 │  • Subjective narratives (reflections)                   │
 │  • Dual-layer synthesis                                  │
+│  • Advanced metrics (MODP, RLHF) incorporated           │
 └────────────────────┬────────────────────────────────────┘
                      │
                      ▼
@@ -252,8 +349,11 @@ This document describes the enhanced meta-cognitive architecture that adds susta
 │  • Leaderboard (efficiency + interpretability)           │
 │  • Reasoning paths visualization                         │
 │  • Comparative insights                                  │
+│  • Enhanced metrics overlay                              │
 └─────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Configuration
 
@@ -282,6 +382,39 @@ meta_cognitive:
     meta_policy_generation: true
 ```
 
+### Enhanced Configuration (`config.json` or `green_policy.yaml` additions)
+
+```yaml
+enhancements:
+  enabled: true                # Master switch
+  limit_graph:
+    enabled: true
+    graph_metrics:
+      centrality: 0.7
+      connectivity: 0.6
+  modp:
+    enabled: true
+    objective_weights: [0.4, 0.3, 0.2, 0.1]
+  rlhf:
+    enabled: true
+    human_feedback_score: 0.6
+  distillation:
+    enabled: true
+    use_moe_gating: true
+  bio_inspired:
+    enabled: true
+    use_evolutionary: true
+  moe_expert:
+    enabled: true
+    n_experts: 4
+  flexgen:
+    enabled: false   # set true to use FlexGen
+    model_name: "facebook/opt-6.7b"
+    default_precision: "fp16"
+```
+
+---
+
 ## Usage
 
 ### Basic Execution
@@ -294,6 +427,12 @@ python run_agent.py \
   --dashboard dashboard.html
 ```
 
+### Execution with Advanced Enhancements
+
+```bash
+python run_agent.py --config config.json --policy green_policy.yaml --enhancements
+```
+
 ### Output Artifacts
 
 1. **results.json**: Complete execution results with reflections
@@ -303,6 +442,9 @@ python run_agent.py \
 5. **reasoning_insights.json**: Long-context analysis
 6. **pareto_analysis.json**: Multi-objective evaluation
 7. **run_memory.json**: Persistent historical data
+8. **Enhanced outputs** – if enhancements enabled, additional fields (MODP score, graph metrics, RLHF feedback) are included in these files.
+
+---
 
 ## Benefits
 
@@ -310,21 +452,27 @@ python run_agent.py \
 - Real-time awareness of resource usage
 - Proactive budget management
 - Adaptive optimization strategies
+- Additional gains from MODP‑driven multi‑objective optimisation
 
 ### 2. Interpretability
 - Clear reasoning paths
 - Self-explanations in natural language
 - Confidence scoring for transparency
+- Enhanced by distillation/MoE providing traceable expert decisions
 
 ### 3. Adaptability
 - Dynamic policy adjustments
 - Learning from historical patterns
 - Meta-policy generation
+- RLHF and evolutionary optimisation allow continuous improvement
 
 ### 4. Accountability
 - Dual-layer feedback (objective + subjective)
 - Alignment verification
 - Comprehensive audit trails
+- DAG carbon ledger and Zero Trust provide immutable provenance
+
+---
 
 ## Future Extensions
 
@@ -333,6 +481,7 @@ python run_agent.py \
 3. **Counterfactual Reasoning**: "What if" analysis for alternative strategies
 4. **Federated Learning**: Share meta-policies across agent populations
 5. **Human-in-the-Loop**: Interactive reflection with human feedback
+6. **Tighter integration of advanced enhancements** – e.g., using MODP to automatically tune reflection thresholds, or using LIMIT Graph to prioritize critical nodes.
 
 ## References
 
@@ -340,3 +489,6 @@ python run_agent.py \
 - AgentBeats Platform: https://agentbeats.ai
 - Pareto Optimization: Multi-objective decision making
 - Meta-Cognitive AI: Self-aware agent architectures
+- **Multi‑Teacher Distillation**: Hinton et al., "Distilling the Knowledge in a Neural Network"
+- **MoE**: Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer"
+- **RLHF**: Christiano et al., "Deep Reinforcement Learning from Human Preferences"
