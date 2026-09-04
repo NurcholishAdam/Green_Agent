@@ -1,11 +1,11 @@
-```markdown
+
 # Expert Collaboration Layer - Integration Guide
 
 ## Overview
 
 This guide shows how to integrate the Expert Collaboration Layer into Green Agent, adding intelligent escalation to external experts while maintaining sustainability focus. It also explains how to leverage the advanced enhancement modules (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, MoE expert gating, and FlexGen) to improve decision‑making and sustainability.
 
-```
+
 ## Architecture
 
 ```
@@ -73,7 +73,7 @@ Feedback Integration & Audit (audit_logger.py)
 Green Agent Dashboard / Monitoring (Prometheus, Grafana)
    • MODP scores, RLHF feedback, graph metrics, distillation updates
 ```
-```
+
 
 ## File Structure
 
