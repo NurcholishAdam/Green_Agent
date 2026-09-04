@@ -5,6 +5,14 @@ metadata:
   labels:
     release: prometheus
     app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
 spec:
   selector:
     matchLabels:
@@ -26,12 +34,17 @@ spec:
     - sourceLabels: [__meta_kubernetes_service_name]
       targetLabel: service
     metricRelabelings:
+    # Drop Go and Python runtime metrics if not needed
     - sourceLabels: [__name__]
       regex: 'go_.*'
       action: drop
     - sourceLabels: [__name__]
       regex: 'python_.*'
       action: drop
+    # Keep only Green Agent metrics (optional)
+    - sourceLabels: [__name__]
+      regex: 'green_agent_.*'
+      action: keep
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -40,11 +53,20 @@ metadata:
   labels:
     release: prometheus
     app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
 spec:
   groups:
   - name: green-agent.rules
     interval: 30s
     rules:
+    # ── Core alerts (unchanged) ──
     - alert: GreenAgentHighCarbonIntensity
       expr: green_agent_carbon_intensity > 400
       for: 5m
@@ -53,7 +75,7 @@ spec:
       annotations:
         summary: "High carbon intensity detected"
         description: "Carbon intensity is {{ $value }} gCO2/kWh"
-    
+
     - alert: GreenAgentHighEnergyConsumption
       expr: rate(green_agent_energy_consumed_kwh_total[5m]) > 10
       for: 10m
@@ -62,7 +84,7 @@ spec:
       annotations:
         summary: "High energy consumption detected"
         description: "Energy consumption rate is {{ $value }} kWh/min"
-    
+
     - alert: GreenAgentTaskFailures
       expr: rate(green_agent_tasks_completed{status="failed"}[5m]) > 0.1
       for: 5m
@@ -71,7 +93,7 @@ spec:
       annotations:
         summary: "High task failure rate"
         description: "Task failure rate is {{ $value }} failures/min"
-    
+
     - alert: GreenAgentLowWorkerCount
       expr: green_agent_active_workers < 2
       for: 5m
@@ -80,7 +102,7 @@ spec:
       annotations:
         summary: "Low worker count"
         description: "Only {{ $value }} workers active"
-    
+
     - alert: GreenAgentServiceDown
       expr: up{job="green-agent"} == 0
       for: 1m
@@ -89,3 +111,65 @@ spec:
       annotations:
         summary: "Green Agent service is down"
         description: "Service has been down for more than 1 minute"
+
+    # ── Enhanced alerts for LIMIT Graph, MODP, RLHF, etc. ──
+
+    # MODP composite score too low (poor multi‑objective performance)
+    - alert: GreenAgentLowMODPScore
+      expr: green_agent_modp_score < 0.4
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Low MODP composite score"
+        description: "MODP score is {{ $value }} (target > 0.6). Check objective weights."
+
+    # RLHF feedback score dropping (human feedback indicates dissatisfaction)
+    - alert: GreenAgentLowRLHFFeedback
+      expr: green_agent_rlhf_feedback < 0.3
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Low RLHF feedback score"
+        description: "Human feedback is {{ $value }}. Consider adjusting behavior."
+
+    # Distillation updates stalled (student not learning)
+    - alert: GreenAgentDistillationStalled
+      expr: rate(green_agent_distillation_update_count[30m]) < 1
+      for: 30m
+      labels:
+        severity: info
+      annotations:
+        summary: "Distillation updates stalled"
+        description: "Few or no distillation updates in last 30 minutes."
+
+    # LIMIT Graph centrality anomaly (graph structure degraded)
+    - alert: GreenAgentGraphCentralityLow
+      expr: green_agent_graph_centrality < 0.3
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Low LIMIT Graph centrality"
+        description: "Graph centrality is {{ $value }}. Topology may be suboptimal."
+
+    # MoE gating instability (gate weight variance too high)
+    - alert: GreenAgentMoEUnstable
+      expr: stddev_over_time(green_agent_moe_gate_weight[15m]) > 0.2
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "MoE gating unstable"
+        description: "Gate weight standard deviation is {{ $value }}."
+
+    # Bio‑inspired evolutionary fitness stagnating
+    - alert: GreenAgentEvolutionStalled
+      expr: green_agent_evolutionary_best_fitness - green_agent_evolutionary_best_fitness offset 1h < 0.01
+      for: 1h
+      labels:
+        severity: info
+      annotations:
+        summary: "Evolutionary optimisation stalled"
+        description: "Best fitness has not improved significantly in the last hour."
