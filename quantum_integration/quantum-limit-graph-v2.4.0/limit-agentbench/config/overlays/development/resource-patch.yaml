@@ -2,14 +2,139 @@ apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
+  labels:
+    app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+      num-cpus: '4'
     template:
       spec:
         securityContext:
           runAsNonRoot: false
         containers:
         - name: ray-head
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0-enhanced
+          imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: true
             readOnlyRootFilesystem: false
+          ports:
+          - containerPort: 6379
+          - containerPort: 8265
+          - containerPort: 8000
+          - containerPort: 9090
+          env:
+          # System / core flags
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.7"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.6"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.6"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "20"
+          - name: MUTATION_RATE
+            value: "0.1"
+          - name: FLEXGEN_ENABLED
+            value: "true"
+          - name: FLEXGEN_MODEL_NAME
+            value: "facebook/opt-6.7b"
+          - name: FLEXGEN_DEFAULT_PRECISION
+            value: "fp16"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+  workerGroupSpecs:
+  - replicas: 4
+    minReplicas: 2
+    maxReplicas: 10
+    groupName: standard-workers
+    rayStartParams:
+      num-cpus: '4'
+      memory: '8589934592'
+    template:
+      spec:
+        containers:
+        - name: ray-worker
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0-enhanced
+          env:
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.7"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.6"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.6"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "20"
+          - name: FLEXGEN_ENABLED
+            value: "true"
+          - name: FLEXGEN_DEFAULT_PRECISION
+            value: "fp16"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+          - name: config-volume
+            mountPath: /app/config
+        volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
