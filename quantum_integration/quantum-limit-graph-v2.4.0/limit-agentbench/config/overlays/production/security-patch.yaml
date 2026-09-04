@@ -2,6 +2,16 @@ apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
+  labels:
+    app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
 spec:
   headGroupSpec:
     template:
@@ -23,6 +33,80 @@ spec:
           volumeMounts:
           - name: tmp-volume
             mountPath: /tmp
+          - name: enhancement-state
+            mountPath: /app/enhancement_state
+          env:
+          # Enhanced feature flags
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_CENTRALITY
+            value: "0.7"
+          - name: LIMIT_GRAPH_CONNECTIVITY
+            value: "0.6"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: MODP_WEIGHTS
+            value: "[0.4,0.3,0.2,0.1]"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: HUMAN_FEEDBACK_SCORE
+            value: "0.6"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          - name: POPULATION_SIZE
+            value: "20"
+          - name: MUTATION_RATE
+            value: "0.1"
         volumes:
         - name: tmp-volume
           emptyDir: {}
+        - name: enhancement-state
+          persistentVolumeClaim:
+            claimName: green-agent-enhancement-pvc   # if persistence needed
+  workerGroupSpecs:
+  - replicas: 1
+    minReplicas: 1
+    maxReplicas: 4
+    groupName: standard-workers
+    template:
+      spec:
+        containers:
+        - name: ray-worker
+          env:
+          - name: ENHANCEMENTS_ENABLED
+            value: "true"
+          - name: LIMIT_GRAPH_ENABLED
+            value: "true"
+          - name: MODP_ENABLED
+            value: "true"
+          - name: RLHF_ENABLED
+            value: "true"
+          - name: DISTILLATION_ENABLED
+            value: "true"
+          - name: MOE_GATING_ENABLED
+            value: "true"
+          - name: EVOLUTIONARY_ENABLED
+            value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+              - ALL
+          volumeMounts:
+          - name: tmp-volume
+            mountPath: /tmp
+          - name: enhancement-state
+            mountPath: /app/enhancement_state
+        volumes:
+        - name: tmp-volume
+          emptyDir: {}
+        - name: enhancement-state
+          persistentVolumeClaim:
+            claimName: green-agent-enhancement-pvc
