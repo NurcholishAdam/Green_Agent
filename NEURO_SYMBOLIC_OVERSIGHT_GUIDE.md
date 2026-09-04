@@ -1,8 +1,13 @@
+
 # Neuro-Symbolic Oversight for Green Agent
 
 ## Overview
 
 This enhancement extends the Green Agent architecture with a neuro-symbolic oversight paradigm inspired by FormalJudge. It combines neural agent reasoning with explicit symbolic constraints to provide interpretable, verifiable governance over agent behavior.
+
+**New in this version:** Integration with advanced enhancement modules (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation, MoE expert gating, and FlexGen) is now supported. These modules enrich the symbolic rules with contextual metrics and learned decision-making, further strengthening the oversight layer.
+
+---
 
 ## Architecture
 
@@ -33,6 +38,7 @@ This enhancement extends the Green Agent architecture with a neuro-symbolic over
 │  │  - Fairness Rules                                │  │
 │  │  - Safety Rules                                  │  │
 │  │  - Compliance Rules                              │  │
+│  │  - Enhanced Rules (MODP, RLHF, Graph, FlexGen)   │  │
 │  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
                           ↓
@@ -43,6 +49,7 @@ This enhancement extends the Green Agent architecture with a neuro-symbolic over
 │  │  1. Objective (Pareto Analysis)                  │  │
 │  │  2. Subjective (Agent Reflections)               │  │
 │  │  3. Symbolic (Rule Violations) ← NEW             │  │
+│  │  4. Advanced Decision Metrics (MODP, RLHF, etc.) │  │
 │  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
                           ↓
@@ -54,9 +61,12 @@ This enhancement extends the Green Agent architecture with a neuro-symbolic over
 │  │  - Category Breakdown                            │  │
 │  │  - Severity Heatmap                              │  │
 │  │  - Trace Explanations                            │  │
+│  │  - Enhanced Metrics Overlay (MODP, Graph)        │  │
 │  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Key Features
 
@@ -81,6 +91,7 @@ symbolic_rules:
 - **Fairness**: Resource distribution, query equity
 - **Safety**: Error rates, system stability
 - **Compliance**: ESG standards, audit requirements
+- **Enhanced**: MODP score, RLHF feedback, LIMIT Graph metrics, FlexGen energy
 
 ### 2. Symbolic Reasoning Engine
 
@@ -98,6 +109,7 @@ violations = engine.evaluate_rules(metrics, step=current_step)
 - Safe evaluation context
 - Modular rule loading
 - Domain-specific rule support
+- **Support for enhanced metrics** (modp_score, graph_centrality, etc.)
 
 ### 3. Formal Violation Traces
 
@@ -174,6 +186,39 @@ summary = engine.get_violation_summary()
 - "Memory violations increase after step 5"
 - "Fairness issues emerge with heterogeneous queries"
 
+---
+
+## Advanced Enhancements Integration
+
+The neuro‑symbolic oversight layer can now use metrics and decisions from the advanced enhancements folder (`src/enhancements`). When those modules are enabled, the following integrations become available:
+
+| Enhancement | Integration with Symbolic Oversight |
+|-------------|---------------------------------------|
+| **LIMIT Graph** | Graph centrality and connectivity are available as rule variables (`graph_centrality`, `graph_connectivity`). Low centrality may trigger topology review. |
+| **MODP** | The composite score (`modp_score`) can be used in rules to trigger policy reviews when below a threshold. |
+| **RLHF** | Human feedback (`human_feedback_score`) influences rule thresholds and can trigger feedback collection actions. |
+| **Multi‑Teacher Distillation** | The distillation update rate (`distillation_update_rate`) is monitored; stalled learning may raise an alert. |
+| **Bio‑inspired Optimisation** | Evolutionary best fitness (`evolutionary_best_fitness`) is tracked; stagnation can trigger restart or parameter tuning. |
+| **MoE Expert Gating** | Gate weight standard deviation (`moe_gate_stddev`) indicates stability; high variance may indicate expert routing issues. |
+| **FlexGen** | FlexGen energy consumption (`flexgen_energy_joules`) can be used to trigger precision switches or delegation policy changes. |
+
+These enhanced metrics are automatically included in the `metrics` dict when the corresponding modules are active, and can be referenced in `symbolic_policy.yaml` rules just like any other metric.
+
+### Example Enhanced Rule
+
+```yaml
+symbolic_rules:
+  - id: "ENH-MODP-001"
+    name: "Low MODP Score Alert"
+    category: "enhanced"
+    priority: "warning"
+    condition: "modp_score < 0.4"
+    action: "trigger_policy_review"
+    explanation: "Overall multi‑objective performance is poor."
+```
+
+---
+
 ## Usage Guide
 
 ### Basic Usage
@@ -209,6 +254,7 @@ symbolic_rules:
 - Comparison: `>`, `<`, `>=`, `<=`, `==`, `!=`
 - Logical: `AND`, `OR`, `NOT`
 - Variables: `energy`, `carbon`, `latency`, `memory`, `tool_calls`, `cpu_percent`
+- **Enhanced variables**: `modp_score`, `graph_centrality`, `graph_connectivity`, `human_feedback_score`, `distillation_update_rate`, `moe_gate_stddev`, `evolutionary_best_fitness`, `flexgen_energy_joules`
 
 ### Domain-Specific Rules
 
@@ -241,6 +287,8 @@ critical = [v for v in violations if v.severity == "critical"]
 filtered = visualizer.filter_by_rule_type("fairness")
 ```
 
+---
+
 ## Integration with Green_Agent Repository
 
 This implementation is designed to integrate seamlessly with the [NurcholishAdam/Green_Agent](https://github.com/NurcholishAdam/Green_Agent) repository:
@@ -255,9 +303,18 @@ green_agent_repo/
 │   │   └── symbolic_reasoning_engine.py
 │   ├── dashboard/
 │   │   └── symbolic_visualizer.py   # NEW: Violation visualization
-│   └── policy/
-│       └── policy_feedback.py       # ENHANCED: Triple-layer feedback
-├── run_agent.py                      # ENHANCED: Symbolic integration
+│   ├── policy/
+│   │   └── policy_feedback.py       # ENHANCED: Triple-layer feedback
+│   └── enhancements/                # ADVANCED MODULES (LIMIT Graph, MODP, RLHF, etc.)
+│       ├── schemas/
+│       │   ├── node_descriptor.py
+│       │   ├── workload_descriptor.py
+│       │   └── feedback_event.py
+│       ├── zero_trust_architecture.py
+│       └── core/
+│           ├── graph_registry.py
+│           └── ...
+├── run_agent.py                      # ENHANCED: Symbolic + advanced integration
 └── demo_symbolic_oversight.py        # NEW: Demo script
 ```
 
@@ -267,14 +324,18 @@ green_agent_repo/
 - **Optional activation** - works with or without symbolic oversight
 - **Backward compatible** with existing policy files
 - **Modular design** - can be disabled by not loading symbolic_policy.yaml
+- **Advanced enhancements** are optional and gracefully skipped if modules missing
+
+---
 
 ## Performance Considerations
 
 ### Computational Overhead
 
 - **Rule evaluation**: O(n) where n = number of rules (~10-50 rules typical)
-- **Per-step overhead**: < 10ms for typical rule sets
+- **Per-step overhead**: < 10ms for typical rule sets (including enhanced metrics)
 - **Memory footprint**: Minimal (~1-2MB for violation history)
+- **Distillation inference**: <5ms per decision (if enhancements enabled)
 
 ### Optimization Tips
 
@@ -282,6 +343,9 @@ green_agent_repo/
 2. **Use priority ordering**: Critical rules evaluated first
 3. **Batch evaluations**: Evaluate at reflection checkpoints only
 4. **Prune history**: Archive old violations periodically
+5. **Disable enhancements when not needed**: Set `use_enhancements=False` in config.
+
+---
 
 ## Comparison with FormalJudge
 
@@ -292,7 +356,10 @@ green_agent_repo/
 | **Integration** | Standalone system | Embedded in agent |
 | **Overhead** | Higher | Minimal |
 | **Flexibility** | Rigid formal proofs | Pragmatic constraints |
+| **Advanced Metrics** | Not applicable | MODP, RLHF, LIMIT Graph, etc. |
 | **Use Case** | Safety-critical systems | Sustainable AI agents |
+
+---
 
 ## Examples
 
@@ -338,6 +405,21 @@ violations = engine.evaluate_rules(metrics, step=8)
 # Result: COMP-SUST-001 violation detected
 ```
 
+### Example 4: Enhanced Rule with MODP
+
+```python
+# Rule: IF modp_score < 0.4 THEN trigger_policy_review
+metrics = {
+    "modp_score": 0.35,
+    # ... other metrics (if enhancements enabled, this is automatically available)
+}
+
+violations = engine.evaluate_rules(metrics, step=10)
+# Result: ENH-MODP-001 violation detected
+```
+
+---
+
 ## Troubleshooting
 
 ### Issue: Rules not triggering
@@ -346,6 +428,7 @@ violations = engine.evaluate_rules(metrics, step=8)
 - Carbon: grams (not kg)
 - Latency: milliseconds
 - Memory: MB
+- For enhanced metrics: scores are typically 0-1, centrality 0-1, energy in Joules.
 
 ### Issue: False positives
 
@@ -363,13 +446,21 @@ evaluation_config:
     - "reflection_checkpoint"  # Only at checkpoints
 ```
 
+### Issue: Enhanced metrics not available
+
+**Solution:** Verify that the `src/enhancements` folder exists and dependencies are installed. When enhancements are disabled, those metrics will not be present in the `metrics` dict, and rules referencing them may not trigger. To include them, enable enhancements in your config or environment.
+
+---
+
 ## Future Enhancements
 
 1. **Z3 Integration**: Use Z3 SMT solver for complex constraints
 2. **Temporal Logic**: Add temporal operators (ALWAYS, EVENTUALLY)
 3. **Probabilistic Rules**: Support uncertainty in conditions
-4. **Auto-tuning**: Learn optimal thresholds from historical data
-5. **Multi-agent Coordination**: Cross-agent rule enforcement
+4. **Auto-tuning**: Learn optimal thresholds from historical data (can use evolutionary optimisation)
+5. **Multi-agent Coordination**: Cross-agent rule enforcement (can use MoE gating for expert selection)
+
+---
 
 ## References
 
@@ -377,6 +468,11 @@ evaluation_config:
 - Green_Agent: [NurcholishAdam/Green_Agent](https://github.com/NurcholishAdam/Green_Agent)
 - Symbolic AI: Rule-based reasoning systems
 - Interpretable AI: Explainable decision-making
+- **Multi‑Teacher Distillation**: Hinton et al., "Distilling the Knowledge in a Neural Network"
+- **MoE**: Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer"
+- **RLHF**: Christiano et al., "Deep Reinforcement Learning from Human Preferences"
+
+---
 
 ## License
 
