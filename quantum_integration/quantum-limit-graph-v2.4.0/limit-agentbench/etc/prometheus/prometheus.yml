@@ -1,10 +1,18 @@
-# Prometheus Configuration for Green Agent v5.0.0
-# ================================================
-# Deploy alongside Green Agent to scrape metrics and evaluate alerting rules
+# Prometheus Configuration for Green Agent v5.0.0 (Enhanced)
+# ========================================================
+# Deploy alongside Green Agent to scrape metrics and evaluate alerting rules.
+# Adds support for advanced enhancement metrics:
+#   - LIMIT Graph (centrality, connectivity)
+#   - MODP (multi‑objective composite score)
+#   - RLHF (human feedback)
+#   - Multi‑Teacher Distillation (update rate)
+#   - MoE Gating (gate stability)
+#   - Bio‑inspired Optimisation (evolutionary fitness)
+#   - FlexGen (energy consumption)
 
 global:
-  scrape_interval: 30s          # How often to scrape targets
-  evaluation_interval: 30s      # How often to evaluate rules
+  scrape_interval: 30s
+  evaluation_interval: 30s
   external_labels:
     cluster: 'green-agent-prod'
     environment: 'production'
@@ -13,8 +21,11 @@ global:
 # Rule files for alerting and recording
 rule_files:
   - "rules/green_agent_alerts.yml"
-  - "rules/helium_alerts.yml"      # ✅ Helium-specific alerts
+  - "rules/helium_alerts.yml"
   - "rules/green_agent_recording.yml"
+  # --- Enhanced rule files for advanced modules ---
+  - "rules/enhanced_alerts.yml"           # Alerts for MODP, RLHF, graph, distillation, MoE, evolutionary, FlexGen
+  - "rules/enhanced_recording.yml"        # Recording rules for enhanced metrics (optional)
 
 # Alertmanager configuration
 alerting:
@@ -31,14 +42,14 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # ✅ Green Agent metrics (includes helium metrics automatically)
+  # Green Agent metrics (includes helium and enhanced metrics automatically)
   - job_name: 'green-agent'
     honor_labels: true
     scrape_interval: 30s
     scrape_timeout: 10s
     metrics_path: /metrics
     scheme: http
-    
+
     # Kubernetes service discovery
     kubernetes_sd_configs:
       - role: endpoints
@@ -47,43 +58,45 @@ scrape_configs:
             - green-agent-production
             - green-agent-staging
             - green-agent-dev
-    
+
     # Relabeling for auto-discovery
     relabel_configs:
-      # Keep only endpoints annotated for Prometheus scraping
       - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
         action: keep
         regex: true
-      
-      # Use annotated port if specified
+
       - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
         action: replace
         target_label: __metrics_port__
         regex: (\d+)
-      
-      # Replace address with correct port
+
       - source_labels: [__address__, __metrics_port__]
         action: replace
         regex: ([^:]+)(?::\d+)?;(\d+)
         replacement: $1:$2
         target_label: __address__
-      
-      # Add Kubernetes metadata as labels
+
       - source_labels: [__meta_kubernetes_namespace]
         action: replace
         target_label: kubernetes_namespace
-      
+
       - source_labels: [__meta_kubernetes_pod_name]
         action: replace
         target_label: pod
-      
+
       - source_labels: [__meta_kubernetes_pod_label_app]
         action: replace
         target_label: app
-      
+
       - source_labels: [__meta_kubernetes_pod_label_component]
         action: replace
         target_label: component
+
+      # Additional relabeling for enhanced modules (optional, to identify enhancement pods)
+      - source_labels: [__meta_kubernetes_pod_label_enhancements]
+        action: replace
+        target_label: enhancements
+        regex: '(.+)'
 
   # Optional: Node exporter for infrastructure metrics
   - job_name: 'node-exporter'
