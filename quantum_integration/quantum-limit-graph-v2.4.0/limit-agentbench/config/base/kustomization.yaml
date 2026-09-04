@@ -7,6 +7,16 @@ commonLabels:
   app: green-agent
   version: "5.0.0"
   managed-by: kustomize
+  enhancements: enabled
+
+commonAnnotations:
+  green-agent/limit-graph: "true"
+  green-agent/modp: "true"
+  green-agent/rlhf: "true"
+  green-agent/distillation: "true"
+  green-agent/bio-inspired: "true"
+  green-agent/moe: "true"
+  green-agent/flexgen: "true"
 
 resources:
 - ray-cluster.yaml
@@ -18,6 +28,113 @@ configMapGenerator:
 - name: green-agent-config
   files:
   - green_agent_config.yaml
+  literals:
+  - ENHANCEMENTS_ENABLED=true
+  - LIMIT_GRAPH_ENABLED=true
+  - LIMIT_GRAPH_CENTRALITY=0.7
+  - LIMIT_GRAPH_CONNECTIVITY=0.6
+  - MODP_ENABLED=true
+  - MODP_WEIGHTS=[0.4,0.3,0.2,0.1]
+  - RLHF_ENABLED=true
+  - HUMAN_FEEDBACK_SCORE=0.6
+  - DISTILLATION_ENABLED=true
+  - MOE_GATING_ENABLED=true
+  - EVOLUTIONARY_ENABLED=true
+  - POPULATION_SIZE=20
+  - MUTATION_RATE=0.1
+  - FLEXGEN_ENABLED=true
+  - FLEXGEN_MODEL_NAME=facebook/opt-6.7b
+  - FLEXGEN_DEFAULT_PRECISION=fp16
+
+patches:
+- patch: |-
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    metadata:
+      name: green-agent-cluster
+    spec:
+      headGroupSpec:
+        template:
+          spec:
+            containers:
+            - name: ray-head
+              env:
+              - name: ENHANCEMENTS_ENABLED
+                value: "true"
+              - name: LIMIT_GRAPH_ENABLED
+                value: "true"
+              - name: LIMIT_GRAPH_CENTRALITY
+                value: "0.7"
+              - name: LIMIT_GRAPH_CONNECTIVITY
+                value: "0.6"
+              - name: MODP_ENABLED
+                value: "true"
+              - name: MODP_WEIGHTS
+                value: "[0.4,0.3,0.2,0.1]"
+              - name: RLHF_ENABLED
+                value: "true"
+              - name: HUMAN_FEEDBACK_SCORE
+                value: "0.6"
+              - name: DISTILLATION_ENABLED
+                value: "true"
+              - name: MOE_GATING_ENABLED
+                value: "true"
+              - name: EVOLUTIONARY_ENABLED
+                value: "true"
+              - name: POPULATION_SIZE
+                value: "20"
+              - name: MUTATION_RATE
+                value: "0.1"
+              - name: FLEXGEN_ENABLED
+                value: "true"
+              - name: FLEXGEN_MODEL_NAME
+                value: "facebook/opt-6.7b"
+              - name: FLEXGEN_DEFAULT_PRECISION
+                value: "fp16"
+      workerGroupSpecs:
+      - groupName: standard-workers
+        template:
+          spec:
+            containers:
+            - name: ray-worker
+              env:
+              - name: ENHANCEMENTS_ENABLED
+                value: "true"
+              - name: LIMIT_GRAPH_ENABLED
+                value: "true"
+              - name: LIMIT_GRAPH_CENTRALITY
+                value: "0.7"
+              - name: LIMIT_GRAPH_CONNECTIVITY
+                value: "0.6"
+              - name: MODP_ENABLED
+                value: "true"
+              - name: MODP_WEIGHTS
+                value: "[0.4,0.3,0.2,0.1]"
+              - name: RLHF_ENABLED
+                value: "true"
+              - name: HUMAN_FEEDBACK_SCORE
+                value: "0.6"
+              - name: DISTILLATION_ENABLED
+                value: "true"
+              - name: MOE_GATING_ENABLED
+                value: "true"
+              - name: EVOLUTIONARY_ENABLED
+                value: "true"
+              - name: POPULATION_SIZE
+                value: "20"
+              - name: MUTATION_RATE
+                value: "0.1"
+              - name: FLEXGEN_ENABLED
+                value: "true"
+              - name: FLEXGEN_MODEL_NAME
+                value: "facebook/opt-6.7b"
+              - name: FLEXGEN_DEFAULT_PRECISION
+                value: "fp16"
+  target:
+    group: ray.io
+    version: v1
+    kind: RayCluster
+    name: green-agent-cluster
 
 images:
 - name: ghcr.io/nurcholishadam/green_agent
