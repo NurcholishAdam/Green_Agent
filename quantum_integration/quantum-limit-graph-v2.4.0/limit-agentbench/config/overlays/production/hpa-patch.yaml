@@ -2,9 +2,65 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: green-agent-hpa
+  labels:
+    app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
 spec:
   minReplicas: 4
   maxReplicas: 20
+
+  scaleTargetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: green-agent-cluster
+
+  metrics:
+  # ── Core resource metrics (unchanged) ──
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+  # ── Advanced custom metrics (from Prometheus) ──
+  # Carbon intensity (gCO₂/kWh) – scale down if too high to reduce footprint
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_carbon_intensity
+      target:
+        type: AverageValue
+        averageValue: "400"
+
+  # MODP composite score – scale up when score improves
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_modp_score
+      target:
+        type: AverageValue
+        averageValue: "0.7"
+
+  # RLHF human feedback score – adjust scaling based on feedback trend
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_rlhf_feedback
+      target:
+        type: AverageValue
+        averageValue: "0.5"
+
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 600
@@ -18,3 +74,10 @@ spec:
       - type: Percent
         value: 100
         periodSeconds: 60
+      # Additional policy for MODP-based rapid scale-up when sustainability score is high
+      - type: Pods
+        pods:
+          metric:
+            name: green_agent_modp_score
+          periodSeconds: 60
+          value: 2
