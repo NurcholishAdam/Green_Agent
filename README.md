@@ -1,4 +1,4 @@
-```markdown
+
 # 🌱 Green Agent with Advanced Sustainability Orchestration
 
 Green Agent is an open‑source framework for sustainable, intelligent orchestration of computing resources, built on a high‑throughput generation engine for large language models. It extends the core engine with carbon‑aware scheduling, helium tracking, predictive analytics, and a suite of reinforcement learning techniques to minimize environmental impact while maintaining performance and security.
