@@ -1,4 +1,4 @@
-```markdown
+
 # AgentBeats Integration - Delivery Summary
 
 ## 🎯 Overview
@@ -620,4 +620,3 @@ See `LICENSE` file for details.
 ✅ Advanced enhancements (LIMIT Graph, MODP, Distillation, MoE, Evolutionary, FlexGen) integrated and optional
 
 **Ready for AgentBeats submission and leaderboard competition!**
-```
