@@ -39,3 +39,74 @@ monitoring:
   logging:
     level: "INFO"
     format: "json"
+
+# ---------------------------------------------------------------------------
+# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation,
+# Bio‑inspired Optimisation, Mixture‑of‑Experts)
+# ---------------------------------------------------------------------------
+enhancements:
+  enabled: true                # Master switch for all advanced features
+
+  # LIMIT Graph integration
+  limit_graph:
+    enabled: true
+    graph_metrics:
+      centrality: 0.5
+      connectivity: 0.5
+      density: 0.4
+    update_interval_seconds: 60
+
+  # Multi‑Objective Decision Process (MODP)
+  modp:
+    enabled: true
+    objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+    normalize_weights: true
+
+  # Reinforcement Learning from Human Feedback (RLHF)
+  rlhf:
+    enabled: true
+    human_feedback_score: 0.5
+    collect_feedback: true
+    feedback_source: "dashboard"
+
+  # Multi‑Teacher On‑Policy Distillation with MoE
+  distillation:
+    enabled: true
+    use_moe_gating: true
+    distillation_lr: 0.01
+    gating_lr: 0.005
+    replay_size: 2000
+    train_every: 10
+    epsilon: 0.1
+    teachers:
+      - "rule_based"
+      - "historical_ml"
+      - "q_learning"
+      - "rlhf"
+
+  # Bio‑inspired Optimisation (Evolutionary)
+  bio_inspired:
+    enabled: true
+    use_evolutionary: true
+    population_size: 20
+    mutation_rate: 0.1
+    crossover_rate: 0.7
+    elitism: 2
+
+  # Mixture‑of‑Experts expert gating
+  moe_expert:
+    enabled: true
+    n_experts: 4
+    gating_lr: 0.005
+
+# ---------------------------------------------------------------------------
+# FlexGen Integration (Optional)
+# ---------------------------------------------------------------------------
+flexgen:
+  enabled: false               # Set to true to use FlexGen as execution backend
+  model_name: "facebook/opt-6.7b"
+  batch_size: 16
+  memory_limit_mb: 4096
+  precision_options: ["fp32", "fp16", "int8"]
+  default_precision: "fp16"
+  delegation_policy: "adaptive"   # adaptive | always | never
