@@ -5,11 +5,48 @@ Demo: Neuro-Symbolic Oversight for Green Agent
 
 Demonstrates the symbolic reasoning engine with formal rule evaluation
 and violation trace generation.
+
+Enhanced with an additional demo (Demo 6) for advanced enhancement modules:
+- LIMIT Graph
+- MODP (Multi‑Objective Decision Process)
+- RLHF
+- Multi‑Teacher On‑Policy Distillation with MoE gating
+- Bio‑inspired Optimisation
+- FlexGen integration hooks
 """
 
 import json
+import asyncio
+import importlib
 from src.symbolic.symbolic_reasoning_engine import SymbolicReasoningEngine
 from src.dashboard.symbolic_visualizer import SymbolicVisualizer
+
+
+# ------------------------------------------------------------------------------
+# Optional imports for advanced enhancements (graceful skip)
+# ------------------------------------------------------------------------------
+ENHANCEMENTS_AVAILABLE = True
+try:
+    from src.enhancements.schemas.node_descriptor import NodeDescriptor, NodeType, CoolingType
+    from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType, Urgency
+    from src.enhancements.schemas.feedback_event import FeedbackEvent
+    from src.enhancements.zero_trust_architecture import ZeroTrustArchitecture, ZeroTrustConfig
+    from src.enhancements.core.graph_registry import GraphRegistry, GraphType
+    from src.enhancements.core.causal_graph import CausalGraph
+    from src.enhancements.core.meta_cognition import MetaCognitionLayer
+    from src.enhancements.metrics.dag_carbon_ledger import DAGCarbonLedger
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+    NodeDescriptor = None
+    WorkloadDescriptor = None
+    FeedbackEvent = None
+    ZeroTrustArchitecture = None
+    ZeroTrustConfig = None
+    GraphRegistry = None
+    GraphType = None
+    CausalGraph = None
+    MetaCognitionLayer = None
+    DAGCarbonLedger = None
 
 
 def demo_basic_rule_evaluation():
@@ -284,6 +321,134 @@ def demo_sustained_reflection():
     return engine
 
 
+def demo_advanced_enhancements():
+    """
+    Demo 6: Advanced Enhancements Integration (Optional)
+    Demonstrates LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
+    Bio‑inspired Optimisation, MoE expert gating, and FlexGen hooks.
+    Runs only if modules are installed.
+    """
+    print("\n" + "=" * 60)
+    print("Demo 6: Advanced Enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Evolutionary, FlexGen)")
+    print("=" * 60)
+
+    if not ENHANCEMENTS_AVAILABLE:
+        print("⚠️  Advanced enhancement modules not installed. Skipping.")
+        return
+
+    # 1. Node Descriptor with distillation + MoE
+    print("\n1. Creating NodeDescriptor with LIMIT Graph, RLHF, MoE, evolutionary flags...")
+    node = NodeDescriptor(
+        id="demo_node",
+        type=NodeType.EDGE,
+        region="us-east",
+        region_carbon_intensity=350.0,
+        energy_per_token=0.00004,
+        use_evolutionary=True,
+        human_feedback_score=0.7,
+        graph_metrics={"centrality": 0.8, "connectivity": 0.6},
+        metadata={"gating_lr": 0.005}
+    )
+    print(f"   ✓ NodeDescriptor created: {node.id}")
+    print(f"     - Graph centrality: {node.graph_metrics['centrality']}")
+    print(f"     - Human feedback: {node.human_feedback_score}")
+
+    # 2. Select routing strategy
+    print("\n2. Selecting routing strategy (distillation + MoE)...")
+    strategy = asyncio.run(node.select_routing_strategy(exploration=False))
+    print(f"   ✓ Selected strategy: {strategy}")
+
+    # 3. Workload Descriptor with MODP weights
+    print("\n3. Creating WorkloadDescriptor with MODP weights and RLHF...")
+    wl = WorkloadDescriptor(
+        task_id="demo_task",
+        task_type=TaskType.INFERENCE,
+        tokens=1000,
+        latency_target=300.0,
+        urgency=Urgency.MEDIUM,
+        use_evolutionary=True,
+        human_feedback_score=0.6,
+        graph_metrics={"centrality": 0.7},
+        metadata={"latency_weight": 0.5, "carbon_weight": 0.3, "energy_weight": 0.2}
+    )
+    print(f"   ✓ WorkloadDescriptor created: {wl.task_id}")
+
+    # 4. Select priority
+    print("\n4. Selecting priority (distillation + MoE)...")
+    priority = asyncio.run(wl.select_priority(exploration=False))
+    print(f"   ✓ Selected priority: {priority}")
+
+    # 5. FeedbackEvent with enhanced fields
+    print("\n5. Creating FeedbackEvent with enhanced fields...")
+    event = FeedbackEvent(
+        source="demo_symbolic",
+        feedback_type="routing",
+        task_id="demo_enhanced",
+        context={"region": "us-east"},
+        action={"selected_action": strategy, "selected_rank": 1},
+        performance={"quality_score": 0.9, "latency_ms": 100, "energy_joules": 100,
+                     "carbon_g": 5, "helium_cost": 0, "duration_ms": 100},
+        adaptive_cost_value=0.85,
+        graph_metrics={"centrality": 0.8},
+        human_feedback_score=0.7,
+        modp_score=0.75,
+        distillation_stats={"student_counter": 5}
+    )
+    print(f"   ✓ FeedbackEvent created: {event.event_id[:8]}...")
+    print(f"     - MODP score: {event.modp_score}")
+    print(f"     - Graph centrality: {event.graph_metrics['centrality']}")
+
+    # 6. Zero Trust with enhancements
+    print("\n6. Initializing Zero Trust with enhancements...")
+    zt_config = ZeroTrustConfig(use_enhancements=True, use_distillation=True, use_evolutionary=True)
+    zta = ZeroTrustArchitecture(config=zt_config)
+    print("   ✓ ZeroTrustArchitecture initialized")
+    print(f"     - Enhancements enabled: {zta.use_enhancements}")
+
+    # 7. LIMIT Graph + Meta-Cognition
+    print("\n7. Using LIMIT Graph (CausalGraph + MetaCognition)...")
+    registry = GraphRegistry()
+    causal_graph = registry.get_or_create(GraphType.CAUSAL)
+    meta = MetaCognitionLayer(causal_graph=causal_graph)
+    meta.observe_snapshot({
+        "CarbonIntensity": 430.0,
+        "CarbonIntensity_high": 400.0,
+        "GridStrain": 0.91,
+    })
+    report = meta.diagnose()
+    print(f"   ✓ Diagnosis status: {report['status']}")
+    print(f"     Recommended action: {report.get('recommended_action')}")
+
+    # 8. DAG Carbon Ledger
+    print("\n8. Using DAG Carbon Ledger for carbon backpropagation...")
+    ledger = DAGCarbonLedger(storage_path="/tmp/demo_ledger")
+    node_a = ledger.add_execution(
+        task_id="A", framework="langchain", energy_kwh=0.01,
+        carbon_co2e_kg=0.002, accuracy=0.9, sustainability_index=0.8
+    )
+    node_b = ledger.add_execution(
+        task_id="B", framework="langchain", energy_kwh=0.008,
+        carbon_co2e_kg=0.0016, accuracy=0.88, sustainability_index=0.75,
+        parent_task_ids=[node_a], dependency_type="model_state"
+    )
+    attributed = ledger.backpropagate_carbon(node_b, transfer_rate=0.3)
+    print(f"   ✓ Carbon backpropagated: {attributed}")
+
+    # 9. FlexGen config (simulated)
+    print("\n9. FlexGen integration hooks (simulated)...")
+    flexgen_config = {
+        "enabled": True,
+        "model_name": "facebook/opt-6.7b",
+        "batch_size": 16,
+        "delegation_policy": "adaptive"
+    }
+    print(f"   ✓ FlexGen config: {flexgen_config}")
+
+    print("\n" + "=" * 60)
+    print("✅ Advanced Enhancements demo completed successfully!")
+    print("=" * 60 + "\n")
+
+
 def main():
     """Run all demos."""
     print("\n🌱 Green Agent - Neuro-Symbolic Oversight Demo")
@@ -296,6 +461,9 @@ def main():
     visualizer = demo_dashboard_visualization()
     engine5 = demo_sustained_reflection()
     
+    # Run advanced enhancements demo (optional)
+    demo_advanced_enhancements()
+    
     # Final summary
     print("\n" + "=" * 60)
     print("✅ Demo Complete")
@@ -306,6 +474,8 @@ def main():
     print("  ✓ Category-based filtering")
     print("  ✓ Dashboard visualization")
     print("  ✓ Sustained reflection patterns")
+    if ENHANCEMENTS_AVAILABLE:
+        print("  ✓ Advanced enhancements (LIMIT Graph, MODP, RLHF, distillation, MoE, evolutionary, FlexGen)")
     print("\nNext Steps:")
     print("  1. Review symbolic_policy.yaml to customize rules")
     print("  2. Run: python run_agent.py --config example_config.json")
