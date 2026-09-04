@@ -1,4 +1,4 @@
-```markdown
+
 # LIMIT-AgentBench - Documentation Index
 
 **Version**: 2.4.2  
@@ -536,4 +536,3 @@ Apache-2.0 License - See LICENSE file for details
 **Date**: January 19, 2026
 
 **🚀 Ready to benchmark your agents with green metrics and advanced decision-making!**
-```
