@@ -4,6 +4,15 @@ metadata:
   name: green-agent-hpa
   labels:
     app: green-agent
+    enhancements: enabled
+  annotations:
+    green-agent/limit-graph: "true"
+    green-agent/modp: "true"
+    green-agent/rlhf: "true"
+    green-agent/distillation: "true"
+    green-agent/bio-inspired: "true"
+    green-agent/moe: "true"
+    green-agent/flexgen: "true"
 spec:
   scaleTargetRef:
     apiVersion: ray.io/v1
@@ -11,7 +20,9 @@ spec:
     name: green-agent-cluster
   minReplicas: 2
   maxReplicas: 20
+
   metrics:
+  # ── Core resource metrics (unchanged) ──
   - type: Resource
     resource:
       name: cpu
@@ -24,8 +35,81 @@ spec:
       target:
         type: Utilization
         averageUtilization: 80
+
+  # ── Enhanced custom metrics (from Prometheus) ──
+
+  # Carbon intensity: scale down if too high to reduce carbon footprint
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_carbon_intensity
+      target:
+        type: AverageValue
+        averageValue: "400"          # gCO₂/kWh threshold
+
+  # MODP composite score: scale up when performance is good across objectives
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_modp_score
+      target:
+        type: AverageValue
+        averageValue: "0.7"          # target score (0-1)
+
+  # RLHF feedback score: adjust scaling based on human satisfaction
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_rlhf_feedback
+      target:
+        type: AverageValue
+        averageValue: "0.5"
+
+  # LIMIT Graph centrality: high centrality may indicate efficient topology
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_graph_centrality
+      target:
+        type: AverageValue
+        averageValue: "0.6"
+
+  # Distillation update rate: ensure the learning loop is active
+  - type: Pods
+    pods:
+      metric:
+        name: green_agent_distillation_update_rate
+      target:
+        type: AverageValue
+        averageValue: "1.0"          # updates per minute
+
+  # MoE gating stability (optional) – could be used to avoid scaling during instability
+  # Uncomment if needed:
+  # - type: Pods
+  #   pods:
+  #     metric:
+  #       name: green_agent_moe_gate_stability
+  #     target:
+  #       type: AverageValue
+  #       averageValue: "0.8"
+
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 25
+        periodSeconds: 60
     scaleUp:
       stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      # Additional policy for rapid scale-up based on MODP score
+      - type: Pods
+        pods:
+          metric:
+            name: green_agent_modp_score
+          periodSeconds: 60
+          value: 2
