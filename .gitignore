@@ -59,3 +59,68 @@ kubeconfig*
 
 # Docker
 .docker/
+
+# ---------------------------------------------------------------------------
+# Advanced Enhancements: LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation,
+# Bio‑inspired Optimisation, MoE expert gating, FlexGen integration
+# ---------------------------------------------------------------------------
+
+# LIMIT Graph snapshots and registry state
+graph_snapshots/
+graph_weights.json
+causal_graph_edges.json
+snapshots/
+.graph_state/
+
+# MODP weight evolution and score logs
+modp_weights.json
+modp_scores.log
+modp_history.json
+
+# RLHF human feedback logs
+rlhf_feedback_history.json
+human_feedback_log.json
+feedback_event_logs.json
+
+# Multi‑Teacher On‑Policy Distillation
+distillation_checkpoints/
+student_model_weights/
+routing_historical_model.pkl
+priority_historical_model.pkl
+auth_historical_model.pkl
+distillation_logs/
+q_tables/
+*.qtable
+replay_buffer/
+distillation_stats.json
+
+# Bio‑inspired Optimisation (Evolutionary)
+evolutionary_state/
+population_snapshots/
+best_individuals.json
+fitness_history.json
+
+# MoE expert gating
+moe_gate_weights/
+moe_gating_state.json
+expert_models/
+moe_expert_logs/
+
+# FlexGen integration
+flexgen_models/
+flexgen_energy_logs/
+flexgen_config_cache.json
+.flexgen_cache/
+
+# Generic enhancement state
+enhancement_state/
+enhancement_artifacts/
+
+# Prometheus and monitoring metric dumps (if not committed)
+*.prom
+metrics.prom
+prometheus_data/
+
+# Ray temporary files (if Ray not already ignored)
+/tmp/ray/
+ray_spill/
