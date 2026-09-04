@@ -1,3 +1,4 @@
+```markdown
 # AgentBeats Integration - Delivery Summary
 
 ## 🎯 Overview
@@ -8,6 +9,16 @@ Complete implementation of AgentBeats-ready Green_Agent architecture with all fo
 2. ✅ **Independent Execution** - Docker orchestration with zero manual intervention
 3. ✅ **Robust Scoring** - Graceful failure handling with partial credit
 4. ✅ **RLHF Feedback Loop** - Reasoning trace analysis and improvement suggestions
+
+Additionally, this version integrates **advanced enhancement modules** from `src/enhancements/` that further strengthen decision-making, sustainability, and security:
+
+- **LIMIT Graph** – topology-aware metrics (centrality, connectivity)
+- **MODP (Multi‑Objective Decision Process)** – configurable trade-offs between accuracy, energy, latency, and carbon
+- **RLHF** – human feedback integrated into adaptive policies
+- **Multi‑Teacher On‑Policy Distillation** – lightweight student policy learned from multiple teachers
+- **Bio‑inspired Optimisation** – evolutionary tuning of weights and strategies
+- **MoE Expert Gating** – dynamic blending of teacher predictions
+- **FlexGen Integration** – optional high‑throughput LLM execution with adaptive precision
 
 ---
 
@@ -22,11 +33,24 @@ Complete implementation of AgentBeats-ready Green_Agent architecture with all fo
 | Docker Orchestrator | `core/docker_orchestrator.py` | Container lifecycle management |
 | Green Metrics | `core/green_metrics.py` | Sustainability tracking (existing) |
 
+### Enhanced Modules (NEW)
+
+| Component | File | Description |
+|-----------|------|-------------|
+| Node Descriptor | `src/enhancements/schemas/node_descriptor.py` | Adaptive routing with distillation + MoE + RLHF + LIMIT Graph |
+| Workload Descriptor | `src/enhancements/schemas/workload_descriptor.py` | Adaptive priority selection |
+| Feedback Event | `src/enhancements/schemas/feedback_event.py` | Canonical event schema with MODP/RLHF fields |
+| Zero Trust Arch. | `src/enhancements/zero_trust_architecture.py` | Security with adaptive authentication |
+| Graph Registry | `src/enhancements/core/graph_registry.py` | LIMIT Graph lifecycle manager |
+| Causal Graph | `src/enhancements/core/causal_graph.py` | Root-cause attribution |
+| DAG Carbon Ledger | `src/enhancements/metrics/dag_carbon_ledger.py` | Carbon backpropagation |
+
 ### Demonstrations
 
 | Demo | File | Purpose |
 |------|------|---------|
 | Complete Integration | `demo_agentbeats_integration.py` | All four pillars in action |
+| Enhanced Demo | `demo_enhanced_green_agent.py` | Advanced modules demonstration |
 | Test Suite | `test_agentbeats_compliance.py` | Validation tests |
 
 ### Documentation
@@ -35,7 +59,7 @@ Complete implementation of AgentBeats-ready Green_Agent architecture with all fo
 |----------|------|---------|
 | Compliance Guide | `AGENTBEATS_COMPLIANCE_GUIDE.md` | Complete implementation guide |
 | Delivery Summary | `AGENTBEATS_DELIVERY_SUMMARY.md` | This document |
-| README | `README.md` | Updated with AgentBeats info |
+| README | `README.md` | Updated with AgentBeats and enhancements info |
 
 ---
 
@@ -76,6 +100,8 @@ Complete implementation of AgentBeats-ready Green_Agent architecture with all fo
 │  │  3. Execute agent with reasoning trace                  │  │
 │  │  4. Stop metrics collection                             │  │
 │  │  5. Generate RLHF feedback                              │  │
+│  │  6. (Optional) Use enhanced descriptors for strategy    │  │
+│  │     and priority selection (distillation + MoE)         │  │
 │  └────────────────────────────────────────────────────────┘  │
 └──────┬───────────────────────────────────────────────────────┘
        │
@@ -98,12 +124,22 @@ Complete implementation of AgentBeats-ready Green_Agent architecture with all fo
        │
        ▼
 ┌──────────────────────────────────────────────────────────────┐
+│  Advanced Enhancement Modules (optional)                      │
+│  - LIMIT Graph metrics for context                            │
+│  - MODP composite score                                       │
+│  - RLHF feedback integration into policies                    │
+│  - Distillation/MoE for lightweight decision-making           │
+│  - Evolutionary optimisation of hyperparameters               │
+└──────┬───────────────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
 │  A2A Response                                                 │
 │  - Task output                                                │
 │  - Green metrics                                              │
 │  - Reasoning trace                                            │
 │  - RLHF feedback                                              │
-│  - Execution metadata                                         │
+│  - Enhanced metrics (MODP score, graph centrality, etc.)     │
 └──────────────────────────────────────────────────────────────┘
        │
        ▼
@@ -229,9 +265,54 @@ Score Calculation:
 
 ---
 
+### 5. Advanced Enhancement Integration (NEW)
+
+#### LIMIT Graph
+
+- **Graph Registry** manages policy, causal, and execution graphs.
+- **Causal Graph** provides root‑cause analysis for anomalies.
+- **DAG Carbon Ledger** attributes carbon costs to upstream tasks.
+
+#### MODP (Multi‑Objective Decision Process)
+
+- Configurable weights (accuracy, energy, latency, carbon) are used in:
+  - `NodeDescriptor` routing strategies
+  - `WorkloadDescriptor` priority selection
+  - Zero Trust authentication level selection
+- Composite score is included in A2A responses and leaderboard rankings.
+
+#### RLHF in Decision‑Making
+
+- Human feedback score is part of state vectors and teachers in distillation.
+- Used to dynamically adjust MODP weights.
+- Feedbacks are logged in `FeedbackEvent` for audit.
+
+#### Multi‑Teacher On‑Policy Distillation with MoE
+
+- `DistillationRoutingOptimizer` in NodeDescriptor learns from:
+  - Rule‑based teacher
+  - Historical ML teacher (RandomForest)
+  - Q‑learning teacher
+  - RLHF teacher
+- MoE gating network blends teacher predictions.
+
+#### Bio‑inspired Optimisation
+
+- `EvolutionaryOptimizer` classes tune MODP weights, routing parameters, and thresholds.
+- Genetic operators: selection, crossover, mutation.
+- Optional in each descriptor (set `use_evolutionary=True`).
+
+#### FlexGen Integration
+
+- When enabled, tasks can be delegated to FlexGen with adaptive precision (`fp32`, `fp16`, `int8`).
+- Decision to use FlexGen is made by the distillation policy.
+- Energy metrics from FlexGen are tracked in the DAG carbon ledger.
+
+---
+
 ## 📊 Example Output
 
-### A2A Response with Full Integration
+### A2A Response with Full Integration and Enhanced Metrics
 
 ```json
 {
@@ -255,7 +336,10 @@ Score Calculation:
     "comparative_baseline": {
       "percentile": 75,
       "vs_average": "+15%"
-    }
+    },
+    "modp_score": 0.71,
+    "graph_centrality": 0.8,
+    "rlhf_feedback": 0.7
   },
   
   "reasoning_trace": [
@@ -300,6 +384,14 @@ Score Calculation:
         "redundant_steps": 0,
         "tool_usage_efficiency": 0.67
       }
+    },
+    "enhanced_decision": {
+      "selected_strategy": "carbon_first",
+      "selected_priority": "green",
+      "distillation_stats": {
+        "student_counter": 5,
+        "buffer_size": 128
+      }
     }
   },
   
@@ -326,13 +418,19 @@ cd quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench
 python demo_agentbeats_integration.py
 ```
 
-### 2. Run Tests
+### 2. Run Enhanced Demo
+
+```bash
+python demo_agentbeats_integration.py --enhanced
+```
+
+### 3. Run Tests
 
 ```bash
 python test_agentbeats_compliance.py
 ```
 
-### 3. Build Docker Image
+### 4. Build Docker Image
 
 ```bash
 # Generate Dockerfile
@@ -342,7 +440,7 @@ python -c "from core.docker_orchestrator import create_dockerfile; create_docker
 docker build -t limit-graph-agent:latest -f Dockerfile.agent .
 ```
 
-### 4. Test Container
+### 5. Test Container
 
 ```bash
 # Create test input
@@ -393,6 +491,14 @@ cat output.json
   - [x] Improvement suggestions
   - [x] Historical comparison
 
+- [x] **Advanced Enhancements (optional)**
+  - [x] LIMIT Graph metrics available
+  - [x] MODP composite score computed
+  - [x] RLHF integrated into decision-making
+  - [x] Distillation + MoE used for routing/priority
+  - [x] Evolutionary optimisation of weights
+  - [x] FlexGen delegation hooks
+
 - [x] **Documentation**
   - [x] Compliance guide
   - [x] API documentation
@@ -429,7 +535,8 @@ Errors: 0
 | A2A Gateway | <1ms | 10MB | <1% |
 | RLHF Engine | 5-10ms | 50MB | 2-5% |
 | Docker Orchestrator | 100-500ms | 20MB | 1-2% |
-| Total Overhead | <600ms | <100MB | <10% |
+| Advanced Enhancements | <5ms per inference | <20MB | <5% |
+| Total Overhead | <600ms | <120MB | <15% |
 
 ---
 
@@ -444,7 +551,7 @@ Errors: 0
 
 2. **Benchmark**
    - Run on AgentBeats test suite
-   - Collect green metrics
+   - Collect green metrics (including MODP)
    - Generate RLHF feedback
 
 3. **Submit**
@@ -464,6 +571,8 @@ Errors: 0
 - [ ] Enhance RLHF with preference learning
 - [ ] Add multi-agent collaboration support
 - [ ] Integrate with more benchmarking platforms
+- [ ] Fine-tune MODP weights using evolutionary optimisation
+- [ ] Expand LIMIT Graph with additional node types
 
 ---
 
@@ -473,6 +582,9 @@ Errors: 0
 - **RLHF Research**: Reinforcement Learning from Human Feedback papers
 - **Green AI**: Sustainable AI computing practices
 - **Docker Best Practices**: Container security and optimization
+- **Multi‑Teacher Distillation**: Hinton et al., "Distilling the Knowledge in a Neural Network"
+- **MoE**: Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer"
+- **LIMIT Graph**: Graph-based decision frameworks for sustainability
 
 ---
 
@@ -505,5 +617,7 @@ See `LICENSE` file for details.
 ✅ Docker orchestration ready  
 ✅ Green metrics integrated  
 ✅ RLHF feedback operational  
+✅ Advanced enhancements (LIMIT Graph, MODP, Distillation, MoE, Evolutionary, FlexGen) integrated and optional
 
 **Ready for AgentBeats submission and leaderboard competition!**
+```
