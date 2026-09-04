@@ -1,4 +1,4 @@
-```markdown
+
 # Quick Start Guide: Meta-Cognitive Green Agent
 
 ## Installation
