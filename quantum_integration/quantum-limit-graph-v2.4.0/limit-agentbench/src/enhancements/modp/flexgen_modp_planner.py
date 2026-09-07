@@ -1,4 +1,4 @@
-# src/enhancements/modp/flexgen_modp_planner.py
+#!/usr/bin/env python3
 """
 Enhanced MODP planner for temporal scheduling of FlexGen workloads.
 Decides when to run (now or defer) and on which node, based on carbon forecasts.
@@ -11,6 +11,8 @@ Improvements over the basic lookahead:
 - Reward includes execution cost and deferral/move penalties.
 - Persistence of Q-table to JSON.
 - Integration with AsyncMessageQueue and FeedbackEvent.
+- Thread‑safe with asyncio.Lock.
+- Optimistic initialization and proper next‑state handling.
 """
 
 import asyncio
@@ -49,6 +51,8 @@ class FlexGenMODPPlanner:
         move_penalty: float = 0.1,        # penalty for moving nodes
         message_queue: Optional[AsyncMessageQueue] = None,
         q_table_path: str = "modp_q_table.json",
+        optimistic_init: float = 1.0,
+        save_every: int = 10,
     ):
         self.carbon_forecaster = carbon_forecaster
         self.horizon = horizon
@@ -60,6 +64,9 @@ class FlexGenMODPPlanner:
         self.move_penalty = move_penalty
         self.message_queue = message_queue
         self.q_table_path = q_table_path
+        self.optimistic_init = optimistic_init
+        self.save_every = save_every
+        self._update_counter = 0
 
         # Q-table: dict key = (carbon_bucket, queue_bucket, deadline_bucket) -> np.array
         # Actions: 0 = run_now, 1..horizon = defer that many hours, horizon+1 = move_node
@@ -67,6 +74,10 @@ class FlexGenMODPPlanner:
         self.last_state: Optional[Tuple[int, int, int]] = None
         self.last_action: Optional[int] = None
         self.last_decision: Optional[Tuple[str, int, Optional[str]]] = None
+        self.last_hours_to_deadline: Optional[float] = None
+
+        # Async lock for thread safety
+        self._lock = asyncio.Lock()
 
         # Load Q-table if exists
         self._load_q_table()
@@ -79,27 +90,33 @@ class FlexGenMODPPlanner:
         return (carbon_bucket, queue_bucket, deadline_bucket)
 
     def _get_action_values(self, state: Tuple[int, int, int]) -> np.ndarray:
-        """Return Q-values for all actions for a given state."""
-        if state not in self.q_table:
-            # Initialize with small random values
-            self.q_table[state] = np.random.randn(self.horizon + 2) * 0.01
-        return self.q_table[state]
+        """Return Q-values for all actions for a given state, initializing if needed."""
+        async with self._lock:
+            if state not in self.q_table:
+                # Optimistic initialization to encourage exploration
+                self.q_table[state] = np.full(self.horizon + 2, self.optimistic_init, dtype=float)
+            return self.q_table[state]
 
     async def get_carbon_forecast(self, hours: Optional[int] = None) -> List[float]:
         """Return predicted carbon intensity for next `hours` hours."""
         hours = hours or self.horizon
         if self.carbon_forecaster:
-            forecast = await self.carbon_forecaster.forecast_carbon_prices(hours=hours)
-            if forecast.get('status') == 'success':
-                return forecast['predictions']
+            try:
+                forecast = await self.carbon_forecaster.forecast_carbon_prices(hours=hours)
+                if isinstance(forecast, dict) and forecast.get('status') == 'success':
+                    return forecast['predictions']
+                elif isinstance(forecast, list):
+                    return forecast
+            except Exception as e:
+                logger.warning(f"Carbon forecast failed: {e}")
         # Fallback: constant intensity
-        return [400] * hours
+        return [400.0] * hours
 
     async def plan(
         self,
         workload: WorkloadDescriptor,
         node: NodeDescriptor,
-        current_policy: FlexGenPolicy,
+        current_policy: Optional[FlexGenPolicy] = None,
         queue_length: int = 0,
         current_carbon: Optional[float] = None,
         available_nodes: Optional[List[NodeDescriptor]] = None,
@@ -110,7 +127,14 @@ class FlexGenMODPPlanner:
         """
         # Get current carbon intensity
         if current_carbon is None:
-            current_carbon = await self.carbon_forecaster.get_current_intensity() if self.carbon_forecaster else 400
+            if self.carbon_forecaster:
+                try:
+                    current_carbon = await self.carbon_forecaster.get_current_intensity()
+                except Exception as e:
+                    logger.warning(f"Failed to get current carbon: {e}")
+                    current_carbon = 400.0
+            else:
+                current_carbon = 400.0
 
         # Compute hours to deadline
         if workload.deadline:
@@ -123,11 +147,12 @@ class FlexGenMODPPlanner:
         state = self._discretize_state(current_carbon, queue_length, hours_to_deadline)
 
         # Choose action using epsilon-greedy
-        action_values = self._get_action_values(state)
-        if np.random.random() < self.epsilon:
-            action = np.random.randint(len(action_values))
-        else:
-            action = int(np.argmax(action_values))
+        async with self._lock:
+            action_values = self._get_action_values(state)
+            if np.random.random() < self.epsilon:
+                action = np.random.randint(len(action_values))
+            else:
+                action = int(np.argmax(action_values))
 
         # Interpret action
         if action == 0:
@@ -135,23 +160,27 @@ class FlexGenMODPPlanner:
         elif action <= self.horizon:
             decision = ("defer", action, None)
         else:
-            # Move to another node (pick the one with lowest carbon intensity)
+            # Move to another node: pick feasible one with lowest carbon intensity
             if available_nodes:
-                best_node = min(available_nodes, key=lambda n: n.region_carbon_intensity)
-                decision = ("move_node", 0, best_node.id)
+                feasible_nodes = [n for n in available_nodes if self._is_node_feasible(n, current_policy)]
+                if feasible_nodes:
+                    best_node = min(feasible_nodes, key=lambda n: n.region_carbon_intensity)
+                    decision = ("move_node", 0, best_node.id)
+                else:
+                    decision = ("run_now", 0, None)  # fallback if no feasible nodes
             else:
                 decision = ("run_now", 0, None)  # fallback if no nodes to move to
 
         # Store state-action for learning
-        self.last_state = state
-        self.last_action = action
-        self.last_decision = decision
+        async with self._lock:
+            self.last_state = state
+            self.last_action = action
+            self.last_decision = decision
+            self.last_hours_to_deadline = hours_to_deadline
 
         # Calculate reward estimate for publishing (not actual reward)
         reward_estimate = 0.0
         if decision[0] == "run_now":
-            # Estimate reward using current policy (could be rough)
-            # For now, just use 0.5
             reward_estimate = 0.5
         elif decision[0] == "defer":
             reward_estimate = -self.defer_penalty * decision[1]
@@ -162,7 +191,8 @@ class FlexGenMODPPlanner:
         await self.publish_decision(workload, decision[0], decision[1], decision[2], reward_estimate)
 
         # Decay epsilon
-        self.epsilon = max(0.01, self.epsilon * self.epsilon_decay)
+        async with self._lock:
+            self.epsilon = max(0.01, self.epsilon * self.epsilon_decay)
 
         return decision
 
@@ -171,27 +201,36 @@ class FlexGenMODPPlanner:
         Update Q-values based on observed reward and next state.
         Call after execution outcome is known.
         """
-        if self.last_state is None or self.last_action is None:
-            return
+        async with self._lock:
+            if self.last_state is None or self.last_action is None:
+                return
 
-        # Compute next state
-        next_state = self._discretize_state(next_carbon, next_queue_length, 24)  # deadline unknown, assume 24h
-        next_values = self._get_action_values(next_state)
-        max_next = np.max(next_values) if len(next_values) > 0 else 0
+            # Compute next state using the stored deadline decremented by the delay
+            if self.last_decision and self.last_decision[0] == "defer":
+                delay = self.last_decision[1]
+                next_deadline = max(0, self.last_hours_to_deadline - delay)
+            else:
+                next_deadline = 24.0  # unknown, assume 24h
 
-        # Q-learning update
-        current_values = self._get_action_values(self.last_state)
-        current_values[self.last_action] += self.lr * (
-            reward + self.discount * max_next - current_values[self.last_action]
-        )
+            next_state = self._discretize_state(next_carbon, next_queue_length, next_deadline)
+            next_values = self._get_action_values(next_state)
+            max_next = np.max(next_values) if len(next_values) > 0 else 0
 
-        # Reset last state/action
-        self.last_state = None
-        self.last_action = None
+            current_values = self._get_action_values(self.last_state)
+            current_values[self.last_action] += self.lr * (
+                reward + self.discount * max_next - current_values[self.last_action]
+            )
 
-        # Save Q-table periodically
-        if np.random.random() < 0.1:  # save ~10% of the time
-            self._save_q_table()
+            # Reset last state/action
+            self.last_state = None
+            self.last_action = None
+            self.last_decision = None
+            self.last_hours_to_deadline = None
+
+            # Increment update counter and save if needed
+            self._update_counter += 1
+            if self._update_counter % self.save_every == 0:
+                self._save_q_table_locked()
 
     async def publish_decision(self, workload: WorkloadDescriptor, action: str, delay: int,
                                node_id: Optional[str] = None, reward_estimate: float = 0.0):
@@ -218,8 +257,19 @@ class FlexGenMODPPlanner:
         )
         await self.message_queue.publish("modp_events", event.to_json())
 
+    def _is_node_feasible(self, node: NodeDescriptor, policy: Optional[FlexGenPolicy]) -> bool:
+        """
+        Check if the node has enough GPU memory for the given policy.
+        This is a simplified feasibility check.
+        """
+        if policy is None:
+            return True
+        required_memory_gb = policy.gpu_batch_size * policy.block_size * 0.1  # rough estimation
+        available_memory_gb = node.metadata.get("gpu_memory_gb", 16.0)
+        return required_memory_gb <= available_memory_gb
+
     def _save_q_table(self) -> None:
-        """Save Q-table to JSON."""
+        """Save Q-table to JSON (non‑lock, used externally)."""
         if not self.q_table_path:
             return
         try:
@@ -230,6 +280,10 @@ class FlexGenMODPPlanner:
             logger.info(f"MODP Q-table saved to {self.q_table_path}")
         except Exception as e:
             logger.warning(f"Failed to save Q-table: {e}")
+
+    def _save_q_table_locked(self):
+        """Save Q-table assuming the lock is already held."""
+        self._save_q_table()  # but we must ensure we are inside async with self._lock
 
     def _load_q_table(self) -> None:
         """Load Q-table from JSON if file exists."""
