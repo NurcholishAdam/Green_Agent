@@ -11,6 +11,7 @@ from src.enhancements.schemas.node_descriptor import NodeDescriptor, NodeType
 from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType, Urgency
 from src.enhancements.zero_trust_architecture import ZeroTrustArchitecture, ZeroTrustConfig
 from src.enhancements.schemas.feedback_event import FeedbackEvent
+from src.enhancements.adaptive_precision_controller import AdaptivePrecisionController
 
 # New enhancement
 from src.enhancements.adaptive_precision_controller import AdaptivePrecisionController
@@ -45,3 +46,20 @@ class UnifiedGreenAgent:
             # Pass precision to FlexGen
             # ...
         # ...
+    __init__:
+    if self.precision_controller:
+    precision = self.precision_controller.select_precision(
+        task_features={
+            'carbon_intensity': self.current_carbon_intensity,
+            'latency_target': task.get('max_latency_ms', 500),
+            'accuracy_requirement': task.get('accuracy_requirement', 0.5)
+        },
+        hardware_metrics={
+            'gpu_util': self.get_gpu_util(),
+            'memory_used': self.get_memory_util()
+        }
+    )
+    self.precision_controller = None
+    if self.config.get('flexgen', {}).get('enabled', False):
+    self.precision_controller = AdaptivePrecisionController()
+
