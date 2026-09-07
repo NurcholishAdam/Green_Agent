@@ -95,3 +95,12 @@ except ImportError:
     QuantumTeacher = None
 
 logger = logging.getLogger(__name__)
+
+DistillationAuthOptimizer.__init__:
+try:
+    from .quantum_teacher import QuantumTeacher
+except ImportError:
+    QuantumTeacher = None
+...
+if config.get('use_quantum_teacher', False) and QuantumTeacher is not None:
+    self.teachers.append(QuantumTeacher(n_actions=3, n_qubits=4, n_layers=2))
