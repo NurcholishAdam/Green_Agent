@@ -1,24 +1,16 @@
 """
-Drift Detection for Adaptive Cost Function
-===========================================
+Drift Detection for Adaptive Cost Function (Enhanced)
+=====================================================
 Detects sudden shifts in cost weights and triggers rollback to a safe snapshot.
 Enhanced with configurable intervals, hysteresis, drift event logging, and metrics.
 
-NEW v2.0:
+NEW v2.1:
 - Integrated optional LIMIT Graph, MODP, RLHF, and MoE components for
   advanced drift event persistence, preference collection, and metric blending.
-- All original features (multiple distance metrics, adaptive threshold, EWMA, etc.)
-  retained.
-
-Enhancements implemented:
-- Multiple distance metrics (Euclidean, Manhattan, Cosine, Relative)
-- Adaptive threshold based on rolling distance history
-- EWMA smoothing for early detection of gradual drift
-- Weighted distance to prioritize important dimensions
-- JSON serialization for portability and safety
-- In-memory caching of last snapshot for performance
-- Additional configuration options (metric, alpha, history size, weights)
+- All original features retained.
+- Added safe config access, improved logging, and minor performance tweaks.
 """
+
 import hashlib
 import time
 import json
@@ -26,7 +18,6 @@ import uuid
 from typing import Dict, Optional, List, Any
 from collections import deque
 import numpy as np
-import copy
 
 from ..storage import Storage
 from ..config import config
@@ -44,21 +35,23 @@ except ImportError:
 # NEW: LIMIT Graph Manager
 # ------------------------------------------------------------------------------
 class LimitGraphManager:
-    """
-    Manages a graph of drift event relationships for LIMIT.
-    Nodes are drift events or snapshots, edges represent temporal or causal links.
-    """
+    """Manages a graph of drift event relationships for LIMIT."""
     def __init__(self, storage: Optional[Storage] = None):
         self.storage = storage
         self.graphs = {}
 
-    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
+    def create_graph(self, graph_id, description, configuration):
         if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
             self.storage.save_limit_graph_metadata(graph_id, description, configuration)
         else:
-            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+            self.graphs[graph_id] = {
+                'description': description,
+                'configuration': configuration,
+                'nodes': {},
+                'edges': {}
+            }
 
-    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
+    def add_node(self, graph_id, node_id, node_type, attributes):
         if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
             self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
         else:
@@ -66,26 +59,27 @@ class LimitGraphManager:
                 self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
             self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
 
-    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
-                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
+    def add_edge(self, graph_id, edge_id, source, target, weight, attributes):
         if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
             self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
         else:
             if graph_id not in self.graphs:
                 self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
-            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+            self.graphs[graph_id]['edges'][edge_id] = {
+                'source': source, 'target': target, 'weight': weight, 'attributes': attributes
+            }
 
-    def get_nodes(self, graph_id: str) -> List[Dict]:
+    def get_nodes(self, graph_id):
         if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
             return self.storage.get_limit_graph_nodes(graph_id)
         return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
 
-    def get_edges(self, graph_id: str) -> List[Dict]:
+    def get_edges(self, graph_id):
         if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
             return self.storage.get_limit_graph_edges(graph_id)
         return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
 
-    def get_metadata(self, graph_id: str) -> Optional[Dict]:
+    def get_metadata(self, graph_id):
         if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
             return self.storage.get_limit_graph_metadata(graph_id)
         return self.graphs.get(graph_id, {})
@@ -95,37 +89,34 @@ class LimitGraphManager:
 # NEW: MODP Optimizer (wrapper)
 # ------------------------------------------------------------------------------
 class MODPOptimizer:
-    """
-    Multi‑Objective Dynamic Programming solver that stores decision states/policies.
-    Used here to persist drift events as states.
-    """
+    """Multi‑Objective Dynamic Programming solver for persisting drift events."""
     def __init__(self, storage: Optional[Storage] = None):
         self.storage = storage
         self.states = {}
 
-    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
-                  objective_values: Dict[str, float], stage: int) -> None:
+    def add_state(self, state_id, problem_id, state_attributes, objective_values, stage):
         if self.storage and hasattr(self.storage, 'save_modp_state'):
             self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
         else:
             if problem_id not in self.states:
                 self.states[problem_id] = []
             self.states[problem_id].append({
-                'state_id': state_id, 'state_attributes': state_attributes,
-                'objective_values': objective_values, 'stage': stage
+                'state_id': state_id,
+                'state_attributes': state_attributes,
+                'objective_values': objective_values,
+                'stage': stage
             })
 
-    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
-                   action: str, expected_objectives: Dict[str, float]) -> None:
+    def add_policy(self, policy_id, problem_id, state_id, action, expected_objectives):
         if self.storage and hasattr(self.storage, 'save_modp_policy'):
             self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
 
-    def get_states(self, problem_id: str) -> List[Dict]:
+    def get_states(self, problem_id):
         if self.storage and hasattr(self.storage, 'get_modp_states'):
             return self.storage.get_modp_states(problem_id)
         return self.states.get(problem_id, [])
 
-    def get_policies(self, problem_id: str) -> List[Dict]:
+    def get_policies(self, problem_id):
         if self.storage and hasattr(self.storage, 'get_modp_policies'):
             return self.storage.get_modp_policies(problem_id)
         return []
@@ -135,24 +126,25 @@ class MODPOptimizer:
 # NEW: RLHF Trainer
 # ------------------------------------------------------------------------------
 class RLHFTrainer:
-    """
-    Collects human preference pairs for rollback decisions.
-    """
+    """Collects human preference pairs for rollback decisions."""
     def __init__(self, storage: Optional[Storage] = None):
         self.storage = storage
         self.pairs = []
 
-    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
-                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
+    def record_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
         if self.storage and hasattr(self.storage, 'save_preference_pair'):
             self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
         else:
             self.pairs.append({
-                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
-                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
+                'pair_id': pair_id,
+                'prompt': prompt,
+                'chosen': chosen,
+                'rejected': rejected,
+                'reward_diff': reward_diff,
+                'metadata': metadata
             })
 
-    def get_pairs(self, limit: int = 100) -> List[Dict]:
+    def get_pairs(self, limit=100):
         if self.storage and hasattr(self.storage, 'get_preference_pairs'):
             return self.storage.get_preference_pairs(limit)
         return self.pairs[-limit:]
@@ -169,31 +161,26 @@ class RLHFTrainer:
 # NEW: MoE Gating Network for Metric Selection
 # ------------------------------------------------------------------------------
 class MoEGatingNetwork:
-    """
-    Mixture-of-Experts gating that blends multiple distance metrics for drift detection.
-    Experts correspond to metrics: euclidean, manhattan, cosine, relative.
-    The gating network learns to select the most informative metric given current context.
-    """
-    def __init__(self, storage: Optional[Storage] = None, config: Optional[Dict] = None):
+    """Mixture-of-Experts gating that blends multiple distance metrics."""
+    def __init__(self, storage=None, config=None):
         self.storage = storage
         self.config = config or {}
-        self.expert_names = self.config.get('expert_names', ['euclidean', 'manhattan', 'cosine', 'relative'])
+        self.expert_names = self.config.get(
+            'expert_names', ['euclidean', 'manhattan', 'cosine', 'relative']
+        )
         self.num_experts = len(self.expert_names)
-        # Simple linear gating on context features: current distance, EWMA, threshold, consecutive count, history mean
         self.gating_weights = np.random.randn(self.num_experts, 5)
-        self._training_samples = []
 
     def _encode_state(self, features: Dict[str, float]) -> np.ndarray:
-        x = np.array([
+        return np.array([
             features.get('distance', 0.0),
             features.get('ewma', 0.0),
             features.get('threshold', 0.0),
             features.get('consecutive', 0.0),
             features.get('history_mean', 0.0),
         ], dtype=np.float32)
-        return x
 
-    async def select_expert(self, features: Dict[str, float]) -> Tuple[str, np.ndarray]:
+    async def select_expert(self, features: Dict[str, float]):
         x = self._encode_state(features)
         logits = self.gating_weights @ x
         probs = np.exp(logits - np.max(logits))
@@ -205,7 +192,7 @@ class MoEGatingNetwork:
             self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
         return selected, probs
 
-    async def add_training_sample(self, features: Dict[str, float], selected_expert: str, reward: float):
+    async def add_training_sample(self, features, selected_expert, reward):
         x = self._encode_state(features)
         expert_idx = self.expert_names.index(selected_expert)
         target = np.zeros(self.num_experts)
@@ -218,7 +205,7 @@ class MoEGatingNetwork:
 
 
 # ==============================================================================
-# Enhanced DriftDetector with optional new components
+# Enhanced DriftDetector
 # ==============================================================================
 class DriftDetector:
     """
@@ -246,48 +233,34 @@ class DriftDetector:
         ewma_alpha: Optional[float] = None,
         weight_importance: Optional[Dict[str, float]] = None,
         distance_history_size: Optional[int] = None,
-        # NEW optional component flags
         enable_limit_graph: bool = True,
         enable_modp: bool = True,
         enable_rlhf: bool = True,
         enable_moe: bool = True,
         moe_expert_names: Optional[List[str]] = None,
     ):
-        """
-        Args:
-            storage: Storage instance for snapshots and event logs.
-            adaptive_cost: AdaptiveCostFunction instance (must have online.weights).
-            metrics_registry: Optional MetricsRegistry for Prometheus counters.
-            metric: Distance metric to use ('euclidean', 'manhattan', 'cosine', 'relative').
-                    Defaults to config.DRIFT_METRIC or 'euclidean'.
-            use_adaptive_threshold: If True, threshold is computed from rolling distance history.
-                    Defaults to config.DRIFT_USE_ADAPTIVE_THRESHOLD or False.
-            ewma_alpha: Smoothing factor for EWMA (0 < alpha <= 1). Larger alpha gives more weight to recent distances.
-                    Defaults to config.DRIFT_EWMA_ALPHA or 0.3.
-            weight_importance: Optional dict mapping weight keys to importance multipliers for weighted distance.
-                    Defaults to config.DRIFT_WEIGHT_IMPORTANCE or {} (all equal).
-            distance_history_size: Number of recent distances to keep for adaptive threshold.
-                    Defaults to config.DRIFT_HISTORY_SIZE or 100.
-            enable_limit_graph: Enable LIMIT Graph manager for drift event nodes.
-            enable_modp: Enable MODP solver for persisting drift events.
-            enable_rlhf: Enable RLHF trainer for human preference pairs.
-            enable_moe: Enable MoE gating for metric selection (experimental).
-            moe_expert_names: Names of experts for MoE gating; defaults to all metrics.
-        """
         self.storage = storage
         self.adaptive_cost = adaptive_cost
-        self.threshold = config.DRIFT_THRESHOLD
-        self.rollback_enabled = config.ROLLBACK_ENABLED
-        self.snapshot_interval = config.DRIFT_SNAPSHOT_INTERVAL or 3600
-        self.hysteresis_count = config.DRIFT_HYSTERESIS_COUNT or 1
+        self.threshold = getattr(config, 'DRIFT_THRESHOLD', 0.2)
+        self.rollback_enabled = getattr(config, 'ROLLBACK_ENABLED', True)
+        self.snapshot_interval = getattr(config, 'DRIFT_SNAPSHOT_INTERVAL', 3600)
+        self.hysteresis_count = getattr(config, 'DRIFT_HYSTERESIS_COUNT', 1)
         self.last_snapshot_time = 0
         self._drift_counter = 0
 
         self.metric = metric or getattr(config, 'DRIFT_METRIC', 'euclidean')
-        self.use_adaptive_threshold = use_adaptive_threshold or getattr(config, 'DRIFT_USE_ADAPTIVE_THRESHOLD', False)
-        self.ewma_alpha = ewma_alpha if ewma_alpha is not None else getattr(config, 'DRIFT_EWMA_ALPHA', 0.3)
+        self.use_adaptive_threshold = (
+            use_adaptive_threshold
+            if use_adaptive_threshold is not None
+            else getattr(config, 'DRIFT_USE_ADAPTIVE_THRESHOLD', False)
+        )
+        self.ewma_alpha = (
+            ewma_alpha if ewma_alpha is not None else getattr(config, 'DRIFT_EWMA_ALPHA', 0.3)
+        )
         self.weight_importance = weight_importance or getattr(config, 'DRIFT_WEIGHT_IMPORTANCE', {})
-        self.distance_history_size = distance_history_size or getattr(config, 'DRIFT_HISTORY_SIZE', 100)
+        self.distance_history_size = (
+            distance_history_size or getattr(config, 'DRIFT_HISTORY_SIZE', 100)
+        )
         self.distance_history = deque(maxlen=self.distance_history_size)
         self._ewma_distance = 0.0
         self._last_snapshot_cache = None
@@ -302,10 +275,10 @@ class DriftDetector:
             self.drift_counter_metric = Counter(
                 'green_agent_drift_detections_total',
                 'Total number of drift detections',
-                registry=metrics_registry.registry if hasattr(metrics_registry, 'registry') else None
+                registry=getattr(metrics_registry, 'registry', None)
             )
 
-        # NEW optional components
+        # Optional components
         self.limit_graph_manager = None
         self.modp_solver = None
         self.rlhf_trainer = None
@@ -313,17 +286,12 @@ class DriftDetector:
 
         if enable_limit_graph:
             self.limit_graph_manager = LimitGraphManager(storage)
-            # Create graph if not exists (assuming storage supports limit graph methods)
-            if hasattr(storage, 'save_limit_graph_metadata'):
-                # Check if metadata exists (we can't easily check without a get method; assume not)
+            if not self.limit_graph_manager.get_metadata("drift_events"):
                 self.limit_graph_manager.create_graph(
                     "drift_events",
                     "Drift Event Relationships",
                     {"created_at": time.time()}
                 )
-            else:
-                # In-memory fallback
-                self.limit_graph_manager.create_graph("drift_events", "Drift Event Relationships", {})
 
         if enable_modp:
             self.modp_solver = MODPOptimizer(storage)
@@ -337,7 +305,7 @@ class DriftDetector:
                 {'expert_names': moe_expert_names or ['euclidean', 'manhattan', 'cosine', 'relative']}
             )
 
-        # Load last snapshot time and cache
+        # Load last snapshot time
         self._load_last_snapshot_time()
 
     def _load_last_snapshot_time(self):
@@ -357,13 +325,6 @@ class DriftDetector:
         return self._last_snapshot_cache
 
     async def check_drift(self, current_weights: Dict[str, float]) -> None:
-        """
-        Compare current weights with the last snapshot.
-        If drift is detected (distance > threshold), increment counter.
-        If counter reaches hysteresis_count, trigger rollback.
-        Periodically take new snapshots.
-        Optional integration with MoE, MODP, LIMIT Graph, RLHF.
-        """
         last_snap = self._get_last_snapshot()
         if not last_snap:
             await self._take_snapshot(current_weights, "initial")
@@ -371,18 +332,16 @@ class DriftDetector:
 
         prev_weights = self._deserialize_weights(last_snap["online_weights"])
 
-        # Compute distance(s) - if MoE enabled, compute all metrics and let MoE select the best
+        # Compute distance(s)
         if self.moe_gating:
-            # Compute all four distances
             distances = {
                 'euclidean': self._distance(current_weights, prev_weights, 'euclidean', self.weight_importance),
                 'manhattan': self._distance(current_weights, prev_weights, 'manhattan', self.weight_importance),
                 'cosine': self._distance(current_weights, prev_weights, 'cosine', self.weight_importance),
                 'relative': self._distance(current_weights, prev_weights, 'relative', self.weight_importance),
             }
-            # Build feature dict for MoE
             features = {
-                'distance': distances[self.metric],  # use default metric as feature
+                'distance': distances[self.metric],
                 'ewma': self._ewma_distance,
                 'threshold': self.threshold if not self.use_adaptive_threshold else self._compute_adaptive_threshold(),
                 'consecutive': self._drift_counter,
@@ -390,18 +349,16 @@ class DriftDetector:
             }
             selected_metric, _ = await self.moe_gating.select_expert(features)
             dist = distances.get(selected_metric, distances[self.metric])
-            self.metric = selected_metric  # update for logging
+            self.metric = selected_metric
         else:
             dist = self._distance(current_weights, prev_weights, self.metric, self.weight_importance)
 
-        # Update EWMA
         self._ewma_distance = self.ewma_alpha * dist + (1 - self.ewma_alpha) * self._ewma_distance
 
         effective_threshold = self.threshold
         if self.use_adaptive_threshold:
             effective_threshold = self._compute_adaptive_threshold()
 
-        # Take snapshot if interval elapsed
         if time.time() - self.last_snapshot_time > self.snapshot_interval:
             await self._take_snapshot(current_weights, "periodic")
 
@@ -409,15 +366,15 @@ class DriftDetector:
 
         if drift_metric > effective_threshold:
             self._drift_counter += 1
-            logger.warning(f"Drift detected! Distance: {drift_metric:.4f} (threshold {effective_threshold:.4f})")
+            logger.warning(
+                f"Drift detected! Distance: {drift_metric:.4f} (threshold {effective_threshold:.4f})"
+            )
             if self.drift_counter_metric:
                 self.drift_counter_metric.inc()
 
-            await self._log_drift_event(
-                drift_metric, effective_threshold, self._drift_counter, rollback_triggered=False
-            )
+            await self._log_drift_event(drift_metric, effective_threshold, self._drift_counter, rollback_triggered=False)
 
-            # Optional: MODP store state and LIMIT graph node for this drift event
+            # Optional MODP state and LIMIT Graph node
             if self.modp_solver:
                 self.modp_solver.add_state(
                     state_id=str(uuid.uuid4()),
@@ -450,14 +407,15 @@ class DriftDetector:
                 )
 
             if self._drift_counter >= self.hysteresis_count:
-                logger.warning(f"Drift persisted for {self._drift_counter} consecutive detections. Triggering rollback.")
+                logger.warning(
+                    f"Drift persisted for {self._drift_counter} consecutive detections. Triggering rollback."
+                )
                 if self.rollback_enabled:
                     await self._rollback_to_snapshot(last_snap)
                     self._drift_counter = 0
                     await self._log_drift_event(
                         drift_metric, effective_threshold, self._drift_counter, rollback_triggered=True
                     )
-                    # RLHF: record preference pair for rollback decision (simulated)
                     if self.rlhf_trainer:
                         self.rlhf_trainer.record_pair(
                             pair_id=str(uuid.uuid4()),
@@ -471,12 +429,14 @@ class DriftDetector:
                     logger.error("Drift detected but rollback disabled. Manual intervention required.")
         else:
             if self._drift_counter > 0:
-                logger.info(f"Drift resolved. Distance {drift_metric:.4f} below threshold {effective_threshold:.4f}.")
+                logger.info(
+                    f"Drift resolved. Distance {drift_metric:.4f} below threshold {effective_threshold:.4f}."
+                )
                 self._drift_counter = 0
             self.distance_history.append(dist)
 
-        # If MoE is active, optionally update it with the outcome (reward = 1 if no drift, -1 if drift)
-        if self.moe_gating and self.moe_gating.expert_names:
+        # Update MoE if active
+        if self.moe_gating:
             reward = -1.0 if drift_metric > effective_threshold else 1.0
             features_for_update = {
                 'distance': dist,
@@ -485,7 +445,6 @@ class DriftDetector:
                 'consecutive': self._drift_counter,
                 'history_mean': float(np.mean(self.distance_history)) if self.distance_history else 0.0,
             }
-            # Use selected metric if we set one; otherwise use self.metric
             await self.moe_gating.add_training_sample(features_for_update, self.metric, reward)
 
     def _compute_adaptive_threshold(self) -> float:
@@ -565,20 +524,13 @@ class DriftDetector:
             return imp.get(k, 1.0)
 
         if metric == "euclidean":
-            total = 0.0
-            for k in all_keys:
-                diff = (a.get(k, 0.0) - b.get(k, 0.0)) * get_imp(k)
-                total += diff * diff
-            return total ** 0.5
+            return np.sqrt(sum((get_imp(k) * (a.get(k, 0.0) - b.get(k, 0.0))) ** 2 for k in all_keys))
         elif metric == "manhattan":
-            total = 0.0
-            for k in all_keys:
-                total += abs(a.get(k, 0.0) - b.get(k, 0.0)) * get_imp(k)
-            return total
+            return sum(get_imp(k) * abs(a.get(k, 0.0) - b.get(k, 0.0)) for k in all_keys)
         elif metric == "cosine":
-            dot = sum(a.get(k, 0.0) * b.get(k, 0.0) * get_imp(k) for k in all_keys)
-            norm_a = sum((a.get(k, 0.0) * get_imp(k)) ** 2 for k in all_keys) ** 0.5
-            norm_b = sum((b.get(k, 0.0) * get_imp(k)) ** 2 for k in all_keys) ** 0.5
+            dot = sum(get_imp(k) * a.get(k, 0.0) * b.get(k, 0.0) for k in all_keys)
+            norm_a = np.sqrt(sum((get_imp(k) * a.get(k, 0.0)) ** 2 for k in all_keys))
+            norm_b = np.sqrt(sum((get_imp(k) * b.get(k, 0.0)) ** 2 for k in all_keys))
             if norm_a == 0 or norm_b == 0:
                 return 1.0
             return 1.0 - dot / (norm_a * norm_b)
@@ -591,7 +543,7 @@ class DriftDetector:
                 if va == 0 and vb == 0:
                     continue
                 denom = max(abs(va), abs(vb))
-                total += (abs(va - vb) / denom) * get_imp(k)
+                total += get_imp(k) * (abs(va - vb) / denom)
                 count += 1
             return total / count if count > 0 else 0.0
         else:
