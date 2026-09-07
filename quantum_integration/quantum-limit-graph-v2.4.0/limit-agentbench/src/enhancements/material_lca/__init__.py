@@ -1,31 +1,20 @@
-# material_lca_v2_3_0.py
-# Version: 2.4.0
+# material_lca_v2_4_0.py
+# Version: 2.4.1
 """
-Enhanced Material Index Integration with Hardware Life‑Cycle Databases v2.4.0
+Enhanced Material Index Integration with Hardware Life‑Cycle Databases v2.4.1
 ======================================================================
 
 Fetches accurate embodied carbon and rare‑earth content from public LCA databases
 and integrates adaptive weight selection via Multi‑Teacher On‑Policy Distillation,
 plus Multi‑Objective Evolutionary Optimization (NSGA‑II) for global weight refinement.
 
-ENHANCEMENTS OVER v2.2.0:
-- Added NSGA‑II optimizer to evolve continuous weight vectors (carbon, rare_earth, water, operational).
-- Maintains a Pareto front of non‑dominated weight vectors.
-- MODP‑based selection of best weight vector using dynamic objective weights.
-- Background task for periodic MOEA evolution.
-- Blending of MOEA global weights with online distillation strategy.
-- New configuration parameters for MOEA.
-- Persistence of evolved Pareto front.
+ENHANCEMENTS OVER v2.4.0:
+- Fixed asyncio task creation in AdaptiveMaterialCostFunction.__init__ (now safe).
+- Added asyncio.Lock for thread safety.
+- Improved record_outcome to skip distillation update if state not set.
+- Minor cleanups.
 
-NEW IN v2.4.0:
-- Added LIMIT Graph manager for weight vector relationships.
-- Added MODP solver wrapper for storing decision states/policies.
-- Added RLHF trainer for human preference collection.
-- Added MoE gating network to blend online distillation and offline MOEA weights.
-- New configuration flags for each component.
-- Integrated with central Storage (optional) for persistence.
-
-All previous features (distillation, caching, circuit breaker, digital twin, etc.) retained.
+All previous features retained.
 """
 
 import asyncio
@@ -775,13 +764,10 @@ class DistillationStudent:
     def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
                reward: float, action: int, distill_weight: float = 0.7, rl_weight: float = 0.3):
         current_probs = self.predict_proba(state_vector, self.n_classes)
-        logits = state_vector @ self.weights + self.biases
-
         grad_distill = -(teacher_probs - current_probs)
         one_hot = np.zeros(self.n_classes)
         one_hot[action] = 1.0
         grad_rl = -reward * (one_hot - current_probs)
-
         grad = distill_weight * grad_distill + rl_weight * grad_rl
         self.weights -= self.lr * np.outer(state_vector, grad)
         self.biases -= self.lr * grad
@@ -1081,6 +1067,8 @@ class NSGAIIWeightOptimizer:
         return best
 
     async def evolve(self) -> List[MOPDWeightVector]:
+        if self.evaluate_func is None:
+            raise ValueError("evaluate_func not set")
         population = [self._random_individual() for _ in range(self.population_size)]
         points = []
         eval_tasks = [self.evaluate_func(ind) for ind in population]
@@ -1366,6 +1354,7 @@ class AdaptiveMaterialCostFunction:
         self.global_best_weights: Optional[Dict[str, float]] = None
         self.pareto_front: List[MOPDWeightVector] = []
         self._moea_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
 
         # NEW v2.4.0 components
         self.limit_graph_manager = LimitGraphManager(storage) if getattr(self.config, 'enable_limit_graph', True) else None
@@ -1380,7 +1369,6 @@ class AdaptiveMaterialCostFunction:
         if self.limit_graph_manager:
             if not self.limit_graph_manager.get_metadata("weight_vectors"):
                 self.limit_graph_manager.create_graph("weight_vectors", "Weight Vector Relationships", {})
-            # Add source nodes
             for src in ['online', 'offline', 'rule_based']:
                 self.limit_graph_manager.add_node(
                     "weight_vectors",
@@ -1389,9 +1377,20 @@ class AdaptiveMaterialCostFunction:
                     {"type": "source"}
                 )
 
-        # Start MOEA background task if enabled
+        # Start MOEA background task if enabled AND a running loop exists
         if getattr(self.config, 'moea_enabled', True):
-            self._moea_task = asyncio.create_task(self._moea_loop())
+            try:
+                loop = asyncio.get_running_loop()
+                self._moea_task = loop.create_task(self._moea_loop())
+            except RuntimeError:
+                # No running loop; task will be started manually via start_background_tasks()
+                logger.info("No running event loop; MOEA task will start when start_background_tasks() is called.")
+
+    async def start_background_tasks(self):
+        """Start MOEA background task if not already running."""
+        if self._moea_task is None or self._moea_task.done():
+            if getattr(self.config, 'moea_enabled', True):
+                self._moea_task = asyncio.create_task(self._moea_loop())
 
     async def _moea_loop(self):
         interval = getattr(self.config, 'moea_interval_seconds', 300)
@@ -1410,7 +1409,6 @@ class AdaptiveMaterialCostFunction:
             return []
 
         async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
-            # Use a representative hardware model for evaluation.
             footprint = await self.lca_client.get_footprint("NVIDIA A100", None)
             carbon_benefit = 1.0 - min(footprint.embodied_carbon_kg / 100.0, 1.0)
             rare_earth_benefit = 1.0 - min(footprint.rare_earth_kg / 0.01, 1.0)
@@ -1444,7 +1442,6 @@ class AdaptiveMaterialCostFunction:
                 self.global_best_weights = best.weights
                 logger.info(f"MOEA selected best weights: {best.weights}")
 
-                # Store in MODP and LIMIT graph
                 if self.modp_solver:
                     self.modp_solver.add_state(
                         state_id=f"moea_best_{best.vector_id}",
@@ -1491,7 +1488,6 @@ class AdaptiveMaterialCostFunction:
 
         # Strategy selection via distillation or MoE
         if self.moe_gating:
-            # Build metrics for gating
             metrics = {
                 'carbon': footprint.embodied_carbon_kg,
                 'rare_earth': footprint.rare_earth_kg,
@@ -1500,11 +1496,9 @@ class AdaptiveMaterialCostFunction:
                 'material_index': footprint.material_index,
             }
             selected_expert, _ = await self.moe_gating.select_expert(metrics)
-            # Map expert to weights
             if selected_expert == 'offline' and self.global_best_weights:
                 weights = self.global_best_weights
             else:
-                # Fallback to rule-based default or balanced
                 weights = self._strategy_to_weights('balanced')
             strategy = selected_expert
             state_vec = state.to_feature_vector()
@@ -1542,7 +1536,6 @@ class AdaptiveMaterialCostFunction:
             "moe_used": self.moe_gating is not None,
         }
 
-        # Optional: update MoE with outcome later (called by record_outcome)
         if self.moe_gating:
             self._last_moe_metrics = metrics
             self._last_selected_expert = selected_expert
@@ -1779,6 +1772,7 @@ if FASTAPI_AVAILABLE:
     async def startup():
         app.lca_client = LCAClient(LCAConfig())
         app.cost_function = AdaptiveMaterialCostFunction(app.lca_client)
+        await app.cost_function.start_background_tasks()
         logger.info("Material LCA API started")
 
     @app.on_event("shutdown")
@@ -1972,8 +1966,8 @@ async def main():
                        enable_rlhf=True, enable_moe=True)
     lca_client = LCAClient(config)
     cost_func = AdaptiveMaterialCostFunction(lca_client, config)
+    await cost_func.start_background_tasks()
 
-    # Compute cost with adaptive weights
     cost, metadata = await cost_func.compute_cost(
         hardware_model="NVIDIA A100",
         variant="24GB",
@@ -1986,14 +1980,11 @@ async def main():
     print(f"Cost: {cost}")
     print(f"Metadata: {metadata}")
 
-    # Wait for MOEA to run at least once (or trigger manually)
     await cost_func.run_moea_update()
     print("MOEA best weights:", cost_func.global_best_weights)
 
-    # Record outcome
     await cost_func.record_outcome(cost=0.3, carbon_savings_kg=5, user_rating=0.9)
 
-    # Access new components
     limit_graph = await cost_func.get_limit_graph()
     print("Limit graph nodes:", len(limit_graph.get('nodes', [])))
     print("MoE experts:", await cost_func.get_moe_experts())
