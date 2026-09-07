@@ -674,6 +674,12 @@ class NodeDescriptor(BaseModel):
         return self.routing_strategy
 
     async def record_outcome(self, carbon_saved_kg: float, latency_ms: float, cost_usd: float):
+        if self._causal_shaper and hasattr(self, '_prev_snapshot') and hasattr(self, '_current_snapshot'):
+            reward = self._causal_shaper.shape_reward(
+                self._last_decision['action_idx'], reward,
+                self._prev_snapshot, self._current_snapshot
+            )
+            
         """Record the outcome of a routing decision and update the distillation agent."""
         # Compute reward
         carbon_norm = min(1.0, carbon_saved_kg / 0.1)
