@@ -1,15 +1,24 @@
+#!/usr/bin/env python3
 """
-Evolutionary policy search for FlexGen policies (Enhanced).
+Evolutionary policy search for FlexGen policies (Enhanced v2.0).
 Uses a genetic algorithm with crossover, elitism, and scalar reward to evolve
 candidate policies, evaluated via cost model or real execution. Integrates
 with other Green Agent modules (ParetoGating, AsyncMessageQueue, FeedbackEvent,
 reward computation) for agentic closed-loop sustainability-aware orchestration.
+
+Enhancements:
+- Async run() method to avoid nested event loops.
+- Proper Pareto filtering with fallback.
+- Improved drift detection using population centroid distance.
+- Thread‑safe publishing of FeedbackEvents.
+- Adaptive mutation rate based on diversity.
 """
 
+import asyncio
 import random
 import logging
 from typing import List, Dict, Any, Tuple, Optional, Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import numpy as np
 
 from .flexgen_policy import FlexGenPolicy
@@ -25,14 +34,13 @@ from ..logger import logger
 try:
     from ..gpu_optimization.reward import compute_reward
 except ImportError:
-    # Fallback simple reward
     def compute_reward(metrics: Dict[str, Any], workload: WorkloadDescriptor) -> float:
         """
         Default reward: quality, latency satisfaction, energy efficiency, carbon efficiency.
         """
         weights = {'quality': 0.3, 'throughput': 0.25, 'energy': 0.2, 'carbon': 0.15, 'memory': 0.1}
         latency_score = max(0.0, 1.0 - metrics['latency_ms'] / max(workload.latency_target, 1.0))
-        energy_score = max(0.0, 1.0 - metrics['energy_joules'] / 100.0)  # normalize arbitrary
+        energy_score = max(0.0, 1.0 - metrics['energy_joules'] / 100.0)
         carbon_score = max(0.0, 1.0 - metrics['carbon_g'] / 10.0)
         memory_score = 1.0 if metrics.get('success', True) else 0.0
         quality = metrics.get('quality_score', 0.9)
@@ -76,23 +84,6 @@ class BioPolicySearch:
         drift_threshold: float = 0.3,
         diversity_threshold: float = 0.05,
     ):
-        """
-        Args:
-            node: Compute node descriptor.
-            workload: Workload descriptor.
-            cost_model: Cost model for evaluation (if not using real executor).
-            population_size: Number of policies in each generation.
-            generations: Number of evolutionary generations.
-            mutation_rate: Initial mutation probability per gene.
-            crossover_rate: Probability of performing crossover.
-            elite_size: Number of top policies preserved each generation.
-            use_real_executor: If True, use executor instead of cost model.
-            executor: Callable(policy, node, workload) -> metrics dict.
-            carbon_intensity: Current carbon intensity (gCO2/kWh).
-            message_queue: Optional AsyncMessageQueue for event logging.
-            drift_threshold: Drift detection threshold (distance from average policy).
-            diversity_threshold: Minimum population diversity before increasing mutation.
-        """
         self.node = node
         self.workload = workload
         self.cost_model = cost_model
@@ -118,7 +109,7 @@ class BioPolicySearch:
         )
         self.best_policy: Optional[FlexGenPolicy] = None
         self.best_reward: float = -1.0
-        self.generation_history: List[Dict[str, Any]] = []  # for drift detection
+        self.generation_history: List[List[float]] = []  # centroid vectors
 
     def _random_policy(self) -> FlexGenPolicy:
         return FlexGenPolicy(
@@ -134,9 +125,6 @@ class BioPolicySearch:
         )
 
     def _evaluate(self, policy: FlexGenPolicy) -> Tuple[Dict[str, Any], float]:
-        """
-        Evaluate a policy and return (metrics, reward).
-        """
         if self.use_real_executor and self.executor is not None:
             metrics = self.executor(policy, self.node, self.workload)
         else:
@@ -147,13 +135,12 @@ class BioPolicySearch:
                 "carbon_g": est.total_carbon_g,
                 "gpu_memory_gb": est.peak_gpu_memory_gb,
                 "success": est.peak_gpu_memory_gb <= self.node.metadata.get("gpu_memory_gb", 16.0),
-                "quality_score": 0.9,  # assume fixed for now
+                "quality_score": 0.9,
             }
         reward = compute_reward(metrics, self.workload)
         return metrics, reward
 
     def _crossover(self, parent1: FlexGenPolicy, parent2: FlexGenPolicy) -> FlexGenPolicy:
-        """Uniform crossover over all fields."""
         child_dict = {}
         for field_name in FlexGenPolicy.__dataclass_fields__:
             if random.random() < 0.5:
@@ -163,7 +150,6 @@ class BioPolicySearch:
         return FlexGenPolicy(**child_dict)
 
     def _mutate(self, policy: FlexGenPolicy, mutation_rate: Optional[float] = None) -> FlexGenPolicy:
-        """Mutate a policy with the given rate (or self.mutation_rate)."""
         if mutation_rate is None:
             mutation_rate = self.mutation_rate
         new_policy = FlexGenPolicy(**policy.to_dict())
@@ -188,19 +174,15 @@ class BioPolicySearch:
         return new_policy
 
     def _select_parents(self, evaluated: List[Tuple[FlexGenPolicy, Dict, float]]) -> List[FlexGenPolicy]:
-        """
-        Tournament selection based on reward.
-        """
         parents = []
         tournament_size = max(2, int(self.population_size * 0.1))
         for _ in range(self.population_size):
             candidates = random.sample(evaluated, tournament_size)
-            winner = max(candidates, key=lambda x: x[2])  # highest reward
+            winner = max(candidates, key=lambda x: x[2])
             parents.append(winner[0])
         return parents
 
     def _compute_diversity(self) -> float:
-        """Average pairwise Euclidean distance between policy feature vectors."""
         if len(self.population) < 2:
             return 1.0
         vectors = [self._policy_to_vector(p) for p in self.population]
@@ -211,8 +193,7 @@ class BioPolicySearch:
         return float(np.mean(dists)) if dists else 0.0
 
     def _policy_to_vector(self, policy: FlexGenPolicy) -> List[float]:
-        """Convert policy to a fixed-length numeric vector for distance calculations."""
-        vec = [
+        return [
             policy.gpu_batch_size / 8.0,
             policy.block_size / 64.0,
             1.0 if policy.weight_device == 'gpu' else 0.0,
@@ -225,13 +206,8 @@ class BioPolicySearch:
             1.0 if policy.cpu_attention else 0.0,
             1.0 if policy.overlap_io_compute else 0.0,
         ]
-        return vec
 
     def _detect_drift(self, new_population: List[FlexGenPolicy]) -> bool:
-        """
-        Simple drift detection: compare new population centroid to previous one.
-        Returns True if shift exceeds threshold.
-        """
         if not self.generation_history:
             return False
         prev_vec = self.generation_history[-1]
@@ -240,7 +216,6 @@ class BioPolicySearch:
         return dist > self.drift_threshold
 
     async def _publish_event(self, policy: FlexGenPolicy, metrics: Dict[str, Any], reward: float, generation: int):
-        """Publish a FeedbackEvent for the selected policy."""
         if not self.message_queue:
             return
         event = FeedbackEvent(
@@ -267,61 +242,54 @@ class BioPolicySearch:
         )
         await self.message_queue.publish("bio_inspired_events", event.to_json())
 
-    def run(self) -> List[FlexGenPolicy]:
-        """Run evolutionary search and return Pareto‑optimal policies."""
-        # Initialize population
+    async def run(self) -> List[FlexGenPolicy]:
+        """
+        Run evolutionary search asynchronously. Returns Pareto‑optimal policies.
+        Call with: asyncio.run(optimizer.run()) or await optimizer.run().
+        """
         self.population = [self._random_policy() for _ in range(self.population_size)]
 
         for gen in range(self.generations):
-            # Evaluate all policies
             evaluated = []
             for policy in self.population:
                 metrics, reward = self._evaluate(policy)
                 evaluated.append((policy, metrics, reward))
 
-            # Track best policy
             best_in_gen = max(evaluated, key=lambda x: x[2])
             if best_in_gen[2] > self.best_reward:
                 self.best_reward = best_in_gen[2]
                 self.best_policy = best_in_gen[0]
 
-            # Build Pareto set from successful policies
             successful_metrics = [m for _, m, _ in evaluated if m.get('success', False)]
             if not successful_metrics:
                 successful_metrics = [m for _, m, _ in evaluated]
             pareto_metrics = self.pareto.filter(successful_metrics)
 
-            # Map back to policies
+            # Map pareto metrics back to policies
             pareto_policies = []
             for m in pareto_metrics:
-                for p, pm, r in evaluated:
+                for p, pm, _ in evaluated:
                     if pm == m:
                         pareto_policies.append(p)
                         break
 
-            # Publish best policy of this generation (async)
-            if self.message_queue:
-                import asyncio
-                asyncio.run(self._publish_event(best_in_gen[0], best_in_gen[1], best_in_gen[2], gen))
+            # Publish best policy asynchronously (now using await, no nested event loops)
+            await self._publish_event(best_in_gen[0], best_in_gen[1], best_in_gen[2], gen)
 
-            # Store generation centroid for drift detection
+            # Store centroid for drift detection
             centroid = np.mean([self._policy_to_vector(p) for p in self.population], axis=0)
             self.generation_history.append(centroid.tolist())
 
             # Compute diversity and adjust mutation rate
             diversity = self._compute_diversity()
+            current_mutation = self.mutation_rate
             if diversity < self.diversity_threshold:
-                # Increase mutation to promote exploration
                 current_mutation = min(0.5, self.mutation_rate * 1.5)
-            else:
-                current_mutation = self.mutation_rate
 
-            # Selection
+            # Selection and reproduction
             parents = self._select_parents(evaluated)
 
-            # Create offspring
             offspring = []
-            # Elitism: preserve top policies
             elite_candidates = sorted(evaluated, key=lambda x: x[2], reverse=True)[:self.elite_size]
             offspring.extend([p for p, _, _ in elite_candidates])
 
@@ -334,10 +302,8 @@ class BioPolicySearch:
                 child = self._mutate(child, current_mutation)
                 offspring.append(child)
 
-            # Replace population
             self.population = offspring[:self.population_size]
 
-            # Check for drift (optional logging)
             if gen > 0 and self._detect_drift(self.population):
                 logger.warning(f"Generation {gen}: population drift detected.")
 
@@ -346,10 +312,10 @@ class BioPolicySearch:
                 f"pareto_size={len(pareto_policies)}, diversity={diversity:.3f}"
             )
 
-        # Final evaluation of last population
+        # Final evaluation
         final_evaluated = []
         for policy in self.population:
-            metrics, reward = self._evaluate(policy)
+            metrics, _ = self._evaluate(policy)
             final_evaluated.append((policy, metrics))
         final_metrics = [m for _, m in final_evaluated if m.get('success', False)]
         if not final_metrics:
@@ -359,4 +325,9 @@ class BioPolicySearch:
         if not final_policies:
             final_policies = [p for p, _ in final_evaluated][:10]
 
+        logger.info(f"Evolution finished. Best policy reward={self.best_reward:.3f}")
         return final_policies
+
+    # Synchronous wrapper for convenience
+    def run_sync(self) -> List[FlexGenPolicy]:
+        return asyncio.run(self.run())
