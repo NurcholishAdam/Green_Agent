@@ -1,25 +1,26 @@
 """
-Enhanced Workload Descriptor v2.2.0
+Enhanced Workload Descriptor v2.3.0
 ====================================
 Defines the structure of a workload/task with adaptive priority selection
 via Multi‑Teacher On‑Policy Distillation.
 
-Features (including v2.2.0 enhancements):
-- Self-contained imports (dataclass, logging).
-- Pydantic v2 config (ConfigDict).
-- Parameterised persistence paths (per workload ID).
-- True historical ML training from logged state vectors.
-- Integration with FeedbackEvent schema (optional).
-- Performance history as List (no deque).
-- Enhanced state representation (more features).
-- Asynchronous lock for safe updates.
-- Optional quantum teacher and causal reward shaping.
+Changes from v2.2.0:
+- Fixed missing deque import.
+- Implemented historical ML training from logs.
+- Corrected gating update (stores full teacher outputs in replay buffer).
+- Added asyncio.Lock and epsilon decay to optimizer.
+- Asynchronous persistence for logs.
+- Causal reward shaping with snapshot mechanism.
+- Federated learning support for student weights.
+- Improved feature scaling and robust handling of n_classes.
+- Added __init__ to initialise lock.
 """
 
 from enum import Enum
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 from pathlib import Path
+from collections import deque
 import json
 import random
 import numpy as np
@@ -27,10 +28,10 @@ from abc import ABC, abstractmethod
 import pickle
 import pandas as pd
 from dataclasses import dataclass
+import asyncio
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict, PrivateAttr
 
-# Logger setup
 import logging
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,11 @@ class PriorityRuleBasedTeacher(Teacher):
         return probs / probs.sum()
 
     def confidence(self, state: WorkloadState) -> float:
-        return 0.6 if state.urgency >= 2.0 else 0.4
+        # Use entropy of output for confidence
+        probs = self.predict(state)
+        entropy = -np.sum(probs * np.log(probs + 1e-9))
+        max_entropy = np.log(3)
+        return 1.0 - entropy / max_entropy
 
 
 class PriorityHistoricalMLTeacher(Teacher):
@@ -192,24 +197,85 @@ class PriorityHistoricalMLTeacher(Teacher):
         if self.model is None or self.label_encoder is None:
             return np.ones(3) / 3
         x = state.to_feature_vector().reshape(1, -1)
-        probs = self.model.predict_proba(x)[0]
-        return probs
+        if hasattr(self.model, 'predict_proba'):
+            probs = self.model.predict_proba(x)[0]
+            # Ensure order matches Priority enum order
+            class_order = [c for c in self.label_encoder.classes_]
+            target_order = [p.value for p in Priority]
+            new_probs = np.zeros(3)
+            for i, p in enumerate(target_order):
+                if p in class_order:
+                    idx = class_order.index(p)
+                    new_probs[i] = probs[idx]
+            probs = new_probs / new_probs.sum() if new_probs.sum() > 0 else np.ones(3)/3
+            return probs
+        else:
+            return np.ones(3) / 3
 
     def confidence(self, state: WorkloadState) -> float:
-        return 0.7 if self.model is not None else 0.0
+        if self.model is None:
+            return 0.0
+        probs = self.predict(state)
+        entropy = -np.sum(probs * np.log(probs + 1e-9))
+        max_entropy = np.log(3)
+        return 1.0 - entropy / max_entropy
 
     @classmethod
     def train_from_logs(cls, log_paths: List[Path], model_path: Path,
                         state_col: str = 'state_vec', label_col: str = 'priority'):
-        # similar to node descriptor
-        pass
+        """Train a RandomForest model from historical logs."""
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.preprocessing import LabelEncoder
+        except ImportError:
+            logger.error("scikit-learn is required for historical model training.")
+            return None
+
+        all_dfs = []
+        for path in log_paths:
+            if path.exists():
+                df = pd.read_csv(path)
+                all_dfs.append(df)
+        if not all_dfs:
+            logger.warning("No logs found for training.")
+            return None
+
+        df = pd.concat(all_dfs, ignore_index=True)
+        if len(df) < 10:
+            logger.warning("Not enough logs to train historical model.")
+            return None
+
+        def parse_state(s):
+            try:
+                return np.fromstring(s, sep=',')
+            except:
+                return None
+
+        valid_indices = [i for i, s in enumerate(df[state_col]) if parse_state(s) is not None]
+        X = np.array([parse_state(df[state_col].iloc[i]) for i in valid_indices])
+        y = df[label_col].iloc[valid_indices].values
+
+        if len(X) < 5:
+            logger.warning("Too few valid samples after parsing.")
+            return None
+
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        clf.fit(X, y_enc)
+
+        with open(model_path, 'wb') as f:
+            pickle.dump((clf, le), f)
+        logger.info(f"Trained historical model and saved to {model_path}")
+        return model_path
 
 
 class PriorityStatefulQTeacher(Teacher):
-    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None):
+    def __init__(self, lr: float = 0.1, weights_path: Optional[Path] = None, feature_dim: int = 23):
         self.lr = lr
         self.weights_path = weights_path or Path("./priority_q_weights.json")
-        self.weights = np.zeros((23, 3))  # feature_dim = 23
+        self.feature_dim = feature_dim
+        self.weights = np.zeros((feature_dim, 3))
         self._load_state()
 
     def _load_state(self):
@@ -218,10 +284,15 @@ class PriorityStatefulQTeacher(Teacher):
                 with open(self.weights_path, 'r') as f:
                     data = json.load(f)
                 self.weights = np.array(data)
+                if self.weights.shape[0] != self.feature_dim:
+                    logger.warning(f"Loaded Q‑weights shape {self.weights.shape}, expected ({self.feature_dim},3). Reinitializing.")
+                    self.weights = np.zeros((self.feature_dim, 3))
+                logger.info(f"Loaded Q‑teacher weights from {self.weights_path}")
             except Exception as e:
                 logger.error(f"Failed to load Q‑weights: {e}")
 
     def _save_state(self):
+        # Simple synchronous save; can be made async if needed
         with open(self.weights_path, 'w') as f:
             json.dump(self.weights.tolist(), f, indent=2)
 
@@ -232,6 +303,7 @@ class PriorityStatefulQTeacher(Teacher):
         return exp_q / exp_q.sum()
 
     def confidence(self, state: WorkloadState) -> float:
+        # Could be based on Q-value spread, but fixed for now
         return 0.5
 
     def update(self, state: WorkloadState, action: int, reward: float):
@@ -262,10 +334,25 @@ class DistillationStudent:
         self.lr = lr
         self.n_classes = n_classes
         self.counter = 0
+        self.grad_clip = 1.0
 
     def predict_proba(self, state_vector, num_classes=None):
         if num_classes is None:
             num_classes = self.n_classes
+        if num_classes != self.n_classes:
+            # Resize only if explicitly requested
+            if num_classes > self.n_classes:
+                new_weights = np.zeros((self.feature_dim, num_classes))
+                new_biases = np.zeros(num_classes)
+                new_weights[:, :self.n_classes] = self.weights
+                new_biases[:self.n_classes] = self.biases
+                self.weights = new_weights
+                self.biases = new_biases
+                self.n_classes = num_classes
+            else:
+                self.weights = self.weights[:, :num_classes]
+                self.biases = self.biases[:num_classes]
+                self.n_classes = num_classes
         logits = state_vector @ self.weights + self.biases
         exp = np.exp(logits - np.max(logits))
         return exp / exp.sum()
@@ -277,33 +364,43 @@ class DistillationStudent:
         one_hot[action] = 1.0
         grad_rl = -reward * (one_hot - current_probs)
         grad = distill_weight * grad_distill + rl_weight * grad_rl
+        # Clip gradient
+        grad = np.clip(grad, -self.grad_clip, self.grad_clip)
         self.weights -= self.lr * np.outer(state_vector, grad)
         self.biases -= self.lr * grad
         self.counter += 1
+
+    def export_weights(self) -> Dict[str, np.ndarray]:
+        return {"weights": self.weights.copy(), "biases": self.biases.copy()}
+
+    def import_weights(self, weight_dict: Dict[str, np.ndarray]):
+        self.weights = weight_dict["weights"].copy()
+        self.biases = weight_dict["biases"].copy()
 
 
 class ReplayBuffer:
     def __init__(self, max_size=2000):
         self.buffer = deque(maxlen=max_size)
 
-    def push(self, state_vec, action, reward, next_state_vec, teacher_probs):
-        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_probs))
+    def push(self, state_vec, action, reward, next_state_vec, teacher_outputs):
+        """teacher_outputs: matrix (n_teachers, n_actions)"""
+        self.buffer.append((state_vec, action, reward, next_state_vec, teacher_outputs))
 
     def sample(self, batch_size=32):
         if len(self.buffer) < batch_size:
             batch = list(self.buffer)
         else:
             batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, teacher_probs = zip(*batch)
+        states, actions, rewards, next_states, teacher_outputs = zip(*batch)
         return (np.array(states), actions, np.array(rewards),
-                np.array(next_states), np.array(teacher_probs))
+                np.array(next_states), np.array(teacher_outputs))
 
     def __len__(self):
         return len(self.buffer)
 
 
 class MoEGatingNetwork:
-    def __init__(self, feature_dim=23, n_experts=4, lr=0.005):
+    def __init__(self, feature_dim=23, n_experts=5, lr=0.005):
         self.feature_dim = feature_dim
         self.n_experts = n_experts
         self.lr = lr
@@ -315,11 +412,16 @@ class MoEGatingNetwork:
         exp = np.exp(logits - np.max(logits))
         return exp / exp.sum()
 
-    def update(self, state_vec, teacher_outputs, student_probs):
-        gate_weights = self.forward(state_vec)
-        combined = np.sum(gate_weights[:, None] * teacher_outputs, axis=0)
-        error = combined - student_probs
-        grad_gate = np.dot(teacher_outputs, error)
+    def update(self, state_vec, teacher_outputs, student_probs, current_gate_weights):
+        """
+        Correct update using actual teacher outputs and current gate weights.
+        teacher_outputs: (n_teachers, n_actions)
+        current_gate_weights: (n_teachers,)
+        """
+        combined = np.sum(current_gate_weights[:, None] * teacher_outputs, axis=0)
+        error = combined - student_probs  # (n_actions,)
+        # Gradient w.r.t. gate logits
+        grad_gate = teacher_outputs @ error  # (n_teachers,)
         self.weights -= self.lr * np.outer(state_vec, grad_gate)
         self.bias -= self.lr * grad_gate
 
@@ -333,67 +435,97 @@ class DistillationPriorityOptimizer:
         self.n_actions = 3
         self.student = DistillationStudent(feature_dim=self.feature_dim,
                                            lr=config.get('distillation_learning_rate', 0.01))
-        self.teachers = [
+        self.teachers: List[Teacher] = [
             PriorityRuleBasedTeacher(),
             PriorityHistoricalMLTeacher(model_path=config.get('historical_model_path')),
             PriorityStatefulQTeacher(lr=config.get('q_learning_rate', 0.1),
-                                     weights_path=config.get('q_weights_path')),
+                                     weights_path=config.get('q_weights_path'),
+                                     feature_dim=self.feature_dim),
             RLHFPriorityTeacher()
         ]
+        # Optional quantum teacher
         if config.get('use_quantum_teacher', False) and QuantumTeacher is not None:
-            self.teachers.append(QuantumTeacher(n_actions=3, n_qubits=4, n_layers=2))
+            self.teachers.append(QuantumTeacher(
+                n_actions=self.n_actions,
+                n_qubits=config.get('quantum_teacher_qubits', 4),
+                n_layers=config.get('quantum_teacher_layers', 2)
+            ))
         self.n_teachers = len(self.teachers)
         self.gating = MoEGatingNetwork(feature_dim=self.feature_dim,
                                        n_experts=self.n_teachers,
                                        lr=config.get('gating_learning_rate', 0.005))
         self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
         self.epsilon = config.get('distillation_epsilon', 0.1)
+        self.epsilon_min = config.get('distillation_epsilon_min', 0.01)
+        self.epsilon_decay = config.get('distillation_epsilon_decay', 0.995)
         self.train_every = config.get('distillation_train_every', 10)
         self.counter = 0
         self.distill_weight = config.get('distill_weight', 0.7)
         self.rl_weight = config.get('rl_weight', 0.3)
         self.batch_update_size = config.get('batch_update_size', 8)
+        self.lock = asyncio.Lock()
 
-    def _compute_teacher_probs(self, state):
+    def _compute_teacher_probs(self, state) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns (combined_probs, gate_weights, teacher_outputs_matrix)."""
         state_vec = state.to_feature_vector()
         teacher_outputs = []
         for teacher in self.teachers:
             prob = teacher.predict(state)
             if len(prob) != self.n_actions:
-                prob = np.pad(prob, (0, max(0, self.n_actions - len(prob))), 'constant')[:self.n_actions]
+                if len(prob) < self.n_actions:
+                    prob = np.pad(prob, (0, self.n_actions - len(prob)), 'constant')
+                else:
+                    prob = prob[:self.n_actions]
             teacher_outputs.append(prob)
-        teacher_outputs = np.array(teacher_outputs)
+        teacher_outputs = np.array(teacher_outputs)  # (n_teachers, n_actions)
         gate_weights = self.gating.forward(state_vec)
         combined = np.sum(gate_weights[:, None] * teacher_outputs, axis=0)
         combined = combined / combined.sum()
-        return combined, gate_weights
+        return combined, gate_weights, teacher_outputs
 
     async def select_priority(self, state, exploration=True):
-        state_vec = state.to_feature_vector()
-        teacher_probs, _ = self._compute_teacher_probs(state)
-        student_probs = self.student.predict_proba(state_vec, self.n_actions)
-        if exploration and random.random() < self.epsilon:
-            action_idx = random.randint(0, self.n_actions - 1)
-        else:
-            combined = 0.8 * student_probs + 0.2 * teacher_probs
-            action_idx = int(np.argmax(combined))
-        return self.PRIORITIES[action_idx], action_idx, state_vec, teacher_probs
+        async with self.lock:
+            state_vec = state.to_feature_vector()
+            teacher_probs, gate_weights, teacher_outputs = self._compute_teacher_probs(state)
+            student_probs = self.student.predict_proba(state_vec, self.n_actions)
+            if exploration and random.random() < self.epsilon:
+                action_idx = random.randint(0, self.n_actions - 1)
+            else:
+                combined = 0.8 * student_probs + 0.2 * teacher_probs
+                action_idx = int(np.argmax(combined))
+            # Decay epsilon
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            return self.PRIORITIES[action_idx], action_idx, state_vec, teacher_outputs
 
-    async def update(self, state_vec, action_idx, reward, next_state_vec, teacher_probs):
-        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
-        self.counter += 1
-        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= self.batch_update_size:
-            batch = self.replay_buffer.sample(self.batch_update_size)
-            states, actions, rewards, _, teacher_probs_batch = batch
-            for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i],
-                                    distill_weight=self.distill_weight, rl_weight=self.rl_weight)
-                student_out = self.student.predict_proba(states[i])
-                teacher_outputs = np.tile(teacher_probs_batch[i], (self.n_teachers, 1))
-                self.gating.update(states[i], teacher_outputs, student_out)
+    async def update(self, state_vec, action_idx, reward, next_state_vec, teacher_outputs):
+        async with self.lock:
+            self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_outputs)
+            self.counter += 1
+            if self.counter % self.train_every == 0 and len(self.replay_buffer) >= self.batch_update_size:
+                batch = self.replay_buffer.sample(self.batch_update_size)
+                states, actions, rewards, _, teacher_outputs_batch = batch
+                for i in range(len(states)):
+                    # Use average teacher probs as distillation target
+                    avg_teacher_probs = teacher_outputs_batch[i].mean(axis=0)
+                    self.student.update(states[i], avg_teacher_probs, rewards[i], actions[i],
+                                        distill_weight=self.distill_weight, rl_weight=self.rl_weight)
+                    # Update gating with actual teacher outputs and current gate weights
+                    current_gate = self.gating.forward(states[i])
+                    student_out = self.student.predict_proba(states[i])
+                    self.gating.update(states[i], teacher_outputs_batch[i], student_out, current_gate)
+
+    async def export_student_weights(self) -> Dict[str, np.ndarray]:
+        async with self.lock:
+            return self.student.export_weights()
+
+    async def import_student_weights(self, weights: Dict[str, np.ndarray]):
+        async with self.lock:
+            self.student.import_weights(weights)
 
     def get_stats(self):
-        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+        return {'student_counter': self.student.counter,
+                'buffer_size': len(self.replay_buffer),
+                'epsilon': self.epsilon}
 
 
 # ============================================================================
@@ -439,13 +571,19 @@ class WorkloadDescriptor(BaseModel):
     evolutionary_elitism: int = Field(2, ge=1)
     use_quantum_teacher: bool = Field(False, description="Enable quantum teacher")
 
-    version: str = Field("2.2.0", description="Schema version")
+    version: str = Field("2.3.0", description="Schema version")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional custom data")
 
     _priority_optimizer: Optional[DistillationPriorityOptimizer] = PrivateAttr(default=None)
     _last_decision: Optional[Dict[str, Any]] = PrivateAttr(default=None)
     _causal_shaper: Optional[CausalRewardShaper] = PrivateAttr(default=None)
     _lock: Any = PrivateAttr(default=None)
+    _prev_snapshot: Dict[str, float] = PrivateAttr(default_factory=dict)
+    _current_snapshot: Dict[str, float] = PrivateAttr(default_factory=dict)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        self._lock = asyncio.Lock()  # Initialize lock immediately
 
     @field_validator('sector_emission_factor')
     def validate_sector_emission_factor(cls, v):
@@ -486,6 +624,8 @@ class WorkloadDescriptor(BaseModel):
         if self._priority_optimizer is None:
             self._priority_optimizer = DistillationPriorityOptimizer({
                 'distillation_epsilon': self.metadata.get('distillation_epsilon', 0.1),
+                'distillation_epsilon_min': self.metadata.get('distillation_epsilon_min', 0.01),
+                'distillation_epsilon_decay': self.metadata.get('distillation_epsilon_decay', 0.995),
                 'distillation_train_every': self.metadata.get('distillation_train_every', 10),
                 'distillation_replay_size': self.metadata.get('distillation_replay_size', 2000),
                 'distillation_learning_rate': self.metadata.get('distillation_learning_rate', 0.01),
@@ -500,26 +640,25 @@ class WorkloadDescriptor(BaseModel):
                 'quantum_teacher_qubits': self.metadata.get('quantum_teacher_qubits', 4),
                 'quantum_teacher_layers': self.metadata.get('quantum_teacher_layers', 2),
             })
-
-    async def _get_lock(self):
-        if self._lock is None:
-            import asyncio
-            self._lock = asyncio.Lock()
-        return self._lock
+        if self.use_evolutionary and not hasattr(self, '_evolutionary_optimizer'):
+            # Evolutionary optimizer placeholder - can be added if needed
+            pass
 
     async def select_priority(self, exploration=True, latency_achieved_ms=None,
-                              carbon_saved_kg=None, energy_used_joules=None):
-        lock = await self._get_lock()
-        async with lock:
+                              carbon_saved_kg=None, energy_used_joules=None,
+                              snapshot_before: Optional[Dict[str, float]] = None):
+        async with self._lock:
             self._ensure_optimizer()
+            if snapshot_before:
+                self._prev_snapshot = snapshot_before.copy()
             state = self._build_state()
-            priority, action_idx, state_vec, teacher_probs = await self._priority_optimizer.select_priority(
+            priority, action_idx, state_vec, teacher_outputs = await self._priority_optimizer.select_priority(
                 state, exploration=exploration
             )
             self._last_decision = {
                 'state_vec': state_vec,
                 'action_idx': action_idx,
-                'teacher_probs': teacher_probs,
+                'teacher_outputs': teacher_outputs,
             }
             self.adaptive_priority = Priority(priority)
 
@@ -528,24 +667,28 @@ class WorkloadDescriptor(BaseModel):
 
             return self.adaptive_priority
 
-    async def record_outcome(self, latency_achieved_ms, carbon_saved_kg, energy_used_joules):
-        lock = await self._get_lock()
-        async with lock:
-            await self._record_outcome_locked(latency_achieved_ms, carbon_saved_kg, energy_used_joules)
+    async def record_outcome(self, latency_achieved_ms, carbon_saved_kg, energy_used_joules,
+                             snapshot_after: Optional[Dict[str, float]] = None):
+        async with self._lock:
+            await self._record_outcome_locked(latency_achieved_ms, carbon_saved_kg, energy_used_joules, snapshot_after)
 
-    async def _record_outcome_locked(self, latency_achieved_ms, carbon_saved_kg, energy_used_joules):
-        # Reward calculation with MODP weights
+    async def _record_outcome_locked(self, latency_achieved_ms, carbon_saved_kg, energy_used_joules,
+                                     snapshot_after: Optional[Dict[str, float]] = None):
+        # Compute reward
         latency_score = 1.0 - min(1.0, abs(latency_achieved_ms - self.latency_target) / self.latency_target)
         carbon_norm = min(1.0, carbon_saved_kg / 0.1)
         energy_norm = 1.0 - min(1.0, energy_used_joules / (self.estimated_energy_joules or 0.1))
         reward = 0.4 * latency_score + 0.3 * carbon_norm + 0.3 * energy_norm
         reward = max(0.0, min(1.0, reward))
 
-        # Optional causal shaping
-        if self._causal_shaper is not None:
-            prev_snapshot = self.metadata.get('prev_snapshot', {})
-            current_snapshot = self.metadata.get('current_snapshot', {})
-            reward = self._causal_shaper.shape_reward(self._last_decision['action_idx'], reward, prev_snapshot, current_snapshot)
+        # Causal shaping with snapshots if available
+        if self._causal_shaper is not None and self._prev_snapshot and (snapshot_after or self._current_snapshot):
+            snap_after = snapshot_after or self._current_snapshot
+            if self._last_decision is not None:
+                reward = self._causal_shaper.shape_reward(
+                    self._last_decision['action_idx'], reward,
+                    self._prev_snapshot, snap_after
+                )
 
         entry = {
             'timestamp': datetime.utcnow().isoformat(),
@@ -558,10 +701,10 @@ class WorkloadDescriptor(BaseModel):
         if self._last_decision is not None:
             state_vec = self._last_decision['state_vec']
             action_idx = self._last_decision['action_idx']
-            teacher_probs = self._last_decision['teacher_probs']
+            teacher_outputs = self._last_decision['teacher_outputs']
             next_state = self._build_state()
             next_state_vec = next_state.to_feature_vector()
-            await self._priority_optimizer.update(state_vec, action_idx, reward, next_state_vec, teacher_probs)
+            await self._priority_optimizer.update(state_vec, action_idx, reward, next_state_vec, teacher_outputs)
             entry['state_vec'] = ','.join(map(str, state_vec))
             self._last_decision = None
 
@@ -569,13 +712,8 @@ class WorkloadDescriptor(BaseModel):
         if len(self.performance_history) > self.max_history_length:
             self.performance_history = self.performance_history[-self.max_history_length:]
 
-        # Persistence
-        log_path = Path(f"./workload_{self.task_id or 'unknown'}_logs.csv")
-        df = pd.DataFrame(self.performance_history)
-        df.to_csv(log_path, index=False)
-        json_path = Path(f"./workload_{self.task_id or 'unknown'}_logs.json")
-        with open(json_path, 'w') as f:
-            json.dump(self.performance_history, f, indent=2)
+        # Asynchronous persistence
+        await asyncio.to_thread(self._persist_logs_sync)
 
         # FeedbackEvent
         if FeedbackEvent is not None:
@@ -598,6 +736,14 @@ class WorkloadDescriptor(BaseModel):
                 logger.debug(f"FeedbackEvent created: {event.event_id}")
             except Exception as e:
                 logger.warning(f"Failed to create FeedbackEvent: {e}")
+
+    def _persist_logs_sync(self):
+        log_path = Path(f"./workload_{self.task_id or 'unknown'}_logs.csv")
+        df = pd.DataFrame(self.performance_history)
+        df.to_csv(log_path, index=False)
+        json_path = Path(f"./workload_{self.task_id or 'unknown'}_logs.json")
+        with open(json_path, 'w') as f:
+            json.dump(self.performance_history, f, indent=2)
 
     def _build_state(self):
         urgency_map = {Urgency.LOW: 0, Urgency.MEDIUM: 1, Urgency.HIGH: 2, Urgency.CRITICAL: 3}
@@ -648,6 +794,14 @@ class WorkloadDescriptor(BaseModel):
     def set_causal_graph(self, causal_graph):
         if CausalRewardShaper is not None:
             self._causal_shaper = CausalRewardShaper(causal_graph, influence_weight=0.3)
+
+    async def export_federated_weights(self) -> Dict[str, np.ndarray]:
+        self._ensure_optimizer()
+        return await self._priority_optimizer.export_student_weights()
+
+    async def import_federated_weights(self, weights: Dict[str, np.ndarray]):
+        self._ensure_optimizer()
+        await self._priority_optimizer.import_student_weights(weights)
 
 
 def create_workload_descriptor(
