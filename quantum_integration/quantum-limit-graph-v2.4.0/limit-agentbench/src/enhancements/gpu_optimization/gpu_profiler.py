@@ -1,16 +1,16 @@
+#!/usr/bin/env python3
 """
-Real GPU profiler using NVML (pynvml). Enhanced with:
-- Multi-GPU support (list all GPUs or specific index)
-- Continuous monitoring with async loop
-- Integration with FeedbackEvent and AsyncMessageQueue
-- Energy and carbon estimation
-- History tracking for drift detection
-- Fallback to dummy data with explicit flag
-- Integration with NodeDescriptor
+Enhanced Real GPU profiler using NVML (pynvml).
+Adds:
+- Per‑GPU energy tracking (separate last sample time/power per handle).
+- Async context manager support.
+- Robust fallback to dummy data.
+- Safe shutdown with proper NVML cleanup.
+- Thread‑safe history access.
 """
 
-import logging
 import asyncio
+import logging
 import time
 from typing import Dict, List, Optional, Any, Deque
 from collections import deque
@@ -66,9 +66,12 @@ class GPUProfiler:
         self.nvml_initialized = False
         self.handles: List[Any] = []
         self._lock = asyncio.Lock()
+        self._history_lock = asyncio.Lock()
         self._monitor_task: Optional[asyncio.Task] = None
-        self._last_sample_time: Optional[float] = None
-        self._last_power_watts: Optional[float] = None
+
+        # Per‑handle tracking for energy calculation
+        self._last_sample_times: Dict[Any, float] = {}
+        self._last_power_watts: Dict[Any, float] = {}
 
         if NVML_AVAILABLE:
             try:
@@ -82,14 +85,21 @@ class GPUProfiler:
                         logger.error(f"GPU index {self.device_index} out of range (count={device_count})")
                 else:
                     self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(device_count)]
+                # Initialize tracking dicts
+                for handle in self.handles:
+                    self._last_sample_times[handle] = None
+                    self._last_power_watts[handle] = None
                 logger.info(f"NVML initialized, monitoring {len(self.handles)} GPU(s)")
             except Exception as e:
                 logger.warning(f"NVML init failed: {e}")
+                self.nvml_initialized = False
+                self.handles = []
+        else:
+            logger.info("NVML not available; using dummy GPU data.")
 
     async def _safe_get_metrics(self) -> List[Dict[str, Any]]:
         """Get metrics for all monitored GPUs. Returns list of dicts."""
         if not self.nvml_initialized or not self.handles:
-            # Return dummy data for development
             return self._get_dummy_metrics()
 
         metrics_list = []
@@ -100,8 +110,8 @@ class GPUProfiler:
                 power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
                 temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
                 name = pynvml.nvmlDeviceGetName(handle)
-                # Additional metrics (may not be available on all GPUs)
-                max_power_w = 0
+
+                max_power_w = 0.0
                 mem_clock_mhz = 0
                 sm_clock_mhz = 0
                 try:
@@ -156,6 +166,8 @@ class GPUProfiler:
     def get_gpu_metrics(self, device_index: Optional[int] = None) -> Dict[str, Any]:
         """
         Synchronous wrapper for getting metrics of a specific GPU (or first if None).
+        Note: This method should not be called from within an async context where an event loop
+        is already running; use `await get_all_gpu_metrics()` instead.
         """
         if device_index is not None and self.device_index is None:
             # Temporary override
@@ -176,7 +188,9 @@ class GPUProfiler:
         """Populate node metadata with GPU information from profiler."""
         metrics = await self.get_all_gpu_metrics()
         if metrics:
-            gpu = metrics[0]  # use first GPU
+            gpu = metrics[0]
+            if node.metadata is None:
+                node.metadata = {}
             node.metadata["gpu_name"] = gpu["gpu_name"]
             node.metadata["gpu_memory_gb"] = gpu["gpu_memory_total_mb"] / 1024.0
             node.metadata["gpu_max_power_w"] = gpu.get("gpu_max_power_watts", 250)
@@ -208,26 +222,33 @@ class GPUProfiler:
             try:
                 metrics_list = await self.get_all_gpu_metrics()
                 for metrics in metrics_list:
-                    # Compute energy and carbon since last sample
-                    energy_j = 0.0
-                    carbon_g = 0.0
                     current_time = time.time()
-                    if self._last_sample_time is not None and self._last_power_watts is not None:
-                        dt = current_time - self._last_sample_time
-                        avg_power = (self._last_power_watts + metrics["gpu_power_watts"]) / 2
-                        energy_j = avg_power * dt
-                        energy_kwh = energy_j / 3.6e6
-                        carbon_g = energy_kwh * self.carbon_intensity
-                    self._last_sample_time = current_time
-                    self._last_power_watts = metrics["gpu_power_watts"]
+                    handle_key = metrics.get("gpu_index", 0)  # use index as key for dummy
+                    # For real handles, we can use handle object if available
+                    # But metrics dict doesn't include handle; we'll use gpu_index.
+                    # For energy tracking, we store by gpu_index.
+                    idx = metrics.get("gpu_index", 0)
+                    last_time = self._last_sample_times.get(idx)
+                    last_power = self._last_power_watts.get(idx)
 
-                    # Add energy/carbon to metrics
+                    energy_j = 0.0
+                    if last_time is not None and last_power is not None:
+                        dt = current_time - last_time
+                        avg_power = (last_power + metrics["gpu_power_watts"]) / 2
+                        energy_j = avg_power * dt
+                    carbon_g = (energy_j / 3.6e6) * self.carbon_intensity
+
+                    # Update tracking
+                    self._last_sample_times[idx] = current_time
+                    self._last_power_watts[idx] = metrics["gpu_power_watts"]
+
                     metrics["energy_joules"] = energy_j
                     metrics["carbon_g"] = carbon_g
                     metrics["timestamp"] = current_time
 
-                    # Store in history
-                    self.history.append(metrics.copy())
+                    # Store history (thread‑safe)
+                    async with self._history_lock:
+                        self.history.append(metrics.copy())
 
                     # Publish FeedbackEvent if queue available
                     if self.message_queue and FeedbackEvent:
@@ -235,8 +256,10 @@ class GPUProfiler:
                             source="gpu_profiler",
                             feedback_type="telemetry",
                             task_id="gpu_monitor",
-                            context={"gpu_index": metrics.get("gpu_index", 0),
-                                     "carbon_intensity": self.carbon_intensity},
+                            context={
+                                "gpu_index": metrics.get("gpu_index", 0),
+                                "carbon_intensity": self.carbon_intensity,
+                            },
                             action={"selected_action": "monitor",
                                     "selected_rank": 0,
                                     "confidence_score": 1.0},
@@ -267,5 +290,15 @@ class GPUProfiler:
         if self.nvml_initialized:
             try:
                 pynvml.nvmlShutdown()
-            except:
-                pass
+                self.nvml_initialized = False
+                logger.info("NVML shutdown complete")
+            except Exception as e:
+                logger.error(f"NVML shutdown failed: {e}")
+
+    async def __aenter__(self):
+        await self.start_monitoring()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.stop_monitoring()
+        self.shutdown()
