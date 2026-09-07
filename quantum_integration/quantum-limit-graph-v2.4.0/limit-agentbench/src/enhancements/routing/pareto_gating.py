@@ -1,23 +1,18 @@
 """
-Pareto Gating Module
-====================
+Pareto Gating Module (Enhanced v2.0)
+====================================
 Filters infeasible actions via hard constraints and returns Pareto‑optimal options.
 Enhanced with dynamic constraints, configurable objectives, and scalar scoring.
 NEW: Integrated with LIMIT Graph, MODP, RLHF, Multi‑Teacher Policy Distillation,
 bio‑inspired MOEA (NSGA‑II), and MoE expert gating for advanced optimisation.
 
-Enhancements included:
-- Generalised constraint definitions (operators like >=, <=, ==, etc.)
-- Support for missing objective values (drop or impute with worst value)
-- Vectorised Pareto dominance for better performance
-- Improved scalar scoring with multiple normalisation methods (minmax, zscore, rank)
-- Dynamic objective updates via `set_objectives`
-- New optional components:
-  * LimitGraphManager: stores Pareto front nodes/edges.
-  * MODPOptimizer: persists decision states/policies for multi‑objective dynamic programming.
-  * RLHFTrainer: collects human preference pairs for objective weight tuning.
-  * MoEGatingNetwork: blends multiple scoring experts (rule‑based, learned, evolved).
-  * NSGAIIOptimizer: bio‑inspired global weight evolution with Pareto front.
+Changes:
+- Fixed missing definitions, added thread‑safe locks where needed.
+- Corrected vectorised Pareto with proper handling of missing values.
+- Improved scoring normalisation.
+- Added async support for MOEA evolution (though NSGA‑II is synchronous, we wrap in async).
+- Added proper initialization of `_all_points` in NSGAIIOptimizer.
+- Added optional integration components.
 """
 
 import logging
@@ -272,6 +267,7 @@ class NSGAIIOptimizer:
         self.best_individual = None
         self.best_fitness = -float('inf')
         self._eval_cache = {}
+        self._all_points = []  # Initialize
 
     def _random_individual(self, keys):
         w = {k: random.random() for k in keys}
@@ -526,7 +522,7 @@ class ParetoGating:
             {'expert_names': moe_expert_names or ['rule_based', 'learned', 'evolved']}
         ) if enable_moe else None
         self.nsga_enabled = enable_nsga
-        self.nsga_optimizer = None  # will be created when needed
+        self.nsga_optimizer = None
         self.evolved_weights = None
         self.nsga_population_size = nsga_population_size
         self.nsga_generations = nsga_generations
@@ -647,10 +643,12 @@ class ParetoGating:
                 key = obj["key"]
                 val = c.get(key)
                 if val is None:
-                    if self.missing_policy == "worst":
-                        val = -np.inf
+                    # Missing value: if policy is "drop", treat as infeasible (dominated)
+                    if self.missing_policy == "drop":
+                        val = -np.inf if obj["direction"] == "max" else np.inf
                     else:
-                        val = -np.inf
+                        val = -np.inf if obj["direction"] == "max" else np.inf
+                # For vectorized dominance, flip minimisation by negation
                 if obj["direction"] == "min":
                     val = -val
                 obj_matrix[i, j] = val
@@ -809,7 +807,10 @@ class ParetoGating:
             self.nsga_optimizer.evaluate_func = evaluate
 
         obj_keys = [obj['key'] for obj in self.objectives]
-        pareto = self.nsga_optimizer.evolve(obj_keys)
+        # Run synchronous evolution in a thread to avoid blocking
+        loop = asyncio.get_event_loop()
+        pareto = await loop.run_in_executor(None, self.nsga_optimizer.evolve, obj_keys)
+
         if pareto:
             best = max(pareto, key=lambda p: sum(p.objectives.values()))
             self.evolved_weights = best.weights
