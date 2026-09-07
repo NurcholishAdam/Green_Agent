@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
-Decision Audit & Dashboard Persistence
-=======================================
+Decision Audit & Dashboard Persistence v3.4.1
+==============================================
 Enhanced FastAPI server for decision audit, benchmark results, drift events,
 MoE expert metrics, MODP Pareto front, LIMIT Graph, RLHF preference pairs,
 and bio‑inspired optimizer runs – with central component integration.
+
+Improvements over v3.4.0:
+- Safe config attribute access with defaults.
+- Rate limiting on public endpoints.
+- Authenticated WebSocket with broadcast capability.
+- Proper configuration passing to PSO and MoE components.
+- Consistent error handling and response models.
+- Concurrency lock for adaptive weight updates.
+- WebSocket manager for real‑time updates.
 """
 
 import asyncio
 import threading
 import time
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 # Central Green Agent components
 from ..storage import Storage
@@ -52,13 +63,36 @@ security = HTTPBearer()
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """
     Verify that the provided Bearer token matches the configured API key.
-    If DASHBOARD_API_KEY is empty, authentication is disabled (for local dev).
+    If DASHBOARD_API_KEY is empty, authentication is disabled (for local dev),
+    but a warning is logged.
     """
-    if not config.DASHBOARD_API_KEY:
+    api_key = getattr(config, 'DASHBOARD_API_KEY', '')
+    if not api_key:
+        logger.warning("DASHBOARD_API_KEY is empty; authentication disabled. For production, set a key.")
         return "local"
-    if credentials.credentials != config.DASHBOARD_API_KEY:
+    if credentials.credentials != api_key:
         raise HTTPException(status_code=403, detail="Invalid API key")
     return credentials.credentials
+
+# --------------------------------------------------------------------------
+# Simple in-memory rate limiter (fallback if slowapi not available)
+# --------------------------------------------------------------------------
+class SimpleRateLimiter:
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(list)
+
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window_seconds
+        self.requests[client_ip] = [t for t in self.requests[client_ip] if t > cutoff]
+        if len(self.requests[client_ip]) >= self.max_requests:
+            return False
+        self.requests[client_ip].append(now)
+        return True
+
+rate_limiter = SimpleRateLimiter(max_requests=200, window_seconds=60)
 
 # --------------------------------------------------------------------------
 # Pydantic response models
@@ -148,10 +182,41 @@ class BioRunResponse(BaseModel):
     timestamp: str
 
 # --------------------------------------------------------------------------
+# WebSocket Manager
+# --------------------------------------------------------------------------
+class WebSocketManager:
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            self.active_connections.add(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+
+    async def broadcast(self, message: str):
+        async with self._lock:
+            for connection in self.active_connections.copy():
+                try:
+                    await connection.send_text(message)
+                except Exception:
+                    self.disconnect(connection)
+
+websocket_manager = WebSocketManager()
+
+# --------------------------------------------------------------------------
 # Request logging middleware
 # --------------------------------------------------------------------------
 async def log_requests(request: Request, call_next):
     start_time = time.time()
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not rate_limiter.is_allowed(client_ip):
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
     response = await call_next(request)
     duration = time.time() - start_time
     logger.info(
@@ -160,7 +225,7 @@ async def log_requests(request: Request, call_next):
         path=request.url.path,
         status=response.status_code,
         duration_ms=round(duration * 1000, 2),
-        client=request.client.host if request.client else None,
+        client=client_ip,
     )
     return response
 
@@ -192,6 +257,21 @@ class DecisionAudit:
         self.metrics = metrics
         self.bio_core = bio_core
 
+        # Extract config dict (use getattr for safety)
+        config_dict = {
+            'distillation_epsilon': getattr(config, 'DISTILLATION_EPSILON', 0.1),
+            'distillation_epsilon_min': getattr(config, 'DISTILLATION_EPSILON_MIN', 0.01),
+            'distillation_epsilon_decay': getattr(config, 'DISTILLATION_EPSILON_DECAY', 0.995),
+            'distillation_train_every': getattr(config, 'DISTILLATION_TRAIN_EVERY', 10),
+            'distillation_replay_size': getattr(config, 'DISTILLATION_REPLAY_SIZE', 2000),
+            'distillation_learning_rate': getattr(config, 'DISTILLATION_LEARNING_RATE', 0.01),
+            'distill_weight': getattr(config, 'DISTILL_WEIGHT', 0.7),
+            'rl_weight': getattr(config, 'RL_WEIGHT', 0.3),
+            'moe_expert_count': getattr(config, 'MOE_EXPERT_COUNT', 4),
+            'pso_particles': getattr(config, 'PSO_PARTICLES', 10),
+            'pso_iterations': getattr(config, 'PSO_ITERATIONS', 20),
+        }
+
         # Instantiate new components if available and storage supports them
         self.limit_graph_manager = None
         self.modp_solver = None
@@ -209,11 +289,11 @@ class DecisionAudit:
             if hasattr(storage, 'save_preference_pair'):
                 self.rlhf_trainer = RLHFTrainer(storage)
             if hasattr(storage, 'save_bio_run'):
-                self.pso_optimizer = ParticleSwarmOptimizer(storage, config if hasattr(config, 'dict') else config.__dict__)
+                self.pso_optimizer = ParticleSwarmOptimizer(storage, config_dict)
             if hasattr(storage, 'log_routing_decision'):
-                self.moe_gating = MoEGatingNetwork(storage, config if hasattr(config, 'dict') else config.__dict__)
+                self.moe_gating = MoEGatingNetwork(storage, config_dict)
             if hasattr(storage, 'save_ga_population'):
-                self.ga_optimizer = GeneticHyperparameterOptimizer(storage, config if hasattr(config, 'dict') else config.__dict__)
+                self.ga_optimizer = GeneticHyperparameterOptimizer(storage, config_dict)
 
         self._app: Optional[FastAPI] = None
         self._server: Optional[uvicorn.Server] = None
@@ -222,10 +302,14 @@ class DecisionAudit:
         self.router = APIRouter()
         self._setup_routes()
         self.cors_origins = []
-        if config.DASHBOARD_CORS_ORIGINS:
-            self.cors_origins = [origin.strip() for origin in config.DASHBOARD_CORS_ORIGINS.split(",")]
+        cors_origins_str = getattr(config, 'DASHBOARD_CORS_ORIGINS', '')
+        if cors_origins_str:
+            self.cors_origins = [origin.strip() for origin in cors_origins_str.split(",")]
         else:
             self.cors_origins = ["*"]
+
+        # Lock for adaptive weights updates
+        self._weights_lock = asyncio.Lock()
 
     def _setup_routes(self):
         """Define all API routes."""
@@ -236,7 +320,7 @@ class DecisionAudit:
             return {
                 "status": "healthy",
                 "service": "green-agent-audit",
-                "version": "3.4.0",
+                "version": "3.4.1",
                 "new_modules": {
                     "limit_graph": self.limit_graph_manager is not None,
                     "modp": self.modp_solver is not None,
@@ -432,13 +516,14 @@ class DecisionAudit:
             """Update adaptive cost weights (admin only)."""
             if self.adaptive_cost is None:
                 raise HTTPException(status_code=404, detail="AdaptiveCostFunction not configured")
-            try:
-                self.adaptive_cost.update_weights(weights)
-                return {"status": "success", "weights": self.adaptive_cost.get_current_weights()}
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            async with self._weights_lock:
+                try:
+                    self.adaptive_cost.update_weights(weights)
+                    return {"status": "success", "weights": self.adaptive_cost.get_current_weights()}
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=str(e))
 
-        # ------------------- NEW ENDPOINTS (v3.4.0) -------------------
+        # ------------------- NEW ENDPOINTS (v3.4.1) -------------------
 
         # ----- LIMIT Graph -----
         @self.router.get("/limit-graph/{graph_id}/nodes", response_model=List[LimitGraphNodeResponse])
@@ -548,15 +633,13 @@ class DecisionAudit:
                 raise HTTPException(status_code=404, detail="MoE gating not available")
             return {"expert_names": self.moe_gating.expert_names}
 
-        # ----- WebSocket for real-time updates (optional) -----
-        # This is handled when the app is created, not in the router.
-
     # --------------------------------------------------------------------------
     # Lifecycle management
     # --------------------------------------------------------------------------
     async def start_dashboard(self):
         """Start the FastAPI server in a background thread."""
-        if not config.DASHBOARD_ENABLED:
+        dashboard_enabled = getattr(config, 'DASHBOARD_ENABLED', True)
+        if not dashboard_enabled:
             logger.info("Dashboard disabled by config.")
             return
         if self._running:
@@ -566,7 +649,7 @@ class DecisionAudit:
         # Create FastAPI app
         self._app = FastAPI(
             title="Green Agent Audit Dashboard",
-            version="3.4.0",
+            version="3.4.1",
             description="API for decision audit, benchmarks, drift events, MoE metrics, LIMIT Graph, RLHF, and bio‑inspired optimization.",
         )
 
@@ -585,21 +668,26 @@ class DecisionAudit:
         # Include router
         self._app.include_router(self.router, prefix="/api/v1")
 
-        # WebSocket endpoint for real-time updates
+        # WebSocket endpoint (authenticated)
         @self._app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
-            await websocket.accept()
+            # Authenticate
+            token = websocket.query_params.get("token")
+            if not token or token != getattr(config, 'DASHBOARD_API_KEY', ''):
+                await websocket.close(code=1008)  # Policy violation
+                return
+            await websocket_manager.connect(websocket)
             try:
                 while True:
                     data = await websocket.receive_text()
-                    # Echo for now; could push updates
+                    # Echo for now; in real system, push updates via broadcast
                     await websocket.send_text(f"Echo: {data}")
             except WebSocketDisconnect:
-                pass
+                websocket_manager.disconnect(websocket)
 
         config_kwargs = {
             "host": "0.0.0.0",
-            "port": config.DASHBOARD_PORT,
+            "port": getattr(config, 'DASHBOARD_PORT', 8000),
             "log_level": "info",
             "loop": "asyncio",
         }
@@ -616,7 +704,7 @@ class DecisionAudit:
         self._server_thread = threading.Thread(target=run_server, daemon=True)
         self._server_thread.start()
         self._running = True
-        logger.info(f"Audit dashboard started on port {config.DASHBOARD_PORT}")
+        logger.info(f"Audit dashboard started on port {config_kwargs['port']}")
 
     async def stop_dashboard(self):
         """Gracefully stop the dashboard server."""
