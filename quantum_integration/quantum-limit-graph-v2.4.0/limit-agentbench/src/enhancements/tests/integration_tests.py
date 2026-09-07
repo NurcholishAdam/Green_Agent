@@ -1,32 +1,16 @@
-# src/enhancements/tests/integration_tests_v3_0_0.py
 """
-Enhanced Integration Tests for Green Agent Components v3.0.0
+Enhanced Integration Tests for Green Agent Components v3.0.1
 =============================================================
 Comprehensive test suite covering core modules with adaptive test selection
 via Multi‑Teacher On‑Policy Distillation, plus optional MoE gating, MOEA (NSGA‑II)
 global weight evolution, RLHF preference collection, MODP state storage, and LIMIT Graph management.
 
-Changes from v2.0.0:
-- Fixed feature vector dimension to 12 (added test_importance).
-- State vectors stored in interaction logs; historical ML training implemented.
-- Emits FeedbackEvent for decisions and outcomes.
-- Safety constraints: critical tests always run.
-- Reward function includes carbon cost and test importance.
-- Automated test metadata loading from JSON.
-- Concurrency safety via asyncio.Lock.
-- Dead-letter/quarantine for repeatedly failing tests.
-- Test execution offloaded to threads.
-
-NEW in v3.0.0:
-- Added LIMIT Graph manager for test relationship modelling.
-- Added MODP solver wrapper for storing decision states/policies.
-- Added RLHF trainer for human preference collection on test selection.
-- Added MoE gating network to blend experts (run, skip).
-- Added NSGA‑II optimizer to evolve global action weights (bio‑inspired).
-- New configuration flags for enabling/disabling each component.
-- Unit tests for these new components.
-
-All previous features retained.
+Changes from v3.0.0:
+- Fixed missing Awaitable import.
+- Test failures are now propagated correctly.
+- MoE update implemented in _record_outcome.
+- NSGA‑II optimizer reused between runs.
+- Pytest hooks redesigned to avoid double execution and correctly report outcomes.
 """
 
 import pytest
@@ -43,7 +27,7 @@ import pickle
 import pandas as pd
 from datetime import datetime
 import os
-from typing import Dict, Any, List, Tuple, Optional, Set, Union
+from typing import Dict, Any, List, Tuple, Optional, Set, Union, Awaitable  # <-- FIXED
 import functools
 import logging
 from dataclasses import dataclass
@@ -458,6 +442,7 @@ class NSGAIITestOptimizer:
         self.evolution_history = []
         self.pareto_front: List[MOPDTestWeights] = []
         self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+        self._all_points: List[MOPDTestWeights] = []   # <-- FIXED: initialize
 
     def _random_individual(self) -> Dict[str, float]:
         keys = ['run', 'skip']
@@ -943,7 +928,7 @@ class AdaptiveTestRunner:
         if metadata_file and Path(metadata_file).exists():
             self.load_test_metadata(metadata_file)
 
-        logger.info("AdaptiveTestRunner initialized (v3.0.0) with MOEA, LIMIT Graph, MODP, RLHF, MoE")
+        logger.info("AdaptiveTestRunner initialized (v3.0.1) with MOEA, LIMIT Graph, MODP, RLHF, MoE")
 
     def _init_limit_graph(self):
         graph_id = "test_selection"
@@ -951,12 +936,10 @@ class AdaptiveTestRunner:
             self.limit_graph_manager.create_graph(graph_id, "Test Selection Relationships", {})
             for action in self.selector.ACTIONS:
                 self.limit_graph_manager.add_node(graph_id, f"action_{action}", action, {})
-            # Add edge between actions (fallback order)
             self.limit_graph_manager.add_edge(graph_id, "edge_run_skip", "action_run", "action_skip", 1.0, {})
 
     def register_test(self, test_name: str, category: str = 'unit',
                       duration_sec: float = 1.0, importance: float = 0.5):
-        """Register a test with its metadata."""
         self.test_metadata[test_name] = {
             'category': category,
             'duration_sec': duration_sec,
@@ -968,7 +951,6 @@ class AdaptiveTestRunner:
         }
 
     def load_test_metadata(self, filepath: str):
-        """Load test metadata from a JSON file."""
         with open(filepath, 'r') as f:
             data = json.load(f)
         for test_name, meta in data.items():
@@ -986,7 +968,6 @@ class AdaptiveTestRunner:
                      system_load: Optional[float] = None,
                      carbon_intensity: Optional[float] = None) -> TestSelectionState:
         meta = self.test_metadata.get(test_name, {})
-        # Use provided context or defaults
         if system_load is None:
             system_load = 0.5
         if carbon_intensity is None:
@@ -1023,7 +1004,7 @@ class AdaptiveTestRunner:
             passed = await self._execute_test(test_name, test_func)
             reward = self._compute_reward(passed, state)
             await self._record_outcome(test_name, action, reward, passed, state_vec=state_vec,
-                                       action_idx=0, teacher_probs=None)
+                                       action_idx=0, teacher_probs=None, state=state)
             return True
 
         state = self._build_state(test_name, system_load, carbon_intensity)
@@ -1058,17 +1039,21 @@ class AdaptiveTestRunner:
             logger.info(f"Skipping test '{test_name}' based on distillation decision")
             reward = 0.1 * (1.0 - state.test_importance)
             await self._record_outcome(test_name, 'skip', reward, passed=None,
-                                       state_vec=state_vec, action_idx=action_idx, teacher_probs=teacher_probs)
+                                       state_vec=state_vec, action_idx=action_idx,
+                                       teacher_probs=teacher_probs, state=state)
             return False
 
         passed = await self._execute_test(test_name, test_func)
         reward = self._compute_reward(passed, state)
         await self._record_outcome(test_name, 'run', reward, passed,
-                                   state_vec=state_vec, action_idx=action_idx, teacher_probs=teacher_probs)
+                                   state_vec=state_vec, action_idx=action_idx,
+                                   teacher_probs=teacher_probs, state=state)
         return True
 
     async def _execute_test(self, test_name: str, test_func) -> bool:
-        """Execute the test function in a thread to avoid blocking the event loop."""
+        """Execute the test function in a thread to avoid blocking the event loop.
+        Re-raises the exception to ensure pytest sees the failure.
+        """
         try:
             await asyncio.to_thread(test_func)
             self.failed_tests[test_name] = 0
@@ -1078,10 +1063,9 @@ class AdaptiveTestRunner:
             logger.error(f"Test '{test_name}' failed: {e}")
             if self.failed_tests[test_name] >= self.quarantine_threshold:
                 logger.warning(f"Test '{test_name}' has failed {self.failed_tests[test_name]} times, quarantining.")
-            return False
+            raise  # <-- FIXED: propagate failure
 
     def _compute_reward(self, passed: bool, state: TestSelectionState) -> float:
-        """Compute reward based on test outcome, carbon cost, and test importance."""
         base = 0.6 if passed else 0.0
         coverage_bonus = 0.2 * min(1.0, state.code_coverage_pct / 100.0)
         time_penalty = 0.1 * min(1.0, state.estimated_duration_sec / 60.0)
@@ -1094,8 +1078,9 @@ class AdaptiveTestRunner:
                               passed: Optional[bool],
                               state_vec: Optional[np.ndarray] = None,
                               action_idx: Optional[int] = None,
-                              teacher_probs: Optional[np.ndarray] = None):
-        """Record outcome, update agent, and emit FeedbackEvent."""
+                              teacher_probs: Optional[np.ndarray] = None,
+                              state: Optional[TestSelectionState] = None):
+        """Record outcome, update agent, MoE, and emit FeedbackEvent."""
         if state_vec is None:
             state_vec = self.last_state_vec
             action_idx = self.last_action_idx
@@ -1129,11 +1114,9 @@ class AdaptiveTestRunner:
                 teacher_probs
             )
 
-        # Update MoE gating if used
-        if self.moe_gating and hasattr(self, '_last_selected_expert'):
-            # Ideally, we should pass the state object to _record_outcome.
-            # For brevity, we'll skip full MoE update here.
-            pass
+        # FIXED: update MoE gating if used
+        if self.moe_gating and hasattr(self, '_last_selected_expert') and state is not None:
+            await self.moe_gating.add_training_sample(state, self._last_selected_expert, reward)
 
         # RLHF: occasionally record preference pair
         if self.rlhf_trainer and random.random() < 0.05:
@@ -1240,16 +1223,21 @@ class AdaptiveTestRunner:
                 objectives[metric] = sum(weighted_values)
             return objectives
 
-        self.moea_optimizer = NSGAIITestOptimizer(
-            evaluate_func=evaluate,
-            population_size=self.config.get('moea_population_size', 20),
-            generations=self.config.get('moea_generations', 10),
-            mutation_rate=self.config.get('moea_mutation_rate', 0.2),
-            crossover_rate=self.config.get('moea_crossover_rate', 0.8),
-            tournament_size=self.config.get('moea_tournament_size', 3),
-            objective_weights=self.config.get('moea_objective_weights'),
-            dynamic_weights=self.config.get('moea_dynamic_weights', True),
-        )
+        # FIXED: reuse existing optimizer if available
+        if self.moea_optimizer is None:
+            self.moea_optimizer = NSGAIITestOptimizer(
+                evaluate_func=evaluate,
+                population_size=self.config.get('moea_population_size', 20),
+                generations=self.config.get('moea_generations', 10),
+                mutation_rate=self.config.get('moea_mutation_rate', 0.2),
+                crossover_rate=self.config.get('moea_crossover_rate', 0.8),
+                tournament_size=self.config.get('moea_tournament_size', 3),
+                objective_weights=self.config.get('moea_objective_weights'),
+                dynamic_weights=self.config.get('moea_dynamic_weights', True),
+            )
+        else:
+            self.moea_optimizer.evaluate_func = evaluate
+
         pareto = await self.moea_optimizer.evolve()
         self.pareto_front = pareto
         if pareto:
@@ -1304,7 +1292,6 @@ def pytest_configure(config):
     """Initialize the adaptive test runner."""
     global _runner_instance
     critical = set()
-    # Example: load from config file or marker
     _runner_instance = AdaptiveTestRunner(
         config={
             'metadata_file': config.getoption('--test-metadata', default=None),
@@ -1320,7 +1307,7 @@ def pytest_configure(config):
     )
 
 def pytest_collection_modifyitems(session, config, items):
-    """Register all collected tests with metadata (if available)."""
+    """Register all collected tests with metadata."""
     if _runner_instance is None:
         return
     for item in items:
@@ -1335,22 +1322,41 @@ def pytest_collection_modifyitems(session, config, items):
         _runner_instance.register_test(test_name, category=category, duration_sec=duration, importance=importance)
 
 def pytest_runtest_call(item):
-    """Intercept test execution to allow skipping based on selector."""
+    """
+    Intercept test execution to allow skipping based on selector.
+    If the selector decides to run, let pytest run the test normally.
+    """
     if _runner_instance is None:
         return
     test_name = item.nodeid
     if test_name in _runner_instance.critical_tests:
         return
-    if test_name not in _runner_instance.test_metadata:
+
+    state = _runner_instance._build_state(test_name)
+    action, _, _, _ = asyncio.run(_runner_instance.selector.select_action(state, exploration=False))
+    if action == 'skip':
+        pytest.skip(f"Skipped by adaptive selector")
+
+def pytest_runtest_makereport(item, call):
+    """Record test outcome after execution."""
+    if _runner_instance is None:
         return
-    async def _decide():
-        return await _runner_instance.decide_and_run(test_name, lambda: item.runtest())
-    try:
-        should_run = asyncio.run(_decide())
-        if not should_run:
-            pytest.skip(f"Skipped by adaptive selector")
-    except Exception as e:
-        logger.error(f"Error in adaptive selector for {test_name}: {e}")
+    if call.when == "call":
+        test_name = item.nodeid
+        passed = not call.failed
+        state = _runner_instance._build_state(test_name)
+        reward = _runner_instance._compute_reward(passed, state)
+        action = 'run' if passed else 'skip'
+        asyncio.run(_runner_instance._record_outcome(
+            test_name,
+            action,
+            reward,
+            passed,
+            state_vec=_runner_instance.last_state_vec,
+            action_idx=_runner_instance.last_action_idx,
+            teacher_probs=_runner_instance.last_teacher_probs,
+            state=state,
+        ))
 
 
 # ============================================================================
@@ -1834,15 +1840,11 @@ class TestNewEnhancementComponents:
             "moea_enabled": True,
             "interaction_logs_path": "./test_new_components.csv",
         })
-        # Register a test
         runner.register_test("dummy_test", category="unit", duration_sec=0.1, importance=0.8)
-        # Execute
         result = await runner.decide_and_run("dummy_test", lambda: None)
-        # Check that some components were used (by checking stats)
         stats = runner.get_runner_stats()
         assert "moea" in stats
         assert "limit_graph" in stats
-        # Cleanup file if created
         if Path("./test_new_components.csv").exists():
             Path("./test_new_components.csv").unlink()
 
