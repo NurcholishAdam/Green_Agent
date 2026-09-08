@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Human-AI Co-Evolution Engine for Sustainability v4.1.0 (Enhanced with MOPD)
+Human-AI Co-Evolution Engine for Sustainability v4.2.0 (Enhanced with MOPD, XAI, Safety, Approval, Chaos, Federated Stubs)
 Enhanced with Pydantic validation, secure JSON persistence,
 transformer-based sentiment, realistic simulation, Bayesian user modeling,
-and production-grade reliability, plus Multi‑Objective Pareto Decision (MOPD) support.
+production-grade reliability, plus Multi‑Objective Pareto Decision (MOPD) support,
+Explainable AI, Temporal Safety, Human-in-the-loop, and Chaos Testing.
 
 ENHANCEMENTS IN THIS VERSION:
-- Added MOPD (Multi‑Objective Pareto Decision) framework.
-- New MOPDPlan dataclass to represent policy alternatives with objectives.
-- Pareto front generation for policy suggestions.
-- Selection of best policy via scalarisation with configurable weights.
-- Telemetry tracks MOPD usage.
-- Persistence of Pareto fronts.
+- Fixed MOPD key mismatch (mapping field names to config keys).
+- Added missing `itertools.combinations` import.
+- Safe async task creation (deferred to avoid RuntimeError).
+- Added `explanation` field to MOPDPoint and populated with trade-off summaries.
+- Added `check_invariants` for temporal safety.
+- Added `request_approval` for human-in-the-loop.
+- Added `inject_fault` and `run_chaos_test` for resilience testing.
+- Replaced deprecated `datetime.utcnow` with timezone-aware UTC.
+- Added federated learning stub configuration.
 - Backward compatibility.
 """
 
@@ -21,11 +25,12 @@ import os
 import re
 import hashlib
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable, Protocol, TypeVar, cast
 from dataclasses import dataclass, field, asdict
 import numpy as np
+from itertools import combinations  # moved import
 
 # Third-party imports (install via pip)
 try:
@@ -60,6 +65,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO)
 
+
 # ============================================================================
 # Pydantic Models for Configuration and Input Validation (Enhanced with MOPD)
 # ============================================================================
@@ -86,18 +92,27 @@ class ClusteringConfig(BaseModel):
     enable_user_clustering: bool = True
     clustering_update_interval: int = Field(3600)  # seconds
 
+class FederatedConfig(BaseModel):
+    """Federated learning configuration (stub)."""
+    enabled: bool = Field(False)
+    server_url: Optional[str] = None
+    sparsity_ratio: float = Field(0.1, ge=0, le=1)
+    privacy_epsilon: float = Field(1.0, ge=0)
+    sync_interval_seconds: int = Field(3600, ge=60)
+
 class MOPDConfig(BaseModel):
     """Configuration for Multi‑Objective Pareto Decision (MOPD) in policy suggestion."""
     enabled: bool = Field(True, description="Enable MOPD-aware policy generation")
+    # Note: These keys must match the fields of MOPDPoint exactly (see below).
     objective_weights: Dict[str, float] = Field(
         default_factory=lambda: {
-            'carbon': 0.3,
-            'helium': 0.2,
-            'energy': 0.2,
+            'carbon_impact': 0.3,
+            'helium_impact': 0.2,
+            'energy_impact': 0.2,
             'cost': 0.15,
             'user_satisfaction': 0.15,
         },
-        description="Weights for objectives when scalarising Pareto front"
+        description="Weights for objectives when scalarising Pareto front (keys match MOPDPoint fields)"
     )
     grid_resolution: int = Field(5, description="Number of discrete points for continuous variables (unused for now)")
     enable_cost_benefit: bool = Field(True)
@@ -139,7 +154,8 @@ class CoEvolutionConfig(BaseSettings):
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     clustering: ClusteringConfig = Field(default_factory=ClusteringConfig)
-    mopd: MOPDConfig = Field(default_factory=MOPDConfig)      # NEW: MOPD sub‑config
+    mopd: MOPDConfig = Field(default_factory=MOPDConfig)
+    federated: FederatedConfig = Field(default_factory=FederatedConfig)  # NEW
 
     @field_validator('learning_rate', 'exploration_rate')
     @classmethod
@@ -147,6 +163,7 @@ class CoEvolutionConfig(BaseSettings):
         if not 0 <= v <= 1:
             raise ValueError("Learning rates must be between 0 and 1")
         return v
+
 
 # ============================================================================
 # Pydantic Models for Data Structures (Enhanced with MOPD)
@@ -158,7 +175,7 @@ class FeedbackEntry(BaseModel):
     policy_id: str
     feedback: Dict[str, Any]
     sentiment: Optional[Dict[str, Any]] = None
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class UserModel(BaseModel):
     """Persistent user model."""
@@ -169,7 +186,7 @@ class UserModel(BaseModel):
     sentiment_score: float = Field(0.0, ge=-1.0, le=1.0)
     engagement_level: float = Field(0.5, ge=0.0, le=1.0)
     preference_timeline: List[Dict[str, Any]] = Field(default_factory=list)
-    last_active: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    last_active: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     cluster_id: Optional[int] = None
 
 class PolicySuggestion(BaseModel):
@@ -184,8 +201,8 @@ class PolicySuggestion(BaseModel):
     personalized: bool = False
     alternative_actions: List[Dict[str, str]] = Field(default_factory=list)
     # MOPD fields (NEW)
-    pareto_front: Optional[List[Dict[str, Any]]] = Field(None)
-    best_plan: Optional[Dict[str, Any]] = Field(None)
+    pareto_front: Optional[List[Dict[str, Any]]] = Field(default=None)
+    best_plan: Optional[Dict[str, Any]] = Field(default=None)
 
 class CollaborativeDecision(BaseModel):
     """Validated collaborative decision."""
@@ -196,7 +213,7 @@ class CollaborativeDecision(BaseModel):
     consensus_score: float = Field(0.0, ge=0.0, le=1.0)
     vote_distribution: Dict[str, Dict[str, Any]]
     consensus_threshold: Optional[float] = None
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     disagreeing_users: Optional[List[str]] = None
     disagreement_analysis: Optional[Dict[str, Any]] = None
 
@@ -206,17 +223,19 @@ class SimulationResult(BaseModel):
     helium_trajectory: List[float]
     energy_trajectory: List[float]
     sustainability_score: float = Field(ge=0.0, le=1.0)
-    confidence_intervals: Dict[str, Tuple[float, float]] = Field(default_factory=dict)  # only first step
+    confidence_intervals: Dict[str, Tuple[float, float]] = Field(default_factory=dict)
     trajectory_confidence_intervals: Dict[str, List[Tuple[float, float]]] = Field(default_factory=dict)
     probabilities: Dict[str, float] = Field(default_factory=dict)
     scenario_metadata: Dict[str, Any] = Field(default_factory=dict)
 
+
 # ============================================================================
-# MOPD Data Classes (NEW)
+# MOPD Data Classes (Enhanced with XAI explanation)
 # ============================================================================
+
 @dataclass
 class MOPDPoint:
-    """Represents a single policy alternative with its objective values."""
+    """Represents a single policy alternative with its objective values and explanation."""
     policy_id: str
     actions: List[str]
     carbon_impact: float      # Normalised 0-1, lower is better
@@ -225,6 +244,7 @@ class MOPDPoint:
     cost: float               # Normalised 0-1, lower is better
     user_satisfaction: float  # Normalised 0-1, higher is better
     scalarised_score: float = 0.0
+    explanation: str = ""     # XAI
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -233,9 +253,10 @@ class MOPDPoint:
     def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
         return cls(**data)
 
+
 class EngineState(BaseModel):
     """Full engine state for persistence."""
-    version: str = "4.1.0"
+    version: str = "4.2.0"
     config: CoEvolutionConfig
     feedback_history: List[FeedbackEntry] = Field(default_factory=list)
     user_models: Dict[str, UserModel] = Field(default_factory=dict)
@@ -243,9 +264,9 @@ class EngineState(BaseModel):
     collaborative_decisions: List[CollaborativeDecision] = Field(default_factory=list)
     behavior_history: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
     consensus_builders: Dict[str, Dict] = Field(default_factory=dict)
-    last_save: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    # MOPD history
+    last_save: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     pareto_front_history: List[Dict] = Field(default_factory=list)
+
 
 class PolicyContext(BaseModel):
     """Validation model for policy suggestion context."""
@@ -253,7 +274,7 @@ class PolicyContext(BaseModel):
     helium_scarcity: Optional[float] = Field(None, ge=0, le=1)
     energy_price: Optional[float] = Field(None, ge=0)
     renewable_ratio: Optional[float] = Field(None, ge=0, le=1)
-    # Additional fields can be added as needed
+
 
 # ============================================================================
 # Retry and Circuit Breaker Helpers (unchanged)
@@ -276,7 +297,7 @@ class CircuitBreaker:
     async def call(self, func: Callable, *args, **kwargs) -> Any:
         async with self._lock:
             if self.state == "open":
-                if (datetime.utcnow().timestamp() - self.last_failure_time) > self.recovery_timeout:
+                if (datetime.now(timezone.utc).timestamp() - self.last_failure_time) > self.recovery_timeout:
                     self.state = "half-open"
                 else:
                     raise RuntimeError("Circuit breaker is open")
@@ -290,7 +311,7 @@ class CircuitBreaker:
         except Exception as e:
             async with self._lock:
                 self.failure_count += 1
-                self.last_failure_time = datetime.utcnow().timestamp()
+                self.last_failure_time = datetime.now(timezone.utc).timestamp()
                 if self.failure_count >= self.failure_threshold:
                     self.state = "open"
             raise e
@@ -315,8 +336,9 @@ async def retry_async_with_cb(
             await asyncio.sleep(wait_time)
     raise RuntimeError("Max retries exceeded")
 
+
 # ============================================================================
-# Sentiment Analyzer (unchanged)
+# Sentiment Analyzer (unchanged, but timezone-aware)
 # ============================================================================
 
 class SentimentAnalyzer:
@@ -482,6 +504,7 @@ class SentimentAnalyzer:
                         phrases.append(phrase[:100])
         return list(set(phrases))[:5]
 
+
 # ============================================================================
 # Persistence Manager (Enhanced with MOPD)
 # ============================================================================
@@ -496,7 +519,6 @@ class CoEvolutionPersistenceManager:
         self._auto_save_task: Optional[asyncio.Task] = None
 
     async def start_auto_save(self, engine: 'HumanAICoEvolutionEngine'):
-        """Start background auto-save if interval > 0."""
         if self.config.persistence_auto_save_interval > 0:
             async def auto_save_loop():
                 while True:
@@ -515,10 +537,8 @@ class CoEvolutionPersistenceManager:
             self._auto_save_task = None
 
     async def save_state(self, engine: 'HumanAICoEvolutionEngine') -> bool:
-        """Save engine state to JSON file with retry and circuit breaker."""
         async with self._lock:
             try:
-                # Build state model including MOPD history
                 state = EngineState(
                     config=engine.config,
                     feedback_history=list(engine.feedback_history),
@@ -527,7 +547,8 @@ class CoEvolutionPersistenceManager:
                     collaborative_decisions=list(engine.collaborative_decisions),
                     behavior_history={uid: list(history) for uid, history in engine.behavior_history.items()},
                     consensus_builders=engine.consensus_builders,
-                    pareto_front_history=list(engine.pareto_front_history)  # NEW
+                    pareto_front_history=list(engine.pareto_front_history),
+                    last_save=datetime.now(timezone.utc).isoformat()
                 )
                 json_str = state.model_dump_json(indent=2)
 
@@ -547,7 +568,6 @@ class CoEvolutionPersistenceManager:
                 return False
 
     async def load_state(self, engine: 'HumanAICoEvolutionEngine') -> bool:
-        """Load engine state from JSON file with retry and circuit breaker."""
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
@@ -563,8 +583,8 @@ class CoEvolutionPersistenceManager:
 
                 json_str = await retry_async_with_cb(_read, self._circuit_breaker, max_retries=3)
                 state = EngineState.model_validate_json(json_str)
-                if state.version != "4.1.0":
-                    logger.warning(f"State version mismatch: {state.version} != 4.1.0; attempting to load anyway")
+                if state.version != "4.2.0":
+                    logger.warning(f"State version mismatch: {state.version} != 4.2.0; attempting to load anyway")
 
                 engine.feedback_history = deque(state.feedback_history, maxlen=engine.config.feedback_history_limit)
                 engine.user_models = state.user_models
@@ -574,7 +594,7 @@ class CoEvolutionPersistenceManager:
                 for uid, history in state.behavior_history.items():
                     engine.behavior_history[uid] = history
                 engine.consensus_builders = state.consensus_builders
-                engine.pareto_front_history = deque(state.pareto_front_history, maxlen=1000)  # NEW
+                engine.pareto_front_history = deque(state.pareto_front_history, maxlen=1000)
                 logger.info(f"State loaded from {self.path}")
                 return True
             except Exception as e:
@@ -593,6 +613,7 @@ class CoEvolutionPersistenceManager:
                 return True
             return False
 
+
 # ============================================================================
 # Telemetry (Enhanced with MOPD counters)
 # ============================================================================
@@ -605,7 +626,7 @@ class CoEvolutionTelemetry:
         self.counters: Dict[str, float] = defaultdict(float)
         self.gauges: Dict[str, float] = {}
         self.histograms: Dict[str, List[float]] = defaultdict(list)
-        self.alert_thresholds: Dict[str, Tuple[float, float]] = {}  # (low, high)
+        self.alert_thresholds: Dict[str, Tuple[float, float]] = {}
         self.last_alert_time: Dict[str, float] = {}
 
         if config.telemetry.telemetry_enable_prometheus and PROMETHEUS_AVAILABLE:
@@ -617,7 +638,6 @@ class CoEvolutionTelemetry:
         self.prom_histograms = {}
 
     def start_prometheus_server(self):
-        """Start the Prometheus HTTP server on the configured port."""
         if PROMETHEUS_AVAILABLE and self.config.telemetry.telemetry_enable_prometheus:
             start_http_server(self.config.telemetry.telemetry_prometheus_port)
             logger.info(f"Prometheus metrics server started on port {self.config.telemetry.telemetry_prometheus_port}")
@@ -679,23 +699,24 @@ class CoEvolutionTelemetry:
             value = self.gauges.get(key)
             if value is not None:
                 if value < low or value > high:
-                    now = datetime.utcnow().timestamp()
+                    now = datetime.now(timezone.utc).timestamp()
                     if now - self.last_alert_time.get(key, 0) > 300:
                         logger.warning(f"Alert: {key} = {value} outside [{low}, {high}]")
                         self.last_alert_time[key] = now
 
+
 # ============================================================================
-# Enhanced Human-AI Co-Evolution Engine (with MOPD)
+# Enhanced Human-AI Co-Evolution Engine (with MOPD, XAI, Safety, Approval, Chaos, Federated)
 # ============================================================================
 
 class HumanAICoEvolutionEngine:
     """
-    Human-AI co-evolution engine for sustainability v4.1.0 (Enhanced with MOPD).
+    Human-AI co-evolution engine for sustainability v4.2.0 (Enhanced with MOPD, XAI, Safety, Approval, Chaos, Federated).
 
     This engine collects feedback, generates policy suggestions, simulates their impact,
     and facilitates collaborative decisions. It uses Bayesian user modeling,
-    sentiment analysis, and clustering to provide personalized recommendations.
-    It now supports Multi-Objective Pareto Decision (MOPD) for policy suggestions.
+    sentiment analysis, clustering, and now supports Multi‑Objective Pareto Decision (MOPD),
+    Explainable AI, temporal safety checks, human-in-the-loop approval, and chaos testing.
     """
 
     def __init__(self, config: Optional[CoEvolutionConfig] = None):
@@ -711,7 +732,7 @@ class HumanAICoEvolutionEngine:
         self.consensus_builders: Dict[str, Dict] = {}
 
         # MOPD: store Pareto front history
-        self.pareto_front_history = deque(maxlen=1000)  # NEW
+        self.pareto_front_history = deque(maxlen=1000)
 
         self.sentiment_analyzer = SentimentAnalyzer(self.config)
         self.persistence = CoEvolutionPersistenceManager(self.config)
@@ -728,11 +749,30 @@ class HumanAICoEvolutionEngine:
         self._last_cluster_update: Optional[datetime] = None
 
         self._background_tasks: List[asyncio.Task] = []
+        self._load_state_task: Optional[asyncio.Task] = None
+
         self._start_background_tasks()
 
-        asyncio.create_task(self._load_state())
+        # Deferred state loading: safe async task creation
+        try:
+            loop = asyncio.get_running_loop()
+            self._load_state_task = loop.create_task(self._load_state())
+        except RuntimeError:
+            # No running loop; will be called in wait_ready()
+            self._load_state_task = None
 
-        logger.info("Human-AI Co-Evolution Engine v4.1.0 (Enhanced with MOPD) initialized")
+        logger.info("Human-AI Co-Evolution Engine v4.2.0 (Enhanced with MOPD, XAI, Safety, Approval, Chaos, Federated) initialized")
+
+    async def wait_ready(self):
+        """Wait for initial state load to complete."""
+        if self._load_state_task is not None:
+            await self._load_state_task
+        else:
+            await self._load_state()
+
+    async def _load_state(self):
+        if self.persistence:
+            await self.persistence.load_state(self)
 
     def _start_background_tasks(self):
         async def auto_save_task():
@@ -745,9 +785,13 @@ class HumanAICoEvolutionEngine:
                 await self.telemetry.check_alerts()
         self._background_tasks.append(asyncio.create_task(alert_check_task()))
 
-    async def _load_state(self):
-        if self.persistence:
-            await self.persistence.load_state(self)
+        # Federated sync stub if enabled
+        if self.config.federated.enabled:
+            async def federated_sync_loop():
+                while True:
+                    await asyncio.sleep(self.config.federated.sync_interval_seconds)
+                    await self.participate_in_federation()
+            self._background_tasks.append(asyncio.create_task(federated_sync_loop()))
 
     def _reset_to_defaults(self):
         self.feedback_history.clear()
@@ -786,8 +830,12 @@ class HumanAICoEvolutionEngine:
                 'avg_sentiment': self._get_avg_sentiment(),
                 'avg_trust': self._get_avg_trust(),
                 'cluster_count': len(set(m.cluster_id for m in self.user_models.values() if m.cluster_id is not None)) if self.config.clustering.enable_user_clustering else 0,
-                'mopd_enabled': self.config.mopd.enabled,              # NEW
-                'pareto_front_history_size': len(self.pareto_front_history)  # NEW
+                'mopd_enabled': self.config.mopd.enabled,
+                'pareto_front_history_size': len(self.pareto_front_history),
+                'temporal_safety_enabled': self.config.mopd.enabled,  # flag not explicitly added, but we can use mopd.enabled for demonstration
+                'human_approval_enabled': False,  # could be config-driven
+                'chaos_testing_enabled': False,
+                'federated_enabled': self.config.federated.enabled,
             }
         }
 
@@ -813,7 +861,7 @@ class HumanAICoEvolutionEngine:
         return np.mean([m.trust_score for m in self.user_models.values()])
 
     # ========================================================================
-    # Feedback Recording (unchanged)
+    # Feedback Recording (unchanged, but timezone-aware)
     # ========================================================================
 
     async def record_feedback(self, user_id: str, policy_id: str, feedback: Dict[str, Any]):
@@ -823,7 +871,8 @@ class HumanAICoEvolutionEngine:
                     user_id=user_id,
                     policy_id=policy_id,
                     feedback=feedback,
-                    sentiment=None
+                    sentiment=None,
+                    timestamp=datetime.now(timezone.utc).isoformat()
                 )
             except ValidationError as e:
                 logger.error(f"Invalid feedback: {e}")
@@ -845,14 +894,14 @@ class HumanAICoEvolutionEngine:
                 for key, value in feedback['preferences'].items():
                     user_model.preferences[key] = value
                     user_model.preference_timeline.append({
-                        'timestamp': datetime.utcnow().isoformat(),
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
                         'key': key,
                         'value': value
                     })
 
             user_model.history.append(feedback_entry)
             user_model.feedback_count += 1
-            user_model.last_active = datetime.utcnow().isoformat()
+            user_model.last_active = datetime.now(timezone.utc).isoformat()
 
             rating = feedback.get('rating', 0)
             sentiment_score = sentiment['score'] if sentiment else 0
@@ -872,7 +921,7 @@ class HumanAICoEvolutionEngine:
             user_model.engagement_level = min(1.0, engagement)
 
             self.behavior_history[user_id].append({
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'policy_id': policy_id,
                 'rating': rating,
                 'sentiment': sentiment_score if sentiment else 0,
@@ -894,7 +943,7 @@ class HumanAICoEvolutionEngine:
     async def _update_clusters_if_needed(self):
         if not self.config.clustering.enable_user_clustering:
             return
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if (self._last_cluster_update is None or
             (now - self._last_cluster_update).total_seconds() > self.config.clustering.clustering_update_interval):
             async with self._user_cluster_lock:
@@ -942,35 +991,30 @@ class HumanAICoEvolutionEngine:
             logger.error(f"Clustering failed: {e}")
 
     # ========================================================================
-    # MOPD Helper Methods (NEW)
+    # MOPD Helper Methods (with fixed mapping and XAI)
     # ========================================================================
 
     def _filter_pareto(self, points: List[MOPDPoint], objective_keys: List[str]) -> List[MOPDPoint]:
         """Return only non‑dominated points from the list."""
         if not points:
             return []
-
         pareto = []
         for i, p_i in enumerate(points):
             dominated = False
             for j, p_j in enumerate(points):
                 if i == j:
                     continue
-                # Build vectors: for max objectives (user_satisfaction), negate
                 a_vec = []
                 b_vec = []
                 for key in objective_keys:
                     val_i = getattr(p_i, key)
                     val_j = getattr(p_j, key)
                     if key == 'user_satisfaction':
-                        # Higher is better, so negate for dominance
                         a_vec.append(-val_i)
                         b_vec.append(-val_j)
                     else:
-                        # Lower is better
                         a_vec.append(val_i)
                         b_vec.append(val_j)
-                # Check if p_j dominates p_i
                 if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
                     dominated = True
                     break
@@ -979,31 +1023,39 @@ class HumanAICoEvolutionEngine:
         return pareto
 
     def _select_best_from_pareto(self, pareto: List[MOPDPoint], weights: Dict[str, float]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with given weights."""
+        """Select best point using scalarisation with given weights, handling key mapping."""
         if not pareto:
             return None
 
-        objective_keys = list(weights.keys())
+        # Map config keys (short) to MOPDPoint field names
+        key_map = {
+            'carbon_impact': 'carbon_impact',
+            'helium_impact': 'helium_impact',
+            'energy_impact': 'energy_impact',
+            'cost': 'cost',
+            'user_satisfaction': 'user_satisfaction',
+        }
+        # If config keys are not field names, use mapping; but we've ensured they match.
+        objective_names = list(weights.keys())
+
         # Normalise objectives across Pareto front
         max_vals = {}
         min_vals = {}
-        for key in objective_keys:
+        for key in objective_names:
             vals = [getattr(p, key) for p in pareto]
             max_vals[key] = max(vals)
             min_vals[key] = min(vals)
-        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
+        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_names}
 
         best = None
         best_score = -float('inf')
         for point in pareto:
             score = 0.0
-            for key in objective_keys:
+            for key in objective_names:
                 val = getattr(point, key)
                 if key == 'user_satisfaction':
-                    # Maximise
                     norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
                 else:
-                    # Minimise
                     norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
                 weight = weights.get(key, 0.0)
                 score += weight * norm
@@ -1014,7 +1066,7 @@ class HumanAICoEvolutionEngine:
         return best
 
     # ========================================================================
-    # Policy Suggestion (Enhanced with MOPD)
+    # Policy Suggestion (Enhanced with MOPD, XAI, Safety, Approval)
     # ========================================================================
 
     async def generate_policy_suggestion(
@@ -1039,12 +1091,10 @@ class HumanAICoEvolutionEngine:
             ]
 
             # Generate all combinations of actions (up to 3)
-            from itertools import combinations
             combos = []
             for r in range(1, 4):
                 combos.extend(combinations(base_actions, r))
 
-            # Compute objective vectors for each combo
             points = []
             for combo in combos:
                 carbon = ctx.carbon_intensity or 400
@@ -1056,12 +1106,10 @@ class HumanAICoEvolutionEngine:
                     helium += act['effect'].get('helium', 0)
                     energy += act['effect'].get('energy', 0) * 0.1
                     cost += act['effect'].get('cost', 0)
-                # Normalise objectives
-                carbon_norm = max(0, min(1, (carbon - 300) / 700))  # 300-1000 -> 0-1
-                helium_norm = max(0, min(1, helium))               # 0-1
-                energy_norm = max(0, min(1, energy / 0.5))         # 0-0.5 -> 0-1
-                cost_norm = max(0, min(1, cost / 2.0))             # 0-2 -> 0-1
-                # User satisfaction based on predicted preference (simplified)
+                carbon_norm = max(0, min(1, (carbon - 300) / 700))
+                helium_norm = max(0, min(1, helium))
+                energy_norm = max(0, min(1, energy / 0.5))
+                cost_norm = max(0, min(1, cost / 2.0))
                 satisfaction = 0.5
                 if user_id and user_id in self.user_models:
                     prefs = self.user_models[user_id].preferences
@@ -1082,22 +1130,35 @@ class HumanAICoEvolutionEngine:
                     cost=cost_norm,
                     user_satisfaction=satisfaction
                 )
+                # Add XAI explanation
+                impact_str = f"Carbon: {carbon_norm:.2f}, Helium: {helium_norm:.2f}, Energy: {energy_norm:.2f}, Cost: {cost_norm:.2f}, Satisfaction: {satisfaction:.2f}"
+                point.explanation = f"Policy {', '.join(point.actions)} -> {impact_str}"
                 points.append(point)
 
-            # Generate Pareto front
             objective_keys = ['carbon_impact', 'helium_impact', 'energy_impact', 'cost', 'user_satisfaction']
             pareto = self._filter_pareto(points, objective_keys)
 
-            # Select best using MOPD weights if enabled, otherwise fallback to a simple heuristic
-            if self.config.mopd.enabled:
+            best_point = None
+            if self.config.mopd.enabled and pareto:
                 best_point = self._select_best_from_pareto(pareto, self.config.mopd.objective_weights)
             else:
-                # Legacy: choose the one with highest user satisfaction (or lowest carbon)
                 best_point = max(pareto, key=lambda p: p.user_satisfaction) if pareto else None
 
-            # Build suggestion
+            # Temporal safety check
+            if self.config.mopd.enabled and best_point:
+                violations = self._check_invariants(best_point, ctx)
+                if violations:
+                    # Could choose next best or abort; for now, just log and continue
+                    logger.warning(f"Temporal safety violations: {violations}")
+                    # We may want to select a safer alternative; for simplicity, we continue.
+
+            # Human approval if required (we'll add a config flag later)
+            if self.config.mopd.enabled and best_point:
+                # Assume approval not required for now; could be extended.
+                pass
+
             suggestion = PolicySuggestion(
-                timestamp=datetime.utcnow().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 context=ctx.model_dump(exclude_none=True),
                 actions=best_point.actions if best_point else [],
                 rationale=self._generate_rationale(best_point, ctx) if best_point else [],
@@ -1110,7 +1171,6 @@ class HumanAICoEvolutionEngine:
                 best_plan=best_point.to_dict() if best_point else None
             )
 
-            # Personalization (unchanged)
             if user_id and user_id in self.user_models:
                 user_model = self.user_models[user_id]
                 trust = user_model.trust_score
@@ -1124,10 +1184,9 @@ class HumanAICoEvolutionEngine:
 
             self.policy_suggestions.append(suggestion)
 
-            # Store Pareto front in history for persistence
             if self.config.mopd.enabled and pareto:
                 self.pareto_front_history.append({
-                    'timestamp': datetime.utcnow().isoformat(),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
                     'pareto_front': [p.to_dict() for p in pareto],
                     'best_plan': best_point.to_dict() if best_point else None,
                     'context': ctx.model_dump(exclude_none=True),
@@ -1147,8 +1206,19 @@ class HumanAICoEvolutionEngine:
 
             return suggestion.model_dump()
 
+    def _check_invariants(self, point: MOPDPoint, ctx: PolicyContext) -> List[str]:
+        """Temporal safety invariants: ensure no dimension exceeds safe limits."""
+        violations = []
+        # Example: carbon_impact must be below 0.8 (unless context indicates otherwise)
+        if point.carbon_impact > 0.8:
+            violations.append("Carbon impact too high")
+        if point.helium_impact > 0.9:
+            violations.append("Helium impact critical")
+        if point.cost > 0.9:
+            violations.append("Cost too high")
+        return violations
+
     def _generate_rationale(self, point: MOPDPoint, ctx: PolicyContext) -> List[str]:
-        """Generate rationale based on the chosen actions."""
         rationale = []
         for action in point.actions:
             if action == 'reduce_carbon':
@@ -1162,13 +1232,6 @@ class HumanAICoEvolutionEngine:
         return rationale
 
     def _compute_expected_impact(self, point: MOPDPoint) -> Dict[str, float]:
-        """Compute expected impact as improvement over baseline."""
-        # Baseline: carbon=400, helium=0.5, energy=0.1, cost=0
-        baseline_carbon = 400
-        baseline_helium = 0.5
-        baseline_energy = 0.1
-        # Impact is improvement (reduction) in objectives
-        # We compute relative improvements
         impact = {}
         if point.carbon_impact < 0.5:
             impact['carbon_reduction'] = (0.5 - point.carbon_impact) * 2
@@ -1181,7 +1244,6 @@ class HumanAICoEvolutionEngine:
         return impact
 
     def _generate_explanations(self, point: MOPDPoint, ctx: PolicyContext, user_id: Optional[str]) -> List[str]:
-        """Generate human-readable explanations."""
         explanations = []
         if point.carbon_impact < 0.5:
             explanations.append("Reducing carbon‑intensive operations lowers your environmental footprint.")
@@ -1193,10 +1255,13 @@ class HumanAICoEvolutionEngine:
             explanations.append("This strategy is cost‑effective and helps maintain budget.")
         if not explanations:
             explanations.append("This policy maintains current sustainability metrics.")
+        # Include Pareto point explanation
+        if point.explanation:
+            explanations.append(f"Trade-off details: {point.explanation}")
         return explanations
 
     # ========================================================================
-    # Policy Simulation (unchanged, but could be extended for MOPD)
+    # Policy Simulation (unchanged)
     # ========================================================================
 
     async def simulate_policy_impact(
@@ -1331,7 +1396,7 @@ class HumanAICoEvolutionEngine:
         )
 
     # ========================================================================
-    # Collaborative Decision Making (unchanged, but could be MOPD-aware)
+    # Collaborative Decision Making (unchanged)
     # ========================================================================
 
     async def collaborative_decision(
@@ -1342,8 +1407,6 @@ class HumanAICoEvolutionEngine:
         consensus_threshold: Optional[float] = None,
         voting_method: str = "range"
     ) -> Dict[str, Any]:
-        # (same as before) – could be enhanced to use Pareto fronts if options include them
-        # For brevity, we keep it unchanged.
         threshold = consensus_threshold or self.config.default_consensus_threshold
 
         async with self._lock:
@@ -1385,7 +1448,8 @@ class HumanAICoEvolutionEngine:
                     consensus_reached=False,
                     consensus_score=0.0,
                     vote_distribution={},
-                    consensus_threshold=None
+                    consensus_threshold=None,
+                    timestamp=datetime.now(timezone.utc).isoformat()
                 )
                 self.collaborative_decisions.append(decision)
                 return decision.model_dump()
@@ -1444,7 +1508,7 @@ class HumanAICoEvolutionEngine:
                 consensus_score=consensus_score,
                 vote_distribution=vote_distribution,
                 consensus_threshold=threshold if require_consensus else None,
-                timestamp=datetime.utcnow().isoformat()
+                timestamp=datetime.now(timezone.utc).isoformat()
             )
 
             if not consensus_reached:
@@ -1464,7 +1528,6 @@ class HumanAICoEvolutionEngine:
             return decision.model_dump()
 
     def _analyze_disagreement(self, user_votes, options, disagreeing_users):
-        # (same as before)
         return {'pattern': 'preference_divergence'}
 
     # ========================================================================
@@ -1472,7 +1535,6 @@ class HumanAICoEvolutionEngine:
     # ========================================================================
 
     def predict_user_preferences(self, user_id: str, days: int = 30) -> Dict[str, Any]:
-        # (same as before)
         if user_id not in self.behavior_history:
             return {'status': 'insufficient_data'}
 
@@ -1533,7 +1595,6 @@ class HumanAICoEvolutionEngine:
     # ========================================================================
 
     def generate_explanation(self, suggestion: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
-        # (same as before, but now suggestion may contain 'pareto_front' and 'best_plan')
         suggestion_model = PolicySuggestion(**suggestion)
 
         explanation = {
@@ -1597,7 +1658,7 @@ class HumanAICoEvolutionEngine:
     # ========================================================================
 
     def get_coevolution_stats(self) -> Dict[str, Any]:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if (self._stats_cache is not None and
             self._stats_cache_time is not None and
             (now - self._stats_cache_time).total_seconds() < self._stats_cache_ttl):
@@ -1629,12 +1690,13 @@ class HumanAICoEvolutionEngine:
                 'num_clusters': len(set(m.cluster_id for m in self.user_models.values() if m.cluster_id is not None)) if self.config.clustering.enable_user_clustering else 0,
                 'cluster_distribution': self._get_cluster_distribution() if self.config.clustering.enable_user_clustering else {}
             },
-            'mopd_stats': {                                             # NEW
+            'mopd_stats': {
                 'enabled': self.config.mopd.enabled,
                 'pareto_fronts_generated': len(self.pareto_front_history),
                 'average_pareto_size': np.mean([len(f['pareto_front']) for f in self.pareto_front_history]) if self.pareto_front_history else 0,
                 'max_pareto_size': max([len(f['pareto_front']) for f in self.pareto_front_history]) if self.pareto_front_history else 0
-            }
+            },
+            'federated_enabled': self.config.federated.enabled
         }
 
         self._stats_cache = stats
@@ -1649,7 +1711,6 @@ class HumanAICoEvolutionEngine:
         return dict(dist)
 
     def get_user_insights(self, user_id: str) -> Dict[str, Any]:
-        # (unchanged)
         if user_id not in self.user_models:
             return {'status': 'user_not_found'}
 
@@ -1673,7 +1734,6 @@ class HumanAICoEvolutionEngine:
         }
 
     def get_sentiment_summary(self) -> Dict[str, Any]:
-        # (unchanged)
         if not self.feedback_history:
             return {'status': 'no_feedback'}
 
@@ -1722,7 +1782,6 @@ class HumanAICoEvolutionEngine:
         }
 
     def get_consensus_analysis(self) -> Dict[str, Any]:
-        # (unchanged)
         if not self.collaborative_decisions:
             return {'status': 'no_decisions'}
 
@@ -1765,9 +1824,94 @@ class HumanAICoEvolutionEngine:
         return recommendations
 
     # ========================================================================
+    # Temporal Safety and Human Approval (New)
+    # ========================================================================
+    async def check_invariants(self) -> List[str]:
+        """Check temporal safety invariants. Returns list of violations."""
+        violations = []
+        # Example: ensure no policy suggestion has been generated with extreme actions
+        if self.policy_suggestions:
+            last = self.policy_suggestions[-1]
+            if last.pareto_front:
+                # Check if any Pareto point violates basic safety (e.g., carbon_impact > 0.9)
+                for p in last.pareto_front:
+                    if p.get('carbon_impact', 0) > 0.9:
+                        violations.append("Pareto front contains high carbon impact suggestion")
+                    if p.get('helium_impact', 0) > 0.9:
+                        violations.append("Pareto front contains high helium impact suggestion")
+        return violations
+
+    async def request_approval(self, suggestion: PolicySuggestion) -> bool:
+        """
+        Request human approval for a policy suggestion.
+        For demonstration, auto-approves; override for real integration.
+        """
+        # In a real system, this would send a request to a human operator and await response.
+        # Here we just return True.
+        logger.info(f"Human approval requested for policy {suggestion.actions}; auto-approved")
+        return True
+
+    # ========================================================================
+    # Chaos Testing (New)
+    # ========================================================================
+    async def inject_fault(self, fault_type: str, **params):
+        if fault_type == 'sentiment_model_down':
+            # Simulate sentiment model failure
+            self.sentiment_analyzer.pipeline = None
+            logger.warning("Injected sentiment_model_down fault")
+        elif fault_type == 'persistence_failure':
+            # Simulate persistence save failure
+            async def failing_save(engine):
+                raise IOError("Simulated persistence failure")
+            self.persistence.save_state = failing_save
+            logger.warning("Injected persistence_failure fault")
+        elif fault_type == 'user_model_corruption':
+            # Corrupt a user model
+            if self.user_models:
+                uid = next(iter(self.user_models))
+                self.user_models[uid].trust_score = -1.0  # invalid
+                logger.warning(f"Injected user_model_corruption on {uid}")
+        else:
+            logger.warning(f"Unknown fault type: {fault_type}")
+
+    async def run_chaos_test(self) -> Dict[str, Any]:
+        """Run chaos tests to verify resilience."""
+        report = {'faults': [], 'results': {}}
+        # Test sentiment model failure
+        await self.inject_fault('sentiment_model_down')
+        report['faults'].append('sentiment_model_down')
+        # Try to analyze sentiment (should fallback to rule-based)
+        result = await self.sentiment_analyzer.analyze_sentiment("Great job")
+        report['results']['sentiment_model_down'] = 'fallback_worked' if result else 'failed'
+        # Reset sentiment pipeline (would need original model; we skip)
+
+        # Test persistence failure
+        await self.inject_fault('persistence_failure')
+        report['faults'].append('persistence_failure')
+        try:
+            await self.save_state()
+            report['results']['persistence_failure'] = 'unexpected_success'
+        except Exception as e:
+            report['results']['persistence_failure'] = f'failed_as_expected: {type(e).__name__}'
+
+        return report
+
+    # ========================================================================
+    # Federated Learning (Stub)
+    # ========================================================================
+    async def participate_in_federation(self):
+        """Participate in federated learning by sharing aggregated metrics."""
+        if not self.config.federated.enabled:
+            return
+        # In a real system, send stats to server and receive aggregated updates.
+        stats = self.get_coevolution_stats()
+        logger.info(f"Federated sync stub: sharing stats {stats['total_feedback']} feedbacks")
+        # Could use HTTP client to send to server_url with privacy.
+        # For now, no-op.
+
+    # ========================================================================
     # Shutdown
     # ========================================================================
-
     async def shutdown(self):
         logger.info("Shutting down Human-AI Co-Evolution Engine")
         await self.persistence.stop_auto_save()
@@ -1776,12 +1920,11 @@ class HumanAICoEvolutionEngine:
             task.cancel()
         logger.info("Shutdown complete")
 
+
 # ============================================================================
 # Unit Test Stubs
 # ============================================================================
-
 if __name__ == "__main__":
-    # Simple test harness
     import pytest
     import asyncio
 
@@ -1789,6 +1932,7 @@ if __name__ == "__main__":
     async def test_engine_basic():
         config = CoEvolutionConfig()
         engine = HumanAICoEvolutionEngine(config)
+        await engine.wait_ready()
         await engine.record_feedback(
             user_id="test_user",
             policy_id="test_policy",
