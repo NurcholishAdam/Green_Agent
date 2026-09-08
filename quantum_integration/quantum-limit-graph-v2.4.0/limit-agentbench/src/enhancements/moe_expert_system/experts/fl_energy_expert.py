@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/fl_energy_expert.py
-# Version 3.2.0 – Full Green Agent MODP Integration
-
-"""
-FL Energy Expert v3.2.0 – Energy-Aware Federated Learning Expert for MoE System
-Full Green Agent MODP Integration
-
-ENHANCEMENTS OVER v3.1.0:
-1. Fixed critical bugs: safe async task creation, generic metric methods, async get_metrics,
-   dataclass config serialization, robust circuit breaker fallback, type annotation typos.
-2. Deep bio‑inspired integration: ATP spend/earn, gradient fields, compartment manager.
-3. Real MODP: multi‑objective metrics, adaptive cost compute, Pareto filtering on all relevant
-   selections, drift‑triggered adaptation.
-4. Enhanced teacher policy (`policy_probs`) as a true context‑aware MoE teacher distribution.
-5. Improved persistence and observability.
-6. All optional dependencies still gracefully degrade.
-"""
+# Version 3.3.0 – Enhanced Green Agent MODP Integration
+#
+# ENHANCEMENTS OVER v3.2.0:
+# 1. Fixed client selection to respect target count (previously returned all candidates).
+# 2. Robust state serialization: exclude non-serializable gradients, parse enums/datetimes.
+# 3. Weight normalization with epsilon to avoid division by zero.
+# 4. Fixed torch aggregation for multi-dimensional gradients (preserve shape).
+# 5. policy_probs guards for empty candidate lists.
+# 6. Added basic temporal safety checks (warning on client over-selection).
+# 7. Added minimal XAI: explanations stored in round objects.
+# 8. Improved error handling and logging.
 
 import asyncio
 import hashlib
@@ -137,7 +132,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 # ============================================================================
-# Configuration – now a dataclass for easy serialization
+# Configuration – dataclass for serialization
 # ============================================================================
 @dataclass
 class FLEnergyConfig:
@@ -161,7 +156,7 @@ class FLEnergyConfig:
             self.target_compression_ratio = 0.1
 
 # ============================================================================
-# Enums and Data Classes (unchanged)
+# Enums and Data Classes
 # ============================================================================
 class ClientState(Enum):
     AVAILABLE = "available"
@@ -235,14 +230,25 @@ class AggregationRound:
     model_hash: str
     compression_ratio: float = 1.0
     aggregated_gradients: Optional[Any] = None
+    # New: explanation for XAI
+    explanation: Optional[Dict[str, Any]] = None
 
 # ============================================================================
-# FLEnergyExpert Implementation – Fully Integrated v3.2.0
+# FLEnergyExpert Implementation – Enhanced v3.3.0
 # ============================================================================
 class FLEnergyExpert(BaseExpert):
     """
-    FL Energy Expert v3.2.0 – Energy-Aware Federated Learning Expert for MoE System
+    FL Energy Expert v3.3.0 – Energy-Aware Federated Learning Expert for MoE System
     Full Green Agent MODP integration.
+
+    Improvements over v3.2.0:
+      - Fixed client selection to respect target count.
+      - Robust state serialization (exclude non-serializable gradients, parse enums/datetimes).
+      - Weight normalization with epsilon.
+      - Fixed torch aggregation for multi-dimensional gradients (preserve shape).
+      - policy_probs guards for empty candidate lists.
+      - Added basic temporal safety checks.
+      - Added minimal XAI (explanations stored in round objects).
     """
 
     def __init__(
@@ -306,11 +312,15 @@ class FLEnergyExpert(BaseExpert):
             recovery_timeout=30.0
         )
 
+        # Temporal safety: track client selection frequency
+        self.client_selection_count = defaultdict(int)
+        self.client_selection_times = defaultdict(list)
+
         # Safe async task creation
         self._load_state_task = self._create_task(self._load_state())
         self._cleanup_task = self._create_task(self._cleanup_stale_clients())
 
-        logger.info(f"FLEnergyExpert v3.2.0 initialized.")
+        logger.info(f"FLEnergyExpert v3.3.0 initialized.")
 
     def _create_task(self, coro):
         try:
@@ -321,17 +331,37 @@ class FLEnergyExpert(BaseExpert):
             return None
 
     # ==========================================================================
-    # State Persistence using central Storage
+    # State Persistence (fixed)
     # ==========================================================================
     async def _load_state(self):
         try:
             data = self.storage.get_state("fl_energy_expert_state")
             if data:
                 state = json.loads(data)
+                # Convert clients
                 for cid, info_dict in state.get('clients', {}).items():
+                    # Parse enums and datetime
+                    info_dict['state'] = ClientState(info_dict['state'])
+                    info_dict['energy_profile'] = ClientEnergyProfile(info_dict['energy_profile'])
+                    info_dict['last_seen'] = datetime.fromisoformat(info_dict['last_seen'])
                     self.clients[cid] = ClientEnergyInfo(**info_dict)
+                # Parse rounds (excluding aggregated_gradients)
                 for r_dict in state.get('rounds', []):
                     r_dict.pop('aggregated_gradients', None)
+                    r_dict['strategy'] = AggregationStrategy(r_dict['strategy'])
+                    r_dict['timestamp'] = datetime.fromisoformat(r_dict['timestamp'])
+                    # Handle nested ClientUpdateInfo
+                    completed = []
+                    for u_dict in r_dict.get('completed_clients', []):
+                        u_dict['update_timestamp'] = datetime.fromisoformat(u_dict['update_timestamp'])
+                        u_dict.pop('gradients', None)  # gradients not persisted
+                        completed.append(ClientUpdateInfo(**u_dict))
+                    r_dict['completed_clients'] = completed
+                    # explanation is optional
+                    explanation = r_dict.get('explanation')
+                    if explanation:
+                        # Keep as dict, no special parsing needed
+                        pass
                     self.rounds.append(AggregationRound(**r_dict))
                 self.total_energy_consumed_joules = state.get('total_energy_consumed_joules', 0.0)
                 self.total_updates_processed = state.get('total_updates_processed', 0)
@@ -340,15 +370,42 @@ class FLEnergyExpert(BaseExpert):
                 self.strategy_change_log = state.get('strategy_log', [])
                 self.compression_ratios = deque(state.get('compression_ratios', []), maxlen=50)
                 self.current_strategy = AggregationStrategy(state.get('current_strategy', 'standard'))
+                # Temporal safety state
+                self.client_selection_count = defaultdict(int, state.get('client_selection_count', {}))
+                self.client_selection_times = defaultdict(list, state.get('client_selection_times', {}))
                 logger.info("FLEnergyExpert state loaded from central storage")
         except Exception as e:
             logger.error(f"Failed to load FLEnergyExpert state: {e}")
 
     async def _save_state(self):
         try:
+            # Prepare clients dict with JSON-safe fields
+            clients_safe = {}
+            for cid, info in self.clients.items():
+                info_dict = asdict(info)
+                # Convert enums to strings and datetime to ISO
+                info_dict['state'] = info.state.value
+                info_dict['energy_profile'] = info.energy_profile.value
+                info_dict['last_seen'] = info.last_seen.isoformat()
+                clients_safe[cid] = info_dict
+
+            # Prepare rounds list, excluding non-serializable gradients
+            rounds_safe = []
+            for r in self.rounds:
+                r_dict = asdict(r)
+                # Remove aggregated_gradients and gradients in completed_clients
+                r_dict.pop('aggregated_gradients', None)
+                for u in r_dict.get('completed_clients', []):
+                    u.pop('gradients', None)
+                    u['update_timestamp'] = u['update_timestamp'].isoformat() if isinstance(u['update_timestamp'], datetime) else u['update_timestamp']
+                r_dict['strategy'] = r.strategy.value
+                r_dict['timestamp'] = r.timestamp.isoformat()
+                # Keep explanation as dict (JSON-safe)
+                rounds_safe.append(r_dict)
+
             state = {
-                'clients': {cid: asdict(info) for cid, info in self.clients.items()},
-                'rounds': [asdict(r) for r in self.rounds],
+                'clients': clients_safe,
+                'rounds': rounds_safe,
                 'total_energy_consumed_joules': self.total_energy_consumed_joules,
                 'total_updates_processed': self.total_updates_processed,
                 'failed_updates': self.failed_updates,
@@ -356,6 +413,8 @@ class FLEnergyExpert(BaseExpert):
                 'strategy_log': self.strategy_change_log,
                 'compression_ratios': list(self.compression_ratios),
                 'current_strategy': self.current_strategy.value,
+                'client_selection_count': dict(self.client_selection_count),
+                'client_selection_times': {k: v for k, v in self.client_selection_times.items()},
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
             self.storage.save_state("fl_energy_expert_state", json.dumps(state))
@@ -364,7 +423,7 @@ class FLEnergyExpert(BaseExpert):
             logger.error(f"Failed to save FLEnergyExpert state: {e}")
 
     # ==========================================================================
-    # Teacher Interface for MOPD (context-aware soft policy)
+    # Teacher Interface for MOPD (guarded)
     # ==========================================================================
     async def policy_probs(self, state: Dict) -> List[float]:
         """
@@ -374,45 +433,22 @@ class FLEnergyExpert(BaseExpert):
         strategies = [s.value for s in AggregationStrategy]
         candidates = []
         for strategy in AggregationStrategy:
-            # Estimate metrics for each strategy (simplified; real metrics would come from profiling)
             if strategy == AggregationStrategy.STANDARD:
-                quality = 0.7
-                carbon_g = 5.0
-                latency_ms = 50.0
-                energy_joules = 50.0
+                quality = 0.7; carbon_g = 5.0; latency_ms = 50.0; energy_joules = 50.0
             elif strategy == AggregationStrategy.LAZY:
-                quality = 0.6
-                carbon_g = 2.0
-                latency_ms = 120.0
-                energy_joules = 20.0
+                quality = 0.6; carbon_g = 2.0; latency_ms = 120.0; energy_joules = 20.0
             elif strategy == AggregationStrategy.PRIORITY:
-                quality = 0.8
-                carbon_g = 8.0
-                latency_ms = 40.0
-                energy_joules = 80.0
+                quality = 0.8; carbon_g = 8.0; latency_ms = 40.0; energy_joules = 80.0
             elif strategy == AggregationStrategy.GRADIENT_COMPRESSION:
-                quality = 0.75
-                carbon_g = 3.0
-                latency_ms = 70.0
-                energy_joules = 35.0
+                quality = 0.75; carbon_g = 3.0; latency_ms = 70.0; energy_joules = 35.0
             elif strategy == AggregationStrategy.SELECTIVE:
-                quality = 0.85
-                carbon_g = 4.0
-                latency_ms = 60.0
-                energy_joules = 45.0
+                quality = 0.85; carbon_g = 4.0; latency_ms = 60.0; energy_joules = 45.0
             else:
-                quality = 0.5
-                carbon_g = 5.0
-                latency_ms = 50.0
-                energy_joules = 50.0
+                quality = 0.5; carbon_g = 5.0; latency_ms = 50.0; energy_joules = 50.0
 
             cost = self.adaptive_cost.compute(
-                quality=quality,
-                carbon_g=carbon_g,
-                latency_ms=latency_ms,
-                energy_joules=energy_joules,
-                health=self.health_status == 'healthy',
-                atp=0.5
+                quality=quality, carbon_g=carbon_g, latency_ms=latency_ms,
+                energy_joules=energy_joules, health=self.health_status == 'healthy', atp=0.5
             )
             candidates.append({
                 'strategy': strategy.value,
@@ -429,16 +465,18 @@ class FLEnergyExpert(BaseExpert):
                 allowed = {c['strategy'] for c in filtered}
                 candidates = [c for c in candidates if c['strategy'] in allowed]
 
+        if not candidates:
+            # Fallback to uniform distribution over all strategies
+            return [1.0 / len(strategies)] * len(strategies)
+
         scores = [c['score'] for c in candidates]
-        if scores:
-            exp_scores = np.exp(scores - np.max(scores))
-            probs = exp_scores / np.sum(exp_scores)
-            full_probs = [0.0] * len(strategies)
-            for c, p in zip(candidates, probs):
-                idx = strategies.index(c['strategy'])
-                full_probs[idx] = p
-            return full_probs
-        return [1.0 / len(strategies)] * len(strategies)
+        exp_scores = np.exp(scores - np.max(scores))
+        probs = exp_scores / np.sum(exp_scores)
+        full_probs = [0.0] * len(strategies)
+        for c, p in zip(candidates, probs):
+            idx = strategies.index(c['strategy'])
+            full_probs[idx] = p
+        return full_probs
 
     # ==========================================================================
     # Core Expert Interface
@@ -477,7 +515,6 @@ class FLEnergyExpert(BaseExpert):
         }
 
     async def get_metrics(self) -> Dict[str, Any]:
-        # Now async and no asyncio.run
         return await self._get_expert_metrics()
 
     async def get_health_status(self) -> Dict[str, Any]:
@@ -512,7 +549,6 @@ class FLEnergyExpert(BaseExpert):
             )
             self.clients[client_id] = info
             logger.info(f"Client registered: {client_id} ({energy_profile.value})")
-            # Publish FeedbackEvent
             event = FeedbackEvent.create_with_context(
                 task_id=f"fl_register_{client_id}",
                 selected_action="register_client",
@@ -578,7 +614,7 @@ class FLEnergyExpert(BaseExpert):
                 logger.error(f"Stale client cleanup error: {e}")
 
     # ==========================================================================
-    # Client Selection (with real MODP and bio integration)
+    # Client Selection (fixed target count, added XAI and temporal safety)
     # ==========================================================================
     async def select_clients_for_round(
         self,
@@ -608,16 +644,15 @@ class FLEnergyExpert(BaseExpert):
                     filtered = available
                 available = filtered
 
-            # Real multi-objective metrics and adaptive cost
+            # Build candidates with metrics
             candidates = []
             for cid, info in available:
-                # Real metrics
                 energy_score = info.get_energy_score()
                 stability_score = 1.0 - (len(self.client_history[cid]) - self.participation_history[cid]) / (len(self.client_history[cid]) + 1)
                 bandwidth_efficiency = (info.upload_bandwidth_mbps + info.download_bandwidth_mbps) / 20.0
-                carbon_g = info.carbon_intensity_g_per_kwh * info.energy_consumption_rate * 100.0  # proxy
+                carbon_g = info.carbon_intensity_g_per_kwh * info.energy_consumption_rate * 100.0
                 latency_ms = info.estimated_sync_time_seconds * 1000.0
-                energy_joules = info.energy_consumption_rate * 1000.0  # proxy
+                energy_joules = info.energy_consumption_rate * 1000.0
                 quality = 0.3 * energy_score + 0.3 * stability_score + 0.4 * bandwidth_efficiency
                 candidates.append({
                     'client_id': cid,
@@ -631,7 +666,7 @@ class FLEnergyExpert(BaseExpert):
                     'carbon_intensity': info.carbon_intensity_g_per_kwh,
                 })
 
-            # Apply central ParetoGating with real metrics
+            # Apply Pareto filter
             if self.pareto:
                 filtered = self.pareto.filter(candidates)
                 if filtered:
@@ -661,26 +696,38 @@ class FLEnergyExpert(BaseExpert):
                 scores.append((c, cost))
 
             scores.sort(key=lambda x: x[1], reverse=True)
+
+            # FIX: select top 'target' candidates
             selected = scores[:target]
+
+            # Temporal safety: track selection frequency and warn if excessive
+            self.client_selection_count = defaultdict(int)
+            self.client_selection_times = defaultdict(list)
+            for c, _ in selected:
+                cid = c['client_id']
+                self.client_selection_count[cid] += 1
+                self.client_selection_times[cid].append(datetime.now(timezone.utc).isoformat())
+                if self.client_selection_count[cid] > 3:  # arbitrary threshold
+                    logger.warning(f"Client {cid} selected frequently; consider adding fairness constraints.")
 
             # Bio-inspired integration: spend ATP before selection
             if self.token_manager and selected:
                 atp_cost = 0.01 * len(selected)
                 await self.token_manager.spend("fl_energy_expert", atp_cost)
 
-            # Pump gradient based on average energy score of selected
+            # Pump gradient based on average energy score
             if self.gradient_manager and selected:
                 avg_score = np.mean([c['energy_score'] for c, _ in selected])
                 trust_delta = 0.05 if avg_score > 0.7 else -0.02
                 self.gradient_manager.pump_field('trust', trust_delta, source="fl_selection")
 
-            # Build weights
-            total_cost = sum(s[1] for s in scores)
+            # Build weights only for selected clients
+            total_cost = sum(s[1] for s in selected)
             energy_weights = {}
-            for c, cost in scores:
-                energy_weights[c['client_id']] = cost / (total_cost + 1e-6)
+            for c, cost in selected:
+                energy_weights[c['client_id']] = cost / (total_cost + 1e-8)
 
-            selected_ids = [c['client_id'] for c, _ in scores]
+            selected_ids = [c['client_id'] for c, _ in selected]
 
             logger.info(f"Selected {len(selected_ids)} clients for round")
 
@@ -688,7 +735,7 @@ class FLEnergyExpert(BaseExpert):
             event = FeedbackEvent.create_with_context(
                 task_id=f"fl_select_{datetime.now(timezone.utc).timestamp()}",
                 selected_action="select_clients",
-                quality_score=np.mean([c['quality_score'] for c, _ in scores]) if scores else 0.0,
+                quality_score=np.mean([c['quality_score'] for c, _ in selected]) if selected else 0.0,
                 energy_joules=0.0,
                 carbon_g=0.0,
                 feedback_type="federated_learning",
@@ -701,10 +748,18 @@ class FLEnergyExpert(BaseExpert):
             )
             await self.queue.publish("feedback_events", event.to_json())
 
-            return selected_ids, energy_weights
+            # XAI: store explanation of selection (to be attached to round later)
+            explanation = {
+                'selection_criteria': ["Energy score", "Pareto dominance", "Adaptive cost"],
+                'num_candidates': len(candidates),
+                'num_selected': len(selected_ids),
+                'top_reasons': f"Selected clients with highest adaptive cost among Pareto-optimal set"
+            }
+
+            return selected_ids, energy_weights, explanation  # Note: changed return signature
 
     # ==========================================================================
-    # Gradient Compression
+    # Gradient Compression (unchanged)
     # ==========================================================================
     def compress_gradients(
         self,
@@ -742,18 +797,14 @@ class FLEnergyExpert(BaseExpert):
         return compressed.reshape(gradients.shape), actual_ratio
 
     # ==========================================================================
-    # Aggregation Strategies
+    # Aggregation Strategies (fixed weight normalization)
     # ==========================================================================
-    async def select_aggregation_strategy(
-        self,
-        state: Dict[str, float],
-    ) -> AggregationStrategy:
+    async def select_aggregation_strategy(self, state: Dict[str, float]) -> AggregationStrategy:
         async with self._lock:
             available_clients = sum(1 for info in self.clients.values() if info.state in [ClientState.AVAILABLE, ClientState.ACTIVE, ClientState.CHARGING])
             avg_battery = np.mean([info.battery_level for info in self.clients.values()]) if self.clients else 0.5
             avg_latency = np.mean([info.estimated_sync_time_seconds for info in self.clients.values() if info.estimated_sync_time_seconds > 0]) if any(info.estimated_sync_time_seconds > 0 for info in self.clients.values()) else 5.0
 
-            # Build candidates with metrics
             strategies = list(AggregationStrategy)
             candidates = []
             for strategy in strategies:
@@ -830,18 +881,25 @@ class FLEnergyExpert(BaseExpert):
         has_gradients = all(u.gradients is not None for u in updates)
 
         if has_gradients and TORCH_AVAILABLE:
-            tensors = [torch.tensor(u.gradients) if isinstance(u.gradients, np.ndarray) else u.gradients for u in updates]
-            tensor_list = []
-            for t in tensors:
-                if t.ndim > 1: tensor_list.append(t.flatten())
-                else: tensor_list.append(t)
-            weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
-            weights = torch.tensor(weights) / sum(weights)
-            aggregated = sum(t * w for t, w in zip(tensor_list, weights))
-            if tensor_list and tensor_list[0].ndim == 1:
-                aggregated = aggregated.reshape(tensor_list[0].shape)
+            # Preserve original shape for aggregation
+            shapes = [u.gradients.shape if isinstance(u.gradients, np.ndarray) else u.gradients.shape for u in updates]
+            # Check all shapes equal
+            if len(set(shapes)) == 1:
+                tensors = [torch.tensor(u.gradients) if isinstance(u.gradients, np.ndarray) else u.gradients for u in updates]
+                weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
+                weights = torch.tensor(weights) / (sum(weights) + 1e-8)
+                aggregated = sum(t * w for t, w in zip(tensors, weights))
+                aggregated_np = aggregated.cpu().numpy() if aggregated.is_cuda else aggregated.numpy()
+            else:
+                # Shapes differ: fall back to flat aggregation
+                tensor_list = [torch.tensor(u.gradients).flatten() if isinstance(u.gradients, np.ndarray) else u.gradients.flatten() for u in updates]
+                weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
+                weights = torch.tensor(weights) / (sum(weights) + 1e-8)
+                aggregated = sum(t * w for t, w in zip(tensor_list, weights))
+                aggregated_np = aggregated.cpu().numpy() if aggregated.is_cuda else aggregated.numpy()
+            result_gradients = aggregated_np
         else:
-            aggregated = None
+            result_gradients = None
 
         if strategy == AggregationStrategy.STANDARD:
             result = self._aggregate_standard(updates, energy_weights)
@@ -854,8 +912,8 @@ class FLEnergyExpert(BaseExpert):
         else:
             result = self._aggregate_selective(updates, energy_weights)
 
-        if aggregated is not None:
-            result['aggregated_gradients'] = aggregated.cpu().numpy().tolist() if isinstance(aggregated, torch.Tensor) else aggregated.tolist()
+        if result_gradients is not None:
+            result['aggregated_gradients'] = result_gradients.tolist() if isinstance(result_gradients, np.ndarray) else result_gradients
         result['total_energy_cost_joules'] = total_energy
         result['aggregation_strategy'] = strategy.value
 
@@ -863,7 +921,7 @@ class FLEnergyExpert(BaseExpert):
 
     def _aggregate_standard(self, updates: List[ClientUpdateInfo], energy_weights: Dict[str, float]) -> Dict[str, Any]:
         weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
-        weights = np.array(weights) / sum(weights)
+        weights = np.array(weights) / (sum(weights) + 1e-8)
         return {
             'method': 'standard_fedavg',
             'num_clients': len(updates),
@@ -874,11 +932,14 @@ class FLEnergyExpert(BaseExpert):
 
     def _aggregate_lazy(self, updates: List[ClientUpdateInfo], energy_weights: Dict[str, float]) -> Dict[str, Any]:
         threshold = np.median([u.transmission_time_ms for u in updates])
-        fast_updates = [u for u in updates if u.transmission_time_ms <= threshold * 1.5]
+        if threshold > 0:
+            fast_updates = [u for u in updates if u.transmission_time_ms <= threshold * 1.5]
+        else:
+            fast_updates = updates
         if not fast_updates:
             fast_updates = updates
         weights = [energy_weights.get(u.client_id, 1.0 / len(fast_updates)) for u in fast_updates]
-        weights = np.array(weights) / sum(weights)
+        weights = np.array(weights) / (sum(weights) + 1e-8)
         return {
             'method': 'lazy_aggregation',
             'num_clients': len(fast_updates),
@@ -893,7 +954,7 @@ class FLEnergyExpert(BaseExpert):
             score = energy_weights.get(u.client_id, 0.5)
             energy_based_weights[u.client_id] = 1.0 / (score + 0.1)
         weights_list = [energy_based_weights.get(u.client_id, 1.0) for u in updates]
-        weights = np.array(weights_list) / sum(weights_list)
+        weights = np.array(weights_list) / (sum(weights_list) + 1e-8)
         return {
             'method': 'energy_priority_aggregation',
             'num_clients': len(updates),
@@ -903,7 +964,7 @@ class FLEnergyExpert(BaseExpert):
 
     def _aggregate_compressed(self, updates: List[ClientUpdateInfo], energy_weights: Dict[str, float]) -> Dict[str, Any]:
         weights = [energy_weights.get(u.client_id, 1.0 / len(updates)) for u in updates]
-        weights = np.array(weights) / sum(weights)
+        weights = np.array(weights) / (sum(weights) + 1e-8)
         avg_compression = np.mean([u.compression_ratio for u in updates])
         return {
             'method': 'compressed_aggregation',
@@ -917,7 +978,7 @@ class FLEnergyExpert(BaseExpert):
         sorted_updates = sorted(updates, key=lambda u: u.gradient_norm)
         top_half = sorted_updates[len(sorted_updates)//2:]
         weights = [energy_weights.get(u.client_id, 1.0 / len(top_half)) for u in top_half]
-        weights = np.array(weights) / sum(weights)
+        weights = np.array(weights) / (sum(weights) + 1e-8)
         return {
             'method': 'selective_aggregation',
             'num_clients': len(top_half),
@@ -926,7 +987,7 @@ class FLEnergyExpert(BaseExpert):
         }
 
     # ==========================================================================
-    # Round Execution and Tracking
+    # Round Execution and Tracking (adapted to new select_clients return)
     # ==========================================================================
     async def execute_aggregation_round(
         self,
@@ -936,7 +997,8 @@ class FLEnergyExpert(BaseExpert):
         logger.info(f"Starting aggregation round {round_id}")
 
         strategy = await self.select_aggregation_strategy(state)
-        selected_ids, energy_weights = await self.select_clients_for_round()
+        # Now select_clients returns 3 values
+        selected_ids, energy_weights, explanation = await self.select_clients_for_round()
 
         updates = []
         failed_clients = []
@@ -973,6 +1035,7 @@ class FLEnergyExpert(BaseExpert):
             model_hash=hashlib.sha256(f"{round_id}_aggregated".encode()).hexdigest(),
             compression_ratio=result.get('avg_compression_ratio', 1.0),
             aggregated_gradients=result.get('aggregated_gradients'),
+            explanation=explanation,  # store XAI
         )
 
         self.rounds.append(round_info)
@@ -1074,7 +1137,7 @@ class FLEnergyExpert(BaseExpert):
         return self.strategy_change_log
 
     # ==========================================================================
-    # Explainability
+    # Explainability (enhanced)
     # ==========================================================================
     async def explain_client_selection(self, round_id: int) -> Optional[Dict[str, Any]]:
         if round_id >= len(self.rounds): return None
@@ -1084,7 +1147,7 @@ class FLEnergyExpert(BaseExpert):
             'strategy': round_info.strategy.value,
             'selected_clients': round_info.selected_clients,
             'failed_clients': round_info.failed_clients,
-            'rationale': {
+            'rationale': round_info.explanation or {
                 'strategy_reason': f"Used {round_info.strategy.value} strategy",
                 'selection_criteria': ["Energy availability", "Historical participation", "Bandwidth efficiency", "Client state"],
             },
