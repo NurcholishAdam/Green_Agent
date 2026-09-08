@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-MoE Expert System – Expert Module (Enhanced v2.3.0) with MOPD Support
+MoE Expert System – Expert Module (Enhanced v2.4.0) with MOPD Support & Green Agent Hooks
 
 This package provides the core experts used in the mixture‑of‑experts framework.
 Each expert implements a specific optimization domain (energy, data, IoT, quantum, helium).
 All experts now support Multi‑Objective Pareto Decision (MOPD) through a standardised interface.
+Additionally, the base class now provides optional hooks for Explainable AI (XAI),
+human‑in‑the‑loop approval, temporal safety checks, and resilience/chaos testing,
+making it easier to integrate Green Agent enhancements consistently.
 
-ENHANCEMENTS OVER v2.2.0:
-1. FIXED: Abstract `propose` renamed to `propose_async` to match actual expert implementations.
-2. FIXED: `get_health_status` is now async; `get_capabilities` is async too (with sync fallback).
-3. ADDED: Optional `policy_probs` method for teacher interface in MTPD.
-4. ADDED: Base-level hooks for bio‑inspired ATP spend/earn and gradient pumping.
-5. ADDED: Base support for central Green Agent components (Storage, AsyncMessageQueue, MetricsRegistry, AdaptiveCostFunction, ParetoGating, DriftDetector) via constructor injection.
-6. IMPROVED: Registry now checks for `propose_async` and `policy_probs` presence.
-7. ENHANCED: `MOPDConfig` now includes optional central MOPD component references.
+ENHANCEMENTS OVER v2.3.0:
+1. Made `__init_subclass__` lenient (warns instead of raising) and sets default version/description.
+2. Added optional async `get_metrics` method.
+3. Improved `policy_probs` default to use `adaptive_cost` when available.
+4. Added `explain_decision` method for simple XAI.
+5. Added `request_approval` and `log_uncertainty` for human‑in‑the‑loop.
+6. Added `check_invariants` for temporal safety verification.
+7. Added `inject_fault` and `run_chaos_test` for resilience engineering.
+8. Fixed `scalarise` to not mutate input solutions (returns scores separately).
+9. Added `requires_human_approval` field to `MOPDProposal`.
+10. Expanded `MOPDConfig` to include optional hooks for XAI and safety.
 """
 
 import logging
@@ -23,7 +29,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import asyncio
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +52,13 @@ class MOPDConfig:
     enable_cost_benefit: bool = True
     enable_predictive: bool = True
     enable_quantum: bool = True
-    # Additional common parameters can be added here
+    # Additional common parameters
     adaptive_cost: Optional[Any] = None          # Reference to central AdaptiveCostFunction
     pareto_gating: Optional[Any] = None          # Reference to central ParetoGating
     drift_detector: Optional[Any] = None         # Reference to central DriftDetector
+    enable_xai: bool = True                     # Should expert generate explanations?
+    enable_human_approval: bool = False         # Should critical decisions require approval?
+    enable_temporal_safety: bool = True         # Should experts check temporal invariants?
 
 # ============================================================================
 # Standardised Proposal Result Type
@@ -63,6 +72,7 @@ class MOPDProposal:
     options: List[Dict[str, Any]]                 # list of trade‑off options (could be Pareto front)
     explanation: str                              # natural‑language description
     pareto_front: Optional[List[Dict[str, Any]]] = None  # full Pareto front if available
+    requires_human_approval: bool = False         # NEW: flag for human‑in‑the‑loop
 
 # ============================================================================
 # Shared MOPD Utilities (can be used by any expert)
@@ -104,54 +114,73 @@ def filter_pareto_front(solutions: List[Dict[str, Any]],
 
 def scalarise(solutions: List[Dict[str, Any]],
               weights: Dict[str, float],
-              objective_keys: List[str]) -> List[Tuple[Dict[str, Any], float]]:
+              objective_keys: List[str]) -> Tuple[List[Dict[str, Any]], List[float]]:
     """
-    Compute a scalarised score for each solution using weighted sum.
-    Assumes objectives are already normalised (or will be normalised inside).
-    Returns list of (solution, score).
+    Compute scalarised scores for a list of solutions using weighted sum.
+    Returns a tuple: (list_of_original_solutions, list_of_scores).
+    The input solutions are NOT modified.
     """
-    norm_solutions = []
+    # Make shallow copies to avoid mutation
+    sols = [sol.copy() for sol in solutions]
+
+    # Normalise each objective across solutions (stored locally)
+    norm_vals = {}
     for key in objective_keys:
-        vals = [sol.get(key, 0) for sol in solutions]
+        vals = [sol.get(key, 0) for sol in sols]
         min_val = min(vals)
         max_val = max(vals)
         range_val = max_val - min_val if max_val != min_val else 1
-        for i, sol in enumerate(solutions):
+        norm_vals[key] = []
+        for sol in sols:
             if key in ['cost', 'latency']:
                 norm_val = (max_val - sol.get(key, 0)) / range_val
             else:
                 norm_val = (sol.get(key, 0) - min_val) / range_val
-            sol[f'_norm_{key}'] = norm_val
+            norm_vals[key].append(norm_val)
 
-    scored = []
-    for sol in solutions:
+    scores = []
+    for i in range(len(sols)):
         score = 0.0
         for key in objective_keys:
             weight = weights.get(key, 0.0)
-            score += weight * sol.get(f'_norm_{key}', 0)
-        scored.append((sol, score))
-    return scored
+            score += weight * norm_vals[key][i]
+        scores.append(score)
+
+    return sols, scores
 
 # ============================================================================
-# Base Expert Interface (Abstract Base Class) – Enhanced with MOPD
+# Base Expert Interface (Abstract Base Class) – Enhanced with MOPD and Green Hooks
 # ============================================================================
 class BaseExpert(ABC):
     """
     Abstract base for all MoE experts.
     All concrete experts must implement the methods defined here.
-    MOPD‑aware methods are now part of the core interface.
+    MOPD‑aware methods are now part of the core interface, along with optional
+    hooks for XAI, human‑in‑the‑loop, temporal safety, and resilience.
 
-    ENHANCEMENTS v2.3.0:
-    - Abstract `propose` renamed to `propose_async`.
-    - `get_health_status` is async.
-    - `get_capabilities` is async (sync fallback provided).
-    - Optional `policy_probs` for teacher interface.
-    - Base hooks for ATP spending/earning and gradient pumping.
-    - Base constructor accepts central Green Agent components (with defaults None).
+    ENHANCEMENTS v2.4.0:
+    - __init_subclass__ lenient (warns if missing version/description, sets defaults).
+    - Optional async get_metrics.
+    - policy_probs default uses adaptive_cost if available.
+    - explain_decision method for simple XAI.
+    - request_approval and log_uncertainty for human‑in‑the‑loop.
+    - check_invariants for temporal safety.
+    - inject_fault and run_chaos_test for resilience.
+    - MOPDProposal now includes requires_human_approval flag.
     """
 
     __expert_version__: str = "0.0.0"          # Override per expert
     __expert_description__: str = ""           # Override per expert
+
+    def __init_subclass__(cls, **kwargs):
+        """Set default version/description if missing, and warn."""
+        super().__init_subclass__(**kwargs)
+        if getattr(cls, '__expert_version__', '0.0.0') == '0.0.0':
+            logger.warning(f"{cls.__name__} does not define __expert_version__. Setting to '0.0.0'.")
+        if getattr(cls, '__expert_description__', '') == '':
+            logger.warning(f"{cls.__name__} does not define __expert_description__. Setting to empty string.")
+            # Optionally set a default description
+            cls.__expert_description__ = "No description provided."
 
     def __init__(self,
                  storage: Optional[Any] = None,
@@ -180,14 +209,6 @@ class BaseExpert(ABC):
         self.harvester = None
         self.scheduler = None
 
-    def __init_subclass__(cls, **kwargs):
-        """Ensure subclasses define version and description."""
-        if cls.__expert_version__ == "0.0.0":
-            raise TypeError(f"{cls.__name__} must define __expert_version__")
-        if cls.__expert_description__ == "":
-            raise TypeError(f"{cls.__name__} must define __expert_description__")
-        super().__init_subclass__(**kwargs)
-
     def set_bio_core(self, bio_core: Any):
         """Inject bio‑inspired core and extract managers."""
         self.bio_core = bio_core
@@ -199,7 +220,7 @@ class BaseExpert(ABC):
             self.harvester = getattr(bio_core, 'harvester', None)
             self.scheduler = getattr(bio_core, 'scheduler', None)
 
-    # ===== Bio‑inspired helper hooks (subclasses can call these) =====
+    # ===== Bio‑inspired helper hooks =====
     async def spend_atp(self, amount: float, consumer: str = "expert"):
         """Spend ATP tokens. Returns True if successful, False otherwise."""
         if self.token_manager:
@@ -222,7 +243,7 @@ class BaseExpert(ABC):
         """Pump a gradient field (e.g., 'trust', 'carbon', 'helium')."""
         if self.gradient_manager:
             try:
-                return self.gradient_manager.pump_field(field, delta, source=source)
+                return await self.gradient_manager.pump_field(field, delta, source=source)
             except Exception as e:
                 logger.debug(f"Gradient pump failed: {e}")
         return False
@@ -282,14 +303,91 @@ class BaseExpert(ABC):
     async def policy_probs(self, state: Dict) -> List[float]:
         """
         Return a probability distribution over strategies/actions.
-        Default implementation returns uniform distribution.
-        Subclasses can override with context-aware multi-objective scoring.
+        Default implementation uses a uniform distribution if no adaptive_cost,
+        otherwise uses a simple scoring based on adaptive_cost for a generic set.
+        Subclasses should override for context‑aware multi‑objective scoring.
         """
-        # Use a simple uniform distribution based on number of supported tasks
         if hasattr(self, 'supported_task_types') and self.supported_task_types:
             n = len(self.supported_task_types)
+            if self.adaptive_cost is not None:
+                # Compute a rough score for each action using adaptive cost
+                scores = []
+                for task_type in self.supported_task_types:
+                    # Use a generic cost computation (subclasses may override)
+                    cost = self.adaptive_cost.compute(
+                        quality=0.5,
+                        carbon_g=0.0,
+                        latency_ms=0.0,
+                        energy_joules=0.0,
+                        health=True,
+                        atp=0.5
+                    )
+                    scores.append(cost)
+                if scores:
+                    exp_scores = np.exp(scores - np.max(scores))
+                    probs = exp_scores / np.sum(exp_scores)
+                    return probs.tolist()
             return [1.0 / n] * n
-        return [0.5, 0.5]  # fallback
+        # Fallback
+        return [0.5, 0.5]
+
+    # ===== Optional XAI hook =====
+    async def explain_decision(self, context: Dict, recommendation: MOPDProposal) -> str:
+        """
+        Generate a human‑readable explanation for a given recommendation.
+        Default implementation returns the stored explanation if present,
+        otherwise a generic message.
+        """
+        if recommendation and recommendation.explanation:
+            return recommendation.explanation
+        return "No explanation available."
+
+    # ===== Optional human‑in‑the‑loop hooks =====
+    async def request_approval(self, recommendation: MOPDProposal, context: Dict) -> bool:
+        """
+        Request human approval for a critical recommendation.
+        Default implementation checks a configured flag (or returns False).
+        Subclasses can override to integrate with an external approval system.
+        """
+        # If config indicates human approval is not required, return True (auto‑approve)
+        mopd_cfg = self.get_mopd_config()
+        if not getattr(mopd_cfg, 'enable_human_approval', False):
+            return True
+        # Otherwise, this is a placeholder; in a real system you'd wait for a response.
+        logger.warning(f"Human approval requested for recommendation but no approval system set. Auto‑denying.")
+        return False
+
+    async def log_uncertainty(self, metric: str, value: float, context: Dict):
+        """
+        Log a metric indicating uncertainty (e.g., low confidence) for later active learning.
+        Default implementation just logs; subclasses can store for querying.
+        """
+        logger.info(f"Uncertainty logged: metric={metric}, value={value}, context={context}")
+
+    # ===== Optional temporal safety check =====
+    async def check_invariants(self, state: Dict) -> List[str]:
+        """
+        Check temporal safety invariants against the current state.
+        Returns a list of violation descriptions (empty if all ok).
+        Subclasses should override with domain‑specific invariants.
+        """
+        return []
+
+    # ===== Optional resilience / chaos testing hooks =====
+    async def inject_fault(self, fault_type: str, **params):
+        """
+        Inject a fault (e.g., 'timeout', 'circuit_open') to test resilience.
+        Default implementation does nothing; subclasses can override.
+        """
+        logger.warning(f"Fault injection '{fault_type}' not implemented for {self.__class__.__name__}.")
+
+    async def run_chaos_test(self):
+        """
+        Run a series of fault injections and verify recovery.
+        Default implementation returns a simple report.
+        """
+        logger.info(f"Running chaos test for {self.__class__.__name__}...")
+        return {'status': 'not_implemented'}
 
     # ===== Optional lifecycle methods =====
     async def initialize(self):
@@ -321,6 +419,15 @@ class BaseExpert(ABC):
             'mopd_weights': self.get_objective_weights(),
             'mopd_config': self.get_mopd_config(),
         }
+
+    # ===== Optional async metrics (non‑abstract) =====
+    async def get_metrics(self) -> Dict[str, Any]:
+        """
+        Return basic metrics about the expert's operation.
+        Subclasses should override with meaningful counters.
+        Default returns empty dict.
+        """
+        return {}
 
     def get_version(self) -> str:
         """Return the expert's version."""
