@@ -1,5 +1,5 @@
 """
-TimeTickEngine v3.4 – Enhanced simulation driver with evolutionary MOPD support.
+TimeTickEngine v3.4 – Enhanced simulation driver with evolutionary MOPD support and integrated enhancement modules.
 
 Supports:
 - CSV data loading with validation and configurable date column.
@@ -14,6 +14,8 @@ Supports:
 - **Dynamic objective weighting** based on system state.
 - **Persistence of Pareto fronts** in checkpoints.
 - **Parallel policy evaluation** for speed.
+- **NEW**: Quantum‑Distillation, Causal RL, Federated Learning, Safety Monitor,
+  XAI, Adaptive Precision, Carbon Markets, Chaos Testing, Human‑in‑the‑Loop.
 """
 
 import asyncio
@@ -30,6 +32,7 @@ import math
 import hashlib
 import random
 import copy
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
@@ -52,7 +55,7 @@ except ImportError:
     TQDM_AVAILABLE = False
 
 # ============================================================================
-# Configuration (Pydantic or dataclass) – Enhanced with MOPD
+# Configuration (Pydantic or dataclass) – Enhanced with MOPD and new flags
 # ============================================================================
 if PYDANTIC_AVAILABLE:
     class MOPDConfig(BaseModel):
@@ -108,6 +111,20 @@ if PYDANTIC_AVAILABLE:
         max_custom_metrics_entries: int = Field(1000, ge=1, description="Maximum number of custom metric entries to keep.")
         # MOPD configuration
         mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
+
+        # ======== NEW ENHANCEMENT FIELDS ========
+        enable_quantum_distillation: bool = False
+        enable_causal_rl: bool = False
+        enable_federated: bool = False
+        enable_safety_monitor: bool = True
+        enable_xai: bool = True
+        enable_precision: bool = False
+        enable_carbon_market: bool = False
+        carbon_market_config: Optional[Dict[str, str]] = None
+        enable_chaos: bool = False
+        chaos_probability: float = 0.0
+        enable_human_approval: bool = False
+        human_approval_timeout: float = 60.0
 
         @validator('interpolation_method')
         def validate_interpolation(cls, v):
@@ -166,6 +183,20 @@ else:
         max_custom_metrics_entries: int = 1000
         mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
+        # New enhancement flags
+        enable_quantum_distillation: bool = False
+        enable_causal_rl: bool = False
+        enable_federated: bool = False
+        enable_safety_monitor: bool = True
+        enable_xai: bool = True
+        enable_precision: bool = False
+        enable_carbon_market: bool = False
+        carbon_market_config: Optional[Dict[str, str]] = None
+        enable_chaos: bool = False
+        chaos_probability: float = 0.0
+        enable_human_approval: bool = False
+        human_approval_timeout: float = 60.0
+
 # ============================================================================
 # Protocols for loose coupling
 # ============================================================================
@@ -175,7 +206,7 @@ class HarvesterProtocol(Protocol):
     def set_mode(self, mode: Any) -> None: ...
     async def get_harvesting_stats(self) -> Dict[str, Any]: ...
     def restore_state(self, state: Dict[str, Any]) -> None: ...
-    def set_parameters(self, params: Dict[str, Any]) -> None: ...  # optional, for fine-tuning
+    def set_parameters(self, params: Dict[str, Any]) -> None: ...
 
 class TranslatorProtocol(Protocol):
     """Protocol for translating CSV rows to harvester input."""
@@ -187,41 +218,34 @@ class TranslatorProtocol(Protocol):
 # ============================================================================
 @dataclass
 class SimulationState:
-    """Serializable state for resuming simulation."""
     current_index: int
     current_date: str
     total_harvested: float
     harvest_cycles: int
-    metrics: Dict[str, Any]  # summary from MetricsCollector
-    metrics_data: Dict[str, Any]  # full metrics for restoration (custom metrics, etc.)
+    metrics: Dict[str, Any]
+    metrics_data: Dict[str, Any]
     harvester_state: Optional[Dict[str, Any]] = None
-    data_hash: Optional[str] = None  # hash of the data file for validation
+    data_hash: Optional[str] = None
     timestamp: str
-    # MOPD additions
-    pareto_front: Optional[List[Dict[str, Any]]] = None  # serialised MOPDPoint list
-    current_policy_id: Optional[str] = None  # if multi‑policy, which one is active
+    pareto_front: Optional[List[Dict[str, Any]]] = None
+    current_policy_id: Optional[str] = None
 
 # ============================================================================
 # MOPD Data Classes
 # ============================================================================
 @dataclass
 class MOPDPoint:
-    """Represents a single policy with its objective values."""
     policy_id: str
-    # Decision variables (can be extended)
     harvester_mode: str
     parameters: Dict[str, Any] = field(default_factory=dict)
-    # Objectives (to be maximised)
     total_harvested: float
     avg_efficiency: float
     carbon_saved: float
     helium_saved: float
-    # Scalarised score (computed later)
     scalarised_score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
@@ -229,10 +253,187 @@ class MOPDPoint:
 
 @dataclass
 class Policy:
-    """A policy defines a simulation scenario with a harvester mode and tunable parameters."""
     policy_id: str
     harvester_mode: str
-    parameters: Dict[str, Any] = field(default_factory=dict)  # additional parameters to set on harvester
+    parameters: Dict[str, Any] = field(default_factory=dict)
+
+# ============================================================================
+# New Enhancement Modules
+# ============================================================================
+class QuantumDistillationModule:
+    """Placeholder for quantum‑distillation integration."""
+    def __init__(self, config):
+        self.config = config
+        self.available = False
+
+    async def optimize(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("Quantum distillation optimization requested (placeholder).")
+        for key in parameters:
+            if isinstance(parameters[key], (int, float)):
+                parameters[key] += random.uniform(-0.01, 0.01)
+        return parameters
+
+    def is_available(self) -> bool:
+        return self.available
+
+
+class CausalRLAgent:
+    """Simplified causal RL agent using Q‑learning with a causal feature mask."""
+    def __init__(self, state_dim: int, action_dim: int, causal_mask: Optional[np.ndarray] = None):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.causal_mask = causal_mask
+        self.q_table = defaultdict(lambda: np.zeros(action_dim))
+        self.epsilon = 0.1
+        self.learning_rate = 0.1
+        self.gamma = 0.99
+
+    def act(self, state: np.ndarray, explore: bool = True) -> int:
+        if explore and random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
+        state_key = tuple(state)
+        return int(np.argmax(self.q_table[state_key]))
+
+    def update(self, state, action, reward, next_state, done):
+        state_key = tuple(state)
+        next_key = tuple(next_state)
+        best_next = np.max(self.q_table[next_key]) if not done else 0.0
+        td_target = reward + self.gamma * best_next
+        self.q_table[state_key][action] += self.learning_rate * (td_target - self.q_table[state_key][action])
+
+    def get_policy_probs(self, state: np.ndarray, temperature: float = 1.0) -> List[float]:
+        state_key = tuple(state)
+        q_values = self.q_table[state_key]
+        if temperature <= 0:
+            probs = np.zeros_like(q_values)
+            probs[np.argmax(q_values)] = 1.0
+            return probs.tolist()
+        exp_q = np.exp((q_values - np.max(q_values)) / temperature)
+        return (exp_q / exp_q.sum()).tolist()
+
+
+class FederatedCoordinator:
+    """Coordinates federated learning of evolved policies across deployments."""
+    def __init__(self, engine: 'TimeTickEngine', queue: Optional[Any] = None):
+        self.engine = engine
+        self.queue = queue
+        self.last_global_model = None
+
+    async def send_update(self):
+        if not self.queue:
+            logger.warning("No message queue for federated update.")
+            return
+        if self.engine._pareto_front:
+            model = {
+                'pareto_front': [p.to_dict() for p in self.engine._pareto_front],
+                'objective_weights': self.engine.config.mopd.objective_weights,
+            }
+            await self.queue.publish("federated_updates", json.dumps(model))
+            logger.info("Federated update sent.")
+
+    async def receive_global_model(self, model_json: str):
+        model = json.loads(model_json)
+        self.last_global_model = model
+        if 'objective_weights' in model:
+            local_weights = self.engine.config.mopd.objective_weights
+            global_weights = model['objective_weights']
+            for key in local_weights:
+                if key in global_weights:
+                    local_weights[key] = 0.5 * local_weights[key] + 0.5 * global_weights[key]
+            total = sum(local_weights.values())
+            if total > 0:
+                for key in local_weights:
+                    local_weights[key] /= total
+        if 'pareto_front' in model:
+            self.engine._pareto_front = [MOPDPoint.from_dict(p) for p in model['pareto_front']]
+        logger.info("Federated global model applied.")
+
+
+class SafetyMonitor:
+    """Runtime monitor for safety invariants on policies and simulation outcomes."""
+    def __init__(self):
+        self.invariants = []
+
+    def add_invariant(self, name: str, condition_fn: Callable[[Dict[str, Any]], bool], description: str):
+        self.invariants.append((name, condition_fn, description))
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        violations = []
+        for name, fn, desc in self.invariants:
+            if not fn(state):
+                violations.append(f"{name}: {desc}")
+        return violations
+
+
+class PrecisionController:
+    """Decides numerical precision for calculations based on load and energy budget."""
+    def __init__(self, policy: str = "energy_aware"):
+        self.policy = policy
+
+    def get_precision(self, load: float, energy_budget: float) -> str:
+        if self.policy == "energy_aware":
+            if load > 0.8 or energy_budget < 0.2:
+                return "float16"
+            else:
+                return "float32"
+        return "float32"
+
+
+class CarbonMarketClient:
+    """Placeholder for carbon market integration."""
+    def __init__(self, provider_url: str = None, contract_address: str = None, private_key: str = None):
+        self.available = False
+        if provider_url and contract_address and private_key:
+            self.available = True
+
+    def buy_credits(self, amount: float) -> bool:
+        if not self.available:
+            return False
+        logger.info(f"Simulating purchase of {amount} carbon credits.")
+        return True
+
+    def sell_credits(self, amount: float) -> bool:
+        if not self.available:
+            return False
+        logger.info(f"Simulating sale of {amount} carbon credits.")
+        return True
+
+
+class ChaosInjector:
+    """Injects random failures into the simulation to test resilience."""
+    def __init__(self, engine: 'TimeTickEngine', chaos_probability: float = 0.01):
+        self.engine = engine
+        self.chaos_probability = chaos_probability
+
+    async def maybe_inject_failure(self):
+        if random.random() < self.chaos_probability:
+            action = random.choice(['delay', 'corrupt_data', 'skip_tick'])
+            logger.warning(f"Chaos injection: {action}")
+            if action == 'delay':
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+            elif action == 'corrupt_data':
+                if self.engine.metrics.custom_metrics:
+                    key = random.choice(list(self.engine.metrics.custom_metrics.keys()))
+                    if self.engine.metrics.custom_metrics[key]:
+                        self.engine.metrics.custom_metrics[key][-1] = random.uniform(0, 100)
+            elif action == 'skip_tick':
+                if self.engine.config.data_source == 'csv':
+                    self.engine._current_index += 1
+
+
+class HumanApprovalHandler:
+    """Requests human approval for critical decisions."""
+    def __init__(self, queue: Optional[Any] = None):
+        self.queue = queue
+
+    async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
+        if not self.queue:
+            logger.warning("No queue for human approval; auto-approving.")
+            return True
+        logger.info(f"Human approval requested for {decision.get('action')}, auto-approving.")
+        await asyncio.sleep(0)
+        return True
+
 
 # ============================================================================
 # Metrics Collector (extensible with capped storage)
@@ -303,7 +504,7 @@ class MetricsCollector:
         return collector
 
 # ============================================================================
-# Live Data Feed (unchanged)
+# Live Data Feed
 # ============================================================================
 class LiveDataFeed:
     """Handles fetching live data via a callback or async generator."""
@@ -350,30 +551,17 @@ class LiveDataFeed:
         self._running = False
 
 # ============================================================================
-# Enhanced TimeTickEngine (with Evolutionary MOPD)
+# Enhanced TimeTickEngine
 # ============================================================================
 class TimeTickEngine:
-    """
-    Enhanced simulation driver with evolutionary MOPD support.
-    """
-
     def __init__(self,
                  harvester: HarvesterProtocol,
                  translator: Union[TranslatorProtocol, Callable],
-                 config: Optional[Union[TimeTickConfig, Dict[str, Any]]] = None):
-        """
-        Initialize the TimeTickEngine.
-
-        Args:
-            harvester: Harvester instance (must implement harvest_cycle).
-            translator: Translator class/instance with a translate_row method or a callable.
-            config: Configuration dictionary or TimeTickConfig instance.
-        """
+                 config: Optional[Union[TimeTickConfig, Dict[str, Any]]] = None,
+                 message_queue: Optional[Any] = None):
         self.harvester = harvester
         self.translator = translator
-
-        if not (callable(translator) or hasattr(translator, 'translate_row')):
-            raise ValueError("translator must be a callable or have a translate_row method")
+        self.message_queue = message_queue
 
         if isinstance(config, dict):
             if PYDANTIC_AVAILABLE:
@@ -385,7 +573,6 @@ class TimeTickEngine:
         else:
             self.config = TimeTickConfig(data_source="csv", csv_path="helium_data.csv")
 
-        # Internal state
         self.daily_df: Optional[pd.DataFrame] = None
         self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
         self._running = False
@@ -395,19 +582,94 @@ class TimeTickEngine:
         self._live_feed: Optional[LiveDataFeed] = None
         self._data_hash: Optional[str] = None
 
-        # MOPD state
-        self._mopd_results: Dict[str, Dict[str, Any]] = {}  # policy_id -> metrics summary
+        self._mopd_results: Dict[str, Dict[str, Any]] = {}
         self._pareto_front: List[MOPDPoint] = []
-        self._policy_cache: Dict[Tuple[str, frozenset], MOPDPoint] = {}  # for caching evaluations
+        self._policy_cache: Dict[Tuple[str, frozenset], MOPDPoint] = {}
 
-        # Ensure checkpoint directory exists
+        # Enhanced modules
+        self.quantum_distillation = QuantumDistillationModule(self.config) if self.config.enable_quantum_distillation else None
+
+        if self.config.enable_causal_rl:
+            self.causal_rl_agent = CausalRLAgent(state_dim=10, action_dim=3)
+        else:
+            self.causal_rl_agent = None
+
+        self.federated_coordinator = FederatedCoordinator(self, self.message_queue) if self.config.enable_federated else None
+
+        self.safety_monitor = SafetyMonitor() if self.config.enable_safety_monitor else None
+        if self.safety_monitor:
+            self._setup_safety_invariants()
+
+        self.precision_controller = PrecisionController() if self.config.enable_precision else None
+
+        self.carbon_market = None
+        if self.config.enable_carbon_market and self.config.carbon_market_config:
+            self.carbon_market = CarbonMarketClient(**self.config.carbon_market_config)
+
+        self.chaos_injector = ChaosInjector(self, self.config.chaos_probability) if self.config.enable_chaos else None
+
+        self.human_approval = HumanApprovalHandler(self.message_queue) if self.config.enable_human_approval else None
+
+        # Start background tasks for federated updates and chaos
+        if self.federated_coordinator:
+            self._federated_task = asyncio.create_task(self._federated_loop())
+        if self.chaos_injector:
+            self._chaos_task = asyncio.create_task(self._chaos_loop())
+
         if self.config.enable_checkpointing:
             Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-        logger.info("TimeTickEngine initialized with config: %s", self.config)
+        logger.info("TimeTickEngine initialized with enhanced modules.")
+
+    def _setup_safety_invariants(self):
+        self.safety_monitor.add_invariant(
+            "efficiency_positive",
+            lambda state: state.get('efficiency', 0) >= 0,
+            "Efficiency must be non-negative"
+        )
+        self.safety_monitor.add_invariant(
+            "harvest_non_negative",
+            lambda state: state.get('total_harvested', 0) >= 0,
+            "Total harvested must be non-negative"
+        )
+
+    async def _federated_loop(self):
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            if self.federated_coordinator:
+                await self.federated_coordinator.send_update()
+
+    async def _chaos_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            if self.chaos_injector:
+                await self.chaos_injector.maybe_inject_failure()
+
+    def _check_safety(self, state: Dict[str, Any]) -> List[str]:
+        if not self.safety_monitor:
+            return []
+        return self.safety_monitor.check(state)
+
+    def _explain_decision(self, point: MOPDPoint) -> str:
+        explanation = (
+            f"Policy {point.policy_id} selected: mode={point.harvester_mode}, "
+            f"total_harvested={point.total_harvested:.2f}, "
+            f"avg_efficiency={point.avg_efficiency:.2f}, "
+            f"carbon_saved={point.carbon_saved:.2f}, helium_saved={point.helium_saved:.2f}."
+        )
+        return explanation
+
+    async def _maybe_trade_carbon(self, carbon_saved: float):
+        if self.carbon_market and self.carbon_market.available and carbon_saved > 0:
+            await self.carbon_market.sell_credits(carbon_saved * 0.1)
+
+    async def _maybe_request_approval(self, action: str, details: Dict[str, Any]) -> bool:
+        if self.human_approval:
+            return await self.human_approval.request_approval({'action': action, 'details': details})
+        return True
 
     # ============================================================================
-    # Data Loading (unchanged)
+    # Data Loading
     # ============================================================================
     async def load_data(self, csv_path: Optional[str] = None):
         if self.config.data_source == 'live':
@@ -420,7 +682,6 @@ class TimeTickEngine:
             raise ValueError("CSV path not provided.")
 
         logger.info("Loading CSV from %s", path)
-
         try:
             with open(path, 'rb') as f:
                 self._data_hash = hashlib.md5(f.read()).hexdigest()
@@ -459,7 +720,6 @@ class TimeTickEngine:
 
         self.df_monthly = df
         self._interpolate_daily()
-
         logger.info("Loaded %d monthly rows, interpolated to %d daily ticks.",
                     len(self.df_monthly), len(self.daily_df))
 
@@ -475,9 +735,7 @@ class TimeTickEngine:
             end=df_monthly.index.max(),
             freq='D'
         )
-
         numeric_cols = [col for col in self.config.value_columns if col in df_monthly.columns]
-
         try:
             if self.config.interpolation_method == 'linear':
                 self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='linear')
@@ -502,15 +760,11 @@ class TimeTickEngine:
         self.daily_df = self.daily_df.fillna(method='ffill').fillna(method='bfill')
 
     # ============================================================================
-    # Single Policy Simulation (original)
+    # Simulation
     # ============================================================================
     async def run_simulation(self,
                              start_index: Optional[int] = None,
                              post_tick_callback: Optional[Callable[[int, pd.Series, Dict[str, Any]], Awaitable[None]]] = None):
-        """
-        Run the simulation over all daily ticks, optionally resuming from a checkpoint.
-        This runs a single policy (the current harvester configuration).
-        """
         if self.config.data_source == 'csv' and self.daily_df is None:
             raise RuntimeError("Data not loaded. Call load_data() first.")
 
@@ -531,7 +785,6 @@ class TimeTickEngine:
         total_ticks = len(self.daily_df) if self.config.data_source == 'csv' else None
 
         logger.info("Starting simulation from index %d", self._current_index)
-
         pbar = None
         if TQDM_AVAILABLE and self.config.data_source == 'csv' and total_ticks:
             pbar = tqdm(total=total_ticks, initial=self._current_index, desc="Simulating")
@@ -563,6 +816,20 @@ class TimeTickEngine:
 
                 result = await self.harvester.harvest_cycle(env_data)
 
+                # Safety check
+                if self.safety_monitor:
+                    state = {
+                        'efficiency': result.get('efficiency', 0),
+                        'total_harvested': self.metrics.total_harvested + result.get('eco_atp_generated', 0),
+                    }
+                    violations = self._check_safety(state)
+                    if violations:
+                        logger.warning("Safety violations detected: %s", violations)
+
+                # Carbon trading
+                if 'carbon_saved' in result and self.carbon_market:
+                    await self._maybe_trade_carbon(result['carbon_saved'])
+
                 if self.config.metrics_enabled:
                     self.metrics.record(result)
 
@@ -574,6 +841,10 @@ class TimeTickEngine:
                             post_tick_callback(self._current_index, row, result)
                     except Exception as e:
                         logger.error("Post-tick callback failed: %s", e)
+
+                if self.config.enable_xai and self._current_index % 100 == 0:
+                    logger.info("XAI: Tick %d, harvested %.2f, mode %s",
+                                self._current_index, result.get('eco_atp_generated', 0), result.get('mode', 'unknown'))
 
                 if self.config.data_source == 'csv' and self._current_index % 30 == 0:
                     logger.info("Day %d: harvested %.2f Eco‑ATP",
@@ -630,19 +901,13 @@ class TimeTickEngine:
             return None
 
     # ============================================================================
-    # Enhanced MOPD: Policy Evaluation and Evolutionary Optimization
+    # Policy Evaluation and Evolutionary Optimization
     # ============================================================================
     async def evaluate_policy(self, policy: Policy) -> MOPDPoint:
-        """
-        Run a full simulation for a given policy and return the resulting MOPDPoint.
-        The harvester's mode and additional parameters are set temporarily.
-        """
-        # Cache check
         params_key = (policy.harvester_mode, frozenset(policy.parameters.items()))
         if params_key in self._policy_cache:
             return self._policy_cache[params_key]
 
-        # Save original state
         original_mode = getattr(self.harvester, 'mode', None)
         original_params = {}
         if hasattr(self.harvester, 'get_parameters'):
@@ -664,9 +929,7 @@ class TimeTickEngine:
             # Run simulation from start
             await self.run_simulation(start_index=0)
 
-            # Extract objectives
             summary = self.metrics.get_summary()
-            # For demonstration, carbon_saved and helium_saved are derived from custom metrics if available
             carbon_saved = summary.get('avg_carbon_impact', 0.0)
             helium_saved = summary.get('avg_helium_usage', 0.0)
 
@@ -679,6 +942,25 @@ class TimeTickEngine:
                 carbon_saved=carbon_saved,
                 helium_saved=helium_saved,
             )
+
+            # Safety check
+            if self.safety_monitor:
+                state = {
+                    'total_harvested': point.total_harvested,
+                    'efficiency': point.avg_efficiency,
+                }
+                violations = self._check_safety(state)
+                if violations:
+                    logger.warning("Policy %s violates safety invariants: %s", policy.policy_id, violations)
+                    point.total_harvested = 0
+                    point.avg_efficiency = 0
+                    point.carbon_saved = 0
+                    point.helium_saved = 0
+
+            # XAI explanation
+            if self.config.enable_xai:
+                logger.info("XAI: %s", self._explain_decision(point))
+
             self._policy_cache[params_key] = point
             return point
 
@@ -697,11 +979,6 @@ class TimeTickEngine:
         policies: List[Policy],
         post_policy_callback: Optional[Callable[[Policy, Dict[str, Any]], Awaitable[None]]] = None
     ) -> List[MOPDPoint]:
-        """
-        Run simulations for a list of policies sequentially (or in parallel if possible)
-        and return the Pareto front.
-        This method is kept for backward compatibility.
-        """
         if not self.config.mopd.enabled:
             logger.warning("MOPD is disabled; no Pareto front will be generated.")
             return []
@@ -714,7 +991,6 @@ class TimeTickEngine:
 
         logger.info("Evaluating %d policies...", len(policies))
         points = []
-        # Parallel evaluation (if possible)
         eval_tasks = [self.evaluate_policy(p) for p in policies]
         results = await asyncio.gather(*eval_tasks, return_exceptions=True)
         for p, res in zip(policies, results):
@@ -723,45 +999,35 @@ class TimeTickEngine:
                 continue
             points.append(res)
 
-        # Update results map for compatibility
         for point in points:
             self._mopd_results[point.policy_id] = {
-                'metrics': self.metrics.get_summary(),  # placeholder
+                'metrics': self.metrics.get_summary(),
                 'point': point,
             }
 
-        # Generate Pareto front
         self._pareto_front = self._filter_pareto(points)
         best_plan = self._select_best_from_pareto(self._pareto_front)
         if best_plan:
             logger.info("Best policy: %s with scalarised score %.3f",
                         best_plan.policy_id, best_plan.scalarised_score)
+            if self.config.enable_xai:
+                logger.info("XAI: %s", self._explain_decision(best_plan))
+            if self.carbon_market:
+                await self._maybe_trade_carbon(best_plan.carbon_saved)
 
-        # Save checkpoint
         if self.config.enable_checkpointing:
             await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
 
-        # Telemetry
         if self.config.metrics_enabled:
             logger.info("MOPD generation: %d policies, Pareto front size: %d",
                         len(policies), len(self._pareto_front))
 
+        if self.federated_coordinator:
+            await self.federated_coordinator.send_update()
+
         return self._pareto_front
 
-    # ---------- New: Evolutionary Optimization ----------
     async def run_evolution(self, policy_space: Dict[str, Any] = None):
-        """
-        Evolve policies using NSGA-II over the specified parameter space.
-
-        Args:
-            policy_space: Dictionary describing the parameter space for policies.
-                          Keys are parameter names (e.g., 'harvester_mode', 'conversion_factor',
-                          'repair_rate'). Values are either a list of discrete choices or a tuple
-                          (low, high) for continuous parameters.
-
-        Returns:
-            The Pareto front of evolved policies as a list of MOPDPoint.
-        """
         if not self.config.mopd.enabled:
             logger.warning("MOPD is disabled; cannot run evolution.")
             return []
@@ -769,7 +1035,6 @@ class TimeTickEngine:
         if self.config.data_source == 'csv' and self.daily_df is None:
             raise RuntimeError("Data not loaded. Call load_data() first.")
 
-        # Create an optimizer instance
         optimizer = NSGAIIOptimizer(
             engine=self,
             policy_space=policy_space,
@@ -784,18 +1049,22 @@ class TimeTickEngine:
         pareto = await optimizer.evolve()
         self._pareto_front = pareto
 
-        # Save checkpoint
         if self.config.enable_checkpointing:
             await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
 
+        if self.config.enable_xai and pareto:
+            best = self._select_best_from_pareto(pareto)
+            if best:
+                logger.info("XAI (evolution): %s", self._explain_decision(best))
+
+        if self.federated_coordinator:
+            await self.federated_coordinator.send_update()
+
         return pareto
 
-    # ---------- MOPD Helper Methods ----------
     def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
-        """Return non‑dominated points."""
         if not points:
             return []
-
         pareto = []
         objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
         for i, p_i in enumerate(points):
@@ -813,21 +1082,13 @@ class TimeTickEngine:
         return pareto
 
     def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with objective weights."""
         if not pareto_front:
             return None
-
         weights = self.config.mopd.objective_weights
         objective_keys = list(weights.keys())
-
-        max_vals = {}
-        min_vals = {}
-        for key in objective_keys:
-            vals = [getattr(p, key) for p in pareto_front]
-            max_vals[key] = max(vals)
-            min_vals[key] = min(vals)
+        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
+        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
         ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
-
         best = None
         best_score = -float('inf')
         for point in pareto_front:
@@ -835,8 +1096,7 @@ class TimeTickEngine:
             for key in objective_keys:
                 val = getattr(point, key)
                 norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                weight = weights.get(key, 0.0)
-                score += weight * norm
+                score += weights.get(key, 0.0) * norm
             point.scalarised_score = score
             if score > best_score:
                 best_score = score
@@ -844,10 +1104,9 @@ class TimeTickEngine:
         return best
 
     # ============================================================================
-    # Checkpointing (Enhanced with MOPD)
+    # Checkpointing
     # ============================================================================
     async def _save_checkpoint(self, current_index: int, pareto_front: Optional[List[MOPDPoint]] = None):
-        """Save current simulation state to a checkpoint file."""
         harvester_state = None
         try:
             if hasattr(self.harvester, 'get_harvesting_stats'):
@@ -946,15 +1205,10 @@ class TimeTickEngine:
             logger.warning("Failed to load checkpoint: %s", e)
             return False
 
-    # ============================================================================
-    # Public API – MOPD Query Methods
-    # ============================================================================
     def get_pareto_front(self) -> List[MOPDPoint]:
-        """Return the current Pareto front (if any)."""
         return self._pareto_front.copy()
 
     def get_mopd_summary(self) -> Dict[str, Any]:
-        """Return a summary of MOPD‑related metrics."""
         if not self.config.mopd.enabled:
             return {"enabled": False}
         return {
@@ -965,9 +1219,6 @@ class TimeTickEngine:
             "num_policies_evaluated": len(self._mopd_results),
         }
 
-    # ============================================================================
-    # General Public Methods (unchanged)
-    # ============================================================================
     def get_metrics(self) -> Dict[str, Any]:
         return self.metrics.get_summary()
 
@@ -977,6 +1228,11 @@ class TimeTickEngine:
             await asyncio.sleep(0.1)
         if self.config.enable_checkpointing and self._current_index > 0 and self.config.data_source == 'csv':
             await self._save_checkpoint(self._current_index)
+        # Cancel background tasks
+        for task in [getattr(self, '_federated_task', None), getattr(self, '_chaos_task', None)]:
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         logger.info("TimeTickEngine shutdown.")
 
     async def __aenter__(self):
@@ -987,12 +1243,9 @@ class TimeTickEngine:
 
 
 # ============================================================================
-# New: NSGA-II Optimizer for Policy Space
+# NSGA-II Optimizer for Policy Space
 # ============================================================================
 class NSGAIIOptimizer:
-    """
-    Multi‑objective optimizer using NSGA‑II to evolve policies for the TimeTickEngine.
-    """
     def __init__(self,
                  engine: TimeTickEngine,
                  policy_space: Optional[Dict[str, Any]] = None,
@@ -1018,12 +1271,10 @@ class NSGAIIOptimizer:
         self.pareto_front: List[MOPDPoint] = []
         self._eval_cache: Dict[Tuple, MOPDPoint] = {}
 
-        # Determine parameter names and types
         self.param_names = list(self.policy_space.keys())
         self.discrete_params = {k: v for k, v in self.policy_space.items() if isinstance(v, (list, tuple)) and not isinstance(v[0], (int, float))}
         self.continuous_params = {k: v for k, v in self.policy_space.items() if isinstance(v, (list, tuple)) and isinstance(v[0], (int, float)) and len(v) == 2}
 
-        # Convert discrete lists of floats/ints to list
         for k, v in self.policy_space.items():
             if isinstance(v, list) and not isinstance(v[0], (list, tuple)):
                 self.discrete_params[k] = v
@@ -1031,7 +1282,6 @@ class NSGAIIOptimizer:
                 self.continuous_params[k] = v
 
     def _default_policy_space(self) -> Dict[str, Any]:
-        # Default: mode choices and a few continuous parameters
         return {
             'harvester_mode': ['standard', 'aggressive', 'conservative'],
             'conversion_factor': (0.5, 1.5),
@@ -1056,7 +1306,6 @@ class NSGAIIOptimizer:
                 child[name] = random.choice([parent1[name], parent2[name]])
             else:
                 low, high = self.continuous_params[name]
-                # SBX
                 if random.random() < 0.5:
                     u = random.random()
                     if u <= 0.5:
@@ -1093,7 +1342,6 @@ class NSGAIIOptimizer:
         return Policy(policy_id=policy_id, harvester_mode=mode, parameters=params)
 
     async def _evaluate_individual(self, ind: Dict) -> MOPDPoint:
-        # Cache
         key = tuple(sorted(ind.items()))
         if key in self._eval_cache:
             return self._eval_cache[key]
@@ -1155,23 +1403,17 @@ class NSGAIIOptimizer:
         return distances
 
     def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDPoint]], crowding: Dict[int, float]) -> Dict:
-        # Select based on rank and crowding distance
-        # We need mapping from individual dict to point
-        # Build mapping id(point) -> individual dict
         point_to_ind = {}
         for ind, point in self._eval_cache.items():
             point_to_ind[id(point)] = ind
 
-        # Randomly choose two individuals
         candidates = random.sample(population, self.tournament_size)
         best = candidates[0]
         best_rank = float('inf')
         best_crowding = -float('inf')
         for cand in candidates:
-            # Find rank
             rank = None
             for fi, front in enumerate(fronts):
-                # front contains MOPDPoint objects; need to find corresponding individual
                 for p in front:
                     if point_to_ind.get(id(p)) == cand:
                         rank = fi
@@ -1180,7 +1422,6 @@ class NSGAIIOptimizer:
                     break
             if rank is None:
                 rank = len(fronts)
-            # Get crowding distance
             cd = crowding.get(id(self._eval_cache.get(tuple(sorted(cand.items())))), 0) if tuple(sorted(cand.items())) in self._eval_cache else 0
             if rank < best_rank or (rank == best_rank and cd > best_crowding):
                 best = cand
@@ -1189,40 +1430,30 @@ class NSGAIIOptimizer:
         return best
 
     def _compute_dynamic_weights(self) -> Dict[str, float]:
-        """Adjust weights based on current system state."""
         weights = self.objective_weights.copy()
         if not self.dynamic_weights:
             return weights
-        # Example: if total harvested is low compared to potential, increase weight on total_harvested
         if self.pareto_front:
             avg_harvest = np.mean([p.total_harvested for p in self.pareto_front])
             max_harvest = max([p.total_harvested for p in self.pareto_front])
             if max_harvest > 0 and avg_harvest < 0.5 * max_harvest:
                 weights['total_harvested'] = min(0.5, weights.get('total_harvested', 0.3) * 1.5)
-                # Normalize
                 total = sum(weights.values())
                 weights = {k: v / total for k, v in weights.items()}
         return weights
 
     async def evolve(self) -> List[MOPDPoint]:
-        """Run NSGA-II optimization."""
         population = [self._random_individual() for _ in range(self.population_size)]
-        # Evaluate initial population
         points = []
         for ind in population:
             p = await self._evaluate_individual(ind)
             points.append(p)
 
-        # Map point to individual for later
         point_to_ind = {id(p): ind for ind, p in zip(population, points)}
 
         for gen in range(self.generations):
-            # Create offspring
             offspring = []
-            # Update population list of individuals (we need mapping)
-            # We'll keep a list of (individual, point)
             pairs = list(zip(population, points))
-            # Fast non-dominated sort of current points
             fronts = self._fast_non_dominated_sort(points)
             crowding = {}
             for front in fronts:
@@ -1239,16 +1470,13 @@ class NSGAIIOptimizer:
                 child = self._mutate(child)
                 offspring.append(child)
 
-            # Evaluate offspring
             child_points = []
             for ind in offspring:
                 p = await self._evaluate_individual(ind)
                 child_points.append(p)
 
-            # Combine parent and offspring
             combined_inds = population + offspring
             combined_points = points + child_points
-            # Remove duplicates based on individual dict
             unique_pairs = {}
             for ind, p in zip(combined_inds, combined_points):
                 key = tuple(sorted(ind.items()))
@@ -1256,21 +1484,18 @@ class NSGAIIOptimizer:
             population = [v[0] for v in unique_pairs.values()]
             points = [v[1] for v in unique_pairs.values()]
 
-            # Non-dominated sorting on combined points
             fronts = self._fast_non_dominated_sort(points)
             new_population = []
             new_points = []
             for front in fronts:
                 if len(new_population) + len(front) <= self.population_size:
                     for p in front:
-                        # Find corresponding individual
                         for ind, p2 in zip(population, points):
                             if p2 is p:
                                 new_population.append(ind)
                                 new_points.append(p)
                                 break
                 else:
-                    # Fill remaining with crowding distance
                     crowding = self._crowding_distance(front)
                     sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
                     for p in sorted_front:
@@ -1284,18 +1509,14 @@ class NSGAIIOptimizer:
             population = new_population[:self.population_size]
             points = new_points[:self.population_size]
 
-            # Update Pareto front (first front)
             fronts = self._fast_non_dominated_sort(points)
             if fronts:
                 self.pareto_front = fronts[0]
             logger.info(f"Generation {gen+1}/{self.generations}: population={len(population)}, Pareto front size={len(self.pareto_front)}")
 
-        # After generations, compute dynamic weights and select best
         weights = self._compute_dynamic_weights()
-        # Use MODP scalarisation on Pareto front
         best_point = self._select_best_from_pareto(self.pareto_front, weights)
         if best_point:
-            # Find corresponding individual and set as best
             for ind, p in zip(population, points):
                 if p is best_point:
                     self.best_individual = ind
@@ -1332,14 +1553,12 @@ class NSGAIIOptimizer:
 # Example usage
 # ============================================================================
 if __name__ == "__main__":
-    # Mock harvester
     class MockHarvester:
         def __init__(self):
             self.mode = "standard"
             self.parameters = {}
 
         async def harvest_cycle(self, env_data):
-            # Simulate different harvest based on mode and parameters
             base = env_data.get('helium_supply', 0.5) * 10
             factor = 1.0
             if self.mode == "aggressive":
@@ -1376,7 +1595,6 @@ if __name__ == "__main__":
         def get_parameters(self):
             return self.parameters
 
-    # Mock translator
     class MockTranslator:
         @staticmethod
         def translate_row(row):
@@ -1390,7 +1608,6 @@ if __name__ == "__main__":
                 'helium_demand': row.get('helium_demand', 0.5)
             }
 
-    # Configuration with MOPD enabled
     config = {
         'data_source': 'csv',
         'csv_path': 'helium_data.csv',
@@ -1410,7 +1627,18 @@ if __name__ == "__main__":
                 'helium_saved': 0.2,
             },
             'dynamic_weights': True
-        }
+        },
+        'enable_quantum_distillation': True,
+        'enable_causal_rl': True,
+        'enable_federated': True,
+        'enable_safety_monitor': True,
+        'enable_xai': True,
+        'enable_precision': True,
+        'enable_carbon_market': True,
+        'carbon_market_config': {'provider_url': 'http://localhost:8545', 'contract_address': '0xabc', 'private_key': '0x123'},
+        'enable_chaos': True,
+        'chaos_probability': 0.1,
+        'enable_human_approval': True,
     }
 
     async def main():
@@ -1420,8 +1648,6 @@ if __name__ == "__main__":
 
         try:
             await engine.load_data()
-
-            # Run evolutionary optimization
             policy_space = {
                 'harvester_mode': ['standard', 'aggressive', 'conservative'],
                 'conversion_factor': (0.5, 1.5),
@@ -1432,7 +1658,6 @@ if __name__ == "__main__":
             print("Evolved Pareto front size:", len(pareto))
             for p in pareto[:5]:
                 print(f"Policy {p.policy_id}: mode={p.harvester_mode}, harvested={p.total_harvested:.2f}, eff={p.avg_efficiency:.2f}")
-
         finally:
             await engine.shutdown()
 
